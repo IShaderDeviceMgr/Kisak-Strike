@@ -38,6 +38,8 @@ endif()
 #endif()
 add_definitions(-DALLOW_TEXT_MODE=1)
 
+include_directories(./)
+
 target_sources(${OUTBINNAME} PRIVATE "CColorCorrection.cpp")
 target_sources(${OUTBINNAME} PRIVATE "cmaterial.cpp")
 target_sources(${OUTBINNAME} PRIVATE "cmaterial_queuefriendly.cpp")

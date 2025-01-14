@@ -19,7 +19,9 @@
 
 #ifdef OSX
 #include <OpenGL/OpenGL.h>
+#ifndef PLATFORM_ARM
 #include "intelglmallocworkaround.h"
+#endif
 #endif
 
 // memdbgon -must- be the last include file in a .cpp file.
@@ -2126,7 +2128,7 @@ void GLMContext::Clear( bool color, unsigned long colorValue, bool depth, float 
 
 		// stencil write mask must be saved and restored
 		GLStencilWriteMask_t			oldstenmask;
-		GLStencilWriteMask_t			newstenmask = { 0xFFFFFFFF };
+		GLStencilWriteMask_t			newstenmask = { ~0xFFFFFFFF };
 		
 		GLColorMaskSingle_t		oldcolormask;
 		GLColorMaskSingle_t		newcolormask = { -1,-1,-1,-1 };	// D3D clears do not honor color mask, so force it
@@ -3036,7 +3038,7 @@ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
 		m_scratchFBO[i] = NewFBO();
 	}
 
-#ifdef OSX
+#if defined(OSX) && !defined(PLATFORM_ARM)
 	UpdateSwapchainVariables( true );
 	if ( m_caps.m_badDriver108Intel )
 	{

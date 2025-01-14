@@ -25,7 +25,7 @@ if( WIN32 AND NOT GL )
 	add_definitions(-DUSE_ACTUAL_DX)
 endif()
 
-include_directories(../)
+include_directories(${SRCDIR}/materialsystem)
 add_definitions(-DSHADERAPIDX9 -DSHADER_DLL_EXPORT -DPROTECTED_THINGS_ENABLE -Dstrncpy=use_Q_strncpy_instead -D_snprintf=use_Q_snprintf_instead)
 
 if( GL )
@@ -63,7 +63,7 @@ if( NOT WIN32 )
 endif()
 
 # Linker
-target_link_libraries(${OUTBINNAME} mathlib_client vstdlib_client bitmap_client tier1_client tier2_client vtf_client bzip2_client )
+target_link_libraries(${OUTBINNAME} mathlib_client vstdlib_client bitmap_client tier1_client tier2_client vtf_client bzip2_client)
 
 if( POSIX )
 	target_link_libraries(${OUTBINNAME} dl )

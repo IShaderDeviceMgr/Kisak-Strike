@@ -23,7 +23,7 @@ project(KisakStrike)
 include(kisak-strike-build-options.cmake)
 
 add_subdirectory(appframework)
-add_subdirectory(external/crypto++-5.61)
+add_subdirectory(external/crypto++)
 #add_subdirectory(external/freetype-2.10.4)
 add_subdirectory(interfaces)
 #add_subdirectory(fgdlib)
@@ -124,7 +124,7 @@ endif()
 
 if( NOT DEDICATED )
 	if( USE_SCALEFORM )
-    		add_subdirectory(scaleformui) #DUMMY cmake project so CLion can do analysis
+    		add_subdirectory(scaleformui) # DUMMY cmake project so CLion can do analysis
 	elseif( USE_ROCKETUI ) #Custom Kisak-Strike UI powered by RmlUI
     		add_subdirectory(thirdparty/RmlUi)
     		add_subdirectory(rocketui)

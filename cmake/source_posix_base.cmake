@@ -123,7 +123,7 @@ if(POSIX)
 endif()
 if(OSX64)
     add_definitions(-DPLATFORM_64BITS)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -arch x86_64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -arch ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
 if(NOT IS_LIB_PROJECT)
@@ -131,7 +131,7 @@ if(NOT IS_LIB_PROJECT)
 
     #$Linker
     if(OSX64)
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -arch x86_64")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -arch ${CMAKE_SYSTEM_PROCESSOR}")
     endif()
 
     #$Folder	"Link Libraries"
@@ -141,6 +141,9 @@ if(NOT IS_LIB_PROJECT)
         link_libraries("libtier0_client")
         link_libraries("tier1_client")
         link_libraries("interfaces_client")
+        if (OSXALL)
+            link_libraries("iconv")
+        endif()
         #include_directories("vstdlib")
     endif()
 endif()

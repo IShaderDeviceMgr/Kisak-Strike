@@ -64,8 +64,10 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#ifndef _PS3
+#if !defined(_PS3) and !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif // _PS3
 #include <string.h>
 #include "tier1/utldict.h"

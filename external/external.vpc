@@ -2,5 +2,5 @@
 // This VPC file allows to point at specific versions of external software
 //
 
-$macro EXTERNALCRYPTOPP		"crypto++-5.61"
+$macro EXTERNALCRYPTOPP		"crypto++"
 $macro EXTERNALOPENSSL		"openssl-1.0.1e"

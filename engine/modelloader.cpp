@@ -68,6 +68,7 @@
 #include "networkstringtable.h"
 #include "fmtstr.h"
 #include "engine_model_client.h"
+#include "gl_model_private.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -2202,10 +2203,10 @@ void Mod_LoadFaces( void )
 	// align these allocations
 	// If you trip one of these, you need to rethink the alignment of the struct
 #ifdef PLATFORM_64BITS
-	msurface1_t* out1 = Hunk_AllocNameAlignedClear< msurface1_t >(count, alignof(msurface1_t), va("%s [%s]", lh.GetLoadName(), "surface1"));
-	msurface2_t* out2 = Hunk_AllocNameAlignedClear< msurface2_t >(count, alignof(msurface2_t), va("%s [%s]", lh.GetLoadName(), "surface2"));
+	msurface1_t* out1 = Hunk_AllocNameAlignedClear< msurface1_t >(count, std::alignment_of<msurface1_t>::value, va("%s [%s]", lh.GetLoadName(), "surface1"));
+	msurface2_t* out2 = Hunk_AllocNameAlignedClear< msurface2_t >(count, std::alignment_of<msurface2_t>::value, va("%s [%s]", lh.GetLoadName(), "surface2"));
 
-	msurfacelighting_t* pLighting = Hunk_AllocNameAlignedClear< msurfacelighting_t >(count, alignof(msurfacelighting_t), va("%s [%s]", lh.GetLoadName(), "surfacelighting"));
+	msurfacelighting_t* pLighting = Hunk_AllocNameAlignedClear< msurfacelighting_t >(count, std::alignment_of<msurfacelighting_t>::value, va("%s [%s]", lh.GetLoadName(), "surfacelighting"));
 #else
 	Assert(sizeof(msurface1_t) == 16);
 	Assert(sizeof(msurface2_t) == 32);
@@ -3232,6 +3233,7 @@ void Mod_LoadGameLumpDict( void )
 					{
 						compressedSize = ( unsigned int ) lh.LumpOffset() + lhSize - ( unsigned int ) pGameLump[ i ].fileofs;
 					}
+					// dgamelump_internal_t lumpInternal = { pGameLump[i], compressedSize };
 					g_GameLumpDict.AddToTail( { pGameLump[ i ], compressedSize } );
 				}
 			}

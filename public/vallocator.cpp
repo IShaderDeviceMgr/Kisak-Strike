@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
 //
@@ -8,8 +8,10 @@
 
 #if !defined(_STATIC_LINKED) || defined(_SHARED_LIB)
 
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif
 #include "vallocator.h"
 #include "basetypes.h"

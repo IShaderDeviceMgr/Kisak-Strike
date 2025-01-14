@@ -16,9 +16,9 @@
 #include "sse2neon.h"
 #else
 #include <xmmintrin.h>  // for sse
-#endif
 #ifndef _LINUX
 #include <emmintrin.h>
+#endif
 #endif
 #endif
 

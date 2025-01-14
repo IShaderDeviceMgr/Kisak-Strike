@@ -15,7 +15,7 @@
 
 
 #include "materialsystem/imaterialsystemhardwareconfig.h"
-#include "IHardwareConfigInternal.h"
+#include "ihardwareconfiginternal.h"
 #include "bitmap/imageformat.h"
 #include "materialsystem/imaterialsystem.h"
 

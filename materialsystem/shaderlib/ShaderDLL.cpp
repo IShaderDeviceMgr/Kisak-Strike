@@ -52,7 +52,7 @@ private:
 //-----------------------------------------------------------------------------
 // Global interfaces/structures
 //-----------------------------------------------------------------------------
-#if !defined( _PS3 ) && !defined( _OSX )
+#if !defined( _PS3 )// && !defined( _OSX )
 IMaterialSystemHardwareConfig* g_pHardwareConfig;
 const MaterialSystem_Config_t *g_pConfig;
 #else

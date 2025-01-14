@@ -15,7 +15,7 @@
 #include "colorspace.h"
 #include "materialsystem/materialsystem_config.h"
 #include "materialsystem/imaterialproxyfactory.h"
-#include "IHardwareConfigInternal.h"
+#include "ihardwareconfiginternal.h"
 #include "shadersystem.h"
 #include "texturemanager.h"
 #include "shaderlib/ShaderDLL.h"

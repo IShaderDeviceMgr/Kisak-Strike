@@ -9,6 +9,7 @@
 #include "tier1/functors.h"
 #include "tier1/fmtstr.h"
 #include "itextureinternal.h"
+#include "materialsystem_global.h"
 
 #ifndef _PS3
 #define MATSYS_INTERNAL
@@ -23,7 +24,7 @@
 
 ConVar mat_report_queue_status( "mat_report_queue_status", "0", FCVAR_MATERIAL_SYSTEM_THREAD );
 
-#if defined( _PS3 ) || defined( _OSX )
+#if defined( _PS3 )
 #define g_pShaderAPI ShaderAPI()
 #endif
 

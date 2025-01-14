@@ -363,6 +363,7 @@ static bool ThreadInIoThread()
 
 #endif //_PS3
 
+/* Look into why these are present
 #if __DARWIN_64_BIT_INO_T
 #error badness
 #endif
@@ -370,6 +371,7 @@ static bool ThreadInIoThread()
 #if _DARWIN_FEATURE_64_BIT_INODE
 #error additional badness
 #endif
+*/
 //-----------------------------------------------------------------------------
 
 class CFileSystem_Stdio : public CBaseFileSystem

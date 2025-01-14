@@ -16,6 +16,7 @@
 #include "mathlib/vector.h"
 #include "mathlib/mathlib.h"
 #include <ctype.h>
+#include <array>
 #include "checksum_crc.h"
 #include "phonemeconverter.h"
 
@@ -346,7 +347,7 @@ unsigned int CPhonemeTag::ComputeDataCheckSum()
 //-----------------------------------------------------------------------------
 // Purpose: Simple language to string and string to language lookup dictionary
 //-----------------------------------------------------------------------------
-#pragma pack(1)
+#pragma pack(16) // That alignment broke compiling on macOS arm64
 
 struct CCLanguage
 {
@@ -368,7 +369,7 @@ static CCLanguage g_CCLanguageLookup[] =
 	{ CC_JAPANESE,	"japanese",		250,	150,	0 },
 	{ CC_RUSSIAN,	"russian",		0,		250,	150 },
 	{ CC_THAI,		"thai",			0 ,		150,	250 },
-	{ CC_PORTUGUESE,"portuguese",	0 ,		0,		150 },	
+	{ CC_PORTUGUESE,"portuguese",	0 ,		0,		150 },
 };
 
 #pragma pack()
@@ -381,7 +382,6 @@ void CSentence::ColorForLanguage( int language, unsigned char& r, unsigned char&
 	{
 		return;
 	}
-
 	r = g_CCLanguageLookup[ language ].r;
 	g = g_CCLanguageLookup[ language ].g;
 	b = g_CCLanguageLookup[ language ].b;

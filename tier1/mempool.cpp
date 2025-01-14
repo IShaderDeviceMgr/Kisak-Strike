@@ -11,8 +11,10 @@
 #include <ctype.h>
 #include "tier1/strtools.h"
 
-#ifndef _PS3
+#if !defined(_PS3) and !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif
 
 // Should be last include

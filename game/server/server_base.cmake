@@ -521,7 +521,7 @@ if( MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4 )
 elseif( MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 )
 	target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/steam_api64.lib Winmm.lib)
 else()
-	target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libsteam_api.so)
+	target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libsteam_api${OUTDLLEXT})
 endif()
 
 target_link_libraries(${OUTBINNAME} libprotobuf) #from /thirdparty

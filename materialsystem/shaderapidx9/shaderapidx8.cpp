@@ -29,7 +29,7 @@ mat_fullbright 1 doesn't work properly on alpha materials in testroom_standards
 #include "shadershadowdx8.h"
 #include "locald3dtypes.h"												   
 #include "utlvector.h"
-#include "IHardwareConfigInternal.h"
+#include "ihardwareconfiginternal.h"
 #include "utlstack.h"
 #include "shaderapi/ishaderutil.h"
 #include "shaderapi/commandbuffer.h"
@@ -43,8 +43,10 @@ mat_fullbright 1 doesn't work properly on alpha materials in testroom_standards
 #include "colorformatdx8.h"
 #include "texturedx8.h"
 #include "textureheap.h"
-#if !defined ( _PS3 )
+#if !defined ( _PS3 ) && !defined(OSX)
 #include <malloc.h>
+#elif defined (OSX)
+#include <malloc/malloc.h>
 #endif // !_PS3
 #include "interface.h"
 #include "utlrbtree.h"

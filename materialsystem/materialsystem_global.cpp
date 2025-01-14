@@ -7,8 +7,10 @@
 #include "materialsystem_global.h"
 #include "shaderapi/ishaderapi.h"
 #include "shadersystem.h"
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif
 #include "filesystem.h"
 

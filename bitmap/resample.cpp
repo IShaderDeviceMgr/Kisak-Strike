@@ -1,4 +1,4 @@
-//======= Copyright © 1996-2005, Valve Corporation, All rights reserved. ======//
+//======= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ======//
 //
 // Purpose: 
 //
@@ -8,8 +8,11 @@
 #include "bitmap/imageformat.h"
 #include "basetypes.h"
 #include "tier0/dbg.h"
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#include <memory.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #include <memory.h>
 #else
 #include <stdlib.h>

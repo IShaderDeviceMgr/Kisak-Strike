@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
 //
@@ -9,8 +9,10 @@
 
 //#include <stdafx.h>
 #include <stdlib.h>
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif
 #include "builddisp.h"
 #include "collisionutils.h"

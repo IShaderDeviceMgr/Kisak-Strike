@@ -46,7 +46,7 @@ lib/public/linux64/*.o
 
 #Ignore crypto++ built files
 external/crypto++-5.61/*.o
-external/crypto++-5.61/libcryptopp.a
+external/crypto++/libcryptopp.a
 
 # compiled .rc files
 *.aps
@@ -81,3 +81,6 @@ public/vphysics_bullet/*
 vphysics_bullet/*
 thirdparty/bullet3/*
 /hammer_launcher_qt/
+
+**/.DS_Store
+external/crypto++-old

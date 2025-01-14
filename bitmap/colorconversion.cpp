@@ -10,8 +10,11 @@
 #include "bitmap/imageformat.h"
 #include "basetypes.h"
 #include "tier0/dbg.h"
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#include <memory.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #include <memory.h>
 #endif
 #include "mathlib/mathlib.h"

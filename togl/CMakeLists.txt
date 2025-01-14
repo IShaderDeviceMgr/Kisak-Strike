@@ -18,6 +18,7 @@ include(${CMAKE_MODULE_PATH}/source_dll_base.cmake)
 
 include_directories("../")
 include_directories("../public/togl")
+include_directories("../common")
 
 if(OSXALL)
     add_definitions(-DTOGL_DLL_EXPORT)
@@ -42,8 +43,10 @@ if( GL )
     if( OSXALL )
         #source
         target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/glmgrcocoa.mm")
-        target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/intelglmallocworkaround.cpp")
-        target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/mach_override.c")
+        if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+            target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/intelglmallocworkaround.cpp")
+            target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/mach_override.c")
+        endif()
     endif()
     target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/cglmtex.cpp")
     target_sources(${OUTBINNAME} PRIVATE "${TOGL_SRCDIR}/cglmfbo.cpp")
@@ -59,4 +62,8 @@ endif()
 #// Link
 #//-----------------------------------------------------------------------------
 
-target_link_libraries(${OUTBINNAME} tier2_client vstdlib_client mathlib_client )
+if(OSXALL)
+    target_link_libraries(${OUTBINNAME} tier2_client vstdlib_client mathlib_client "-framework Foundation -framework OpenGL -framework CoreGraphics -framework AppKit -framework Carbon")
+else()
+    target_link_libraries(${OUTBINNAME} tier2_client vstdlib_client mathlib_client)
+endif()

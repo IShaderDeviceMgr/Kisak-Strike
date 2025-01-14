@@ -12,6 +12,7 @@
 #include "tier0/vprof.h"
 
 #ifdef OSX
+#include <sys/sysctl.h>
 #include <OpenGL/OpenGL.h>
 
 #endif

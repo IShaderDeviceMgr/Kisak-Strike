@@ -19,7 +19,7 @@ include_directories(${ESRCDIR}/audio/private)
 include_directories(${ESRCDIR}/audio/private/snd_op_sys)
 include_directories(${ESRCDIR}/audio/public)
 include_directories(${SRCDIR}/thirdparty/quickhull)
-include_directories(${SRCDIR}/external/crypto++-5.61)
+include_directories(${SRCDIR}/external/crypto++)
 if( WIN32 )
     include_directories(${SRCDIR}/external/dxsdk/include)
 endif()
@@ -62,6 +62,10 @@ if( LINUXALL )
         target_link_options(${OUTBINNAME} PRIVATE -L/usr/lib32 -L/usr/lib)
     endif()
     target_compile_options(${OUTBINNAME} PRIVATE -Wno-narrowing) # downgrade some errors to fix build
+endif()
+
+if( OSXALL )
+    target_compile_options(${OUTBINNAME} PRIVATE -Wno-narrowing -std=c++11) # downgrade some errors to fix build
 endif()
 
 if( NOT DEDICATED )
@@ -447,7 +451,7 @@ if( (NOT DEFINED NO_STEAM) )
 	elseif( MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 )
 		target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/steam_api64.lib)
 	else()
-		target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libsteam_api.so)
+		target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libsteam_api${OUTDLLEXT})
 	endif()
 endif()
 
@@ -476,8 +480,16 @@ if( LINUXALL AND NOT DEDICATED )
 endif()
 target_link_libraries(${OUTBINNAME} quickhull_client cryptopp-object)
 if( SDL AND NOT LINUXALL )
+    target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libSDL2${OUTDLLEXT})
     #$ImpLib	"SDL2" [$SDL && !$LINUXALL]
 endif()
+
+
+if (OSXALL)
+    target_link_libraries(${OUTBINNAME} "-framework Carbon -framework AppKit -framework OpenGL -framework IOKit -framework AudioToolbox -framework CoreAudio -framework SystemConfiguration -framework OpenAL")
+    target_link_libraries(${OUTBINNAME} "${LIBPUBLIC}/libcurl.dylib")
+endif()
+
 
 if( LINUX64 AND NOT DEDICATED )
     if( USE_VALVE_HRTF )
@@ -488,3 +500,5 @@ if( LINUX64 AND NOT DEDICATED )
         message("Using Standard CS:GO Audio.\n")
     endif()
 endif()
+
+#target_compile_options(${OUTBINNAME} PRIVATE -std=c++11)

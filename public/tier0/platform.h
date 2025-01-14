@@ -140,7 +140,11 @@
 	#define NO_STEAM_GAMECOORDINATOR
 #endif
 
+#ifdef OSX
+	#include <malloc/malloc.h>
+#else
 	#include <malloc.h>
+#endif
 	#include <memory.h>
 	#include <limits.h>
 	#include <float.h>
@@ -1165,7 +1169,17 @@ typedef void * HINSTANCE;
 		#define DebuggerBreak() {  __asm volatile ("tw 31,1,1"); } 
 		#endif
 	#elif defined( OSX )
-		#define DebuggerBreak()  if ( Plat_IsInDebugSession() ) asm( "int3" ); else { raise(SIGTRAP); }
+		#if defined(__aarch64__) || defined(arm)
+			#ifdef __clang__
+				#define DebuggerBreak()  do { if ( Plat_IsInDebugSession() ) { __builtin_debugtrap(); } else { raise(SIGTRAP); } } while(0)
+			#elif defined(__GNUC__)
+				#define DebuggerBreak()  do { if ( Plat_IsInDebugSession() ) { __builtin_trap(); } else { raise(SIGTRAP); } } while(0)
+			#else
+				#define DebuggerBreak()  raise(SIGTRAP)
+			#endif
+		#else
+			#define DebuggerBreak()  if ( Plat_IsInDebugSession() ) asm( "int3" ); else { raise(SIGTRAP); }
+		#endif
 	#elif ( defined( PLATFORM_CYGWIN ) || defined( PLATFORM_POSIX ) ) && !defined( __e2k__ ) && !defined( PLATFORM_ARM )
 		#define DebuggerBreak()		__asm__( "int $0x3;")
 	#else

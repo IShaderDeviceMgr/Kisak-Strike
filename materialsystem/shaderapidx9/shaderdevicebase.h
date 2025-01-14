@@ -15,7 +15,7 @@
 
 #include "togl/rendermechanism.h"
 #include "shaderapi/IShaderDevice.h"
-#include "IHardwareConfigInternal.h"
+// #include "ihardwareconfiginternal.h"
 #include "bitmap/imageformat.h"
 #include "materialsystem/imaterialsystem.h"
 #include "hardwareconfig.h"
