@@ -18,8 +18,8 @@
 #include "filesystem.h"
 #include "vguifont.h"
 
-#ifdef LINUX
-#include <ft2build.h>
+#if defined(LINUX) || defined(OSX)
+#include "freetype/ft2build.h"
 #include FT_FREETYPE_H
 typedef void *(*FontDataHelper)( const char *pchFontName, int &size );
 #endif
@@ -71,7 +71,7 @@ public:
 	IFileSystem *FileSystem() { return m_pFileSystem; }
 	IMaterialSystem *MaterialSystem() { return m_pMaterialSystem; }
 
-#ifdef LINUX
+#if defined(LINUX) || defined(OSX)
 	FT_Library GetFontLibraryHandle() { return library; }
 	void SetFontDataHelper( FontDataHelper helper ) { pFontDataHelper = helper; }
 #endif
@@ -96,7 +96,7 @@ private:
 	CUtlVector<CFontAmalgam> m_FontAmalgams;
 	CUtlVector<font_t *> m_Win32Fonts;
 
-#ifdef LINUX
+#if defined(LINUX) || defined(OSX)
 	FT_Library library; 
 	FontDataHelper pFontDataHelper;		
 #endif

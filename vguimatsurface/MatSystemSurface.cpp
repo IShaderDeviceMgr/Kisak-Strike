@@ -17,8 +17,11 @@
 #ifdef OSX
 #include <Carbon/Carbon.h>
 #endif
-#ifdef LINUX
+
+#if defined(LINUX) || defined(OSX)
 #include <fontconfig/fontconfig.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
 #endif
 
 #if defined( USE_SDL ) || defined(OSX) 
@@ -56,8 +59,10 @@ ILauncherMgr *g_pLauncherMgr = NULL;
 #include "mathlib/vmatrix.h"
 #include <tier0/vprof.h>
 #include "materialsystem/itexture.h"
-#ifndef _PS3
+#if !defined(_PS3) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #else
 #include <wctype.h>
 #endif
@@ -163,7 +168,7 @@ EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CMatSystemSurface, ISurface,
 EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CMatSystemSurface, ISchemeSurface, 
 						SCHEME_SURFACE_INTERFACE_VERSION, g_MatSystemSurface );
 
-#ifdef LINUX
+#if defined(LINUX) | defined(OSX)
 CUtlDict< CMatSystemSurface::font_entry, unsigned short > CMatSystemSurface::m_FontData;
 #endif
 
@@ -2383,54 +2388,7 @@ bool CMatSystemSurface::AddCustomFontFile( const char *fontFileName )
 #endif // X360
 #elif defined( _PS3 )
 	return true;
-#elif defined( OSX )
-	// Just load the font data, decrypt in memory and register for this process
-	CUtlBuffer buf;
-	if ( !g_pFullFileSystem->ReadFile( fontFileName, NULL, buf ) )
-	{
-		Msg( "Failed to load custom font file '%s'\n", fontFileName );
-		return false;
-	}
-	
-  OSStatus err;
-	ATSFontContainerRef container;
-  err = ATSFontActivateFromMemory( buf.Base(), buf.TellPut(), kATSFontContextLocal, kATSFontFormatUnspecified, NULL, kATSOptionFlagsDefault, &container );
-  if ( err != noErr && ValveFont::DecodeFont( buf ) )
-	{
-    err = ATSFontActivateFromMemory( buf.Base(), buf.TellPut(), kATSFontContextLocal, kATSFontFormatUnspecified, NULL, kATSOptionFlagsDefault, &container );
-  }
-	
-#if 0
-  if ( err == noErr )
-  {
-	 // Debug code to let you find out the name of a font we pull in from a memory buffer
-	 // Count the number of fonts that were loaded.
-	 ItemCount fontCount = 0;
-	 err = ATSFontFindFromContainer(container, kATSOptionFlagsDefault, 0,
-	 NULL, &fontCount);
-	 
-	 if (err != noErr || fontCount < 1) {
-	 return false;
-	 }
-	 
-	 // Load font from container.
-	 ATSFontRef font_ref_ats = 0;
-	 ATSFontFindFromContainer(container, kATSOptionFlagsDefault, 1,
-	 &font_ref_ats, NULL);
-	 
-	 if (!font_ref_ats) {
-	 return false;
-	 }
-	 
-	 CFStringRef name;
-	 ATSFontGetPostScriptName( font_ref_ats, kATSOptionFlagsDefault, &name );
-	 
-	 const char *font_name = CFStringGetCStringPtr( name, CFStringGetSystemEncoding());
-   printf( "loaded %s\n", font_name );
-  }
-#endif
-	return err == noErr;
-#elif defined(LINUX)
+#elif defined(LINUX) || defined(OSX)
 	// Just load the font data, decrypt in memory and register for this process
 	CUtlBuffer buf;
 	if ( !g_pFullFileSystem->ReadFile( fontFileName, NULL, buf ) )

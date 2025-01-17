@@ -63,7 +63,11 @@ if( NOT WIN32 )
 endif()
 
 # Linker
-target_link_libraries(${OUTBINNAME} mathlib_client vstdlib_client bitmap_client tier1_client tier2_client vtf_client bzip2_client)
+target_link_libraries(${OUTBINNAME} mathlib_client vstdlib_client bitmap_client tier1_client tier2_client vtf_client bzip2_client engine_client)
+
+#if (OSXALL)
+#	target_link_options(${OUTBINNAME} PUBLIC -Wl,-undefined,dynamic_lookup)
+#endif ()
 
 if( POSIX )
 	target_link_libraries(${OUTBINNAME} dl )

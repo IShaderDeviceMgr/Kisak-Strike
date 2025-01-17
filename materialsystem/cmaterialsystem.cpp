@@ -747,7 +747,7 @@ void CMaterialSystem::DestroyShaderAPI()
 //-----------------------------------------------------------------------------
 void CMaterialSystem::SetShaderAPI( char const *pShaderAPIDLL )
 {
-#if defined( _PS3 ) || defined( _OSX )
+#if defined( _PS3 )
 	return;
 #endif
 
@@ -784,6 +784,9 @@ bool CMaterialSystem::Connect( CreateInterfaceFn factory )
 	if ( !factory )
 		return false;
 
+	if  ( !m_ShaderAPIFactory )
+		return false;
+
 	if ( !BaseClass::Connect( factory ) )
 		return false;
 
@@ -797,14 +800,12 @@ bool CMaterialSystem::Connect( CreateInterfaceFn factory )
 
 	// Get at the interfaces exported by the shader DLL
 
-#ifndef _OSX
-	g_pShaderDeviceMgr = (IShaderDeviceMgr*)m_ShaderAPIFactory( SHADER_DEVICE_MGR_INTERFACE_VERSION, 0 );
+	g_pShaderDeviceMgr = (CShaderDeviceMgrBase*)m_ShaderAPIFactory( SHADER_DEVICE_MGR_INTERFACE_VERSION, 0 );
 	if ( !g_pShaderDeviceMgr )
 		return false;
 	g_pHWConfig = (IHardwareConfigInternal*)m_ShaderAPIFactory( MATERIALSYSTEM_HARDWARECONFIG_INTERFACE_VERSION, 0 );
 	if ( !g_pHWConfig )
 		return false;
-#endif
 
 #ifndef DEDICATED
 

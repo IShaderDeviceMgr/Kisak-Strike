@@ -21,6 +21,13 @@ include_directories(../public/mathlib)
 if( LINUXALL )
     include_directories(/usr/include/freetype2)
 endif()
+if ( OSXALL )
+    find_package(Freetype REQUIRED)
+    find_package(Fontconfig REQUIRED)
+    find_package(SDL2 REQUIRED)
+
+    include_directories(${OUTBINNAME} PRIVATE ${FREETYPE_INCLUDE_DIRS} ${Fontconfig_INCLUDE_DIRS})
+endif()
 add_definitions(-DBENCHMARK -DVGUIMATSURFACE_DLL_EXPORT -DGAMEUI_EXPORTS -DDONT_PROTECT_FILEIO_FUNCTIONS -DPROTECTED_THINGS_ENABLE)
 add_definitions(-DENABLE_CHROMEHTMLWINDOW)
 
@@ -45,3 +52,7 @@ target_link_libraries(${OUTBINNAME} vgui_controls_client vgui_surfacelib_client 
 if( LINUXALL )
     target_link_libraries(${OUTBINNAME} fontconfig freetype SDL2)
 endif()
+
+if ( OSXALL )
+    target_link_libraries(${OUTBINNAME} ${Fontconfig_LIBRARIES} ${FREETYPE_LIBRARIES} ${LIBPUBLIC}/libSDL2${OUTDLLEXT} "-framework CoreGraphics")
+endif ()

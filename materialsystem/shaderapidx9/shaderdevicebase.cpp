@@ -38,7 +38,7 @@ CShaderDeviceBase *g_pShaderDevice;
 CShaderAPIBase *g_pShaderAPI;
 CShaderDeviceMgrBase *g_pShaderDeviceMgr;
 IShaderShadow *g_pShaderShadow;
-#if !defined( _PS3 ) && !defined( _OSX )
+#if !defined( _PS3 )
 IShaderUtil* g_pShaderUtil;		// The main shader utility interface
 IVJobs * g_pVJobs;
 #else

@@ -631,7 +631,7 @@ private:
 
 	CUtlRBTree< ContextAbsPos_t > m_ContextAbsPos;
 
-#ifdef LINUX
+#if defined(LINUX) || defined(OSX)
 	struct font_entry
 	{
 		void *data;
@@ -640,7 +640,7 @@ private:
 
 	static CUtlDict< font_entry, unsigned short > m_FontData;
 
-	static void *FontDataHelper( const char *pchFontName, int &size );		
+	static void *FontDataHelper( const char *pchFontName, int &size );
 #endif
 
 

@@ -45,7 +45,7 @@ lib/public/linux64/stWJvlNz
 lib/public/linux64/*.o
 
 #Ignore crypto++ built files
-external/crypto++-5.61/*.o
+external/crypto++/*.o
 external/crypto++/libcryptopp.a
 
 # compiled .rc files

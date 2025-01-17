@@ -571,8 +571,13 @@ int CSystem::GetAvailableDrives(char *buf, int bufLen)
 //-----------------------------------------------------------------------------
 double CSystem::GetFreeDiskSpace(const char *path)
 {
+#if __DARWIN_ONLY_64_BIT_INO_T || PLATFORM_BSD // macOS is 64bit only after 10.15
+	struct statfs buf;
+	int ret = statfs( path, &buf );
+#else
 	struct statfs64 buf;
 	int ret = statfs64( path, &buf );
+#endif
 	if ( ret < 0 )
 		return 0.0;
 	return (double) ( buf.f_bsize * buf.f_bfree );

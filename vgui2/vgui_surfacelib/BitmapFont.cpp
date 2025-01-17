@@ -10,8 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#if !defined( _PS3 )
+#if !defined( _PS3 ) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif // ! _PS3
 #include "vgui_surfacelib/BitmapFont.h"
 #include "vgui_surfacelib/fontmanager.h"

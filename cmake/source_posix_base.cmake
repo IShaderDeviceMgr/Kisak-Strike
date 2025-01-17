@@ -57,7 +57,7 @@ else()
 	endif()
     add_definitions(-DNDEBUG)
     if( OSXALL )
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gdwarf-2 -g2 -O2 -march=native")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gdwarf-2 -g2 -march=native") # -gdwarf-2 -g2 -O2
     elseif( LINUXALL )
         if( NO_GCC_OPTIMIZE )
             message("^^ Not Setting -O for Target")

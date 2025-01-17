@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose:
 //
@@ -6,8 +6,10 @@
 
 #include "datacache/idatacache.h"
 
-#if defined( POSIX ) && !defined( _PS3 )
+#if defined( POSIX ) && !defined( _PS3 ) && !defined(OSX)
 #include <malloc.h>
+#elif defined(OSX)
+#include <malloc/malloc.h>
 #endif
 
 #include "tier0/vprof.h"
