@@ -843,18 +843,16 @@ bool CMaterialSystem::Connect( CreateInterfaceFn factory )
 
 #endif // !DEDICATED
 
-#ifndef _OSX
 	// FIXME: ShaderAPI, ShaderDevice, and ShaderShadow should only come in after setting mode
-	g_pShaderAPI = (IShaderAPI*)m_ShaderAPIFactory( SHADERAPI_INTERFACE_VERSION, 0 );
+	g_pShaderAPI = (CShaderAPIBase*)m_ShaderAPIFactory( SHADERAPI_INTERFACE_VERSION, 0 );
 	if ( !g_pShaderAPI )
 		return false;
-	g_pShaderDevice = (IShaderDevice*)m_ShaderAPIFactory( SHADER_DEVICE_INTERFACE_VERSION, 0 );
+	g_pShaderDevice = (CShaderDeviceBase*)m_ShaderAPIFactory( SHADER_DEVICE_INTERFACE_VERSION, 0 );
 	if ( !g_pShaderDevice )
 		return false;
 	g_pShaderShadow = (IShaderShadow*)m_ShaderAPIFactory( SHADERSHADOW_INTERFACE_VERSION, 0 );
 	if ( !g_pShaderShadow )
 		return false;
-#endif
 
 	// Remember the factory for connect
 	g_fnMatSystemConnectCreateInterface = factory;
@@ -881,7 +879,7 @@ void CMaterialSystem::Disconnect()
 		// Unload the DLL
 		DestroyShaderAPI();
 	}
-#if !defined( _PS3 ) && !defined( _OSX )
+#if !defined( _PS3 )
 	g_pShaderAPI = NULL;
 	g_pHWConfig = NULL;
 	g_pShaderShadow = NULL;
@@ -1876,11 +1874,11 @@ void CMaterialSystem::ReleaseShaderObjects( int nChangeFlags )
 
 void CMaterialSystem::RestoreShaderObjects( CreateInterfaceFn shaderFactory, int nChangeFlags )
 {
-#if !defined( _PS3 ) && !defined( _OSX )
+#if !defined( _PS3 )
 	if ( shaderFactory )
 	{
-		g_pShaderAPI = (IShaderAPI*)shaderFactory( SHADERAPI_INTERFACE_VERSION, NULL );
-		g_pShaderDevice = (IShaderDevice*)shaderFactory( SHADER_DEVICE_INTERFACE_VERSION, NULL );
+		g_pShaderAPI = (CShaderAPIBase*)shaderFactory( SHADERAPI_INTERFACE_VERSION, NULL );
+		g_pShaderDevice = (CShaderDeviceBase*)shaderFactory( SHADER_DEVICE_INTERFACE_VERSION, NULL );
 		g_pShaderShadow = (IShaderShadow*)shaderFactory( SHADERSHADOW_INTERFACE_VERSION, NULL );
 	}
 #endif
