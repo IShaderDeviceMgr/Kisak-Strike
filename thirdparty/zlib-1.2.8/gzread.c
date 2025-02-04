@@ -4,7 +4,9 @@
  */
 
 #include "gzguts.h"
-
+#ifdef POSIX
+#include <unistd.h>
+#endif
 /* Local functions */
 local int gz_load OF((gz_statep, unsigned char *, unsigned, unsigned *));
 local int gz_avail OF((gz_statep));

@@ -7,6 +7,8 @@
 #include "togl/rendermechanism.h"
 
 // memdbgon -must- be the last include file in a .cpp file.
+#include <string>
+
 #include "tier0/memdbgon.h"
 
 // LINUXTODO : took out cmdline here
@@ -425,6 +427,8 @@ CGLMBuffer::CGLMBuffer( GLMContext *pCtx, EGLMBufferType type, uint size, uint o
 	}
 				
 	m_nSize = size;
+	std::string logString = "Size: " + std::to_string(m_nSize) + "\n";
+	Log_Msg(LOG_GENERAL, logString.c_str());
 	m_nActualSize = size;
 	m_bMapped = false;
 	m_pLastMappedAddress = NULL;
@@ -662,6 +666,7 @@ void CGLMBuffer::Lock( GLMBuffLockParams *pParams, char **pAddressOut )
 	
 	if ( pParams->m_nOffset >= m_nSize )
 	{
+		// Log_Error( LOG_GENERAL, std::to_string(m_nSize).c_str());
 		DXABSTRACT_BREAK_ON_ERROR();
 		return;
 	}

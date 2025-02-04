@@ -1609,7 +1609,7 @@ bool CIndexBufferDx8::Lock( int nMaxIndexCount, bool bAppend, IndexDesc_t &desc 
 	ShaderUtil()->SyncMatrices();
 	g_ShaderMutex.Lock();
 
-	VPROF( "CIndexBufferX8::Lock" );		
+	VPROF( "CIndexBufferX8::Lock" );
 
 	void *pLockedData = NULL;
 	HRESULT hr;

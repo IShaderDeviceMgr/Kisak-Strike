@@ -16,7 +16,7 @@
 #include "cmaterialsystem.h"
 #include "occlusionquerymgr.h"
 #include "texturemanager.h"
-#include "IHardwareConfigInternal.h"
+#include "ihardwareconfiginternal.h"
 #include "ctype.h"
 
 #include "tier1/fmtstr.h"
@@ -986,9 +986,9 @@ Vector CMatRenderContextBase::GetToneMappingScaleLinear( void )
 }
 
 #undef g_pShaderAPI
-#if defined( _PS3 ) || defined( _OSX )
-#define g_pShaderAPI ShaderAPI()
-#endif
+// #if defined( _PS3 ) || defined( _OSX )
+// #define g_pShaderAPI ShaderAPI()
+// #endif
 
 //-----------------------------------------------------------------------------
 //

@@ -4,6 +4,9 @@
  */
 
 #include "gzguts.h"
+#ifdef POSIX
+#include <unistd.h>
+#endif
 
 /* Local functions */
 local int gz_init OF((gz_statep));

@@ -35,7 +35,7 @@
 #include "tier0/memdbgon.h"
 
 // NOTE: This is externed in BaseVSShader.h so it needs to be here
-#if defined( _PS3 ) || defined( OSX )
+#if defined( _PS3 )
 extern ConVar r_flashlightbrightness;
 #else
 ConVar r_flashlightbrightness( "r_flashlightbrightness", "0.25", FCVAR_CHEAT );
@@ -1194,7 +1194,7 @@ void CBaseVSShader::DrawEqualDepthToDestAlpha( void )
 }
 
 
-#if !defined( _PS3 ) && !defined( OSX )
+#if !defined( _PS3 )
 //-----------------------------------------------------------------------------
 bool ToolsEnabled()
 {
