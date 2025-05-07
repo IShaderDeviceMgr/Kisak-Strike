@@ -20,6 +20,11 @@ If you want to build with VPC for an authentic experience(not recommended), see 
 ## Packages
 SDL2 SDL2_mixer tcmalloc_minimal rt openal curl ssl z crypto dl pthread fontconfig freetype GL
 
+#### macOS
+```
+brew install cryptopp openssl cmake sdl2 sdl2_mixer fontconfig curl-openssl libpng libjpeg zlib
+```
+
 #### Ubuntu 
 ```
 sudo apt install git build-essential cmake libsdl2-mixer-dev libsdl2-dev libgoogle-perftools-dev libopenal-dev libcurlpp-dev libssl-dev libfontconfig1-dev libcurl4-openssl-dev net-tools

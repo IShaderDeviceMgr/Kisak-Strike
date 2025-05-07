@@ -99,6 +99,7 @@ if(DEDICATED)
 endif()
 if(OSXALL)
     add_definitions(-D_OSX -DOSX -D_DARWIN_UNLIMITED_SELECT -DFD_SETSIZE=10240)
+    add_compile_options(-Wno-c++11-narrowing)
 endif()
 
 if(LINUXALL)

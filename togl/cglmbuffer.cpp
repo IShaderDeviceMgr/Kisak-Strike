@@ -427,8 +427,6 @@ CGLMBuffer::CGLMBuffer( GLMContext *pCtx, EGLMBufferType type, uint size, uint o
 	}
 				
 	m_nSize = size;
-	std::string logString = "Size: " + std::to_string(m_nSize) + "\n";
-	Log_Msg(LOG_GENERAL, logString.c_str());
 	m_nActualSize = size;
 	m_bMapped = false;
 	m_pLastMappedAddress = NULL;

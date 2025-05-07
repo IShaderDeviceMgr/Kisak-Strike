@@ -4,6 +4,9 @@ include(${CMAKE_MODULE_PATH}/common_functions.cmake)
 MacroRequired( SRCDIR )
 MacroRequired( GAMENAME )
 
+find_package( ZLIB REQUIRED )
+find_package( PNG REQUIRED )
+
 set(OUTBINNAME "client_client")
 set(OUTBINDIR "${SRCDIR}/../game/${GAMENAME}/bin")
 set(GENERATED_PROTO_DIR "${SRCDIR}/game/client/generated_proto")
@@ -599,4 +602,4 @@ else()
 	target_link_libraries(${OUTBINNAME} ${LIBPUBLIC}/libsteam_api${OUTDLLEXT})
 endif()
 target_link_libraries(${OUTBINNAME} tier3_client vgui_controls_client videocfg_client vtf_client resourcefile_client )
-target_link_libraries(${OUTBINNAME} zlib png libprotobuf) #from /thirdparty
+target_link_libraries(${OUTBINNAME} ${ZLIB_LIBRARIES} ${PNG_LIBRARIES} libprotobuf) #from /thirdparty
