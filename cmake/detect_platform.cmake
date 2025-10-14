@@ -19,7 +19,7 @@ elseif(UNIX AND NOT APPLE) #LINUX
     endif()
 elseif(UNIX AND APPLE) #MAC
     set(OSXALL "1")
-    set(GL "1")
+    set(MTL "1")
     set(POSIX "1")
     set(_DLL_EXT "_client.dylib")
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)

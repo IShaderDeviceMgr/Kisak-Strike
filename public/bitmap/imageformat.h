@@ -486,6 +486,7 @@ namespace ImageLoader
 	void ByteSwapImageData( unsigned char *pImageData, int nImageSize, ImageFormat imageFormat, int width = 0, int stride = 0 );
 	bool IsFormatValidForConversion( ImageFormat fmt );
 
+#if !USE_MTL
 	//-----------------------------------------------------------------------------
 	// convert back and forth from D3D format to ImageFormat, regardless of
 	// whether it's supported or not
@@ -493,7 +494,7 @@ namespace ImageLoader
 	//-----------------------------------------------------------------------------
 	ImageFormat D3DFormatToImageFormat( D3DFORMAT format );
 	D3DFORMAT ImageFormatToD3DFormat( ImageFormat format );
-
+#endif
 	// Flags for ResampleRGBA8888
 	enum
 	{

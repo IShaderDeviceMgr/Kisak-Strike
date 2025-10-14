@@ -1,9 +1,14 @@
-if( GL AND NOT OSX32 AND NOT DEDICATED )
+if( (GL OR MTL) AND NOT OSX32 AND NOT DEDICATED )
     set(SDL "1")
 endif()
 
 if( WIN32 )
 	 add_definitions(-DAVI_VIDEO)
+endif()
+
+if (MTL)
+    add_definitions(-DUSE_MTL)
+    include_directories(${SRCDIR}/thirdparty/metal-cpp/include)
 endif()
 
 if( GL )

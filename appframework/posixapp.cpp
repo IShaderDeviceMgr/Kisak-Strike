@@ -14,7 +14,6 @@
 #include "filesystem_init.h"
 #include "tier1/convar.h"
 #include "vstdlib/cvar.h"
-#include "togl/rendermechanism.h"
 
 // NOTE: This has to be the last file included! (turned off below, since this is included like a header)
 #include "tier0/memdbgon.h"

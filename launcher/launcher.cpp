@@ -14,6 +14,7 @@
 #endif
 #elif defined ( OSX ) 
 #include <Carbon/Carbon.h>
+#include <sys/stat.h>
 #elif defined ( LINUX )
 #define O_EXLOCK 0
 #include <sys/types.h>
@@ -189,32 +190,32 @@ public:
 #if defined ( WIN32 ) || defined( LINUX )
 		if ( pContext->m_Severity == LS_WARNING && pContext->m_ChannelID == LOG_EngineInitialization )
 		{
-			::MessageBox( NULL, pMessage, "Warning!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
+			::MessageBox( nullptr, pMessage, "Warning!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
 		}
 		else if ( pContext->m_Severity == LS_ASSERT && !ShouldUseNewAssertDialog() )
 		{
-			::MessageBox( NULL, pMessage, "Assert!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
+			::MessageBox( nullptr, pMessage, "Assert!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
 		}
 		else if ( pContext->m_Severity == LS_ERROR )
 		{
-			::MessageBox( NULL, pMessage, "Error!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
+			::MessageBox( nullptr, pMessage, "Error!", MB_OK | MB_SYSTEMMODAL | MB_ICONERROR );
 		}
 #elif defined(OSX)
 		CFOptionFlags responseFlags;
 		CFStringRef message;
-		message = CFStringCreateWithCString(NULL, pMessage, CFStringGetSystemEncoding() ) ;
+		message = CFStringCreateWithCString(nullptr, pMessage, CFStringGetSystemEncoding() ) ;
 		
 		if ( pContext->m_Severity == LS_WARNING && pContext->m_ChannelID == LOG_EngineInitialization )
 		{
-			CFUserNotificationDisplayAlert(0, kCFUserNotificationCautionAlertLevel, 0, 0, 0, CFSTR( "Warning" ), message, NULL, NULL, NULL, &responseFlags);
+			CFUserNotificationDisplayAlert(0, kCFUserNotificationCautionAlertLevel, 0, 0, 0, CFSTR( "Warning" ), message, nullptr, nullptr, nullptr, &responseFlags);
 		}
 		else if ( pContext->m_Severity == LS_ASSERT && !ShouldUseNewAssertDialog() )
 		{
-			CFUserNotificationDisplayAlert(0, kCFUserNotificationNoteAlertLevel, 0, 0, 0, CFSTR( "Assert" ), message, NULL, NULL, NULL, &responseFlags);
+			CFUserNotificationDisplayAlert(0, kCFUserNotificationNoteAlertLevel, 0, 0, 0, CFSTR( "Assert" ), message, nullptr, nullptr, nullptr, &responseFlags);
 		}
 		else if ( pContext->m_Severity == LS_ERROR )
 		{
-			CFUserNotificationDisplayAlert(0,  kCFUserNotificationStopAlertLevel, 0, 0, 0, CFSTR( "Error" ), message, NULL, NULL, NULL, &responseFlags);
+			CFUserNotificationDisplayAlert(0,  kCFUserNotificationStopAlertLevel, 0, 0, 0, CFSTR( "Error" ), message, nullptr, nullptr, nullptr, &responseFlags);
 		}	
 		CFRelease(message);
 #else
@@ -251,7 +252,7 @@ void SetGameDirectory( const char *game )
 bool GetExecutableName( char *out, int outSize )
 {
 #ifdef WIN32
-	if ( !::GetModuleFileName( ( HINSTANCE )GetModuleHandle( NULL ), out, outSize ) )
+	if ( !::GetModuleFileName( ( HINSTANCE )GetModuleHandle( nullptr ), out, outSize ) )
 	{
 		return false;
 	}
@@ -280,10 +281,10 @@ const char * GetExecutableFilename()
 		_splitpath
 		( 
 			exepath, // Input
-			NULL,  // drive
-			NULL,  // dir
+			nullptr,  // drive
+			nullptr,  // dir
 			filename, // filename
-			NULL // extension
+			nullptr // extension
 		);
 	}
 
@@ -464,7 +465,7 @@ void CLogAllFiles::Init()
 
 	m_bActive = true;
 
-	char const *pszDir = NULL;
+	char const *pszDir = nullptr;
 	if ( CommandLine()->CheckParm( "-reslistdir", &pszDir ) && pszDir )
 	{
 		char szDir[ MAX_PATH ];
@@ -700,7 +701,7 @@ void ReportDirtyDiskNoMaterialSystem()
 #endif
 }
 
-IVJobs * g_pVJobs = NULL;
+IVJobs * g_pVJobs = nullptr;
 
 
 //-----------------------------------------------------------------------------
@@ -717,7 +718,7 @@ bool CSourceAppSystemGroup::Create()
 	pFileSystem->InstallDirtyDiskReportFunc( ReportDirtyDiskNoMaterialSystem );
 
 #ifdef WIN32
-	CoInitialize( NULL );
+	CoInitialize( nullptr );
 #endif
 
 	// Are we running in edit mode?
@@ -856,8 +857,12 @@ bool CSourceAppSystemGroup::Create()
 
 	// Load up the appropriate shader DLL
 	// This has to be done before connection.
+#if USE_MTL
+	char const *pDLLName = "shaderapimtl" DLL_EXT_STRING;
+#else
 	char const *pDLLName = "shaderapidx9" DLL_EXT_STRING;
-	const char* pArg = NULL;
+#endif
+	const char* pArg = nullptr;
 	if ( CommandLine()->FindParm( "-noshaderapi" ) )
 	{
 		pDLLName = "shaderapiempty" DLL_EXT_STRING;
@@ -886,7 +891,7 @@ bool CSourceAppSystemGroup::PreInit()
 		return false;
 
 #ifdef _PS3
-	g_pVJobs = ( IVJobs* )factory( VJOBS_INTERFACE_VERSION, NULL );  // this is done only once; g_pVJobs doesn't change even after multiple reloads of VJobs.prx
+	g_pVJobs = ( IVJobs* )factory( VJOBS_INTERFACE_VERSION, nullptr );  // this is done only once; g_pVJobs doesn't change even after multiple reloads of VJobs.prx
 	FileSystem_AddSearchPath_Platform( g_pFullFileSystem, GetGameDirectory() );
 #else // _PS3
 	CFSSteamSetupInfo steamInfo;
@@ -985,10 +990,10 @@ void CSourceAppSystemGroup::PostShutdown()
 
 void CSourceAppSystemGroup::Destroy() 
 {
-	g_pEngineAPI = NULL;
-	g_pMaterialSystem = NULL;
-	g_pHammer = NULL;
-	g_pVJobs = NULL;
+	g_pEngineAPI = nullptr;
+	g_pMaterialSystem = nullptr;
+	g_pHammer = nullptr;
+	g_pVJobs = nullptr;
 
 #ifdef WIN32
 	CoUninitialize();
@@ -1028,22 +1033,22 @@ const char *CSourceAppSystemGroup::DetermineDefaultGame()
 int MessageBox( HWND hWnd, const char *message, const char *header, unsigned uType )
 {
     //convert the strings from char* to CFStringRef
-    CFStringRef header_ref      = CFStringCreateWithCString( NULL, header,     strlen(header)    );
-    CFStringRef message_ref  = CFStringCreateWithCString( NULL, message,  strlen(message) );
+    CFStringRef header_ref      = CFStringCreateWithCString( nullptr, header,     strlen(header)    );
+    CFStringRef message_ref  = CFStringCreateWithCString( nullptr, message,  strlen(message) );
 
     CFOptionFlags result;  //result code from the message box
   
     //launch the message box
     CFUserNotificationDisplayAlert( 0, // no timeout
                                     kCFUserNotificationNoteAlertLevel, //change it depending message_type flags ( MB_ICONASTERISK.... etc.)
-									NULL, //icon url, use default, you can change it depending message_type flags
-									NULL, //not used
-									NULL, //localization of strings
+									nullptr, //icon url, use default, you can change it depending message_type flags
+									nullptr, //not used
+									nullptr, //localization of strings
 									header_ref, //header text 
 									message_ref, //message text
-									NULL, //default "ok" text in button
-									NULL,
-									NULL, //other button title, null--> no other button
+									nullptr, //default "ok" text in button
+									nullptr,
+									nullptr, //other button title, nullptr--> no other button
 									&result //response flags
 									);
 
@@ -1073,7 +1078,7 @@ int MessageBox( HWND hWnd, const char *message, const char *header, unsigned uTy
 // Allow only one windowed source app to run at a time
 //-----------------------------------------------------------------------------
 #ifdef WIN32
-HANDLE g_hMutex = NULL;
+HANDLE g_hMutex = nullptr;
 #elif defined( POSIX )
 int g_lockfd = -1;
 char g_lockFilename[MAX_PATH];
@@ -1091,7 +1096,7 @@ bool GrabSourceMutex()
 		}
 
 		// don't allow more than one instance to run
-		g_hMutex = ::CreateMutex(NULL, FALSE, TEXT("hl2_singleton_mutex"));
+		g_hMutex = ::CreateMutex(nullptr, FALSE, TEXT("hl2_singleton_mutex"));
 
 		unsigned int waitResult = ::WaitForSingleObject(g_hMutex, 0);
 
@@ -1120,7 +1125,7 @@ bool GrabSourceMutex()
 	// Check TMPDIR environment variable for temp directory.
 	const char *tmpdir = getenv( "TMPDIR" );
 
-	// If it's NULL, or it doesn't exist, or it isn't a directory, fallback to /tmp.
+	// If it's nullptr, or it doesn't exist, or it isn't a directory, fallback to /tmp.
 	struct stat buf;
 	if( !tmpdir || stat( tmpdir, &buf ) || !S_ISDIR ( buf.st_mode ) )
 		tmpdir = "/tmp";
@@ -1198,7 +1203,7 @@ void ReleaseSourceMutex()
 	{
 		::ReleaseMutex( g_hMutex );
 		::CloseHandle( g_hMutex );
-		g_hMutex = NULL;
+		g_hMutex = nullptr;
 	}
 #elif defined( POSIX )
 	if ( g_lockfd != -1 )
@@ -1245,7 +1250,7 @@ void RemoveSpuriousGameParameters()
 static char const *Cmd_TranslateFileAssociation(char const *param )
 {
 	static char sz[ 512 ];
-	char *retval = NULL;
+	char *retval = nullptr;
 
 	char temp[ 512 ];
 	Q_strncpy( temp, param, sizeof( temp ) );
@@ -1277,7 +1282,7 @@ static char const *Cmd_TranslateFileAssociation(char const *param )
 		}		
 	}
 
-	// return null if no translation, otherwise return commands
+	// return nullptr if no translation, otherwise return commands
 	return retval;
 }
 
@@ -1502,7 +1507,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
         setenv( "LC_ALL", en_US, 1 );
         setlocale( LC_ALL, en_US );
 
-        const char *CurrentLocale = setlocale( LC_ALL, NULL );
+        const char *CurrentLocale = setlocale( LC_ALL, nullptr );
         if ( Q_stricmp( CurrentLocale, en_US ) )
         {
                 Warning( "WARNING: setlocale('%s') failed, using locale:'%s'. International characters may not work.\n", en_US, CurrentLocale );
@@ -1534,7 +1539,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 
 	// GS - If we didn't specify a game name then default to CSGO
 	// This is required for running from a HDD Boot Game package
-	if ( CommandLine()->CheckParm( "-game") == NULL )
+	if ( CommandLine()->CheckParm( "-game") == nullptr )
 	{
 		CommandLine()->AppendParm( "-game", "csgo" );
 	}
@@ -1552,9 +1557,9 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 #endif
 
 	bool bDvdDev, bSpewDllInfo, bWaitForConsole;
-	bDvdDev         = CommandLine()->CheckParm( "-dvddev"    ) != NULL;
-	bSpewDllInfo    = CommandLine()->CheckParm( "-dllinfo"   ) != NULL;
-	bWaitForConsole = CommandLine()->CheckParm( "-vxconsole" ) != NULL;
+	bDvdDev         = CommandLine()->CheckParm( "-dvddev"    ) != nullptr;
+	bSpewDllInfo    = CommandLine()->CheckParm( "-dllinfo"   ) != nullptr;
+	bWaitForConsole = CommandLine()->CheckParm( "-vxconsole" ) != nullptr;
 
 #if defined( _X360 )
 	XboxConsoleInit();
@@ -1690,7 +1695,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 
 #ifdef SIXENSE
 	// If the game arg is currently portal2
-	char const *game_param_val = NULL;
+	char const *game_param_val = nullptr;
 	CommandLine()->CheckParm( "-game", &game_param_val );
 
 	if( game_param_val && !Q_strcmp( game_param_val, "portal2" ) )
@@ -1774,12 +1779,12 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 			// directly from the web browser. The -hijack command prevents the launcher from objecting that there is already an instance of the game.
 			if (CommandLine()->CheckParm( "-hijack" ))
 			{
-				HWND hwndEngine = FindWindow( "Valve001", NULL );
+				HWND hwndEngine = FindWindow( "Valve001", nullptr );
 
 				// Can't find the engine
-				if ( hwndEngine == NULL )
+				if ( hwndEngine == nullptr )
 				{
-					::MessageBox( NULL, "The modified entity keyvalues could not be sent to the Source Engine because the engine does not appear to be running.", "Source Engine Not Running", MB_OK | MB_ICONEXCLAMATION );
+					::MessageBox( nullptr, "The modified entity keyvalues could not be sent to the Source Engine because the engine does not appear to be running.", "Source Engine Not Running", MB_OK | MB_ICONEXCLAMATION );
 				}
 				else
 				{			
@@ -1795,7 +1800,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 
 					if ( !::SendMessage( hwndEngine, WM_COPYDATA, 0, (LPARAM)&copyData ) )
 					{
-						::MessageBox( NULL, "The Source Engine was found running, but did not accept the request to load a savegame. It may be an old version of the engine that does not support this functionality.", "Source Engine Declined Request", MB_OK | MB_ICONEXCLAMATION );
+						::MessageBox( nullptr, "The Source Engine was found running, but did not accept the request to load a savegame. It may be an old version of the engine that does not support this functionality.", "Source Engine Declined Request", MB_OK | MB_ICONEXCLAMATION );
 					}
 					else
 					{
@@ -1807,7 +1812,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 			}
 			else
 			{
-				::MessageBox(NULL, "Only one instance of the game can be running at one time.", "Source - Warning", MB_ICONINFORMATION | MB_OK);
+				::MessageBox(nullptr, "Only one instance of the game can be running at one time.", "Source - Warning", MB_ICONINFORMATION | MB_OK);
 			}
 
 			return retval;
@@ -1818,7 +1823,7 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 	{
 		if ( !GrabSourceMutex() )
 		{
-			::MessageBox(NULL, "Only one instance of the game can be running at one time.", "Source - Warning", 0 );
+			::MessageBox(nullptr, "Only one instance of the game can be running at one time.", "Source - Warning", 0 );
 			return -1;
 		}
 	}
@@ -1839,9 +1844,9 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 #endif
 
 		// If game is not run from Steam then add -insecure in order to avoid client timeout message
-		if ( NULL == CommandLine()->CheckParm( "-steam" ) )
+		if ( nullptr == CommandLine()->CheckParm( "-steam" ) )
 		{
-			CommandLine()->AppendParm( "-insecure", NULL );
+			CommandLine()->AppendParm( "-insecure", nullptr );
 		}
 	}
 
@@ -1855,8 +1860,8 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 	// When building cubemaps, we don't need sound and can't afford to have async I/O - cubemap writes to the BSP can collide with async bsp reads
 	if ( CommandLine()->CheckParm( "-buildcubemaps") )
 	{
-		CommandLine()->AppendParm( "-nosound", NULL );
-		CommandLine()->AppendParm( "-noasync", NULL );
+		CommandLine()->AppendParm( "-nosound", nullptr );
+		CommandLine()->AppendParm( "-noasync", nullptr );
 	}
 
 	g_LeakDump.m_bCheckLeaks = CommandLine()->CheckParm( "-leakcheck" ) ? true : false;
@@ -1877,8 +1882,8 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 #if ENABLE_HARDWARE_PROFILER 
 		// Hack fix, causes memory leak, but prevents crash due to bad coding not doing proper teardown
 		// need to ensure these list anchors don't anchor stale pointers
-		g_pPhysicsMiniProfilers = NULL;
-		g_pOtherMiniProfilers = NULL;
+		g_pPhysicsMiniProfilers = nullptr;
+		g_pOtherMiniProfilers = nullptr;
 #endif
 
 		if ( steamApplication.GetCurrentStage() == CSourceAppSystemGroup::INITIALIZATION )
@@ -1934,12 +1939,12 @@ extern "C" DLL_EXPORT int LauncherMain( int argc, char **argv )
 	// Now that the mutex has been released, check HKEY_CURRENT_USER\Software\Valve\Source\Relaunch URL. If there is a URL here, exec it.
 	// This supports the capability of immediately re-launching the the game via Steam in a different audio language 
 	HKEY hKey; 
-	if ( RegOpenKeyEx( HKEY_CURRENT_USER, "Software\\Valve\\Source", NULL, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS )
+	if ( RegOpenKeyEx( HKEY_CURRENT_USER, "Software\\Valve\\Source", nullptr, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS )
 	{
 		char szValue[MAX_PATH];
 		DWORD dwValueLen = MAX_PATH;
 
-		if ( RegQueryValueEx( hKey, "Relaunch URL", NULL, NULL, (unsigned char*)szValue, &dwValueLen ) == ERROR_SUCCESS )
+		if ( RegQueryValueEx( hKey, "Relaunch URL", nullptr, nullptr, (unsigned char*)szValue, &dwValueLen ) == ERROR_SUCCESS )
 		{
 			ShellExecute (0, "open", szValue, 0, 0, SW_SHOW);
 			RegDeleteValue( hKey, "Relaunch URL" );

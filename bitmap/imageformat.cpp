@@ -372,6 +372,7 @@ int GetNumMipMapLevels( int width, int height, int depth )
 // convert back and forth from D3D format to ImageFormat, regardless of
 // whether it's supported or not
 //-----------------------------------------------------------------------------
+#if !USE_MTL
 ImageFormat D3DFormatToImageFormat( D3DFORMAT format )
 {
 #if defined( PLATFORM_X360 )
@@ -647,6 +648,8 @@ D3DFORMAT ImageFormatToD3DFormat( ImageFormat format )
 	COMPILE_TIME_ASSERT( ARRAYSIZE( s_pD3DFormats ) == NUM_IMAGE_FORMATS + 1 );
 	return s_pD3DFormats[ format + 1 ];
 }
+
+#endif
 
 #pragma warning (default:4063)
 

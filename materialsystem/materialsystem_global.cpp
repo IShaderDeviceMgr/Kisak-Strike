@@ -19,10 +19,13 @@
 
 int g_FrameNum;
 
+#ifdef USE_MTL
+#else
 CShaderAPIBase *g_pShaderAPI = 0;
 IShaderAPIDX8 *g_pShaderAPIDX8 = 0;
 CShaderDeviceMgrBase* g_pShaderDeviceMgr = 0;
 CShaderDeviceBase *g_pShaderDevice = 0;
+#endif
 IShaderShadow* g_pShaderShadow = 0;
 
 IClientMaterialSystem *g_pClientMaterialSystem = 0;

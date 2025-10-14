@@ -725,7 +725,7 @@ void *__cdecl operator new[] ( size_t nSize, int nBlockUse, const char *pFileNam
 
 #else
 
-void *__cdecl operator new( size_t nSize ) throw (std::bad_alloc)
+void *__cdecl operator new( size_t nSize ) noexcept(false)
 {
 	return AllocUnattributed( nSize );
 }
@@ -735,7 +735,7 @@ void *__cdecl operator new( size_t nSize, int nBlockUse, const char *pFileName, 
 	return MemAlloc_Alloc(nSize, pFileName, nLine );
 }
 
-void *__cdecl operator new[] ( size_t nSize ) throw (std::bad_alloc)
+void *__cdecl operator new[] ( size_t nSize ) noexcept(false)
 {
 	return AllocUnattributed( nSize );
 }

@@ -38,8 +38,9 @@
 	#define  COCOAMGR_INTERFACE_VERSION "CocoaMgrInterface006"
 #endif
 
-
+#if !USE_MTL
 class GLMDisplayDB;
+#endif
 class CCocoaEvent;
 class CShowPixelsParams;
 class CStackCrawlParams;
@@ -66,19 +67,20 @@ public:
 #else
 	virtual bool CreateGameWindow( const char *pTitle, bool bWindowed, int width, int height ) = 0;
 #endif
-	
+
+#if !USE_MTL
 	virtual void GetDesiredPixelFormatAttribsAndRendererInfo( uint **ptrOut, uint *countOut, GLMRendererInfoFields *rendInfoOut ) = 0;
 
 	// Get the NSGLContext for a window's main view - note this is the carbon windowref as an argument
 	virtual PseudoGLContextPtr GetGLContextForWindow( void* windowref ) = 0;
-	
+#endif
 	// Get the next N events. The function returns the number of events that were filled into your array.
 	virtual int GetEvents( CCocoaEvent *pEvents, int nMaxEventsToReturn, bool debugEvents = false ) = 0;
 
 	// Set the mouse cursor position.
 	virtual void SetCursorPosition( int x, int y ) = 0;
 	
-	virtual void ShowPixels( CShowPixelsParams *params ) = 0;
+	// virtual void ShowPixels( CShowPixelsParams *params ) = 0;
 	
 #ifdef USE_SDL
 	virtual void SetWindowFullScreen( bool bFullScreen, int nWidth, int nHeight, bool bDesktopFriendlyFullscreen ) = 0;
@@ -98,16 +100,19 @@ public:
 	virtual void GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, uint &nRefreshHz ) = 0; // Retrieve the size of the monitor (desktop)
 	virtual void RenderedSize( uint &width, uint &height, bool set ) = 0;	// either set or retrieve rendered size value (from dxabstract)
 	virtual void DisplayedSize( uint &width, uint &height ) = 0;			// query backbuffer size (window size whether FS or windowed)
-	
+
+#if !USE_MTL
 	virtual GLMDisplayDB *GetDisplayDB( void ) = 0;
-	
+#endif
+
 	virtual void WaitUntilUserInput( int msSleepTime ) = 0;
 
+#if !USE_MTL
 	virtual PseudoGLContextPtr	GetMainContext() = 0;
 	virtual PseudoGLContextPtr CreateExtraContext() = 0;
 	virtual void DeleteContext( PseudoGLContextPtr hContext ) = 0;
 	virtual bool MakeContextCurrent( PseudoGLContextPtr hContext ) = 0;
-
+#endif
 	virtual void GetStackCrawl( CStackCrawlParams *params ) = 0;	
 
 	virtual void *GetWindowRef() = 0;

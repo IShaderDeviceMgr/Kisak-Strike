@@ -761,6 +761,7 @@ typedef void * HINSTANCE;
 #define  FLOAT32_MAX		FLT_MAX
 #define  FLOAT64_MAX		DBL_MAX
 
+/*
 #ifdef GNUC
 #undef offsetof
 // Note: can't use builtin offsetof because many use cases (esp. in templates) wouldn't compile due to restrictions on the builtin offsetof
@@ -771,7 +772,7 @@ typedef void * HINSTANCE;
 #undef offsetof
 #define offsetof(s,m)	(size_t)&(((s *)0)->m)
 #endif
-
+*/
 
 #define  FLOAT32_MIN		FLT_MIN
 #define  FLOAT64_MIN		DBL_MIN

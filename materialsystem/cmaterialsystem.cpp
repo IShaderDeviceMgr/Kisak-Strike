@@ -759,7 +759,11 @@ void CMaterialSystem::SetShaderAPI( char const *pShaderAPIDLL )
 
 	if ( !pShaderAPIDLL )
 	{
+#if USE_MTL
+		pShaderAPIDLL = "shaderapimtl";
+#else
 		pShaderAPIDLL = "shaderapidx9";
+#endif
 	}
 
 	// m_pShaderDLL is needed to spew driver info

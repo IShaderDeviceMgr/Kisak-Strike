@@ -18,12 +18,19 @@
 #include "tier0/dbg.h"
 #include "tier2/tier2.h"
 
-#if defined( _PS3 ) || defined( _OSX )
+#if defined( _PS3 ) ||( defined( _OSX ) && !USE_MTL)
 #include "shaderapidx9/shaderapidx8.h"
 #include "shaderapidx9/shaderdevicedx8.h"
 #include "shaderapidx9/hardwareconfig.h"
 #include "shaderapidx9/shaderapidx8_global.h"
 #include "shaderapidx9/shadershadowdx8.h"
+#endif
+
+#if USE_MTL
+inline IMaterialSystemHardwareConfig* HardwareConfig()
+{
+	return g_pMaterialSystemHardwareConfig;
+}
 #endif
 
 #if defined( INCLUDE_SCALEFORM )

@@ -13,7 +13,6 @@
 #include "tier1/callqueue.h"
 #include "tier0/vprof.h"
 #include "tier0/basetypes.h"
-#include "togl/rendermechanism.h"
 
 // NOTE: This has to be the last file included!
 #include "tier0/memdbgon.h"
