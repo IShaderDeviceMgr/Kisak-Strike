@@ -2391,6 +2391,24 @@ FORCEINLINE void ResetBaseTime( void )						  // reset plat_floattime to 0 for a
 
 #endif
 
+#if defined(USE_MTL) // Normally in dxabstract_def.h, however I don't want to deal with that mess today
+typedef struct _GUID {
+
+	bool operator==( const struct _GUID &other ) const;
+
+	unsigned long  Data1;
+	unsigned short Data2;
+	unsigned short Data3;
+	unsigned char  Data4[ 8 ];
+} GUID;
+
+typedef struct _RECT {
+	int left;
+	int top;
+	int right;
+	int bottom;
+} RECT;
+#endif
 
 #ifdef COMPILER_MSVC
 /*

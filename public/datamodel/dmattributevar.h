@@ -122,6 +122,9 @@ public:
 	// NULL check
 	bool operator!() const;
 
+	// Returns the underlying DmElementHandle_t data
+	const DmElementHandle_t& Data() const;
+
 	// Assignment.. wish I knew how to un-inline these methods
 	template <class S> CDmaElement<T> &operator=( S* pElement )
 	{
@@ -1171,6 +1174,12 @@ inline void CDmaElement<T>::InitAndCreate( CDmElement *pOwner, const char *pAttr
 
 	// this has to happen AFTER set so the set happens before FATTRIB_READONLY
 	this->m_pAttribute->AddFlag( flags | FATTRIB_MUSTCOPY );
+}
+
+template <class T>
+inline const DmElementHandle_t& CDmaElement<T>::Data() const
+{
+	return Value();
 }
 
 template <class T>

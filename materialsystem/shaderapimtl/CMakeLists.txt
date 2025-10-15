@@ -17,6 +17,8 @@ include(${CMAKE_MODULE_PATH}/source_dll_base.cmake)
 include_directories(../)
 add_definitions(-DSHADER_DLL_EXPORT -DPROTECTED_THINGS_ENABLE)
 
+target_link_libraries(${OUTBINNAME} "-framework AppKit -framework CoreFoundation -framework Metal")
+
 target_compile_options(${OUTBINNAME} PRIVATE -Wno-dynamic-exception-spec)
 
 target_sources(${OUTBINNAME} PRIVATE "../../thirdparty/metal-cpp/metal-impl.cpp")
