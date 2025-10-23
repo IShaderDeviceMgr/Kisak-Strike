@@ -356,7 +356,7 @@ FORCEINLINE int iclamp( int x, int min, int max )
 #if CROSS_PLATFORM_VERSION < 1
 
 #ifndef DONT_DEFINE_BOOL // Needed for Cocoa stuff to compile.
-typedef int BOOL;
+typedef bool BOOL;
 #endif
 
 typedef int qboolean;

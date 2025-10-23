@@ -24,13 +24,9 @@
 #include "shaderapidx9/hardwareconfig.h"
 #include "shaderapidx9/shaderapidx8_global.h"
 #include "shaderapidx9/shadershadowdx8.h"
-#endif
-
-#if USE_MTL
-inline IMaterialSystemHardwareConfig* HardwareConfig()
-{
-	return g_pMaterialSystemHardwareConfig;
-}
+#elif defined (USE_MTL)
+#include "shaderapimtl/shaderapimtl.h"
+#include "shaderapimtl/shaderapimtl_global.h"
 #endif
 
 #if defined( INCLUDE_SCALEFORM )

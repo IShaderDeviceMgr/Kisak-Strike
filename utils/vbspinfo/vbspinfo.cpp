@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
 //
@@ -405,10 +405,10 @@ void PrintCommandLine( int argc, char **argv )
 	Warning( "\n\n" );
 }
 
-void main (int argc, char **argv)
+int main (int argc, char **argv)
 {
 	// Install an exception handler.
-	SetupDefaultToolsMinidumpHandler();
+	// SetupDefaultToolsMinidumpHandler();
 
 	int			i;
 	char		source[1024];
@@ -425,7 +425,7 @@ void main (int argc, char **argv)
 	InitCommandLineProgram( argc, argv );
 	g_pFileSystem = g_pFullFileSystem;
 
-	MathLib_Init( 2.2f, 2.2f, 0.0f, 2.0f, false, false, false, false );
+	MathLib_Init( 2.2f, 2.2f, 0.0f, 2.0f, false, false, false );
 	PrintCommandLine( argc, argv );
 	if (argc == 1)
 	{
@@ -526,7 +526,7 @@ void main (int argc, char **argv)
 
 			// If the filename doesn't have a path, prepend with the current directory
 			char fullbspname[MAX_PATH];
-			_fullpath( fullbspname, source, sizeof( fullbspname ) );
+			// _fullpath( fullbspname, source, sizeof( fullbspname ) );
 
 			for ( int extract = 0; extract < HEADER_LUMPS; extract++ )
 			{
@@ -540,7 +540,7 @@ void main (int argc, char **argv)
 			CloseBSPFile();
 
 			printf ("Finished extraction.\n" );
-			return;
+			return 0;
 		}
 
 

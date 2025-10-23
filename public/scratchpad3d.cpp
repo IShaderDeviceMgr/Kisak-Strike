@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
 //
@@ -17,7 +17,7 @@
 // #define __stdcall
 // #endif
 
-#ifndef POSIX
+// #ifndef POSIX
 // NOTE - linux doesn't need any of this code!
 
 extern "C"
@@ -636,5 +636,5 @@ IScratchPad3D* ScratchPad3D_Create( char const *pFilename )
 	CScratchPad3D *pRet = new CScratchPad3D( pFilename, pFileSystem, true );
 	return pRet;
 }
-#endif // POSIX
+// #endif // POSIX
 

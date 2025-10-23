@@ -130,6 +130,8 @@ if( NOT DEDICATED )
 	add_subdirectory(launcher_main) #The actual executable that just dlopen's launcher
 endif()
 
+add_subdirectory(utils/vbspinfo)
+
 if( NOT DEDICATED )
 	if( USE_SCALEFORM )
     		add_subdirectory(scaleformui) # DUMMY cmake project so CLion can do analysis
