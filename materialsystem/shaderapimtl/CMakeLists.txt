@@ -15,10 +15,11 @@ include(${CMAKE_MODULE_PATH}/detect_platform.cmake)
 include(${CMAKE_MODULE_PATH}/source_dll_base.cmake)
 
 include_directories(../)
-add_definitions(-DSHADER_DLL_EXPORT -DPROTECTED_THINGS_ENABLE)
+add_definitions(-DSHADER_DLL_EXPORT -DPROTECTED_THINGS_ENABLE -Dstrncpy=use_Q_strncpy_instead -D_snprintf=use_Q_snprintf_instead)
 
 target_link_libraries(${OUTBINNAME} "-framework AppKit -framework CoreFoundation -framework Metal")
 
 target_compile_options(${OUTBINNAME} PRIVATE -Wno-dynamic-exception-spec)
 
-target_sources(${OUTBINNAME} PRIVATE "../../thirdparty/metal-cpp/metal-impl.cpp")
+target_sources(${OUTBINNAME} PRIVATE ../../thirdparty/metal-cpp/metal-impl.cpp)
+target_sources(${OUTBINNAME} PRIVATE shaderapimtl.cpp)

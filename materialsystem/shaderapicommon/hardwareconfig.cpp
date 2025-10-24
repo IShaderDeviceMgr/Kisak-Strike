@@ -7,9 +7,9 @@
 //=============================================================================//
 #define DISABLE_PROTECTED_THINGS
 #include "togl/rendermechanism.h"
-#include "hardwareconfig.h"
+#include "../shaderapidx9/hardwareconfig.h"
 #include "shaderapi/ishaderutil.h"
-#include "shaderapi_global.h"
+#include "../shaderapidx9/shaderapi_global.h"
 #include "materialsystem/materialsystem_config.h"
 #include "tier1/convar.h"
 #include "shaderdevicebase.h"

@@ -9,7 +9,12 @@
 #ifndef SHADERAPIMTL_H
 #define SHADERAPIMTL_H
 #include "shaderapi/ishaderapi.h"
+#include "shaderapicommon/meshbase.h"
 #include <Metal.hpp>
+
+#include "shaderapi/ishadershadow.h"
+#include "shadershadowmtl.h"
+#include "materialsystem/IShader.h"
 
 
 //-----------------------------------------------------------------------------
@@ -25,7 +30,32 @@ struct BufferedState_t
 };
 
 //-----------------------------------------------------------------------------
-// The DX8 shader API
+// Compiled lighting state
+//-----------------------------------------------------------------------------
+struct CompiledLightingState_t
+{
+	Vector4D	m_AmbientLightCube[6];
+	int			m_nLocalLightCount;
+	Vector4D	m_PixelShaderLocalLights[6];
+	Vector4D	m_VertexShaderLocalLights[20];
+	int			m_VertexShaderLocalLightLoopControl[4];
+	int			m_VertexShaderLocalLightEnable[VERTEX_SHADER_LIGHT_ENABLE_BOOL_CONST_COUNT];
+};
+
+struct InstanceInfo_t
+{
+	// Have we compiled various bits of lighting state?
+	bool		m_bAmbientCubeCompiled : 1;
+	bool		m_bPixelShaderLocalLightsCompiled : 1;
+	bool		m_bVertexShaderLocalLightsCompiled : 1;
+
+	// Have we set various shader constants?
+	bool		m_bSetSkinConstants : 1;
+	bool		m_bSetLightVertexShaderConstants : 1;
+};
+
+//-----------------------------------------------------------------------------
+// The MTL shader API
 //-----------------------------------------------------------------------------
 // FIXME: Remove this! Either move them into CShaderAPIBase or CShaderAPIDx8
 class IShaderAPIMTL : public IShaderAPI

@@ -56,4 +56,8 @@ inline IMaterialSystemHardwareConfig* HardwareConfig()
     return g_pMaterialSystemHardwareConfig;
 }
 
+
+typedef intp VertexShader_t;
+typedef intp PixelShader_t;
+
 #endif // SHADERAPIMTL_GLOBAL_H

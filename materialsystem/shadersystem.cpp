@@ -29,9 +29,12 @@
 // NOTE: This must be the last file included!
 #include "tier0/memdbgon.h"
 
-#if defined( _PS3 ) || defined( _OSX )
+#if defined( _PS3 ) || (defined( _OSX ) && !defined(USE_MTL))
 #define g_pShaderAPI ShaderAPI()
 #define ShaderApiParam( x ) g_pShaderAPIDX8
+#elif defined ( _OSX) && defined (USE_MTL)
+#define g_pShaderAPI ShaderAPI()
+#define ShaderApiParam( x ) g_pShaderAPIMTL
 #else
 #define ShaderApiParam( x ) x
 #endif

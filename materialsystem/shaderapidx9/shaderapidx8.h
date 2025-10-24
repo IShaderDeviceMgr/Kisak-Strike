@@ -9,7 +9,7 @@
 #ifndef SHADERAPIDX8_H
 #define SHADERAPIDX8_H
 
-#include "shaderapibase.h"
+#include "../shaderapicommon/shaderapibase.h"
 #include "shaderapi/ishadershadow.h"
 #include "materialsystem/IShader.h"
 #include "locald3dtypes.h"

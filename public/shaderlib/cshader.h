@@ -39,7 +39,7 @@
 // Global interfaces
 //-----------------------------------------------------------------------------
 #if defined( _PS3 ) || defined( _OSX )
-#include "shaderapidx9/hardwareconfig.h"
+#include "../../materialsystem/shaderapicommon/hardwareconfig.h"
 #else
 extern IMaterialSystemHardwareConfig *g_pHardwareConfig;
 #endif

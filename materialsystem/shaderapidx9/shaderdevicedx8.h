@@ -14,7 +14,7 @@
 #endif
 
 
-#include "shaderdevicebase.h"
+#include "../shaderapicommon/shaderdevicebase.h"
 #include "shaderapidx8_global.h"
 #include "tier1/utlvector.h"
 #include "materialsystem/imaterialsystem.h"

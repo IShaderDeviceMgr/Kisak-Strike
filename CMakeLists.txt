@@ -53,14 +53,12 @@ add_subdirectory(soundsystem/lowlevel)
 endif()
 add_subdirectory(thirdparty/quickhull)
 
+add_subdirectory(thirdparty/protobuf-3.5.1/cmake)
+
 find_package(ZLIB REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
-include_directories(${PNG_INCLUDE_DIRS})
-include_directories(${ZLIB_INCLUDE_DIRS})
-include_directories(${JPEG_INCLUDE_DIRS})
 
-add_subdirectory(thirdparty/protobuf-3.5.1/cmake)
 add_subdirectory(utils/bzip2)
 add_subdirectory(unitlib)
 if( NOT DEDICATED )

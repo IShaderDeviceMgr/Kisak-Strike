@@ -7,7 +7,6 @@
 //=============================================================================//
 #define DISABLE_PROTECTED_THINGS
 #include "togl/rendermechanism.h"
-#include "shaderdevicebase.h"
 #include "tier1/keyvalues.h"
 #include "tier1/convar.h"
 #include "tier1/utlbuffer.h"
@@ -18,10 +17,13 @@
 #include "shaderapi/ishaderutil.h"
 #include "shaderapibase.h"
 #include "shaderapi/ishadershadow.h"
-#include "shaderapi_global.h"
 #include "videocfg/videocfg.h"
 #include "vjobs_interface.h"
-#include "winutils.h"
+#include "shaderdevicebase.h"
+#ifndef USE_MTL
+#include "../shaderapidx9/shaderapi_global.h"
+#include "../shaderapidx9/winutils.h"
+#endif
 
 #ifdef _X360
 #include "xbox/xbox_win32stubs.h"

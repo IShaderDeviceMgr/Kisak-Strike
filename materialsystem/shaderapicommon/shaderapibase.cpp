@@ -1,4 +1,4 @@
-//===== Copyright © 1996-2005, Valve Corporation, All rights reserved. ======//
+//===== Copyright ï¿½ 1996-2005, Valve Corporation, All rights reserved. ======//
 //
 // Purpose: 
 //
@@ -8,7 +8,7 @@
 
 #undef PROTECTED_THINGS_ENABLE   // prevent warnings when windows.h gets included
 
-#include "shaderapibase.h"
+#include "../shaderapidx9/shaderapibase.h"
 #include "shaderapi/ishaderutil.h"
 
 // NOTE: This has to be the last file included!

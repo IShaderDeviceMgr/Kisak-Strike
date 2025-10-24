@@ -15,8 +15,10 @@
 
 #include "togl/rendermechanism.h"
 #include "shaderapi/ishaderapi.h"
-#include "shaderapi_global.h"
-#include "locald3dtypes.h"
+#ifndef USE_MTL
+#include "../shaderapidx9/shaderapi_global.h"
+#include "../shaderapidx9/locald3dtypes.h"
+#endif
 
 // Colors for PIX graphs
 #define PIX_VALVE_ORANGE	0xFFF5940F
