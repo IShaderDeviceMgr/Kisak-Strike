@@ -13,7 +13,6 @@
 #pragma once
 #endif
 
-#include "togl/rendermechanism.h"
 #include "shaderapi/IShaderDevice.h"
 // #include "ihardwareconfiginternal.h"
 #include "bitmap/imageformat.h"
@@ -62,8 +61,9 @@ public:
 	virtual void AddDeviceDependentObject( IShaderDeviceDependentObject *pObject );
 	virtual void RemoveDeviceDependentObject( IShaderDeviceDependentObject *pObject );
 	virtual void InvokeDeviceLostNotifications( void );
+#ifndef USE_MTL
 	virtual void InvokeDeviceResetNotifications( IDirect3DDevice9 *pDevice, D3DPRESENT_PARAMETERS *pPresentParameters, void *pHWnd );
-
+#endif
 	// Reads in the hardware caps from the dxsupport.cfg file
 	void ReadHardwareCaps( HardwareCaps_t &caps, int nDxLevel );
 

@@ -10,7 +10,7 @@
 #define SHADERAPIMTL_H
 #include "shaderapi/ishaderapi.h"
 #include "shaderapicommon/meshbase.h"
-#include <Metal.hpp>
+#include "shaderapimtl_global.h"
 
 #include "shaderapi/ishadershadow.h"
 #include "shadershadowmtl.h"

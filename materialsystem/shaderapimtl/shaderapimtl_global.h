@@ -9,6 +9,9 @@
 #ifndef SHADERAPIMTL_GLOBAL_H
 #define SHADERAPIMTL_GLOBAL_H
 
+#include <Metal.hpp>
+#include "shaderdevicemtl.h"
+
 //-----------------------------------------------------------------------------
 // Forward declarations
 //-----------------------------------------------------------------------------

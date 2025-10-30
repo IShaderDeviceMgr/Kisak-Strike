@@ -10,14 +10,14 @@
 
 #include "materialsystem/idebugtextureinfo.h"
 
-class CShaderAPIDx8 : public CShaderDeviceMTL, public IShaderAPIMTL, public IDebugTextureInfo
+class CShaderAPIMTL : public CShaderDeviceMTL, public IShaderAPIMTL, public IDebugTextureInfo
 {
 	typedef CShaderDeviceMTL BaseClass;
 
 public:
 	// constructor, destructor
-	CShaderAPIDx8( );
-	virtual ~CShaderAPIDx8();
+	CShaderAPIMTL( );
+	virtual ~CShaderAPIMTL();
 
 	// Methods of IShaderAPI
 public:
@@ -764,7 +764,7 @@ private:
 	CascadedShadowMappingState_t m_CascadedShadowMappingState_LightMapScaled;
 	ITexture *m_pCascadedShadowMappingDepthTexture;
 
-	CShaderAPIDx8( CShaderAPIDx8 const& );
+	CShaderAPIMTL( CShaderAPIMTL const& );
 
 	enum
 	{
@@ -1388,26 +1388,26 @@ private:
 //-----------------------------------------------------------------------------
 // Class Factory
 //-----------------------------------------------------------------------------
-static CShaderAPIDx8 g_ShaderAPIDX8;
+static CShaderAPIMTL g_ShaderAPIDX8;
 IShaderAPIDX8 *g_pShaderAPIDX8 = &g_ShaderAPIDX8;
 CShaderDeviceDx8* g_pShaderDeviceDx8 = &g_ShaderAPIDX8;
 
 // FIXME: Remove IShaderAPI + IShaderDevice; they change after SetMode
-EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIDx8, IShaderAPI,
+EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIMTL, IShaderAPI,
 				SHADERAPI_INTERFACE_VERSION, g_ShaderAPIDX8 )
 
-EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIDx8, IShaderDevice,
+EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIMTL, IShaderDevice,
 				SHADER_DEVICE_INTERFACE_VERSION, g_ShaderAPIDX8 )
 
-EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIDx8, IDebugTextureInfo,
+EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderAPIMTL, IDebugTextureInfo,
 				DEBUG_TEXTURE_INFO_VERSION, g_ShaderAPIDX8 )
 
 //-----------------------------------------------------------------------------
-// CShaderAPIDx8 static members
+// CShaderAPIMTL static members
 //-----------------------------------------------------------------------------
-CTHREADLOCALINTEGER( ShaderAPITextureHandle_t ) CShaderAPIDx8::m_ModifyTextureHandle(INVALID_SHADERAPI_TEXTURE_HANDLE);
-CTHREADLOCALINT CShaderAPIDx8::m_ModifyTextureLockedLevel(-1);
-CTHREADLOCALINT CShaderAPIDx8::m_ModifyTextureLockedFace;
+CTHREADLOCALINTEGER( ShaderAPITextureHandle_t ) CShaderAPIMTL::m_ModifyTextureHandle(INVALID_SHADERAPI_TEXTURE_HANDLE);
+CTHREADLOCALINT CShaderAPIMTL::m_ModifyTextureLockedLevel(-1);
+CTHREADLOCALINT CShaderAPIMTL::m_ModifyTextureLockedFace;
 
 //-----------------------------------------------------------------------------
 // Accessors for major interfaces

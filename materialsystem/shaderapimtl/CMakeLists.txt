@@ -22,4 +22,5 @@ target_link_libraries(${OUTBINNAME} "-framework AppKit -framework CoreFoundation
 target_compile_options(${OUTBINNAME} PRIVATE -Wno-dynamic-exception-spec)
 
 target_sources(${OUTBINNAME} PRIVATE ../../thirdparty/metal-cpp/metal-impl.cpp)
+target_sources(${OUTBINNAME} PRIVATE shaderdevicemtl.cpp)
 target_sources(${OUTBINNAME} PRIVATE shaderapimtl.cpp)
