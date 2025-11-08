@@ -287,7 +287,7 @@ protected:
 #endif
 
 #ifndef _GAMECONSOLE
-	MTL::Device	*m_pD3DDevice;
+	MTL::Device	*m_pMTLDevice;
 #endif
 
 	D3DPRESENT_PARAMETERS m_PresentParameters;
@@ -360,7 +360,7 @@ extern CShaderDeviceMTL* g_pShaderDeviceDx8;
 #if defined( _GAMECONSOLE )
 FORCEINLINE bool CShaderDeviceMTL::IsActive() const
 {
-	return ( m_pD3DDevice != NULL );
+	return ( m_pMTLDevice != NULL );
 }
 #endif
 

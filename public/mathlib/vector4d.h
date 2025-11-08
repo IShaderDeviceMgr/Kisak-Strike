@@ -16,7 +16,7 @@
 #include <math.h>
 #include <float.h>
 #if !defined( PLATFORM_PPC ) && !defined( _PS3 )
-	#if defined( PLATFORM_ARM )
+	#if defined( PLATFORM_ARM ) || defined( __aarch64__)
 		#include "sse2neon.h"
 	#else
 		#include <xmmintrin.h>	// for sse

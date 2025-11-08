@@ -30,6 +30,7 @@ bld/
 .idea/
 
 # Ignore cmake-build, but keep placeholder.
+build/*
 cmake-build/*
 cmake-dev-test/*
 !cmake-build/placeholder.txt

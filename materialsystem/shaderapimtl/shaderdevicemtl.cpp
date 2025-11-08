@@ -6,25 +6,23 @@
 //
 //===========================================================================//
 #define DISABLE_PROTECTED_THINGS
-#include "locald3dtypes.h"
 
 #include "shaderdevicemtl.h"
 #include "shaderapi/ishaderutil.h"
-#include "shaderapidx8_global.h"
+#include "shaderapimtl_global.h"
 #include "filesystem.h"
 #include "tier0/icommandline.h"
 #include "tier2/tier2.h"
-#include "shadershadowdx8.h"
-#include "colorformatdx8.h"
+#include "shadershadowmtl.h"
+// #include "colorformatdx8.h"
 #include "materialsystem/IShader.h"
-#include "shaderapidx8.h"
-#include "shaderapidx8_global.h"
-#include "imeshdx8.h"
+#include "shaderapimtl.h"
+// #include "shaderapidx8_global.h"
+// #include "imeshmtl.h"
 #include "materialsystem/materialsystem_config.h"
-#include "vertexshaderdx8.h"
-#include "recording.h"
+// #include "vertexshaderdx8.h"
+// #include "recording.h"
 #include "vstdlib/ikeyvaluessystem.h"
-#include "winutils.h"
 #include "tier0/vprof_telemetry.h"
 #include "tier0/miniprofiler.h"
 
@@ -41,10 +39,10 @@ DEFINE_LOGGING_CHANNEL_NO_TAGS( LOG_EngineInitialization, "EngineInitialization"
 //-----------------------------------------------------------------------------
 // Globals
 //-----------------------------------------------------------------------------
-static CShaderDeviceMgrDx8 g_ShaderDeviceMgrDx8;
-CShaderDeviceMgrDx8* g_pShaderDeviceMgrDx8 = &g_ShaderDeviceMgrDx8;
+static CShaderDeviceMgrMTL g_ShaderDeviceMgrDx8;
+CShaderDeviceMgrMTL* g_pShaderDeviceMgrDx8 = &g_ShaderDeviceMgrDx8;
 
-EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderDeviceMgrDx8, IShaderDeviceMgr,
+EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CShaderDeviceMgrMTL, IShaderDeviceMgr,
 	SHADER_DEVICE_MGR_INTERFACE_VERSION, g_ShaderDeviceMgrDx8 )
 
 
@@ -73,7 +71,7 @@ ConVar mat_debugalttab( "mat_debugalttab", "0", FCVAR_CHEAT );
 //-----------------------------------------------------------------------------
 // constructor, destructor
 //-----------------------------------------------------------------------------
-CShaderDeviceMgrDx8::CShaderDeviceMgrDx8()
+CShaderDeviceMgrMTL::CShaderDeviceMgrMTL()
 {
 	m_pD3D = NULL;
 	m_bAdapterInfoIntialized = false;
@@ -87,7 +85,7 @@ CShaderDeviceMgrDx8::CShaderDeviceMgrDx8()
 #endif	
 }
 
-CShaderDeviceMgrDx8::~CShaderDeviceMgrDx8()
+CShaderDeviceMgrMTL::~CShaderDeviceMgrMTL()
 {
 }
 
@@ -98,47 +96,21 @@ CShaderDeviceMgrDx8::~CShaderDeviceMgrDx8()
 //-----------------------------------------------------------------------------
 // Connect, disconnect
 //-----------------------------------------------------------------------------
-bool CShaderDeviceMgrDx8::Connect( CreateInterfaceFn factory )
+bool CShaderDeviceMgrMTL::Connect( CreateInterfaceFn factory )
 {
-	LOCK_SHADERAPI();
+	// LOCK_SHADERAPI();
 
 	if ( !BaseClass::Connect( factory ) )
 		return false;
 
-#if defined ( DX_TO_GL_ABSTRACTION )
-	gGL = ToGLConnectLibraries( factory );
-#endif
 
-#if defined( DO_DX9_HOOK )
-	m_pD3D = Direct3DCreate9Hook(D3D_SDK_VERSION);
-#else
-	m_pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-#endif
 
-	if ( !m_pD3D )
+	if ( !m_pMTLDevice )
 	{
 		Warning( "Failed to create D3D9!\n" );
 		return false;
 	}
 
-#if defined( PIX_INSTRUMENTATION ) && defined ( DX_TO_GL_ABSTRACTION ) && defined( _WIN32 )
-	// This is a little odd, but AMD PerfStudio hooks D3D9.DLL and intercepts all of the D3DPERF API's (even for OpenGL apps).
-	// So dynamically load d3d9.dll and get the address of these exported functions.
-	if ( !m_hD3D9 )
-	{
-		m_hD3D9 = LoadLibraryA("d3d9.dll");
-	}
-	if ( m_hD3D9 )
-	{
-		Plat_DebugString( "PIX_INSTRUMENTATION: Loaded d3d9.dll\n" );
-		printf( "PIX_INSTRUMENTATION: Loaded d3d9.dll\n" );
-
-		m_pBeginEvent = (D3DPERF_BeginEvent_FuncPtr)GetProcAddress( m_hD3D9, "D3DPERF_BeginEvent" );
-		m_pEndEvent = (D3DPERF_EndEvent_FuncPtr)GetProcAddress( m_hD3D9, "D3DPERF_EndEvent" );
-		m_pSetMarker = (D3DPERF_SetMarker_FuncPtr)GetProcAddress( m_hD3D9, "D3DPERF_SetOptions" );
-		m_pSetOptions = (D3DPERF_SetOptions_FuncPtr)GetProcAddress( m_hD3D9, "D3DPERF_SetMarker" );
-	}
-#endif
 
 	// FIXME: Want this to be here, but we can't because Steam
 	// hasn't had it's application ID set up yet.
@@ -147,7 +119,7 @@ bool CShaderDeviceMgrDx8::Connect( CreateInterfaceFn factory )
 	return true;
 }
 
-void CShaderDeviceMgrDx8::Disconnect()
+void CShaderDeviceMgrMTL::Disconnect()
 {
 	LOCK_SHADERAPI();
 
@@ -182,7 +154,7 @@ void CShaderDeviceMgrDx8::Disconnect()
 //-----------------------------------------------------------------------------
 // Initialization
 //-----------------------------------------------------------------------------
-InitReturnVal_t CShaderDeviceMgrDx8::Init( )
+InitReturnVal_t CShaderDeviceMgrMTL::Init( )
 {
 	// FIXME: Remove call to InitAdapterInfo once Steam startup issues are resolved.
 	// Do it in Connect instead.
@@ -195,7 +167,7 @@ InitReturnVal_t CShaderDeviceMgrDx8::Init( )
 //-----------------------------------------------------------------------------
 // Shutdown
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::Shutdown( )
+void CShaderDeviceMgrMTL::Shutdown( )
 {
 	LOCK_SHADERAPI();
 	
@@ -235,7 +207,7 @@ bool CShaderDeviceDx8::IsActive() const
 //-----------------------------------------------------------------------------
 // Initialize adapter information
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::InitAdapterInfo()
+void CShaderDeviceMgrMTL::InitAdapterInfo()
 {
 	if ( m_bAdapterInfoIntialized )
 		return;
@@ -276,7 +248,7 @@ void CShaderDeviceMgrDx8::InitAdapterInfo()
 // bit is messed up in drivers due to a stupid WHQL test that requires this to work
 // with float textures which we don't generally care about wrt this address mode)
 //--------------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::CheckBorderColorSupport( HardwareCaps_t *pCaps, int nAdapter )
+void CShaderDeviceMgrMTL::CheckBorderColorSupport( HardwareCaps_t *pCaps, int nAdapter )
 {
 #ifdef DX_TO_GL_ABSTRACTION
 	if( true )
@@ -295,7 +267,7 @@ void CShaderDeviceMgrDx8::CheckBorderColorSupport( HardwareCaps_t *pCaps, int nA
 //--------------------------------------------------------------------------------
 // Vendor-dependent code to detect support for various flavors of shadow mapping
 //--------------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::CheckVendorDependentShadowMappingSupport( HardwareCaps_t *pCaps, int nAdapter )
+void CShaderDeviceMgrMTL::CheckVendorDependentShadowMappingSupport( HardwareCaps_t *pCaps, int nAdapter )
 {
 	// Set a default null texture format...may be overridden below by IHV-specific surface type
 	pCaps->m_NullTextureFormat = IMAGE_FORMAT_ARGB8888;
@@ -465,7 +437,7 @@ void CShaderDeviceMgrDx8::CheckVendorDependentShadowMappingSupport( HardwareCaps
 //-----------------------------------------------------------------------------
 // Vendor-dependent code to detect Alpha To Coverage Backdoors
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::CheckVendorDependentAlphaToCoverage( HardwareCaps_t *pCaps, int nAdapter )
+void CShaderDeviceMgrMTL::CheckVendorDependentAlphaToCoverage( HardwareCaps_t *pCaps, int nAdapter )
 {
 	pCaps->m_bSupportsAlphaToCoverage = false;
 
@@ -541,7 +513,7 @@ void CShaderDeviceMgrDx8::CheckVendorDependentAlphaToCoverage( HardwareCaps_t *p
 //-----------------------------------------------------------------------------
 #define FOURCC_RESZ ((D3DFORMAT)(MAKEFOURCC('R','E','S','Z')))
 #define FOURCC_INTZ ((D3DFORMAT)(MAKEFOURCC('I','N','T','Z')))
-void CShaderDeviceMgrDx8::CheckVendorDependentDepthResolveSupport( HardwareCaps_t *pCaps, int nAdapter )
+void CShaderDeviceMgrMTL::CheckVendorDependentDepthResolveSupport( HardwareCaps_t *pCaps, int nAdapter )
 {
 	// Bail out on OpenGL
 #ifdef DX_TO_GL_ABSTRACTION
@@ -590,7 +562,7 @@ ConVar mat_fastclip( "mat_fastclip", "0", FCVAR_CHEAT  );
 //-----------------------------------------------------------------------------
 // Determine capabilities
 //-----------------------------------------------------------------------------
-bool CShaderDeviceMgrDx8::ComputeCapsFromD3D( HardwareCaps_t *pCaps, int nAdapter )
+bool CShaderDeviceMgrMTL::ComputeCapsFromD3D( HardwareCaps_t *pCaps, int nAdapter )
 {
 	D3DCAPS caps;
 	D3DADAPTER_IDENTIFIER9 ident;
@@ -1183,7 +1155,7 @@ bool CShaderDeviceMgrDx8::ComputeCapsFromD3D( HardwareCaps_t *pCaps, int nAdapte
 //-----------------------------------------------------------------------------
 // Compute the effective DX support level based on all the other caps
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::ComputeDXSupportLevel( HardwareCaps_t &caps )
+void CShaderDeviceMgrMTL::ComputeDXSupportLevel( HardwareCaps_t &caps )
 {
 	// NOTE: Support level is actually DX level * 10 + subversion
 	// So, 70 = DX7, 80 = DX8, 81 = DX8 w/ 1.4 pixel shaders
@@ -1247,10 +1219,10 @@ void CShaderDeviceMgrDx8::ComputeDXSupportLevel( HardwareCaps_t &caps )
 //-----------------------------------------------------------------------------
 // Gets the number of adapters...
 //-----------------------------------------------------------------------------
-int CShaderDeviceMgrDx8::GetAdapterCount() const
+int CShaderDeviceMgrMTL::GetAdapterCount() const
 {
 	// FIXME: Remove call to InitAdapterInfo once Steam startup issues are resolved.
-	const_cast<CShaderDeviceMgrDx8*>( this )->InitAdapterInfo();
+	const_cast<CShaderDeviceMgrMTL*>( this )->InitAdapterInfo();
 
 	return m_Adapters.Count();
 }
@@ -1259,10 +1231,10 @@ int CShaderDeviceMgrDx8::GetAdapterCount() const
 //-----------------------------------------------------------------------------
 // Returns info about each adapter
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::GetAdapterInfo( int nAdapter, MaterialAdapterInfo_t& info ) const
+void CShaderDeviceMgrMTL::GetAdapterInfo( int nAdapter, MaterialAdapterInfo_t& info ) const
 {
 	// FIXME: Remove call to InitAdapterInfo once Steam startup issues are resolved.
-	const_cast<CShaderDeviceMgrDx8*>( this )->InitAdapterInfo();
+	const_cast<CShaderDeviceMgrMTL*>( this )->InitAdapterInfo();
 
 	Assert( ( nAdapter >= 0 ) && ( nAdapter < m_Adapters.Count() ) );
 	const HardwareCaps_t &caps = m_Adapters[ nAdapter ].m_ActualCaps;
@@ -1273,7 +1245,7 @@ void CShaderDeviceMgrDx8::GetAdapterInfo( int nAdapter, MaterialAdapterInfo_t& i
 //-----------------------------------------------------------------------------
 // Sets the adapter
 //-----------------------------------------------------------------------------
-bool CShaderDeviceMgrDx8::SetAdapter( int nAdapter, int nAdapterFlags )
+bool CShaderDeviceMgrMTL::SetAdapter( int nAdapter, int nAdapterFlags )
 {
 	LOCK_SHADERAPI();
 
@@ -1315,7 +1287,7 @@ bool CShaderDeviceMgrDx8::SetAdapter( int nAdapter, int nAdapterFlags )
 //-----------------------------------------------------------------------------
 // Returns the screen resolution
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::GetDesktopResolution( int *pWidth, int *pHeight, int nAdapter ) const
+void CShaderDeviceMgrMTL::GetDesktopResolution( int *pWidth, int *pHeight, int nAdapter ) const
 {
 #if defined ( _X360 )
 #elif defined ( DX_TO_GL_ABSTRACTION )
@@ -1343,7 +1315,7 @@ void CShaderDeviceMgrDx8::GetDesktopResolution( int *pWidth, int *pHeight, int n
 //-----------------------------------------------------------------------------
 // Returns the number of modes
 //-----------------------------------------------------------------------------
-int CShaderDeviceMgrDx8::GetModeCount( int nAdapter ) const
+int CShaderDeviceMgrMTL::GetModeCount( int nAdapter ) const
 {
 	LOCK_SHADERAPI();
 	Assert( m_pD3D && (nAdapter < GetAdapterCount() ) );
@@ -1435,7 +1407,7 @@ static void PS3_GetVideoOutResolution( int *pWidth, int *pHeight, float *pAspect
 //-----------------------------------------------------------------------------
 // Returns mode information..
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::GetModeInfo( ShaderDisplayMode_t* pInfo, int nAdapter, int nMode ) const
+void CShaderDeviceMgrMTL::GetModeInfo( ShaderDisplayMode_t* pInfo, int nAdapter, int nMode ) const
 {
 	Assert( pInfo->m_nVersion == SHADER_DISPLAY_MODE_VERSION );
 
@@ -1476,7 +1448,7 @@ void CShaderDeviceMgrDx8::GetModeInfo( ShaderDisplayMode_t* pInfo, int nAdapter,
 //-----------------------------------------------------------------------------
 // Returns the current mode information for an adapter
 //-----------------------------------------------------------------------------
-void CShaderDeviceMgrDx8::GetCurrentModeInfo( ShaderDisplayMode_t* pInfo, int nAdapter ) const
+void CShaderDeviceMgrMTL::GetCurrentModeInfo( ShaderDisplayMode_t* pInfo, int nAdapter ) const
 {
 	Assert( pInfo->m_nVersion == SHADER_DISPLAY_MODE_VERSION );
 
@@ -1519,7 +1491,7 @@ void CShaderDeviceMgrDx8::GetCurrentModeInfo( ShaderDisplayMode_t* pInfo, int nA
 //-----------------------------------------------------------------------------
 // Sets the video mode
 //-----------------------------------------------------------------------------
-CreateInterfaceFn CShaderDeviceMgrDx8::SetMode( void *hWnd, int nAdapter, const ShaderDeviceInfo_t& mode )
+CreateInterfaceFn CShaderDeviceMgrMTL::SetMode( void *hWnd, int nAdapter, const ShaderDeviceInfo_t& mode )
 {
 	LOCK_SHADERAPI();
 
@@ -1579,7 +1551,7 @@ CreateInterfaceFn CShaderDeviceMgrDx8::SetMode( void *hWnd, int nAdapter, const 
 //-----------------------------------------------------------------------------
 // Validates the mode...
 //-----------------------------------------------------------------------------
-bool CShaderDeviceMgrDx8::ValidateMode( int nAdapter, const ShaderDeviceInfo_t &info ) const
+bool CShaderDeviceMgrMTL::ValidateMode( int nAdapter, const ShaderDeviceInfo_t &info ) const
 {
 	if ( nAdapter >= (int)D3D()->GetAdapterCount() )
 		return false;
@@ -1605,7 +1577,7 @@ bool CShaderDeviceMgrDx8::ValidateMode( int nAdapter, const ShaderDeviceInfo_t &
 //-----------------------------------------------------------------------------
 // Returns the amount of video memory in bytes for a particular adapter
 //-----------------------------------------------------------------------------
-int CShaderDeviceMgrDx8::GetVidMemBytes( int nAdapter ) const
+int CShaderDeviceMgrMTL::GetVidMemBytes( int nAdapter ) const
 {
 #if defined( _X360 )
 	return 256*1024*1024;
