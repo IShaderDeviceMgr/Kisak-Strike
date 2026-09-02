@@ -81,3 +81,5 @@ public/vphysics_bullet/*
 vphysics_bullet/*
 thirdparty/bullet3/*
 /hammer_launcher_qt/
+
+**/.DS_Store

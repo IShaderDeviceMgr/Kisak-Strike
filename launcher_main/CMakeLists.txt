@@ -12,11 +12,13 @@ set(OUTBINDIR "${SRCDIR}/../game")
 
 include(${CMAKE_MODULE_PATH}/detect_platform.cmake)
 
-if( WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
-    set(OUTBINNAME "csgo")
-elseif( WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(OUTBINNAME "csgo_win64")
-elseif( OSX32 )
+# Kisak-Strike only targets POSIX platforms (Linux and macOS today, see
+# ../PORTING.md) -- no Windows, no consoles.
+if( NOT (LINUXALL OR OSXALL) )
+    message(FATAL_ERROR "launcher_main only supports Linux and macOS.")
+endif()
+
+if( OSX32 )
     set(OUTBINNAME "csgo_osx")
 elseif( OSX64 )
     set(OUTBINNAME "csgo_osx64")
@@ -26,18 +28,36 @@ elseif( LINUX64 )
     set(OUTBINNAME "csgo_linux64")
 endif()
 
-set(NOSTINKYLINKIES "1")
-set(NOSKELETONBASE "1")
-
-include(${CMAKE_MODULE_PATH}/source_exe_base.cmake)
-
-target_sources(${OUTBINNAME} PRIVATE main.cpp)
-
-# I dont know if mingw can compile resource files
-if( MSVC )
-	target_sources(${OUTBINNAME} PRIVATE launcher_main.rc)
+# launcher_main is a Rust crate (src/main.rs) -- see ../PORTING.md. It's a
+# standalone dlopen()+dlsym() redirection stub with no dependency on any
+# other module's ABI, so it needed no cxx bridge or vtable shim; this just
+# runs `cargo build` and drops the resulting binary in OUTBINDIR.
+if( CMAKE_BUILD_TYPE STREQUAL "DEBUG" )
+    set( CARGO_BUILD_FLAG "" )
+    set( CARGO_PROFILE_DIR "debug" )
+else()
+    set( CARGO_BUILD_FLAG "--release" )
+    set( CARGO_PROFILE_DIR "release" )
 endif()
 
-if( LINUXALL )
-    target_link_libraries(${OUTBINNAME} dl pthread)
-endif()
+set( CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/target" )
+set( RUST_LAUNCHER_MAIN_BIN "${CARGO_TARGET_DIR}/${CARGO_PROFILE_DIR}/launcher_main" )
+
+add_custom_command(
+    OUTPUT "${RUST_LAUNCHER_MAIN_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
+            cargo build ${CARGO_BUILD_FLAG}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.rs" "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
+    COMMENT "Building launcher_main (Rust)"
+    VERBATIM
+)
+
+add_custom_target( ${OUTBINNAME}_cargo ALL DEPENDS "${RUST_LAUNCHER_MAIN_BIN}" )
+
+add_custom_command(
+    TARGET ${OUTBINNAME}_cargo POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${OUTBINDIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${RUST_LAUNCHER_MAIN_BIN}" "${OUTBINDIR}/${OUTBINNAME}"
+    VERBATIM
+)
