@@ -4,6 +4,12 @@
 *.userosscache
 *.sln.docstates
 
+# Rust build artifacts (per-module crates being ported to Rust -- see PORTING.md).
+# CMake routes each module's `cargo build` to an out-of-tree target dir
+# (CARGO_TARGET_DIR under the CMake build dir), but a stray target/ can still show
+# up from running cargo directly in a module dir during iteration.
+target/
+
 # Build results
 [Dd]ebug_*/
 [Dd]ebug/

@@ -1,9 +1,0 @@
-[package]
-name = "launcher_main"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[[bin]]
-name = "launcher_main"
-path = "src/main.rs"

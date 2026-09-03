@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "launcher_main"
+name = "source-engine"
 version = "0.1.0"

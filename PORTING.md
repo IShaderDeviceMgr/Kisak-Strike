@@ -1,283 +1,439 @@
 # PORTING.md
 
-Goal: gradually rewrite Kisak-Strike from C++ to Rust, module by module, without a
-big-bang rewrite and without breaking the ability to build a working game at every
-commit. This document is the standing design reference for that effort — read it
-before porting any module, and update it when the plan changes. Every future
-porting-related session (Claude or otherwise) should treat this file, not tribal
-knowledge, as the source of truth.
+Goal: rewrite the Source engine in Rust as **one Rust project** — a single crate at
+the repository root producing a single statically-linked binary, with no
+`dlopen`-based app system and interfaces designed for Rust rather than inherited from
+Valve's C++.
 
-FFI approach: [`cxx`](https://cxx.rs). Interfaces stay in their original Valve/Source
-form (pure-virtual C++ abstract classes, `CreateInterface`-style factories, the
-`IAppSystem` lifecycle) for as long as both Rust and C++ modules coexist. Only once a
-whole dependency subtree has been ported do we replace that subtree's boundary with
-something more idiomatic (see "Endgame" below). Don't jump to idiomatic Rust traits
-across a still-mixed boundary — it defeats the incremental strategy.
+**Target game: Portal 2.** The original tree is the `cstrike15` branch, which is what
+we're working from, but the goal is Portal 2 — so `portal`/`portal2` content is in
+scope and CS:GO-specific content generally isn't (see "Game scope" below).
+
+This document is the standing design reference. Read it before porting anything, and
+update it when the plan changes. Every future porting session (Claude or otherwise)
+should treat this file, not tribal knowledge, as the source of truth. Per-module
+detail lives in `portdocs/<MODULE>.md` — see "Per-module porting docs".
+
+## Repository layout
+
+```
+/                  Rust project root — Cargo.toml, src/
+  src/main.rs      entry point
+  src/launcher/    process bootstrap (first module ported)
+  legacy/          the original C++ tree, verbatim
+  portdocs/        per-module porting design docs
+  PORTING.md       this file
+```
+
+**`legacy/` is the original C++ source, moved wholesale out of the root.** It is the
+*reference implementation* — read it, measure it, port from it — but it is **not a
+build dependency and not linked into anything.** The Rust project does not use CMake,
+does not compile any C++, and has no FFI to `legacy/`. Nothing in `legacy/` should be
+edited.
+
+Note that all file paths cited throughout this document and in `portdocs/` are given
+relative to the original tree (`engine/sys_dll2.cpp`, `public/tier1/interface.h`, …);
+prefix them with `legacy/` to open them.
+
+`legacy/` shrinks as subsystems land in `src/` and can be deleted directory by
+directory once nothing needs reading from it any more.
+
+### Consequence: no incremental scaffolding
+
+An earlier revision of this plan kept the C++ linked in as static-library scaffolding
+so the game stayed runnable at every commit. **That is no longer the approach.** With
+`legacy/` fully decoupled, the Rust binary is not a playable game until enough
+subsystems exist to boot one — bootstrap, filesystem, the engine host loop, rendering,
+and enough of the game layer. Two things follow:
+
+- **Verification is against the reference, not against a running hybrid.** Compare
+  behavior by reading `legacy/`, and by building the C++ tree separately if a live
+  reference is wanted (see the caveat in "Status" — the C++ launcher was removed, so
+  that tree no longer links a game binary as-is).
+- **Ordering matters more than it would otherwise.** Nothing is exercised end-to-end
+  until the boot path is complete, so prefer depth on the startup path over breadth
+  across subsystems. See "Porting order".
+
+---
+
+## Architecture: one crate, one binary, no app system
+
+The original engine is ~30 shared libraries that find each other at runtime by name
+through `CreateInterface` and a versioned-string registry (`public/tier1/interface.h`,
+`appframework/AppSystemGroup.cpp`). **The Rust port does not reproduce this.** Instead:
+
+- **One crate, one `Cargo.toml`**, at the repository root. Each former Valve module
+  becomes a **module** under `src/` (`src/engine/`, `src/filesystem/`,
+  `src/materials/`, …) — not a separate crate, not a separate library.
+- **One statically-linked executable.** No `.so`s of our own, no `dlopen` of our own
+  code, no `CreateInterface`, no `IAppSystem` lifecycle, no interface version strings.
+- **Ordinary Rust calls between modules** — real types, real generics, real trait
+  objects where dynamism is genuinely wanted, and full inlining/LTO throughout.
+
+**Why not keep the dynamic app system:** Rust has no stable ABI. Dynamically linking
+Rust-to-Rust either pins every module to one exact compiler version (`dylib`) or
+forces everything through `extern "C"` with C-representable types only — which throws
+away the idiomatic interfaces that are the whole point of this rewrite. The plugin
+architecture was load-bearing for C++ and is pure cost for Rust.
+
+**What we give up, acknowledged:** runtime module swapping (`CAppSystemGroup::ReloadModule`)
+and third-party binary game modules. Neither matters for a single-player-focused
+Portal 2 build.
+
+**One asterisk:** `libsteam_api.so` is a closed-source shared object. If Steam
+integration is kept, that one `dlopen` remains regardless — it's a plain C ABI, so
+it's not a problem, but "one pure static binary" isn't literally reachable.
+
+## No FFI, no C++, no CMake
+
+There is **no C++ in the Rust project and no build script** — no `cxx`, no
+`extern "C"` bridge to `legacy/`, no vtable shims, no `build.rs`, no CMake. `cargo
+build` is the entire build.
+
+This is a deliberate simplification over an FFI-bridged port. It costs the ability to
+run a hybrid binary mid-port (see "Consequence: no incremental scaffolding" above) and
+buys: no ABI-compatibility surface to get wrong, no C++ toolchain in the build, no
+adapter code written only to be deleted, and no risk of Valve's interface shapes
+leaking into the Rust design through the FFI boundary.
+
+**The only `dlopen` in the design is `libsteam_api.so`**, a closed-source C-ABI blob,
+if and when Steam integration is added.
+
+### Polarity: the Rust interface is the contract
+
+The most important design rule here, and the reason the FFI approach was dropped.
+
+**Define the interface Rust wants. Never derive it from a Valve one.** When porting a
+subsystem, read `legacy/` to learn *what it does* and *why* — the domain knowledge is
+real and hard-won — then design the Rust API from scratch. Do not transliterate a
+Valve signature, do not preserve an interface shape "for now", and do not let a C++
+type dictate a Rust type.
+
+The practical test when porting something: if a Rust signature only makes sense once
+you've read the C++ it came from, it's wrong. Rewrite it.
+
+What *does* carry across from `legacy/`: algorithms, data layouts that are fixed by an
+external format (see "Format is fixed" below), protocol state machines, physics and
+math, frame-ordering constraints, and the accumulated bug fixes encoded in odd-looking
+special cases. Read those carefully and preserve the behavior — just not the shape.
+
+### What "idiomatic" means concretely
+
+Do not carry these Valve patterns into Rust, even where mechanically translating them
+would be easier:
+
+| Valve C++ pattern | Rust replacement |
+|---|---|
+| `Connect(factory)` / `Init()` / `Shutdown()` / `Disconnect()` four-phase lifecycle | Construction returns a fully-initialized value (`fn new(deps) -> Result<Self>`); `Drop` handles teardown |
+| `QueryInterface(const char *name)` string lookup | Real types. If dynamism is genuinely needed, an enum or `dyn Trait`, resolved at compile time |
+| `CreateInterfaceFn` + version strings (`"VMaterialSystem080"`) | Cargo dependency versions |
+| `bool` returns with out-params for errors | `Result<T, E>` with a real error enum (`thiserror`) |
+| Raw `T*` with documented-but-unenforced ownership | `&T`, `&mut T`, `Box<T>`, `Arc<T>`, lifetimes |
+| `g_pGlobalSingleton` mutable globals | Explicit dependency passing; `OnceLock`/`Arc` only where genuinely process-global |
+| `CUtlVector`, `CUtlString`, `KeyValues` | `Vec`, `String`, `HashMap`, `serde` |
+| Manual `new`/`delete`, no move semantics | Ownership, RAII, moves |
+| `virtual` everything, deep inheritance | Traits, composition, generics; `dyn` only where runtime polymorphism is real |
+| `#ifdef` platform branching | `#[cfg]`, or better, no branch at all (see "Supported platforms") |
+
+Where a Valve interface encodes real domain knowledge (the shape of a BSP node, the
+netchannel state machine, the phases of a frame), **keep the knowledge and discard the
+encoding.**
+
+---
 
 ## Supported platforms
 
-The Rust port only needs to support POSIX platforms:
+POSIX only:
 
-- **Linux** — the primary target today. Android is a plausible future POSIX target
-  (it's Linux-derived) but is not in scope right now; don't design around it yet,
-  just don't design anything that would gratuitously preclude it later.
-- **Apple platforms** — macOS first. iOS, iPadOS, tvOS, and visionOS are plausible
-  future targets (same POSIX/Darwin lineage as macOS) but, like Android, are not in
-  scope right now.
+- **Linux** — primary target. Android is a plausible future POSIX target but not in
+  scope; don't design around it, don't gratuitously preclude it.
+- **Apple** — macOS first. iOS/iPadOS/tvOS/visionOS are plausible later targets, also
+  not in scope now.
 
-**Windows and consoles (X360, PS3, etc.) are explicitly out of scope and will not be
-supported**, full stop — not "not yet ported." Don't write conditional scaffolding for
-them (`#[cfg(windows)]`, `cfg_if` branches, Windows-shaped CMake options, etc.) on the
-assumption they'll be filled in later; there is no later for those platforms. Where
-the original C++ had `WIN32`/`_X360`/`_PS3`/`SN_TARGET_PS3` branches, the Rust port
-simply doesn't have that branch — see `launcher_main/src/main.rs` and
-`launcher_main/CMakeLists.txt` for the pattern (POSIX-only code, no Windows fallback
-path, and the CMake hard-errors via `message(FATAL_ERROR ...)` if it somehow gets
-configured for anything other than `LINUXALL`/`OSXALL`).
+**Windows and consoles (X360, PS3) are permanently out of scope** — not "not yet."
+Don't write `#[cfg(windows)]` scaffolding on the assumption someone fills it in later.
+Where the original had `WIN32`/`_X360`/`_PS3`/`SN_TARGET_PS3` branches, the Rust port
+simply has no branch. When reading Source files, skim for `#elif defined(POSIX)` /
+`LINUX` / `OSX` and unconditional code, and disregard the rest.
 
-This also simplifies the porting-order guidance below: fan-out into
-`_X360`/`_PS3`/Windows-only branches in a module you're scouting is dead code from the
-Rust port's perspective, not extra complexity to plan around — it just doesn't get
-ported.
+This also simplifies scoping: console/Windows-only code in a module you're sizing up
+is dead weight from the port's perspective, not complexity to plan around.
 
-## Why the app system is the thing to preserve
+## Rendering, windowing, and UI
 
-This codebase already has a real plugin architecture — it isn't "one giant binary,"
-it's ~30 shared libraries (`engine_client.so`, `materialsystem_client.so`,
-`vphysics_client.so`, ...) that find each other at runtime by name. That's exactly the
-seam a gradual rewrite needs: a module boundary that already tolerates independent
-compilation, independent versioning, and "the other side doesn't know or care what
-language implemented me." We don't need to invent a plugin system for the Rust port —
-we need to keep participating in the one that's already there.
+Three replacements, all decided:
 
-Three layers make this work, from outside in:
+- **`wgpu` replaces `materialsystem/shaderapidx9` + `togl`.** The current renderer is
+  written against a D3D9-shaped API and runs on POSIX through `togl`
+  (`togl/glmgr.cpp`, gated on `DX_TO_GL_ABSTRACTION`), a hand-written D3D9→OpenGL
+  translation layer. That whole tower goes. `wgpu` targets Metal on macOS and Vulkan
+  (falling back to GL) on Linux, so there's no translation shim to maintain.
+  **The shaders are rewritten in WGSL**, translated from the `.fxc` HLSL sources in
+  `materialsystem/stdshaders/`. The shipped `.vcs` files are D3D9 bytecode and are
+  unusable — reusing them would mean writing a new `dx9asmtogl`, which is the tower being
+  deleted. Valve's static/dynamic **combo system goes with it**: one `.fxc` there declares
+  ~15.3M static variants, and `utils/shadercompile` was a distributed farm built to
+  compile them. In the port, most combo axes are pinned at compile time, most of the rest
+  become uniform branches, and only vertex-layout/pipeline-state changes stay as real
+  pipeline variants. See `portdocs/MATERIALSYSTEM.md` §7.
+- **`winit` replaces `ILauncherMgr`/SDL2/Cocoa windowing** — i.e.
+  `public/appframework/ilaunchermgr.h`, `appframework/sdlmgr.cpp` (`CSDLMgr`),
+  `appframework/cocoamgr.mm`, and the vendored `thirdparty/SDL2`.
+- **`egui` replaces vgui2, RocketUI, and ScaleformUI** — every UI backend at once.
+  Picked because it's Rust-native with first-class `egui-wgpu`/`egui-winit` backends,
+  making it the natural third leg of this stack.
 
-1. **`CAppSystemGroup` (public/appframework/IAppSystemGroup.h, appframework/AppSystemGroup.cpp)**
-   — the orchestrator. Owns the staged lifecycle
-   (`CREATION → DEPENDENCIES → CONNECTION → PREINIT → INIT → POSTINIT → RUNNING →
-   PRESHUTDOWN → SHUTDOWN → POSTSHUTDOWN → DISCONNECTION → DESTRUCTION`), `dlopen`s
-   modules by base name (`LoadModule("materialsystem.dll")`, extension resolved per
-   platform — see `_DLL_EXT` in `cmake/detect_platform.cmake`), asks each for a named
-   interface via its factory, and topologically sorts/init's/shuts-down systems based
-   on `IAppSystem::GetDependencies()`. **This class must never need to know whether a
-   module is C++ or Rust.** As long as a module still exports a working
-   `CreateInterface` that hands back a vtable-compatible pointer, `CAppSystemGroup` is
-   untouched, forever, even after every module underneath it is Rust.
+### The control-flow inversion
 
-2. **`CreateInterface` / `InterfaceReg` (public/tier1/interface.h, tier1/interface.cpp)**
-   — the per-module factory. Each module keeps a linked list of
-   `(version-string, InstantiateInterfaceFn)` pairs registered by static constructors
-   (`EXPOSE_INTERFACE`/`EXPOSE_SINGLE_INTERFACE` macros), and exports one
-   `CreateInterface(const char *pName, int *pReturnCode)` symbol that walks the list.
-   Interface version strings and their global pointer variables (`g_pMaterialSystem`,
-   `g_pFullFileSystem`, ...) are centralized in `public/interfaces/interfaces.h`. A
-   ported module keeps registering under the *same* version string
-   (`MATERIAL_SYSTEM_INTERFACE_VERSION` etc.) so nothing on the C++ side has to change
-   to keep finding it.
+Source's frame loop is **pull-based**: `CEngineAPI::MainLoop()`
+(`engine/sys_dll2.cpp:1132`) is a bare `while(true)` that calls `PumpMessages()` then
+`eng->Frame()`. `winit` is **push-based**: you hand an `EventLoop` an
+`ApplicationHandler` and it calls *you* (`resumed`, `window_event`, `about_to_wait`),
+with `ControlFlow` governing pacing.
 
-3. **`IAppSystem` (public/appframework/iappsystem.h)** — the per-instance contract:
-   `Connect(factory) → Init() → [ticks] → Shutdown() → Disconnect()`, plus
-   `QueryInterface` (secondary interfaces on the same object), `GetDependencies`
-   (drives the auto-load/topo-sort), `GetTier`, `Reconnect`, `IsSingleton`. A Rust
-   module's root object needs to behave like one of these from the outside, even
-   though nothing forces it to be *implemented* as a C++ vtable internally.
+The specific collision: **`CEngine::Frame()` (`engine/sys_engine.cpp:418-614`) owns
+its own frame pacing and sleeps inside itself** — it calls `FilterTime()`, and if not
+enough time has passed it `ThreadNanoSleep()`s and returns without doing work. Two
+systems both trying to own pacing, one sleeping inside a callback the other scheduled,
+is the failure mode to design against.
 
-The key realization: only layers 2 and 3 need a Rust-shaped answer. Layer 1 (the
-orchestrator) is dependency-free of language once layers 2/3 hold up their end of the
-contract.
+Target shape (to be validated, not settled):
 
-## The actual FFI problem, and why it's not solved by `cxx` alone
+- `window_event` translates winit events into the engine's input events directly.
+- `about_to_wait` drives one engine tick.
+- `FilterTime`'s *policy* survives (respect `fps_max` and friends) but becomes
+  `ControlFlow::WaitUntil(deadline)` instead of a sleep.
+- Quit/restart signalling maps to `ControlFlow::Exit` while preserving the
+  restart-vs-exit distinction the launcher's restart loop depends on.
 
-`cxx` is excellent at "Rust calls into C++" (opaque C++ types, methods, `UniquePtr`,
-etc.) and "C++ calls plain Rust functions/structs." What it deliberately does **not**
-support is the thing we need for layer 2/3: **a Rust type standing in for a C++
-abstract class and being handed out through a vtable pointer that pre-existing,
-unmodified C++ code will call through.** `cxx` has no notion of overriding a C++
-virtual method from Rust — it can't synthesize an Itanium-ABI vtable.
+Also note: the UI event precedence chain in `CGame::DispatchInputEvent`
+(`engine/sys_mainwind.cpp:399`) currently runs VGui → RocketUI → GameUI, with VGui
+getting first refusal. Since `egui` replaces all three, that chain collapses into
+`egui`'s "did the UI consume this event" answer — a real design question, not a
+translation. Details in `portdocs/ENGINE.md`.
 
-So the plan uses a small, deliberate, hand-written seam at exactly that point and
-nowhere else:
+## Tier libraries (`tier0`–`tier3`): not used by Rust code
 
-### Direction A — Rust module *provides* an interface (C++ calls into Rust)
+Rust code does not depend on `tier0`/`tier1`/`tier2`/`tier3` — not even the
+"obviously portable" utility bits. Use `std` and ordinary crates:
 
-Hand-write a thin C++ "vtable shim" per interface being served out of Rust:
+- **`tier0`** (`libtier0_client`) is ambient infrastructure: a custom allocator
+  (`tier0/mem.cpp`, `tier0/dlmalloc/`), memory debugging, threading
+  (`tier0/threadtools.cpp`), assert/logging (`tier0/dbg.cpp`, `tier0/logging.cpp`),
+  CPU detection, and the `platform.h` macro layer. All of that is `std` (allocation,
+  `std::thread`/`std::sync`, `panic!`/`Result`) plus a logging crate (`tracing`/`log`).
+- **`tier1`** is Valve's pre-STL container layer — `CUtlVector`, `CUtlString`,
+  `KeyValues`, `bitbuf`, checksums, `ConVar`/`CCommand`. Replaced by `Vec`/`String`/
+  `HashMap`/`serde` and, for bit-level work, `deku`/`bitvec` (see below).
+- **`tier2`/`tier3`** are helpers built on `tier1`'s shapes; same reasoning.
 
-```cpp
-// materialsystem/rust_shim.cpp — the ONLY handwritten C++ in a ported module
-class CRustMaterialSystem : public IMaterialSystem
-{
-public:
-    bool Connect( CreateInterfaceFn factory ) override { return rust_materialsystem_connect( m_pState, factory ); }
-    void Disconnect() override { rust_materialsystem_disconnect( m_pState ); }
-    void *QueryInterface( const char *pName ) override { return rust_materialsystem_query_interface( m_pState, pName ); }
-    InitReturnVal_t Init() override { return rust_materialsystem_init( m_pState ); }
-    void Shutdown() override { rust_materialsystem_shutdown( m_pState ); }
-    // ... every other IMaterialSystem virtual, one trampoline line each ...
-private:
-    RustMaterialSystemState *m_pState = rust_materialsystem_new();
-};
+Since nothing links `legacy/`, this rule is now automatic rather than a discipline to
+maintain — there is no tier0/tier1 in the process at all. It's recorded here mainly so
+that "port `tier1`" never gets mistaken for a task: those modules are replaced by
+`std` and crates, not translated.
 
-EXPOSE_SINGLE_INTERFACE( CRustMaterialSystem, IMaterialSystem, MATERIAL_SYSTEM_INTERFACE_VERSION )
-```
+## Prefer modern Rust crates over porting old in-engine code
 
-The `rust_materialsystem_*` functions are `extern "C"` (or a `#[cxx::bridge] extern
-"Rust"` block) implemented in Rust. `m_pState` is an opaque pointer into a Rust struct
-implementing an `AppSystem`-shaped trait (see below) plus whatever the real interface
-needs. **This shim is boilerplate, not logic** — it should be mechanically generated
-per interface where practical (a build script parsing the interface header, or just
-diligent copy-paste for the handful of interfaces we actually port), never grown
-organically. All real behavior lives in Rust.
+Where the engine hand-rolled something the Rust ecosystem does better, **use the crate
+— don't transliterate the C++.** Same reasoning as the tier rule, one level up.
+Applies to compression, hashing, thread pools, HTTP, string formatting, and above all
+serialization.
 
-Only the interfaces a module actually *exposes* need a shim. Internal types, helper
-classes, anything not reachable through `CreateInterface` — pure Rust, no shim needed.
+**But separate the *mechanism* from the *format*** — conflating them is the expensive
+mistake:
 
-### Direction B — Rust module *consumes* an interface (Rust calls into C++)
+- **Mechanism** (how the code is written): always modernize. A derive macro or parser
+  combinator beats hand-written `bf_read::ReadUBitLong()` calls, with zero
+  compatibility consequence.
+- **Format** (what bytes come out): only free to change where **we own both ends**.
 
-This is `cxx`'s home turf, with one caveat: most Source interfaces take/return Valve
-container types (`CUtlVector`, `KeyValues*`, `const char*` with manual lifetime rules)
-that aren't `cxx`-representable directly. Don't fight this — write a thin C++ adapter
-free-function per call site that translates to `cxx`-friendly shapes (raw slices,
-`&CxxString`, `usize`, plain structs), the mirror image of Direction A's shim. Keep
-adapters colocated with the consuming Rust module (e.g.
-`<module>/rust_bridge.h`/`.cpp`), not scattered into the shared `public/` headers —
-`public/` interface headers stay pristine, unmodified Valve/Source contracts.
+### Format is ours to change
 
-Global interface pointers (`g_pFullFileSystem`, `materials`, ...) declared in
-`interfaces.h`: never bind Rust directly to the raw `extern` global. Expose a small
-accessor (`const IFileSystem *rust_get_filesystem()`) from the adapter layer instead —
-keeps the unsafe extern-mutable-global reasoning in one obvious place per module.
+Internal-only data; savegames; anything new; and the client↔server wire format *if* we
+accept a flag day (this tree builds both client and dedicated server, so we can change
+both at once — the cost is losing the ported-client-vs-unported-server test
+configuration, and breaking stock third-party servers).
 
-### The `AppSystem` trait
+### Format is fixed regardless of crate choice
 
-To keep every ported module's shim mechanically identical (and to keep the door open
-for dropping the shim later — see Endgame), define one Rust trait mirroring
-`IAppSystem` 1:1:
+- **Valve asset formats — `.bsp`, `.mdl`, `.vtf`, `.vmt`, `.vpk`.** Content comes from
+  Valve's depots; we don't own the producer and never will. Parse them with
+  `binrw`/`nom`/`deku` instead of hand-rolled readers, but the byte layout is
+  immovable.
+- **`SendTable`/`RecvTable` entity delta encoding**, while `game/client`/`game/server`
+  are still C++ — those define the props via `SendPropInt`/`RecvPropInt` macros in
+  `game/shared/`, so the engine must speak exactly the format they describe. Becomes
+  negotiable once they're ported.
+- **`.dem` demo files**, if existing recordings should stay playable — decide
+  explicitly rather than breaking it by accident.
+- Steam-facing protocols (auth, matchmaking, GC messages, datagram relay).
 
-```rust
-pub trait AppSystem {
-    fn connect(&mut self, factory: CreateInterfaceFn) -> bool;
-    fn disconnect(&mut self);
-    fn query_interface(&mut self, name: &str) -> *mut c_void;
-    fn init(&mut self) -> InitReturnVal;
-    fn shutdown(&mut self);
-    fn dependencies(&self) -> &[AppSystemInfo] { &[] }
-    fn tier(&self) -> AppSystemTier { AppSystemTier::Other }
-    fn reconnect(&mut self, factory: CreateInterfaceFn, interface_name: &str) {}
-    fn is_singleton(&self) -> bool { true }
-}
-```
+### Netchannel specifically
 
-A module's root struct implements this once; the C++ shim's overrides are 1:1
-trampolines into it. Every additional interface-specific virtual (the actual
-`IMaterialSystem` surface beyond `IAppSystem`) gets its own trampoline into inherent
-methods on the same struct — no separate trait needed for those, since they're not
-part of the shared lifecycle contract `CAppSystemGroup` depends on.
+It's already half schema-driven: `common/netmessages.proto` (674 lines) defines the
+messages, and `engine/net_chan.cpp` is a roughly even mix of protobuf and `bitbuf`
+calls.
 
-## Choosing porting order
+- **Messages** → feed the existing `.proto` files to `prost`. No hand-porting, format
+  preserved free. (Caveat: vendored runtime is protobuf 3.5.1; watch `proto2`
+  semantics, which `prost` handles differently.)
+- **Framing** (fragments, subchannels, reliability, bit-packed headers) → the
+  hand-rolled part. Describe the layout declaratively with `deku`/`bitvec` rather than
+  transliterating `bf_read`/`bf_write` sequences.
 
-Port **one whole `CreateInterface`-exposing shared-lib module at a time** — never
-half a module. Partial-module ports don't have a clean seam (everything inside one
-`.so` shares C++ statics/singletons freely; there's no `CreateInterface` boundary to
-hang a shim off of internally).
+**On `serde` specifically:** right tool when we control both ends and want a compact
+format (`postcard`, `bincode`). Wrong tool for reading fixed legacy binary layouts —
+use `deku` (bit-level, derive-based), `binrw` (byte-level), or `nom`. Choosing `serde`
+for `.bsp` parsing would be a category error.
 
-Use the existing dependency signal instead of guessing:
-- `public/tier1/interface.h`'s `DECLARE_TIER1/2/3_INTERFACE` groupings in
-  `interfaces.h` are Valve's own difficulty/layering ranking.
-- `CAppSystemGroup::ComputeDependencies`/`SortDependentLibraries` (in
-  `appframework/AppSystemGroup.cpp`) computes this at runtime from
-  `IAppSystem::GetDependencies()` — reading a module's `GetDependencies()` override
-  (or its `Create()`'s `AppSystemInfo_t appSystems[]` list, e.g.
-  `appframework/matsysapp.cpp`) is the fastest way to find its real fan-in/fan-out.
+---
+
+## Game scope: Portal 2 from a cstrike15 base
+
+The tree is the `cstrike15` branch but the target is Portal 2, so scope is neither
+"everything in `game/`" nor "what the CS:GO build compiles."
+
+Measured sizes (whole subtree; not all of it is compiled today):
+
+| Path | Lines | Disposition |
+|---|---|---|
+| `game/shared/portal` | 41,642 | **In scope** — core Portal gameplay (portals, physics, grab controller) |
+| `game/client/portal` | 15,069 | In scope |
+| `game/server/portal` | 12,841 | In scope |
+| `game/server/portal2` | 4,655 | In scope |
+| `game/shared/portal2` | 3,785 | In scope |
+| `game/client/portal2` | 111,384 | **~90k is `gameui/portal2/` → replaced by `egui`.** Real entity code (`c_prop_weightedcube`, `c_prop_floor_button`, `radialmenu`) is small |
+| `game/*/cstrike15` | — | Out of scope except where it's the only implementation of something generic |
+
+Portal-2-specific engine features already identified in the tree: `engine/paint.cpp`
+(1,656 lines — paint/gel maps) is **essential**, not vestigial as it would be for a
+CS:GO build. `vscript/` (Squirrel VM, ~55k) matters because Portal 2 puzzle logic is
+scripted — worth evaluating a Rust Squirrel binding or an alternative VM rather than
+porting the vendored one.
+
+Beware: the `cstrike15` base means some shared systems are CS:GO-shaped (e.g.
+`DEFAULT_HL2_GAMEDIR` is `"csgo"` in the launcher, game rules default to CS:GO). Those
+need retargeting as part of making Portal 2 boot, and each is worth calling out in the
+relevant `portdocs/` entry when hit.
+
+## Build
+
+`cargo build`. That's the whole thing — one crate, no build script, no C++ toolchain,
+no CMake. Release builds use full LTO and a single codegen unit (see `Cargo.toml`).
+
+The CMake tree under `legacy/` is not part of this build and is not maintained. Don't
+invest in it, and don't wire it back in.
+
+## Porting order
+
+Use the dependency signal rather than guessing — `IAppSystem::GetDependencies()`
+overrides and `Create()`'s `AppSystemInfo_t` lists (e.g. `appframework/matsysapp.cpp`)
+still document the real graph even though we're discarding the mechanism.
 
 Rules of thumb:
-- **Avoid `tier0`/`tier1` first.** They're static libraries linked into nearly every
-  other target (`TIER1_STATIC_LIB`, no `CreateInterface` boundary at all in most of
-  tier1) — porting them means touching everything at once, the opposite of gradual.
-  They're a good *late* target once most dynamic modules around them are already Rust.
-- **Start with a leaf dynamic module**: something that exposes exactly one or two
-  interfaces, has few entries in its own `GetDependencies()`, and has few *other*
-  modules depending on it (check via `search_graph`/`trace_path` against the module's
-  interface version macro — see below). Candidates worth scouting first:
-  `soundemittersystem`, `localize`, `resourcefile`, `scenefilecache` — small, mostly
-  self-contained, not on the hot path of every frame.
-  Don't port `materialsystem`, `engine`, or anything game/client/server until the
-  shim pattern has been proven on something low-stakes.
-- Prefer modules that are already mostly POSIX to begin with over anything with heavy
-  `_X360`/`_PS3`/Windows-only branches — not because those platforms need supporting
-  (they don't, see "Supported platforms" above), but because a module steeped in
-  console/Windows special-casing is more work to even *read* — more branches to mentally
-  discard while figuring out what the POSIX behavior actually is.
 
-## Build integration
+- **Follow the boot path, depth-first.** Since nothing runs until the whole startup
+  chain exists, the ordering that produces a running artifact soonest is: bootstrap →
+  filesystem (enough to read `gameinfo.txt` and mount VPKs) → windowing (`winit`) →
+  rendering (`wgpu`, enough to clear a frame) → engine host loop → map loading →
+  the game layer. Breadth across unrelated subsystems produces nothing runnable.
+- **`tier0`/`tier1` are not tasks.** They're replaced by `std` and crates as a side
+  effect of porting everything else, not ported in their own right.
+- **Do the `winit`/`wgpu` groundwork deliberately**, before the engine's frame loop —
+  it constrains how that loop can be structured. See `portdocs/ENGINE.md`.
+- **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
+  (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
+  of the raw line count evaporates this way — roughly half of the compiled
+  `game/client`, for instance.
+- Prefer modules already mostly POSIX over ones steeped in console/Windows branching —
+  not because those platforms need support, but because there's less to mentally
+  discard while reading.
 
-A ported module keeps its existing CMake target identity: same output name
-(`OUTLIBNAME`/`OUTDLLNAME`), same `_client.so`/`.dylib`/`.dll` extension convention
-from `cmake/detect_platform.cmake`, same base name string other modules pass to
-`LoadModule("thatmodule.dll")` in their `Create()`. Nothing upstream should be able to
-tell the module changed language.
+## Per-module porting docs (`portdocs/`)
 
-Concretely: the module's `CMakeLists.txt` keeps `include(source_dll_base.cmake)` etc.,
-adds the (few) hand-written shim `.cpp` files via `target_sources` as today, and links
-a static library produced from the module's Rust crate (via `corrosion` — the
-`corrosion-rs` CMake integration — or a `add_custom_command` wrapping `cargo build
---release` and `target_link_libraries`-ing the resulting `.a`/`.lib`). Pick whichever
-adds less CMake ceremony once the first module is actually being ported;
-`kisak-strike-build-options.cmake` is the natural place for a global
-`USE_CARGO`/Rust-toolchain-path option if one becomes necessary.
+This file is the cross-cutting strategy. Per-module detail goes in
+`portdocs/<MODULE>.md`, named after the module directory in `SCREAMING_SNAKE_CASE`
+(`engine/` → `portdocs/ENGINE.md`). Write one for any module with real internal
+complexity — multiple subsystems, meaningful fan-in/fan-out, or a structural change —
+covering:
 
-## Endgame — once a subtree is fully Rust
+- The module's real dependency graph in both directions.
+- Internal architecture a porter needs to hold in their head.
+- What to port faithfully vs. replace vs. delete.
+- Structural/behavioral changes specific to it, staged as concrete steps.
+- Open questions and known-risky spots.
 
-`CreateInterface`/`InterfaceReg`/versioned-string lookup and the vtable shims are a
-*transitional* tax paid only at a still-mixed-language boundary. Once every module in
-a dependency subtree is Rust (e.g. some module and everything it calls into), the
-shims between *those* modules can be deleted and replaced with a normal Rust
-dependency (direct crate dependency, `dyn AppSystem` trait objects, real Cargo
-workspace boundaries instead of `dlopen`) — `cxx` drops out entirely for that subtree.
-Keep a shim only at the outer edge, wherever the subtree still hands an interface to
-C++ code that hasn't been ported yet. `CAppSystemGroup` itself is the last thing to
-go, if it ever does — it's cheap to keep even after everything under it is Rust, since
-it costs nothing at the fully-ported end state beyond one `dlopen` per module.
+Read it before touching that module; update it as the port proceeds and reality
+diverges. Small leaf modules don't need one — a Status entry here is enough.
 
-## Using codebase-memory-mcp for this work
+## Using codebase-memory-mcp
 
-This repo is indexed in the `codebase-memory-mcp` knowledge graph
-(project `Users-damienbrown-Documents-SourceEngineWork-Kisak-Strike`). Prefer its
-graph tools over plain grep/Explore when scouting a module to port or checking a
-shim's completeness — this codebase is too large (500k+ indexed nodes) to explore
-reliably by hand:
+This repo is indexed in the `codebase-memory-mcp` knowledge graph (project
+`Users-damienbrown-Documents-SourceEngineWork-Kisak-Strike`). Prefer its graph tools
+over blind grep when scouting — the tree is too large to explore by hand:
 
-- `search_graph` (BM25/`name_pattern`) to find an interface's declaration, every
-  `EXPOSE_INTERFACE`/`EXPOSE_SINGLE_INTERFACE` registration, or every class
-  implementing a given abstract interface.
-- `trace_path` (mode `calls`, `direction: inbound`) on an interface's key virtuals to
-  find real fan-in before committing to a porting order — this is more reliable than
-  reading `GetDependencies()` alone, since plenty of code reaches an interface via
-  `factory(VERSION_STRING, ...)` directly rather than through `AddSystem`.
-  See [[claude-md]] for the general index/coverage-checking workflow.
-- `get_architecture` (`aspects: ["structure","entry_points"]`, scoped via `path`) to
-  get oriented in an unfamiliar module directory before touching it.
-- `check_index_coverage` before trusting a "nothing found" result on a file you're
-  about to port — large generated or third-party files sometimes aren't fully parsed.
+- `search_graph` — find declarations, registrations, implementors.
+- `trace_path` (`direction: inbound`) — real fan-in before committing to an order.
+- `get_architecture` (`aspects: ["structure","clusters"]`, scoped by `path`) — orient
+  in an unfamiliar module; `clusters` finds de-facto subsystems that cut across the
+  folder layout.
+- `check_index_coverage` — **before trusting any negative result.** Coverage on large
+  engine files is frequently partial; `engine/sys_engine.cpp:264-686` (all of
+  `CEngine::Frame` and `FilterTime`) is unparsed, for instance. Read flagged ranges
+  from source and treat graph results there as under-reporting.
 
 ## Status
 
-- **`launcher_main` — fully ported, old C++ deleted.** Rewritten in Rust:
-  `launcher_main/Cargo.toml` + `launcher_main/src/main.rs`, wired into
-  `launcher_main/CMakeLists.txt` via a `cargo build` custom command. Per "Supported
-  platforms" above, there's no Windows/X360/PS3 fallback to keep around — the old
-  `main.cpp` (and its `_X360`/`SN_TARGET_PS3`/`WIN32` branches) has been deleted
-  outright, and the CMakeLists hard-errors via `message(FATAL_ERROR ...)` if
-  configured for anything other than `LINUXALL`/`OSXALL`. It turned out to need
-  neither FFI direction from this document —
-  it's pure process bootstrap (`dlopen("launcher_client.so", RTLD_NOW)`,
-  `dlsym(..., "LauncherMain")`, call the resulting `extern "C" fn(argc, argv) -> c_int`
-  function pointer, exit with its return value), so there's no `IAppSystem` interface
-  to implement or consume and thus no vtable shim to write. Confirms it as the
-  natural first target: zero fan-in (nothing links against `launcher_main`) and zero
-  interface surface. One deliberate behavior change from the original: on a failed
-  `dlopen`/`dlsym`, the C++ version hangs in `while(1);` before an unreachable
-  `return 0;` (looks like a leftover debugging aid); the Rust version prints the
-  `dlerror()` message and exits `1` instead.
-- Everything else is still C++. Update this list as modules move, and keep the
-  porting-order rules above current as real fan-in/fan-out data comes back from
-  `trace_path`.
+**Repository restructured**: the entire original C++ tree was moved to `legacy/`, and
+the repo root is now the Rust crate (`Cargo.toml`, `src/`). The `ivp` submodule moved
+with it and `.gitmodules` was updated to `legacy/ivp`.
+
+- **`src/launcher/` — process bootstrap, ported.** Command-line handling
+  (`cmdline.rs`), single-instance locking (`single_instance.rs`), early-error
+  reporting (`dialog.rs`), and the startup sequence (`mod.rs`). Replaces both
+  `launcher_main` and `launcher` from the original tree, which existed only to
+  `dlopen` their way up a chain of shared libraries — meaningless in a single binary.
+  Notable design choices, all deliberate departures from the original: `CommandLine`
+  is an owned struct passed explicitly rather than a `CommandLine()` singleton behind
+  a pure-virtual interface; the `GrabSourceMutex`/`ReleaseSourceMutex` pair became an
+  RAII guard released on `Drop`; the native error dialogs are stderr for now
+  (see `dialog.rs`). The startup sequence runs to completion and then stops — there's
+  no engine to hand off to yet.
+- **`filesystem` — documented, not started.** `portdocs/FILESYSTEM.md`: inventory, the
+  search-path/path-ID model, the `gameinfo.txt` bootstrap, VPK format, the proposed Rust
+  `Vfs` design, and a staged plan. Next module on the boot path. Two subsystems confirmed
+  dead and excluded (`IAsyncFileSystem`, ~3,700 lines with no callers;
+  `filesystem_steam.cpp`, not in the build), which along with console/`sv_pure`/QueuedLoader
+  removal takes the real reading surface to ~13–15k lines.
+- **`materialsystem` — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
+  the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
+  (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the
+  "rendering" step of the boot path below** — there is no separate renderer. Settled: the
+  `IShaderDeviceMgr`/`IShaderDevice`/`IShaderAPI`/`IShaderShadow` tower is deleted and
+  `wgpu` is used directly from inside the material system. That deletes `shaderapidx9`,
+  `shaderapiempty`, `glmgr`, `ps3gcm` and `togl` outright — ~148k of the module's ~262k
+  lines — leaving a real port target around 30–35k. Also settled: **the shaders are
+  rewritten in WGSL** from the `.fxc` HLSL, and the static/dynamic combo system is deleted
+  (see below).
+- **`engine` — documented, not started.** `portdocs/ENGINE.md`: 23 subsystems enumerated
+  with files and sizes, plus the frame-loop/`winit` analysis. Conclusion stands: don't
+  port it as one unit. **Each subsystem becomes its own Rust module under `src/engine/`**
+  (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules from 23 subsystems,
+  with ~45,700 lines deleted outright (HLTV, replay, VGui panels, dev tooling, tool
+  framework, console platform code). Its `paint.cpp` is essential for Portal 2. Corrected
+  while rewriting: **sound is ~97,200 lines, not the ~48,000 previously recorded** — the
+  largest subsystem in the module by a wide margin.
+- **Everything else is unported** and lives in `legacy/`.
+
+**Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
+`launcher_main` were deleted before the restructure, so `legacy/` no longer links a
+game binary as-is. Everything else is intact and readable. If a *running* reference is
+wanted, recover those two directories from git history
+(`git log --diff-filter=D --name-only -- launcher launcher_main` to find the commit)
+and restore them under `legacy/`.
+
+**Docs that predate the current architecture:** `portdocs/LAUNCHER.md` carries a banner
+noting what changed for it. Its factual content — module behavior analysis — remains
+accurate and is the reason to keep it; its *plan* assumed the earlier FFI-bridged model.
+`portdocs/ENGINE.md` used to carry the same banner and has since been rewritten against
+the current architecture.

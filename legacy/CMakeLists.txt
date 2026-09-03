@@ -11,7 +11,7 @@
 # Bzip2*                 inputsystem*           particles*             soundemittersystem*    vgui_surfacelib*
 # choreoobjects*         interfaces*            quickhull*             soundsystem_lowlevel*  videocfg*
 #                        launcher*              Raytrace*              stdshader_dx9*         vpklib*
-#                        launcher_main*                                studiorender*          vscript*
+#                                                                      studiorender*          vscript*
 #                        localize*                                                            vstdlib*
 # Client_CSGO*           matchmakingbase*       resourcefile*          tier0*                 vtf*
 # datacache*             matchmakingbase_ds*    responserules_runtime* tier1*
@@ -48,9 +48,9 @@ if(NOT DEDICATED)
 add_subdirectory(soundsystem/lowlevel)
 endif()
 add_subdirectory(thirdparty/quickhull)
-add_subdirectory(thirdparty/zlib-1.2.8)
-add_subdirectory(thirdparty/libpng-1.5.30)
-add_subdirectory(thirdparty/protobuf-3.5.1/cmake)
+#add_subdirectory(thirdparty/zlib-1.2.8)
+#add_subdirectory(thirdparty/libpng-1.5.30)
+#add_subdirectory(thirdparty/protobuf-3.5.1/cmake)
 add_subdirectory(utils/bzip2)
 add_subdirectory(utils/jpeglib)
 add_subdirectory(unitlib)
@@ -118,8 +118,7 @@ add_subdirectory(game/client) #CSGO Client
 add_subdirectory(game/server) #CSGO Server
 add_subdirectory(matchmaking) #Does all 4 matchmaking projects
 if( NOT DEDICATED )
-	add_subdirectory(launcher)
-	add_subdirectory(launcher_main) #The actual executable that just dlopen's launcher
+	add_subdirectory(launcher) #The game executable itself (Rust) -- see PORTING.md
 endif()
 
 if( NOT DEDICATED )

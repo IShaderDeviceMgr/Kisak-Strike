@@ -1,0 +1,19 @@
+[package]
+name = "source-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Rust rewrite of the Source engine, targeting Portal 2. See ../PORTING.md."
+
+# One project, one manifest. Every former Valve module (engine, filesystem,
+# materialsystem, ...) becomes a module under src/, not a separate crate and
+# not a separate shared library -- see ../PORTING.md, "Architecture".
+#
+# No build.rs, no CMake, no C++. The legacy C++ tree in the repo root is the
+# reference implementation this is replacing, not a dependency.
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
