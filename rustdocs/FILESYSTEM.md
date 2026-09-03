@@ -12,7 +12,7 @@ Porting rationale, C++ inventory and what was deliberately dropped are in
 |---|---|
 | Module | `crate::filesystem` |
 | Lines | ~3,600 including tests |
-| Tests | 79 (`cargo test`) |
+| Tests | 70 (`cargo test filesystem`) |
 | Dependencies | `thiserror` only |
 | Status | Implemented. Async, `.bsp` pak lumps and `sv_pure` deferred — see [Not implemented](#not-implemented) |
 

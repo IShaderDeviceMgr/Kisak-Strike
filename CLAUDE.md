@@ -38,20 +38,26 @@ cargo build
 cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and one
-dependency (`thiserror`). Release builds use full LTO and one codegen unit (see
-`Cargo.toml`).
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and four
+direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster` (each justified in a
+comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is now a unit test suite (`cargo test`, 78 tests, mostly `filesystem`), but
-**the binary is not a runnable game yet** and
-won't be until the whole boot path exists — bootstrap, filesystem, windowing, rendering,
-engine host loop, game layer. Verification in the meantime is against the reference:
-read `legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
+There is a unit test suite (`cargo test`, 91 tests, mostly `filesystem`), and the binary
+now **runs**: it mounts the game filesystem, opens a window and clears it. It is **not a
+runnable game** and won't be until the rest of the boot path exists — engine host loop,
+map loading, game layer. Verification is still mostly against the reference: read
+`legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
+
+To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
+
+```
+cargo run -- -basedir /path/to/game -game portal2 -window -width 1280 -height 720
+```
 
 ## The port: standing decisions
 
@@ -95,28 +101,57 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
 ### Status
 
 - **`src/launcher/` — ported.** Command line, single-instance lock, early-error
-  reporting, startup sequence. Mounts the filesystem, then stops; there's no engine to
-  hand off to yet.
+  reporting, startup sequence. Mounts the filesystem, then hands off to
+  `engine::window::run`.
 - **`src/filesystem/` — ported.** `Vfs` over an ordered mount list: `gameinfo.txt` ->
   search paths, KeyValues reader, case-folded directory mounts, and VPK reading
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`engine` — documented, not started** (`portdocs/ENGINE.md`). Conclusion: don't port
-  it as one unit. Each of its 23 subsystems becomes its own Rust module under
-  `src/engine/` (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules
-  surviving, ~45,700 lines deleted outright.
-- **`materialsystem` — documented, not started** (`portdocs/MATERIALSYSTEM.md`). This
-  module *is* the "rendering" step of the boot path. Settled: the `IShaderDevice`/
-  `IShaderAPI` tower is deleted and `wgpu` is used directly inside the material system,
-  which drops `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl` entirely.
-  Also settled: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in
-  `stdshaders/`, and Valve's static/dynamic shader-combo system is deleted with them.
+- **`src/materials/` — stage 1 of 8 ported.** `Renderer` owns `wgpu`'s
+  instance/adapter/device/queue/surface and exposes one frame boundary
+  (`begin_frame` → `clear` → `present`). The `IShaderDevice`/`IShaderAPI` tower is
+  deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
+  have no counterpart. **API: `rustdocs/MATERIALS.md`**; plan: `portdocs/MATERIALSYSTEM.md`.
+  Stages 2-8 (textures, materials + the WGSL prelude, meshes, lightmaps, the shader set,
+  paint maps) are not started, and nothing here loads content yet. Still settled for
+  those: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
+  Valve's static/dynamic shader-combo system is deleted with them.
+- **`src/engine/` — `window/` ported, the other 12 subsystems not started**
+  (`portdocs/ENGINE.md`, `rustdocs/ENGINE.md`). Conclusion stands: don't port `engine` as
+  one unit. Each of its 23 subsystems becomes its own Rust module under `src/engine/`
+  (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules surviving, ~45,700
+  lines deleted outright. `window/` is the `winit` event loop plus `VideoConfig`; input
+  and the engine tick are not implemented, and frame pacing lives here rather than in the
+  engine (see `rustdocs/ENGINE.md` gotcha #3).
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: the `winit`/`wgpu` groundwork, which is
-`materialsystem` stages 1-3 — deliberately *before* the engine frame loop, since it
+Next on the boot path per `PORTING.md`: `materialsystem` stage 2 (the texture path — VTF
+parse, `ImageFormat` → `wgpu::TextureFormat`, upload, mips, the error checkerboard) and
+stage 3 (the `.vmt` parser, the bind-group layout of `MATERIALSYSTEM.md` §7.4, and the
+WGSL prelude of §7.5). Both land before the engine frame loop, since the frame boundary
 constrains how that loop can be structured.
+
+### Known warts, and what triggers fixing them
+
+Deliberate small compromises, recorded so nobody has to rediscover them and nobody
+"fixes" one prematurely. Each names the condition that makes it worth doing. Both are
+also commented at the site.
+
+- **`CommandLine` lives in `src/launcher/` but is read from `src/engine/window/`.** The
+  dependency direction is backwards — the launcher boots the engine, so the engine
+  importing from it is upside down. It sits there because that is where it is built, but
+  Valve kept `CommandLine()` in `tier0` precisely because *everything* reads it, and this
+  port will end up the same way. **Move it to a crate-level `src/cmdline.rs` when a third
+  subsystem needs it** — not before, since the only cost today is one odd-looking import,
+  and the only benefit of moving early is churn in reviewed code.
+- **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
+  window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
+  `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The
+  alternative — threading a `GameInfo` back out of a `Vfs` that has no other use for one —
+  is worse for one consumer. **When a second subsystem wants gameinfo, load it once in the
+  launcher and pass it down**; the Steam app ID (`SteamAppId`, already parsed into
+  `GameInfo::steam_app_id`) is the obvious next consumer.
 
 ### Per-module porting docs
 

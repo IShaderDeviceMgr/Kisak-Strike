@@ -6,7 +6,10 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: design/scoping. Not started.**
+**Status: stage 1 of §9 done** (`wgpu`/`winit` bring-up — a cleared window). Stages 2-8
+not started. The implemented API is documented in
+[`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
+`src/materials/`, and this document before extending it.
 
 **Headline decision (settled):** the `IShaderDeviceMgr` / `IShaderDevice` / `IShaderAPI`
 / `IShaderShadow` tower is **deleted, not ported**. `wgpu` is used *directly* from inside
@@ -584,10 +587,20 @@ Each stage is meant to be independently reviewable. Nothing here produces a play
 game; stages 1–3 produce a window with pixels in it, which is the first visible
 milestone the project has.
 
-1. **`src/materials/renderer` — `wgpu` + `winit` bring-up.** Instance → adapter →
-   device/queue → surface configured against the `winit` window; acquire/clear/present.
-   Establishes the frame boundary the engine host loop will later have to fit
-   (`ENGINE.md`'s control-flow inversion). **Deliverable: a cleared window.**
+1. ~~**`src/materials/renderer` — `wgpu` + `winit` bring-up.**~~ **Done.** Instance →
+   adapter → device/queue → surface configured against the `winit` window;
+   acquire/clear/present. Landed as `src/materials/renderer.rs` (the `wgpu` half) plus
+   `src/engine/window/` (the `winit` half — windowing is `ENGINE.md` §7.3's subsystem,
+   and keeping it there is what lets `src/materials/` avoid naming `winit` at all).
+   Verified on macOS/Metal: `Bgra8UnormSrgb` surface, first frame presented.
+
+   Decisions made here that the later stages inherit, all recorded in
+   `../rustdocs/MATERIALS.md`: an **sRGB surface format** (so shaders write linear and
+   must not apply the curve themselves); **SDR / `SurfaceColorSpace::Auto`**, leaving §10's
+   HDR question open; **`wgpu::Limits::default()`** as the single capability tier of §4.6;
+   backends restricted to `METAL | VULKAN | GL`; and a frame boundary where a skipped
+   frame is `begin_frame() -> None` rather than an error. **Not** done here and still
+   owed: MSAA (`-mat_antialias`), exclusive fullscreen modes, refresh rate, gamma.
 2. **Texture path.** `.vtf` parse (`binrw`) → `ImageFormat`→`wgpu::TextureFormat`
    mapping → upload, mips, sampler creation. Include the error checkerboard, since every
    later stage depends on failing gracefully. **Deliverable: a full-screen textured quad
@@ -637,8 +650,10 @@ paths.**
 - **`IShaderAPI` leakage** (`shadowmgr.cpp`, `staticpropmgr.cpp`, `MatSystemSurface.cpp`,
   `client/`): each needs a purpose-built Rust API. Enumerate them properly before stage 4.
 - **HDR.** `GetHDRType`/`SupportsHDRMode` gate a whole rendering mode (float render
-  targets + tonemapping). Portal 2 ships HDR-lit maps. Decide early whether HDR is in the
-  first target — it affects render-target formats from stage 1.
+  targets + tonemapping). Portal 2 ships HDR-lit maps. **Still open, and now deferred by
+  default:** stage 1 configures the swap chain SDR (`SurfaceColorSpace::Auto` with an
+  sRGB format). That is a one-field change to reverse, but the rest — a float format and
+  a tonemap pass — is real work, so decide before the post-processing shaders, not after.
 - **Threading.** The queued context is deleted (§5.3), but the eventual replacement —
   parallel command encoding — should be designed for, not retrofitted. Keep render-pass
   recording free of global mutable state from the start.

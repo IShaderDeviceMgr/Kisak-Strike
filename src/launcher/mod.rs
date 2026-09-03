@@ -10,6 +10,7 @@ pub mod cmdline;
 pub mod dialog;
 pub mod single_instance;
 
+use crate::engine::window::{self, VideoConfig};
 use crate::filesystem;
 use cmdline::CommandLine;
 use single_instance::{LockError, SingleInstanceLock};
@@ -84,8 +85,8 @@ pub fn run() -> i32 {
     // an engine to hand off to there's nothing the content would be used for,
     // and reporting the problem is more useful than exiting.
     let mod_name = cmdline.value_or("-game", DEFAULT_MOD).to_string();
-    match mount_filesystem(&cmdline, &mod_name) {
-        Ok(vfs) => {
+    let (_vfs, game_title) = match mount_filesystem(&cmdline, &mod_name) {
+        Ok((vfs, title)) => {
             for warning in vfs.warnings() {
                 eprintln!("source-engine: filesystem: {warning}");
             }
@@ -95,27 +96,41 @@ pub fn run() -> i32 {
             for (path_id, description) in vfs.search_paths() {
                 eprintln!("  {path_id:<15?} {description}");
             }
+            // Held for the rest of `run()`: the mounts stay alive as long as
+            // the game does. Nothing reads through it yet — the renderer's
+            // first content load is stage 2 of portdocs/MATERIALSYSTEM.md.
+            (Some(vfs), title)
         }
         Err(err) => {
             eprintln!("source-engine: filesystem: {err}");
+            (None, None)
         }
-    }
+    };
 
-    // TODO: hand off to the engine. Nothing to hand off to yet — the engine
-    // is still C++ in `legacy/` and hasn't been ported. See portdocs/ENGINE.md
-    // for the subsystem breakdown and PORTING.md for sequencing.
-    eprintln!(
-        "source-engine: startup complete (mod: {mod_name}), but the engine is not ported yet."
-    );
-    eprintln!("See PORTING.md for the current state of the rewrite.");
+    // Create the window and run the frame loop. This is where
+    // `CEngineAPI::Run`/`MainLoop` (`engine/sys_dll2.cpp:1132`) took over.
+    //
+    // TODO: the engine itself is still unported, so the loop clears a frame
+    // and presents it. `run` returning `Ok` therefore always means "the window
+    // was closed"; `QUIT_RESTART` has to become a distinct outcome here before
+    // the original's restart loop can exist. See portdocs/ENGINE.md §6.
+    let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
+    if let Err(err) = window::run(video) {
+        dialog::report_error("Source - Error", &err.to_string());
+        return 1;
+    }
 
     0
 }
 
-/// Builds the [`Vfs`] from the command line.
+/// Builds the [`Vfs`] from the command line, and reads the game's display
+/// name out of `gameinfo.txt` on the way past.
 ///
 /// [`Vfs`]: crate::filesystem::Vfs
-fn mount_filesystem(cmdline: &CommandLine, mod_name: &str) -> filesystem::Result<filesystem::Vfs> {
+fn mount_filesystem(
+    cmdline: &CommandLine,
+    mod_name: &str,
+) -> filesystem::Result<(filesystem::Vfs, Option<String>)> {
     // `-basedir` has already been applied with `set_current_dir` above, so the
     // working directory is the base directory either way.
     let base_dir = std::env::current_dir().map_err(|e| filesystem::VfsError::io(".", e))?;
@@ -135,7 +150,19 @@ fn mount_filesystem(cmdline: &CommandLine, mod_name: &str) -> filesystem::Result
     };
 
     let game_dir = filesystem::locate_game_dir(&base_dir, mod_name);
-    filesystem::Vfs::mount_game(&game_dir, &base_dir, &options)
+
+    // The window title is `gameinfo.txt`'s `game` key
+    // (`engine/sys_mainwind.cpp:1261`, via `ModInfo()`). `mount_game` parses
+    // the same file again a line below; that's a few kilobytes read twice at
+    // startup, against threading a `GameInfo` back out of a VFS that has no
+    // other use for one. When a second subsystem wants gameinfo — the Steam
+    // app ID is the obvious next one — load it once here and pass it down.
+    let title = filesystem::GameInfo::load(&game_dir)
+        .ok()
+        .and_then(|info| info.title);
+
+    let vfs = filesystem::Vfs::mount_game(&game_dir, &base_dir, &options)?;
+    Ok((vfs, title))
 }
 
 #[cfg(target_os = "linux")]

@@ -21,6 +21,8 @@ detail lives in `portdocs/<MODULE>.md` — see "Per-module porting docs".
   src/main.rs      entry point
   src/launcher/    process bootstrap (first module ported)
   src/filesystem/  search paths, gameinfo.txt, VPK reading
+  src/materials/   the GPU device and the frame boundary (wgpu)
+  src/engine/      the engine; window/ (winit) so far
   legacy/          the original C++ tree, verbatim
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -342,7 +344,9 @@ Rules of thumb:
 - **`tier0`/`tier1` are not tasks.** They're replaced by `std` and crates as a side
   effect of porting everything else, not ported in their own right.
 - **Do the `winit`/`wgpu` groundwork deliberately**, before the engine's frame loop —
-  it constrains how that loop can be structured. See `portdocs/ENGINE.md`.
+  it constrains how that loop can be structured. See `portdocs/ENGINE.md`. *Stage 1 of
+  that groundwork (a cleared window, and the frame boundary the host loop has to fit) is
+  done; stages 2-3, textures and materials, are next.*
 - **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
   (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
   of the raw line count evaporates this way — roughly half of the compiled
@@ -411,7 +415,7 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   parsing and search-path construction, a KeyValues reader (with the `[$COND]`
   evaluator), `RelPath` normalization, `DirMount` with a cached case-folded index, and a
   `VpkMount` covering v1/v2/headerless directories, multi-archive files and embedded
-  chunks. 78 tests; the launcher mounts the game at startup and prints the search paths.
+  chunks. 70 tests; the launcher mounts the game at startup and prints the search paths.
   Deferred deliberately: async, `.bsp` pak lump mounts, `sv_pure` tracking,
   `QueuedLoader`. Two subsystems confirmed dead and excluded (`IAsyncFileSystem`, ~3,700
   lines with no callers; `filesystem_steam.cpp`, not in the build).
@@ -421,7 +425,20 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
   `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
   search paths.
-- **`materialsystem` — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
+- **`src/materials/` — stage 1 of 8 ported; `src/engine/window/` with it.** The
+  `wgpu`/`winit` groundwork this file calls for below: `Renderer` owns the `wgpu`
+  instance/adapter/device/queue/surface and exposes one frame boundary
+  (`begin_frame` → `clear` → `present`), and `src/engine/window/` owns the `winit` event
+  loop, the window, and `VideoConfig` (the port of
+  `OverrideMaterialSystemConfigFromCommandLine`). The launcher now boots into a window
+  instead of stopping after the filesystem mount. 12 new tests, 91 total; verified on
+  macOS/Metal. **APIs: `rustdocs/MATERIALS.md` and `rustdocs/ENGINE.md`** — read those
+  before calling in. Deliberate divergences, each with its reversing switch, are recorded
+  there: windowed 1280x720 with vsync on by default (Valve's real defaults come from
+  `videoconfig.cfg`, which isn't ported), SDR only, and `wgpu::Limits::default()` as the
+  single capability tier. Not yet: input, the engine tick, MSAA, exclusive fullscreen
+  modes, and any content loading at all — the renderer has no `Vfs` connection yet.
+- **`materialsystem` (stages 2-8) — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the
   "rendering" step of the boot path below** — there is no separate renderer. Settled: the

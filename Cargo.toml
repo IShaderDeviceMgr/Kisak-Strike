@@ -13,6 +13,13 @@ description = "Rust rewrite of the Source engine, targeting Portal 2. See ../POR
 # reference implementation this is replacing, not a dependency.
 
 [dependencies]
+# wgpu's adapter and device requests are async, and startup is not. pollster is
+# the whole of an executor for exactly that: block the calling thread on one
+# future. Nothing else in the engine is async, and adding a real runtime
+# (tokio/async-std) to await two calls made once at boot would be the tail
+# wagging the dog. Revisit only if async arrives for its own reasons -- the
+# filesystem's deferred async path is the likeliest candidate.
+pollster = "1.0.1"
 # Error enums. PORTING.md's "What idiomatic means concretely" names thiserror as
 # the replacement for Valve's bool-return/sentinel error convention.
 #
@@ -24,6 +31,16 @@ description = "Rust rewrite of the Source engine, targeting Portal 2. See ../POR
 # cursor instead, which is what "modernize the mechanism" actually asks for:
 # no unchecked pointer arithmetic, every read validated.
 thiserror = "2"
+# The renderer. Replaces materialsystem/shaderapidx9 + glmgr + togl outright --
+# see portdocs/MATERIALSYSTEM.md, "Headline decision". Used directly from inside
+# src/materials/; there is no device-abstraction layer over it, because wgpu
+# already is one.
+wgpu = "30.0.1"
+# Windowing and input. Replaces ILauncherMgr, appframework/sdlmgr.cpp,
+# appframework/cocoamgr.mm and the vendored thirdparty/SDL2. 0.30 is the current
+# stable line; 0.31 is in beta and its ApplicationHandler API differs, so the
+# upgrade is a deliberate change to src/engine/window/, not a version bump.
+winit = "0.30.13"
 
 [profile.release]
 lto = true

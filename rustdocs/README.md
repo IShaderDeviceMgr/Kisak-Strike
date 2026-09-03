@@ -20,6 +20,12 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
 
 - [`FILESYSTEM.md`](FILESYSTEM.md) — `src/filesystem/`. `Vfs`, `PathId`, mounts,
   `gameinfo.txt` parsing, the KeyValues reader, and VPK reading.
+- [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer`, the frame boundary, and
+  the `wgpu` decisions the rest of the renderer inherits. Its porting doc is
+  [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named after the C++
+  module, while this one is named after the Rust module.
+- [`ENGINE.md`](ENGINE.md) — `src/engine/`. Only `window` exists so far: the `winit`
+  event loop, `VideoConfig`, and where frame pacing is going to live.
 
 ## Why these exist
 

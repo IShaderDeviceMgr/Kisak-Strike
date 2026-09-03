@@ -5,12 +5,15 @@
 //! original C++ tree lives in `legacy/` and is the reference implementation
 //! this replaces, not a dependency.
 //!
-//! Subsystems are modules under `src/`. `launcher` (process bootstrap) and
-//! `filesystem` (search paths, VPKs) exist so far; `engine`, `materials`, and
-//! the rest arrive as they're ported.
+//! Subsystems are modules under `src/`. `launcher` (process bootstrap),
+//! `filesystem` (search paths, VPKs), `materials` (the GPU device) and
+//! `engine::window` (the game window) exist so far; the rest of `engine` and
+//! the game layer arrive as they're ported.
 
+mod engine;
 mod filesystem;
 mod launcher;
+mod materials;
 
 fn main() -> std::process::ExitCode {
     let code = launcher::run();
