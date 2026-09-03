@@ -6,10 +6,11 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stages 1-3 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
-texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), and the material
-path (`.vmt` → `Material` → a quad drawn with `UnlitGeneric` in WGSL). Stages 4-8 not
-started. The implemented API is documented in
+**Status: stages 1-4 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
+texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), the material path
+(`.vmt` → `Material` → `UnlitGeneric` in WGSL), and meshes plus the render context (typed
+vertex buffers, static and dynamic geometry, render targets, and a depth buffer). Stages
+5-8 not started. The implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
 
@@ -689,12 +690,65 @@ milestone the project has.
    and everything `UnlitGeneric` can do past a base texture (detail, envmap, distance
    alpha, decals, phong, flashlight) — each of which §7.8 puts with the shaders that
    share it.
-4. **Mesh + render context.** Typed vertex structs, static and dynamic buffers, the
-   render state / matrix / render-target stacks, frame begin/end. Design this against
-4. **Mesh + render context.** Typed vertex structs, static and dynamic buffers, the
-   render state / matrix / render-target stacks, frame begin/end. Design this against
-   what `studiorender` and `engine`'s world rendering actually need — read those
-   call sites *before* fixing the API.
+4. ~~**Mesh + render context.**~~ **Done.** Typed vertex structs, static and dynamic
+   buffers, render targets, the depth buffer, and the pass that replaces the render
+   state / matrix / render-target stacks. Landed as
+   `src/materials/{mesh,target,context}.rs`, with `preview.rs` rewritten on top of them
+   and `-vmt` now drawing two cubes and a ground quad instead of a full-screen quad.
+   **API: `../rustdocs/MATERIALS.md`.** `glam` was added for the matrix maths, which is
+   this file's `mathlib` substitution arriving.
+
+   Decisions made here that the later stages inherit:
+
+   - **The three stacks are deleted, not ported, and that answers §10's highest-risk
+     question.** `m_MatrixStacks`, `m_RenderTargetStack` and `m_ScissorRectStack` exist
+     because D3D9 had one global device whose state every draw shared. A `wgpu` render
+     pass already *is* that saved state, so a target, a viewport and a camera are the
+     *arguments* to opening a pass, and the model matrix is an argument to a draw. The
+     one thing that genuinely changes shape: **passes do not nest**, so portal views,
+     water reflections and post-processing run innermost-first — fill a `RenderTarget`,
+     end that pass, then open the pass that samples it. The RT stack needed deleting
+     rather than restructuring, and the dependency order it implied becomes explicit.
+   - **Vertex and index buffers are separate objects, and there is no `IMesh` equivalent.**
+     This is the thing reading `studiorender/` and `engine/` actually changed. Both real
+     draw paths build one static vertex buffer per material at load and gather the visible
+     indices into a dynamic buffer per frame — `GetDynamicMesh( false, g_WorldStaticMeshes[sortID] )`
+     (`engine/gl_rsurf.cpp:1168`) and `GetDynamicMeshEx( fmt, false, 0, pGroup->m_pMesh )`
+     (`studiorender/r_studiodraw.cpp:2268`). `IMesh` inheriting from both buffer
+     interfaces is what the `vertexOverride`/`indexOverride` parameters exist to work
+     around; fusing them here would have reproduced the bug.
+   - **The vertex layout belongs to the shader, not to the mesh and not to the pipeline
+     key.** `IShaderShadow::VertexShaderVertexFormat` is called by each shader's shadow
+     phase, so `ShaderKind::vertex_layout()` is where it lives. The key grows a layout
+     field the day one shader has two — which is `LightmappedGeneric`'s bumped variant,
+     exactly as §10 predicted.
+   - **Per-frame and per-draw constants are bump-allocated with dynamic offsets.**
+     `Queue::write_buffer` stages its copy ahead of the *whole* command buffer, so a
+     single uniform buffer rewritten between draws gives every draw in the frame the last
+     values written. This is the module's sharpest trap and it is silent; a GPU test pins
+     it.
+   - **The depth buffer belongs to the `Renderer`**, because D3D9 created it as part of
+     the swap chain and resizing it anywhere else means two places that must agree about
+     the window size. `Depth24PlusStencil8` for everything: Portal needs the stencil, and
+     `DepthBias::Decal`'s -64 was derived in 24-bit depth units, so a float format would
+     make the decal offset quietly wrong.
+   - **`Camera::screen`'s near and far go in reversed.** `glam`'s are distances along
+     `-z`; passing them the natural way round makes a larger `z` mean *nearer*. This was
+     wrong first time round and the depth GPU test is what caught it.
+
+   **A finding that corrects §10:** the **`IShaderAPI` leakage is not real in this tree.**
+   §10 lists `shadowmgr.cpp`, `staticpropmgr.cpp`, `MatSystemSurface.cpp` and `client/` as
+   sites needing purpose-built Rust APIs before stage 4. Grepping every spelling —
+   `IShaderAPI`, `g_pShaderAPI`, `IShaderDynamicAPI`, `IShaderDevice`, `IShaderShadow` —
+   outside `materialsystem/`, `public/shaderapi/` and `togl/` finds only `scaleformui` and
+   `rocketui` (deleted with `egui`), the shader-authoring headers `public/materialsystem/IShader.h`
+   and `public/shaderlib/cshader.h` (deleted with the tower), and one Perl build script.
+   Nothing in `engine/` or `game/` touches it. That item is closed.
+
+   Still owed from this stage: MSAA (`TargetFormat::samples` is in the key and always 1),
+   multiple colour attachments, 32-bit indices, stencil operations, and the `WorldVertex`
+   and `ModelVertex` structs — whose layouts are enumerated on `VertexLayout` but which
+   arrive with the shaders that read them.
 5. **Lightmaps.** `imagepacker` port, atlas pages, `colorspace` math, then
    `LightmappedGeneric`. **Deliverable: a lit BSP surface.** (Requires BSP loading, so
    this stage is gated on map loading landing.)
@@ -702,11 +756,10 @@ milestone the project has.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–3 are done, which is the whole of the "wgpu groundwork" PORTING.md says to do
-before the engine frame loop.
-Stage 4 is where the engine's real requirements start dictating the API, so **don't
-finalize the mesh/context API before reading `studiorender/` and `engine/`'s draw
-paths.**
+Stages 1–4 are done. Stage 5 is **gated on map loading** — there is no lightmap without a
+`.bsp` — so the next thing on the boot path is the engine host loop and map loading, not
+another material-system stage. `PORTING.md`'s ordering rule applies: follow the boot path
+depth-first.
 
 ## 10. Open questions and risks
 
@@ -727,26 +780,42 @@ paths.**
   cache and the plan needs a stage for it. *Stage 3 update:* `UnlitGeneric`'s
   `RenderState` has 2 × 2 × 2 × 2 × 5 × 2 × 2 reachable combinations on paper, but the
   ones content actually asks for are far fewer — `PipelineCache::len()` is the
-  measurement, and the honest answer needs a real map's material list.
+  measurement, and the honest answer needs a real map's material list. *Stage 4 update:*
+  the target format is now part of the key and has one more field that varies (a depth
+  attachment, present for the back buffer and optional for render targets), so the count
+  is per-shader-per-target rather than per-shader. Still single digits.
 - **Vertex-texture-fetch morph** (`ApplyMorph`/`SampleMorphDelta` in `common_vs_fxc.h`)
   is tied to `morph.cpp`, which §2 defers. Make sure deferring it doesn't silently break
   the shaders that call it — the prelude needs a no-op path.
 - **Vertex compression**: keep the packed formats (saves bandwidth, matches the shipped
-  MDL data) or unpack at load (simpler shaders, more memory)? Decide when stage 4 meets
-  real `studiorender` data.
-- **Render-target stack semantics.** Portal rendering, water reflections and post
-  processing all push/pop render targets, and `wgpu` render passes are not freely
-  nestable the way D3D9 RT switches were. This may force restructuring in
-  `cmatrendercontext`'s RT stack. **Highest-risk unknown after shaders.**
-- **`IShaderAPI` leakage** (`shadowmgr.cpp`, `staticpropmgr.cpp`, `MatSystemSurface.cpp`,
-  `client/`): each needs a purpose-built Rust API. Enumerate them properly before stage 4.
+  MDL data) or unpack at load (simpler shaders, more memory)? *Stage 4 update: still
+  open, and deliberately not forced.* Nothing in the current shader set declares
+  `VERTEX_FORMAT_COMPRESSED` — `VertexLitGeneric` is the first that will
+  (`vertexlitgeneric_dx9_helper.cpp:893`) — and `common_vs_fxc.h`'s
+  `DecompressBoneWeights` is the other half of the same decision, so **answer it with
+  skinning, not before it**.
+- ~~**Render-target stack semantics.**~~ **Resolved in stage 4, and the answer was
+  simpler than the question.** `wgpu` render passes are not nestable, so the stack was
+  deleted rather than restructured: a target, a viewport and a camera are the arguments
+  to opening a pass, the pass ends when it drops, and nested rendering becomes
+  *sequential* rendering in dependency order — fill a `RenderTarget`, end that pass, then
+  open the pass that samples it. Portal recursion is a loop over passes rather than a
+  stack of pushes. See `rustdocs/MATERIALS.md`, "Passes replace three stacks".
+- ~~**`IShaderAPI` leakage**~~ **— closed; the premise was wrong.** Enumerating every
+  spelling of it outside `materialsystem/`, `public/shaderapi/` and `togl/` finds
+  `scaleformui` and `rocketui` (both deleted with `egui`), the two shader-authoring
+  headers that go with the tower, and one Perl build script. `engine/` and `game/` do not
+  reference it at all, so there is nothing to design a replacement API for.
 - **HDR.** `GetHDRType`/`SupportsHDRMode` gate a whole rendering mode (float render
   targets + tonemapping). Portal 2 ships HDR-lit maps. **Still open, and now deferred by
   default:** stage 1 configures the swap chain SDR (`SurfaceColorSpace::Auto` with an
   sRGB format). That is a one-field change to reverse, but the rest — a float format and
   a tonemap pass — is real work, so decide before the post-processing shaders, not after.
 - **Threading.** The queued context is deleted (§5.3), but the eventual replacement —
-  parallel command encoding — should be designed for, not retrofitted. Keep render-pass
-  recording free of global mutable state from the start.
+  parallel command encoding — should be designed for, not retrofitted. *Stage 4 update:
+  the property is held so far.* `RenderContext` owns its arenas and reaches no global
+  mutable state; the thing that will need thought is that the per-draw uniform arena is a
+  single bump allocator, so parallel encoding wants one arena per thread rather than a
+  lock.
 - **`CMaterialSubRect`** — confirm nothing outside the module creates sub-rect materials
   before deleting.

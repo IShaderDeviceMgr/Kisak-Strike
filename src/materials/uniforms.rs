@@ -45,20 +45,70 @@
 //! nothing. So a `VMatrix`-shaped value is transposed exactly once, on its way
 //! into a uniform, and everything downstream of that is column-major.
 //!
-//! Nothing does that transpose yet, because nothing yet turns a `VMatrix` into
-//! a uniform *matrix*: the only matrix a `.vmt` can hold is a texture-coordinate
-//! transform, and those are passed as two explicit **rows** and applied with
-//! `dot`, exactly as `vertexlit_and_unlit_generic_vs20.fxc:498` does — no
-//! matrix type, no convention to get wrong. The first real one arrives with the
-//! matrix stack in stage 4, where `glam::Mat4::to_cols_array_2d` is the
-//! transpose.
+//! [`from_mat4`] and [`from_row_major`] are the two ways in, and the difference
+//! between them is exactly this convention: `glam::Mat4` is already
+//! column-major and left-multiplying, so it needs no transpose and is what the
+//! matrix stack holds; a `VMatrix` read out of Valve's data or Valve's code is
+//! row-major and needs one.
+//!
+//! The `.vmt` texture-coordinate transform is the exception that proves the
+//! rule: it is passed as two explicit **rows** and applied with `dot`, exactly
+//! as `vertexlit_and_unlit_generic_vs20.fxc:498` does — no matrix type, so no
+//! convention to get wrong.
 
 use bytemuck::{Pod, Zeroable};
+use glam::Mat4;
 
 /// A 4x4 matrix as the GPU reads it: four columns.
 pub type ColumnMajor = [[f32; 4]; 4];
 
+/// A `glam::Mat4` as a uniform.
+///
+/// No transpose: `glam::Mat4` is column-major and applies as `m * v`, which is
+/// this module's convention and WGSL's. This is a re-spelling, not a
+/// conversion, and it exists so that call sites name the convention rather than
+/// reaching for `to_cols_array_2d` and leaving the reader to check.
+pub fn from_mat4(matrix: Mat4) -> ColumnMajor {
+    matrix.to_cols_array_2d()
+}
+
+/// A Valve `VMatrix`'s `m[4][4]` as a uniform.
+///
+/// `VMatrix` subscripts as `m[row][col]` and keeps the translation in the last
+/// *column* — `m[0][3]`, `m[1][3]`, `m[2][3]` (`public/mathlib/vmatrix.h`) — so
+/// as a mathematical matrix it is the ordinary column-vector one, stored the
+/// other way round from how WGSL stores it. This transposes the array, which
+/// leaves the mathematical matrix alone: afterwards `m[3]` is the translation
+/// column and `m * v` means what it says.
+///
+/// The translation is the field to check when this looks wrong. `[0][3]`,
+/// `[1][3]`, `[2][3]` going in must come out at `[3][0]`, `[3][1]`, `[3][2]`;
+/// if it comes back unmoved, something skipped the conversion, and the picture
+/// will be plausible until the camera translates.
+///
+/// This is the *only* place a Valve-shaped matrix crosses into the port's
+/// convention. Use it when reading a matrix out of Valve data or transcribing
+/// one from Valve code; use [`from_mat4`] for anything the port computed
+/// itself.
+// No caller yet: everything the port computes itself is already a `glam::Mat4`
+// (see [`from_mat4`]). The first real one is the `.bsp`'s stored transforms and
+// anything transcribed out of `engine/view.cpp`. Kept, and tested, because it
+// is the single point at which the two conventions meet and rediscovering which
+// direction the transpose goes is the expensive part.
+#[allow(dead_code)]
+pub fn from_row_major(rows: [[f32; 4]; 4]) -> ColumnMajor {
+    // `from_cols_array_2d` reads `rows` as columns, which builds the transpose;
+    // transposing that back gives the matrix `rows` describes, now stored the
+    // way `to_cols_array_2d` and WGSL want it.
+    Mat4::from_cols_array_2d(&rows)
+        .transpose()
+        .to_cols_array_2d()
+}
+
 /// The identity, in this module's convention.
+// Read only by the tests since the matrix stack started producing real
+// matrices; kept as the statement of what the layout is.
+#[allow(dead_code)]
 pub const IDENTITY: ColumnMajor = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -165,6 +215,9 @@ pub struct DrawUniforms {
 
 impl DrawUniforms {
     /// One draw of an untransformed, unmodulated thing.
+    // `Pass::draw_modulated` builds these from a model matrix and a modulation
+    // instead; this is what a caller with neither wants.
+    #[allow(dead_code)]
     pub fn identity() -> DrawUniforms {
         DrawUniforms {
             model: IDENTITY,
@@ -199,6 +252,88 @@ mod tests {
             flat,
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn a_valve_matrix_moves_its_translation_into_the_last_column() {
+        // The one field whose position differs between the two conventions,
+        // and the one that produces a plausible picture when it is wrong: a
+        // rotation-only matrix survives a missed transpose looking merely
+        // mirrored, a translation does not survive it at all.
+        let mut rows = [[0.0f32; 4]; 4];
+        for (i, row) in rows.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        // VMatrix puts translation in the last column of each row.
+        rows[0][3] = 10.0;
+        rows[1][3] = 20.0;
+        rows[2][3] = 30.0;
+
+        let columns = from_row_major(rows);
+        assert_eq!(columns[3], [10.0, 20.0, 30.0, 1.0]);
+        // ... and nowhere else.
+        assert_eq!(columns[0], [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(columns[1], [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(columns[2], [0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn the_conversion_is_a_transpose_and_nothing_else() {
+        // Every entry distinct, so a swap of any pair shows up.
+        let mut rows = [[0.0f32; 4]; 4];
+        for (row, values) in rows.iter_mut().enumerate() {
+            for (col, value) in values.iter_mut().enumerate() {
+                *value = (row * 4 + col) as f32;
+            }
+        }
+        let columns = from_row_major(rows);
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_eq!(columns[col][row], rows[row][col], "[{row}][{col}]");
+            }
+        }
+    }
+
+    #[test]
+    fn a_glam_matrix_is_passed_through_unchanged() {
+        // The other half of the pair: glam is already in this convention, so
+        // `from_mat4` must *not* transpose. Asserting that against a matrix
+        // with a translation is what separates it from `from_row_major`.
+        let matrix = Mat4::from_translation(glam::Vec3::new(10.0, 20.0, 30.0));
+        assert_eq!(from_mat4(matrix)[3], [10.0, 20.0, 30.0, 1.0]);
+        assert_eq!(from_mat4(Mat4::IDENTITY), IDENTITY);
+    }
+
+    #[test]
+    fn a_point_transforms_the_same_way_under_both_conventions() {
+        // The end-to-end statement the other three are pieces of: apply
+        // Valve's matrix to a point Valve's way (row vector on the left, over
+        // the row-major array), apply the converted one WGSL's way (`m * v`),
+        // and get the same point.
+        let rows = [
+            [0.0, -1.0, 0.0, 5.0],
+            [1.0, 0.0, 0.0, 6.0],
+            [0.0, 0.0, 1.0, 7.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let point = [2.0f32, 3.0, 4.0, 1.0];
+
+        // Valve: result[i] = sum over j of m[i][j] * p[j] -- a column-vector
+        // multiply, which is what VMatrix's translation-in-column-3 layout is.
+        let mut valve = [0.0f32; 4];
+        for (i, out) in valve.iter_mut().enumerate() {
+            *out = (0..4).map(|j| rows[i][j] * point[j]).sum();
+        }
+
+        // Ours: the same thing WGSL does with `m * v` over four columns.
+        let columns = from_row_major(rows);
+        let mut ours = [0.0f32; 4];
+        for (i, out) in ours.iter_mut().enumerate() {
+            *out = (0..4).map(|c| columns[c][i] * point[c]).sum();
+        }
+
+        assert_eq!(valve, ours);
+        assert_eq!(valve, [2.0, 8.0, 11.0, 1.0]);
     }
 
     #[test]

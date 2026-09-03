@@ -50,10 +50,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 // rather than growing more of these imports.
 use crate::filesystem::Vfs;
 use crate::launcher::cmdline::CommandLine;
-use crate::materials::pipeline::TargetFormat;
-use crate::materials::uniforms::DrawUniforms;
 use crate::materials::{
-    Material, MaterialCache, MaterialPreview, Renderer, RendererOptions, CLEAR_COLOR,
+    Material, MaterialCache, MaterialPreview, RenderContext, Renderer, RendererOptions, CLEAR_COLOR,
 };
 
 /// Fallback window title, from `CGame::CreateGameWindow`
@@ -317,8 +315,14 @@ struct GameWindow<'a> {
     /// Owns what the preview draws, so it outlives the draw rather than being
     /// a local in [`GameWindow::create`].
     materials: Option<MaterialCache>,
-    /// The quad and the shared bind groups, built with the renderer.
+    /// The uniform arenas, the dynamic geometry buffers and the pass factory.
+    /// Built with the renderer, because it needs the device.
+    context: Option<RenderContext>,
+    /// The cube and its buffers.
     preview: Option<MaterialPreview>,
+    /// When the first frame was drawn, so the preview camera can orbit. The
+    /// engine's own clock replaces this with the host loop.
+    started: Instant,
     /// Built only when `-vmt` asked for one.
     material: Option<Arc<Material>>,
     /// When to try again after a skipped frame. See [`SKIP_RETRY`].
@@ -343,7 +347,9 @@ impl<'a> GameWindow<'a> {
             renderer: None,
             window: None,
             materials: None,
+            context: None,
             preview: None,
+            started: Instant::now(),
             material: None,
             retry_at: None,
             presented: false,
@@ -366,10 +372,12 @@ impl<'a> GameWindow<'a> {
         )?;
 
         let mut materials = MaterialCache::new(renderer.device(), renderer.queue());
-        self.preview = Some(MaterialPreview::new(
+        self.context = Some(RenderContext::new(
             renderer.device(),
-            materials.pipelines().layouts(),
+            renderer.queue(),
+            materials.pipelines(),
         ));
+        self.preview = Some(MaterialPreview::new(renderer.device()));
         self.material = self.load_test_material(&mut materials);
         self.materials = Some(materials);
         self.window = Some(window);
@@ -429,32 +437,13 @@ impl<'a> GameWindow<'a> {
             return;
         };
 
-        // Stage 3's verification draw, prepared *before* the frame is
-        // acquired: compiling the pipeline and writing the uniform buffers both
-        // need the renderer, and an acquired `Frame` borrows it for its whole
-        // lifetime. Removed with `-vmt` when stage 4's render context can draw
-        // real geometry.
-        let prepared = match (&self.material, &self.preview, &mut self.materials) {
-            (Some(material), Some(preview), Some(materials)) => {
-                let target = TargetFormat::color_only(renderer.surface_format());
-                let pipeline = materials.pipelines().get(&material.pipeline_key(target));
-
-                let size = window.inner_size();
-                preview.update(
-                    renderer.queue(),
-                    (size.width, size.height),
-                    // What a render context would build: the material's colour
-                    // and alpha, with no per-instance override to multiply in
-                    // and no camera to place it with.
-                    &DrawUniforms {
-                        modulation: material.modulation,
-                        ..DrawUniforms::identity()
-                    },
-                );
-                Some((material, preview, pipeline))
-            }
-            _ => None,
-        };
+        // Reclaimed before the frame is acquired, not after it is presented:
+        // this is the point at which the previous frame is certainly finished
+        // being *recorded*, and it keeps the reset in one place rather than on
+        // every path out of `draw`.
+        if let Some(context) = &mut self.context {
+            context.begin_frame();
+        }
 
         // `None` is the ordinary "not on screen right now" answer, not a
         // failure — see `Renderer::begin_frame`. Back off rather than asking
@@ -464,9 +453,27 @@ impl<'a> GameWindow<'a> {
             return;
         };
 
-        frame.clear(CLEAR_COLOR);
-        if let Some((material, preview, pipeline)) = &prepared {
-            frame.draw_material(preview, material, pipeline);
+        // Stage 4's verification draw. Deleted with `-vmt` and
+        // `MaterialPreview` when there is a map to draw instead.
+        let scene = (
+            &self.material,
+            &self.preview,
+            &mut self.context,
+            &mut self.materials,
+        );
+        match scene {
+            (Some(material), Some(preview), Some(context), Some(materials)) => {
+                context.draw_preview(
+                    &mut frame,
+                    materials.pipelines(),
+                    preview,
+                    material,
+                    self.started.elapsed().as_secs_f32(),
+                );
+            }
+            // Nothing to draw: clear and present anyway, so the window is a
+            // window rather than whatever was behind it.
+            _ => frame.clear(CLEAR_COLOR),
         }
 
         // Tells the compositor a frame is imminent, so it can schedule

@@ -27,6 +27,8 @@
 use std::sync::Arc;
 
 use super::error::RendererError;
+use super::pipeline::TargetFormat;
+use super::target::{DepthBuffer, CLEAR_DEPTH, DEPTH_FORMAT};
 
 /// Backends we ask `wgpu` for.
 ///
@@ -131,6 +133,16 @@ pub struct Renderer {
     /// of the next frame, because reconfiguring while a `SurfaceTexture` is
     /// alive panics.
     reconfigure_pending: bool,
+    /// The back buffer's depth-stencil attachment, kept in step with the
+    /// surface's size. `None` exactly when the surface is unconfigured, which
+    /// is when there is no area to allocate it for.
+    ///
+    /// It lives here rather than in the render context because it belongs to
+    /// the *back buffer*: D3D9 created the depth buffer as part of the
+    /// swap chain (`D3DPRESENT_PARAMETERS::AutoDepthStencilFormat`), and
+    /// resizing it anywhere else would mean two places that have to agree
+    /// about the window's size.
+    depth: Option<DepthBuffer>,
 }
 
 impl Renderer {
@@ -250,6 +262,7 @@ impl Renderer {
             config,
             configured: false,
             reconfigure_pending: false,
+            depth: None,
         };
         renderer.reconfigure();
         Ok(renderer)
@@ -270,18 +283,31 @@ impl Renderer {
         &self.queue
     }
 
-    /// The swap-chain image's format, which every pipeline drawing to the
-    /// screen has to declare as its colour target.
-    pub fn surface_format(&self) -> wgpu::TextureFormat {
-        self.config.format
-    }
-
     /// Reports a new physical window size.
     ///
     /// Cheap and idempotent: a resize to the current size does nothing. A zero
     /// dimension (a minimized window) is not an error — it unconfigures the
     /// surface, and [`begin_frame`](Self::begin_frame) then yields `None`
     /// until there is area to draw into again.
+    /// What a pipeline drawn into the back buffer must be built for.
+    ///
+    /// The colour format the surface was configured with, plus the depth
+    /// format of `target::DEPTH_FORMAT`, plus one sample. Pass it to
+    /// [`Material::pipeline_key`](super::material::Material::pipeline_key), or
+    /// read it off a [`Pass`](super::context::Pass), which carries the one it
+    /// was opened against.
+    pub fn target_format(&self) -> TargetFormat {
+        TargetFormat {
+            color: self.config.format,
+            depth: Some(DEPTH_FORMAT),
+            // MSAA is still owed from stage 1 (`-mat_antialias`); a
+            // multisampled back buffer needs a resolve target here and a
+            // matching `samples` on every pipeline, which is one field in each
+            // of two places rather than a design question.
+            samples: 1,
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if self.config.width == width && self.config.height == height && self.configured {
             return;
@@ -350,17 +376,38 @@ impl Renderer {
 
         Some(Frame {
             queue: &self.queue,
+            depth: self.depth.as_ref().map(DepthBuffer::view),
+            size: (self.config.width, self.config.height),
+            format: self.target_format(),
             texture,
             view,
             encoder,
         })
     }
 
-    /// Applies [`Self::config`] to the surface, tracking whether it took.
+    /// Applies [`Self::config`] to the surface, tracking whether it took, and
+    /// keeps the depth buffer the same size as the colour one — a mismatch is
+    /// a `wgpu` validation error rather than a stretched picture.
     fn reconfigure(&mut self) {
         self.configured = self.config.width > 0 && self.config.height > 0;
-        if self.configured {
-            self.surface.configure(&self.device, &self.config);
+        if !self.configured {
+            // Nothing to attach it to, and `wgpu` rejects a zero-sized
+            // texture. Reallocated on the way back from minimized.
+            self.depth = None;
+            return;
+        }
+        self.surface.configure(&self.device, &self.config);
+        match &mut self.depth {
+            Some(depth) => {
+                depth.resize(&self.device, self.config.width, self.config.height);
+            }
+            None => {
+                self.depth = Some(DepthBuffer::new(
+                    &self.device,
+                    self.config.width,
+                    self.config.height,
+                ));
+            }
         }
     }
 
@@ -424,48 +471,83 @@ fn select_adapter(
 #[must_use = "a Frame that is never presented is silently discarded"]
 pub struct Frame<'a> {
     queue: &'a wgpu::Queue,
+    /// The renderer's depth-stencil attachment. Always `Some` in practice —
+    /// a frame is only acquired when the surface is configured, which is when
+    /// the depth buffer exists — but carried as an `Option` so that the one
+    /// place the two could disagree is a `None` attachment rather than a
+    /// panic.
+    depth: Option<&'a wgpu::TextureView>,
+    size: (u32, u32),
+    format: TargetFormat,
     texture: wgpu::SurfaceTexture,
     view: wgpu::TextureView,
     encoder: wgpu::CommandEncoder,
 }
 
 impl Frame<'_> {
-    /// Records a clear of the whole frame.
-    ///
-    /// Stage 1's entire draw path. Later stages record real passes into the
-    /// same encoder and this becomes the first of them.
-    pub fn clear(&mut self, color: wgpu::Color) {
-        let _pass = self.begin_color_pass("clear", wgpu::LoadOp::Clear(color));
+    /// The back buffer's physical size in pixels, for `cScreenSize` and for a
+    /// viewport that means "all of it".
+    pub fn size(&self) -> (u32, u32) {
+        self.size
     }
 
-    /// Starts a pass writing to the swap-chain image.
+    /// What a pipeline drawn into this frame must be built for.
+    /// [`Renderer::target_format`].
+    pub fn target_format(&self) -> TargetFormat {
+        self.format
+    }
+
+    /// Clears the frame and draws nothing.
     ///
-    /// The one place render passes are opened, so the attachment setup is
-    /// stated once. Deliberately not public: `portdocs/MATERIALSYSTEM.md` §10
-    /// calls the render-target stack the highest-risk unknown after the
-    /// shaders, and letting callers open arbitrary passes against the back
-    /// buffer before that design exists is how it gets decided by accident.
-    pub(super) fn begin_color_pass(
-        &mut self,
-        label: &str,
-        load: wgpu::LoadOp<wgpu::Color>,
-    ) -> wgpu::RenderPass<'_> {
-        self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some(label),
+    /// `ClearBuffers( true, true )` with no pass after it — what a frame with
+    /// no scene to draw does. A frame that *is* drawing should open its pass
+    /// with [`Load::Clear`](super::context::Load::Clear) instead and clear as
+    /// part of it, rather than paying for two passes over the frame.
+    pub fn clear(&mut self, color: wgpu::Color) {
+        let (encoder, view, depth) = self.parts();
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.view,
+                view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load,
+                    load: wgpu::LoadOp::Clear(color),
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: depth.map(|view| wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(CLEAR_DEPTH),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        })
+        });
+    }
+
+    /// The encoder and the two attachments, borrowed together.
+    ///
+    /// One method rather than three accessors because a caller needs the
+    /// encoder mutably *and* the views immutably at the same time, which only
+    /// works as a single split borrow of the struct's fields.
+    ///
+    /// `pub(super)` so that [`RenderContext`](super::context::RenderContext)
+    /// can open passes and nothing outside `src/materials/` can — opening a
+    /// pass means deciding what its constants are, and that decision belongs
+    /// in one place.
+    pub(super) fn parts(
+        &mut self,
+    ) -> (
+        &mut wgpu::CommandEncoder,
+        &wgpu::TextureView,
+        Option<&wgpu::TextureView>,
+    ) {
+        (&mut self.encoder, &self.view, self.depth)
     }
 
     /// Submits everything recorded and presents the frame.
@@ -481,6 +563,9 @@ impl Frame<'_> {
             texture,
             encoder,
             view: _,
+            depth: _,
+            size: _,
+            format: _,
         } = self;
         queue.submit(std::iter::once(encoder.finish()));
         queue.present(texture);

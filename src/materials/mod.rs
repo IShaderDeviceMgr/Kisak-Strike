@@ -27,19 +27,32 @@
 //! - [`ShaderKind`](shader::ShaderKind) is the shader set, one deep so far:
 //!   `UnlitGeneric`, written in WGSL against the constant ABI in [`uniforms`]
 //!   and compiled through the cache in [`pipeline`].
-//! - [`MaterialPreview`] draws one material over the frame. That is a
-//!   *verification* path, not the beginning of a render context; see its docs.
+//! - [`mesh`] is geometry: [`SimpleVertex`](mesh::SimpleVertex) and the
+//!   [`VertexLayout`](mesh::VertexLayout) a shader declares,
+//!   [`VertexBuffer`](mesh::VertexBuffer)/[`IndexBuffer`](mesh::IndexBuffer)
+//!   for what outlives a frame, and
+//!   [`DynamicBuffers`](mesh::DynamicBuffers) for what does not.
+//! - [`RenderContext`] opens passes. A [`Pass`](context::Pass) has a target, a
+//!   [`Camera`](context::Camera) and a depth buffer, and everything Valve
+//!   stacked is a parameter of one or the other — see its docs.
+//! - [`target`] is what a pass draws into:
+//!   [`DepthBuffer`](target::DepthBuffer) and
+//!   [`RenderTarget`](target::RenderTarget).
+//! - [`MaterialPreview`] draws one material on a cube. That is a
+//!   *verification* path, not a scene graph; see its docs.
 //!
-//! Stage 4 (meshes and the render context) is not started, so the only geometry
-//! is that one quad and there is no depth buffer to draw it against.
+//! Stage 5 (lightmaps) is not started, and needs map loading before it.
 
+pub mod context;
 pub mod error;
 pub mod image_format;
 pub mod material;
+pub mod mesh;
 pub mod pipeline;
 pub mod preview;
 pub mod renderer;
 pub mod shader;
+pub mod target;
 pub mod texture;
 pub mod uniforms;
 pub mod var;
@@ -51,6 +64,7 @@ pub mod vtf;
 // `materials::image_format::ImageFormat`, ...) and is re-exported when it
 // acquires a caller, so that this list stays a statement about what the rest of
 // the engine actually uses.
+pub use context::RenderContext;
 pub use error::RendererError;
 pub use image_format::ColorSpace;
 pub use material::{Material, MaterialCache};

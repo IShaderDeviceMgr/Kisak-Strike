@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::filesystem::{keyvalues, Vfs};
 
 use super::error::VmtError;
-use super::pipeline::{BindLayouts, PipelineCache, PipelineKey, RenderState, TargetFormat};
+use super::pipeline::{BindLayouts, PipelineCache, RenderState};
 use super::shader::{self, ShaderKind};
 use super::texture::{Texture, TextureCache};
 use super::var::MaterialFlags;
@@ -67,15 +67,6 @@ impl Material {
     /// Binds the material's textures and parameters — bind group 1.
     pub fn bind_group(&self) -> &wgpu::BindGroup {
         &self.bind_group
-    }
-
-    /// The pipeline this material needs to draw into `target`.
-    pub fn pipeline_key(&self, target: TargetFormat) -> PipelineKey {
-        PipelineKey {
-            shader: self.shader,
-            state: self.state,
-            target,
-        }
     }
 
     /// Resolves a parsed `.vmt` into something drawable.

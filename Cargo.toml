@@ -62,6 +62,22 @@ wgpu = "30.0.1"
 # stable line; 0.31 is in beta and its ApplicationHandler API differs, so the
 # upgrade is a deliberate change to src/engine/window/, not a version bump.
 winit = "0.30.13"
+# Vector and matrix math. Replaces `mathlib/` -- PORTING.md's dependency graph
+# for materialsystem names the substitution directly ("mathlib (-> glam)"), and
+# `VMatrix`/`matrix3x4_t` are the shapes it stands in for. Arrives with stage 4's
+# matrix stack, which is the first thing in the port that multiplies matrices
+# rather than passing them through.
+#
+# The alternative is a hand-written Mat4: ~200 lines of multiply, inverse,
+# perspective and orthographic construction, each of which is a place to put a
+# sign error that renders a plausible wrong picture. glam has no dependencies of
+# its own and is SIMD-accelerated on the targets this port supports.
+#
+# Note the convention it settles, which `src/materials/uniforms.rs` documents at
+# length: glam::Mat4 is column-major and multiplies on the left, so it *is* this
+# port's convention rather than a thing to convert out of. Valve's row-major
+# VMatrix is what needs converting, and `uniforms::from_row_major` is where.
+glam = "0.33.6"
 
 [profile.release]
 lto = true

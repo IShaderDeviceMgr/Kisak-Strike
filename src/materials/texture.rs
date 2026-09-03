@@ -94,6 +94,12 @@ impl Texture {
         &self.sampler
     }
 
+    /// The texture itself, for the copies that need one rather than a view —
+    /// `ReadPixels`, `CopyRenderTargetToTexture`.
+    pub(super) fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
     /// Whether the texture carries transparency. `CTexture::IsTranslucent`
     /// (`ctexture.cpp:3094`).
     ///
@@ -126,12 +132,13 @@ impl Texture {
         color_space: ColorSpace,
         sampler: wgpu::Sampler,
     ) -> Result<Texture, TextureError> {
-        let format = vtf.format.gpu_format(color_space).ok_or_else(|| {
-            TextureError::UnsupportedFormat {
-                name: name.to_owned(),
-                format: vtf.format.name(),
-            }
-        })?;
+        let format =
+            vtf.format
+                .gpu_format(color_space)
+                .ok_or_else(|| TextureError::UnsupportedFormat {
+                    name: name.to_owned(),
+                    format: vtf.format.name(),
+                })?;
 
         let (block_w, block_h) = format.block_dimensions();
         if vtf.width % block_w != 0 || vtf.height % block_h != 0 {
@@ -172,7 +179,11 @@ impl Texture {
                 1,
             )
         } else {
-            (wgpu::TextureDimension::D2, wgpu::TextureViewDimension::D2, 1)
+            (
+                wgpu::TextureDimension::D2,
+                wgpu::TextureViewDimension::D2,
+                1,
+            )
         };
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -224,7 +235,11 @@ impl Texture {
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
                         mip_level: level,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: face,
+                        },
                         aspect: wgpu::TextureAspect::All,
                     },
                     &bytes,
@@ -308,6 +323,62 @@ impl Texture {
     /// lands.
     pub fn white(device: &wgpu::Device, queue: &wgpu::Queue, sampler: wgpu::Sampler) -> Texture {
         Texture::procedural(device, queue, "white", 1, &[255, 255, 255, 255], sampler)
+    }
+
+    /// A texture the GPU writes by drawing into it.
+    ///
+    /// `CTexture::InitRenderTarget` (`ctexture.cpp:1130`), reduced to what it
+    /// is: a texture with `RENDER_ATTACHMENT` on top of `TEXTURE_BINDING`.
+    /// Valve's version also carried a `RenderTargetSizeMode_t` (sizes derived
+    /// from the frame buffer at various fractions), the auto-mipmap flag and
+    /// the depth-buffer-sharing rules, none of which are decisions this makes
+    /// for the caller.
+    ///
+    /// Not translucent, whatever it ends up containing:
+    /// [`is_translucent`](Texture::is_translucent) reports what a `.vtf`'s
+    /// flags claimed, and a render target has no flags. A material that blends
+    /// one has to say so itself.
+    pub(super) fn render_target(
+        device: &wgpu::Device,
+        name: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        sampler: wgpu::Sampler,
+    ) -> Texture {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(name),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // `COPY_SRC` so a test — and later `CopyRenderTargetToTexture` and
+            // `ReadPixels` — can get the result back off the GPU.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Texture {
+            name: name.to_string(),
+            width,
+            height,
+            depth: 1,
+            mip_count: 1,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            frame: 0,
+            translucent: false,
+            texture,
+            view,
+            sampler,
+        }
     }
 
     /// A square RGBA texture built in code rather than loaded.
@@ -461,8 +532,10 @@ pub fn sampler_key(flags: TextureFlags, mip_count: u32) -> SamplerKey {
 
 impl SamplerKey {
     /// The sampler state for a texture that is drawn once, at full size, with
-    /// no wrapping — the error checkerboard and the debug blit.
-    fn simple() -> SamplerKey {
+    /// no wrapping — the error checkerboard, the debug blit, and render
+    /// targets, which `CTexture::InitRenderTarget` gives
+    /// `TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP`.
+    pub(super) fn simple() -> SamplerKey {
         SamplerKey {
             address_u: AddressMode::Clamp,
             address_v: AddressMode::Clamp,

@@ -345,11 +345,11 @@ Rules of thumb:
   effect of porting everything else, not ported in their own right.
 - **Do the `winit`/`wgpu` groundwork deliberately**, before the engine's frame loop —
   it constrains how that loop can be structured. See `portdocs/ENGINE.md`. *That
-  groundwork — stages 1-3 of `portdocs/MATERIALSYSTEM.md` §9: a cleared window with the
-  frame boundary the host loop has to fit, the texture path, and the material path — is
-  done. The next material-system stage (meshes and the render context) is deliberately
-  designed against the engine's real draw paths, so it is no longer strictly ahead of the
-  host loop in the ordering.*
+  groundwork — stages 1-4 of `portdocs/MATERIALSYSTEM.md` §9: a cleared window with the
+  frame boundary the host loop has to fit, the texture path, the material path, and the
+  meshes and render context designed against the engine's real draw paths — is done. The
+  next material-system stage is lightmaps, which needs a `.bsp`, so the host loop and map
+  loading come first.*
 - **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
   (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
   of the raw line count evaporates this way — roughly half of the compiled
@@ -428,7 +428,7 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
   `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
   search paths.
-- **`src/materials/` — stages 1-3 of 8 ported; `src/engine/window/` with it.**
+- **`src/materials/` — stages 1-4 of 8 ported; `src/engine/window/` with it.**
 
   *Stage 1, the `wgpu`/`winit` groundwork this file calls for below:* `Renderer` owns the
   `wgpu` instance/adapter/device/queue/surface and exposes one frame boundary
@@ -454,10 +454,20 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   `MaterialCache` turns a material name into a `Material` — or into the error material,
   which is itself an `UnlitGeneric` drawing the error checkerboard.
 
-  100 tests in the module, 193 total; verified on macOS/Metal, including eight
+  *Stage 4, meshes and the render context:* `mesh` is geometry — typed `#[repr(C)]` vertex
+  structs in place of `CMeshBuilder`'s 3,900 inlined lines, static buffers, and a
+  per-frame bump arena for dynamic ones — `target` is what a pass draws into
+  (`DepthBuffer`, `RenderTarget`), and `context` opens passes. **The matrix, render-target
+  and scissor stacks are deleted rather than ported:** a `wgpu` render pass already is the
+  state they saved and restored, so a target, a camera and a viewport are the arguments to
+  opening one, and nesting becomes sequencing. That closes the open question
+  `portdocs/MATERIALSYSTEM.md` §10 called the highest risk after the shaders. `glam`
+  arrives here as the `mathlib` substitution this file's dependency graph names.
+
+  124 tests in the module, 217 total; verified on macOS/Metal, including 19
   render-to-texture-and-read-the-pixels-back tests that pin down orientation, the matrix
-  convention, DXT decoding, colour modulation, the alpha-test discard and pipeline
-  dedup. **APIs: `rustdocs/MATERIALS.md` and `rustdocs/ENGINE.md`** — read those before
+  convention, depth occlusion, per-draw uniform isolation, render-to-texture-and-sample,
+  DXT decoding, colour modulation, the alpha-test discard and pipeline dedup. **APIs: `rustdocs/MATERIALS.md` and `rustdocs/ENGINE.md`** — read those before
   calling in. Deliberate divergences, each with its reversing switch, are recorded
   there: windowed 1280x720 with vsync on by default (Valve's real defaults come from
   `videoconfig.cfg`, which isn't ported), SDR only, and `wgpu::Limits::default()` as the
@@ -467,10 +477,17 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   not a property of the file**, and the shader is what decides it (Valve decided it per
   sampler, in the shader, and stage 3 put the decision back there); **matrices are
   column-major and multiply on the left**, against Valve's row-vector D3D9 convention;
-  and `-vmt <name>` draws one material full-screen as stage 3's verification path — it is
-  deleted with `preview.rs` when stage 4 lands. Not yet: input, the engine tick, meshes, a
-  depth buffer, MSAA, exclusive fullscreen modes, `mat_picmip`, and texture streaming.
-- **`materialsystem` (stages 4-8) — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
+  and `-vmt <name>` draws one material on two cubes as stage 4's verification path — it is
+  deleted with `preview.rs` when there is a map to draw instead. Two more that stage 4
+  adds: **`wgpu` render passes do not nest**, so a render target is filled by a pass that
+  has ended before the pass sampling it begins; and **per-draw constants are
+  bump-allocated with dynamic offsets**, because `Queue::write_buffer` stages its copy
+  ahead of the whole command buffer and a rewritten uniform would reach every draw in the
+  frame. Not yet: input, the engine tick, MSAA, stencil, exclusive fullscreen modes,
+  `mat_picmip`, and texture streaming.
+- **`materialsystem` (stages 5-8) — documented, not started.** Stage 5 (lightmaps) is
+  gated on map loading, so the next thing on the boot path is the engine host loop rather
+  than another material-system stage.  `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the
   "rendering" step of the boot path below** — there is no separate renderer. Settled: the

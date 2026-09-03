@@ -22,8 +22,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
-
 use super::shader::{
     ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_MATERIAL_UNIFORMS,
 };
@@ -196,17 +194,6 @@ pub struct TargetFormat {
     pub samples: u32,
 }
 
-impl TargetFormat {
-    /// The stage-3 target: one colour attachment, no depth, no MSAA.
-    pub fn color_only(format: wgpu::TextureFormat) -> TargetFormat {
-        TargetFormat {
-            color: format,
-            depth: None,
-            samples: 1,
-        }
-    }
-}
-
 /// Everything that identifies one `wgpu::RenderPipeline`.
 ///
 /// `StateSnapshot_t`, with the shader and the target folded in — they were
@@ -217,51 +204,6 @@ pub struct PipelineKey {
     pub shader: ShaderKind,
     pub state: RenderState,
     pub target: TargetFormat,
-}
-
-/// One vertex, as every stage-3 shader reads it.
-///
-/// **Provisional, and the one thing here that stage 4 will replace.**
-/// `portdocs/MATERIALSYSTEM.md` §4.4 says the mesh API must be designed against
-/// what `studiorender` and the engine's world rendering actually request, and
-/// that reading has not happened. What this is *not* is a port of
-/// `CMeshBuilder`: the 4,402 lines of `public/materialsystem/imesh.h` write
-/// attributes one at a time through a `VertexFormat_t` bitfield decoded at
-/// runtime, and the replacement is a typed struct whose layout is derived by
-/// the compiler.
-///
-/// The attributes are the ones `unlitgeneric_vs20.fxc`'s `VS_INPUT` declares
-/// and uses: position, one texture coordinate, and a colour. Its `vNormal`,
-/// `vBoneWeights` and `vBoneIndices` are declared there and read only by the
-/// skinning and lighting paths, which are bucket 1.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct Vertex {
-    /// World space. Valve's is object space, transformed by `SkinPosition`
-    /// against `cModel[0]`; here the model matrix is in
-    /// [`DrawUniforms`](super::uniforms::DrawUniforms) and does the same job.
-    pub position: [f32; 3],
-    /// `TEXCOORD0`.
-    pub texcoord: [f32; 2],
-    /// `COLOR0`, read only when `$vertexcolor` is set.
-    pub color: [f32; 4],
-}
-
-impl Vertex {
-    /// Locations match the `@location` attributes in `shaders/prelude.wgsl`.
-    const ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
-        0 => Float32x3,
-        1 => Float32x2,
-        2 => Float32x4,
-    ];
-
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Vertex::ATTRIBUTES,
-        }
-    }
 }
 
 /// The bind group layouts every pipeline shares.
@@ -334,7 +276,15 @@ impl BindLayouts {
     }
 }
 
-/// A layout holding one uniform buffer at binding 0, visible to both stages.
+/// A layout holding one uniform buffer at binding 0, visible to both stages,
+/// bound with a dynamic offset.
+///
+/// The dynamic offset is what makes groups 0 and 2 sub-allocations of one
+/// buffer rather than a buffer each: `Queue::write_buffer` stages its copy
+/// ahead of the whole command buffer, so a block rewritten between draws would
+/// be read by every draw in the frame at its final value. See
+/// [`context`](super::context)'s "Uniforms are arenas" section, which is the
+/// full statement of the hazard.
 fn uniform_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
@@ -343,7 +293,7 @@ fn uniform_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
+                has_dynamic_offset: true,
                 min_binding_size: None,
             },
             count: None,
@@ -423,7 +373,10 @@ impl PipelineCache {
                 vertex: wgpu::VertexState {
                     module,
                     entry_point: Some("vs_main"),
-                    buffers: &[Some(Vertex::layout())],
+                    // `IShaderShadow::VertexShaderVertexFormat`: the layout is
+                    // the shader's declaration, not the mesh's. See
+                    // `ShaderKind::vertex_layout`.
+                    buffers: &[Some(key.shader.vertex_layout().buffer_layout())],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -546,13 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn the_vertex_layout_matches_the_struct() {
-        let layout = Vertex::layout();
-        assert_eq!(layout.array_stride, 36, "3 + 2 + 4 floats");
-        assert_eq!(layout.attributes.len(), 3);
-        assert_eq!(layout.attributes[0].offset, 0);
-        assert_eq!(layout.attributes[1].offset, 12, "texcoord after position");
-        assert_eq!(layout.attributes[2].offset, 20, "colour after texcoord");
+    fn the_shader_is_what_decides_the_vertex_layout() {
+        // Not the mesh, and not a field of the key: the layout comes from
+        // `ShaderKind::vertex_layout`, which is `VertexShaderVertexFormat`.
+        // Two keys that differ only in shader therefore differ in layout too,
+        // which is why the key does not carry one.
+        assert_eq!(
+            ShaderKind::UnlitGeneric.vertex_layout(),
+            crate::materials::mesh::VertexLayout::Simple
+        );
     }
 
     #[test]
@@ -560,7 +515,11 @@ mod tests {
         let opaque = PipelineKey {
             shader: ShaderKind::UnlitGeneric,
             state: RenderState::default(),
-            target: TargetFormat::color_only(wgpu::TextureFormat::Rgba8Unorm),
+            target: TargetFormat {
+                color: wgpu::TextureFormat::Rgba8Unorm,
+                depth: None,
+                samples: 1,
+            },
         };
         let mut translucent = opaque;
         translucent.state.blend = BlendMode::Blend;

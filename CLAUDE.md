@@ -40,19 +40,20 @@ cargo build
 cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and five
-direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck` (each justified
-in a comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and six
+direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam` (each
+justified in a comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 193 tests), and the binary now **runs**: it
-mounts the game filesystem, opens a window, clears it, and can draw a quad through a real
-`.vmt` from the game's content — its shader, its textures and its pipeline state
-(`-vmt <name>`). It is **not a runnable game** and won't be until the rest of the boot
+There is a unit test suite (`cargo test`, 217 tests), and the binary now **runs**: it
+mounts the game filesystem, opens a window, and draws real geometry — an orbiting
+perspective camera, two overlapping cubes resolved by a depth buffer, and a ground quad
+built into per-frame dynamic buffers — textured with a real `.vmt` from the game's own
+content (`-vmt <name>`). It is **not a runnable game** and won't be until the rest of the boot
 path exists — engine host loop, map loading, game layer. Verification is still mostly against the reference: read
 `legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
 
@@ -60,8 +61,12 @@ To see it work you need a directory containing a mod directory with a `gameinfo.
 
 ```
 cargo run -- -basedir /path/to/game -game portal2 -window -width 1280 -height 720
-cargo run -- -basedir /path/to/game -game portal2 -window -vmt metal/metalwall048a
+cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
+
+Most Portal 2 world materials name `LightmappedGeneric`, which is not ported, so they
+draw the magenta error checkerboard. `tools/toolsblack` and `vgui/white` are real
+`UnlitGeneric` materials in the shipped content.
 
 ## The port: standing decisions
 
@@ -112,9 +117,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-3 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-4 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
-  (`begin_frame` → `clear` → `present`). The `IShaderDevice`/`IShaderAPI` tower is
+  (`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
   have no counterpart. Stage 2 added the texture path: `Vtf` (`.vtf` 7.0-7.5),
   `ImageFormat` (Valve's format table, the mip-offset arithmetic, and the CPU conversions
@@ -124,15 +129,26 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   coercions), `ShaderKind` (`UnlitGeneric`, rewritten in WGSL over the §7.4 constant ABI
   and the §7.5 prelude), `PipelineCache` (replacing `StateSnapshot_t` and deleting
   `TransitionTable.cpp`), and `MaterialCache` (name → `Material`, falling back to the
-  error material). `-vmt <name>` draws one material full-screen; that switch and
-  `preview.rs` are stage 3's verification path and are deleted when stage 4 lands.
-  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the two
+  error material). Stage 4 added geometry and the render context: `mesh` (typed
+  `#[repr(C)]` vertex structs replacing `CMeshBuilder`, static buffers, and a per-frame
+  bump arena for dynamic ones), `target` (`DepthBuffer`, `RenderTarget`) and `context`
+  (`RenderContext`, `Pass`, `Camera`). **Valve's matrix, render-target and scissor stacks
+  are deleted rather than ported** — a `wgpu` render pass already *is* the state they
+  saved and restored, so a target, a camera and a viewport are the arguments to opening
+  one, and nesting becomes sequencing. `glam` arrives here as the `mathlib` substitution.
+  `-vmt <name>` draws two cubes and a ground quad; that switch and
+  `preview.rs` are the verification path and are deleted when map loading lands.
+  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the four
   conventions that produce a plausible wrong picture rather than an error: **matrices are
-  column-major and multiply on the left** (Valve's are the reverse on both counts), and
+  column-major and multiply on the left** (Valve's are the reverse on both counts);
   **`ColorSpace` is a load-time decision the shader makes**, because Valve made it
-  per-sampler in the shader. Plan: `portdocs/MATERIALSYSTEM.md`.
-  Stages 4-8 (meshes and the render context, lightmaps, the rest of the shader set,
-  paint maps) are not started. Still settled for those: the shaders are
+  per-sampler in the shader; **per-draw constants need distinct arena slots**, because
+  `Queue::write_buffer` stages its copy ahead of the whole command buffer and a rewritten
+  uniform would reach every draw in the frame; and **`glam`'s `near`/`far` are distances
+  along `-z`**, so a hand-built projection can silently invert the depth comparison.
+  Plan: `portdocs/MATERIALSYSTEM.md`.
+  Stages 5-8 (lightmaps, the rest of the shader set, paint maps) are not started, and
+  stage 5 is gated on map loading. Still settled for those: the shaders are
   **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
   Valve's static/dynamic shader-combo system is deleted with them — `UnlitGeneric`
   needed no source-text variants at all, so §10's "how are variants expressed" question
@@ -146,12 +162,13 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   engine (see `rustdocs/ENGINE.md` gotcha #3).
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: `materialsystem` stage 4 — typed vertex structs,
-static and dynamic buffers, and the render state / matrix / render-target stacks, which
-between them bring the depth buffer the stage-3 pipeline state is already carrying but
-cannot apply. **Read `studiorender/` and `engine/`'s draw paths before fixing that API**
-(`portdocs/MATERIALSYSTEM.md` §9); unlike stage 3 it is not strictly ahead of the engine
-host loop, since it is the loop's requirements that should shape it.
+Next on the boot path per `PORTING.md`: **the engine host loop and map loading**, not
+another material-system stage. Stage 5 is lightmaps, which needs a `.bsp` before it has
+anything to pack, so the `wgpu` groundwork that had to come first is finished and the
+ordering hands back to `portdocs/ENGINE.md`. The frame boundary the host loop has to fit
+inside is `RenderContext::begin_frame` → `Renderer::begin_frame` → passes →
+`Frame::present`; `rustdocs/MATERIALS.md` states it precisely, including why that
+ordering is not arbitrary.
 
 ### Known warts, and what triggers fixing them
 

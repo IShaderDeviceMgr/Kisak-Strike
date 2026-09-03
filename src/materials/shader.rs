@@ -59,6 +59,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use super::image_format::ColorSpace;
+use super::mesh::VertexLayout;
 use super::pipeline::{BlendMode, DepthBias, DepthFunc, RenderState};
 use super::texture::Texture;
 use super::var::{MaterialFlags, MaterialVar};
@@ -102,6 +103,29 @@ impl ShaderKind {
     pub fn name(self) -> &'static str {
         match self {
             ShaderKind::UnlitGeneric => "UnlitGeneric",
+        }
+    }
+
+    /// The vertex layout this shader reads.
+    ///
+    /// `IShaderShadow::VertexShaderVertexFormat( flags, nTexCoords, pDims,
+    /// nUserDataSize )`, called by every shader's shadow phase — the vertex
+    /// format was always the *shader's* declaration rather than the mesh's, and
+    /// keeping it there is what lets [`PipelineKey`](super::pipeline::PipelineKey)
+    /// stay a `ShaderKind` plus state instead of growing a layout field.
+    ///
+    /// It grows a field the day a shader has two layouts. That will be
+    /// `LightmappedGeneric`, whose bumped variant adds tangents and a third
+    /// texture coordinate (`lightmappedgeneric_dx9_helper.cpp:617,672`) — which
+    /// is `portdocs/MATERIALSYSTEM.md` §7.3's bucket 3, and the first real
+    /// pipeline variant this port will have.
+    pub fn vertex_layout(self) -> VertexLayout {
+        match self {
+            // `unlitgeneric_vs20.fxc`'s `VS_INPUT` also declares `vNormal`,
+            // `vBoneWeights` and `vBoneIndices`; with lighting and skinning off
+            // — which is what `unlitgeneric_dx9.cpp` asks the shared helper for
+            // — nothing reads them.
+            ShaderKind::UnlitGeneric => VertexLayout::Simple,
         }
     }
 

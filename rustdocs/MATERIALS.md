@@ -1,9 +1,9 @@
 # `src/materials/` — API reference
 
-The material system. Right now that means three things: the GPU device and the frame
-boundary; the texture path from a `.vtf` on disk to a sampler on the GPU; and the
-material path from a `.vmt` to a compiled pipeline that can draw with it. Meshes and the
-render context are not here yet, so the only geometry is one quad.
+The material system. Right now that means five things: the GPU device and the frame
+boundary; the texture path from a `.vtf` on disk to a sampler on the GPU; the material
+path from a `.vmt` to a compiled pipeline; the geometry that pipeline draws; and the
+render context that opens a pass and puts a camera behind it.
 
 Porting design doc: [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named
 after the *original* module (`materialsystem/`), while this file is named after the Rust
@@ -12,24 +12,27 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~7,900 Rust including tests, plus ~260 of WGSL |
-| Tests | 100 (`cargo test materials`) — 8 of them run on a real GPU |
-| Dependencies | `wgpu` 30, `bytemuck`, `pollster`, `thiserror` |
-| Status | **Stages 1-3 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material` -> a drawn quad. Stages 4+ not started |
+| Lines | ~10,400 Rust including tests, plus ~260 of WGSL |
+| Tests | 124 (`cargo test materials`) — 19 of them run on a real GPU |
+| Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror` |
+| Status | **Stages 1-4 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context and a depth buffer. Stages 5+ not started |
 
 ```
 src/materials/
-  renderer.rs      Renderer, Frame, RendererOptions — the device and the frame boundary
+  renderer.rs      Renderer, Frame, RendererOptions — the device, the frame boundary, the depth buffer
   vtf.rs           Vtf, TextureFlags — reading .vtf files
   image_format.rs  ImageFormat, ColorSpace — pixel formats, size maths, CPU conversions
   texture.rs       Texture, TextureCache, SamplerKey — textures on the GPU
   var.rs           MaterialVar, MaterialFlags — what a .vmt says, and the coercions
   vmt.rs           Vmt — reading a .vmt: patches, conditionals, flags, vars
-  shader.rs        ShaderKind, ShaderParam, render_state — the shader set and its shadow phase
-  uniforms.rs      FrameUniforms, DrawUniforms — the constant ABI (§7.4)
-  pipeline.rs      RenderState, PipelineKey, PipelineCache, BindLayouts, Vertex
+  shader.rs        ShaderKind, ShaderParam, render_state, vertex_layout — the shader set and its shadow phase
+  uniforms.rs      FrameUniforms, DrawUniforms, from_mat4, from_row_major — the constant ABI (§7.4)
+  pipeline.rs      RenderState, PipelineKey, TargetFormat, PipelineCache, BindLayouts
   material.rs      Material, MaterialCache — a .vmt bound to a shader and its textures
-  preview.rs       MaterialPreview — the stage-3 verification draw. Temporary
+  mesh.rs          SimpleVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers, slices
+  target.rs        DepthBuffer, RenderTarget, DEPTH_FORMAT — what a pass draws into
+  context.rs       RenderContext, Pass, Camera, Load, StateOverride — passes and the constants under them
+  preview.rs       MaterialPreview — the stage-4 verification draw. Temporary
   shaders/prelude.wgsl        the shared prelude (§7.5)
   shaders/unlitgeneric.wgsl   the one shader
   error.rs         RendererError, VtfError, VmtError, TextureError
@@ -41,13 +44,17 @@ directly. If you find yourself adding a trait so that "another renderer could be
 in later", stop — `wgpu` is already that abstraction, and re-adding the tower is the
 specific mistake `portdocs/MATERIALSYSTEM.md` §5.1 exists to prevent.
 
+**Also deliberately absent, as of stage 4:** the matrix stack, the render-target stack
+and the scissor stack. They are not "not yet" — they are replaced. See
+[Passes replace three stacks](#passes-replace-three-stacks).
+
 ## Quick start
 
 ```rust
-use std::sync::Arc;
-use crate::materials::pipeline::TargetFormat;
-use crate::materials::uniforms::DrawUniforms;
-use crate::materials::{MaterialCache, MaterialPreview, Renderer, RendererOptions, CLEAR_COLOR};
+use glam::{Mat4, Vec3};
+use crate::materials::context::{Camera, Load};
+use crate::materials::mesh::{IndexBuffer, SimpleVertex, VertexBuffer};
+use crate::materials::{MaterialCache, RenderContext, Renderer, RendererOptions, CLEAR_COLOR};
 
 // `window` is an `Arc<winit::window::Window>`; `display` is the event loop's
 // `OwnedDisplayHandle`.
@@ -62,31 +69,47 @@ let mut renderer = Renderer::new(
 // The material dictionary, and the texture and pipeline caches under it.
 // Independent of the renderer — it holds its own `Device`/`Queue` handles.
 let mut materials = MaterialCache::new(renderer.device(), renderer.queue());
-let preview = MaterialPreview::new(renderer.device(), materials.pipelines().layouts());
+let mut context = RenderContext::new(renderer.device(), renderer.queue(), materials.pipelines());
 
 // Cannot fail: a missing or broken material is the error material.
-let wall = materials.load(&vfs, "metal/metalwall048a");
+let wall = materials.load(&vfs, "tools/toolsblack");
 
-// ... once per frame. Anything that needs the renderer happens *before*
-// `begin_frame`, because the `Frame` borrows it for its whole lifetime:
-let target = TargetFormat::color_only(renderer.surface_format());
-let pipeline = materials.pipelines().get(&wall.pipeline_key(target));
-preview.update(
-    renderer.queue(),
-    (size.width, size.height),
-    &DrawUniforms { modulation: wall.modulation, ..DrawUniforms::identity() },
-);
+// Geometry that outlives the frame.
+let vertices = VertexBuffer::new(renderer.device(), "quad", &[
+    SimpleVertex::new([0.0, 0.0, 0.0], [0.0, 0.0]),
+    SimpleVertex::new([1.0, 0.0, 0.0], [1.0, 0.0]),
+    SimpleVertex::new([1.0, 1.0, 0.0], [1.0, 1.0]),
+    SimpleVertex::new([0.0, 1.0, 0.0], [0.0, 1.0]),
+]);
+let indices = IndexBuffer::new(renderer.device(), "quad", &[0, 2, 1, 0, 3, 2]);
 
+// ... once per frame:
+context.begin_frame();                        // reclaims last frame's arenas
 if let Some(mut frame) = renderer.begin_frame() {
-    frame.clear(CLEAR_COLOR);
-    frame.draw_material(&preview, &wall, &pipeline);
+    {
+        let mut pass = context.pass(
+            &mut frame,
+            materials.pipelines(),
+            &Camera::screen(),
+            Load::Clear(CLEAR_COLOR),
+        );
+        pass.draw(&wall, &vertices.slice(), &indices.slice(), Mat4::IDENTITY);
+    }                                          // the pass ends here, on drop
     window.pre_present_notify();
     frame.present();
 }
 
-// ... on WindowEvent::Resized:
+// ... on WindowEvent::Resized. The depth buffer follows the surface.
 renderer.resize(size.width, size.height);
 ```
+
+Two orderings in there are not stylistic:
+
+- **`context.begin_frame()` comes before `renderer.begin_frame()`.** It resets the
+  uniform and geometry arenas, and anything still holding a slice from last frame will
+  read whatever overwrites it.
+- **The pass must end before the frame is presented**, which the inner block does. A
+  `wgpu` encoder allows one open pass at a time, and `Frame::present` consumes the frame.
 
 `src/engine/window/` is the only caller; see [`rustdocs/ENGINE.md`](ENGINE.md).
 
@@ -111,7 +134,7 @@ where
 
 pub fn device(&self) -> &wgpu::Device;
 pub fn queue(&self) -> &wgpu::Queue;
-pub fn surface_format(&self) -> wgpu::TextureFormat;
+pub fn target_format(&self) -> TargetFormat;   // colour + depth + samples
 pub fn resize(&mut self, width: u32, height: u32);
 pub fn begin_frame(&mut self) -> Option<Frame<'_>>;
 ```
@@ -164,33 +187,33 @@ command line.
 ### `Frame<'a>`
 
 ```rust
-pub fn clear(&mut self, color: wgpu::Color);
-pub fn draw_material(                         // stage 3 only; see below
-    &mut self,
-    preview: &MaterialPreview,
-    material: &Material,
-    pipeline: &wgpu::RenderPipeline,
-);
-pub fn present(self);   // #[must_use] on the struct
+pub fn size(&self) -> (u32, u32);              // physical pixels
+pub fn target_format(&self) -> TargetFormat;   // == Renderer::target_format
+pub fn clear(&mut self, color: wgpu::Color);   // colour and depth; draws nothing
+pub fn present(self);                          // #[must_use] on the struct
 ```
 
-One acquired swap-chain image plus the `CommandEncoder` recording into it. `present`
-consumes it: submit, then present. Dropping a `Frame` without presenting discards
-everything recorded into it — correct for an abandoned frame, silent data loss if
-accidental, which is why the type is `#[must_use]`.
+One acquired swap-chain image, the renderer's depth attachment, and the `CommandEncoder`
+recording into both. `present` consumes it: submit, then present. Dropping a `Frame`
+without presenting discards everything recorded into it — correct for an abandoned
+frame, silent data loss if accidental, which is why the type is `#[must_use]`.
 
-**A `Frame` borrows the renderer mutably for its lifetime**, so everything that needs the
-renderer — asking the pipeline cache for a pipeline (it needs the surface format), writing
-a uniform buffer (it needs the queue) — has to happen *before* `begin_frame`. That is not
-a wart to work around: `Surface::configure` panics if a frame is alive, so the borrow
-checker is enforcing a real `wgpu` rule, and the ordering it forces is the one a render
-context wants anyway.
+**A `Frame` borrows the renderer mutably for its lifetime**, so anything that needs the
+renderer itself — `resize`, another `begin_frame` — has to happen outside that borrow.
+`Surface::configure` **panics** if a frame is alive, so the borrow checker is enforcing a
+real `wgpu` rule. Do not work around it with interior mutability.
 
-Render passes against the back buffer are opened by `Frame::begin_color_pass`, which is
-`pub(super)` on purpose: `portdocs/MATERIALSYSTEM.md` §10 calls the render-target stack
-the highest-risk unknown after the shaders, and letting arbitrary callers open passes
-against the swap-chain image before that design exists is how it gets decided by
-accident.
+What that borrow does *not* block is drawing, because
+[`RenderContext`](#the-render-context) holds its own `Device`/`Queue` handles: a pass
+borrows the frame and the context together, and both are satisfied.
+
+`Frame::clear` clears colour *and* depth and opens no pass of its own beyond that — it is
+for a frame with nothing to draw. A frame that is drawing should clear as part of its
+first pass (`Load::Clear`) rather than pay for two passes over the target.
+
+Passes are opened through `RenderContext`, not here: `Frame::parts` — the encoder and the
+two attachment views, borrowed together — is `pub(super)`, so opening a pass and deciding
+what constants it carries stay in one place.
 
 ### The frame boundary
 
@@ -489,7 +512,6 @@ pub struct Material {
 }
 
 pub fn bind_group(&self) -> &wgpu::BindGroup;               // group 1
-pub fn pipeline_key(&self, target: TargetFormat) -> PipelineKey;
 
 pub fn new(
     device: &wgpu::Device,
@@ -753,6 +775,326 @@ orderings inside `render_state` are the original's and look wrong out of context
 `get` returns an `Arc` on purpose — asking the cache borrows it mutably and recording a
 pass borrows the frame, so the pipeline has to outlive the lookup.
 
+Note what is *not* a field of `PipelineKey`: the vertex layout. It comes from
+`ShaderKind::vertex_layout()`, because that is where `IShaderShadow::VertexShaderVertexFormat`
+put it — the shader declares the layout it reads, in its shadow phase. The key grows a
+field the day one shader has two layouts, which will be `LightmappedGeneric`'s bumped
+variant.
+
+---
+
+## Meshes
+
+`src/materials/mesh.rs`. Replaces `public/materialsystem/imesh.h` (4,402 lines, ~3,900 of
+them the inlined `CMeshBuilder`). None of that is ported: a vertex is a `#[repr(C)]`
+struct, its GPU layout is derived from the struct, and filling a buffer is
+`bytemuck::cast_slice`.
+
+### Vertices and layouts
+
+```rust
+pub enum VertexLayout { Simple }
+impl VertexLayout {
+    pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static>;
+    pub fn stride(self) -> u64;
+}
+
+pub trait Vertex: Pod { const LAYOUT: VertexLayout; }
+
+#[repr(C)]
+pub struct SimpleVertex { pub position: [f32; 3], pub texcoord: [f32; 2], pub color: [f32; 4] }
+impl SimpleVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> SimpleVertex; }
+```
+
+`VertexLayout` is `VertexFormat_t` (a `uint64` of flags plus per-texcoord sizes) reduced
+to what it was used for. It is an enum, not a bitfield, because the set is not open: a
+layout exists only if some shader reads it.
+
+The layouts the rest of the shader set will need are enumerated on `VertexLayout`'s own
+docs, with the `VertexShaderVertexFormat` call in each helper that says so. The short
+version, since it is the expensive half of stage 4's reading:
+
+| Shader | Attributes |
+|---|---|
+| `UnlitGeneric` | position, one texcoord, colour — `Simple` |
+| `LightmappedGeneric` | position, base uv, lightmap uv, lightmap-offset uv, normal, tangent s/t, colour; the last three only when bumped |
+| `VertexLitGeneric` | bone weights, position, normal, uv, plus a tangent from the `.vvd` when bumped |
+
+Those structs arrive **with the shaders that read them**, not before.
+
+### Buffers, and why vertices and indices are separate
+
+```rust
+pub struct VertexBuffer;   // static, immutable
+impl VertexBuffer {
+    pub fn new<V: Vertex>(device: &wgpu::Device, label: &str, vertices: &[V]) -> VertexBuffer;
+    pub fn layout(&self) -> VertexLayout;
+    pub fn slice(&self) -> VertexSlice;
+}
+
+pub struct IndexBuffer;    // static, immutable, 16-bit
+impl IndexBuffer {
+    pub fn new(device: &wgpu::Device, label: &str, indices: &[u16]) -> IndexBuffer;
+    pub fn slice(&self) -> IndexSlice;
+    pub fn range(&self, first: u32, count: u32) -> IndexSlice;   // IMesh::Draw(first, count)
+}
+```
+
+**There is no `Mesh` type, deliberately.** `IMesh` inherits from both `IVertexBuffer` and
+`IIndexBuffer`, so Valve's unit of geometry holds both — and every real draw path in the
+engine works around that, which is why `GetDynamicMesh` grew `vertexOverride` and
+`indexOverride` parameters:
+
+- World brushes: every surface sharing a material goes into one static vertex buffer at
+  map load (`engine/matsys_interface.cpp:1864`); each frame the *visible* ones' indices
+  are gathered into a dynamic buffer (`engine/gl_rsurf.cpp:1168`).
+- Models: identical shape (`studiorender/r_studiodraw.cpp:2268`).
+
+Static vertices with dynamic indices is *the* pattern, not a special case. So a draw
+takes a `VertexSlice` and an `IndexSlice` and does not care where either came from.
+
+A slice holds a cloned `wgpu::Buffer`, which is a refcounted handle rather than the
+allocation — one atomic increment. That is what lets a slice outlive the borrow of the
+arena it came from.
+
+`new` **panics on an empty slice**, matching `Assert( g_Meshes[i].vertCount > 0 )`:
+`wgpu` refuses a zero-sized buffer, and an empty static buffer is a caller bug rather
+than a state worth representing.
+
+### `DynamicBuffers` — geometry that lives one frame
+
+```rust
+pub fn begin_frame(&mut self, device: &wgpu::Device);
+pub fn vertices<V: Vertex>(&mut self, device, queue, vertices: &[V]) -> VertexSlice;
+pub fn indices(&mut self, device, queue, indices: &[u16]) -> IndexSlice;
+pub fn vertices_remaining(&self, layout: VertexLayout) -> u32;   // GetMaxVerticesToRender
+pub fn indices_remaining(&self) -> u32;                          // GetMaxIndicesToRender
+```
+
+`shaderapidx9/dynamicvb.h`'s ring allocation, with the reasoning kept and the code
+discarded: `Queue::write_buffer` stages its copy and orders it ahead of the submission
+that reads it, so a bump allocator reset once a frame is the whole of it. It **grows**
+rather than failing, unlike Valve's fixed allocation, but the `*_remaining` queries are
+still there because a batcher that splits before it overflows produces fewer
+reallocations.
+
+In practice you reach these through `Pass::vertices` / `Pass::indices`, which is where
+allocation and drawing interleave.
+
+---
+
+## The render context
+
+`src/materials/context.rs`. Replaces `cmatrendercontext.cpp` (3,455 lines);
+`CMatQueuedRenderContext` and `cmaterial_queuefriendly` are deleted outright (§5.3).
+
+### Passes replace three stacks
+
+`CMatRenderContextBase` carries `m_MatrixStacks[NUM_MATRIX_MODES]`, `m_RenderTargetStack`
+and `m_ScissorRectStack`, driven in the fixed-function idiom OpenGL 1.x taught it —
+`MatrixMode`, `PushMatrix`, `LoadIdentity`, `Ortho`, draw, `PopMatrix`
+(`engine/gl_rmain.cpp:920-985` does it three times over). Those stacks exist because D3D9
+had one global device whose state every draw shared.
+
+**A `wgpu` render pass already is that saved state.** So:
+
+| `CMatRenderContext` | Here |
+|---|---|
+| `m_RenderTargetStack` entry: targets + depth + viewport | the arguments to `pass` / `target_pass` |
+| `MATERIAL_VIEW` / `MATERIAL_PROJECTION` stacks | `Camera`, a pass argument |
+| `MATERIAL_MODEL` stack | a parameter of `Pass::draw` |
+| `m_ScissorRectStack` | `Pass::set_scissor`, which the pass ends |
+| `PushRenderTargetAndViewport` / `Pop` | opening a pass and letting it drop |
+| `OverrideDepthEnable`, `CullMode`, `FlipCullMode` | `StateOverride` |
+
+**`wgpu` render passes do not nest.** One must end before the next begins on the same
+encoder, so portal views, water reflections and post-processing run *innermost first* —
+render into a `RenderTarget`, end that pass, then open the pass that samples it. That is
+the resolution of what `portdocs/MATERIALSYSTEM.md` §10 called the highest-risk unknown
+after the shaders: the RT stack does not need restructuring, it needs deleting, and the
+dependency order it implied becomes explicit.
+
+### `RenderContext`
+
+```rust
+pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, pipelines: &PipelineCache) -> RenderContext;
+pub fn begin_frame(&mut self);
+
+pub fn pass<'a>(&'a mut self, frame: &'a mut Frame<'_>, pipelines: &'a mut PipelineCache,
+                camera: &Camera, load: Load) -> Pass<'a>;
+pub fn target_pass<'a>(&'a mut self, frame: &'a mut Frame<'_>, pipelines: &'a mut PipelineCache,
+                       target: &'a RenderTarget, camera: &Camera, load: Load) -> Pass<'a>;
+pub fn offscreen_pass<'a>(&'a mut self, encoder: &'a mut wgpu::CommandEncoder,
+                          pipelines: &'a mut PipelineCache, target: &RenderTarget,
+                          camera: &Camera, load: Load) -> Pass<'a>;
+```
+
+`pass` draws to the swap-chain image and the renderer's depth buffer; `target_pass` to an
+offscreen `RenderTarget` using the frame's encoder; `offscreen_pass` to one with an
+encoder the caller supplies and submits, for rendering that is not part of a presented
+frame.
+
+`pipelines` is passed in rather than owned because `MaterialCache` owns the
+`PipelineCache` and needs it to build materials. The two `&mut` borrows are of different
+objects, so they coexist; a material comes out of the cache as an `Arc<Material>` and is
+therefore independent of the cache's borrow.
+
+### Uniforms are arenas, not single buffers
+
+**The one hazard this module exists to prevent, and it is not obvious.** Every pass
+recorded into a frame is submitted as *one command buffer*, and `Queue::write_buffer`
+stages its copy to run before that whole command buffer — not at the point in the
+recording where it was called. So writing one uniform buffer per draw and rewriting it
+for the next does not give each draw its own constants: it gives **every draw in the
+frame the last values written**.
+
+Both blocks are therefore bump-allocated out of a large buffer and bound with a dynamic
+offset — one slot per pass for `FrameUniforms`, one per draw for `DrawUniforms`. Slots
+are padded to `min_uniform_buffer_offset_alignment` (256 on the portable floor), so a
+96-byte block costs 256 bytes. That is the price of one bind group per draw instead of
+one buffer per draw.
+
+`each_draw_gets_its_own_model_matrix` in `preview.rs` is the regression test.
+
+### `Camera`
+
+```rust
+pub struct Camera { pub view: Mat4, pub projection: Mat4, pub eye: Vec3 }
+
+pub fn screen() -> Camera;
+pub fn perspective(eye: Vec3, view: Mat4, fov_x_degrees: f32, aspect: f32,
+                   z_near: f32, z_far: f32) -> Camera;
+pub fn orthographic(eye: Vec3, view: Mat4, left: f32, right: f32, bottom: f32, top: f32,
+                    z_near: f32, z_far: f32) -> Camera;
+pub fn view_proj(&self) -> Mat4;   // projection * view
+```
+
+**Use these rather than reaching into `glam` directly.** They go through
+`glam::camera::rh::proj::directx`, where `directx` names the *NDC convention* and not the
+API: right-handed Y-up view space in, depth in `0..1` and Y-up out, which is exactly
+WebGPU's. The `opengl` module produces `-1..1` and the `vulkan` one flips Y; either would
+draw a picture, just the wrong one. (`Mat4::perspective_rh` is the deprecated spelling of
+the same function.)
+
+`fov_x_degrees` is the **horizontal** field of view, because every Valve entry point takes
+it that way (`CViewSetup::fov`); `glam` wants the vertical one, and the conversion here is
+`CalcFovY`'s.
+
+`Camera::screen()` is the 2D setup, `y` down and **`z` away from the viewer**. It passes
+`glam`'s `near`/`far` reversed, and that is deliberate: `glam`'s are distances along `-z`,
+so the natural-looking `-1.0, 1.0` would make a *larger* `z` mean *nearer* — a
+painter's-order trap for anything that thinks in layers.
+`the_screen_camera_puts_z_into_the_screen` pins it.
+
+### `Pass<'a>`
+
+```rust
+pub fn draw(&mut self, material: &Material, vertices: &VertexSlice, indices: &IndexSlice,
+            model: Mat4);
+pub fn draw_modulated(&mut self, material: &Material, vertices: &VertexSlice,
+                      indices: &IndexSlice, model: Mat4, modulation: [f32; 4]);
+
+pub fn vertices<V: Vertex>(&mut self, vertices: &[V]) -> VertexSlice;
+pub fn indices(&mut self, indices: &[u16]) -> IndexSlice;
+pub fn vertices_remaining(&self, layout: VertexLayout) -> u32;
+pub fn indices_remaining(&self) -> u32;
+
+pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, height: f32);
+pub fn set_depth_range(&mut self, x: f32, y: f32, width: f32, height: f32,
+                       near: f32, far: f32);
+pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
+pub fn set_state_override(&mut self, overrides: StateOverride);
+pub fn target_format(&self) -> TargetFormat;
+```
+
+The pass ends when it drops. `model` is object space to world space — the
+`MATERIAL_MODEL` matrix, as a parameter rather than a stack, because unlike view and
+projection it genuinely changes between draws and a caller doing a hierarchical traversal
+already has it in hand.
+
+`draw_modulated` is `IMesh::DrawModulated`: the per-instance colour is multiplied by the
+material's own, which is what `CBaseMeshDX8::DrawMesh` (`shaderapidx9/meshdx8.cpp:2378`)
+did before every draw.
+
+**`draw` panics if the vertex slice's layout is not what the material's shader declared.**
+That is a programming error, not a data error — both halves are ours — and the
+alternative is `wgpu` reading a model's bone weights as a lightmap coordinate and drawing
+something that merely looks wrong. An empty slice is *not* an error; it draws nothing.
+
+`vertices`/`indices` live on the pass, not on `RenderContext`, because that is how the
+engine draws: `GetDynamicMesh` -> fill -> `Draw`, once per batch, over and over inside
+what is one pass here. An API that made a caller allocate everything before opening a
+pass would be unusable for exactly the two call sites stage 4 was designed against.
+
+### `Load` and `StateOverride`
+
+```rust
+pub enum Load { Clear(wgpu::Color), Keep }
+
+pub struct StateOverride {
+    pub cull: Option<bool>,          // CullMode / FlipCullMode
+    pub depth_test: Option<bool>,    // OverrideDepthEnable
+    pub depth_write: Option<bool>,
+}
+```
+
+`Load::Clear` clears colour *and* depth — `ClearBuffers( true, true )`. `None` fields of a
+`StateOverride` leave the material's own choice alone; it applies from the call to the end
+of the pass. `FlipCullMode` is not a debug feature: a mirror or a portal view flips the
+view matrix horizontally, reversing every triangle's winding, and without the flip the
+whole reflected world is back-face culled.
+
+---
+
+## Render targets and the depth buffer
+
+`src/materials/target.rs`.
+
+```rust
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+pub const CLEAR_DEPTH: f32 = 1.0;
+
+pub struct DepthBuffer;
+impl DepthBuffer {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> DepthBuffer;   // panics on zero
+    pub fn view(&self) -> &wgpu::TextureView;
+    pub fn size(&self) -> (u32, u32);
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool;
+}
+
+pub struct RenderTarget;
+impl RenderTarget {
+    pub fn new(device: &wgpu::Device, name: &str, width: u32, height: u32,
+               color_format: wgpu::TextureFormat, depth: bool) -> RenderTarget;
+    pub fn texture(&self) -> &Arc<Texture>;    // bindable as a material's texture
+    pub fn format(&self) -> TargetFormat;
+    pub fn size(&self) -> (u32, u32);
+}
+```
+
+**The back buffer's depth attachment belongs to `Renderer`**, not to the render context:
+D3D9 created it as part of the swap chain, and resizing it anywhere else would mean two
+places that have to agree about the window's size. `Renderer::resize` keeps them in step;
+a mismatch is a `wgpu` validation error, not a stretched picture.
+
+`DEPTH_FORMAT` is 24-bit depth plus 8 bits of stencil, and the choice is load-bearing for
+three reasons documented at the constant: Portal 2's portal surfaces need the stencil,
+`DepthBias::Decal`'s -64 was derived by multiplying Valve's `mat_depthbias_decal` by 2^24
+(a float depth format scales the bias differently and would be quietly wrong), and it
+costs nothing from the capability tier. Nothing writes the stencil yet — pipelines carry
+`StencilState::default()` and passes leave `stencil_ops` at `None`, which `wgpu` reads as
+a read-only stencil aspect.
+
+A `RenderTarget` is **not** registered in `TextureCache`.
+`CreateNamedRenderTargetTextureEx` put render targets in the same dictionary as `.vtf`
+files, so a `.vtf` of the same name could silently shadow one. Here a render target is a
+value the caller holds, and binding one to a material is an explicit act.
+
+Multiple colour attachments (`MAX_RENDER_TARGETS` is 4) are not implemented: the only
+things in the tree that bind more than one are a lighting-preview G-buffer path behind an
+`#if 0` and CS:GO's `character_ssao`.
+
+
 ## Invariants and gotchas
 
 Ordered by how likely each is to bite.
@@ -772,50 +1114,64 @@ Ordered by how likely each is to bite.
 3. **Read parameters through `shader::param_value`, not `Vmt::var`.** A `.vmt` that does
    not mention `$alpha` has no `$alpha` var, and treating that as zero makes every such
    material invisible. `param_value` is where `InitShaderParameters`' defaults live.
-4. **A `Frame` borrows the renderer.** Compile the pipeline and write the uniform buffers
-   *before* `begin_frame`. This is a real `wgpu` rule, not a Rust inconvenience — see
-   [`Frame`](#framea).
-5. **There is no depth buffer yet.** `TargetFormat::depth` is `None`, so `RenderState`'s
-   four depth fields are carried in the pipeline key and not applied. They become live the
-   day a depth attachment exists, with no other change — but until then, `$ignorez` and
-   `$decal` look like they work and do nothing.
-6. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
+4. **Per-draw constants must go in distinct arena slots, and this is not obvious.**
+   `Queue::write_buffer` stages its copy to run before the *whole* command buffer, not at
+   the point in the recording where it was called — so one uniform buffer rewritten
+   between draws gives every draw in the frame the last values written. `RenderContext`
+   handles it; anything that adds a new per-draw block must too. See
+   [Uniforms are arenas](#uniforms-are-arenas-not-single-buffers).
+5. **`RenderContext::begin_frame` must run before anything allocates, once a frame.** It
+   resets the uniform and geometry arenas. A slice held over from the previous frame
+   reads whatever overwrites it — silently, and only under load, because the arena has to
+   wrap round to the same offset first.
+6. **A `Frame` borrows the renderer.** `resize` and a second `begin_frame` have to happen
+   outside that borrow: `Surface::configure` panics if a frame is alive, so the borrow
+   checker is enforcing a real `wgpu` rule. Drawing is unaffected — `RenderContext` holds
+   its own device handles.
+7. **`wgpu` render passes do not nest**, so a render target is filled by a pass that has
+   *ended* before the pass that samples it begins. See
+   [Passes replace three stacks](#passes-replace-three-stacks).
+8. **`Pass::draw` panics on a vertex-layout mismatch.** The layout comes from the
+   material's shader (`ShaderKind::vertex_layout`), not from the buffer, and drawing
+   model data through a world shader would otherwise reinterpret bone weights as
+   coordinates and draw something merely wrong.
+9. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
    it.** Minimizing a window reports width or height 0. `resize(w, 0)` marks the surface
    unconfigured and `begin_frame` then returns `None` until real dimensions arrive. If you
    add another path that configures the surface, replicate that guard.
-7. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
+10. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
    window, so it cannot make the call itself. It must happen immediately before
    `Frame::present`; skipping it costs compositor scheduling accuracy, not correctness.
-8. **Sizes are physical pixels.** See `Renderer::new` above.
-9. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
+11. **Sizes are physical pixels.** See `Renderer::new` above.
+12. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
    macOS/Metal). That is the replacement for `IShaderDevice::SetHardwareGammaRamp`: the
    hardware encodes on write instead of the engine warping the display's gamma ramp
    process-wide — and leaving it warped if it crashed. **Consequence:** values written by
    a shader are treated as *linear* and encoded on the way out. Do not apply an sRGB curve
    in shader code as well.
-10. **Copies into a compressed texture use the level's *physical* size, not its logical
+13. **Copies into a compressed texture use the level's *physical* size, not its logical
     one.** The tail of a DXT mip chain is levels smaller than a 4x4 block (a 64x64 DXT1
     texture ends 2x2, 1x1), and WebGPU requires a copy to be a whole number of blocks —
     writing the logical 2x2 is a validation error, not a silent truncation.
     `ImageFormat::mem_required` rounds the same way, because `GetMemRequired` did, so the
     byte counts agree. This bit once; `Texture::from_vtf` handles it.
-11. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
+14. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
     texture Valve ships is DXT, and there is no fallback tier — decompressing on the CPU
     would quadruple both load time and video memory for the whole game. An adapter without
     it fails at startup with `RendererError::NoBlockCompression` rather than half-working.
-12. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
+15. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
     adapter's ceiling.** Deliberate: §4.6 replaces `IMaterialSystemHardwareConfig`'s ~50
     caps queries and the `dxlevel` ladder with one fixed capability tier, and asking every
     machine for the same limits is what makes that tier mean anything. Raise it
     deliberately when a shader needs more; never adapter-by-adapter.
-13. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
+16. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
     and HDR is still an open question (`portdocs/MATERIALSYSTEM.md` §10). Switching it on
     means a float format and a tonemap pass, not just changing this field.
-14. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
+17. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
     merely unreachable, per `PORTING.md`'s POSIX-only rule. `WGPU_BACKEND` still overrides
     at runtime (as do `WGPU_ADAPTER_NAME` and `WGPU_DEBUG`) — those are left enabled on
     purpose as the modern equivalent of the old `-gl`/`-dx9` switches.
-15. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
+18. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
     Fine at startup, on the main thread, once. Do not call it from a frame.
 
 ## Deliberate divergences from Valve's behavior
@@ -836,13 +1192,32 @@ Each of these changes what the engine does, and each names the thing that revers
 | A blended material does not force alpha-testing at `1/255` | `CShaderShadowDX8` turns alpha test on at a reference of one 255th whenever standard alpha blending is on (`shadershadowdx8.cpp:793`), to skip fully transparent pixels. In WebGPU that is a `discard`, which costs early-Z, and the pixel contributes nothing either way | — |
 | `$fallbackmaterial` is not followed | it is reachable only from inside the fallback-shader loop, which §4.1 deletes. A material that relies on it draws with its own shader instead | — |
 | A cubemap or volume texture bound to a 2D sampler becomes the checkerboard | binding one is a `wgpu` validation error rather than a wrong picture, so it is treated as a broken texture and logged | — |
+| The matrix, render-target and scissor stacks do not exist | a `wgpu` render pass already *is* the saved state those stacks restored, and it is scoped by the borrow checker. A nested render target becomes a pass that ends before the one sampling it begins | — |
+| Render targets are not in the texture dictionary | `CreateNamedRenderTargetTextureEx` shared a namespace with `.vtf` files, so a file could silently shadow a target. Binding one is now an explicit act | — |
+| The depth buffer is `Depth24PlusStencil8` for everything | Portal's stencil, and `DepthBias::Decal`'s constant being in 24-bit depth units. Valve chose the format per render target | `target::DEPTH_FORMAT` |
+| The dynamic geometry arena grows instead of overflowing | `CDynamicVB` was a fixed allocation and callers split batches to fit. The `*_remaining` queries are still there for callers that want to | `mesh::ARENA_BYTES` |
 
 ## Not implemented
 
-Stages 4-8. There is no mesh API, no render context, no depth buffer and no render-target
-stack, so the only thing that can be drawn is one full-screen quad. The shader set is one
-shader deep. Also deliberately absent, and listed so nobody looks for them:
+Stages 5-8: lightmaps, the rest of the shader set, paint maps, GPU morph. The shader set
+is one shader deep, so most `.vmt` files in shipped content resolve to the error material
+because they name a shader that does not exist yet. Also deliberately absent, and listed
+so nobody looks for them:
 
+- **`WorldVertex` and `ModelVertex`.** The layouts are enumerated on `VertexLayout` — the
+  reading is done — but the structs arrive with `LightmappedGeneric` and
+  `VertexLitGeneric`, because a vertex struct with no shader to read it cannot be checked
+  against anything.
+- **Vertex compression** (`VERTEX_FORMAT_COMPRESSED`, packed normals and bone weights).
+  Still open, and answered *with* skinning: the shaders unpack what the vertex format
+  packs, so the two halves are one decision.
+- **32-bit indices.** `MATERIAL_INDEX_FORMAT_32BIT` exists in the enum but nothing in the
+  engine's draw paths asks for it — a batch is bounded by `GetMaxIndicesToRender` long
+  before it reaches 65,536 vertices.
+- **Multiple colour attachments.** `MAX_RENDER_TARGETS` is 4; nothing in scope binds more
+  than one.
+- **Stencil.** The depth format carries eight bits of it for Portal's sake, and no
+  pipeline writes it. Portal surfaces are what will.
 - **Everything `UnlitGeneric` can do beyond a base texture.** `$detail`, `$envmap` and
   `$envmapmask`, the distance-alpha family (`$distancealpha`, `$outline`, `$glow`, soft
   edges), `$decaltexture`, phong, and the flashlight. Each is declared in
@@ -855,17 +1230,20 @@ shader deep. Also deliberately absent, and listed so nobody looks for them:
 - **`$frame` animation.** Read but not acted on — `TextureCache` loads frame 0 (see the
   divergence table).
 - **`CMaterialSubRect`** (`subrect` materials) and `mat_stub`.
-
 - **`sv_pure`, `mat_picmip`, texture exclusion and streaming.** `CTextureManager` had all
   of it. None is worth rebuilding before there is a map to measure against.
-- **MSAA.** `-mat_antialias` is parsed nowhere yet. A multisampled swap chain needs a
-  separate render target plus a resolve, which belongs with the render-target stack in
-  stage 4.
+- **MSAA.** `-mat_antialias` is parsed nowhere yet. `TargetFormat::samples` is in the
+  pipeline key and always 1; a multisampled back buffer needs a resolve target on the
+  pass and the same `samples` on every pipeline — one field in each of two places, not a
+  design question.
 - **Exclusive fullscreen video modes.** `CVideoMode_Common`'s mode enumeration and
   `AdjustWindow`'s mode switching are not ported; fullscreen is borderless on the current
   monitor. On a modern compositor an exclusive mode change buys nothing and costs a
   display reconfiguration on every alt-tab.
 - **Refresh rate, gamma, `mat_queue_mode`.** All config-file territory.
+- **Parallel command encoding.** §5.3 deletes the queued render context but keeps its
+  reasoning; `RenderContext` records into one encoder on one thread. Nothing in it reaches
+  global mutable state, which is the property that keeps the door open.
 - **Any headless/null path** (`mat_stub.cpp`, `cmatnullrendercontext.cpp`,
   `shaderapiempty/`). §5.4: if one is ever wanted it is a single enum branch here, not
   three parallel no-op implementations.
@@ -875,55 +1253,60 @@ shader deep. Also deliberately absent, and listed so nobody looks for them:
 
 ## `MaterialPreview` — temporary, and meant to be deleted
 
-`preview.rs` draws one material over the whole frame. It exists because
-`portdocs/MATERIALSYSTEM.md` §9 makes stage 3's deliverable "a quad drawn through a real
-`.vmt` and a real WGSL shader", and because a `.vmt` that *parses* is no evidence that its
-shader compiled, that its bind groups match their layouts, or that the matrix convention
-this port just committed to is the one the shader reads.
+`preview.rs` draws one material on two overlapping cubes and a ground quad, seen through
+an orbiting perspective camera. It exists because `portdocs/MATERIALSYSTEM.md` §9 makes
+stage 4's deliverable typed vertex buffers, static and dynamic geometry, and a depth
+buffer that resolves occlusion — and none of those is a thing a unit test can see. A
+full-screen quad could not tell a working depth buffer from an absent one.
 
-What it owns is the render context's job, not a material's: the vertex and index buffers,
-the per-frame and per-draw uniform blocks, and the decision of where the quad goes.
+What changed from stage 3's version is the measure of the stage: it used to own the
+vertex and index buffers, both uniform blocks, the bind groups and the choice of where
+the quad went. All of that is `RenderContext`'s now. What is left is a cube, a camera and
+a clock — a *scene*, which is the engine's job.
 
 `src/launcher/`'s `-vmt <name>` switch is the way to ask for one:
 
 ```
-cargo run -- -basedir /path/to/game -game portal2 -window -vmt metal/metalwall048a
+cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
 
-A missing or broken name draws the error material — magenta checkerboard — which is itself
-worth seeing.
+A missing or broken name draws the error material — magenta checkerboard — which is
+itself worth seeing. Most Portal 2 world materials name `LightmappedGeneric` and will do
+exactly that until stage 6.
 
 Two things it pins down that are worth reading before writing the real one:
 
-- **The quad is the unit square with `y` down**, and `VIEW_PROJ` maps it to the whole
-  viewport with the flip. That flip reverses the winding, so `QUAD_INDICES` runs
-  `0, 2, 1` rather than `0, 1, 2` — `FrontFace::Ccw` means counter-clockwise in *clip*
-  space. Getting it backwards draws nothing at all, silently.
-- **`VIEW_PROJ` is deliberately not the identity.** An identity view-projection would
-  still draw a centred quad with a transposed matrix, and the convention would go
-  unchecked until something with a real camera depended on it.
+- **The cube is built rather than written out**, from a per-face `(normal, u, v)` triple
+  chosen so that `u × v == n`. That is what makes each face wind counter-clockwise as
+  seen from outside without anyone having to check twenty-four literals. Getting one face
+  backwards does not draw it mirrored — it draws a hole, silently, invisible from most
+  angles.
+- **The ground quad is dynamic on purpose**, not because it changes. The dynamic vertex
+  path is what every immediate-mode draw in the engine uses, and a path only the tests
+  exercise is a path that rots.
 
-**Do not grow this.** Stage 4 brings typed vertex structs, real buffers and the render
-state stack. When it lands, delete `preview.rs`, `Frame::draw_material` and the `-vmt`
-switch together — and move the GPU tests at the bottom of that file onto whatever draws a
-quad then, because they are the only place the whole path is checked against real pixels.
+**Do not grow this.** When map loading lands, delete `preview.rs` and the `-vmt` switch
+together, and move the GPU tests at the bottom of that file onto whatever draws the world
+— they are the only place the whole path is checked against real pixels.
 
 ## Test coverage
 
-100 tests, in two groups.
+124 tests, in two groups.
 
-**Pure logic, no GPU** (92) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (105) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
-| `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
 | `vtf` (18) | every version 7.0-7.5, the seventh cubemap face, partial mip chains, the thumbnail, flag masking, and each way a file can be malformed |
 | `vmt` (17) | the type sniffing, conditional keys, flags-are-not-vars, fallback blocks, and patch expansion against a real temp-directory `Vfs` |
+| `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
 | `shader` (13) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule |
 | `var` (12) | the value grammar and every coercion between the arms, plus the flag-name table against the bit constants |
 | `texture` (7) | the `.vtf` flags -> sampler policy, and name normalization |
-| `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and the vertex layout offsets |
-| `uniforms` (3) | the uniform block sizes WGSL expects, and the no-fog packing |
+| `uniforms` (7) | the uniform block sizes WGSL expects, the no-fog packing, and the row-major/column-major conversion in both directions |
+| `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout |
+| `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
+| `mesh` (4) | the vertex layout against the struct it describes, and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
 
 The `vtf` tests build files with an in-memory writer that can produce *archaic* and
@@ -933,40 +1316,43 @@ real content actually contains and that no valid-file test would reach. The `vmt
 tests write a small game directory into the temp dir and mount it, because `include` names
 a file and there is no honest way to test the chain without one.
 
-**End to end, on a real GPU** (8, in `preview.rs`) — a `.vmt` and a `.vtf`, through the
+The `context` projection tests deserve a word: `glam` offers three NDC conventions one
+module path apart, and its `near`/`far` are distances along `-z` rather than `z` values.
+`the_screen_camera_puts_z_into_the_screen` exists because that second point was got wrong
+first time round — the GPU depth test is what caught it, and this is the cheap check that
+keeps it caught.
+
+**End to end, on a real GPU** (19, in `preview.rs`) — a `.vmt` and a `.vtf`, through the
 material system, onto the GPU, through real WGSL, and back to the CPU by rendering to an
-offscreen target and reading the pixels back:
+offscreen `RenderTarget` and reading the pixels back:
 
 | Test | What it would catch |
 |---|---|
-| `a_material_draws_its_base_texture_the_right_way_up` | the three composed orientation conventions: the view projection's `y` flip, the quad's texture coordinates, and WebGPU's framebuffer origin |
-| `the_model_matrix_places_the_quad` | a transposed matrix, against a view projection that is not the identity |
+| `a_material_draws_its_base_texture_the_right_way_up` | the three composed orientation conventions: the camera's `y` flip, the quad's texture coordinates, and WebGPU's framebuffer origin |
+| `the_depth_buffer_decides_which_of_two_overlapping_quads_is_seen` | a depth buffer that is attached but not tested, or tested in the wrong direction |
+| `without_a_depth_buffer_the_last_draw_wins` | the control for the one above — without it, that test proves nothing |
+| `each_draw_gets_its_own_model_matrix` | the per-draw uniform arena: one buffer rewritten between draws would give both draws the second matrix |
+| `a_render_target_can_be_drawn_into_and_then_sampled` | the render-to-texture path that replaces `PushRenderTargetAndViewport` |
+| `a_state_override_turns_the_depth_test_off` | `OverrideDepthEnable`, the `$ignorez` path |
+| `back_faces_are_culled_and_a_state_override_can_stop_it` | the winding convention, and `CullMode`/`FlipCullMode` |
+| `a_static_vertex_buffer_can_be_drawn_with_dynamic_indices` | the world and model draw pattern — the reason vertex and index buffers are separate |
+| `an_index_range_draws_only_its_batch` | `IMesh::Draw( first, count )` over a shared buffer |
+| `an_odd_number_of_indices_draws` | the copy-alignment padding leaking into the draw as a second, garbage triangle |
+| `the_cube_is_wound_so_that_every_face_survives_culling` | a hole in a cube, which is invisible from most angles and obvious from one |
+| `the_preview_scene_draws_its_ground` | the other half of that: a quad wound the wrong way is not a wrong picture but an absent one |
 | `a_dxt1_texture_is_decoded_by_the_hardware` | block layout and the BC feature |
 | `the_error_material_draws_the_checkerboard` | the whole fallback path, through the real `MaterialCache` |
 | `colour_modulation_multiplies_the_texture` | `$color * $color2` reaching `cModulationColor` |
+| `modulation_multiplies_the_material_by_the_instance` | `IMesh::DrawModulated` — the per-instance colour on top of the material's |
 | `an_alpha_tested_material_discards_below_its_reference` | the `discard` that replaces D3D9's fixed-function alpha test |
 | `a_material_with_no_base_texture_draws_white_not_the_checkerboard` | the difference between an *undefined* texture parameter and a *failed* one |
-| `materials_with_the_same_state_share_one_pipeline` | the dedup that replaces `TransitionTable` |
+| `identical_states_share_one_pipeline` | the dedup that replaces `TransitionTable` |
 
-They earn the GPU: row pitch, block layout, channel order, winding, matrix convention and
-bind group layout are all invisible to a unit test, and each produces a *plausible* wrong
-picture rather than a crash. The winding was in fact wrong first time round, and drew
-nothing at all — silently — which is exactly what these are for.
+They earn the GPU: row pitch, block layout, channel order, winding, matrix convention,
+depth direction and bind group layout are all invisible to a unit test, and each produces
+a *plausible* wrong picture rather than a crash. `the_depth_buffer_decides_which_of_two_overlapping_quads_is_seen`
+earned its place immediately: it caught `Camera::screen` passing `glam` its near and far
+planes the wrong way round, which had inverted the depth comparison for every 2D draw.
 
 **They skip, printing why, when no adapter with BC support is available**, so a machine
 with no GPU still gets a green `cargo test`.
-
-Nothing tests `Renderer` itself, and that stays deliberate: every function there either
-calls `wgpu` or hands a value straight to it, so a unit test would assert that arguments
-were passed along. What verifies it is running it. On macOS/Metal that produces:
-
-```
-source-engine: renderer: Apple M1 Pro (IntegratedGpu, "") via Metal
-source-engine: renderer: 640x480 Bgra8UnormSrgb, vsync on
-source-engine: materials: -vmt metal/wall -> UnlitGeneric (metal/wall), flags none
-source-engine: renderer: first frame presented
-```
-
-The last line is the one that matters and is printed once, from `src/engine/window/`:
-creating a device and creating a window both succeed on machines where nothing is ever
-presented, so "a window opened" is not evidence that the GPU path works. That line is.

@@ -54,12 +54,12 @@ enforces on every platform.
 
 `vfs` is the mounted game content, and is `Option` because a failed mount is survivable:
 the launcher reports it and boots the window anyway, since a window that opens and says
-what is wrong beats a process that exits. `test_material` is `-vmt <name>`, **stage 3 of
-`portdocs/MATERIALSYSTEM.md` §9's verification path**: it loads `materials/<name>.vmt`,
-resolves its shader and textures, and draws it over the frame — falling back to the error
+what is wrong beats a process that exits. `test_material` is `-vmt <name>`, **`portdocs/MATERIALSYSTEM.md` §9's verification
+path**: it loads `materials/<name>.vmt`, resolves its shader and textures, and draws it
+on two cubes and a ground quad under an orbiting camera — falling back to the error
 material if anything about that fails, including there being no `vfs` at all. Both that
-parameter and `crate::materials::MaterialPreview` are deleted when stage 4's render
-context can draw real geometry.
+parameter and `crate::materials::MaterialPreview` are deleted when there is a map to draw
+instead.
 
 The signature will keep growing until there is an engine to hand these to — that is the
 seam `CEngineAPI::Run` occupied, and it is not yet a real one.
@@ -185,11 +185,19 @@ Both are in `from_command_line`, both are guarded by tests:
   they replace (`Key_Event` → VGui → RocketUI → GameUI, `sys_mainwind.cpp:399`) and the
   UI-precedence design question `egui` raises are in `portdocs/ENGINE.md` §6.
 - **The engine tick.** `about_to_wait` currently requests a redraw and `RedrawRequested`
-  clears one frame and, with `-vmt`, draws one material over it. That draw call is the
-  seam where one engine tick will go. Note the ordering `draw` already has to observe:
-  everything needing the renderer — the pipeline lookup, the uniform writes — happens
-  *before* `begin_frame`, because the acquired frame borrows it. A tick will have to be
-  split the same way.
+  draws one frame — with `-vmt`, the preview scene; otherwise a clear. That draw call is
+  the seam where one engine tick will go. Two orderings `draw` already observes and a
+  tick will inherit:
+  - **`RenderContext::begin_frame` runs before `Renderer::begin_frame`**, and before
+    anything allocates. It reclaims the previous frame's uniform and geometry arenas, and
+    a slice held across it reads whatever overwrites it.
+  - **Every pass ends before `Frame::present`.** A `wgpu` encoder allows one open pass at
+    a time, and `present` consumes the frame, so the borrow checker enforces both.
+
+  What is *no longer* a constraint, and used to be: work no longer has to be hoisted
+  ahead of `begin_frame` just because the frame borrows the renderer. `RenderContext`
+  holds its own `Device`/`Queue` handles, so a pass borrows the frame and the context
+  together. `resize` and a second `begin_frame` are still outside that borrow.
 - **Multiple windows / `AddView`.** Never coming back; the original needed them for
   Hammer.
 - **Window icon** (`SetApplicationIcon` from `resource/game-icon.bmp`,
