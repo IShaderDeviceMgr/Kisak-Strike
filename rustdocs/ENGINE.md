@@ -22,9 +22,9 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 | | |
 |---|---|
 | Module | `crate::engine::window` |
-| Lines | ~530 including tests |
+| Lines | ~640 including tests |
 | Tests | 12 (`cargo test engine::window`) |
-| Dependencies | `winit` 0.30, `crate::materials`, `crate::launcher::cmdline` |
+| Dependencies | `winit` 0.30, `crate::materials`, `crate::filesystem`, `crate::launcher::cmdline` |
 
 ### Quick start
 
@@ -32,7 +32,7 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 use crate::engine::window::{run, VideoConfig};
 
 let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
-run(video)?;   // returns when the window closes
+run(video, vfs.as_ref(), cmdline.value("-vtf"))?;   // returns when the window closes
 ```
 
 `src/launcher/mod.rs` is the only caller, and this is where `CEngineAPI::Run`/`MainLoop`
@@ -41,12 +41,28 @@ run(video)?;   // returns when the window closes
 ### `run`
 
 ```rust
-pub fn run(config: VideoConfig) -> Result<(), WindowError>;
+pub fn run(
+    config: VideoConfig,
+    vfs: Option<&Vfs>,
+    test_texture: Option<&str>,
+) -> Result<(), WindowError>;
 ```
 
 Creates the event loop, the window and the renderer, and runs until the window closes.
 **Must be called from the main thread** — a hard AppKit requirement on macOS that `winit`
 enforces on every platform.
+
+`vfs` is the mounted game content, and is `Option` because a failed mount is survivable:
+the launcher reports it and boots the window anyway, since a window that opens and says
+what is wrong beats a process that exits. `test_texture` is `-vtf <name>`, **stage 2 of
+`portdocs/MATERIALSYSTEM.md` §9's verification path**: it loads `materials/<name>.vtf`
+and draws it over the frame, falling back to the error checkerboard if anything about
+that fails (including there being no `vfs` at all). Both that parameter and
+`crate::materials::TextureBlit` are deleted when stage 3's material path can draw a quad
+through a real `.vmt`.
+
+The signature will keep growing until there is an engine to hand these to — that is the
+seam `CEngineAPI::Run` occupied, and it is not yet a real one.
 
 A failure inside a `winit` callback cannot be returned from that callback, so a startup
 error is parked on the handler, the loop is asked to exit, and the error is re-raised

@@ -165,10 +165,24 @@ impl Renderer {
         let adapter = select_adapter(&instance, &surface, options.adapter_index)?;
         let info = adapter.get_info();
 
+        // Every texture Valve ships is DXT-compressed, so this is not optional
+        // and there is no fallback tier to drop to — decompressing on the CPU
+        // would quadruple both load time and video memory for the whole game.
+        // Checked here rather than left to `request_device` so the message says
+        // what is actually missing.
+        if !adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+        {
+            return Err(RendererError::NoBlockCompression {
+                adapter: info.name.clone(),
+            });
+        }
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("source-engine"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
                 // The portable floor, not the adapter's ceiling. `portdocs/
                 // MATERIALSYSTEM.md` §4.6 replaces `IMaterialSystemHardwareConfig`'s
                 // ~50 caps queries and the `dxlevel` ladder with one fixed
@@ -238,6 +252,27 @@ impl Renderer {
         };
         renderer.reconfigure();
         Ok(renderer)
+    }
+
+    /// The GPU device, for building textures, buffers and pipelines.
+    ///
+    /// `wgpu::Device` and `wgpu::Queue` are cheap handles to shared state and
+    /// are `Clone`, so a subsystem that needs to create resources holds its own
+    /// copy rather than borrowing the renderer for its lifetime — which is what
+    /// lets [`crate::materials::TextureCache`] exist outside this struct.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The submission queue. See [`Renderer::device`].
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The swap-chain image's format, which every pipeline drawing to the
+    /// screen has to declare as its colour target.
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
     }
 
     /// Reports a new physical window size.
@@ -399,14 +434,29 @@ impl Frame<'_> {
     /// Stage 1's entire draw path. Later stages record real passes into the
     /// same encoder and this becomes the first of them.
     pub fn clear(&mut self, color: wgpu::Color) {
-        let _pass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear"),
+        let _pass = self.begin_color_pass("clear", wgpu::LoadOp::Clear(color));
+    }
+
+    /// Starts a pass writing to the swap-chain image.
+    ///
+    /// The one place render passes are opened, so the attachment setup is
+    /// stated once. Deliberately not public: `portdocs/MATERIALSYSTEM.md` §10
+    /// calls the render-target stack the highest-risk unknown after the
+    /// shaders, and letting callers open arbitrary passes against the back
+    /// buffer before that design exists is how it gets decided by accident.
+    pub(super) fn begin_color_pass(
+        &mut self,
+        label: &str,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) -> wgpu::RenderPass<'_> {
+        self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(color),
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -414,7 +464,7 @@ impl Frame<'_> {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        })
     }
 
     /// Submits everything recorded and presents the frame.

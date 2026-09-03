@@ -48,8 +48,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 // Valve kept `CommandLine()` in tier0 precisely because everything reads it.
 // If a third subsystem needs it, move it to a crate-level `src/cmdline.rs`
 // rather than growing more of these imports.
+use crate::filesystem::Vfs;
 use crate::launcher::cmdline::CommandLine;
-use crate::materials::{Renderer, RendererOptions, CLEAR_COLOR};
+use crate::materials::{
+    ColorSpace, Renderer, RendererOptions, TextureBlit, TextureCache, CLEAR_COLOR,
+};
 
 /// Fallback window title, from `CGame::CreateGameWindow`
 /// (`engine/sys_mainwind.cpp:1266`) — used when `gameinfo.txt` has no `game`
@@ -267,11 +270,20 @@ pub enum WindowError {
 /// the boot sequence (`engine/sys_dll2.cpp:1132`), and on POSIX it must be
 /// called from the main thread — a hard requirement of macOS's AppKit that
 /// `winit` enforces.
-pub fn run(config: VideoConfig) -> Result<(), WindowError> {
+pub fn run(
+    config: VideoConfig,
+    vfs: Option<&Vfs>,
+    test_texture: Option<&str>,
+) -> Result<(), WindowError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = GameWindow::new(config, event_loop.owned_display_handle());
+    let mut app = GameWindow::new(
+        config,
+        event_loop.owned_display_handle(),
+        vfs,
+        test_texture,
+    );
     event_loop.run_app(&mut app)?;
 
     // A failure inside a `winit` callback cannot be returned from it, so it is
@@ -284,15 +296,26 @@ pub fn run(config: VideoConfig) -> Result<(), WindowError> {
 
 /// The `winit` application handler: everything Valve's `CGame` and `CSDLMgr`
 /// were between them, minus the event normalization `winit` already does.
-struct GameWindow {
+struct GameWindow<'a> {
     config: VideoConfig,
     /// The display connection, kept because the renderer is built later, in
     /// `resumed`, and `wgpu` wants it on the instance.
     display: OwnedDisplayHandle,
+    /// The mounted game content, if it mounted. `None` is survivable — see
+    /// [`GameWindow::load_test_texture`].
+    vfs: Option<&'a Vfs>,
+    /// `-vtf <name>`: the stage-2 verification switch. See
+    /// [`GameWindow::load_test_texture`].
+    test_texture: Option<&'a str>,
     /// Declared before `window` so the surface is torn down before the window
     /// it points at.
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
+    /// The name-to-texture dictionary. Owns the textures the blit draws, so it
+    /// outlives them rather than being a local in [`GameWindow::create`].
+    textures: Option<TextureCache>,
+    /// Built only when `-vtf` asked for one.
+    blit: Option<TextureBlit>,
     /// When to try again after a skipped frame. See [`SKIP_RETRY`].
     retry_at: Option<Instant>,
     /// Whether the milestone line has been printed. See [`GameWindow::draw`].
@@ -300,13 +323,22 @@ struct GameWindow {
     startup_error: Option<WindowError>,
 }
 
-impl GameWindow {
-    fn new(config: VideoConfig, display: OwnedDisplayHandle) -> Self {
+impl<'a> GameWindow<'a> {
+    fn new(
+        config: VideoConfig,
+        display: OwnedDisplayHandle,
+        vfs: Option<&'a Vfs>,
+        test_texture: Option<&'a str>,
+    ) -> Self {
         GameWindow {
             config,
             display,
+            vfs,
+            test_texture,
             renderer: None,
             window: None,
+            textures: None,
+            blit: None,
             retry_at: None,
             presented: false,
             startup_error: None,
@@ -327,9 +359,54 @@ impl GameWindow {
             &self.config.renderer_options(),
         )?;
 
+        self.blit = self.load_test_texture(&renderer);
         self.window = Some(window);
         self.renderer = Some(renderer);
         Ok(())
+    }
+
+    /// Loads `-vtf <name>` and prepares to draw it over the frame.
+    ///
+    /// **Stage 2 verification only.** `portdocs/MATERIALSYSTEM.md` §9 makes the
+    /// deliverable of the texture stage a real `.vtf` out of a real VPK, on
+    /// screen; this is the switch that asks for one, and it goes away with
+    /// `crate::materials::TextureBlit` when stage 3's material path can draw.
+    ///
+    /// Failure is deliberately not an error. A missing or broken texture
+    /// resolves to the error checkerboard, exactly as
+    /// `CTextureManager::FindOrLoadTexture` did, because "one texture is
+    /// broken" must never be "the game does not start" — and seeing the
+    /// checkerboard is itself evidence that the fallback path works.
+    fn load_test_texture(&mut self, renderer: &Renderer) -> Option<TextureBlit> {
+        let name = self.test_texture?;
+        let textures = self
+            .textures
+            .insert(TextureCache::new(renderer.device(), renderer.queue()));
+
+        // Colour, since a `-vtf` is something someone wants to look at. A
+        // material would decide per sampler instead — see rustdocs/MATERIALS.md.
+        let texture = match self.vfs {
+            Some(vfs) => textures.load(vfs, name, ColorSpace::Srgb),
+            None => {
+                eprintln!("source-engine: materials: -vtf {name}: no game content is mounted");
+                textures.error_texture()
+            }
+        };
+
+        eprintln!(
+            "source-engine: materials: -vtf {} -> {}x{} {:?}, {} mip(s)",
+            name, texture.width, texture.height, texture.format, texture.mip_count
+        );
+
+        let blit = TextureBlit::new(renderer.device(), renderer.surface_format(), &texture);
+        if blit.is_none() {
+            eprintln!(
+                "source-engine: materials: -vtf {name}: {:?} textures cannot be shown by the \
+                 stage-2 blit",
+                texture.view_dimension
+            );
+        }
+        blit
     }
 
     /// One frame.
@@ -357,6 +434,11 @@ impl GameWindow {
         };
 
         frame.clear(CLEAR_COLOR);
+        // Stage 2's verification draw. Removed with `-vtf` when stage 3's
+        // material path can put a quad on the screen through a real `.vmt`.
+        if let Some(blit) = &self.blit {
+            frame.blit(blit);
+        }
 
         // Tells the compositor a frame is imminent, so it can schedule
         // accordingly. Must be immediately before the present.
@@ -371,7 +453,7 @@ impl GameWindow {
     }
 }
 
-impl ApplicationHandler for GameWindow {
+impl ApplicationHandler for GameWindow<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // `resumed` fires again after a suspend on mobile targets, which are
         // out of scope; on desktop it fires once. Guard anyway, so that a

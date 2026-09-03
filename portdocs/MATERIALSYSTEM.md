@@ -6,8 +6,9 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stage 1 of §9 done** (`wgpu`/`winit` bring-up — a cleared window). Stages 2-8
-not started. The implemented API is documented in
+**Status: stages 1-2 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), and the
+texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard). Stages 3-8 not
+started. The implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
 
@@ -94,8 +95,8 @@ These aren't `materialsystem/` but you cannot do textures or draw a model withou
 
 | Module | Lines | Note |
 |---|---:|---|
-| `vtf/` | 6,230 | `.vtf` container parse. **Format is fixed** — use `binrw`/`nom` |
-| `bitmap/` | 10,550 | `ImageFormat` conversion, DXT decode, mip generation. Mostly replaceable by crates (`image`, `texture2ddecoder`), except the format table |
+| `vtf/` | 6,230 | **Done** — `src/materials/vtf.rs`, ~350 lines of it. The other 5,900 are `vtex`'s content pipeline compiled into the engine (mip generation, spheremap projection, cubemap border blending), which a reader does not need |
+| `bitmap/` | 10,550 | **Mostly done** — the format table, size arithmetic and CPU conversions are `src/materials/image_format.rs`; hardware decodes DXT, so no decoder was needed. What is left is mip *generation* and resampling, which only a content tool wants |
 | `studiorender/` | 18,725 | Consumes `IMatRenderContext` + `IMesh`. Separate port; constrains the mesh API |
 | `vgui2/matsys_controls/` | 13,552 | **Delete** — → `egui` |
 
@@ -601,10 +602,35 @@ milestone the project has.
    backends restricted to `METAL | VULKAN | GL`; and a frame boundary where a skipped
    frame is `begin_frame() -> None` rather than an error. **Not** done here and still
    owed: MSAA (`-mat_antialias`), exclusive fullscreen modes, refresh rate, gamma.
-2. **Texture path.** `.vtf` parse (`binrw`) → `ImageFormat`→`wgpu::TextureFormat`
-   mapping → upload, mips, sampler creation. Include the error checkerboard, since every
-   later stage depends on failing gracefully. **Deliverable: a full-screen textured quad
-   from a real `.vtf` out of a VPK.**
+2. ~~**Texture path.**~~ **Done.** `.vtf` parse → `ImageFormat`→`wgpu::TextureFormat`
+   mapping → upload, mips, sampler creation, and the error checkerboard. Landed as
+   `src/materials/{vtf,image_format,texture}.rs`, with `blit.rs` + `shaders/blit.wgsl` and
+   a `-vtf <name>` switch as the deliverable's "on screen" half. **API:
+   `../rustdocs/MATERIALS.md`.**
+
+   Decisions made here that the later stages inherit:
+
+   - **`binrw` was not used**, contrary to the line this bullet used to carry. The VTF
+     header is four inherited `pack(1)` structs whose real layout is stated only in a
+     comment (`public/vtf/vtf.h:300`), with hand-written padding, a version-dependent
+     tail, and fields at unaligned offsets — describing that declaratively is longer and
+     less clear than reading fifteen fields at named offsets. Same conclusion the VPK
+     directory reached, for the same reason; both are recorded in `Cargo.toml`.
+   - **`Features::TEXTURE_COMPRESSION_BC` is now required of the adapter.** Essentially
+     all Valve content is DXT and there is no fallback tier, so this is the first
+     deliberate raise of §4.6's single capability tier.
+   - **sRGB is a load-time parameter, not a property of the file.** `EnableSRGBRead` was
+     per-sampler and per-shader; `wgpu` bakes it into the `TextureFormat`. Stage 3's
+     materials are what should encode the rule — see `../rustdocs/MATERIALS.md`.
+   - **One GPU texture per animation frame**, as `CTexture::m_pTextureHandles[iFrame]` had
+     it. Cube faces and volume slices are layers within one texture; frames are not.
+   - Five `ImageFormat` values are knowingly not uploadable (`P8`, `NULL`,
+     `RGBA16161616`, `BGRA1010102`, `UVLX8888`). `RGBA16161616` is the one that will
+     matter: it is the HDR lightmap format, and stage 5 has to decide between the
+     `TEXTURE_FORMAT_16BIT_NORM` feature and converting to `Rgba16Float` on load.
+
+   Still owed from this stage: `mat_picmip`/mip-skipping on load, texture streaming and
+   exclusion lists, and frames past 0 of an animated `.vtf`.
 3. **Material path + WGSL prelude.** `.vmt` parser → `MaterialVar` → material registry
    with handles and refcounts. In parallel, the bind-group layout of §7.4 and the WGSL
    prelude of §7.5 — both are prerequisites for *every* shader, so they are stage-3 work,
@@ -621,7 +647,8 @@ milestone the project has.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–3 are the "wgpu groundwork" PORTING.md says to do before the engine frame loop.
+Stages 1–2 are done. Stages 1–3 are the "wgpu groundwork" PORTING.md says to do before
+the engine frame loop.
 Stage 4 is where the engine's real requirements start dictating the API, so **don't
 finalize the mesh/context API before reading `studiorender/` and `engine/`'s draw
 paths.**

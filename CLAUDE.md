@@ -47,9 +47,9 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 91 tests, mostly `filesystem`), and the binary
-now **runs**: it mounts the game filesystem, opens a window and clears it. It is **not a
-runnable game** and won't be until the rest of the boot path exists — engine host loop,
+There is a unit test suite (`cargo test`, 134 tests), and the binary now **runs**: it
+mounts the game filesystem, opens a window, clears it, and can put a `.vtf` from the
+game's content on the screen (`-vtf <name>`). It is **not a runnable game** and won't be until the rest of the boot path exists — engine host loop,
 map loading, game layer. Verification is still mostly against the reference: read
 `legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
 
@@ -57,6 +57,7 @@ To see it work you need a directory containing a mod directory with a `gameinfo.
 
 ```
 cargo run -- -basedir /path/to/game -game portal2 -window -width 1280 -height 720
+cargo run -- -basedir /path/to/game -game portal2 -window -vtf metal/metalwall048a
 ```
 
 ## The port: standing decisions
@@ -108,14 +109,21 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stage 1 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-2 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → `clear` → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
-  have no counterpart. **API: `rustdocs/MATERIALS.md`**; plan: `portdocs/MATERIALSYSTEM.md`.
-  Stages 2-8 (textures, materials + the WGSL prelude, meshes, lightmaps, the shader set,
-  paint maps) are not started, and nothing here loads content yet. Still settled for
-  those: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
+  have no counterpart. Stage 2 added the texture path: `Vtf` (`.vtf` 7.0-7.5),
+  `ImageFormat` (Valve's format table, the mip-offset arithmetic, and the CPU conversions
+  for formats `wgpu` lacks), and `TextureCache` (name → `Texture`, falling back to the
+  error checkerboard). `-vtf <name>` draws one full-screen; that switch and `blit.rs` are
+  stage 2's verification path and are deleted when stage 3 lands.
+  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the rule
+  on `ColorSpace`, which is a load-time decision here because Valve made it per-sampler
+  in the shader. Plan: `portdocs/MATERIALSYSTEM.md`.
+  Stages 3-8 (materials + the WGSL prelude, meshes, lightmaps, the shader set,
+  paint maps) are not started. Still settled for those: the shaders are
+  **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
   Valve's static/dynamic shader-combo system is deleted with them.
 - **`src/engine/` — `window/` ported, the other 12 subsystems not started**
   (`portdocs/ENGINE.md`, `rustdocs/ENGINE.md`). Conclusion stands: don't port `engine` as
@@ -126,11 +134,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   engine (see `rustdocs/ENGINE.md` gotcha #3).
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: `materialsystem` stage 2 (the texture path — VTF
-parse, `ImageFormat` → `wgpu::TextureFormat`, upload, mips, the error checkerboard) and
-stage 3 (the `.vmt` parser, the bind-group layout of `MATERIALSYSTEM.md` §7.4, and the
-WGSL prelude of §7.5). Both land before the engine frame loop, since the frame boundary
-constrains how that loop can be structured.
+Next on the boot path per `PORTING.md`: `materialsystem` stage 3 — the `.vmt` parser,
+`MaterialVar`, the material registry, the bind-group layout of `MATERIALSYSTEM.md` §7.4
+and the WGSL prelude of §7.5, then `UnlitGeneric` end to end. It lands before the engine
+frame loop, since the frame boundary constrains how that loop can be structured.
 
 ### Known warts, and what triggers fixing them
 

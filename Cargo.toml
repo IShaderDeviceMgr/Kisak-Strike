@@ -23,13 +23,22 @@ pollster = "1.0.1"
 # Error enums. PORTING.md's "What idiomatic means concretely" names thiserror as
 # the replacement for Valve's bool-return/sentinel error convention.
 #
-# Deliberately NOT here: binrw/deku for the VPK directory, which portdocs/
-# FILESYSTEM.md suggested. The VPK directory is a variable-length nested
-# NUL-terminated string tree (extension -> dir -> basename), not a fixed struct
-# layout, so a derive macro can't describe it -- you end up hand-writing the
-# parse impl regardless. src/filesystem/mount/vpk.rs uses a bounds-checked
-# cursor instead, which is what "modernize the mechanism" actually asks for:
-# no unchecked pointer arithmetic, every read validated.
+# Deliberately NOT here: binrw/deku, which portdocs/FILESYSTEM.md suggested for
+# the VPK directory and portdocs/MATERIALSYSTEM.md for the VTF header. Neither
+# is the fixed-struct-array shape those crates are good at:
+#
+#   - The VPK directory is a variable-length nested NUL-terminated string tree
+#     (extension -> dir -> basename), which a derive macro can't describe at all
+#     -- you end up hand-writing the parse impl regardless.
+#   - The VTF header is four inherited pack(1) structs whose true layout exists
+#     only in a comment (public/vtf/vtf.h:300), with hand-written padding, a
+#     version-dependent tail, and fields at unaligned offsets. Declaring that is
+#     longer and less legible than reading fifteen fields at named offsets.
+#
+# Both use a bounds-checked read instead, which is what "modernize the
+# mechanism" actually asks for: no unchecked pointer arithmetic, every read
+# validated. Revisit if a format arrives that really is a struct array --
+# .bsp lumps and .mdl are the candidates.
 thiserror = "2"
 # The renderer. Replaces materialsystem/shaderapidx9 + glmgr + togl outright --
 # see portdocs/MATERIALSYSTEM.md, "Headline decision". Used directly from inside

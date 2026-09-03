@@ -21,7 +21,7 @@ detail lives in `portdocs/<MODULE>.md` — see "Per-module porting docs".
   src/main.rs      entry point
   src/launcher/    process bootstrap (first module ported)
   src/filesystem/  search paths, gameinfo.txt, VPK reading
-  src/materials/   the GPU device and the frame boundary (wgpu)
+  src/materials/   the GPU device, the frame boundary (wgpu), and textures
   src/engine/      the engine; window/ (winit) so far
   legacy/          the original C++ tree, verbatim
   portdocs/        per-module porting design docs (what to build)
@@ -344,9 +344,9 @@ Rules of thumb:
 - **`tier0`/`tier1` are not tasks.** They're replaced by `std` and crates as a side
   effect of porting everything else, not ported in their own right.
 - **Do the `winit`/`wgpu` groundwork deliberately**, before the engine's frame loop —
-  it constrains how that loop can be structured. See `portdocs/ENGINE.md`. *Stage 1 of
-  that groundwork (a cleared window, and the frame boundary the host loop has to fit) is
-  done; stages 2-3, textures and materials, are next.*
+  it constrains how that loop can be structured. See `portdocs/ENGINE.md`. *Stages 1-2 of
+  that groundwork (a cleared window with the frame boundary the host loop has to fit, and
+  the texture path) are done; stage 3, materials and the WGSL prelude, is next.*
 - **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
   (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
   of the raw line count evaporates this way — roughly half of the compiled
@@ -425,20 +425,36 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
   `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
   search paths.
-- **`src/materials/` — stage 1 of 8 ported; `src/engine/window/` with it.** The
-  `wgpu`/`winit` groundwork this file calls for below: `Renderer` owns the `wgpu`
-  instance/adapter/device/queue/surface and exposes one frame boundary
+- **`src/materials/` — stages 1-2 of 8 ported; `src/engine/window/` with it.**
+
+  *Stage 1, the `wgpu`/`winit` groundwork this file calls for below:* `Renderer` owns the
+  `wgpu` instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → `clear` → `present`), and `src/engine/window/` owns the `winit` event
   loop, the window, and `VideoConfig` (the port of
-  `OverrideMaterialSystemConfigFromCommandLine`). The launcher now boots into a window
-  instead of stopping after the filesystem mount. 12 new tests, 91 total; verified on
-  macOS/Metal. **APIs: `rustdocs/MATERIALS.md` and `rustdocs/ENGINE.md`** — read those
-  before calling in. Deliberate divergences, each with its reversing switch, are recorded
-  there: windowed 1280x720 with vsync on by default (Valve's real defaults come from
-  `videoconfig.cfg`, which isn't ported), SDR only, and `wgpu::Limits::default()` as the
-  single capability tier. Not yet: input, the engine tick, MSAA, exclusive fullscreen
-  modes, and any content loading at all — the renderer has no `Vfs` connection yet.
-- **`materialsystem` (stages 2-8) — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
+  `OverrideMaterialSystemConfigFromCommandLine`). The launcher boots into a window
+  instead of stopping after the filesystem mount.
+
+  *Stage 2, the texture path:* `Vtf` reads `.vtf` files (versions 7.0-7.5, cubemaps,
+  volume textures, animation frames, partial mip chains), `ImageFormat` ports the format
+  table and the size arithmetic that decides where each mip level lives in a file and
+  converts the formats `wgpu` has no equivalent for, and `TextureCache` turns a texture
+  name into a `Texture` — or into the error checkerboard, reproduced exactly, which is
+  what a missing or broken texture resolves to. The renderer now reads through the `Vfs`.
+
+  43 tests in the module, 134 total; verified on macOS/Metal, including three
+  render-to-texture-and-read-the-pixels-back tests that pin down orientation, channel
+  order and DXT decoding. **APIs: `rustdocs/MATERIALS.md` and `rustdocs/ENGINE.md`** —
+  read those before calling in. Deliberate divergences, each with its reversing switch,
+  are recorded there: windowed 1280x720 with vsync on by default (Valve's real defaults
+  come from `videoconfig.cfg`, which isn't ported), SDR only, and
+  `wgpu::Limits::default()` as the single capability tier — now raised once, deliberately,
+  to require `TEXTURE_COMPRESSION_BC`, since all Valve content is DXT and there is no
+  fallback worth having. Two things worth knowing before calling in: **sRGB is a
+  load-time parameter, not a property of the file** (Valve decided it per sampler, in the
+  shader), and `-vtf <name>` draws one texture full-screen as stage 2's verification
+  path — it is deleted with `blit.rs` when stage 3 lands. Not yet: input, the engine
+  tick, MSAA, exclusive fullscreen modes, `mat_picmip`, and texture streaming.
+- **`materialsystem` (stages 3-8) — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the
   "rendering" step of the boot path below** — there is no separate renderer. Settled: the

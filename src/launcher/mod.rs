@@ -85,7 +85,7 @@ pub fn run() -> i32 {
     // an engine to hand off to there's nothing the content would be used for,
     // and reporting the problem is more useful than exiting.
     let mod_name = cmdline.value_or("-game", DEFAULT_MOD).to_string();
-    let (_vfs, game_title) = match mount_filesystem(&cmdline, &mod_name) {
+    let (vfs, game_title) = match mount_filesystem(&cmdline, &mod_name) {
         Ok((vfs, title)) => {
             for warning in vfs.warnings() {
                 eprintln!("source-engine: filesystem: {warning}");
@@ -97,8 +97,7 @@ pub fn run() -> i32 {
                 eprintln!("  {path_id:<15?} {description}");
             }
             // Held for the rest of `run()`: the mounts stay alive as long as
-            // the game does. Nothing reads through it yet — the renderer's
-            // first content load is stage 2 of portdocs/MATERIALSYSTEM.md.
+            // the game does, and the renderer reads `.vtf` files through it.
             (Some(vfs), title)
         }
         Err(err) => {
@@ -115,7 +114,11 @@ pub fn run() -> i32 {
     // was closed"; `QUIT_RESTART` has to become a distinct outcome here before
     // the original's restart loop can exist. See portdocs/ENGINE.md §6.
     let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
-    if let Err(err) = window::run(video) {
+    // `-vtf <name>`: stage 2's verification switch, which draws one texture out
+    // of the game's content over the frame. See `GameWindow::load_test_texture`;
+    // it goes away when stage 3's material path lands.
+    let test_texture = cmdline.value("-vtf");
+    if let Err(err) = window::run(video, vfs.as_ref(), test_texture) {
         dialog::report_error("Source - Error", &err.to_string());
         return 1;
     }

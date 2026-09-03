@@ -20,8 +20,9 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
 
 - [`FILESYSTEM.md`](FILESYSTEM.md) — `src/filesystem/`. `Vfs`, `PathId`, mounts,
   `gameinfo.txt` parsing, the KeyValues reader, and VPK reading.
-- [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer`, the frame boundary, and
-  the `wgpu` decisions the rest of the renderer inherits. Its porting doc is
+- [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer`, the frame boundary, the
+  `wgpu` decisions the rest of the renderer inherits, and the texture path: `Vtf`,
+  `ImageFormat`, `Texture` and `TextureCache`. Its porting doc is
   [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named after the C++
   module, while this one is named after the Rust module.
 - [`ENGINE.md`](ENGINE.md) — `src/engine/`. Only `window` exists so far: the `winit`

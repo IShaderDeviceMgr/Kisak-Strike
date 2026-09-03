@@ -33,7 +33,95 @@ pub enum RendererError {
     #[error("the selected GPU adapter ({adapter}) cannot present to the game window")]
     SurfaceUnsupported { adapter: String },
 
+    /// The adapter cannot sample BC (S3TC/DXT) textures.
+    ///
+    /// Reported before `request_device` so the message names the real problem
+    /// rather than "device creation failed". Essentially every texture Valve
+    /// ships is DXT1 or DXT5, so there is no useful fallback short of a CPU
+    /// decompressor — see `rustdocs/MATERIALS.md`.
+    #[error("the selected GPU adapter ({adapter}) cannot sample compressed (BC/DXT) textures, which all Source content uses")]
+    NoBlockCompression { adapter: String },
+
     /// The adapter refused the requested features/limits.
     #[error("could not open the GPU device: {0}")]
     DeviceCreation(#[from] wgpu::RequestDeviceError),
+}
+
+/// Anything that can go wrong reading a `.vtf`.
+///
+/// Replaces the `Warning(...)`-then-`return false` pattern of
+/// `CVTFTexture::Unserialize` (`vtf/vtf.cpp:1046`), which told the caller only
+/// that *something* was wrong and printed the reason somewhere else entirely.
+#[derive(Debug, thiserror::Error)]
+pub enum VtfError {
+    #[error("not a VTF file")]
+    BadSignature,
+
+    /// A `.360.vtf` or `.ps3.vtf`. Both are byte-swapped and tiled, and both
+    /// platforms are permanently out of scope (`PORTING.md`, "Supported
+    /// platforms").
+    #[error("this is a {platform} texture, which is not supported")]
+    ConsoleFormat { platform: &'static str },
+
+    #[error("unsupported VTF version {major}.{minor}")]
+    UnsupportedVersion { major: u32, minor: u32 },
+
+    #[error("truncated VTF: needs {needed} bytes, file is {actual}")]
+    Truncated { needed: usize, actual: usize },
+
+    /// A format value with no counterpart here — a depth, console or
+    /// runtime-compression format. See `image_format::unsupported_name`.
+    #[error("VTF uses image format {name} ({raw}), which cannot appear in a PC texture")]
+    UnsupportedFormat { raw: i32, name: &'static str },
+
+    /// The header contradicts itself.
+    #[error("malformed VTF: {0}")]
+    Invalid(&'static str),
+
+    /// A 7.3+ file whose resource dictionary has no image entry.
+    #[error("VTF contains no image data")]
+    NoImageData,
+}
+
+/// Anything that can go wrong turning a name into a texture on the GPU.
+#[derive(Debug, thiserror::Error)]
+pub enum TextureError {
+    /// The `.vtf` could not be read out of the game's content.
+    ///
+    /// Transparent because every `VfsError` already names the path it happened
+    /// on, so wrapping it in "materials/x.vtf: ..." would print the path twice.
+    #[error(transparent)]
+    Read(#[from] crate::filesystem::VfsError),
+
+    #[error("{name}: {source}")]
+    Vtf {
+        name: String,
+        #[source]
+        source: VtfError,
+    },
+
+    /// A format we can name but cannot put on the GPU — see
+    /// `ImageFormat::gpu_format` for the five cases and why each one is
+    /// deliberate.
+    #[error("{name}: image format {format} cannot be uploaded")]
+    UnsupportedFormat { name: String, format: &'static str },
+
+    /// A block-compressed texture whose base level is not a whole number of
+    /// 4x4 blocks. WebGPU requires it; D3D9 did not.
+    #[error("{name}: {width}x{height} is not a whole number of {format} blocks")]
+    NotBlockAligned {
+        name: String,
+        format: &'static str,
+        width: u32,
+        height: u32,
+    },
+
+    /// Bigger than the device's `max_texture_dimension_2d`.
+    #[error("{name}: {width}x{height} exceeds the device limit of {limit}")]
+    TooLarge {
+        name: String,
+        width: u32,
+        height: u32,
+        limit: u32,
+    },
 }
