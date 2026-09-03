@@ -20,8 +20,10 @@ detail lives in `portdocs/<MODULE>.md` — see "Per-module porting docs".
 /                  Rust project root — Cargo.toml, src/
   src/main.rs      entry point
   src/launcher/    process bootstrap (first module ported)
+  src/filesystem/  search paths, gameinfo.txt, VPK reading
   legacy/          the original C++ tree, verbatim
-  portdocs/        per-module porting design docs
+  portdocs/        per-module porting design docs (what to build)
+  rustdocs/        per-module API references (what exists)
   PORTING.md       this file
 ```
 
@@ -366,6 +368,12 @@ covering:
 Read it before touching that module; update it as the port proceeds and reality
 diverges. Small leaf modules don't need one — a Status entry here is enough.
 
+Once a module is **implemented**, it also gets an API reference in `rustdocs/<MODULE>.md`
+describing what now exists in `src/` — public types, usage, invariants, gotchas, and what
+stayed deferred. `portdocs/` says how to build it; `rustdocs/` says how to use it. See
+`CLAUDE.md`'s "Per-module API docs" for what belongs in one and `rustdocs/FILESYSTEM.md`
+for the worked example.
+
 ## Using codebase-memory-mcp
 
 This repo is indexed in the `codebase-memory-mcp` knowledge graph (project
@@ -399,12 +407,20 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   RAII guard released on `Drop`; the native error dialogs are stderr for now
   (see `dialog.rs`). The startup sequence runs to completion and then stops — there's
   no engine to hand off to yet.
-- **`filesystem` — documented, not started.** `portdocs/FILESYSTEM.md`: inventory, the
-  search-path/path-ID model, the `gameinfo.txt` bootstrap, VPK format, the proposed Rust
-  `Vfs` design, and a staged plan. Next module on the boot path. Two subsystems confirmed
-  dead and excluded (`IAsyncFileSystem`, ~3,700 lines with no callers;
-  `filesystem_steam.cpp`, not in the build), which along with console/`sv_pure`/QueuedLoader
-  removal takes the real reading surface to ~13–15k lines.
+- **`src/filesystem/` — ported.** `Vfs` over an ordered list of mounts: `gameinfo.txt`
+  parsing and search-path construction, a KeyValues reader (with the `[$COND]`
+  evaluator), `RelPath` normalization, `DirMount` with a cached case-folded index, and a
+  `VpkMount` covering v1/v2/headerless directories, multi-archive files and embedded
+  chunks. 78 tests; the launcher mounts the game at startup and prints the search paths.
+  Deferred deliberately: async, `.bsp` pak lump mounts, `sv_pure` tracking,
+  `QueuedLoader`. Two subsystems confirmed dead and excluded (`IAsyncFileSystem`, ~3,700
+  lines with no callers; `filesystem_steam.cpp`, not in the build).
+  **Behavior change, unverified against a real install:** VPKs are ordinary ordered
+  mounts rather than a global list that always wins over loose files, so a loose file
+  overrides the VPK beside it. `VPKS_AFTER_LOOSE_FILES` reverts it.
+  **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
+  `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
+  search paths.
 - **`materialsystem` — documented, not started.** `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the

@@ -15,9 +15,11 @@ is not compiled, not linked, and not edited.
 ```
 /                  Rust crate root — Cargo.toml, src/
   src/main.rs      entry point
-  src/launcher/    process bootstrap (only module ported so far)
+  src/launcher/    process bootstrap
+  src/filesystem/  search paths, gameinfo.txt, VPK reading
   legacy/          the original C++ tree, verbatim; read-only reference
-  portdocs/        per-module porting design docs
+  portdocs/        per-module porting design docs (what to build)
+  rustdocs/        per-module API references (what exists)
   PORTING.md       standing design reference — read before any port work
 ```
 
@@ -33,17 +35,20 @@ file is a summary of it.
 
 ```
 cargo build
+cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI.** Release
-builds use full LTO and one codegen unit (see `Cargo.toml`).
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and one
+dependency (`thiserror`). Release builds use full LTO and one codegen unit (see
+`Cargo.toml`).
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is no test suite. More importantly, **the binary is not a runnable game yet** and
+There is now a unit test suite (`cargo test`, 78 tests, mostly `filesystem`), but
+**the binary is not a runnable game yet** and
 won't be until the whole boot path exists — bootstrap, filesystem, windowing, rendering,
 engine host loop, game layer. Verification in the meantime is against the reference:
 read `legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
@@ -90,8 +95,13 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
 ### Status
 
 - **`src/launcher/` — ported.** Command line, single-instance lock, early-error
-  reporting, startup sequence. Runs to completion and stops; there's no engine to hand
-  off to yet.
+  reporting, startup sequence. Mounts the filesystem, then stops; there's no engine to
+  hand off to yet.
+- **`src/filesystem/` — ported.** `Vfs` over an ordered mount list: `gameinfo.txt` ->
+  search paths, KeyValues reader, case-folded directory mounts, and VPK reading
+  (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
+  `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
+  porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
 - **`engine` — documented, not started** (`portdocs/ENGINE.md`). Conclusion: don't port
   it as one unit. Each of its 23 subsystems becomes its own Rust module under
   `src/engine/` (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules
@@ -104,9 +114,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `stdshaders/`, and Valve's static/dynamic shader-combo system is deleted with them.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: filesystem (enough to read `gameinfo.txt` and
-mount VPKs), then the `winit`/`wgpu` groundwork — deliberately, *before* the engine
-frame loop, since it constrains how that loop can be structured.
+Next on the boot path per `PORTING.md`: the `winit`/`wgpu` groundwork, which is
+`materialsystem` stages 1-3 — deliberately *before* the engine frame loop, since it
+constrains how that loop can be structured.
 
 ### Per-module porting docs
 
@@ -120,6 +130,40 @@ goes in one.
 changed for it. Its *plan* assumes the old FFI-bridged model; its factual content — module
 behavior analysis — remains accurate and is the reason to keep it. `portdocs/ENGINE.md`
 used to carry the same banner and has been rewritten against the current architecture.
+
+### Per-module API docs (`rustdocs/`) — required for every subsystem you implement
+
+**When you finish implementing a subsystem under `src/`, write its API reference in
+`rustdocs/<MODULE>.md`** (same `SCREAMING_SNAKE_CASE` naming as `portdocs/`), and update
+it whenever the API changes. This is not optional polish — porting sessions get their
+context cleared, and a cold-started session that has to re-derive an API from source
+burns most of its budget doing so and still misses the non-obvious rules.
+
+`portdocs/` and `rustdocs/` are deliberately different documents:
+
+| | `portdocs/<MODULE>.md` | `rustdocs/<MODULE>.md` |
+|---|---|---|
+| Written | *before* the port | *with* the port |
+| Subject | the C++ in `legacy/` | the Rust in `src/` |
+| Answers | "how do I port this?" | "how do I *use* this?" |
+| Lifetime | can go stale once the module lands | must stay accurate forever |
+
+An API doc should cover, roughly in this order: a one-line summary and status table; a
+quick-start example that actually compiles; the core public types with real signatures;
+cross-cutting semantics that no single `///` can hold (search order, scoping rules,
+lifecycle); an **invariants-and-gotchas** list ordered by how likely each is to bite; what
+is deliberately *not* implemented and why; how to extend it; and which tests guard which
+behavior. `rustdocs/FILESYSTEM.md` is the worked example.
+
+Two rules that keep these trustworthy:
+
+- **Verify signatures against the source before writing them down.** Grep the `pub`
+  items; do not transcribe from memory. A confidently wrong API doc is worse than none.
+- **Record deliberate divergences from Valve's behavior**, with the switch or function
+  that reverses them. Those are exactly what a future session cannot rediscover.
+
+Rustdoc comments in the source stay the authority on individual items; `rustdocs/` carries
+what doesn't fit on one item.
 
 ## Reading the reference tree (`legacy/`)
 

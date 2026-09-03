@@ -16,8 +16,9 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   paint maps, and a staged plan. Written against the current architecture. This is the
   "rendering" step of PORTING.md's boot path.
 - [`FILESYSTEM.md`](FILESYSTEM.md) — `filesystem` (+ `vpklib`, `public/filesystem_init.cpp`).
-  **Next module on the boot path.** Inventory, search-path/path-ID model, VPK format,
-  the Rust `Vfs` design, and a staged plan. Written against the current architecture.
+  **Ported — see `src/filesystem/`.** Inventory, search-path/path-ID model, VPK format,
+  the `Vfs` design, the decisions taken while implementing, and what stayed deferred.
+  Written against the current architecture.
 - [`LAUNCHER.md`](LAUNCHER.md) — `launcher`. **Partly superseded** by PORTING.md's
   move to a single-binary architecture (see the banner at the top of the doc); its
   module-behavior analysis is still the reference.

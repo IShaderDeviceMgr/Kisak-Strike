@@ -10,6 +10,7 @@ pub mod cmdline;
 pub mod dialog;
 pub mod single_instance;
 
+use crate::filesystem;
 use cmdline::CommandLine;
 use single_instance::{LockError, SingleInstanceLock};
 
@@ -78,16 +79,63 @@ pub fn run() -> i32 {
         }
     }
 
+    // Mount the game's content. This is `FileSystem_LoadSearchPaths` plus VPK
+    // discovery — see portdocs/FILESYSTEM.md. Failure isn't fatal yet: without
+    // an engine to hand off to there's nothing the content would be used for,
+    // and reporting the problem is more useful than exiting.
+    let mod_name = cmdline.value_or("-game", DEFAULT_MOD).to_string();
+    match mount_filesystem(&cmdline, &mod_name) {
+        Ok(vfs) => {
+            for warning in vfs.warnings() {
+                eprintln!("source-engine: filesystem: {warning}");
+            }
+            // `CBaseFileSystem::PrintSearchPaths`. Comparing this against a
+            // stock build's output is the cheapest way to verify the port.
+            eprintln!("source-engine: search paths:");
+            for (path_id, description) in vfs.search_paths() {
+                eprintln!("  {path_id:<15?} {description}");
+            }
+        }
+        Err(err) => {
+            eprintln!("source-engine: filesystem: {err}");
+        }
+    }
+
     // TODO: hand off to the engine. Nothing to hand off to yet — the engine
     // is still C++ in `legacy/` and hasn't been ported. See portdocs/ENGINE.md
     // for the subsystem breakdown and PORTING.md for sequencing.
     eprintln!(
-        "source-engine: startup complete (mod: {}), but the engine is not ported yet.",
-        cmdline.value_or("-game", DEFAULT_MOD)
+        "source-engine: startup complete (mod: {mod_name}), but the engine is not ported yet."
     );
     eprintln!("See PORTING.md for the current state of the rewrite.");
 
     0
+}
+
+/// Builds the [`Vfs`] from the command line.
+///
+/// [`Vfs`]: crate::filesystem::Vfs
+fn mount_filesystem(cmdline: &CommandLine, mod_name: &str) -> filesystem::Result<filesystem::Vfs> {
+    // `-basedir` has already been applied with `set_current_dir` above, so the
+    // working directory is the base directory either way.
+    let base_dir = std::env::current_dir().map_err(|e| filesystem::VfsError::io(".", e))?;
+
+    let options = filesystem::SearchPathOptions {
+        // `initInfo.m_pLanguage` is set by the engine, not by
+        // filesystem_init.cpp. There's no engine yet to ask, so localized
+        // search paths stay off until one exists — see portdocs/FILESYSTEM.md's
+        // open question about where the language actually comes from.
+        language: None,
+        // `IsLowViolenceBuild()` is `return false` on POSIX except via `-lv`.
+        low_violence: cmdline.has("-lv"),
+        temp_content: cmdline.has("-tempcontent"),
+        executable_dir: std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf())),
+    };
+
+    let game_dir = filesystem::locate_game_dir(&base_dir, mod_name);
+    filesystem::Vfs::mount_game(&game_dir, &base_dir, &options)
 }
 
 #[cfg(target_os = "linux")]

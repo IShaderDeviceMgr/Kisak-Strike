@@ -13,6 +13,63 @@ All paths below are relative to the original tree; prefix with `legacy/` to open
 
 ---
 
+## Status: **implemented** — `src/filesystem/`
+
+Stages 1–5 of the staged plan below are done and landed. `cargo test` covers them with
+78 tests; `src/launcher/` mounts the game at startup and prints the search path list.
+
+| File | What |
+|---|---|
+| `src/filesystem/mod.rs` | `Vfs`, `PathId`, `ScopedVfs`, search order, VPK discovery |
+| `src/filesystem/gameinfo.rs` | `gameinfo.txt` -> ordered search path plan |
+| `src/filesystem/keyvalues.rs` | KeyValues reader + `[$COND]` evaluator |
+| `src/filesystem/path.rs` | `RelPath` normalization and case folding |
+| `src/filesystem/mount/dir.rs` | `DirMount` + cached case-folded index |
+| `src/filesystem/mount/vpk.rs` | `VpkMount` — v1/v2/headerless, embedded chunks |
+
+Not done, all deferred deliberately: async, `.bsp` pak lump mounts, `sv_pure` tracking,
+`QueuedLoader`. See "Staged plan" below.
+
+### Decisions taken while implementing
+
+* **VPKs are ordered mounts, placed after the directory they were found in.** The
+  original's VPK-wins-always behavior (see "The open path") is *not* reproduced. This is
+  the recommendation below, acted on. It **remains unverified against a real Portal 2
+  install**; `VPKS_AFTER_LOOSE_FILES` in `mod.rs` is the single switch to flip.
+* **`CONTENT` is omitted entirely**, not implemented-correctly, for the reasons in "One
+  live bug to not reproduce".
+* **Compound `game+mod` path IDs are split**, which this tree does not do. Costs nothing
+  and stops a gameinfo written for a neighbouring Source branch from silently
+  contributing an untagged path.
+* **One divergence from a literal port, in the VPK embedded-chunk base offset.**
+  `packedstore.cpp:1211` computes it as `dir_size + sizeof(VPKDirHeader_t)`, hardcoding
+  28 even for a v1 file whose header is 12 bytes. That is a latent 16-byte error that
+  never fires, because embedded chunks are a v2 feature. The port uses the real header
+  size.
+* **The mod directory's VPKs are parsed once and shared** behind an `Arc`. The mod dir is
+  added twice (as `MOD` and as `GAME`) and the original rescans for VPKs on every
+  `AddSearchPath`, so a naive port parses a shipping `pak01_dir.vpk` — tens of MB of
+  directory blob plus a six-figure entry map — once per search path.
+
+### A trap worth recording: `$WIN32` does not mean Windows
+
+`gameinfo.txt` is KeyValues, and KeyValues supports `[$SYMBOL]` conditionals that gate
+whether a line is kept. Real gameinfo files use them on search paths.
+
+**`DefaultConditionalSymbolProc` (`tier1/exprevaluator.cpp:31`) resolves `$WIN32` to
+`IsPC()`** — in Valve's platform vocabulary "PC" means "not a game console", so `[$WIN32]`
+is **true on Linux and macOS**. `$WINDOWS` is the symbol that actually means Windows.
+Reading `$WIN32` as `cfg!(windows)` would silently drop search paths from `gameinfo.txt`,
+and the failure would surface much later as missing content with nothing pointing back at
+the cause. The full symbol table is ported in `keyvalues.rs`'s `ConditionalSymbols`.
+
+Related: escape sequences are **off** in Valve's `LoadFromBuffer` unless
+`UsesEscapeSequences(true)` is called, and nothing calls it for `gameinfo.txt`. Since
+Valve content is full of Windows-authored paths, treating `\` as an escape would corrupt
+them.
+
+---
+
 ## Scale, stated plainly
 
 The module is smaller than it looks, because a large fraction of it is either
@@ -482,34 +539,39 @@ ourselves.
 Each stage is independently verifiable, which matters because there's no running hybrid
 to test against.
 
-1. **KeyValues reader.** Enough to parse `gameinfo.txt`: nested blocks, quoted and
-   unquoted tokens, `//` comments, duplicate keys preserved in order. Unit-testable
-   against fixtures copied from a real install.
-2. **`gameinfo.txt` → search path list.** Port `FileSystem_LoadSearchPaths`' ordering
-   rules including the `|gameinfo_path|`/`|all_source_engine_paths|` tokens, the
-   first-`game`-is-`MOD` rule, and the `GAMEBIN`/`PLATFORM`/`WritePath` extras. Output is
-   a printable list — compare it directly against `PrintSearchPaths()` output from a
-   stock build. **This is the highest-value verification opportunity in the whole
-   module**; take it.
-3. **`DirMount` + case-folded index.** Read a loose file through the search path list.
-4. **`VpkMount`.** Parse the v1/v2 directory, read a file spanning numbered archives, and
-   handle the embedded-chunk case. Verify against a real `pak01_dir.vpk` by comparing
-   extracted bytes with a known-good VPK extractor.
-5. **Iteration** (`list`) across mounts with dedup — needed for map lists and content
-   enumeration.
-6. **`BspPakMount`**, when map loading lands. Not before.
+1. ~~**KeyValues reader.**~~ **Done** — `keyvalues.rs`. Nested blocks, quoted and
+   unquoted tokens, `//` comments, duplicate keys preserved in order, plus the
+   `[$COND]` conditional evaluator the original plan missed (see the trap above).
+2. ~~**`gameinfo.txt` → search path list.**~~ **Done** — `gameinfo.rs`. The
+   `|gameinfo_path|`/`|all_source_engine_paths|` tokens, the first-`game`-is-`MOD` rule,
+   and the `GAMEBIN`/`PLATFORM`/write-root extras, in the original's order.
+   `Vfs::search_paths()` prints the list. **Comparing that output against
+   `PrintSearchPaths()` from a stock build is still the highest-value verification
+   available and has not been done** — it needs a real install.
+3. ~~**`DirMount` + case-folded index.**~~ **Done** — `mount/dir.rs`. Exact-match fast
+   path, then a per-directory folded index cached behind an `RwLock`.
+4. ~~**`VpkMount`.**~~ **Done** — `mount/vpk.rs`. v1, v2 and headerless directories,
+   files spanning numbered archives, and the embedded chunk. Verified against a VPK built
+   by a *separately written* encoder rather than by this module's own test builder, so
+   the reader is checked against the spec instead of against itself
+   (`reads_a_vpk_from_an_independent_encoder`). Comparison against a real Valve
+   `pak01_dir.vpk` is still outstanding.
+5. ~~**Iteration** (`list`) across mounts with dedup.~~ **Done** — case-insensitive
+   dedup, earlier mounts win.
+6. **`BspPakMount`**, when map loading lands. Not before. The `Mount` trait is the seam.
 7. **Async**, when a consumer exists to measure. Not before.
-
-Stages 1–4 are what `PORTING.md` means by "enough to read `gameinfo.txt` and mount VPKs",
-and they're a realistic first landing.
 
 ---
 
 ## Open questions
 
-- **Does VPK-wins-always get preserved?** My recommendation is no — make VPKs ordered
-  mounts — but this changes observable behavior for loose-file overrides and should be
-  checked against a real Portal 2 install before it's locked in.
+Every one of these needs a real Portal 2 install to answer; none could be resolved from
+this tree, which contains no assets and no `gameinfo.txt` anywhere.
+
+- **Does VPK-wins-always get preserved?** **Decided: no** — VPKs are ordered mounts
+  (`VPKS_AFTER_LOOSE_FILES`). This changes observable behavior for loose-file overrides
+  and is **still unverified against a real install**. Flip the constant if content turns
+  out to depend on the original behavior.
 - **What is Portal 2's actual content layout?** The `pakNN_dir.vpk` scan, the `update/`
   directory, and the `csgo_dlc%d` DLC scan are all CS:GO-shaped. Portal 2's real
   directory and VPK naming can't be determined from this tree — there are no assets and
@@ -518,8 +580,9 @@ and they're a realistic first landing.
   `ToolsAppId`, `GameData`, and `singleplayer_only` are read elsewhere in the tree; worth
   a sweep once a real Portal 2 `gameinfo.txt` is in hand.
 - **How is the language for `AddLanguageGameDir` determined?** `initInfo.m_pLanguage` is
-  set by the caller, not by `filesystem_init.cpp`; trace the engine side before deciding
-  whether localized search paths matter for a first boot.
+  set by the caller, not by `filesystem_init.cpp`. Implemented but wired to `None` in
+  `src/launcher/`, since there is no engine yet to ask; trace the engine side when one
+  exists.
 - **Does anything still need plain-zip support at runtime**, or is it only `.bsp` pak
   lumps and VPKs? If the latter, `zip_utils.cpp`'s replacement scope shrinks a lot.
 - **Async model**: deferred by design. Revisit when map loading exists.

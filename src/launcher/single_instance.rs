@@ -69,7 +69,10 @@ impl fmt::Display for LockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyRunning => {
-                write!(f, "only one instance of the game can be running at one time")
+                write!(
+                    f,
+                    "only one instance of the game can be running at one time"
+                )
             }
             Self::Io(e) => write!(f, "could not open the single-instance lock file: {e}"),
         }
