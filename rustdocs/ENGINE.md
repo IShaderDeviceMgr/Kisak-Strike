@@ -22,7 +22,7 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 | | |
 |---|---|
 | Module | `crate::engine::window` |
-| Lines | ~640 including tests |
+| Lines | ~670 including tests |
 | Tests | 12 (`cargo test engine::window`) |
 | Dependencies | `winit` 0.30, `crate::materials`, `crate::filesystem`, `crate::launcher::cmdline` |
 
@@ -32,7 +32,7 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 use crate::engine::window::{run, VideoConfig};
 
 let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
-run(video, vfs.as_ref(), cmdline.value("-vtf"))?;   // returns when the window closes
+run(video, vfs.as_ref(), cmdline.value("-vmt"))?;   // returns when the window closes
 ```
 
 `src/launcher/mod.rs` is the only caller, and this is where `CEngineAPI::Run`/`MainLoop`
@@ -44,7 +44,7 @@ run(video, vfs.as_ref(), cmdline.value("-vtf"))?;   // returns when the window c
 pub fn run(
     config: VideoConfig,
     vfs: Option<&Vfs>,
-    test_texture: Option<&str>,
+    test_material: Option<&str>,
 ) -> Result<(), WindowError>;
 ```
 
@@ -54,12 +54,12 @@ enforces on every platform.
 
 `vfs` is the mounted game content, and is `Option` because a failed mount is survivable:
 the launcher reports it and boots the window anyway, since a window that opens and says
-what is wrong beats a process that exits. `test_texture` is `-vtf <name>`, **stage 2 of
-`portdocs/MATERIALSYSTEM.md` §9's verification path**: it loads `materials/<name>.vtf`
-and draws it over the frame, falling back to the error checkerboard if anything about
-that fails (including there being no `vfs` at all). Both that parameter and
-`crate::materials::TextureBlit` are deleted when stage 3's material path can draw a quad
-through a real `.vmt`.
+what is wrong beats a process that exits. `test_material` is `-vmt <name>`, **stage 3 of
+`portdocs/MATERIALSYSTEM.md` §9's verification path**: it loads `materials/<name>.vmt`,
+resolves its shader and textures, and draws it over the frame — falling back to the error
+material if anything about that fails, including there being no `vfs` at all. Both that
+parameter and `crate::materials::MaterialPreview` are deleted when stage 4's render
+context can draw real geometry.
 
 The signature will keep growing until there is an engine to hand these to — that is the
 seam `CEngineAPI::Run` occupied, and it is not yet a real one.
@@ -185,7 +185,11 @@ Both are in `from_command_line`, both are guarded by tests:
   they replace (`Key_Event` → VGui → RocketUI → GameUI, `sys_mainwind.cpp:399`) and the
   UI-precedence design question `egui` raises are in `portdocs/ENGINE.md` §6.
 - **The engine tick.** `about_to_wait` currently requests a redraw and `RedrawRequested`
-  clears one frame. That draw call is the seam where one engine tick will go.
+  clears one frame and, with `-vmt`, draws one material over it. That draw call is the
+  seam where one engine tick will go. Note the ordering `draw` already has to observe:
+  everything needing the renderer — the pipeline lookup, the uniform writes — happens
+  *before* `begin_frame`, because the acquired frame borrows it. A tick will have to be
+  split the same way.
 - **Multiple windows / `AddView`.** Never coming back; the original needed them for
   Hammer.
 - **Window icon** (`SetApplicationIcon` from `resource/game-icon.bmp`,

@@ -12,25 +12,38 @@
 //!
 //! # Status
 //!
-//! Stages 1 and 2 of `portdocs/MATERIALSYSTEM.md` §9.
+//! Stages 1 to 3 of `portdocs/MATERIALSYSTEM.md` §9.
 //!
 //! - [`Renderer`] brings up the GPU and owns the frame boundary.
-//! - [`Vtf`] reads `.vtf` files, [`ImageFormat`] says what each pixel format
-//!   becomes on the GPU, and [`TextureCache`] turns a texture name into a
-//!   [`Texture`] — or into the error checkerboard, which is the same thing as
-//!   far as a caller is concerned.
-//! - [`TextureBlit`] draws one over the frame. That is a *verification* path,
-//!   not the beginning of a renderer; see its docs.
+//! - [`Vtf`](vtf::Vtf) reads `.vtf` files,
+//!   [`ImageFormat`](image_format::ImageFormat) says what each pixel format
+//!   becomes on the GPU, and [`TextureCache`](texture::TextureCache) turns a
+//!   texture name into a
+//!   [`Texture`](texture::Texture) — or into the error checkerboard, which is
+//!   the same thing as far as a caller is concerned.
+//! - [`Vmt`](vmt::Vmt) reads `.vmt` files, [`MaterialVar`](var::MaterialVar)
+//!   holds what they say, and [`MaterialCache`] turns a material name into a
+//!   [`Material`] — or into the error material, likewise.
+//! - [`ShaderKind`](shader::ShaderKind) is the shader set, one deep so far:
+//!   `UnlitGeneric`, written in WGSL against the constant ABI in [`uniforms`]
+//!   and compiled through the cache in [`pipeline`].
+//! - [`MaterialPreview`] draws one material over the frame. That is a
+//!   *verification* path, not the beginning of a render context; see its docs.
 //!
-//! Stage 3 (`.vmt` materials, the bind-group layout, the WGSL prelude) and
-//! stage 4 (meshes and the render context) are not started, so nothing here
-//! reads a `.vmt` or a real shader.
+//! Stage 4 (meshes and the render context) is not started, so the only geometry
+//! is that one quad and there is no depth buffer to draw it against.
 
-pub mod blit;
 pub mod error;
 pub mod image_format;
+pub mod material;
+pub mod pipeline;
+pub mod preview;
 pub mod renderer;
+pub mod shader;
 pub mod texture;
+pub mod uniforms;
+pub mod var;
+pub mod vmt;
 pub mod vtf;
 
 // Re-exported because something outside this module names them. Everything
@@ -38,8 +51,8 @@ pub mod vtf;
 // `materials::image_format::ImageFormat`, ...) and is re-exported when it
 // acquires a caller, so that this list stays a statement about what the rest of
 // the engine actually uses.
-pub use blit::TextureBlit;
 pub use error::RendererError;
 pub use image_format::ColorSpace;
+pub use material::{Material, MaterialCache};
+pub use preview::MaterialPreview;
 pub use renderer::{Renderer, RendererOptions, CLEAR_COLOR};
-pub use texture::TextureCache;

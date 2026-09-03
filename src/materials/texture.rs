@@ -70,6 +70,13 @@ pub struct Texture {
     pub view_dimension: wgpu::TextureViewDimension,
     /// Which `.vtf` frame this is.
     pub frame: u32,
+    /// Whether the file claims an alpha channel worth reading —
+    /// `TEXTUREFLAGS_ONEBITALPHA | TEXTUREFLAGS_EIGHTBITALPHA`.
+    ///
+    /// Not derived from the pixel format: a DXT5 texture whose alpha is all
+    /// 255 is opaque, and only the flags in the header say so. See
+    /// [`Texture::is_translucent`].
+    translucent: bool,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -85,6 +92,17 @@ impl Texture {
     /// The sampler the `.vtf`'s flags asked for. See [`sampler_key`].
     pub fn sampler(&self) -> &wgpu::Sampler {
         &self.sampler
+    }
+
+    /// Whether the texture carries transparency. `CTexture::IsTranslucent`
+    /// (`ctexture.cpp:3094`).
+    ///
+    /// Read by the shadow phase: whether a material blends depends on whether
+    /// its base texture has an alpha channel at all
+    /// (`CBaseShader::TextureIsTranslucent`), which is why this is on the
+    /// texture rather than on the `.vtf` that is dropped after loading.
+    pub fn is_translucent(&self) -> bool {
+        self.translucent
     }
 
     /// Uploads one frame of a parsed `.vtf`.
@@ -239,6 +257,8 @@ impl Texture {
             format,
             view_dimension,
             frame,
+            translucent: vtf.flags.contains(TextureFlags::ONE_BIT_ALPHA)
+                || vtf.flags.contains(TextureFlags::EIGHT_BIT_ALPHA),
             texture,
             view,
             sampler,
@@ -267,17 +287,56 @@ impl Texture {
                 }
             }
         }
+        Texture::procedural(device, queue, "error", size, &pixels, sampler)
+    }
+
+    /// The 1x1 opaque white texture an *undefined* texture parameter binds.
+    ///
+    /// `TEXTURE_WHITE`, `CTextureManager::Init` (`texturemanager.cpp:659`) —
+    /// one white texel, no mips. Distinct from [`Texture::error`] and the
+    /// distinction matters: a `.vmt` with no `$basetexture` is not broken, it
+    /// is a material whose colour comes entirely from `$color` and the vertex
+    /// stream, and every shader binds white for it rather than complaining
+    /// (`vertexlitgeneric_dx9_helper.cpp:1255`). Valve's own `___flat.vmt` is
+    /// one. Drawing a checkerboard there would report a failure that did not
+    /// happen.
+    ///
+    /// The rest of the standard family — `black`, `grey`, `greyalphazero`, the
+    /// normalization cubemap — is not here: each is reached only from a shader
+    /// feature that is not ported (an envmap with no base texture binds black,
+    /// for instance), and each is four lines when the shader that wants it
+    /// lands.
+    pub fn white(device: &wgpu::Device, queue: &wgpu::Queue, sampler: wgpu::Sampler) -> Texture {
+        Texture::procedural(device, queue, "white", 1, &[255, 255, 255, 255], sampler)
+    }
+
+    /// A square RGBA texture built in code rather than loaded.
+    ///
+    /// The survivor of `ITextureRegenerator` (`texturemanager.cpp:178`), which
+    /// was an interface with a `RegenerateTextureBits` callback so that D3D9
+    /// could ask for the pixels again after a lost device. There is no lost
+    /// device, so there is no callback — just the bytes.
+    fn procedural(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: &'static str,
+        size: u32,
+        pixels: &[u8],
+        sampler: wgpu::Sampler,
+    ) -> Texture {
+        debug_assert_eq!(pixels.len(), (size * size * 4) as usize);
 
         // `TEXTUREFLAGS_SRGB` in the original, and these are colours a human
         // picked, so the hardware should decode them.
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let extent = wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("error"),
-            size: wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: 1,
-            },
+            label: Some(name),
+            size: extent,
             // `TEXTUREFLAGS_NOMIP`.
             mip_level_count: 1,
             sample_count: 1,
@@ -293,26 +352,22 @@ impl Texture {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &pixels,
+            pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(size * 4),
                 rows_per_image: Some(size),
             },
-            wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: 1,
-            },
+            extent,
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("error"),
+            label: Some(name),
             ..Default::default()
         });
 
         Texture {
-            name: "error".to_owned(),
+            name: name.to_owned(),
             width: size,
             height: size,
             depth: 1,
@@ -320,6 +375,10 @@ impl Texture {
             format,
             view_dimension: wgpu::TextureViewDimension::D2,
             frame: 0,
+            // Neither is created with an alpha flag (`texturemanager.cpp:651`),
+            // so a material falling back to one stays opaque rather than
+            // turning translucent.
+            translucent: false,
             texture,
             view,
             sampler,
@@ -474,14 +533,16 @@ pub struct TextureCache {
     textures: HashMap<(String, ColorSpace), Arc<Texture>>,
     samplers: HashMap<SamplerKey, wgpu::Sampler>,
     error: Arc<Texture>,
+    white: Arc<Texture>,
 }
 
 impl TextureCache {
     /// Builds the cache and, with it, the error checkerboard.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> TextureCache {
         let mut samplers = HashMap::new();
-        let error_sampler = sampler_for(device, &mut samplers, SamplerKey::simple());
-        let error = Arc::new(Texture::error(device, queue, error_sampler));
+        let sampler = sampler_for(device, &mut samplers, SamplerKey::simple());
+        let error = Arc::new(Texture::error(device, queue, sampler.clone()));
+        let white = Arc::new(Texture::white(device, queue, sampler));
 
         TextureCache {
             device: device.clone(),
@@ -489,12 +550,21 @@ impl TextureCache {
             textures: HashMap::new(),
             samplers,
             error,
+            white,
         }
     }
 
     /// The checkerboard. `CTextureManager::ErrorTexture`.
     pub fn error_texture(&self) -> Arc<Texture> {
         Arc::clone(&self.error)
+    }
+
+    /// The 1x1 white texture. `TEXTURE_WHITE`, via `BindStandardTexture`.
+    ///
+    /// What an *undefined* texture parameter binds — which is not the same as
+    /// a failed one. See [`Texture::white`].
+    pub fn white_texture(&self) -> Arc<Texture> {
+        Arc::clone(&self.white)
     }
 
     /// Loads `materials/<name>.vtf`, or returns the error checkerboard.

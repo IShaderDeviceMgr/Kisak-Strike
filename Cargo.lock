@@ -1589,6 +1589,7 @@ dependencies = [
 name = "source-engine"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "pollster",
  "thiserror 2.0.20",
  "wgpu",

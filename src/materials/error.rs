@@ -83,6 +83,35 @@ pub enum VtfError {
     NoImageData,
 }
 
+/// Anything that can go wrong reading a `.vmt`.
+///
+/// Replaces the `Warning( "CMaterial::PrecacheVars: error loading vmt file for
+/// %s" )` of `materialsystem/cmaterial.cpp:2326`, which reported every one of
+/// these the same way and left the caller with a material bound to the
+/// wireframe shader.
+#[derive(Debug, thiserror::Error)]
+pub enum VmtError {
+    /// The `.vmt` could not be read out of the game's content. Transparent for
+    /// the same reason as [`TextureError::Read`]: the path is already in there.
+    #[error(transparent)]
+    Read(#[from] crate::filesystem::VfsError),
+
+    /// The document has no outermost block, so it names no shader.
+    #[error("{name}: contains no shader block")]
+    NoShader { name: String },
+
+    /// A `patch` block with no `include` key. The original tries to load the
+    /// empty string and reports the failed read instead.
+    #[error("{name}: is a patch with no $include")]
+    PatchWithoutInclude { name: String },
+
+    /// The document names a shader this port does not have. Valve's wording,
+    /// from `CMaterial::InitializeShader` (`cmaterial.cpp:1613`), minus its
+    /// "using wireframe instead" — the substitute here is the error material.
+    #[error("{name}: uses unknown shader \"{shader}\"")]
+    UnknownShader { name: String, shader: String },
+}
+
 /// Anything that can go wrong turning a name into a texture on the GPU.
 #[derive(Debug, thiserror::Error)]
 pub enum TextureError {

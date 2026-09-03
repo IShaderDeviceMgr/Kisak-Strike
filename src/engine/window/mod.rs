@@ -50,8 +50,10 @@ use winit::window::{Fullscreen, Window, WindowId};
 // rather than growing more of these imports.
 use crate::filesystem::Vfs;
 use crate::launcher::cmdline::CommandLine;
+use crate::materials::pipeline::TargetFormat;
+use crate::materials::uniforms::DrawUniforms;
 use crate::materials::{
-    ColorSpace, Renderer, RendererOptions, TextureBlit, TextureCache, CLEAR_COLOR,
+    Material, MaterialCache, MaterialPreview, Renderer, RendererOptions, CLEAR_COLOR,
 };
 
 /// Fallback window title, from `CGame::CreateGameWindow`
@@ -273,7 +275,7 @@ pub enum WindowError {
 pub fn run(
     config: VideoConfig,
     vfs: Option<&Vfs>,
-    test_texture: Option<&str>,
+    test_material: Option<&str>,
 ) -> Result<(), WindowError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -282,7 +284,7 @@ pub fn run(
         config,
         event_loop.owned_display_handle(),
         vfs,
-        test_texture,
+        test_material,
     );
     event_loop.run_app(&mut app)?;
 
@@ -302,20 +304,23 @@ struct GameWindow<'a> {
     /// `resumed`, and `wgpu` wants it on the instance.
     display: OwnedDisplayHandle,
     /// The mounted game content, if it mounted. `None` is survivable — see
-    /// [`GameWindow::load_test_texture`].
+    /// [`GameWindow::load_test_material`].
     vfs: Option<&'a Vfs>,
-    /// `-vtf <name>`: the stage-2 verification switch. See
-    /// [`GameWindow::load_test_texture`].
-    test_texture: Option<&'a str>,
+    /// `-vmt <name>`: the stage-3 verification switch. See
+    /// [`GameWindow::load_test_material`].
+    test_material: Option<&'a str>,
     /// Declared before `window` so the surface is torn down before the window
     /// it points at.
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
-    /// The name-to-texture dictionary. Owns the textures the blit draws, so it
-    /// outlives them rather than being a local in [`GameWindow::create`].
-    textures: Option<TextureCache>,
-    /// Built only when `-vtf` asked for one.
-    blit: Option<TextureBlit>,
+    /// The material dictionary, and the texture and pipeline caches under it.
+    /// Owns what the preview draws, so it outlives the draw rather than being
+    /// a local in [`GameWindow::create`].
+    materials: Option<MaterialCache>,
+    /// The quad and the shared bind groups, built with the renderer.
+    preview: Option<MaterialPreview>,
+    /// Built only when `-vmt` asked for one.
+    material: Option<Arc<Material>>,
     /// When to try again after a skipped frame. See [`SKIP_RETRY`].
     retry_at: Option<Instant>,
     /// Whether the milestone line has been printed. See [`GameWindow::draw`].
@@ -328,17 +333,18 @@ impl<'a> GameWindow<'a> {
         config: VideoConfig,
         display: OwnedDisplayHandle,
         vfs: Option<&'a Vfs>,
-        test_texture: Option<&'a str>,
+        test_material: Option<&'a str>,
     ) -> Self {
         GameWindow {
             config,
             display,
             vfs,
-            test_texture,
+            test_material,
             renderer: None,
             window: None,
-            textures: None,
-            blit: None,
+            materials: None,
+            preview: None,
+            material: None,
             retry_at: None,
             presented: false,
             startup_error: None,
@@ -359,54 +365,51 @@ impl<'a> GameWindow<'a> {
             &self.config.renderer_options(),
         )?;
 
-        self.blit = self.load_test_texture(&renderer);
+        let mut materials = MaterialCache::new(renderer.device(), renderer.queue());
+        self.preview = Some(MaterialPreview::new(
+            renderer.device(),
+            materials.pipelines().layouts(),
+        ));
+        self.material = self.load_test_material(&mut materials);
+        self.materials = Some(materials);
         self.window = Some(window);
         self.renderer = Some(renderer);
         Ok(())
     }
 
-    /// Loads `-vtf <name>` and prepares to draw it over the frame.
+    /// Loads `-vmt <name>` and prepares to draw it over the frame.
     ///
-    /// **Stage 2 verification only.** `portdocs/MATERIALSYSTEM.md` §9 makes the
-    /// deliverable of the texture stage a real `.vtf` out of a real VPK, on
-    /// screen; this is the switch that asks for one, and it goes away with
-    /// `crate::materials::TextureBlit` when stage 3's material path can draw.
+    /// **Stage 3 verification only.** `portdocs/MATERIALSYSTEM.md` §9 makes the
+    /// deliverable of the material stage "a quad drawn through a real `.vmt`
+    /// and a real WGSL shader"; this is the switch that asks for one, and it
+    /// goes away with [`crate::materials::MaterialPreview`] when stage 4's
+    /// render context can draw real geometry.
     ///
-    /// Failure is deliberately not an error. A missing or broken texture
-    /// resolves to the error checkerboard, exactly as
-    /// `CTextureManager::FindOrLoadTexture` did, because "one texture is
-    /// broken" must never be "the game does not start" — and seeing the
-    /// checkerboard is itself evidence that the fallback path works.
-    fn load_test_texture(&mut self, renderer: &Renderer) -> Option<TextureBlit> {
-        let name = self.test_texture?;
-        let textures = self
-            .textures
-            .insert(TextureCache::new(renderer.device(), renderer.queue()));
+    /// Failure is deliberately not an error. A missing material, a malformed
+    /// one, or one naming a shader this port does not have resolves to the
+    /// error material — magenta checkerboard — exactly as
+    /// `CMaterialSystem::FindMaterial` did, because "one material is broken"
+    /// must never be "the game does not start". Seeing the checkerboard is
+    /// itself evidence that the fallback path works.
+    fn load_test_material(&mut self, materials: &mut MaterialCache) -> Option<Arc<Material>> {
+        let name = self.test_material?;
 
-        // Colour, since a `-vtf` is something someone wants to look at. A
-        // material would decide per sampler instead — see rustdocs/MATERIALS.md.
-        let texture = match self.vfs {
-            Some(vfs) => textures.load(vfs, name, ColorSpace::Srgb),
+        let material = match self.vfs {
+            Some(vfs) => materials.load(vfs, name),
             None => {
-                eprintln!("source-engine: materials: -vtf {name}: no game content is mounted");
-                textures.error_texture()
+                eprintln!("source-engine: materials: -vmt {name}: no game content is mounted");
+                materials.error_material()
             }
         };
 
         eprintln!(
-            "source-engine: materials: -vtf {} -> {}x{} {:?}, {} mip(s)",
-            name, texture.width, texture.height, texture.format, texture.mip_count
+            "source-engine: materials: -vmt {} -> {} ({}), flags {}",
+            name,
+            material.shader.name(),
+            material.name,
+            material.flags
         );
-
-        let blit = TextureBlit::new(renderer.device(), renderer.surface_format(), &texture);
-        if blit.is_none() {
-            eprintln!(
-                "source-engine: materials: -vtf {name}: {:?} textures cannot be shown by the \
-                 stage-2 blit",
-                texture.view_dimension
-            );
-        }
-        blit
+        Some(material)
     }
 
     /// One frame.
@@ -425,6 +428,34 @@ impl<'a> GameWindow<'a> {
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
+
+        // Stage 3's verification draw, prepared *before* the frame is
+        // acquired: compiling the pipeline and writing the uniform buffers both
+        // need the renderer, and an acquired `Frame` borrows it for its whole
+        // lifetime. Removed with `-vmt` when stage 4's render context can draw
+        // real geometry.
+        let prepared = match (&self.material, &self.preview, &mut self.materials) {
+            (Some(material), Some(preview), Some(materials)) => {
+                let target = TargetFormat::color_only(renderer.surface_format());
+                let pipeline = materials.pipelines().get(&material.pipeline_key(target));
+
+                let size = window.inner_size();
+                preview.update(
+                    renderer.queue(),
+                    (size.width, size.height),
+                    // What a render context would build: the material's colour
+                    // and alpha, with no per-instance override to multiply in
+                    // and no camera to place it with.
+                    &DrawUniforms {
+                        modulation: material.modulation,
+                        ..DrawUniforms::identity()
+                    },
+                );
+                Some((material, preview, pipeline))
+            }
+            _ => None,
+        };
+
         // `None` is the ordinary "not on screen right now" answer, not a
         // failure — see `Renderer::begin_frame`. Back off rather than asking
         // again immediately; see `about_to_wait`.
@@ -434,10 +465,8 @@ impl<'a> GameWindow<'a> {
         };
 
         frame.clear(CLEAR_COLOR);
-        // Stage 2's verification draw. Removed with `-vtf` when stage 3's
-        // material path can put a quad on the screen through a real `.vmt`.
-        if let Some(blit) = &self.blit {
-            frame.blit(blit);
+        if let Some((material, preview, pipeline)) = &prepared {
+            frame.draw_material(preview, material, pipeline);
         }
 
         // Tells the compositor a frame is imminent, so it can schedule

@@ -17,6 +17,8 @@ is not compiled, not linked, and not edited.
   src/main.rs      entry point
   src/launcher/    process bootstrap
   src/filesystem/  search paths, gameinfo.txt, VPK reading
+  src/materials/   the GPU device and frame boundary (wgpu), textures, materials
+  src/engine/      the engine; window/ (winit) so far
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -38,26 +40,27 @@ cargo build
 cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and four
-direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster` (each justified in a
-comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and five
+direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck` (each justified
+in a comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 134 tests), and the binary now **runs**: it
-mounts the game filesystem, opens a window, clears it, and can put a `.vtf` from the
-game's content on the screen (`-vtf <name>`). It is **not a runnable game** and won't be until the rest of the boot path exists — engine host loop,
-map loading, game layer. Verification is still mostly against the reference: read
+There is a unit test suite (`cargo test`, 193 tests), and the binary now **runs**: it
+mounts the game filesystem, opens a window, clears it, and can draw a quad through a real
+`.vmt` from the game's content — its shader, its textures and its pipeline state
+(`-vmt <name>`). It is **not a runnable game** and won't be until the rest of the boot
+path exists — engine host loop, map loading, game layer. Verification is still mostly against the reference: read
 `legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
 ```
 cargo run -- -basedir /path/to/game -game portal2 -window -width 1280 -height 720
-cargo run -- -basedir /path/to/game -game portal2 -window -vtf metal/metalwall048a
+cargo run -- -basedir /path/to/game -game portal2 -window -vmt metal/metalwall048a
 ```
 
 ## The port: standing decisions
@@ -109,22 +112,31 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-2 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-3 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → `clear` → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
   have no counterpart. Stage 2 added the texture path: `Vtf` (`.vtf` 7.0-7.5),
   `ImageFormat` (Valve's format table, the mip-offset arithmetic, and the CPU conversions
   for formats `wgpu` lacks), and `TextureCache` (name → `Texture`, falling back to the
-  error checkerboard). `-vtf <name>` draws one full-screen; that switch and `blit.rs` are
-  stage 2's verification path and are deleted when stage 3 lands.
-  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the rule
-  on `ColorSpace`, which is a load-time decision here because Valve made it per-sampler
-  in the shader. Plan: `portdocs/MATERIALSYSTEM.md`.
-  Stages 3-8 (materials + the WGSL prelude, meshes, lightmaps, the shader set,
+  error checkerboard). Stage 3 added the material path: `Vmt` (`.vmt` parsing, patch
+  chains, conditional keys, flags), `MaterialVar` (the value grammar and Valve's
+  coercions), `ShaderKind` (`UnlitGeneric`, rewritten in WGSL over the §7.4 constant ABI
+  and the §7.5 prelude), `PipelineCache` (replacing `StateSnapshot_t` and deleting
+  `TransitionTable.cpp`), and `MaterialCache` (name → `Material`, falling back to the
+  error material). `-vmt <name>` draws one material full-screen; that switch and
+  `preview.rs` are stage 3's verification path and are deleted when stage 4 lands.
+  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the two
+  conventions that produce a plausible wrong picture rather than an error: **matrices are
+  column-major and multiply on the left** (Valve's are the reverse on both counts), and
+  **`ColorSpace` is a load-time decision the shader makes**, because Valve made it
+  per-sampler in the shader. Plan: `portdocs/MATERIALSYSTEM.md`.
+  Stages 4-8 (meshes and the render context, lightmaps, the rest of the shader set,
   paint maps) are not started. Still settled for those: the shaders are
   **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
-  Valve's static/dynamic shader-combo system is deleted with them.
+  Valve's static/dynamic shader-combo system is deleted with them — `UnlitGeneric`
+  needed no source-text variants at all, so §10's "how are variants expressed" question
+  is still open and still unforced.
 - **`src/engine/` — `window/` ported, the other 12 subsystems not started**
   (`portdocs/ENGINE.md`, `rustdocs/ENGINE.md`). Conclusion stands: don't port `engine` as
   one unit. Each of its 23 subsystems becomes its own Rust module under `src/engine/`
@@ -134,10 +146,12 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   engine (see `rustdocs/ENGINE.md` gotcha #3).
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: `materialsystem` stage 3 — the `.vmt` parser,
-`MaterialVar`, the material registry, the bind-group layout of `MATERIALSYSTEM.md` §7.4
-and the WGSL prelude of §7.5, then `UnlitGeneric` end to end. It lands before the engine
-frame loop, since the frame boundary constrains how that loop can be structured.
+Next on the boot path per `PORTING.md`: `materialsystem` stage 4 — typed vertex structs,
+static and dynamic buffers, and the render state / matrix / render-target stacks, which
+between them bring the depth buffer the stage-3 pipeline state is already carrying but
+cannot apply. **Read `studiorender/` and `engine/`'s draw paths before fixing that API**
+(`portdocs/MATERIALSYSTEM.md` §9); unlike stage 3 it is not strictly ahead of the engine
+host loop, since it is the loop's requirements that should shape it.
 
 ### Known warts, and what triggers fixing them
 

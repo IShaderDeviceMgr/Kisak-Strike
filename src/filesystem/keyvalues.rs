@@ -70,6 +70,43 @@ impl Block {
         }
     }
 
+    /// First matching entry, if it is a block, mutably.
+    ///
+    /// Exists for `.vmt` patching, which edits a loaded document in place —
+    /// see [`crate::materials::vmt`].
+    pub fn find_block_mut(&mut self, key: &str) -> Option<&mut Block> {
+        match self
+            .entries
+            .iter_mut()
+            .find(|e| e.key.eq_ignore_ascii_case(key))
+            .map(|e| &mut e.value)
+        {
+            Some(Value::Block(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Sets `key`, replacing the first case-insensitive match or appending.
+    ///
+    /// `KeyValues::SetString`/`SetInt` and friends, which resolve the key with
+    /// `FindKey( name, true )` — create-if-absent — and overwrite whatever was
+    /// there. The *first* match is the one replaced, matching `FindKey`, so a
+    /// document with duplicate keys keeps its later copies untouched and the
+    /// entry stays in its original position.
+    pub fn set(&mut self, key: &str, value: Value) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|e| e.key.eq_ignore_ascii_case(key))
+        {
+            Some(entry) => entry.value = value,
+            None => self.entries.push(Entry {
+                key: key.to_owned(),
+                value,
+            }),
+        }
+    }
+
     /// First matching entry, if it is a string.
     pub fn find_string(&self, key: &str) -> Option<&str> {
         match self.find(key) {
@@ -98,6 +135,28 @@ impl Block {
     pub fn first_block(&self) -> Option<&Block> {
         self.entries.iter().find_map(|e| match &e.value {
             Value::Block(b) => Some(b),
+            Value::String(_) => None,
+        })
+    }
+
+    /// The first entry whose value is a block, mutably. See [`Block::first_block`].
+    pub fn first_block_mut(&mut self) -> Option<&mut Block> {
+        self.entries.iter_mut().find_map(|e| match &mut e.value {
+            Value::Block(b) => Some(b),
+            Value::String(_) => None,
+        })
+    }
+
+    /// The key of the first entry whose value is a block.
+    ///
+    /// A `.vmt`'s outermost key is its *shader name*, and a patch file's is the
+    /// literal `patch` — so unlike `gameinfo.txt`, where the wrapper's name is
+    /// noise, here it carries the meaning. Separate from
+    /// [`first_block`](Block::first_block) so that reading the name does not
+    /// borrow the block that is about to be edited.
+    pub fn first_block_key(&self) -> Option<&str> {
+        self.entries.iter().find_map(|e| match &e.value {
+            Value::Block(_) => Some(e.key.as_str()),
             Value::String(_) => None,
         })
     }
@@ -600,5 +659,38 @@ mod tests {
         let doc = parse("t", "  // nothing here\n").unwrap();
         assert!(doc.is_empty());
         assert!(doc.first_block().is_none());
+    }
+
+    #[test]
+    fn set_overwrites_the_first_match_in_place_or_appends() {
+        let mut doc = parse("t", r#""r" { a 1  b 2  a 3 }"#).unwrap();
+        let root = doc.first_block_mut().unwrap();
+
+        root.set("A", Value::String("9".into()));
+        // In place, and only the first of the duplicates: `FindKey` returns the
+        // first, and `SetString` writes through it.
+        let keys: Vec<_> = root.values().collect();
+        assert_eq!(keys, [("a", "9"), ("b", "2"), ("a", "3")]);
+
+        root.set("c", Value::String("4".into()));
+        assert_eq!(root.find_string("c"), Some("4"));
+        assert_eq!(root.entries().len(), 4, "appended at the end");
+    }
+
+    #[test]
+    fn blocks_can_be_reached_mutably() {
+        let mut doc = parse("t", r#""r" { sub { a 1 } leaf 2 }"#).unwrap();
+        let root = doc.first_block_mut().unwrap();
+
+        root.find_block_mut("SUB")
+            .unwrap()
+            .set("a", Value::String("5".into()));
+        assert_eq!(root.find_block("sub").unwrap().find_string("a"), Some("5"));
+
+        assert!(
+            root.find_block_mut("leaf").is_none(),
+            "a string is not a block"
+        );
+        assert!(root.find_block_mut("absent").is_none());
     }
 }

@@ -19,9 +19,10 @@
 //! | `SetHardwareGammaRamp` | an sRGB surface format, chosen in [`Renderer::new`] |
 //! | `AddView`/`RemoveView`/`SetView` (Hammer child windows) | gone; one window |
 //!
-//! **Stage 1 only.** The public surface here is deliberately the minimum that
-//! clears and presents a window; textures, pipelines and meshes arrive in
-//! stages 2-4 of `portdocs/MATERIALSYSTEM.md` §9.
+//! The public surface here is deliberately the minimum that acquires, records
+//! and presents. It has not grown since stage 1 and should not: stage 3 draws
+//! by adding a `Frame` method in its own file (`preview.rs`), and the
+//! render-target stack of stage 4 is the next thing with a claim on it.
 
 use std::sync::Arc;
 
@@ -259,7 +260,7 @@ impl Renderer {
     /// `wgpu::Device` and `wgpu::Queue` are cheap handles to shared state and
     /// are `Clone`, so a subsystem that needs to create resources holds its own
     /// copy rather than borrowing the renderer for its lifetime — which is what
-    /// lets [`crate::materials::TextureCache`] exist outside this struct.
+    /// lets [`crate::materials::texture::TextureCache`] exist outside this struct.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }

@@ -6,8 +6,9 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stages 1-2 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), and the
-texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard). Stages 3-8 not
+**Status: stages 1-3 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
+texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), and the material
+path (`.vmt` → `Material` → a quad drawn with `UnlitGeneric` in WGSL). Stages 4-8 not
 started. The implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
@@ -604,8 +605,9 @@ milestone the project has.
    owed: MSAA (`-mat_antialias`), exclusive fullscreen modes, refresh rate, gamma.
 2. ~~**Texture path.**~~ **Done.** `.vtf` parse → `ImageFormat`→`wgpu::TextureFormat`
    mapping → upload, mips, sampler creation, and the error checkerboard. Landed as
-   `src/materials/{vtf,image_format,texture}.rs`, with `blit.rs` + `shaders/blit.wgsl` and
-   a `-vtf <name>` switch as the deliverable's "on screen" half. **API:
+   `src/materials/{vtf,image_format,texture}.rs`, with a `blit.rs` + `shaders/blit.wgsl`
+   and a `-vtf <name>` switch as the deliverable's "on screen" half — both deleted by
+   stage 3, which replaced them with `preview.rs` and `-vmt`. **API:
    `../rustdocs/MATERIALS.md`.**
 
    Decisions made here that the later stages inherit:
@@ -620,8 +622,9 @@ milestone the project has.
      all Valve content is DXT and there is no fallback tier, so this is the first
      deliberate raise of §4.6's single capability tier.
    - **sRGB is a load-time parameter, not a property of the file.** `EnableSRGBRead` was
-     per-sampler and per-shader; `wgpu` bakes it into the `TextureFormat`. Stage 3's
-     materials are what should encode the rule — see `../rustdocs/MATERIALS.md`.
+     per-sampler and per-shader; `wgpu` bakes it into the `TextureFormat`. Stage 3 moved
+     the decision into the shader, where `EnableSRGBRead` made it — see
+     `shader::texture_requests`.
    - **One GPU texture per animation frame**, as `CTexture::m_pTextureHandles[iFrame]` had
      it. Cube faces and volume slices are layers within one texture; frames are not.
    - Five `ImageFormat` values are knowingly not uploadable (`P8`, `NULL`,
@@ -631,11 +634,63 @@ milestone the project has.
 
    Still owed from this stage: `mat_picmip`/mip-skipping on load, texture streaming and
    exclusion lists, and frames past 0 of an animated `.vtf`.
-3. **Material path + WGSL prelude.** `.vmt` parser → `MaterialVar` → material registry
-   with handles and refcounts. In parallel, the bind-group layout of §7.4 and the WGSL
-   prelude of §7.5 — both are prerequisites for *every* shader, so they are stage-3 work,
-   not stage-6 work. Then `UnlitGeneric` end to end, with the pipeline cache.
-   **Deliverable: a quad drawn through a real `.vmt` and a real WGSL shader.**
+3. ~~**Material path + WGSL prelude.**~~ **Done.** `.vmt` parse (patches, conditional
+   keys, flags, vars) → `MaterialVar` → a material registry, the bind-group layout of
+   §7.4, the WGSL prelude of §7.5, and `UnlitGeneric` end to end through a pipeline
+   cache. Landed as `src/materials/{var,vmt,shader,uniforms,pipeline,material}.rs` plus
+   `shaders/{prelude,unlitgeneric}.wgsl`, with `preview.rs` and a `-vmt <name>` switch as
+   the deliverable's "on screen" half. **API: `../rustdocs/MATERIALS.md`.**
+
+   Decisions made here that the later stages inherit:
+
+   - **Matrices are column-major and multiply on the left** (`m * v`), against Valve's
+     row-major `mul( float4(pos,1), M )`. Translating every shader through a transpose
+     forever would be a permanent tax; the transpose happens once, on the way into a
+     uniform. This is the single most expensive convention in the module to get wrong,
+     because it produces a plausible picture rather than an error, and a GPU test pins it
+     against a view projection that is deliberately not the identity.
+   - **The §7.4 bind groups are frequency groups, and groups 0 and 2 are shared by every
+     shader.** Only group 1 — the material's block plus its textures — is the shader's
+     own. Group 3 (skinning, morph) is not created: it is bulk data wanting storage
+     buffers, and nothing is skinned yet.
+   - **§10's "how are variants expressed" question stays open, and that is the answer for
+     now.** `ShaderKind::wgsl` concatenates the prelude with the body, which is what a
+     `#include` of `common_ps_fxc.h` was. `UnlitGeneric`'s bucketing produced *no*
+     textual variants at all — bucket 3 is pipeline state and bucket 2 is a flag word in
+     a uniform — so `naga_oil`, `override` constants and a build-time preprocessor all
+     remain unchosen, which is what §10 asks for until three shaders exist.
+   - **Alpha testing is a `discard`, not state.** D3D9 had `AlphaFunc`; WebGPU does not,
+     so it becomes a branch on a flag bit against `$alphatestreference`. The same applies
+     to anything else that was fixed-function and is not in `RenderState`.
+   - **`bIsAlphaModulating` is read from `$alpha` alone**, because there is no render
+     context to override it. That is the input that made Valve keep up to eight state
+     snapshots per material; here it is one field of a cache key, and when the render
+     context lands it becomes an argument to `render_state` with nothing else changing.
+   - **The error material is an ordinary `UnlitGeneric`** whose `$basetexture` is the
+     error checkerboard, built in memory exactly as `CreateDebugMaterials` builds
+     `___error.vmt`. Material fallback and texture fallback are the same mechanism one
+     layer apart.
+
+   **Two findings that correct this document**, both recorded at their sites:
+
+   - **§7.2 is wrong that `SHADER_PARAM`'s declared default is `.vmt` surface area.**
+     `m_pDefaultValue` is read by exactly one file in the tree — `tools/vmt/vmtdoc.cpp`,
+     the material editor. At runtime an undefined parameter takes a *type*-based default
+     from `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:865`) or an explicit
+     one from the shader's own `SHADER_INIT_PARAMS` block. The parameter *names* are
+     still fixed content surface area; the defaults in the table are documentation.
+   - **The `.vmt` value grammar is two layers, not one**, and they have to be read
+     together: `KeyValues`' text loader sniffs int-vs-float-vs-string with `strtol`/
+     `strtod` end pointers (`tier1/KeyValues.cpp:2620`) *before*
+     `CreateMaterialVarFromKeyValue` (`cmaterial.cpp:1085`) ever sees a string and looks
+     for matrices and vectors. Reading only the second gets `" 1 "` and `0x10` wrong.
+
+   Still owed from this stage: material proxies, `$fallbackmaterial`, `$frame` animation,
+   and everything `UnlitGeneric` can do past a base texture (detail, envmap, distance
+   alpha, decals, phong, flashlight) — each of which §7.8 puts with the shaders that
+   share it.
+4. **Mesh + render context.** Typed vertex structs, static and dynamic buffers, the
+   render state / matrix / render-target stacks, frame begin/end. Design this against
 4. **Mesh + render context.** Typed vertex structs, static and dynamic buffers, the
    render state / matrix / render-target stacks, frame begin/end. Design this against
    what `studiorender` and `engine`'s world rendering actually need — read those
@@ -647,8 +702,8 @@ milestone the project has.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–2 are done. Stages 1–3 are the "wgpu groundwork" PORTING.md says to do before
-the engine frame loop.
+Stages 1–3 are done, which is the whole of the "wgpu groundwork" PORTING.md says to do
+before the engine frame loop.
 Stage 4 is where the engine's real requirements start dictating the API, so **don't
 finalize the mesh/context API before reading `studiorender/` and `engine/`'s draw
 paths.**
@@ -661,9 +716,18 @@ paths.**
   string preprocessing at build time, or `naga_oil` for `#include`/`#ifdef`-style
   composition (which would also serve the §7.5 prelude). **Decide after the prelude and
   ~3 shaders exist**, not before — the shape of the problem isn't visible yet.
+  *Stage 3 update, one shader in:* still open, and `UnlitGeneric` did not need any of
+  them. Its bucketing produced no textual variants at all, so the prelude is prepended by
+  string concatenation (`ShaderKind::wgsl`) and nothing else is chosen. The shader most
+  likely to force the question is `LightmappedGeneric`, whose bumped/unbumped split
+  changes the vertex layout — a real bucket-3 axis, and therefore a pipeline variant
+  before it is a source-text one.
 - **How many pipeline variants actually survive?** §7.3 predicts single digits per
   shader. If a shader genuinely needs dozens, the pipeline cache needs an on-disk warm
-  cache and the plan needs a stage for it.
+  cache and the plan needs a stage for it. *Stage 3 update:* `UnlitGeneric`'s
+  `RenderState` has 2 × 2 × 2 × 2 × 5 × 2 × 2 reachable combinations on paper, but the
+  ones content actually asks for are far fewer — `PipelineCache::len()` is the
+  measurement, and the honest answer needs a real map's material list.
 - **Vertex-texture-fetch morph** (`ApplyMorph`/`SampleMorphDelta` in `common_vs_fxc.h`)
   is tied to `morph.cpp`, which §2 defers. Make sure deferring it doesn't silently break
   the shaders that call it — the prelude needs a no-op path.

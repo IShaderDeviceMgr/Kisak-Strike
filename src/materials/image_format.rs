@@ -254,7 +254,7 @@ impl ImageFormat {
     /// Note the truncating `>> 2` rather than a rounding-up division. That is
     /// Valve's, it is what the bytes in the file are laid out by, and it differs
     /// from a ceiling only for dimensions that are not multiples of 4 — which
-    /// `GetMemRequired` asserts never happens and [`crate::materials::Vtf`]
+    /// `GetMemRequired` asserts never happens and [`crate::materials::vtf::Vtf`]
     /// rejects up front. There is a second, *different* size routine in the
     /// original (`ImageLoader::SizeInBytes( fmt, w, h )`,
     /// `public/bitmap/imageformat.h:621`) which rounds up and charges 8 bytes a

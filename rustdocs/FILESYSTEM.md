@@ -12,7 +12,7 @@ Porting rationale, C++ inventory and what was deliberately dropped are in
 |---|---|
 | Module | `crate::filesystem` |
 | Lines | ~3,600 including tests |
-| Tests | 70 (`cargo test filesystem`) |
+| Tests | 72 (`cargo test filesystem`) |
 | Dependencies | `thiserror` only |
 | Status | Implemented. Async, `.bsp` pak lumps and `sv_pure` deferred — see [Not implemented](#not-implemented) |
 
@@ -278,9 +278,13 @@ impl Block {
     fn is_empty(&self) -> bool;
     fn find(&self, key: &str) -> Option<&Value>;        // case-insensitive, first match
     fn find_block(&self, key: &str) -> Option<&Block>;
+    fn find_block_mut(&mut self, key: &str) -> Option<&mut Block>;
     fn find_string(&self, key: &str) -> Option<&str>;
     fn values(&self) -> impl Iterator<Item = (&str, &str)>;  // leaf pairs, skips blocks
+    fn set(&mut self, key: &str, value: Value);         // replace first match, else append
     fn first_block(&self) -> Option<&Block>;
+    fn first_block_mut(&mut self) -> Option<&mut Block>;
+    fn first_block_key(&self) -> Option<&str>;
 }
 
 pub struct ConditionalSymbols;
@@ -289,7 +293,15 @@ impl ConditionalSymbols { pub fn get(name: &str) -> bool; }
 
 `values()` is `GetFirstValue`/`GetNextValue` — **it skips nested blocks**, which is what
 `FileSystem_LoadSearchPaths` iterates. `first_block()` finds the outer `"GameInfo"`
-wrapper positionally, because Valve locates it that way and mods do rename it.
+wrapper positionally, because Valve locates it that way and mods do rename it;
+`first_block_key()` is that wrapper's *name*, which is noise for `gameinfo.txt` and is the
+whole meaning for a `.vmt`, where it is the shader name (or the literal `patch`).
+
+The three mutating methods exist for one caller, `.vmt` patching
+([`MATERIALS.md`](MATERIALS.md#vmt)), which edits a loaded document in place the way
+`InsertKeyValues` (`materialsystem/cmaterial.cpp:3369`) does. `set` follows
+`KeyValues::SetString`: it resolves the key with a `FindKey`-style *first* match and
+overwrites through it, so duplicate keys keep their later copies and nothing moves.
 
 ### `filesystem::gameinfo`
 
@@ -440,7 +452,7 @@ its ordering is covered by unit tests that read like a specification.
 
 ## Test coverage
 
-79 tests, all in-module. Notable ones to look at before changing behavior:
+72 tests, all in-module. Notable ones to look at before changing behavior:
 
 | Test | Guards |
 |---|---|
@@ -453,6 +465,7 @@ its ordering is covered by unit tests that read like a specification.
 | `resolves_wrong_case_in_every_component` | case folding across all path components |
 | `traversal_out_of_the_mount_is_rejected` | gotcha #2 |
 | `public_types_are_thread_safe` | the `Send + Sync` guarantees above |
+| `set_overwrites_the_first_match_in_place_or_appends` | `KeyValues::SetString`'s first-match-wins rule, which `.vmt` patching depends on |
 
 The one verification still outstanding needs a real Portal 2 install: comparing
 `vfs.search_paths()` against a stock build's `PrintSearchPaths()`, and reading a real
