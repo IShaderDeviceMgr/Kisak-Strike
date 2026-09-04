@@ -547,6 +547,12 @@ them — then `materialsystem` stage 5 (lightmaps), which is no longer blocked a
 highest visual return of anything outstanding: it is what turns 62 of `sp_a1_intro1`'s 66
 materials from magenta checkerboard into content.
 
+Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
+`src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`
+§1 originally had it. Its first two stages (keyboard, mouse, mouse look) depend on nothing
+unbuilt; bindings want `console/`, and controllers (`gilrs`) are deferred to a later
+stage.
+
 **Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
 `launcher_main` were deleted before the restructure, so `legacy/` no longer links a
 game binary as-is. Everything else is intact and readable. If a *running* reference is

@@ -24,10 +24,17 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   module-behavior analysis is still the reference.
 - [`ENGINE.md`](ENGINE.md) — `engine`. Design/scoping only, but rewritten against the
   current architecture. 23 subsystems enumerated with files and sizes, mapped onto the
-  **13 Rust modules under `src/engine/`** they become, plus the frame-loop/`winit`
+  **14 Rust modules under `src/engine/`** they become, plus the frame-loop/`winit`
   analysis. Concludes `engine` should **not** be ported as one unit or ported next, and
   each surviving subsystem gets its own portdoc (`ENGINE_AUDIO.md`, `ENGINE_NET.md`,
   `ENGINE_HOST.md`) when it's scheduled.
+- [`ENGINE_INPUT.md`](ENGINE_INPUT.md) — input: Valve's top-level `inputsystem/`, plus
+  `engine/keys.cpp` and the `game/client/in_*.cpp` movement layer. Inventory across all
+  three, the `winit` event mapping, the two platform traps (`CursorGrabMode` is
+  unimplemented on X11 *or* macOS depending on the mode; raw motion is accelerated on
+  macOS only), the key-up latch that must survive, and a five-stage plan whose first two
+  stages depend on nothing unbuilt. Controllers (`gilrs`) are stage 5, deliberately
+  deferred. Concludes input should be **its own module**, revising `ENGINE.md` §1.
 
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.

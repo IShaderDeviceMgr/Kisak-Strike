@@ -35,7 +35,8 @@ src/engine/
   mod.rs          Engine construction + ownership of the subsystems below    **done**
   host/           frame loop, host state machine, level/map lifecycle        (§7.2) **done**
   window/         winit integration, video mode, input translation           (§7.3) **done, minus input**
-  console/        cvars, command buffer, dev console, key binding            (§7.4)
+  input/          button state, bindings, mouse look, controllers            (§7.3/§7.4)
+  console/        cvars, command buffer, dev console                         (§7.4)
   client/         client connection lifecycle, entity parsing, prediction    (§7.5)
   server/         server lifecycle, connected clients, snapshot writing      (§7.6)
   net/            UDP transport, netchannel, framing, protobuf messages      (§7.7)
@@ -51,10 +52,12 @@ src/engine/
   save/           savegame serialization                                     (§7.21)
 ```
 
-**Thirteen modules from twenty-three subsystems.** Six subsystems are deleted outright
-rather than ported (§7.12, §7.13, §7.19, §7.20, §7.22, §7.23 — ~45,700 lines), one
-dissolves into the launcher and `mod.rs` (§7.1), and the renderer front-end (§7.16, ~40k)
-mostly folds into the `src/materials/` work rather than being ported in place.
+**Fourteen modules from twenty-three subsystems.** (Thirteen until `input/` was split
+out of `window/` and `console/` — see `portdocs/ENGINE_INPUT.md` §8.1 for why.) Six
+subsystems are deleted outright rather than ported (§7.12, §7.13, §7.19, §7.20, §7.22,
+§7.23 — ~45,700 lines), one dissolves into the launcher and `mod.rs` (§7.1), and the
+renderer front-end (§7.16, ~40k) mostly folds into the `src/materials/` work rather than
+being ported in place.
 
 Notes on specific choices:
 
@@ -321,8 +324,9 @@ enum state machine — a good place to start.
 `CGame` stub), `igame.h` (17-method window abstraction).
 **Primary `winit` target.** Expect this to shrink dramatically (§1).
 
-### 7.4 Console, cvars & commands — ~5,600 → `console/`
-`console.cpp` (1,652), `cvar.cpp` (1,425), `keys.cpp` (1,392), `cmd.cpp` (1,171),
+### 7.4 Console, cvars & commands — ~5,600 → `console/` (+ `input/`)
+`console.cpp` (1,652), `cvar.cpp` (1,425), `keys.cpp` (1,392 — **now `input/`**, see
+`portdocs/ENGINE_INPUT.md`), `cmd.cpp` (1,171),
 `ipc_console.cpp` (294), `netconsole.cpp` (258), `cl_bounded_cvars.cpp` (163),
 `cheatcodes.cpp` (162), `baseautocompletefilelist.cpp` (97).
 **Port early — everything depends on it.** The cvar registry is the one piece of ambient
@@ -597,7 +601,9 @@ reached.** Remaining, in dependency order:
 
 1. **Input** (§7.3's remainder) — the largest gap in `window/`, and the thing that makes
    the placeholder camera in `rustdocs/ENGINE.md` unnecessary. Needs the `egui`
-   precedence decision in §6.
+   precedence decision in §6. **Planned in `portdocs/ENGINE_INPUT.md`**, which lands it as
+   its own module: stages 1-2 (keyboard, mouse, mouse look) need nothing that does not
+   exist; bindings want `console/`, and controllers (`gilrs`) are deferred to stage 5.
 2. **`console/`** (§7.4) — now genuinely earned: `map`, `fps_max`, `restart` and
    `quit` all exist as engine operations with no way to type them.
 3. **`materialsystem` stage 5** (lightmaps) — no longer blocked; there is a `.bsp` to
