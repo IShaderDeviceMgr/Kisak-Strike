@@ -27,8 +27,6 @@
 
 use glam::Vec3;
 
-use super::{Button, Input, Key};
-
 /// `sensitivity` (`in_mouse.cpp:100`), clamped there to `0.0001..1000`.
 pub const SENSITIVITY: f32 = 2.5;
 
@@ -152,11 +150,7 @@ impl ViewAngles {
         let (sr, cr) = self.roll.to_radians().sin_cos();
 
         let forward = Vec3::new(cp * cy, cp * sy, -sp);
-        let right = Vec3::new(
-            -sr * sp * cy + cr * sy,
-            -sr * sp * sy - cr * cy,
-            -sr * cp,
-        );
+        let right = Vec3::new(-sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp);
         let up = Vec3::new(cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp);
 
         (forward, right, up)
@@ -170,11 +164,10 @@ impl ViewAngles {
 /// `CGameMovement` collapsed into eight lines, all three of which arrive with
 /// `client/` and the game DLL.
 ///
-/// The keys are **hard-coded**, because bindings are stage 3 and want
-/// `console/`: WASD, space and left control to rise and fall, left shift to
-/// walk. Those are Portal 2's shipped defaults for `+forward`, `+back`,
-/// `+moveleft`, `+moveright`, `+moveup`, `+movedown` and `+speed`; when the
-/// binding table lands, this reads it instead.
+/// The keys are no longer hard-coded: movement comes from [`MoveButtons`],
+/// which is fed by the `+forward`/`-forward` commands that
+/// [`Bindings::dispatch`](super::bind::Bindings::dispatch) produces. Which
+/// physical key that is comes from `cfg/config_default.cfg`.
 #[derive(Debug, Clone, Copy)]
 pub struct FlyCamera {
     /// The eye, in world units.
@@ -204,36 +197,35 @@ impl FlyCamera {
     /// the detail that `+speed` halves the move factor **after** the speed
     /// clamp is computed from the unhalved one — so walking never reaches the
     /// clamp.
-    pub fn step(&mut self, input: &Input, seconds: f32) {
-        let held = |key| input.is_down(Button::Key(key));
+    pub fn step(&mut self, buttons: &MoveButtons, seconds: f32) {
         let (forward, right, _) = self.angles.vectors();
 
         let mut wish = Vec3::ZERO;
-        if held(Key::W) {
+        if buttons.forward.is_down() {
             wish += forward * CL_FORWARDSPEED;
         }
-        if held(Key::S) {
+        if buttons.back.is_down() {
             wish -= forward * CL_FORWARDSPEED;
         }
-        if held(Key::D) {
+        if buttons.move_right.is_down() {
             wish += right * CL_SIDESPEED;
         }
-        if held(Key::A) {
+        if buttons.move_left.is_down() {
             wish -= right * CL_SIDESPEED;
         }
         // Along world `+Z`, not along `up`: `FullNoClipMove` adds `m_flUpMove`
         // to `wishvel[2]` after the forward/right terms, so looking down does
         // not tilt which way "up" is.
-        if held(Key::Space) {
+        if buttons.up.is_down() {
             wish.z += CL_UPSPEED;
         }
-        if held(Key::LeftControl) {
+        if buttons.down.is_down() {
             wish.z -= CL_UPSPEED;
         }
 
         let mut factor = SV_NOCLIPSPEED;
         let max_speed = SV_MAXSPEED * factor;
-        if held(Key::LeftShift) {
+        if buttons.speed.is_down() {
             factor /= 2.0;
         }
 
@@ -246,9 +238,153 @@ impl FlyCamera {
     }
 }
 
+/// One button a `+command` holds down. `kbutton_t` (`in_main.cpp:424`), minus
+/// the half that belongs to `client/`.
+///
+/// **`down` is the point of it.** A `+command` carries the index of the button
+/// that sent it, and this records up to two of them, so that two keys bound to
+/// `+forward` do not cancel each other: releasing one leaves the other holding
+/// the movement. Without it, `bind UPARROW +forward` alongside `bind w
+/// +forward` makes tapping either one stop the other.
+///
+/// **Deliberately not ported:** `state`'s impulse bits and `KeyState`'s
+/// fraction-of-a-frame (`in_main.cpp:813`), which is what stops a 30 Hz frame
+/// from swallowing a fast tap. That is genuinely good design and it is
+/// genuinely `client/`'s — it exists to fill in `CUserCmd`'s float move
+/// values, and there is no `CUserCmd`. Building it against a camera would bake
+/// in the wrong consumer (`portdocs/ENGINE_INPUT.md` §4.4).
+///
+/// One divergence from the C++, and it fixes a latent bug: Valve stores the
+/// holders as `int` with **0 meaning empty**, so button code 0 could never
+/// hold anything. This uses `Option`, and `None` is the only empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KButton {
+    /// The indices currently holding this down. `Some(-1)` is the holder for a
+    /// `+command` typed with no argument, which is what Valve's `k = -1` is.
+    down: [Option<i32>; 2],
+}
+
+impl KButton {
+    /// `KeyDown` (`in_main.cpp:424`).
+    pub fn press(&mut self, index: Option<i32>) {
+        let index = index.or(Some(-1));
+        if self.down[0] == index || self.down[1] == index {
+            return; // repeating key
+        }
+        if self.down[0].is_none() {
+            self.down[0] = index;
+        } else if self.down[1].is_none() {
+            self.down[1] = index;
+        }
+        // Valve warns and drops a third holder; two is enough to make the
+        // two-keys-one-command case work, which is all this is for.
+    }
+
+    /// `KeyUp` (`in_main.cpp:460`).
+    ///
+    /// A `-command` typed with **no argument** releases unconditionally —
+    /// Valve's `if ( !c || !c[0] )` branch. That is what makes typing
+    /// `-forward` at the console a way out of a stuck key.
+    pub fn release(&mut self, index: Option<i32>) {
+        let Some(index) = index else {
+            self.down = [None; 2];
+            return;
+        };
+        if self.down[0] == Some(index) {
+            self.down[0] = None;
+        } else if self.down[1] == Some(index) {
+            self.down[1] = None;
+        } else {
+            return; // key up without a corresponding down
+        }
+    }
+
+    pub fn is_down(&self) -> bool {
+        self.down[0].is_some() || self.down[1].is_some()
+    }
+}
+
+/// The `+command` buttons the placeholder camera reads.
+///
+/// `CInput`'s `in_forward`, `in_back`, `in_moveleft`, `in_moveright`, `in_up`,
+/// `in_down` and `in_speed` — the seven that `FullNoClipMove` and
+/// `ComputeUpwardMove` actually consume. **Moves to `client/` with
+/// [`FlyCamera`]**, where it becomes the front of `CUserCmd`.
+///
+/// # What Portal 2 does and does not bind
+///
+/// `cfg/config_default.cfg` binds `+forward`, `+back`, `+moveleft` and
+/// `+moveright`, and **not** `+moveup`, `+movedown` or `+speed` — vertical
+/// movement is a noclip-only concept and the shipped game has no key for it.
+/// So this also accepts **`+jump` and `+duck`** (SPACE and CTRL in the shipped
+/// config) as the camera's up and down. That is a **placeholder divergence**,
+/// not Valve's behaviour: `ComputeUpwardMove` (`in_main.cpp:1101`) reads
+/// `in_up`/`in_down` only, and jump is a button on `CUserCmd`, not a movement
+/// axis. It exists so that a camera standing in for a player flies with the
+/// keys the player's config actually binds, and it **dies with `client/`**.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MoveButtons {
+    pub forward: KButton,
+    pub back: KButton,
+    pub move_left: KButton,
+    pub move_right: KButton,
+    pub up: KButton,
+    pub down: KButton,
+    pub speed: KButton,
+}
+
+/// The `+command`/`-command` pairs [`MoveButtons`] answers to.
+///
+/// Both spellings are listed rather than derived, because a [`CommandSpec`]
+/// name is `&'static str` and these are what gets registered.
+///
+/// `jump` and `duck` are the placeholder divergence documented on
+/// [`MoveButtons`].
+///
+/// [`CommandSpec`]: crate::engine::console::CommandSpec
+pub const MOVE_COMMANDS: &[(&str, &str)] = &[
+    ("+forward", "-forward"),
+    ("+back", "-back"),
+    ("+moveleft", "-moveleft"),
+    ("+moveright", "-moveright"),
+    ("+moveup", "-moveup"),
+    ("+movedown", "-movedown"),
+    ("+speed", "-speed"),
+    ("+jump", "-jump"),
+    ("+duck", "-duck"),
+];
+
+impl MoveButtons {
+    /// Applies one `+name`/`-name` command. True if `name` was one of ours.
+    ///
+    /// `name` is the command without its sign, and `index` is the button-index
+    /// argument the binding carried — `None` when a bare `+forward` was typed.
+    pub fn apply(&mut self, name: &str, down: bool, index: Option<i32>) -> bool {
+        let button = match name.to_ascii_lowercase().as_str() {
+            "forward" => &mut self.forward,
+            "back" => &mut self.back,
+            "moveleft" => &mut self.move_left,
+            "moveright" => &mut self.move_right,
+            "moveup" | "jump" => &mut self.up,
+            "movedown" | "duck" => &mut self.down,
+            "speed" => &mut self.speed,
+            _ => return false,
+        };
+        match down {
+            true => button.press(index),
+            false => button.release(index),
+        }
+        true
+    }
+
+    /// `CInput::ClearStates` — focus loss must not leave the camera walking.
+    pub fn clear(&mut self) {
+        *self = MoveButtons::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::Event;
     use super::*;
 
     /// Within a quarter of a unit, which is finer than anything visible and
@@ -257,16 +393,16 @@ mod tests {
         (a - b).length() < 0.25
     }
 
-    fn hold(keys: &[Key]) -> Input {
-        let mut input = Input::new();
-        for &key in keys {
-            input.push(Event::Pressed {
-                button: Button::Key(key),
-                repeat: false,
-            });
+    /// Holds the named `+command`s, as a binding would.
+    fn hold(commands: &[&str]) -> MoveButtons {
+        let mut buttons = MoveButtons::default();
+        for (index, name) in commands.iter().enumerate() {
+            assert!(
+                buttons.apply(name, true, Some(index as i32)),
+                "`{name}` is not a movement command"
+            );
         }
-        input.frame();
-        input
+        buttons
     }
 
     #[test]
@@ -348,7 +484,7 @@ mod tests {
     #[test]
     fn holding_forward_moves_along_the_view() {
         let mut camera = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        camera.step(&hold(&[Key::W]), 1.0);
+        camera.step(&hold(&["forward"]), 1.0);
         assert!(close(
             camera.origin,
             Vec3::X * CL_FORWARDSPEED * SV_NOCLIPSPEED
@@ -358,7 +494,7 @@ mod tests {
     #[test]
     fn strafing_right_moves_along_negative_y_when_facing_positive_x() {
         let mut camera = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        camera.step(&hold(&[Key::D]), 1.0);
+        camera.step(&hold(&["moveright"]), 1.0);
         assert!(camera.origin.y < 0.0, "{:?}", camera.origin);
         assert!(camera.origin.x.abs() < 0.25);
     }
@@ -366,23 +502,23 @@ mod tests {
     #[test]
     fn rising_is_along_world_up_whatever_the_view_is_doing() {
         let mut camera = FlyCamera::new(Vec3::ZERO, 60.0, 30.0);
-        camera.step(&hold(&[Key::Space]), 1.0);
+        camera.step(&hold(&["moveup"]), 1.0);
         assert!(close(camera.origin, Vec3::Z * CL_UPSPEED * SV_NOCLIPSPEED));
     }
 
     #[test]
     fn walking_halves_the_speed() {
         let mut fast = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        fast.step(&hold(&[Key::W]), 1.0);
+        fast.step(&hold(&["forward"]), 1.0);
         let mut slow = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        slow.step(&hold(&[Key::W, Key::LeftShift]), 1.0);
+        slow.step(&hold(&["forward", "speed"]), 1.0);
         assert!((slow.origin.length() * 2.0 - fast.origin.length()).abs() < 0.25);
     }
 
     #[test]
     fn opposite_keys_cancel() {
         let mut camera = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        camera.step(&hold(&[Key::W, Key::S, Key::A, Key::D]), 1.0);
+        camera.step(&hold(&["forward", "back", "moveleft", "moveright"]), 1.0);
         assert_eq!(camera.origin, Vec3::ZERO);
     }
 
@@ -398,11 +534,77 @@ mod tests {
         // Forward and up together are 2,022 units a second unclamped;
         // `FullNoClipMove` clamps to `sv_maxspeed * factor`.
         let mut camera = FlyCamera::new(Vec3::ZERO, 0.0, 0.0);
-        camera.step(&hold(&[Key::W, Key::Space]), 1.0);
+        camera.step(&hold(&["forward", "moveup"]), 1.0);
         let travelled = camera.origin.length();
         assert!(
             (travelled - SV_MAXSPEED * SV_NOCLIPSPEED).abs() < 0.25,
             "{travelled}"
         );
+    }
+
+    #[test]
+    fn two_keys_bound_to_one_command_do_not_cancel_each_other() {
+        // The whole reason a `+command` carries the index of the button that
+        // sent it. `bind w +forward` and `bind UPARROW +forward`: hold both,
+        // release one, keep walking.
+        let mut buttons = MoveButtons::default();
+        buttons.apply("forward", true, Some(10));
+        buttons.apply("forward", true, Some(20));
+        assert!(buttons.forward.is_down());
+
+        buttons.apply("forward", false, Some(20));
+        assert!(
+            buttons.forward.is_down(),
+            "the other key is still holding it"
+        );
+
+        buttons.apply("forward", false, Some(10));
+        assert!(!buttons.forward.is_down());
+    }
+
+    #[test]
+    fn a_release_for_a_button_that_never_pressed_is_ignored() {
+        let mut buttons = MoveButtons::default();
+        buttons.apply("forward", true, Some(10));
+        buttons.apply("forward", false, Some(99));
+        assert!(buttons.forward.is_down(), "key up without a matching down");
+    }
+
+    #[test]
+    fn a_repeated_press_from_the_same_button_is_not_a_second_holder() {
+        let mut buttons = MoveButtons::default();
+        buttons.apply("forward", true, Some(10));
+        buttons.apply("forward", true, Some(10));
+        buttons.apply("forward", false, Some(10));
+        assert!(!buttons.forward.is_down(), "one press, one release");
+    }
+
+    /// Valve's `if ( !c || !c[0] )` branch: typing `-forward` at the console
+    /// releases regardless of who was holding it, which is the way out of a
+    /// stuck movement key.
+    #[test]
+    fn a_bare_minus_command_releases_unconditionally() {
+        let mut buttons = MoveButtons::default();
+        buttons.apply("forward", true, Some(10));
+        buttons.apply("forward", true, Some(20));
+        buttons.apply("forward", false, None);
+        assert!(!buttons.forward.is_down());
+    }
+
+    #[test]
+    fn jump_and_duck_drive_the_placeholder_camera_vertically() {
+        // A documented divergence: `ComputeUpwardMove` reads `+moveup`/
+        // `+movedown` only, and Portal 2 binds neither. See `MoveButtons`.
+        let mut buttons = MoveButtons::default();
+        buttons.apply("jump", true, Some(1));
+        assert!(buttons.up.is_down());
+        buttons.apply("duck", true, Some(2));
+        assert!(buttons.down.is_down());
+    }
+
+    #[test]
+    fn an_unknown_command_is_refused_rather_than_silently_dropped() {
+        let mut buttons = MoveButtons::default();
+        assert!(!buttons.apply("attack", true, Some(1)));
     }
 }

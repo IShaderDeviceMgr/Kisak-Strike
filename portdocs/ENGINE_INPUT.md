@@ -575,11 +575,15 @@ Each stage is independently reviewable and independently useful.
    *Then:* write `rustdocs/ENGINE.md`'s `input` section. The module is real at this point
    and the API doc is not optional (`CLAUDE.md`).
 
-3. **Bindings and command dispatch.** The binding table, `+`/`-` with the index argument,
-   `CommandSink`, `bind`/`unbind`/`unbindall`, `kb_def.lst` defaults if the content has
-   them. *Wants `console/`*, and is the natural first consumer of it — landing `console/`
-   between stages 2 and 3 is the expected order, since `PORTING.md` puts console next
-   anyway.
+3. **Bindings and command dispatch.** — **done.** The binding table, `+`/`-` with the
+   index argument, `CommandSink`, `bind`/`bind_osx`/`unbind`/`unbindall`,
+   `key_listboundkeys`/`key_findbinding`. `console/` landed between stages 2 and 3 as
+   expected.
+   **`kb_def.lst` turned out not to be the default binding set** and was not ported:
+   `GetDefaultKeyBindings` (`keys.cpp:348`) parses it into a *command → suggested key*
+   map that `GetSuggestedBinding` feeds to the options UI for commands that are unbound.
+   The actual defaults are `cfg/config_default.cfg`, which `exec` reads. It comes back
+   with an options UI, not before.
 
 4. **UI precedence.** egui's consumed-answer plus the key-up latch (§4.3, §8.3). *Wants
    the egui integration*, which is not scheduled.
@@ -589,7 +593,22 @@ Each stage is independently reviewable and independently useful.
 Stages 1 and 2 are the first landing and are what "port input over" means in this
 request. 3 onwards are gated on modules that do not exist.
 
-**Stages 1 and 2 landed as planned**, with three additions worth recording here because
+**Stages 1-3 landed as planned.** Stage 3 (bindings) arrived with `console/` stage 2, as
+this plan expected — `console/` supplies `CommandSink`, the table lives in `input/`, and
+WASD now comes from `cfg/config_default.cfg`. Two things about stage 3 are worth recording
+because the plan did not anticipate them:
+
+- **`kbutton_t`'s two-holder set had to be ported after all**, in
+  `input::view::KButton`. §4.4 defers `kbutton_t` wholesale to `client/`, but the index
+  argument the `+`/`-` convention carries is *only* meaningful against `down[2]` — without
+  it, two keys bound to `+forward` cancel each other and the argument is decoration. The
+  fractional `KeyState`, which is the genuinely client-shaped half, is still deferred.
+- **Portal 2 binds no vertical movement.** `config_default.cfg` has `+jump` and `+duck`
+  but neither `+moveup` nor `+movedown`, and `ComputeUpwardMove` (`in_main.cpp:1101`)
+  reads only the latter pair. `MoveButtons` accepts jump and duck as the placeholder
+  camera's up and down; it is documented as a divergence and dies with `client/`.
+
+Stages 1 and 2 landed with three additions worth recording here because
 they change what a later stage inherits:
 
 - **`Event` gained `FocusGained`.** Valve had no need for it; this port does, because

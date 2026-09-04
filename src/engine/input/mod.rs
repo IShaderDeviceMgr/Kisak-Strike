@@ -41,10 +41,23 @@
 //! not the event rate, so a lower `fps_max` is a higher input latency. That is
 //! faithful to `CInput::AccumulateMouse`.
 
+pub mod bind;
 pub mod button;
 pub mod view;
 
+pub use bind::{Bindings, CommandSink};
 pub use button::{Button, Key, MouseButton};
+pub use view::MoveButtons;
+
+/// The modifiers `toggleconsole` is swallowed under (`engine/keys.cpp:1172`).
+const MODIFIERS: &[Key] = &[
+    Key::LeftShift,
+    Key::RightShift,
+    Key::LeftControl,
+    Key::RightControl,
+    Key::LeftAlt,
+    Key::RightAlt,
+];
 
 /// One thing the platform reported.
 ///
@@ -113,6 +126,15 @@ pub struct Input {
     mouse_look: bool,
     /// Whether the window has focus.
     focused: bool,
+    /// Button to command text. Global even in the original — `s_KeyContext`
+    /// held one table, not one per splitscreen player.
+    bindings: Bindings,
+    /// What the `+command`s a binding sends have left held.
+    ///
+    /// Client state living in `input/` for the same reason
+    /// [`view`](crate::engine::input::view) does: there is nowhere else yet.
+    /// **Moves to `client/` with [`view::FlyCamera`]**.
+    move_buttons: MoveButtons,
 }
 
 impl Input {
@@ -130,6 +152,52 @@ impl Input {
             // window the desktop never activated never sends a `Focused`
             // event to correct an assumption with.
             focused: true,
+            bindings: Bindings::new(),
+            move_buttons: MoveButtons::default(),
+        }
+    }
+
+    pub fn bindings(&self) -> &Bindings {
+        &self.bindings
+    }
+
+    pub fn bindings_mut(&mut self) -> &mut Bindings {
+        &mut self.bindings
+    }
+
+    pub fn move_buttons(&self) -> &MoveButtons {
+        &self.move_buttons
+    }
+
+    pub fn move_buttons_mut(&mut self) -> &mut MoveButtons {
+        &mut self.move_buttons
+    }
+
+    /// Turns this tick's presses and releases into command text.
+    ///
+    /// `Key_Event`'s dispatch half (`engine/keys.cpp:1130`), called once per
+    /// frame **after** [`frame`](Input::frame) and **before** the console runs,
+    /// so that a key pressed this tick has its command executed in the same
+    /// tick rather than the next one.
+    ///
+    /// Reads [`events`](Input::events), so the redundant-transition guard has
+    /// already run: an auto-repeat press for a key that is already down never
+    /// reaches here, which is what `kbutton_t::KeyDown`'s "repeating key" early
+    /// return handles in the original.
+    pub fn dispatch_bindings(&self, sink: &mut dyn CommandSink) {
+        // `keys.cpp:1170` swallows `toggleconsole` under any modifier. Sampled
+        // once for the tick rather than per event: the modifier state cannot
+        // change within a tick, because a modifier press is itself an event in
+        // this same list and the guard is about what is *held*.
+        let modifier_down = MODIFIERS.iter().any(|&key| self.is_down(Button::Key(key)));
+
+        for event in &self.tick {
+            let (button, down) = match *event {
+                Event::Pressed { button, .. } => (button, true),
+                Event::Released(button) => (button, false),
+                _ => continue,
+            };
+            self.bindings.dispatch(button, down, modifier_down, sink);
         }
     }
 
@@ -268,6 +336,11 @@ impl Input {
     pub fn clear(&mut self) {
         self.down = [false; Button::COUNT];
         self.mouse = (0.0, 0.0);
+        // The `+command`s a binding sent are held by the *command*, not by the
+        // key, so clearing the down-state is not enough: without this, alt-tab
+        // with `+forward` held leaves the camera walking forever, which is the
+        // exact failure `CInput::ClearStates` exists to prevent.
+        self.move_buttons.clear();
     }
 }
 
@@ -427,5 +500,90 @@ mod tests {
                 Event::Wheel(1.0)
             ]
         );
+    }
+
+    #[derive(Default)]
+    struct Sink(Vec<String>);
+
+    impl CommandSink for Sink {
+        fn enqueue(&mut self, command: &str) {
+            self.0.push(command.to_string());
+        }
+    }
+
+    fn dispatched(input: &Input) -> Vec<String> {
+        let mut sink = Sink::default();
+        input.dispatch_bindings(&mut sink);
+        sink.0
+    }
+
+    #[test]
+    fn a_bound_press_and_release_become_commands() {
+        let mut input = Input::new();
+        let w = Button::Key(Key::W);
+        input.bindings_mut().bind(w, "+forward");
+
+        input.push(Event::Pressed {
+            button: w,
+            repeat: false,
+        });
+        input.frame();
+        assert_eq!(dispatched(&input), [format!("+forward {}", w.index())]);
+
+        input.push(Event::Released(w));
+        input.frame();
+        assert_eq!(dispatched(&input), [format!("-forward {}", w.index())]);
+    }
+
+    /// The redundant-transition guard already dropped it, so the `+command`
+    /// cannot be sent twice — which is what `kbutton_t::KeyDown`'s "repeating
+    /// key" early return handles in the original.
+    #[test]
+    fn auto_repeat_never_reaches_the_binding() {
+        let mut input = Input::new();
+        let w = Button::Key(Key::W);
+        input.bindings_mut().bind(w, "+forward");
+
+        input.push(Event::Pressed {
+            button: w,
+            repeat: false,
+        });
+        input.push(Event::Pressed {
+            button: w,
+            repeat: true,
+        });
+        input.frame();
+        assert_eq!(dispatched(&input).len(), 1);
+    }
+
+    #[test]
+    fn a_modifier_held_swallows_toggleconsole() {
+        let mut input = Input::new();
+        let backquote = Button::Key(Key::Backquote);
+        input.bindings_mut().bind(backquote, "toggleconsole");
+
+        input.push(Event::Pressed {
+            button: Button::Key(Key::LeftShift),
+            repeat: false,
+        });
+        input.push(Event::Pressed {
+            button: backquote,
+            repeat: false,
+        });
+        input.frame();
+        assert!(dispatched(&input).is_empty());
+    }
+
+    /// Losing focus with `+forward` held must not leave the view walking: the
+    /// command holds the button, so clearing the key down-state is not enough.
+    #[test]
+    fn focus_loss_releases_what_the_commands_are_holding() {
+        let mut input = Input::new();
+        input.move_buttons_mut().apply("forward", true, Some(3));
+        assert!(input.move_buttons().forward.is_down());
+
+        input.push(Event::FocusLost);
+        input.frame();
+        assert!(!input.move_buttons().forward.is_down());
     }
 }

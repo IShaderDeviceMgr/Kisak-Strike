@@ -612,8 +612,9 @@ subsystems want it.
 **§10.3's "first point at which something recognizable appears on screen" has been
 reached.** Remaining, in dependency order:
 
-1. **Input** (§7.3's remainder) — the largest gap in `window/`, and the thing that makes
-   the placeholder camera in `rustdocs/ENGINE.md` unnecessary. Needs the `egui`
+1. **Input** (§7.3's remainder) — **stages 1-3 of five done.** The largest gap in
+   `window/`, and the thing that makes the placeholder camera in `rustdocs/ENGINE.md`
+   unnecessary. Needs the `egui`
    precedence decision in §6. **Planned in `portdocs/ENGINE_INPUT.md`**, which lands it as
    its own module: stages 1-2 (keyboard, mouse, mouse look) need nothing that does not
    exist; bindings want `console/`, and controllers (`gilrs`) are deferred to stage 5.

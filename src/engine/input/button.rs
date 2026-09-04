@@ -388,7 +388,6 @@ impl Button {
     ///
     /// The empty string is not a button: it is `KEY_NONE`'s name, and Valve
     /// rejects it before the loop.
-    #[allow(dead_code)] // stage 3: `bind <name> <command>`
     pub fn from_name(name: &str) -> Option<Button> {
         if name.is_empty() {
             return None;
@@ -405,7 +404,6 @@ impl Button {
     }
 
     /// Every button, in index order. Test and diagnostic use.
-    #[allow(dead_code)] // stage 3: `key_listboundkeys` walks exactly this
     pub fn all() -> impl Iterator<Item = Button> {
         (0..Button::COUNT).filter_map(Button::from_index)
     }

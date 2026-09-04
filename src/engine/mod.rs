@@ -60,8 +60,8 @@ use console::{
     ExecContext, Source,
 };
 use host::{Host, Level, Outcome};
-use input::view::FlyCamera;
-use input::{Button, Input, Key, MouseButton};
+use input::view::{FlyCamera, MOVE_COMMANDS};
+use input::{Button, CommandSink, Input, Key, MouseButton};
 use world::World;
 
 /// `VIEW_NEARZ` (`game/client/view.h:27`).
@@ -167,10 +167,31 @@ impl<'a> Engine<'a> {
             }),
             CommandSpec::new("quit", "Exit the engine."),
             CommandSpec::new("restart", "Restart the engine."),
+            CommandSpec::new("bind", "Bind a key."),
+            CommandSpec::new("bind_osx", "Bind a key for OSX only."),
+            CommandSpec::new("unbind", "Unbind a key."),
+            CommandSpec::new("unbindall", "Unbind all keys."),
+            CommandSpec::new("key_listboundkeys", "List bound keys with bindings."),
+            CommandSpec::new(
+                "key_findbinding",
+                "Find key bound to specified command string.",
+            ),
         ] {
             console
                 .register_command(spec)
                 .expect("the engine's commands are unique");
+        }
+
+        // The `+command`s a binding sends. Both signs are registered, because
+        // dispatch only consults the target for names it has been told about —
+        // an unregistered `-forward` would fall through to "unknown" and the
+        // camera would never stop.
+        for (down, up) in MOVE_COMMANDS {
+            for name in [down, up] {
+                console
+                    .register_command(CommandSpec::new(name, "Movement button."))
+                    .expect("the movement commands are unique");
+            }
         }
 
         let mut materials = MaterialCache::new(device, queue);
@@ -224,6 +245,18 @@ impl<'a> Engine<'a> {
     /// same way it does in the shipped game, through the config files, rather
     /// than from a command-line argument read directly.
     pub fn boot(&mut self) {
+        // `Host_Init` (`engine/host.cpp:2055`) execs `config.cfg` and falls
+        // back to `config_default.cfg`, *before* `valve.rc`. Only the fallback
+        // is read here: nothing writes a `config.cfg` yet
+        // (`ENGINE_CONSOLE.md` §8 stage 3 is what does, and it is what adds
+        // the preference and the `Host_WasConfigCfgExecuted` guard), and
+        // exec'ing a file that a fresh install does not have would print an
+        // error at every launch.
+        //
+        // This is where WASD comes from. `config_default.cfg` opens with
+        // `unbindall` and then binds `+forward` and friends.
+        self.console
+            .enqueue("exec config_default.cfg", Source::Code);
         self.console.enqueue("exec valve.rc", Source::Code);
     }
 
@@ -300,16 +333,34 @@ impl<'a> Engine<'a> {
         let seconds = self.host.frame_time();
         self.scene.curtime += seconds;
 
+        // `DispatchAllStoredGameMessages`' place in `MainLoop`
+        // (`sys_mainwind.cpp:509`), and the accumulator reset with it. This
+        // must precede the two steps below: bindings read *this* tick's
+        // events, and the console executes what they produce.
+        let (dx, dy) = self.input.frame();
+
+        // `Key_Event`'s dispatch half (`engine/keys.cpp:1130`): a bound press
+        // becomes `+forward <index>` in the command buffer.
+        let Engine { console, input, .. } = self;
+        input.dispatch_bindings(console);
+
         // `Cbuf_Execute`. **Inside the frame**, so that one run is one tick and
         // `wait 1` means "next frame" — running it per window event instead
-        // would tick the command buffer at the display's rate.
+        // would tick the command buffer at the display's rate. It runs *after*
+        // the bindings, so a key pressed this tick moves the view this tick
+        // rather than the next one.
         //
         // The borrow is `ENGINE_CONSOLE.md` §6.6: `self.console.run(&mut self)`
         // cannot compile, so a struct of disjoint field borrows is the target.
         // It is the same move `host.frame(&mut self.scene)` above already
         // makes.
-        let Engine { console, host, .. } = self;
-        console.run(&mut EngineCommands { host });
+        let Engine {
+            console,
+            host,
+            input,
+            ..
+        } = self;
+        console.run(&mut EngineCommands { host, input });
 
         // What `fps_max_callback` did. A poll rather than a callback, because a
         // callback would have to own `&mut Host` — §6.2.
@@ -332,7 +383,7 @@ impl<'a> Engine<'a> {
         // (`sys_mainwind.cpp:509`): after the frame is agreed, before anything
         // uses what it says. It is *after* the host, so a frame that loaded a
         // level moves the view the level put it at, not the previous one's.
-        self.update_view(seconds);
+        self.update_view(seconds, dx, dy);
 
         // Reclaims the previous frame's uniform and geometry arenas. Must
         // happen before anything allocates out of them and after the previous
@@ -353,12 +404,14 @@ impl<'a> Engine<'a> {
     /// motion was *accumulated* under, before this tick's events can change
     /// it; and the camera moves after, so a tap of a movement key on the same
     /// tick as a click is not lost.
-    fn update_view(&mut self, seconds: f32) {
-        let (dx, dy) = self.input.frame();
+    fn update_view(&mut self, seconds: f32, dx: f32, dy: f32) {
         if self.input.mouse_look() {
             self.scene.view.look(dx, dy);
         }
-        self.scene.view.step(&self.input, seconds);
+        // What is held is now what the `+command`s left held, not which
+        // physical keys are down — so which keys move the view is
+        // `config_default.cfg`'s answer rather than this file's.
+        self.scene.view.step(self.input.move_buttons(), seconds);
 
         let mouse_look = mouse_look_after(self.input.mouse_look(), self.input.events());
         self.input.set_mouse_look(mouse_look);
@@ -552,10 +605,34 @@ impl Level for Scene<'_> {
 /// `restart` are all [`Host`] requests, so it holds one.
 struct EngineCommands<'e> {
     host: &'e mut Host,
+    input: &'e mut Input,
+}
+
+/// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
+/// **neither may name the other** — that is what keeps both testable alone. So
+/// the one line joining them lives here, in the module that already owns both.
+impl CommandSink for Console<'_> {
+    fn enqueue(&mut self, command: &str) {
+        // `kCommandSrcUserInput`: this came from a key the user pressed, which
+        // is the distinction `ENGINE_CONSOLE.md` §4.7 exists to preserve.
+        Console::enqueue(self, command, Source::UserInput);
+    }
 }
 
 impl CommandTarget for EngineCommands<'_> {
     fn execute(&mut self, cmd: &Command, cx: &mut ExecContext<'_>) -> Dispatch {
+        // The `+command`/`-command` pair, which is most of what a binding
+        // sends. The argument is the index of the button that sent it; a bare
+        // `-forward` typed at the console has none and releases regardless.
+        if let Some(name) = cmd.name().strip_prefix(['+', '-']) {
+            let down = cmd.name().starts_with('+');
+            let index = cmd.arg(1).and_then(|arg| arg.trim().parse().ok());
+            return match self.input.move_buttons_mut().apply(name, down, index) {
+                true => Dispatch::Handled,
+                false => Dispatch::Unknown,
+            };
+        }
+
         match cmd.name().to_ascii_lowercase().as_str() {
             // `CON_COMMAND_F( map, ... )` (`engine/host_cmd.cpp`), reduced to
             // the argument that currently means anything. Queued rather than
@@ -571,9 +648,84 @@ impl CommandTarget for EngineCommands<'_> {
             // (`engine/host_cmd.cpp:2750`).
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
+
+            // `BindHelper` (`engine/keys.cpp:280`). `bind_osx` is the same
+            // command gated on the platform, and it is not a curiosity:
+            // `config_default.cfg` ships `bind_osx "z" "+zoom"`, and macOS is
+            // a supported target.
+            "bind" => self.bind(cmd, cx),
+            "bind_osx" => {
+                if cfg!(target_os = "macos") {
+                    self.bind(cmd, cx);
+                }
+            }
+            "unbind" => match cmd.arg(1).and_then(Button::from_name) {
+                Some(button) => {
+                    if !self.input.bindings_mut().unbind(button) {
+                        cx.print("Can't unbind ESCAPE key");
+                    }
+                }
+                None => cx.print("unbind <key> : remove commands from a key"),
+            },
+            "unbindall" => self.input.bindings_mut().unbind_all(),
+            "key_listboundkeys" => {
+                let listing: Vec<String> = self
+                    .input
+                    .bindings()
+                    .iter()
+                    .map(|(button, command)| format!("\"{}\" = \"{command}\"", button.name()))
+                    .collect();
+                cx.print(&listing.join("\n"));
+            }
+            "key_findbinding" => match cmd.arg(1) {
+                Some(wanted) => {
+                    let listing: Vec<String> = self
+                        .input
+                        .bindings()
+                        .find(wanted)
+                        .map(|button| {
+                            let command = self.input.bindings().get(button).unwrap_or_default();
+                            format!("\"{}\" = \"{command}\"", button.name())
+                        })
+                        .collect();
+                    cx.print(&listing.join("\n"));
+                }
+                None => cx.print("key_findbinding <command> : find key bound to a command"),
+            },
+
             _ => return Dispatch::Unknown,
         }
         Dispatch::Handled
+    }
+}
+
+impl EngineCommands<'_> {
+    /// `BindHelper` (`engine/keys.cpp:280`).
+    ///
+    /// One argument prints the current binding; two or more join the rest with
+    /// spaces, so `bind F6 save quick` binds `save quick` even though the
+    /// tokenizer split it.
+    fn bind(&mut self, cmd: &Command, cx: &mut ExecContext<'_>) {
+        let Some(name) = cmd.arg(1) else {
+            cx.print("bind <key> [command] : attach a command to a key");
+            return;
+        };
+        let Some(button) = Button::from_name(name) else {
+            cx.print(&format!("\"{name}\" isn't a valid key"));
+            return;
+        };
+
+        if cmd.argc() < 3 {
+            match self.input.bindings().get(button) {
+                Some(command) => cx.print(&format!("\"{name}\" = \"{command}\"")),
+                None => cx.print(&format!("\"{name}\" is not bound")),
+            }
+            return;
+        }
+
+        self.input
+            .bindings_mut()
+            .bind(button, &cmd.args()[1..].join(" "));
     }
 }
 
@@ -640,5 +792,95 @@ mod tests {
         let click = pressed(Button::Mouse(MouseButton::Left));
         assert!(mouse_look_after(true, &[escape, click]));
         assert!(!mouse_look_after(false, &[click, escape]));
+    }
+
+    /// Stage 2 of `portdocs/ENGINE_CONSOLE.md` end to end, without a GPU: a
+    /// `bind` command puts a key in the table, pressing that key produces
+    /// command text, the console executes it, and the movement button ends up
+    /// held. Every seam in the chain is exercised and none of them is mocked.
+    #[test]
+    fn a_bound_key_moves_the_camera_through_the_command_buffer() {
+        use console::{Console, Source};
+
+        let mut console = Console::detached();
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+
+        for spec in [
+            console::CommandSpec::new("bind", ""),
+            console::CommandSpec::new("+forward", ""),
+            console::CommandSpec::new("-forward", ""),
+        ] {
+            console.register_command(spec).expect("unique");
+        }
+
+        // `bind w +forward`, as `config_default.cfg` does.
+        console.enqueue("bind w +forward", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+        assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
+
+        // Press it. The binding turns the press into command text...
+        input.push(input::Event::Pressed {
+            button: Button::Key(Key::W),
+            repeat: false,
+        });
+        input.frame();
+        input.dispatch_bindings(&mut console);
+
+        // ...and the console executing it holds the movement button down.
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+        assert!(input.move_buttons().forward.is_down());
+
+        // Releasing the key stops it again.
+        input.push(input::Event::Released(Button::Key(Key::W)));
+        input.frame();
+        input.dispatch_bindings(&mut console);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+        assert!(!input.move_buttons().forward.is_down());
+    }
+
+    #[test]
+    fn unbindall_spares_escape_and_the_console_key() {
+        use console::{Console, Source};
+
+        let mut console = Console::detached();
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+        for spec in [
+            console::CommandSpec::new("bind", ""),
+            console::CommandSpec::new("unbindall", ""),
+        ] {
+            console.register_command(spec).expect("unique");
+        }
+
+        // The opening lines of `config_default.cfg`.
+        console.enqueue(
+            "bind \"ESCAPE\" \"cancelselect\"; bind \"`\" \"toggleconsole\"; bind \"w\" \"+forward\"",
+            Source::Code,
+        );
+        console.enqueue("unbindall", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+
+        assert_eq!(input.bindings().get(Button::Key(Key::W)), None);
+        assert_eq!(
+            input.bindings().get(Button::Key(Key::Escape)),
+            Some("cancelselect")
+        );
+        assert_eq!(
+            input.bindings().get(Button::Key(Key::Backquote)),
+            Some("toggleconsole")
+        );
     }
 }

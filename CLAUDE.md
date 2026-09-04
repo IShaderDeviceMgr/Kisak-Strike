@@ -49,10 +49,10 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 382 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 403 tests), and the binary now **runs, loads a
 map and lets you fly around it**: it mounts the game filesystem, opens a window, runs an
-engine frame loop with a real host state machine, **reads the shipped `cfg/valve.rc` and
-boots through it**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
+engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
+`cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
 draws its world geometry **lit**, and moves the view with WASD and the mouse. It is **not a runnable game** — there is no simulation, sound or
 netcode, and nothing that moves is a player — but the boot path is continuous from
 `main` to a rendered, lit level you can look around.
@@ -186,7 +186,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
   resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
   (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
-  `input/` is stages 1-2 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
+  `input/` is stages 1-3 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
   space with Valve's shipped key names, an event queue **pushed between ticks and
   drained once per tick** inside `Engine::frame`, `ViewAngles`' faithful
   `ApplyMouse`/`ClampAngles`/`AngleVectors`, and a free-fly camera at
@@ -204,13 +204,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path: **`console/` stage 2 — bindings**, which is the same work as
-`input/` stage 3. The command buffer it was waiting on now exists, `console/` supplies the
-`CommandSink`, and the table itself lives in `input/`; the deliverable is that WASD comes
-from the shipped `cfg/config_default.cfg` instead of `FlyCamera`'s hard-coded keys.
-**Stage 3 (config persistence) is small and can follow immediately**; stage 4 (the console
-dialog) is gated on `egui`, which is unscheduled, and should be done together with
-`input/` stage 4 since they share one integration. `materialsystem` stage 6
+Next on the boot path: **`console/` stage 3 — config persistence.** `FCVAR_ARCHIVE`,
+`Host_WriteConfiguration` (`host.cpp:1559`) minus Steam Cloud, `Key_WriteBindings`, and
+preferring `config.cfg` over `config_default.cfg` at startup (`Engine::boot` reads only the
+fallback today). It is small, and **guard it the way Valve does**: do not write a config
+until one has been read (`Host_WasConfigCfgExecuted`), or a crashed first launch overwrites
+a real user's settings with defaults. After that the boot path is gated on `egui`, which is
+unscheduled: `console/` stage 4 and `input/` stage 4 are one integration and should land
+together. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is a
+breadth move: unblocked, but not on the boot path. `materialsystem` stage 6
 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked, but not
 on the boot path.
 

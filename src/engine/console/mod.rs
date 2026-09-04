@@ -279,6 +279,9 @@ pub struct Console<'a> {
     /// from subsystems that do not exist yet, and a wall of errors at every
     /// launch is worse than a count.
     unknown_from_code: u32,
+    /// Unknown names already reported, so each is printed once. See
+    /// [`Console::report_unknown`].
+    unknown_reported: std::collections::HashSet<Box<str>>,
 }
 
 impl<'a> Console<'a> {
@@ -327,6 +330,7 @@ impl<'a> Console<'a> {
             dispatched: 0,
             budget_exceeded: false,
             unknown_from_code: 0,
+            unknown_reported: std::collections::HashSet::new(),
         };
         console.register_builtins();
         console
@@ -577,20 +581,36 @@ impl<'a> Console<'a> {
         self.report_unknown(cmd);
     }
 
-    /// `Unknown command "%s"`, quietly when it came from a config file.
+    /// `Unknown command "%s"` — counted always, printed **once per name**.
+    ///
+    /// Two things pull in opposite directions here and the split resolves both.
     ///
     /// §9 open question 6: `modsettings.cfg` and `config_default.cfg` are
-    /// exec'd unconditionally and name cvars from subsystems that do not exist
-    /// yet, so a printed error per line is a wall at every launch. A typed
-    /// command is different — silence there just looks broken.
+    /// exec'd unconditionally and name commands from subsystems that do not
+    /// exist yet, so a printed error per line is a wall at every launch. A
+    /// *typed* command is different — silence there just looks broken. Hence
+    /// the source split.
+    ///
+    /// The once-per-name rule is what makes that survive bindings.
+    /// `config_default.cfg` binds `+attack` to MOUSE1 and `cancelselect` to
+    /// Escape, and neither exists yet, so every click and every Escape would
+    /// otherwise print. **Valve prints every time**, and can afford to: it
+    /// implements all of its commands. A port where most of the game is
+    /// missing cannot. The count is still incremented on every occurrence, so
+    /// nothing is hidden from `take_unknown_count`.
     fn report_unknown(&mut self, cmd: &Command) {
         if cmd.source() == Source::Code {
             self.unknown_from_code += 1;
-            self.log
-                .developer_print(1, &format!("Unknown command \"{}\"", cmd.name()));
-        } else {
-            self.log
-                .error(&format!("Unknown command \"{}\"", cmd.name()));
+        }
+
+        if !self.unknown_reported.insert(cmd.name().into()) {
+            return;
+        }
+
+        let line = format!("Unknown command \"{}\"", cmd.name());
+        match cmd.source() {
+            Source::Code => self.log.developer_print(1, &line),
+            _ => self.log.error(&line),
         }
     }
 
@@ -1257,9 +1277,25 @@ mod tests {
         assert_eq!(console.take_unknown_count(), 2);
         assert_eq!(console.take_unknown_count(), 0, "and the count resets");
 
-        console.enqueue("not_a_thing 1", Source::UserInput);
+        console.enqueue("still_not_a_thing 1", Source::UserInput);
         console.run(&mut NoTarget);
         assert_eq!(console.log().len(), 1, "a typed mistake is always visible");
+    }
+
+    /// `config_default.cfg` binds `+attack` and `cancelselect`, neither of
+    /// which exists yet, so without this every click and every Escape prints.
+    #[test]
+    fn an_unknown_name_is_printed_once_but_counted_every_time() {
+        let mut console = Console::detached();
+        for _ in 0..5 {
+            console.enqueue("+attack 3", Source::UserInput);
+            console.run(&mut NoTarget);
+        }
+        assert_eq!(console.log().len(), 1, "one line, not five");
+
+        console.enqueue("+attack 3", Source::Code);
+        console.run(&mut NoTarget);
+        assert_eq!(console.take_unknown_count(), 1, "still counted");
     }
 
     #[test]

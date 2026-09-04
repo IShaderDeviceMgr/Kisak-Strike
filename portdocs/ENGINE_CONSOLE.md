@@ -1,8 +1,11 @@
 # Porting console, cvars & commands → `src/engine/console/`
 
-**Status: stage 1 landed** (§8.1 — cvars, the command buffer, both tokenizers,
-dispatch, aliases, `exec`, `stuffcmds`, the log sink, and `map`/`quit`/`restart`
-through a `CommandTarget`). Stages 2-5 are not started. This is the plan,
+**Status: stages 1 and 2 landed.** Stage 1 (§8.1) is cvars, the command buffer, both
+tokenizers, dispatch, aliases, `exec`, `stuffcmds`, the log sink, and
+`map`/`quit`/`restart` through a `CommandTarget`. Stage 2 (§8.2) is bindings, which is the
+same work as `ENGINE_INPUT.md` stage 3: `console/` supplies `CommandSink`, the table lives
+in `input/`, and WASD now comes from the shipped `cfg/config_default.cfg`. Stages 3-5
+(config persistence, the `egui` dialog, the list commands) are not started. This is the plan,
 written before the port, per `PORTING.md`'s per-module rule; **the API reference
 in `rustdocs/ENGINE.md`'s `src/engine/console/` section is the document to read
 in order to *use* the module**, and it is authoritative where the two disagree.
@@ -722,12 +725,16 @@ Each stage is independently reviewable and independently useful.
    a duplicate registration being an error (§4.8).
    *Not here:* bindings, the UI, config writing.
 
-2. **Bindings.** `ENGINE_INPUT.md` stage 3 — the binding table, `+`/`-` with the
-   index argument, `bind`/`bind_osx`/`unbind`/`unbindall`, and `kb_def.lst`
-   defaults. `console/` supplies `CommandSink`; the table itself lives in
-   `input/`.
-   *Deliverable:* WASD comes from `config_default.cfg` instead of from
+2. **Bindings.** — **done.** `ENGINE_INPUT.md` stage 3: the binding table, `+`/`-`
+   with the index argument, `bind`/`bind_osx`/`unbind`/`unbindall`. `console/`
+   supplies `CommandSink`; the table itself lives in `input/`.
+   *Deliverable, met:* WASD comes from `config_default.cfg` instead of from
    `FlyCamera`'s hard-coded keys.
+   **`kb_def.lst` was not ported** — it is a *suggested-key* map for the options UI, not
+   the default binding set; see `ENGINE_INPUT.md` stage 3. **One rule was added that
+   Valve does not have:** an unknown command name is printed once and counted every time,
+   because `config_default.cfg` binds `+attack` and `cancelselect`, neither of which
+   exists yet, and Valve — which implements all its commands — never had to care.
 
 3. **Config persistence.** `FCVAR_ARCHIVE`, `Host_WriteConfiguration`
    (`host.cpp:1559`) minus Steam Cloud, `Key_WriteBindings`, and the

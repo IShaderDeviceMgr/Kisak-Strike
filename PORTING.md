@@ -577,12 +577,21 @@ now boots through the shipped `cfg/valve.rc` → `stuffcmds`, and the launcher's
 block is gone. The port's third consumer of the command line arrived with it, so
 `CommandLine` moved to `src/cmdline.rs` as planned.
 
-**Next on the boot path:** `console/` stage 2 — **bindings**, which is the same work as
-`input/` stage 3 (`bind`, `bind_osx`, `unbind`, `unbindall`, `kb_def.lst` defaults and the
-`+`/`-` command convention with its button-index argument). `console/` supplies the
-`CommandSink`; the table lives in `input/`. Stage 3 (config persistence) is small and can
-follow; stage 4 (the console dialog) wants `egui` and should land with `input/` stage 4,
-since UI precedence and the key-up latch are the same integration. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+**`console/` stage 2 and `input/` stage 3 are done — they are the same work.** The binding
+table lives in `input/`, `console/` supplies the `CommandSink`, and the `impl` joining them
+sits in `engine/mod.rs` so that neither module names the other. `bind`, `bind_osx`,
+`unbind`, `unbindall`, `key_listboundkeys` and `key_findbinding` exist, and the `+`/`-`
+convention carries the button index that makes two keys bound to one command work.
+**WASD now comes from Portal 2's own `cfg/config_default.cfg`** rather than from
+hard-coded keys. `kb_def.lst` turned out to be a *suggested-key* map for the options UI
+rather than the default binding set, and was not ported.
+
+**Next on the boot path:** `console/` stage 3 — **config persistence**. `FCVAR_ARCHIVE`,
+`Host_WriteConfiguration` minus Steam Cloud, `Key_WriteBindings`, and preferring
+`config.cfg` over `config_default.cfg` at startup. Small, and it must keep Valve's guard:
+do not write a config until one has been read, or a crashed first launch overwrites real
+settings with defaults. After that the boot path is gated on `egui` — `console/` stage 4
+and `input/` stage 4 are one integration. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
 unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
 visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
 magenta checkerboard into lit content.
