@@ -1,7 +1,14 @@
 # Porting input → `src/engine/input/`
 
-**Status: not started.** Written against the current architecture (single crate, no FFI,
-`winit`/`wgpu`); nothing here assumes the old FFI-bridged model.
+**Status: stages 1 and 2 of §9's five are done** — translation, button state, mouse
+capture, mouse look and a free-fly camera. **The API they landed is
+`rustdocs/ENGINE.md`'s `src/engine/input/` section; read that to *use* the module, and
+this to understand why it is shaped that way.** Stage 3 (bindings) wants `console/`,
+stage 4 (UI precedence) wants `egui`, stage 5 (controllers) wants `gilrs`; §9 and §10
+still stand as written for all three.
+
+Written against the current architecture (single crate, no FFI, `winit`/`wgpu`); nothing
+here assumes the old FFI-bridged model.
 
 This is `portdocs/ENGINE.md` §7.3's remaining half, and it is the doc for three things at
 once, because in the original tree input is spread across three modules that only make
@@ -197,7 +204,8 @@ reports axes as axes.
 
 The Rust shape is a real enum with a dense index (§8.2), which gets both properties.
 
-Sizes worth knowing: `KEY_COUNT` is 106, `MOUSE_COUNT` is 7 (five buttons plus
+Sizes worth knowing: `KEY_COUNT` is 107 — `KEY_NONE`, 103 real keys, and the three
+`KEY_*TOGGLE` pseudo-keys — `MOUSE_COUNT` is 7 (five buttons plus
 `MOUSE_WHEEL_UP`/`_DOWN` as fake buttons — **keep those two**, because `bind MWHEELUP
 +jump` is real content), and analog values are scaled to `MAX_BUTTONSAMPLE` = 32768.
 
@@ -580,6 +588,20 @@ Each stage is independently reviewable and independently useful.
 
 Stages 1 and 2 are the first landing and are what "port input over" means in this
 request. 3 onwards are gated on modules that do not exist.
+
+**Stages 1 and 2 landed as planned**, with three additions worth recording here because
+they change what a later stage inherits:
+
+- **`Event` gained `FocusGained`.** Valve had no need for it; this port does, because
+  X11 delivers raw motion from the *device* whether or not the window is focused, so
+  `Input` must gate accumulation on focus rather than trusting the source.
+- **Motion is dropped at `push`, not filtered later**, for the same reason, and because
+  that is also `ResetMouse`'s swallow-the-jump behavior on re-capture.
+- **`window/` owns a `capture_wanted` edge**, so a grab the platform refuses is reported
+  once rather than retried every frame (§6.2 describes the fallback but not the retry).
+
+Not landed, and deliberately: no `CommandSink` (§8.3) — nothing would implement it yet,
+and an unused trait is scaffolding.
 
 ---
 

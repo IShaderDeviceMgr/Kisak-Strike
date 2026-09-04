@@ -483,8 +483,8 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   has ended before the pass sampling it begins; and **per-draw constants are
   bump-allocated with dynamic offsets**, because `Queue::write_buffer` stages its copy
   ahead of the whole command buffer and a rewritten uniform would reach every draw in the
-  frame. Not yet: input, the engine tick, MSAA, stencil, exclusive fullscreen modes,
-  `mat_picmip`, and texture streaming.
+  frame. Not yet: MSAA, stencil, exclusive fullscreen modes, `mat_picmip`, and texture
+  streaming.
 - **`materialsystem` stage 5 (lightmaps) — done; stages 6-8 documented, not started.**
   A faithful `CImagePacker` port, `Rgba16Float` atlas pages holding linear radiance, the
   `ColorRGBExp32` decode and the bumped-lightmap correction, and `LightmappedGeneric` in
@@ -504,10 +504,11 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   lines — leaving a real port target around 30–35k. Also settled: **the shaders are
   rewritten in WGSL** from the `.fxc` HLSL, and the static/dynamic combo system is deleted
   (see below).
-- **`engine` — 3 of 13 modules ported: `window/`, `host/`, and `world/`'s geometry.**
+- **`engine` — 4 of 14 modules ported: `window/`, `host/`, `world/`'s geometry, and
+  `input/`.**
   `portdocs/ENGINE.md` enumerates all 23 subsystems; **API: `rustdocs/ENGINE.md`**.
   Conclusion stands: don't port it as one unit. Each subsystem is its own module under
-  `src/engine/` — 13 modules from 23 subsystems, ~45,700 lines deleted outright. Its
+  `src/engine/` — 14 modules from 23 subsystems, ~45,700 lines deleted outright. Its
   `paint.cpp` is essential for Portal 2. Corrected while rewriting: **sound is ~97,200
   lines, not the ~48,000 previously recorded.**
 
@@ -535,6 +536,23 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   14.5k triangles, with 4,828 surfaces carrying real baked lighting over 12 atlas pages. Not loaded: visibility (every face is drawn every frame), collision,
   displacements, brush entities, static props, the 3D skybox, dynamic lights.
 
+  *`input/` — the device and dispatch layers, and a camera to prove them.* Stages 1 and 2
+  of `portdocs/ENGINE_INPUT.md`'s five. `inputsystem/`'s 10,649 lines are **answered
+  rather than ported**: `winit`'s `KeyEvent` carries the physical key, the logical key
+  and the text of one press in one struct, which is what the three-events-per-keypress
+  posting and its SDL double-report workarounds existed to reconstruct. What survives is
+  `ButtonCode_t`'s flat dense space (without the macro arithmetic), the shipped key
+  *names* — external content, in this file's sense, since `bind "w" "+forward"` lives in
+  `.cfg` files — the redundant-transition guard, the mouse accumulator, and
+  `ApplyMouse`/`ClampAngles`/`AngleVectors` with Valve's constants.
+  **`window/` translates, `input/` decides**: `input/` names no `winit` type, so the
+  guard, the accumulator and the angle math are tested without a window, and `gilrs`
+  (polled, not pushed) has somewhere to land at stage 5. The one deliberate divergence
+  is **binding by physical key** rather than by keycap, so WASD stays a square on AZERTY.
+  A free-fly camera at `FullNoClipMove`'s speeds replaces the turntable and stands in for
+  `client/`'s `CUserCmd`; the view angles are a documented wart that moves to `client/`
+  with it.
+
   **One divergence that is not cosmetic**, recorded in full in `rustdocs/ENGINE.md`
   gotcha #1: **world triangles are emitted with their winding reversed.** Valve's
   `D3DCULL_CCW` maps, through Valve's own D3D→GL layer, to `glFrontFace(GL_CCW)` — which
@@ -547,19 +565,20 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   present convention.
 - **Everything else is unported** and lives in `legacy/`.
 
-**Next on the boot path:** input (the largest remaining gap in `window/`, and what
-retires the placeholder turntable camera), then `console/` — now genuinely earned, since
-`map`, `fps_max`, `restart` and `quit` all exist as engine operations with no way to type
-them. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+**Next on the boot path:** `console/` — doubly earned now, since `map`, `fps_max`,
+`restart` and `quit` all exist as engine operations with no way to type them, and
+`input/` stage 3 (`bind`, and the `+`/`-` command convention) is waiting on the command
+buffer. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
 unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
 visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
 magenta checkerboard into lit content.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`
-§1 originally had it. Its first two stages (keyboard, mouse, mouse look) depend on nothing
-unbuilt; bindings want `console/`, and controllers (`gilrs`) are deferred to a later
-stage.
+§1 originally had it. **Stages 1 and 2 are done** (translation, button state, mouse look,
+free-fly camera). Stage 3 (bindings) wants `console/` and is its natural first consumer;
+stage 4 (UI precedence, and the key-up latch that goes with it) wants `egui`; stage 5
+(controllers, `gilrs`) is deliberately last.
 
 **Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
 `launcher_main` were deleted before the restructure, so `legacy/` no longer links a

@@ -1,21 +1,23 @@
 # `src/engine/` — API reference
 
 The engine. [`portdocs/ENGINE.md`](../portdocs/ENGINE.md) breaks the original `engine/`
-module into 23 subsystems, 13 of which become modules here. **Three exist so far.**
+module into 23 subsystems, 14 of which become modules here. **Four exist so far.**
 
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
 | [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
-| [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window + event loop done; input not started |
+| [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look and a free-fly camera done; no bindings, UI precedence or controllers |
+| [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop and input translation done |
 | `net/`, `console/`, `client/`, `server/`, `audio/`, … | the other 10 | not started |
 
 The binary now loads a real Portal 2 `.bsp` and draws it **lit**: base textures multiplied
 by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` that is
 5,512 of 5,638 faces over 77 batches, 58 of its 66 materials resolving, and 4,828 surfaces
-with real lighting across 12 atlas pages. What is still missing is listed under
+with real lighting across 12 atlas pages, and **WASD and the mouse fly through it**.
+What is still missing is listed under
 [Known limits](#known-limits-of-what-is-drawn); the largest items are visibility (every
-face is drawn every frame), displacements, props and input.
+face is drawn every frame), displacements and props.
 
 ---
 
@@ -50,16 +52,20 @@ cargo run --release -- -basedir /path/to/game -game portal2 -window +map sp_a1_i
 This is the whole control flow, and the part worth holding in your head:
 
 ```
+WindowEvent      -> Engine::push_input()    -> queued, not acted on
+DeviceEvent      -> Engine::push_input()    -> raw motion, ditto
 about_to_wait    -> Engine::deadline()      -> ControlFlow::WaitUntil
 RedrawRequested  -> Engine::frame(now)      -> None: too early, return and wait
+                                            -> Input::frame(), then the view
                                             -> Some(Quit | Restart): exit
                                             -> Some(Continue): carry on
+                 -> apply_capture()         -> the cursor grab follows the engine
                  -> Renderer::begin_frame() -> None: back off SKIP_RETRY
                  -> Engine::render(&mut frame)
                  -> Frame::present()
 ```
 
-Four orderings in there are load-bearing:
+Five orderings in there are load-bearing:
 
 1. **`Engine::frame` runs before the surface is acquired.** A frame the clock refuses
    costs no acquisition, and a frame that loads a map does not hold a swap-chain image
@@ -67,7 +73,11 @@ Four orderings in there are load-bearing:
 2. **`RenderContext::begin_frame` is inside `Engine::frame`**, and reclaims the previous
    frame's arenas before anything allocates ([`MATERIALS.md`](MATERIALS.md) gotcha #5).
 3. **Every pass ends before `present`** — the borrow checker enforces it.
-4. **Nothing sleeps.** See [Pacing](#pacing-is-split-in-two).
+4. **Input is drained inside `Engine::frame`**, after the host has agreed a frame is
+   happening — `DispatchAllStoredGameMessages`' place in `MainLoop`. Events pile up
+   between ticks rather than being sampled by a frame that never runs; see
+   [`input`](#engine-input) gotcha #2.
+5. **Nothing sleeps.** See [Pacing](#pacing-is-split-in-two).
 
 <a id="engine-host"></a>
 
@@ -341,9 +351,268 @@ which has real internal pointers.
 
 ---
 
-## Invariants and gotchas
+<a id="engine-input"></a>
+
+## `src/engine/input/`
+
+Buttons, the event queue, and where the view points. Replaces `inputsystem/` (10,649
+lines), `engine/keys.cpp` (1,392) and `sys_mainwind.cpp`'s `DispatchInputEvent`, and
+stands in for `game/client/in_*.cpp` (7,402) until `client/` exists.
+[`portdocs/ENGINE_INPUT.md`](../portdocs/ENGINE_INPUT.md) is the plan; **stages 1 and 2
+of its five are done** — translation, button state, mouse look and a free-fly camera.
+Bindings (stage 3) want `console/`, UI precedence (stage 4) wants `egui`, and controllers
+(stage 5) want `gilrs`.
+
+| | |
+|---|---|
+| Module | `crate::engine::input`, with `input::button` and `input::view` |
+| Lines | ~1,360 including tests |
+| Tests | 34 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
+| Dependencies | `std` and `glam`. **Not `winit`** — see [the seam](#the-seam-window-translates-input-decides) |
+
+### Quick start
+
+```rust
+use crate::engine::input::{Button, Event, Input, Key};
+
+let mut input = Input::new();
+
+// From `window/`, as events arrive, between ticks:
+input.push(Event::Pressed { button: Button::Key(Key::W), repeat: false });
+input.push(Event::MouseMotion { dx: 4.0, dy: -1.0 });
+
+// From `Engine::frame`, once per tick:
+let (dx, dy) = input.frame();          // dispatches the queue, sums the motion
+for event in input.events() { /* … */ }
+if input.is_down(Button::Key(Key::W)) { /* … */ }
+```
+
+### `Button`, `Key`, `MouseButton`
+
+```rust
+pub enum Button { Key(Key), Mouse(MouseButton) }
+pub enum MouseButton { Left, Right, Middle, Mouse4, Mouse5, WheelUp, WheelDown }
+pub enum Key { Num0, …, A, …, Pad0, …, Escape, …, F12 }   // 103 variants
+
+impl Button {
+    pub const COUNT: usize;                                // 110
+    pub fn index(self) -> usize;                           // dense, 0..COUNT
+    pub fn from_index(index: usize) -> Option<Button>;
+    pub fn name(self) -> &'static str;                     // "w", "MOUSE1", "MWHEELUP"
+    pub fn from_name(name: &str) -> Option<Button>;        // case-insensitive
+    pub fn all() -> impl Iterator<Item = Button>;
+}
+```
+
+`Key::COUNT` is 103 and `MouseButton::COUNT` is 7; both also have `index` and `name`.
+The flat dense space is the one thing kept from `ButtonCode_t` — it is what lets stage
+3's binding table be an array and the down-state be a bitset, and why a controller button
+will bind to `+forward` with no special case. The macro arithmetic
+(`JOYSTICK_BUTTON( joy, button )`) and `JOYSTICK_AXIS_BUTTON` are not kept; `gilrs`
+reports axes as axes.
+
+**The names are external content**, transcribed verbatim from `s_pButtonCodeName`
+(`key_translation.cpp:357`), because `bind "w" "+forward"` lives in shipped `.cfg` files
+and `scripts/kb_def.lst`. Divergences from Valve's table, all in `button.rs`'s module
+docs: `KEY_NONE` is `Option::None`; the three `KEY_*TOGGLE` pseudo-keys are gone (vgui
+toggle *state*, not keys — Valve's own table asks what they are for); and `LWIN`/`RWIN`
+keep those names on every platform instead of both becoming `"COMMAND"` on macOS, which
+could not round-trip. `"COMMAND"` is still accepted by `from_name`, as it is on Valve's
+non-OSX path.
+
+### `Event`
+
+```rust
+pub enum Event {
+    Pressed { button: Button, repeat: bool },
+    Released(Button),
+    Text(char),
+    MouseMotion { dx: f32, dy: f32 },   // raw, look only
+    CursorMoved { x: f32, y: f32 },     // absolute, UI only
+    Wheel(f32),                         // notches, positive away from the user
+    FocusLost,
+    FocusGained,
+}
+```
+
+`InputEvent_t` minus the three-events-per-keypress it was built on. Valve posted
+`IE_ButtonPressed` (carrying a scan code *and* a virtual code), `IE_KeyCodeTyped` and
+`IE_KeyTyped` for one key press, then spent a hundred lines undoing SDL's double
+reporting of the same fact; `winit`'s `KeyEvent` carries all three facts in one struct.
+`FocusGained` is not in Valve's set — this port needs it because X11 delivers raw motion
+whether or not the window is focused.
+
+### `Input`
+
+```rust
+impl Input {
+    pub fn new() -> Input;
+    pub fn push(&mut self, event: Event);           // between ticks, from window/
+    pub fn frame(&mut self) -> (f32, f32);          // once a tick; returns summed motion
+    pub fn events(&self) -> &[Event];               // this tick's, until the next frame()
+    pub fn is_down(&self, button: Button) -> bool;
+    pub fn mouse_look(&self) -> bool;
+    pub fn set_mouse_look(&mut self, on: bool);
+    pub fn clear(&mut self);                        // ClearStates
+}
+```
+
+`push`/`frame` is `PostEvent`/`DispatchAllStoredGameMessages`, and the split is what
+makes the sampling rule structural rather than remembered. `frame` is also
+`GetAccumulatedMouseDeltasAndResetAccumulators`: it is the **single** point at which the
+motion accumulator resets, and a second one would silently halve the turn rate.
+
+### `ViewAngles` and `FlyCamera`
+
+```rust
+pub const SENSITIVITY: f32 = 2.5;                   // `sensitivity`
+
+pub struct ViewAngles { pub pitch: f32, pub yaw: f32, pub roll: f32 }
+
+impl ViewAngles {
+    pub fn new(pitch: f32, yaw: f32) -> ViewAngles;
+    pub fn apply_mouse(&mut self, dx: f32, dy: f32, sensitivity: f32);
+    pub fn vectors(&self) -> (Vec3, Vec3, Vec3);    // AngleVectors: forward, right, up
+}
+
+pub struct FlyCamera { pub origin: Vec3, pub angles: ViewAngles }
+
+impl FlyCamera {
+    pub fn new(origin: Vec3, pitch: f32, yaw: f32) -> FlyCamera;
+    pub fn look(&mut self, dx: f32, dy: f32);
+    pub fn step(&mut self, input: &Input, seconds: f32);
+}
+```
+
+`ViewAngles` is faithful: `ScaleMouse`/`ApplyMouse` (`in_mouse.cpp:412`, `:470`),
+`ClampAngles` (`in_main.cpp:975`) and `AngleVectors` (`mathlib_base.cpp:1027`), with
+Valve's shipped constants — `sensitivity` 2.5, `m_yaw`/`m_pitch` 0.022,
+`cl_pitchdown`/`cl_pitchup` 89. Roll is deliberately *not* clamped, because Portal
+excludes itself from the ±50° limit every other Source game applies ("the player can be
+upside down! -Jeep").
+
+`FlyCamera` is not faithful and is not meant to be: it is `CUserCmd` + `CGameMovement` +
+`CViewRender::SetUpView` collapsed to eight lines, moving at `FullNoClipMove`'s speeds
+(`cl_forwardspeed` 175 — Portal 2's `MAX_LINEAR_SPEED`, where other Source games get 450
+— times `sv_noclipspeed` 5, halved by `+speed`, clamped to `sv_maxspeed * 5`) with no
+acceleration. **It replaced the turntable camera**, and it is replaced in turn by
+`client/`.
+
+### The seam: `window/` translates, `input/` decides
+
+| Stage | Where | What |
+|---|---|---|
+| `WindowEvent` → `Event` | `window/translate.rs` + `window_event` | a lookup and one `match` arm each |
+| `DeviceEvent::MouseMotion` → `Event` | `window/`'s `device_event` | the only source of look input |
+| queue | `Engine::push_input` → `Input::push` | between ticks; nothing acts on it |
+| dispatch | `Engine::frame` → `Input::frame` | once a tick, after the host agrees |
+| policy | `Engine::update_view`, `mouse_look_after` | Escape frees the cursor, a click takes it |
+| the grab | `window/`'s `apply_capture`/`warp_cursor` | `mouse_look && focused` |
+
+`input/` names no `winit` type on purpose. That is what makes the guard, the accumulator
+and the angle math testable without a window, and it is what leaves room for `gilrs`,
+which is *polled* rather than pushed — stage 5 drains it into the same queue before
+`Input::frame` runs.
+
+### Invariants and gotchas (input)
 
 Ordered by how likely each is to bite.
+
+1. **View look comes from `DeviceEvent::MouseMotion`, never from `CursorMoved`.**
+   `CursorMoved` is clamped to the window and quantised to pixels, so a view driven from
+   it stalls at the screen edge — the classic "cannot turn past 180°" bug. `CursorMoved`
+   is translated and queued for the UI that does not exist yet, and nothing reads it.
+2. **Input is sampled at the frame rate, not the event rate.** The queue is drained
+   inside `Engine::frame`, *after* `Host::frame` agrees a frame is happening, so a frame
+   `fps_max` refuses samples nothing and **a lower `fps_max` is a higher input latency**.
+   That is faithful. It is also why mouse motion accumulates as a **sum**: applying it
+   per event would make turn speed depend on event rate, and keeping only the last delta
+   would discard motion on every refused frame. `m_flAccumulatedMouseXMovement` is the
+   field this is, and it looks like sampling cruft that could be dropped. It cannot.
+3. **Bindings are by physical key.** `Key::W` is the key *where* W is on a US layout,
+   which is where Z is printed on AZERTY. Valve's POSIX path collapsed scancode and
+   virtual code, so `bind w +forward` there binds the key labelled W and WASD stops being
+   a square. Consequence to document for users: a `bind` listing can name a key whose
+   keycap says something else. Text entry and key *display* will use the logical key;
+   neither exists yet.
+4. **Raw motion is not equally raw.** X11 (XI2) and Wayland
+   (`zwp_relative_pointer_v1`) deliver unaccelerated device deltas; **macOS delivers
+   `NSEvent.deltaX`, already through the OS ballistics curve**. The same `sensitivity`
+   therefore feels different on macOS, and that is recorded rather than corrected —
+   Valve answered the same problem with convars, not by inverting the curve.
+5. **Escape is the only way to get the cursor back**, until there is a UI. A click takes
+   it again. If that policy is ever moved or "simplified", a grabbed window becomes one
+   the user cannot leave.
+6. **Neither cursor grab mode works on both platforms.** `CursorGrabMode::Locked` is
+   unimplemented on X11, `Confined` is unimplemented on macOS
+   (`winit-0.30.13/src/window.rs:1682`), and which applies is a *runtime* property of the
+   session — X11-versus-Wayland is not a compile-time fact. `window/` tries `Locked`,
+   falls back to `Confined` plus a per-frame warp to the window centre (which is what
+   `CInput::ResetMouse` was), and if both fail says so once and leaves the cursor visible.
+   **Re-check this on any `winit` upgrade.**
+7. **The redundant-transition guard is load-bearing.** `Input::frame` drops any press or
+   release that does not change the down-state (`keys.cpp:1284`). Valve needed it because
+   several paths reported the same transition; this port needs it because `winit` emits
+   **synthetic key events on focus change** to report keys already held. With the guard
+   they cost nothing; without it they double-count, and a `+attack` sent twice is stopped
+   once.
+8. **Losing focus releases every held button, but does not surrender the mouse.**
+   `Input::clear` is `CInput::ClearStates` — alt-tabbing with `+forward` held and coming
+   back to a player who walked into a wall for thirty seconds is the failure it prevents.
+   `mouse_look` deliberately survives, because the grab is suspended by `window/`
+   (`mouse_look && focused`) rather than given up; otherwise coming back from an alt-tab
+   would leave the cursor loose in a game that thinks it has it.
+9. **Motion is dropped at `push` when the mouse is not driving the view**, rather than
+   accumulated and ignored later. X11's raw events arrive from the *device*, so an
+   alt-tabbed window would otherwise spin the view while the user works elsewhere, and
+   the accumulator would deliver one enormous delta on the frame the grab returns.
+10. **`repeat` is passed through, not filtered.** The console wants auto-repeat and
+    bindings must not have it (`kbutton_t`'s `KeyDown` returns early on one,
+    `in_main.cpp:434`), so the consumer decides. Likewise `Text` is unfiltered, control
+    characters included — what counts as typable is the console's question.
+11. **Wheel notches are accumulated before becoming button presses.** A mouse reports
+    lines and a trackpad reports pixels, continuously; `MWHEELUP`/`MWHEELDOWN` are
+    discrete. `window/`'s `PIXELS_PER_NOTCH` (50, a chosen constant — Valve never saw a
+    pixel delta) is the threshold, and the fractional remainder is kept, so a slow swipe
+    still eventually clicks.
+
+### Not implemented, and what each waits on
+
+| Missing | Waits on |
+|---|---|
+| The binding table, `bind`/`unbind`/`unbindall`, the `+`/`-` convention with the button index as an argument | `console/` — stage 3. The seam is `CommandSink`, and it is deliberately **not** written yet: nothing would implement it. |
+| UI event precedence, and the **key-up latch** (`FilterKey`, `keys.cpp:1189`) that delivers a key-up to whoever consumed the key-down | `egui` — stage 4. Every "stuck key" bug in a Source-like engine is that invariant being violated: press `mouse1`, open the console, release. |
+| Controllers, hot-plug, analog axes | `gilrs` — stage 5. `in_joystick.cpp`'s response curves and deadzones are content-tuned client behavior and come with `client/`, not with the device layer. |
+| `CUserCmd`, `kbutton_t`'s `down[2]`, the fractional `KeyState` model, `CreateMove`, prediction | `client/`. Correct and the right design; building them against a camera instead of a player would bake in the wrong consumer. |
+| `m_customaccel` 1-4, `m_mousespeed`/`m_mouseaccel1`/`m_mouseaccel2` | Nothing — deliberately dropped. Per-user feel tuning with no default behavior, and the latter three are Windows `SPI_SETMOUSE` overrides, inert on POSIX. |
+| `cl_mouselook_roll_compensation` — rotating the mouse delta by the inverse of the view roll | Something that rolls the view. **In scope for Portal 2**, which rolls constantly (gels, portals through non-vertical surfaces); `ViewAngles::roll` is where it attaches. |
+| `Key_StartTrapMode` ("press a key to bind it") | An options UI. ~35 lines, trivially re-added. |
+| Split-screen: per-player down-state and view angles | Co-op being scheduled. The binding table was global even in the original, so the cost is deferred as long as nothing bakes a player slot into `Event` or `Button` — nothing does. |
+| IME, cursor icons, `IInputStackSystem`, X360/PS3/TrackIR/Novint hardware | Deleted, not deferred. See `portdocs/ENGINE_INPUT.md` §5. |
+
+### Test coverage (input)
+
+| Test | Guards |
+|---|---|
+| `every_name_round_trips`, `no_two_buttons_share_a_name` | the external name format — a name that does not survive `bind` is a binding that vanishes from a `.cfg` |
+| `names_are_in_button_code_order`, `indices_are_dense_and_round_trip` | that the name table and the discriminant have not drifted apart |
+| `every_key_has_exactly_one_position` | that no `Key` is missing a `winit` code, which would be a key that silently does nothing |
+| `a_transition_that_changes_nothing_is_dropped` | gotcha #7, the guard |
+| `motion_accumulates_across_refused_frames` | gotcha #2, the accumulator |
+| `motion_is_dropped_while_the_mouse_is_not_driving_the_view`, `motion_while_unfocused_never_reaches_the_view` | gotcha #9 |
+| `losing_focus_releases_everything_held`, `losing_focus_does_not_give_up_the_mouse` | gotcha #8, both halves |
+| `escape_gives_the_cursor_back_and_a_click_takes_it_again` | gotcha #5 |
+| `a_zero_angle_looks_down_positive_x`, `positive_pitch_looks_down` | `AngleVectors`' signs — "right" is `-Y` facing `+X`, and pitch is positive downwards |
+| `moving_the_mouse_right_turns_right`, `pitch_clamps_at_the_poles` | `ApplyMouse` and `ClampAngles` |
+| `the_wish_velocity_is_clamped_to_the_server_maximum`, `walking_halves_the_speed` | `FullNoClipMove`'s arithmetic, including that the clamp uses the *unhalved* factor |
+
+The cursor grab, the `winit` event arms and `device_event` need a window and cannot be
+tested here; they are verified by running the binary.
+
+## Invariants and gotchas
+
+Ordered by how likely each is to bite. Input has its own list, with the module:
+[`input`'s invariants](#invariants-and-gotchas-input).
 
 1. **World triangles are emitted with their winding reversed, and this is not optional.**
    In file order every world surface is back-facing here, and the map draws as an empty
@@ -410,23 +679,27 @@ Not bugs; each names what it waits on.
 | Brush entities (models 1..n) | Positioned by the entity that names them, so they need the entity system, not just the lump. |
 | Static props, `.mdl` models | `staticpropmgr.cpp`, `studiorender`. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
-| Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. |
+| Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. Now that the camera flies, it is also possible to fly *out* of the level and look back in, which nothing culls. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
 | Collision, traces | `cmodel.cpp`, `enginetrace.cpp` — needed by gameplay, not by drawing. |
-| Input, simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. |
+| Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. Input exists but moves a camera, not a player. |
 
 ### The camera is a placeholder
 
-There is no input, so a fixed camera would show one wall. `Engine::camera` places the
-view at the spawn point and **turns it slowly on the spot** (12°/s) so that the geometry,
-depth and materials are all visible. What is faithful is the projection — `VIEW_NEARZ` 7
-(`game/client/view.h:27`), far = `r_mapextents` × √3 (`view.cpp:644`), and Portal's
-`default_fov` 75 (`clientmode_portal.cpp:32`) — and the coordinate system: Source is
-**Z-up right-handed**, so the view is built with `Z` as up and world geometry needs no
-conversion. `angles` are Valve's `(pitch, yaw, roll)` and **pitch is positive downwards**.
+`Engine::camera` reads the [`FlyCamera`](#engine-input) the level put at
+`info_player_start` and that input moves: **WASD, space and left control to rise and
+fall, left shift to walk, mouse to look, Escape to release the cursor.** (The turntable
+that stood here before input landed is gone.) What is faithful is the projection —
+`VIEW_NEARZ` 7 (`game/client/view.h:27`), far = `r_mapextents` × √3 (`view.cpp:644`),
+and Portal's `default_fov` 75 (`clientmode_portal.cpp:32`) — and the coordinate system:
+Source is **Z-up right-handed**, so the view is built with `Z` as up and world geometry
+needs no conversion. The basis comes from `AngleVectors`, so the direction the camera
+looks and the direction it moves are the same arithmetic, and **pitch is positive
+downwards**.
 
-The turntable goes away with the first commit that can move the view, and takes
-`Engine::camera` with it — `CViewRender::SetUpView` is its real replacement.
+What is *not* faithful is that there is no player: no collision, no gravity, no
+`CUserCmd`, no prediction. `CViewRender::SetUpView` and `client/` are the real
+replacement, and `FlyCamera` goes with them.
 
 **A black screen on some maps is this, not a lighting bug.** `info_player_start` is only
 where the *engine* puts the player; several Portal 2 maps spawn inside a sealed box in the
@@ -459,9 +732,9 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 
 | | |
 |---|---|
-| Module | `crate::engine::window` |
-| Lines | ~740 including tests |
-| Tests | 12 (`cargo test engine::window`) |
+| Module | `crate::engine::window`, with `window::translate` |
+| Lines | ~1,230 including tests (`mod.rs` + `translate.rs`) |
+| Tests | 17 (`cargo test engine::window`) |
 | Dependencies | `winit` 0.30, `crate::engine`, `crate::materials`, `crate::filesystem`, `crate::launcher::cmdline` |
 
 ### `run`, `Boot` and `RunOutcome`
@@ -504,6 +777,19 @@ handling from `CGame::CreateGameWindow`. Switches, divergences from Valve's defa
 `-height` forcing 4:3; `-w`/`-h` beating `-width`/`-height`) are unchanged — see the
 tests, which are the specification.
 
+### Input translation and the cursor grab
+
+`window/` translates and nothing else: `window::translate` is a `KeyCode` → `Key` table
+and a mouse-button `match`, and each `winit` event arm builds one
+[`input::Event`](#engine-input) and pushes it. `device_event` is implemented for
+`DeviceEvent::MouseMotion`, which is the only source of view look.
+
+The one piece of *state* here is the cursor grab, because that is a `winit` call. It
+follows `engine.wants_mouse_capture() && focused`, is reconciled after each engine tick
+and on every focus change, and picks its mode at runtime — see
+[`input`](#engine-input) gotchas #5, #6 and #8, which are the ones that bite. A grab the
+platform refuses is reported once and not retried every frame.
+
 ### Two deadlines, and why the later wins
 
 `about_to_wait` can have two outstanding "do not come back before" times:
@@ -537,16 +823,26 @@ pub fn deadline(&self) -> Option<Instant>;
 pub fn request_new_game(&mut self, map: &str);
 pub fn request_shutdown(&mut self);
 pub fn host(&self) -> &Host;
+
+pub fn push_input(&mut self, event: input::Event);  // from window/, between ticks
+pub fn wants_mouse_capture(&self) -> bool;          // window/ turns this into a grab
 ```
 
 The renderer stays with the window because the surface is tied to the window handle, and
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
 refcounted clones.
 
-Internally `Engine` is two fields: the `Host`, and a private `Scene` holding the `Vfs`,
-the device, the `MaterialCache`, the `RenderContext`, the `World` and `curtime`. `Scene`
-is what implements [`Level`], so `host.frame(&mut self.scene)` is a split borrow of two
-fields rather than `&mut self` twice — that is the whole reason for the split.
+Internally `Engine` is three fields: the `Host`, the `Input`, and a private `Scene`
+holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`,
+the view and `curtime`. `Scene` is what implements [`Level`], so
+`host.frame(&mut self.scene)` is a split borrow of two fields rather than `&mut self`
+twice — that is the whole reason for the split. The view lives in `Scene` rather than
+beside the `Input` because it is level state: loading a map puts it at that map's
+`info_player_start`.
+
+`Engine::update_view` is where input becomes movement, and `mouse_look_after` is the
+whole of the UI-precedence policy until there is a UI: Escape frees the cursor, a click
+takes it back, last event of the tick wins.
 
 `-vmt` is owned here too: when set, `render` draws the material preview *instead of* the
 world, because it is an inspector for one material and anything else in the shot defeats
@@ -557,7 +853,9 @@ system's GPU regression suite.
 
 ## Test coverage
 
-49 tests across the three modules; 252 in the crate.
+93 tests across the four modules; 317 in the crate. **42 of those arrived with input** —
+34 in `input/`, 5 for the `winit` key table and 3 for the cursor-release policy — and
+have [their own table](#test-coverage-input).
 
 | Test | Guards |
 |---|---|

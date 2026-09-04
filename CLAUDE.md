@@ -49,12 +49,13 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 275 tests), and the binary now **runs and
-loads a map**: it mounts the game filesystem, opens a window, runs an engine frame loop
-with a real host state machine, reads a Portal 2 `.bsp`, packs its baked lightmaps into an
-atlas, and draws its world geometry **lit**. It is **not a runnable game** — there is no
-input, simulation, sound or netcode — but the boot path is continuous from `main` to a
-rendered, lit level.
+There is a unit test suite (`cargo test`, 317 tests), and the binary now **runs, loads a
+map and lets you fly around it**: it mounts the game filesystem, opens a window, runs an
+engine frame loop with a real host state machine, reads a Portal 2 `.bsp`, packs its
+baked lightmaps into an atlas, draws its world geometry **lit**, and moves the view with
+WASD and the mouse. It is **not a runnable game** — there is no simulation, sound or
+netcode, and nothing that moves is a player — but the boot path is continuous from
+`main` to a rendered, lit level you can look around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -68,8 +69,9 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 draw as the magenta error checkerboard are `maps/<map>/…` cubemap patches living in the
 `.bsp`'s embedded pak lump, which the `Vfs` does not mount yet. The scene is **dimmer than
 the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
-unexposed. The camera **turns slowly on the spot** because there is no input yet; that is
-a placeholder and is documented as one.
+unexposed. The camera is a **free-fly noclip camera** — WASD, space and left control,
+left shift to walk, mouse to look, **Escape to release the cursor** — standing in for a
+player that does not exist yet; it is a placeholder and is documented as one.
 
 Verification is otherwise still mostly against the reference: read `legacy/`, compare
 behavior, reason it through. There is no hybrid binary to run.
@@ -166,11 +168,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   expressed" question is still open and still unforced. **`LightmappedGeneric` was
   expected to force it and did not**: bumped and unbumped share one vertex layout, because
   the bumped diffuse path never leaves tangent space.
-- **`src/engine/` — 3 of 13 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps**
+- **`src/engine/` — 4 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
+  lightmaps, and `input/`**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
-  its own module, 13 surviving, ~45,700 lines deleted outright.
+  its own module, 14 surviving, ~45,700 lines deleted outright.
   `host/` is `CHostState`'s state machine (eight states become five, keeping the
   invariant that every path to a new level goes *through* `GameShutdown`) plus
   `FilterTime`'s policy; it depends on `std` alone, because loading a level is a `Level`
@@ -184,7 +186,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
   resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
   (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
-  Not implemented: input, simulation, visibility, collision, displacements, brush
+  `input/` is stages 1-2 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
+  space with Valve's shipped key names, an event queue **pushed between ticks and
+  drained once per tick** inside `Engine::frame`, `ViewAngles`' faithful
+  `ApplyMouse`/`ClampAngles`/`AngleVectors`, and a free-fly camera at
+  `FullNoClipMove`'s speeds that **deleted the turntable**. It names no `winit` type —
+  `window/` translates, `input/` decides — so it is tested without a window, which is
+  also what leaves room for `gilrs` at stage 5. Bindings (stage 3) want `console/`; UI
+  precedence and the key-up latch (stage 4) want `egui`.
+  Not implemented: simulation, visibility, collision, displacements, brush
   entities, static props, the skybox, dynamic lights and lightstyle animation.
   **The one divergence that will bite:** world triangles are emitted with their **winding
   reversed**, because Valve's `D3DCULL_CCW` and this port's `front_face: Ccw` read
@@ -194,9 +204,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: **input** (planned in
-`portdocs/ENGINE_INPUT.md`), then **`console/`** (now earned — `map`, `fps_max`, `restart`
-and `quit` all exist as engine operations with no way to type them). `materialsystem`
+Next on the boot path per `PORTING.md`: **`console/`** — now doubly earned, since `map`,
+`fps_max`, `restart` and `quit` all exist as engine operations with no way to type them,
+and `input/` stage 3 (`bind`) is waiting on the command buffer. `materialsystem`
 stage 6 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked,
 but not on the boot path.
 
@@ -213,6 +223,17 @@ also commented at the site.
   port will end up the same way. **Move it to a crate-level `src/cmdline.rs` when a third
   subsystem needs it** — not before, since the only cost today is one odd-looking import,
   and the only benefit of moving early is churn in reviewed code.
+- **The view angles and the free-fly camera live in `src/engine/input/view.rs`.** They
+  belong to the client: `CInput::AdjustAngles` reads and writes them through
+  `engine->GetViewAngles`/`SetViewAngles`, which resolve to `CClientState::viewangles`
+  (`engine/cdll_engine_int.cpp:1050`), and only the client DLL mutates them. They sit in
+  `input/` because there is nowhere else — the alternative, `engine/mod.rs`, spreads the
+  same code over two modules instead of one. **Move them to `client/` when it exists**,
+  along with `FlyCamera`, whose real replacements are `CUserCmd`, `CGameMovement` and
+  `CViewRender::SetUpView`. Until then, do not grow `FlyCamera` towards `CUserCmd`:
+  `kbutton_t`'s `down[2]` and its fractional `KeyState` are correct and are the right
+  design, but building them against a camera instead of a player bakes in the wrong
+  consumer.
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
   `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The
@@ -260,13 +281,37 @@ behavior. `rustdocs/FILESYSTEM.md` is the worked example.
 
 Two rules that keep these trustworthy:
 
-- **Verify signatures against the source before writing them down.** Grep the `pub`
-  items; do not transcribe from memory. A confidently wrong API doc is worse than none.
+- **Verify signatures against the source before writing them down.** Search the `pub`
+  items with the `Grep` tool; do not transcribe from memory. A confidently wrong API doc
+  is worse than none.
 - **Record deliberate divergences from Valve's behavior**, with the switch or function
   that reverses them. Those are exactly what a future session cannot rediscover.
 
 Rustdoc comments in the source stay the authority on individual items; `rustdocs/` carries
 what doesn't fit on one item.
+
+## Searching: use the `Grep` tool, never shell `grep`
+
+**Always search with the `Grep` tool. Do not call `grep`, `rg` or `ag` through `Bash`.**
+This is not a style preference — shell `grep` gives *wrong answers* on this repo:
+
+- **`legacy/` is ISO-8859 (latin-1), not UTF-8.** GNU/BSD `grep` classifies those files as
+  binary and prints `Binary file … matches` or, piped, nothing at all. A search for a
+  symbol that is sitting right there comes back empty, and the natural conclusion — "that
+  doesn't exist, it must have been deleted" — is wrong. This has already cost one session:
+  `SurfaceCtx_t` and `SurfComputeLightmapCoordinate` both read as absent from every header
+  in the tree until the encoding was noticed.
+- The `Grep` tool also handles ignore rules, multiline mode and output modes
+  (`files_with_matches`, `content`, `count`) without a pipeline, and does not blow up
+  context on a large hit.
+
+**If the `Grep` tool is not available** — some session configurations disable it and route
+everything through `Bash` — then shell `grep` is the fallback, and **`-a` is mandatory on
+anything under `legacy/`**: `grep -arn "Symbol" legacy/`. Without it a negative result
+means nothing.
+
+Either way: when a search comes back empty, **suspect the encoding before you conclude the
+symbol is gone.**
 
 ## Reading the reference tree (`legacy/`)
 
@@ -309,8 +354,9 @@ current layout, so **graph paths are `legacy/`-prefixed**.
 For structural questions — finding a symbol, tracing callers/callees, checking who
 implements or registers a given interface, orienting in an unfamiliar module — prefer its
 graph tools (`search_graph`, `trace_path`, `get_code_snippet`, `get_architecture`,
-`query_graph`) over blind grep/Explore; the tree is too large to explore by hand. Fall
-back to `search_code`/filesystem grep for literal text or when graph coverage looks thin.
+`query_graph`) over blind text search; the tree is too large to explore by hand. Fall
+back to `search_code` or the `Grep` tool for literal text, or when graph coverage looks
+thin — see "Searching" above for why that fallback must not be shell `grep`.
 
 **Check `check_index_coverage` before trusting any negative result.** Coverage on large
 engine files is frequently partial (~6,300 files have unparsed ranges) — e.g. all of

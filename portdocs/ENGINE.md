@@ -34,8 +34,8 @@ Modules marked **done** exist in `src/`; the rest are the plan.
 src/engine/
   mod.rs          Engine construction + ownership of the subsystems below    **done**
   host/           frame loop, host state machine, level/map lifecycle        (§7.2) **done**
-  window/         winit integration, video mode, input translation           (§7.3) **done, minus input**
-  input/          button state, bindings, mouse look, controllers            (§7.3/§7.4)
+  window/         winit integration, video mode, input translation           (§7.3) **done**
+  input/          button state, bindings, mouse look, controllers            (§7.3/§7.4) **stages 1-2 done**
   console/        cvars, command buffer, dev console                         (§7.4)
   client/         client connection lifecycle, entity parsing, prediction    (§7.5)
   server/         server lifecycle, connected clients, snapshot writing      (§7.6)
@@ -287,9 +287,13 @@ two-systems-both-pacing failure structurally impossible rather than merely avoid
 (`m_nDLLState`/`m_nQuitting`) is deleted outright: it existed only to carry that decision
 across the `IEngine` boundary by polling, and there is no such boundary.
 
-The input path (the left column above) is **still not started** — `WindowEvent`'s
-keyboard and mouse variants are dropped, and the `egui` precedence question is untouched.
-That is now the largest single gap in `window/`.
+The input path (the left column above) is **now done as far as it can go without
+`console/` and `egui`**: `window/translate.rs` plus one `match` arm per event turns
+`WindowEvent` and `DeviceEvent::MouseMotion` into `input::Event`, and `Engine::frame`
+drains the queue once a tick. What is left of the chain is the two ends —
+bindings (`portdocs/ENGINE_INPUT.md` stage 3, wants the command buffer) and the `egui`
+precedence question with the key-up latch it carries (stage 4). **API:
+`rustdocs/ENGINE.md`.**
 
 ## 7. Subsystem breakdown
 

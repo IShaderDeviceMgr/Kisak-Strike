@@ -33,21 +33,34 @@
 //!   is `CEngineAPI::MainLoop`'s `RUN_OK`/`RUN_RESTART`. Closing the window
 //!   does not exit the loop directly — it asks the engine to shut down, so the
 //!   host state machine still unloads the level on the way out.
+//!
+//! # Input
+//!
+//! `window/` **translates and nothing else**: one `match` arm per `winit`
+//! event, into [`input::Event`], pushed into the engine's queue. No state, no
+//! bindings, no policy — those are [`crate::engine::input`]'s, which names no
+//! windowing type precisely so that it can be tested without a window
+//! (`portdocs/ENGINE_INPUT.md` §8.1). The one thing this module does own is
+//! the cursor grab, because that is a `winit` call: see [`Capture`].
+
+mod translate;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{DeviceEvent, DeviceId, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::keyboard::PhysicalKey;
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 // `CommandLine` sits under `launcher` because that is where it is built, but
 // Valve kept `CommandLine()` in tier0 precisely because everything reads it.
 // If a third subsystem needs it, move it to a crate-level `src/cmdline.rs`
 // rather than growing more of these imports.
 use crate::engine::host::Outcome;
+use crate::engine::input::{self, Button, MouseButton};
 use crate::engine::Engine;
 use crate::filesystem::Vfs;
 use crate::launcher::cmdline::CommandLine;
@@ -296,6 +309,39 @@ pub struct Boot<'a> {
     pub fps_max: f32,
 }
 
+/// How the cursor is held while the mouse is driving the view.
+///
+/// **`winit` 0.30's two grab modes are each unimplemented on one of the two
+/// platforms this port supports** (`winit-0.30.13/src/window.rs:1682`):
+/// `Locked` returns `NotSupported` on X11, `Confined` returns it on macOS. So
+/// neither mode works everywhere, and which one is available is a **runtime**
+/// property of the session — X11-versus-Wayland is not a compile-time fact —
+/// which is why this is a value decided at grab time and not a `cfg!`.
+///
+/// The fallback is Valve's own, and it is what `CInput::ResetMouse`
+/// (`in_mouse.cpp:342`) existed for: confine the cursor and warp it back to
+/// the centre of the window every frame. Neither mode promises to hide the
+/// cursor, so [`GameWindow::apply_capture`] hides it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    /// `CursorGrabMode::Locked` — the cursor does not move at all. Wayland and
+    /// macOS.
+    Locked,
+    /// `CursorGrabMode::Confined` plus a warp to the window centre each frame.
+    /// X11.
+    Warped,
+}
+
+/// How many pixels of trackpad scrolling make one wheel notch.
+///
+/// `MOUSE_WHEEL_UP`/`_DOWN` are *discrete* buttons — `bind MWHEELUP +jump` is
+/// a real binding — but a macOS trackpad reports scrolling in pixels,
+/// continuously. Without a threshold one swipe is hundreds of presses.
+///
+/// Not a Valve constant: `CInputSystem` never saw a pixel delta. 50 is about
+/// three lines of text, which makes a swipe a handful of notches.
+const PIXELS_PER_NOTCH: f32 = 50.0;
+
 /// Creates the game window and runs the frame loop until the game quits.
 ///
 /// This is `CEngineAPI::MainLoop`'s place in the boot sequence
@@ -334,6 +380,30 @@ struct GameWindow<'a> {
     retry_at: Option<Instant>,
     /// Whether the milestone line has been printed. See [`GameWindow::draw`].
     presented: bool,
+    /// Whether the window has focus. Half of the grab condition — the other
+    /// half is the engine wanting the mouse — because a captured cursor in a
+    /// window the user has alt-tabbed away from is a trapped cursor.
+    ///
+    /// Seeded from `Window::has_focus` at creation rather than assumed, and
+    /// updated from `WindowEvent::Focused` after that. Assuming it starts
+    /// focused is wrong in exactly the case that matters: a window opened by a
+    /// process the desktop did not activate never receives `Focused(true)`, so
+    /// an assumed `true` would capture the mouse out from under whatever the
+    /// user is actually looking at, with no focus-loss event to give it back.
+    focused: bool,
+    /// Whether the cursor grab has been *asked* for, which is not the same as
+    /// [`GameWindow::capture`]: a grab that the platform refuses leaves this
+    /// `true` and that `None`, so the refusal is not retried on every frame
+    /// for the rest of the session.
+    capture_wanted: bool,
+    /// How the cursor is held, or `None` for not held. See [`Capture`].
+    capture: Option<Capture>,
+    /// Whether the "could not capture the mouse" line has been printed. Once
+    /// is enough; the condition is per-session.
+    capture_warned: bool,
+    /// Fractional wheel notches not yet turned into a button press. See
+    /// [`PIXELS_PER_NOTCH`].
+    wheel: f32,
     outcome: RunOutcome,
     startup_error: Option<WindowError>,
 }
@@ -349,6 +419,12 @@ impl<'a> GameWindow<'a> {
             engine: None,
             retry_at: None,
             presented: false,
+            // Replaced by `Window::has_focus` as soon as there is a window.
+            focused: false,
+            capture_wanted: false,
+            capture: None,
+            capture_warned: false,
+            wheel: 0.0,
             outcome: RunOutcome::Quit,
             startup_error: None,
         }
@@ -384,9 +460,20 @@ impl<'a> GameWindow<'a> {
             engine.request_new_game(map);
         }
 
+        self.focused = window.has_focus();
         self.engine = Some(engine);
         self.window = Some(window);
         self.renderer = Some(renderer);
+
+        // Seed the engine's idea of focus, rather than letting it assume: raw
+        // motion arrives from the device even when the window is not focused,
+        // and a window the desktop never activated never gets a `Focused`
+        // event to correct an assumption with.
+        self.push(if self.focused {
+            input::Event::FocusGained
+        } else {
+            input::Event::FocusLost
+        });
         Ok(())
     }
 
@@ -410,9 +497,9 @@ impl<'a> GameWindow<'a> {
     /// the `COM_TimestampedLog` calls that bracketed `CreateGameWindow`
     /// (`engine/sys_getmodes.cpp:537`).
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(renderer), Some(engine)) =
-            (&self.window, &mut self.renderer, &mut self.engine)
-        else {
+        // The window and the renderer are created with the engine, so one
+        // `Some` stands for all three.
+        let Some(engine) = &mut self.engine else {
             return;
         };
 
@@ -436,6 +523,18 @@ impl<'a> GameWindow<'a> {
             }
         }
 
+        // The tick above is what drained the input queue, so this is the first
+        // moment the grab can disagree with what the game wants — pressing
+        // Escape reaches the engine there and gives the cursor back here.
+        self.apply_capture();
+        self.warp_cursor();
+
+        let (Some(window), Some(renderer), Some(engine)) =
+            (&self.window, &mut self.renderer, &mut self.engine)
+        else {
+            return;
+        };
+
         // `None` is the ordinary "not on screen right now" answer, not a
         // failure — see `Renderer::begin_frame`. Back off rather than asking
         // again immediately; see `about_to_wait`.
@@ -456,6 +555,167 @@ impl<'a> GameWindow<'a> {
             self.presented = true;
             eprintln!("source-engine: renderer: first frame presented");
         }
+    }
+
+    /// Posts one translated event into the engine's queue.
+    ///
+    /// `CInputSystem::PostEvent`. Events that arrive before the engine exists
+    /// are dropped, which is the same thing `CGame::WindowProc` did before
+    /// `CEngineAPI::Run`.
+    fn push(&mut self, event: input::Event) {
+        if let Some(engine) = &mut self.engine {
+            engine.push_input(event);
+        }
+    }
+
+    /// One key press or release, plus the text it produced.
+    ///
+    /// The three events Valve posted for one key press — `IE_ButtonPressed`
+    /// with a scan code *and* a virtual code, `IE_KeyCodeTyped`, and
+    /// `IE_KeyTyped` with a character — are one `KeyEvent` here, so the
+    /// button and the text come off the same struct rather than being
+    /// reassembled from two SDL events (`portdocs/ENGINE_INPUT.md` §4.1).
+    ///
+    /// `is_synthetic` is deliberately not consulted: `winit` uses those to
+    /// report keys already held when a window gains focus, and
+    /// `Input::frame`'s redundant-transition guard already makes a repeated
+    /// press into nothing.
+    fn push_key(&mut self, event: KeyEvent) {
+        let down = event.state.is_pressed();
+
+        if let PhysicalKey::Code(code) = event.physical_key {
+            if let Some(key) = translate::key(code) {
+                let button = Button::Key(key);
+                self.push(if down {
+                    input::Event::Pressed {
+                        button,
+                        repeat: event.repeat,
+                    }
+                } else {
+                    input::Event::Released(button)
+                });
+            }
+        }
+
+        // Unfiltered, control characters included: what counts as typable is
+        // the console's question, and it does not exist yet.
+        if down {
+            for character in event.text.iter().flat_map(|text| text.chars()) {
+                self.push(input::Event::Text(character));
+            }
+        }
+    }
+
+    /// The wheel, in both spellings: a continuous amount and the two fake
+    /// buttons.
+    ///
+    /// A mouse reports lines, discretely; a trackpad reports pixels,
+    /// continuously. Both become notches, and the button presses come off an
+    /// accumulator so that a fractional line delta is not lost and a trackpad
+    /// swipe is not hundreds of presses. See [`PIXELS_PER_NOTCH`].
+    fn push_wheel(&mut self, delta: MouseScrollDelta) {
+        let notches = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(position) => position.y as f32 / PIXELS_PER_NOTCH,
+        };
+        // A non-finite delta would be an infinite loop below, and the source
+        // is a driver rather than anything this code controls.
+        if notches == 0.0 || !notches.is_finite() {
+            return;
+        }
+        self.push(input::Event::Wheel(notches));
+
+        self.wheel += notches;
+        let whole = self.wheel.trunc();
+        self.wheel -= whole;
+
+        let button = Button::Mouse(if whole > 0.0 {
+            MouseButton::WheelUp
+        } else {
+            MouseButton::WheelDown
+        });
+        for _ in 0..whole.abs() as u32 {
+            self.push(input::Event::Pressed {
+                button,
+                repeat: false,
+            });
+            self.push(input::Event::Released(button));
+        }
+    }
+
+    /// Reconciles the cursor grab with what the game wants.
+    ///
+    /// The grab is `mouse_look && focused`: the engine decides whether the
+    /// mouse is driving the view, and this decides whether it can be held
+    /// right now. Both halves matter — releasing on focus loss is what stops
+    /// an alt-tabbed window from keeping the cursor
+    /// (`portdocs/ENGINE_INPUT.md` §6.5).
+    ///
+    /// `Locked` is tried first because it does not move the cursor at all,
+    /// which is what a first-person camera wants; `Confined` plus a warp is
+    /// the fallback where it is unavailable. See [`Capture`].
+    fn apply_capture(&mut self) {
+        let wanted = self.focused
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| engine.wants_mouse_capture());
+        if wanted == self.capture_wanted {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+        self.capture_wanted = wanted;
+
+        if !wanted {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            self.capture = None;
+            return;
+        }
+
+        self.capture = match window.set_cursor_grab(CursorGrabMode::Locked) {
+            Ok(()) => Some(Capture::Locked),
+            Err(locked) => match window.set_cursor_grab(CursorGrabMode::Confined) {
+                Ok(()) => Some(Capture::Warped),
+                Err(confined) => {
+                    if !self.capture_warned {
+                        self.capture_warned = true;
+                        eprintln!(
+                            "source-engine: window: could not capture the mouse \
+                             (locked: {locked}; confined: {confined}); \
+                             the view will still turn, but the cursor is loose"
+                        );
+                    }
+                    None
+                }
+            },
+        };
+
+        // Neither grab mode promises to hide the cursor. Leave it visible when
+        // the grab failed outright, so that a loose cursor is at least a
+        // findable one.
+        window.set_cursor_visible(self.capture.is_none());
+    }
+
+    /// Puts the cursor back in the middle of the window, under
+    /// [`Capture::Warped`].
+    ///
+    /// `CInput::ResetMouse` (`in_mouse.cpp:342`). The centre is recomputed
+    /// rather than remembered because the window can be resized under a live
+    /// grab. Errors are ignored: this is a best-effort tidy-up on a platform
+    /// that already refused the mode that would have made it unnecessary.
+    fn warp_cursor(&mut self) {
+        if self.capture != Some(Capture::Warped) {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let centre = PhysicalPosition::new(size.width / 2, size.height / 2);
+        let _ = window.set_cursor_position(centre);
     }
 }
 
@@ -508,10 +768,80 @@ impl ApplicationHandler for GameWindow<'_> {
 
             WindowEvent::RedrawRequested => self.draw(event_loop),
 
-            // Input arrives here. `portdocs/ENGINE.md` §6 has the chain it
-            // replaces and the open question about UI event precedence, which
-            // `egui` collapses into one "did the UI consume this" answer.
+            // Input, from here down: translated and queued, never acted on.
+            // `Engine::frame` drains the queue once a tick, which is where
+            // `DispatchAllStoredGameMessages` sat in `MainLoop`
+            // (`sys_mainwind.cpp:509`) and is what keeps sampling independent
+            // of how many events `fps_max` let pile up.
+            WindowEvent::KeyboardInput { event, .. } => self.push_key(event),
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(button) = translate::mouse(button) {
+                    let button = Button::Mouse(button);
+                    self.push(if state.is_pressed() {
+                        input::Event::Pressed {
+                            button,
+                            repeat: false,
+                        }
+                    } else {
+                        input::Event::Released(button)
+                    });
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => self.push_wheel(delta),
+
+            // **Never view look.** `CursorMoved` is clamped to the window and
+            // quantised to pixels, so a view driven from it stalls at the
+            // screen edge; that is `DeviceEvent::MouseMotion`'s job. This is
+            // for the UI, which does not exist yet.
+            WindowEvent::CursorMoved { position, .. } => self.push(input::Event::CursorMoved {
+                x: position.x as f32,
+                y: position.y as f32,
+            }),
+
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.push(if focused {
+                    input::Event::FocusGained
+                } else {
+                    input::Event::FocusLost
+                });
+                // Not deferred to the next tick: the cursor has to come back
+                // now, whether or not a frame is due.
+                self.apply_capture();
+            }
+
+            // `ModifiersChanged` is redundant here, as it was for Valve:
+            // shift, control and alt are ordinary buttons with their own
+            // codes, and they arrive as `KeyboardInput` like every other key.
             _ => {}
+        }
+    }
+
+    /// Raw mouse motion — the only thing that turns the view.
+    ///
+    /// `DeviceEvent` rather than `WindowEvent` because this is the device's
+    /// own delta: XI2 raw events on X11 and `zwp_relative_pointer_v1`'s
+    /// unaccelerated delta on Wayland. **macOS is the exception**: it is
+    /// `NSEvent.deltaX`, which has already been through the OS pointer
+    /// ballistics curve, so the same `sensitivity` feels different there.
+    /// Valve hit the same thing and answered it with convars rather than by
+    /// inverting the curve (`portdocs/ENGINE_INPUT.md` §6.3).
+    ///
+    /// It arrives whether or not the window is focused, which is why
+    /// [`input::Input`] gates on focus rather than trusting the source.
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.push(input::Event::MouseMotion {
+                dx: dx as f32,
+                dy: dy as f32,
+            });
         }
     }
 
