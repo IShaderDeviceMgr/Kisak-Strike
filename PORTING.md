@@ -586,12 +586,18 @@ convention carries the button index that makes two keys bound to one command wor
 hard-coded keys. `kb_def.lst` turned out to be a *suggested-key* map for the options UI
 rather than the default binding set, and was not ported.
 
-**Next on the boot path:** `console/` stage 3 — **config persistence**. `FCVAR_ARCHIVE`,
-`Host_WriteConfiguration` minus Steam Cloud, `Key_WriteBindings`, and preferring
-`config.cfg` over `config_default.cfg` at startup. Small, and it must keep Valve's guard:
-do not write a config until one has been read, or a crashed first launch overwrites real
-settings with defaults. After that the boot path is gated on `egui` — `console/` stage 4
-and `input/` stage 4 are one integration. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+**`console/` stage 3 is done:** `config.cfg` is written on a clean exit and preferred over
+`config_default.cfg` at startup, with both of Valve's guards — nothing is written until
+startup has read a config, and nothing is written when almost nothing is bound. The
+composition spans two modules, as it does in the original: the bindings are `input/`'s and
+the archived cvars are `console/`'s, joined by engine policy. `sensitivity` became the
+first `FCVAR_ARCHIVE` cvar.
+
+**Next on the boot path:** the **`egui` console UI** — `console/` stage 4 and `input/`
+stage 4, which are one integration and must land together. `egui` is already a decided
+replacement, so this is unscheduled rather than blocked. `input/` stage 4 brings the
+key-up latch, which is a correctness fix: without it, clicking and then opening the console
+leaves `+attack` held forever. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
 unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
 visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
 magenta checkerboard into lit content.

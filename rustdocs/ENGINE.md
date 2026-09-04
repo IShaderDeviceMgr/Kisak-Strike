@@ -8,7 +8,7 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
 | [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings and a free-fly camera done; no UI precedence or controllers |
-| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds`, `bind` done; no config writing or UI |
+| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg` done; no UI |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop and input translation done |
 | `net/`, `client/`, `server/`, `audio/`, … | the other 9 | not started |
 
@@ -374,7 +374,7 @@ UI precedence (stage 4) wants `egui`, and controllers (stage 5) want `gilrs`.
 |---|---|
 | Module | `crate::engine::input`, with `input::bind`, `input::button` and `input::view` |
 | Lines | ~1,960 including tests |
-| Tests | 51 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
+| Tests | 52 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
 | Dependencies | `std` and `glam`. **Not `winit`** — see [the seam](#the-seam-window-translates-input-decides) |
 
 ### Quick start
@@ -595,6 +595,8 @@ pub fn unbind_all(&mut self);
 pub fn get(&self, button: Button) -> Option<&str>;
 pub fn iter(&self) -> impl Iterator<Item = (Button, &str)>;
 pub fn find(&self, command: &str) -> impl Iterator<Item = Button> + '_;
+pub fn count(&self) -> usize;                       // Key_CountBindings
+pub fn write(&self, out: &mut String);              // Key_WriteBindings
 pub fn dispatch(&self, button: Button, down: bool, modifier_down: bool,
                 sink: &mut dyn CommandSink) -> bool;
 
@@ -723,15 +725,16 @@ Cvars, commands, the buffer that turns typed or scripted text into them, and the
 they print to. Replaces `tier1/convar.cpp` + `tier1/commandbuffer.cpp` (the objects and
 the queue), `vstdlib/cvar.cpp` (the registry), `engine/cmd.cpp` + `engine/cvar.cpp` (the
 policy) and the print half of `engine/console.cpp`. The design is
-[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stages 1 and 2 of
-its §8 — stage 2 being bindings, which is the same work as `input/` stage 3 and is
-documented [there](#bindings-and-commandsink).
+[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stages 1-3 of its
+§8 — stage 2 being bindings, which is the same work as `input/` stage 3 and is documented
+[there](#bindings-and-commandsink), and stage 3 being
+[config persistence](#config-persistence).
 
 | | |
 |---|---|
 | Module | `crate::engine::console`, with `console::{buffer, cvar, log, token}` |
 | Lines | ~3,250 including tests |
-| Tests | 65 (`cargo test engine::console`) |
+| Tests | 69 (`cargo test engine::console`) |
 | Dependencies | **`std` only** — no `wgpu`, no `winit`, no `crate::filesystem` |
 
 **It names no engine type and no filesystem type**, which is what lets it be constructed,
@@ -918,9 +921,17 @@ borrows of the console the dispatcher is already inside.
 ```rust
 pub trait ConfigFiles {
     fn read_config(&self, path: &str, path_id: Option<&str>) -> Option<Vec<u8>>;
+    fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool;      // defaulted
+    fn write_config(&self, path: &str, contents: &str) -> Result<(), String>; // defaulted
 }
-pub struct NoConfigFiles;                // reads nothing
+pub struct NoConfigFiles;                // reads nothing, writes nothing
 ```
+
+Reading and writing are **not symmetric**, which is why they are separate methods and why
+only one takes a path ID: a read searches every mount in order, and there is exactly one
+place a write can go (`Vfs::write_root`, the mod directory). That asymmetry is also why
+`DEFAULT_WRITE_PATH` was not ported as a search path — see
+[`FILESYSTEM.md`](FILESYSTEM.md).
 
 The seam that keeps `console/` off `crate::filesystem`. `path` arrives assembled
 (`cfg/valve.rc`); `path_id` is `exec`'s optional second argument, which Valve spells as the
@@ -930,6 +941,72 @@ The seam that keeps `console/` off `crate::filesystem`. `path` arrives assembled
 > **This resolves a contradiction in the plan.** `ENGINE_CONSOLE.md` §0.1 asks for a module
 > testable "without a mounted filesystem" while §3 and §4.5 have `exec` reading
 > `cfg/*.cfg`. Both hold only if the read goes through a trait, so it does.
+
+### Config persistence
+
+```rust
+// free function -- both callers hold different things
+pub fn write_archived_cvars(cvars: &CvarRegistry, out: &mut String);
+
+// on Console:
+pub fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool;
+pub fn config_was_read(&self) -> bool;
+pub fn set_config_was_read(&mut self, read: bool);
+pub fn write_config_file(&self, path: &str, contents: &str) -> Result<(), String>;
+
+// on ExecContext, for a command that persists state:
+pub fn cvars(&self) -> &CvarRegistry;
+pub fn config_was_read(&self) -> bool;
+pub fn write_config(&mut self, path: &str, contents: &str) -> Result<(), String>;
+```
+
+`Host_WriteConfiguration` (`engine/host.cpp:1559`) is **engine policy that pulls from two
+modules** — `Key_WriteBindings` from `keys.cpp` and `WriteVariables` from `cvar.cpp` — so
+the composition lives in `src/engine/mod.rs` as `build_configuration`, exactly where
+`host.cpp` put it. `Engine::write_configuration` and the `host_writeconfig` command are
+its two callers.
+
+The file is `unbindall`, then every binding, then every `FCVAR_ARCHIVE` cvar as
+`<name> "<value>"`:
+
+```
+unbindall
+bind "w" "+forward"
+bind "MOUSE1" "+attack"
+sensitivity "6"
+```
+
+- **`unbindall` first is what makes the file idempotent** — reading it back throws away
+  what was bound rather than merging. It is also why
+  [`unbind_all` spares Escape and the backquote](#bindings-and-commandsink): this file is
+  exec'd at startup, and without those exceptions reading your own config would take away
+  the menu key and the console key.
+- **Cvars are sorted case-insensitively by name** (`CVarSortFunc`, `cvar.cpp:629`). Not
+  cosmetic: the file is rewritten on every clean exit, and an unstable order would churn
+  against version control and against any diff a user takes.
+- **The value is quoted**, which is what makes `strip_set_value` the reader — a cvar
+  holding spaces survives the round trip.
+- **The format is fixed** (§7). We write it *and* read it, but a user's existing
+  `config.cfg` was written by the shipped engine, and one we write must stay readable by
+  it.
+
+**Two guards, both load-bearing, neither an optimization:**
+
+1. **`config_was_read`** (`Host_WasConfigCfgExecuted`, `:1587`). Nothing may be written
+   until startup's config exec has been through the buffer. Without it, a crash between
+   startup and that exec overwrites a real user's settings with defaults. `Engine` sets it
+   after the first `Console::run`, which is where `Host_Init` calls `Cbuf_Execute` and then
+   `Host_SetConfigCfgExecuted` (`:2092`).
+2. **`Bindings::count() <= 1`** (`:1603`). A session that somehow bound nothing must not
+   persist that over a real config.
+
+**Startup** (`Engine::boot`, `host.cpp:2058`) prefers `//mod/cfg/config.cfg` and falls
+back to `config_default.cfg`, setting `save_config` so the user gets a real config written
+on that first launch. Valve checks `//usrlocal/` first; that is a console-era per-user path
+this port has no equivalent for.
+
+`execifexists` (`cmd.cpp:798`) is `exec` with `bOnlyIfExists` — silent about a missing
+file, where `exec` complains.
 
 ### `CommandBuffer` and the tick model
 
@@ -1028,8 +1105,6 @@ Both are runaway protection, and they catch different shapes:
 
 | Missing | Waits on |
 |---|---|
-| `bind`/`unbind`/`bind_osx`, `kb_def.lst` defaults, the `+`/`-` convention | stage 2 — the table lives in `input/` |
-| `config.cfg` reading and writing, `FCVAR_ARCHIVE` persistence | stage 3 |
 | The console dialog, scrollback rendering, history, completion *algorithm* | stage 4 — wants `egui` |
 | `cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar` | stage 5 |
 | The flag-versus-source permission matrix | `net/` — the check is already a function returning "allowed" (§9 q4) |
@@ -1086,6 +1161,13 @@ Found while implementing, and recorded because the plan is otherwise the referen
 | `a_plus_argument_seeds_a_cvar_at_registration` | `GetCommandLineValue`, distinct from `stuffcmds` |
 | `valve_rc_boots_a_map_through_stuffcmds` | stage 1's deliverable, end to end |
 | `filter_mode_one_drops_and_mode_two_dims`, `developer_is_a_level_not_a_bool`, `the_ring_is_bounded` | the log sink |
+| `only_archived_cvars_are_written_and_they_are_sorted` | `WriteVariables`' filter and `CVarSortFunc` |
+| `a_written_cvar_reads_back_through_the_set_path` | that the writer's quoting and `strip_set_value` agree |
+| `execifexists_is_silent_about_a_missing_file` | the difference from `exec` |
+| `a_written_config_reads_back_as_the_same_bindings_and_cvars` | the whole round trip across two consoles and two binding tables |
+| `writing_is_refused_until_startup_has_read_a_config`, `writing_is_refused_when_almost_nothing_is_bound` | both guards |
+| `the_config_opens_with_unbindall_then_bindings_then_cvars` | the file's shape |
+| `the_written_config_reads_back_as_the_same_table` | `Key_WriteBindings`' exact lines |
 
 ---
 
@@ -1320,8 +1402,10 @@ The renderer stays with the window because the surface is tied to the window han
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
 refcounted clones.
 
-Internally `Engine` is five fields: the `Console`, the `Host`, the `Input` (which owns the
-binding table and the movement buttons), the engine's
+Internally `Engine` is seven fields: the `Console`, the `Host`, the `Input` (which owns the
+binding table and the movement buttons), `sensitivity` — the port's first `FCVAR_ARCHIVE`
+cvar, and therefore the first thing `config.cfg` persists that is not a binding — the
+engine's
 own `fps_max` handle with the generation it last saw, and a private `Scene`
 holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`,
 the view and `curtime`. `Scene` is what implements [`Level`], so
@@ -1339,11 +1423,11 @@ is the `CommandTarget`: a struct of field borrows, holding `&mut Host` and `&mut
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, and the `+`/`-` movement pair.
 
-`Engine::boot` queues `exec config_default.cfg` and then `exec valve.rc`. `Host_Init`
-(`engine/host.cpp:2055`) execs `config.cfg` and falls back to `config_default.cfg`; only
-the fallback is read, because nothing writes a `config.cfg` yet — stage 3 is what adds the
-preference and the `Host_WasConfigCfgExecuted` guard, and exec'ing a file a fresh install
-does not have would print an error at every launch.
+`Engine::boot` prefers `//mod/cfg/config.cfg` and falls back to `config_default.cfg`, then
+queues `exec valve.rc` — see [config persistence](#config-persistence). `Engine::frame`
+completes the handshake on its first pass: it binds the backquote to `toggleconsole` if
+nothing else did (`host.cpp:2085`), sets `config_was_read`, and writes a config if startup
+fell back to the defaults. A clean `Outcome::Quit` or `Restart` writes one too.
 
 `Engine::update_view` is where input becomes movement, and `mouse_look_after` is the
 whole of the UI-precedence policy until there is a UI: Escape frees the cursor, a click
@@ -1358,8 +1442,8 @@ system's GPU regression suite.
 
 ## Test coverage
 
-178 tests across the five modules; 403 in the crate. **65 arrived with `console/`** and
-have [their own table](#test-coverage-console); the input tests, now 51, have
+187 tests across the five modules; 412 in the crate. **69 arrived with `console/`** and
+have [their own table](#test-coverage-console); the input tests, now 52, have
 [theirs](#test-coverage-input). The 21 that arrived with bindings are split across both,
 because the feature is.
 

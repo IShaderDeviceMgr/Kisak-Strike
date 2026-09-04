@@ -27,8 +27,17 @@
 
 use glam::Vec3;
 
-/// `sensitivity` (`in_mouse.cpp:100`), clamped there to `0.0001..1000`.
+/// `sensitivity`'s declared default (`in_mouse.cpp:100`).
+///
+/// The value is a **cvar**, not a constant — `FCVAR_ARCHIVE`, so it persists to
+/// `config.cfg` — and [`Engine`](crate::engine::Engine) holds the handle. This
+/// is only the default it is registered with, and the bounds below are the ones
+/// `ConVar`'s clamp is given.
 pub const SENSITIVITY: f32 = 2.5;
+
+/// `sensitivity`'s clamp (`in_mouse.cpp:100`): `true, 0.0001f, true, 10000000`.
+pub const SENSITIVITY_MIN: f32 = 0.0001;
+pub const SENSITIVITY_MAX: f32 = 10_000_000.0;
 
 /// `m_yaw` (`in_mouse.cpp:103`): degrees of yaw per unit of scaled motion.
 const M_YAW: f32 = 0.022;
@@ -184,8 +193,8 @@ impl FlyCamera {
     }
 
     /// Turns the view by one tick's accumulated raw motion.
-    pub fn look(&mut self, dx: f32, dy: f32) {
-        self.angles.apply_mouse(dx, dy, SENSITIVITY);
+    pub fn look(&mut self, dx: f32, dy: f32, sensitivity: f32) {
+        self.angles.apply_mouse(dx, dy, sensitivity);
     }
 
     /// Moves the view by one tick, from what is held.

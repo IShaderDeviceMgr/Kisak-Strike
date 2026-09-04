@@ -4,8 +4,10 @@
 tokenizers, dispatch, aliases, `exec`, `stuffcmds`, the log sink, and
 `map`/`quit`/`restart` through a `CommandTarget`. Stage 2 (§8.2) is bindings, which is the
 same work as `ENGINE_INPUT.md` stage 3: `console/` supplies `CommandSink`, the table lives
-in `input/`, and WASD now comes from the shipped `cfg/config_default.cfg`. Stages 3-5
-(config persistence, the `egui` dialog, the list commands) are not started. This is the plan,
+in `input/`, and WASD now comes from the shipped `cfg/config_default.cfg`. Stage 3 (§8.3)
+is config persistence: `FCVAR_ARCHIVE`, `host_writeconfig`, `execifexists`, and the
+`config.cfg`-over-`config_default.cfg` preference at startup, with both of Valve's guards.
+Stages 4-5 (the `egui` dialog, the list commands) are not started. This is the plan,
 written before the port, per `PORTING.md`'s per-module rule; **the API reference
 in `rustdocs/ENGINE.md`'s `src/engine/console/` section is the document to read
 in order to *use* the module**, and it is authoritative where the two disagree.
@@ -736,12 +738,17 @@ Each stage is independently reviewable and independently useful.
    because `config_default.cfg` binds `+attack` and `cancelselect`, neither of which
    exists yet, and Valve — which implements all its commands — never had to care.
 
-3. **Config persistence.** `FCVAR_ARCHIVE`, `Host_WriteConfiguration`
+3. **Config persistence.** — **done.** `FCVAR_ARCHIVE`, `Host_WriteConfiguration`
    (`host.cpp:1559`) minus Steam Cloud, `Key_WriteBindings`, and the
-   `config.cfg` → `config_default.cfg` fallback at startup. **Guard it the way
-   Valve does:** do not write a config until one has been read
-   (`Host_WasConfigCfgExecuted`), or a crashed first launch overwrites a real
-   user's settings with defaults.
+   `config.cfg` → `config_default.cfg` fallback at startup, with **both** of
+   Valve's guards: nothing is written until startup has read a config
+   (`Host_WasConfigCfgExecuted`), and nothing is written when `Key_CountBindings()`
+   is at most one. `execifexists` came with it, and `sensitivity` became the
+   port's first `FCVAR_ARCHIVE` cvar so that the archive path has a real
+   consumer rather than only a test.
+   *Verified against the depot:* first launch reads `config_default.cfg` and
+   writes a `config.cfg`; the second reads that `config.cfg` back; `+quit`
+   writes on the way out.
 
 4. **The dev console UI.** *Wants `egui`*, which is unscheduled. The ring, the
    input line, history, the completion popup and `toggleconsole` — plus

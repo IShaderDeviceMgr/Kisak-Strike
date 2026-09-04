@@ -114,6 +114,27 @@ impl Bindings {
             .filter_map(|(index, command)| Some((Button::from_index(index)?, command.as_deref()?)))
     }
 
+    /// `Key_CountBindings` (`engine/keys.cpp:510`).
+    ///
+    /// Read before writing a config: Valve refuses to write one when this is
+    /// `<= 1` (`host.cpp:1603`), on the grounds that a session which somehow
+    /// bound nothing must not be allowed to persist that over a real config.
+    pub fn count(&self) -> usize {
+        self.table.iter().filter(|b| b.is_some()).count()
+    }
+
+    /// `Key_WriteBindings` (`engine/keys.cpp:533`): one `bind "<key>"
+    /// "<command>"` line per bound button, in button order.
+    ///
+    /// The names are the fixed external format — `s_pButtonCodeName` — so a
+    /// name that does not round-trip is a binding that vanishes from the user's
+    /// config the next time it is read back.
+    pub fn write(&self, out: &mut String) {
+        for (button, command) in self.iter() {
+            out.push_str(&format!("bind \"{}\" \"{}\"\n", button.name(), command));
+        }
+    }
+
     /// Every button bound to `command`, compared case-insensitively.
     /// `key_findbinding`.
     pub fn find(&self, command: &str) -> impl Iterator<Item = Button> + '_ {
@@ -303,5 +324,27 @@ mod tests {
         assert_eq!(bindings.iter().count(), 2);
         let found: Vec<Button> = bindings.find("+FORWARD").collect();
         assert_eq!(found, [Button::Key(Key::W)], "matching is case-insensitive");
+    }
+
+    #[test]
+    fn the_written_config_reads_back_as_the_same_table() {
+        let mut bindings = Bindings::new();
+        bindings.bind(Button::Key(Key::W), "+forward");
+        bindings.bind(Button::Mouse(super::super::MouseButton::Left), "+attack");
+        bindings.bind(Button::Key(Key::F6), "save quick");
+        assert_eq!(bindings.count(), 3);
+
+        let mut out = String::new();
+        bindings.write(&mut out);
+
+        // The exact shape `config.cfg` has, and the shipped `exec` has to be
+        // able to read it back.
+        assert!(out.contains("bind \"w\" \"+forward\"\n"), "{out}");
+        assert!(out.contains("bind \"MOUSE1\" \"+attack\"\n"), "{out}");
+        assert!(
+            out.contains("bind \"F6\" \"save quick\"\n"),
+            "a multi-word command survives its quotes: {out}"
+        );
+        assert_eq!(out.lines().count(), 3);
     }
 }

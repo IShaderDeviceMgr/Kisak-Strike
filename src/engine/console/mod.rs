@@ -171,6 +171,13 @@ pub enum Dispatch {
 pub struct ExecContext<'a> {
     buffer: &'a mut CommandBuffer,
     log: &'a mut Log,
+    /// Read-only, for `host_writeconfig`. `Host_WriteConfiguration`
+    /// (`engine/host.cpp:1559`) is engine policy that pulls from *both*
+    /// `keys.cpp` and `cvar.cpp`, so the composing command lives in the engine
+    /// and reaches the cvars through here.
+    cvars: &'a CvarRegistry,
+    files: &'a dyn ConfigFiles,
+    config_was_read: bool,
     source: Source,
 }
 
@@ -207,6 +214,26 @@ impl ExecContext<'_> {
     pub fn source(&self) -> Source {
         self.source
     }
+
+    /// Every registered cvar, for a command that has to walk them.
+    pub fn cvars(&self) -> &CvarRegistry {
+        self.cvars
+    }
+
+    /// `Host_WasConfigCfgExecuted` (`engine/host.cpp:1446`).
+    ///
+    /// **Check this before writing a config.** It is set once the startup
+    /// config exec has happened; writing before then would overwrite a real
+    /// user's settings with defaults, which is what a crash during startup
+    /// would otherwise cost them.
+    pub fn config_was_read(&self) -> bool {
+        self.config_was_read
+    }
+
+    /// Writes a config file under the write root.
+    pub fn write_config(&mut self, path: &str, contents: &str) -> Result<(), String> {
+        self.files.write_config(path, contents)
+    }
 }
 
 /// Who runs the commands the console does not own.
@@ -238,6 +265,23 @@ impl CommandTarget for NoTarget {
 /// defaults to `*`, meaning any mount.
 pub trait ConfigFiles {
     fn read_config(&self, path: &str, path_id: Option<&str>) -> Option<Vec<u8>>;
+
+    /// Whether the file is there, without reading it.
+    ///
+    /// Used for the `config.cfg`-or-`config_default.cfg` choice at startup
+    /// (`engine/host.cpp:2058`), which has to happen *before* either is exec'd.
+    fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool {
+        self.read_config(path, path_id).is_some()
+    }
+
+    /// Writes `contents` to `path` under the write root.
+    ///
+    /// Separate from reading because they are not symmetric: reads search
+    /// every mount in order, and there is exactly one place a write can go.
+    fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
+        let _ = (path, contents);
+        Err("no writable game directory is mounted".to_string())
+    }
 }
 
 /// A [`ConfigFiles`] with nothing in it. `exec` then behaves as it does for a
@@ -271,6 +315,9 @@ pub struct Console<'a> {
     command_line: Vec<String>,
     sv_cheats: Cvar,
     exec_depth: u32,
+    /// `g_bConfigCfgExecuted` (`engine/host.cpp:1283`). See
+    /// [`ExecContext::config_was_read`].
+    config_was_read: bool,
     /// Commands dispatched in the current [`Console::run`]. See
     /// [`MAX_COMMANDS_PER_ROUND`].
     dispatched: u32,
@@ -327,6 +374,7 @@ impl<'a> Console<'a> {
             command_line,
             sv_cheats,
             exec_depth: 0,
+            config_was_read: false,
             dispatched: 0,
             budget_exceeded: false,
             unknown_from_code: 0,
@@ -351,6 +399,11 @@ impl<'a> Console<'a> {
                     ext: "cfg",
                 },
             ),
+            CommandSpec::new("execifexists", "Execute a script file if it exists.")
+                .with_completion(Completion::Files {
+                    dir: "cfg",
+                    ext: "cfg",
+                }),
             CommandSpec::new("alias", "Alias a name to a body of command text."),
             CommandSpec::new("echo", "Print its arguments to the console."),
             CommandSpec::new("clear", "Clear the console scrollback."),
@@ -478,6 +531,30 @@ impl<'a> Console<'a> {
         &self.buffer
     }
 
+    /// Whether `path` resolves, without reading it.
+    pub fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool {
+        self.files.config_exists(path, path_id)
+    }
+
+    /// `Host_WasConfigCfgExecuted`.
+    pub fn config_was_read(&self) -> bool {
+        self.config_was_read
+    }
+
+    /// Writes a config file under the write root. See
+    /// [`ExecContext::write_config`].
+    pub fn write_config_file(&self, path: &str, contents: &str) -> Result<(), String> {
+        self.files.write_config(path, contents)
+    }
+
+    /// `Host_SetConfigCfgExecuted` (`engine/host.cpp:1456`), which the original
+    /// calls unconditionally once the startup exec block has run — *either*
+    /// branch of it, so this means "startup finished reading configs", not
+    /// "`config.cfg` specifically was found".
+    pub fn set_config_was_read(&mut self, read: bool) {
+        self.config_was_read = read;
+    }
+
     /// How many `Source::Code` commands went unrecognised since the last call,
     /// resetting the count. See [`Console::unknown_from_code`].
     pub fn take_unknown_count(&mut self) -> u32 {
@@ -559,10 +636,20 @@ impl<'a> Console<'a> {
             if self.run_builtin(cmd, target) {
                 return;
             }
-            let Console { buffer, log, .. } = self;
+            let Console {
+                buffer,
+                log,
+                cvars,
+                files,
+                config_was_read,
+                ..
+            } = self;
             let mut cx = ExecContext {
                 buffer,
                 log,
+                cvars,
+                files: &**files,
+                config_was_read: *config_was_read,
                 source: cmd.source(),
             };
             if target.execute(cmd, &mut cx) == Dispatch::Unknown {
@@ -704,7 +791,10 @@ impl<'a> Console<'a> {
     /// that are genuinely the engine's.
     fn run_builtin(&mut self, cmd: &Command, target: &mut dyn CommandTarget) -> bool {
         match cmd.name().to_ascii_lowercase().as_str() {
-            "exec" => self.cmd_exec(cmd, target),
+            "exec" => self.cmd_exec(cmd, target, false),
+            // `Cmd_ExecIfExists_f` (`engine/cmd.cpp:798`), which is
+            // `_Cmd_Exec_f` with `bOnlyIfExists`.
+            "execifexists" => self.cmd_exec(cmd, target, true),
             "alias" => self.cmd_alias(cmd),
             "echo" => {
                 let text = cmd.args().join(" ");
@@ -727,7 +817,7 @@ impl<'a> Console<'a> {
     /// completes before the rest of the outer file runs, which `valve.rc`
     /// depends on. It is also why a syntax error on line 3 does not stop lines
     /// 1 and 2 from having run.
-    fn cmd_exec(&mut self, cmd: &Command, target: &mut dyn CommandTarget) {
+    fn cmd_exec(&mut self, cmd: &Command, target: &mut dyn CommandTarget, only_if_exists: bool) {
         if cmd.argc() < 2 {
             self.log
                 .print("exec <filename> [path id]: execute a script file");
@@ -766,7 +856,8 @@ impl<'a> Console<'a> {
             // (`engine/cmd.cpp:572`). This looks like a hack and is exactly
             // right: Portal 2 ships none of them, and `valve.rc` execs two --
             // without the special case, every launch prints two errors.
-            if !fails_silently(&name) {
+            // `execifexists` asks for the same silence for any file.
+            if !only_if_exists && !fails_silently(&name) {
                 self.log.error(&format!("exec: couldn't exec {name}"));
             }
             return;
@@ -915,6 +1006,32 @@ impl<'a> Console<'a> {
         if !build.is_empty() {
             self.buffer.add_text(&build, cmd.source(), 0);
         }
+    }
+}
+
+/// `CCvarUtilities::WriteVariables` (`engine/cvar.cpp:637`): every
+/// `FCVAR_ARCHIVE` cvar as `<name> "<value>"`, **sorted case-insensitively by
+/// name** (`CVarSortFunc`, `:629`).
+///
+/// A free function rather than a method, because both callers need it and they
+/// hold different things: the `host_writeconfig` command reaches the registry
+/// through an [`ExecContext`], and the shutdown path has the [`Console`].
+///
+/// The sort is not cosmetic. `config.cfg` is rewritten on every clean exit, so
+/// an unstable order would make the file churn against version control and
+/// against any diff a user takes of it.
+///
+/// The value is quoted, which is what makes `strip_set_value` the reader: a
+/// cvar holding spaces survives the round trip.
+pub fn write_archived_cvars(cvars: &CvarRegistry, out: &mut String) {
+    let mut archived: Vec<&Cvar> = cvars
+        .iter()
+        .filter(|cvar| cvar.flags().contains(CvarFlags::ARCHIVE))
+        .collect();
+    archived.sort_by_key(|cvar| cvar.name().to_ascii_lowercase());
+
+    for cvar in archived {
+        out.push_str(&format!("{} \"{}\"\n", cvar.name(), cvar.string()));
     }
 }
 
@@ -1587,5 +1704,63 @@ mod tests {
             1,
             "`startupmenu` is GameUI's and is not ported"
         );
+    }
+
+    // ---- config persistence (stage 3) --------------------------------------
+
+    #[test]
+    fn only_archived_cvars_are_written_and_they_are_sorted() {
+        let mut console = Console::detached();
+        console.cvar("zzz_archived", "1", CvarFlags::ARCHIVE, "");
+        console.cvar("aaa_archived", "2", CvarFlags::ARCHIVE, "");
+        console.cvar("Mid_Archived", "3", CvarFlags::ARCHIVE, "");
+        console.cvar("not_archived", "4", CvarFlags::NONE, "");
+
+        let mut out = String::new();
+        write_archived_cvars(console.cvars(), &mut out);
+
+        assert_eq!(
+            out, "aaa_archived \"2\"\nMid_Archived \"3\"\nzzz_archived \"1\"\n",
+            "sorted case-insensitively, and FCVAR_ARCHIVE only"
+        );
+    }
+
+    /// The format is fixed (§7): we write it *and* read it, but a user's
+    /// existing `config.cfg` was written by the shipped engine.
+    #[test]
+    fn a_written_cvar_reads_back_through_the_set_path() {
+        let mut console = Console::detached();
+        let hostname = console.cvar("hostname", "", CvarFlags::ARCHIVE, "");
+        hostname.set_string("  a b  ");
+
+        let mut out = String::new();
+        write_archived_cvars(console.cvars(), &mut out);
+        assert_eq!(out, "hostname \"  a b  \"\n");
+
+        // What `exec` does with that line: tokenize, then strip the quotes the
+        // writer added -- interior spaces intact.
+        let cmd = Command::parse(out.trim_end(), Source::Code);
+        assert_eq!(strip_set_value(cmd.tail()), "  a b  ");
+    }
+
+    #[test]
+    fn execifexists_is_silent_about_a_missing_file() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.enqueue("execifexists nothing_here.cfg", Source::Code);
+        console.run(&mut NoTarget);
+        assert!(console.log().is_empty());
+
+        // Plain `exec` still complains, which is the difference between them.
+        console.enqueue("exec nothing_here.cfg", Source::Code);
+        console.run(&mut NoTarget);
+        assert_eq!(console.log().len(), 1);
+    }
+
+    #[test]
+    fn the_config_read_flag_starts_false() {
+        let mut console = Console::detached();
+        assert!(!console.config_was_read());
+        console.set_config_was_read(true);
+        assert!(console.config_was_read());
     }
 }

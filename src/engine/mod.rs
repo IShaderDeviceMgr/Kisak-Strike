@@ -56,11 +56,12 @@ use crate::materials::renderer::Frame;
 use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
 
 use console::{
-    Command, CommandSpec, CommandTarget, ConfigFiles, Console, Cvar, CvarFlags, Dispatch,
-    ExecContext, Source,
+    Command, CommandSpec, CommandTarget, ConfigFiles, Console, Cvar, CvarFlags, CvarRegistry,
+    Dispatch, ExecContext, Source,
 };
 use host::{Host, Level, Outcome};
-use input::view::{FlyCamera, MOVE_COMMANDS};
+use input::view::{FlyCamera, MOVE_COMMANDS, SENSITIVITY, SENSITIVITY_MAX, SENSITIVITY_MIN};
+use input::Bindings;
 use input::{Button, CommandSink, Input, Key, MouseButton};
 use world::World;
 
@@ -92,6 +93,18 @@ pub struct Engine<'a> {
     /// `FnChangeCallback_t` in the original (`engine/sys_engine.cpp:78`); this
     /// counter is what replaces it.
     fps_max_generation: u32,
+    /// `sensitivity` (`game/client/in_mouse.cpp:100`). The port's first
+    /// `FCVAR_ARCHIVE` cvar, and therefore the first thing `config.cfg`
+    /// persists that is not a binding.
+    sensitivity: Cvar,
+    /// Whether the startup config exec has been through the buffer yet.
+    /// `Host_Init` runs `Cbuf_Execute` and only then calls
+    /// `Host_SetConfigCfgExecuted` (`engine/host.cpp:2092`); this is that
+    /// ordering, spread over the first frame instead of a blocking drain.
+    booted: bool,
+    /// `saveconfig` (`engine/host.cpp:2069`): startup found no `config.cfg` and
+    /// fell back to the defaults, so one should be written out.
+    save_config: bool,
     host: Host,
     /// Everything the host drives when it changes level. Separate from [`Host`]
     /// so that `host.frame(&mut self.scene)` is a split borrow of two fields
@@ -157,6 +170,18 @@ impl<'a> Engine<'a> {
             "Frame rate limiter.",
         );
 
+        // `ConVar sensitivity( "sensitivity", "2.5", FCVAR_ARCHIVE | FCVAR_SS,
+        // "Mouse sensitivity.", true, 0.0001f, true, 10000000 )`. `FCVAR_SS` is
+        // splitscreen and is deleted (`ENGINE_CONSOLE.md` §5).
+        let sensitivity = console.cvar_bounded(
+            "sensitivity",
+            &SENSITIVITY.to_string(),
+            CvarFlags::ARCHIVE,
+            "Mouse sensitivity.",
+            Some(SENSITIVITY_MIN),
+            Some(SENSITIVITY_MAX),
+        );
+
         // The engine's commands. Declared here as data and run by
         // [`EngineCommands`]; `ENGINE_CONSOLE.md` §6.3 is why they are not
         // callbacks.
@@ -217,6 +242,9 @@ impl<'a> Engine<'a> {
 
         Engine {
             fps_max_generation: fps_max.generation(),
+            booted: false,
+            save_config: false,
+            sensitivity,
             host: Host::new(fps_max.float()),
             console,
             fps_max,
@@ -245,19 +273,60 @@ impl<'a> Engine<'a> {
     /// same way it does in the shipped game, through the config files, rather
     /// than from a command-line argument read directly.
     pub fn boot(&mut self) {
-        // `Host_Init` (`engine/host.cpp:2055`) execs `config.cfg` and falls
-        // back to `config_default.cfg`, *before* `valve.rc`. Only the fallback
-        // is read here: nothing writes a `config.cfg` yet
-        // (`ENGINE_CONSOLE.md` §8 stage 3 is what does, and it is what adds
-        // the preference and the `Host_WasConfigCfgExecuted` guard), and
-        // exec'ing a file that a fresh install does not have would print an
-        // error at every launch.
+        // `Host_Init` (`engine/host.cpp:2055`) prefers a user's `config.cfg`
+        // and falls back to `config_default.cfg`, *before* `valve.rc`. Valve
+        // checks `//usrlocal/` before `//mod/`; `usrlocal` is a console-era
+        // per-user path this port has no equivalent for, so the mod directory
+        // is the only candidate.
         //
-        // This is where WASD comes from. `config_default.cfg` opens with
-        // `unbindall` and then binds `+forward` and friends.
-        self.console
-            .enqueue("exec config_default.cfg", Source::Code);
+        // This is where WASD comes from: whichever of the two is read opens
+        // with `unbindall` and then binds `+forward` and friends.
+        match self.console.config_exists("cfg/config.cfg", Some("mod")) {
+            true => self.console.enqueue("exec config.cfg mod", Source::Code),
+            false => {
+                self.console
+                    .enqueue("exec config_default.cfg", Source::Code);
+                // `saveconfig` (`:2069`): started from the shipped defaults, so
+                // write the user a real config once startup is safely past.
+                self.save_config = true;
+            }
+        }
         self.console.enqueue("exec valve.rc", Source::Code);
+    }
+
+    /// `Host_WriteConfiguration` (`engine/host.cpp:1559`), minus Steam Cloud,
+    /// splitscreen and the map-editor case.
+    ///
+    /// The composition is Valve's and spans two modules on purpose: the
+    /// bindings are `input/`'s and the archived cvars are `console/`'s, and
+    /// this is the engine-level policy that joins them — which is exactly where
+    /// `host.cpp` put it.
+    ///
+    /// **Both guards are load-bearing and neither is an optimization.**
+    fn write_configuration(&mut self, file: &str) {
+        // `Host_WasConfigCfgExecuted` (`:1587`). Writing before startup has
+        // read a config overwrites a real user's settings with defaults — which
+        // is what a crash during startup would otherwise cost them. Silent,
+        // because it is the normal state for most of a launch.
+        if !self.console.config_was_read() {
+            return;
+        }
+
+        // `Key_CountBindings() <= 1` (`:1603`). A session that somehow bound
+        // nothing must not be allowed to persist that over a real config.
+        if self.input.bindings().count() <= 1 {
+            eprintln!("source-engine: console: skipping {file} output, no keys bound");
+            return;
+        }
+
+        let contents = build_configuration(self.input.bindings(), self.console.cvars());
+        match self
+            .console
+            .write_config_file(&format!("cfg/{file}"), &contents)
+        {
+            Ok(()) => eprintln!("source-engine: console: wrote cfg/{file}"),
+            Err(err) => eprintln!("source-engine: console: could not write cfg/{file}: {err}"),
+        }
     }
 
     /// Queues a map. See [`Host::request_new_game`].
@@ -368,6 +437,31 @@ impl<'a> Engine<'a> {
             self.host.clock_mut().set_fps_max(self.fps_max.float());
         }
 
+        if !self.booted {
+            self.booted = true;
+
+            // `engine/host.cpp:2085`: if nothing bound the console key, bind
+            // it. Same family as `unbindall` sparing it — there has to be a way
+            // to reach the console.
+            let backquote = Button::Key(Key::Backquote);
+            if self.input.bindings().get(backquote).is_none() {
+                self.input.bindings_mut().bind(backquote, "toggleconsole");
+            }
+
+            // Only now, after the startup execs have actually been through the
+            // buffer, is writing a config safe.
+            self.console.set_config_was_read(true);
+            if std::mem::take(&mut self.save_config) {
+                self.write_configuration("config.cfg");
+            }
+        }
+
+        // A clean exit persists settings, which is the other half of stage 3:
+        // `HostState_Shutdown` calls `Host_WriteConfiguration` on the way out.
+        if matches!(outcome, Outcome::Quit | Outcome::Restart) {
+            self.write_configuration("config.cfg");
+        }
+
         // Configs name cvars from subsystems that do not exist yet, so an
         // unrecognised name from a file is counted rather than printed
         // (§9 open question 6). One line beats sixty, and zero hides typos.
@@ -406,7 +500,7 @@ impl<'a> Engine<'a> {
     /// tick as a click is not lost.
     fn update_view(&mut self, seconds: f32, dx: f32, dy: f32) {
         if self.input.mouse_look() {
-            self.scene.view.look(dx, dy);
+            self.scene.view.look(dx, dy, self.sensitivity.float());
         }
         // What is held is now what the `+command`s left held, not which
         // physical keys are down — so which keys move the view is
@@ -668,6 +762,21 @@ impl CommandTarget for EngineCommands<'_> {
                 None => cx.print("unbind <key> : remove commands from a key"),
             },
             "unbindall" => self.input.bindings_mut().unbind_all(),
+            "host_writeconfig" => {
+                let file = cmd.arg(1).unwrap_or("config.cfg");
+                if !cx.config_was_read() {
+                    cx.print("skipping config output, startup has not read one yet");
+                } else if self.input.bindings().count() <= 1 {
+                    cx.print(&format!("skipping {file} output, no keys bound"));
+                } else {
+                    let contents = build_configuration(self.input.bindings(), cx.cvars());
+                    let path = format!("cfg/{file}");
+                    match cx.write_config(&path, &contents) {
+                        Ok(()) => cx.print(&format!("wrote {path}")),
+                        Err(err) => cx.error(&format!("could not write {path}: {err}")),
+                    }
+                }
+            }
             "key_listboundkeys" => {
                 let listing: Vec<String> = self
                     .input
@@ -729,6 +838,27 @@ impl EngineCommands<'_> {
     }
 }
 
+/// The text of a `config.cfg`.
+///
+/// `Host_WriteConfiguration`'s body (`engine/host.cpp:1624`): `unbindall`, then
+/// every binding, then every archived cvar.
+///
+/// **`unbindall` first is what makes the file idempotent** — reading it back
+/// throws away whatever was bound before rather than merging with it. It is
+/// also why `Bindings::unbind_all` has to spare Escape and the backquote: this
+/// file is exec'd at startup, and without those exceptions reading your own
+/// config would take away the menu key and the console key.
+///
+/// **The format is not ours to change** even though we write it and read it
+/// (`ENGINE_CONSOLE.md` §7): a user's existing `config.cfg` was written by the
+/// shipped engine, and one we write has to stay readable by it.
+fn build_configuration(bindings: &Bindings, cvars: &CvarRegistry) -> String {
+    let mut out = String::from("unbindall\n");
+    bindings.write(&mut out);
+    console::write_archived_cvars(cvars, &mut out);
+    out
+}
+
 /// `exec`'s window onto the mounted content.
 ///
 /// The whole of why `console/` names no filesystem type: it declares
@@ -752,6 +882,34 @@ impl ConfigFiles for VfsConfigFiles<'_> {
             // naming a path this port does not have should still be read.
             Some(_) => vfs.read(path).ok(),
         }
+    }
+
+    fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool {
+        let Some(vfs) = self.0 else {
+            return false;
+        };
+        match path_id.map(str::to_ascii_lowercase).as_deref() {
+            Some("mod") => vfs.scoped(PathId::Mod).exists(path),
+            Some("game") => vfs.scoped(PathId::Game).exists(path),
+            Some("gamebin") => vfs.scoped(PathId::GameBin).exists(path),
+            Some("platform") => vfs.scoped(PathId::Platform).exists(path),
+            Some("executable_path") => vfs.scoped(PathId::ExecutablePath).exists(path),
+            _ => vfs.exists(path),
+        }
+    }
+
+    /// There is exactly one place a write can go — [`Vfs::write_root`] — where
+    /// a read searches every mount in order. That asymmetry is why
+    /// `DEFAULT_WRITE_PATH` was not ported as a search path
+    /// (`rustdocs/FILESYSTEM.md`), and it is why this does not take a path ID.
+    fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
+        let vfs = self.0.ok_or("no game content is mounted")?;
+        let target = vfs.write_path(path).map_err(|err| err.to_string())?;
+        if let Some(dir) = target.parent() {
+            // `CreateDirHierarchy( "cfg", ... )` (`engine/host.cpp:1618`).
+            std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        }
+        std::fs::write(&target, contents).map_err(|err| format!("{}: {err}", target.display()))
     }
 }
 
@@ -881,6 +1039,178 @@ mod tests {
         assert_eq!(
             input.bindings().get(Button::Key(Key::Backquote)),
             Some("toggleconsole")
+        );
+    }
+
+    // ---- config persistence (stage 3) --------------------------------------
+
+    /// A `ConfigFiles` that reads and writes an in-memory map, shared with the
+    /// test through an `Arc` so both consoles in a round trip see one store.
+    #[derive(Default)]
+    struct MemoryConfigs {
+        files: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    }
+
+    impl ConfigFiles for std::sync::Arc<MemoryConfigs> {
+        fn read_config(&self, path: &str, _path_id: Option<&str>) -> Option<Vec<u8>> {
+            self.files
+                .lock()
+                .expect("not poisoned")
+                .get(path)
+                .map(|text| text.as_bytes().to_vec())
+        }
+
+        fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
+            self.files
+                .lock()
+                .expect("not poisoned")
+                .insert(path.to_string(), contents.to_string());
+            Ok(())
+        }
+    }
+
+    /// A console with the engine's persistence-related commands registered and
+    /// one archived cvar to carry across.
+    fn config_console(store: &std::sync::Arc<MemoryConfigs>) -> (Console<'static>, Cvar) {
+        let mut console = Console::new(Box::new(store.clone()), Vec::new());
+        console.log_mut().set_echo_to_stderr(false);
+        for spec in [
+            CommandSpec::new("bind", ""),
+            CommandSpec::new("unbindall", ""),
+            CommandSpec::new("host_writeconfig", ""),
+        ] {
+            console.register_command(spec).expect("unique");
+        }
+        let sensitivity = console.cvar("sensitivity", "2.5", CvarFlags::ARCHIVE, "");
+        (console, sensitivity)
+    }
+
+    /// The whole of stage 3: what the writer produces, the reader reproduces.
+    /// Both halves are ours, but the format is Valve's — a user's existing
+    /// `config.cfg` has to stay readable and one we write has to stay readable
+    /// by the shipped engine.
+    #[test]
+    fn a_written_config_reads_back_as_the_same_bindings_and_cvars() {
+        let store = std::sync::Arc::new(MemoryConfigs::default());
+
+        // Session one: bind some keys, change a setting, write it out.
+        let (mut console, sensitivity) = config_console(&store);
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+        console.set_config_was_read(true);
+        console.enqueue(
+            "bind \"w\" \"+forward\"; bind \"MOUSE1\" \"+attack\"; bind \"F6\" \"save quick\"",
+            Source::Code,
+        );
+        console.enqueue("host_writeconfig", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+        sensitivity.set_string("6");
+        console.enqueue("host_writeconfig", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+
+        let written = store
+            .files
+            .lock()
+            .expect("not poisoned")
+            .get("cfg/config.cfg")
+            .cloned()
+            .expect("a config was written");
+        assert!(
+            written.starts_with("unbindall\n"),
+            "reading it back must throw away what was bound before: {written}"
+        );
+
+        // Session two: a fresh console and a fresh binding table, reading it.
+        let (mut console, sensitivity) = config_console(&store);
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+        console.enqueue("exec config.cfg", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+
+        assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
+        assert_eq!(
+            input
+                .bindings()
+                .get(Button::Mouse(input::MouseButton::Left)),
+            Some("+attack")
+        );
+        assert_eq!(
+            input.bindings().get(Button::Key(Key::F6)),
+            Some("save quick"),
+            "a multi-word binding survives the quotes"
+        );
+        assert_eq!(sensitivity.float(), 6.0, "and the archived cvar came back");
+    }
+
+    /// `Host_WasConfigCfgExecuted`. Without this, a crash between startup and
+    /// the config exec writes defaults over a real user's settings.
+    #[test]
+    fn writing_is_refused_until_startup_has_read_a_config() {
+        let store = std::sync::Arc::new(MemoryConfigs::default());
+        let (mut console, _) = config_console(&store);
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+
+        console.enqueue(
+            "bind \"w\" \"+forward\"; bind \"s\" \"+back\"",
+            Source::Code,
+        );
+        console.enqueue("host_writeconfig", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+
+        assert!(
+            store.files.lock().expect("not poisoned").is_empty(),
+            "nothing may be written before startup has read a config"
+        );
+    }
+
+    /// `Key_CountBindings() <= 1`. A session that bound nothing must not
+    /// persist that over a real config.
+    #[test]
+    fn writing_is_refused_when_almost_nothing_is_bound() {
+        let store = std::sync::Arc::new(MemoryConfigs::default());
+        let (mut console, _) = config_console(&store);
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+        console.set_config_was_read(true);
+
+        console.enqueue("bind \"w\" \"+forward\"", Source::Code);
+        console.enqueue("host_writeconfig", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+        });
+        assert!(store.files.lock().expect("not poisoned").is_empty());
+    }
+
+    #[test]
+    fn the_config_opens_with_unbindall_then_bindings_then_cvars() {
+        let mut console = Console::detached();
+        console.cvar("sensitivity", "2.5", CvarFlags::ARCHIVE, "");
+        let mut bindings = Bindings::new();
+        bindings.bind(Button::Key(Key::W), "+forward");
+
+        let text = build_configuration(&bindings, console.cvars());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "unbindall",
+                "bind \"w\" \"+forward\"",
+                "sensitivity \"2.5\""
+            ]
         );
     }
 }

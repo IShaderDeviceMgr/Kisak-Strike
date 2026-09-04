@@ -49,7 +49,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 403 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 412 tests), and the binary now **runs, loads a
 map and lets you fly around it**: it mounts the game filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
 `cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
@@ -204,14 +204,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path: **`console/` stage 3 — config persistence.** `FCVAR_ARCHIVE`,
-`Host_WriteConfiguration` (`host.cpp:1559`) minus Steam Cloud, `Key_WriteBindings`, and
-preferring `config.cfg` over `config_default.cfg` at startup (`Engine::boot` reads only the
-fallback today). It is small, and **guard it the way Valve does**: do not write a config
-until one has been read (`Host_WasConfigCfgExecuted`), or a crashed first launch overwrites
-a real user's settings with defaults. After that the boot path is gated on `egui`, which is
-unscheduled: `console/` stage 4 and `input/` stage 4 are one integration and should land
-together. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is a
+Next on the boot path: **the `egui` console UI — `console/` stage 4 and `input/` stage 4,
+which are one integration and must land together.** `egui` is already a decided
+replacement (see "Replacements, all decided"), so this is unscheduled rather than blocked,
+and everything it needs is waiting: `` ` `` is bound to `toggleconsole`, `Log` holds the
+ring, `Console::enqueue` takes the input line, and `Completion` is declared on every
+`CommandSpec`. `input/` stage 4 brings **the key-up latch**, which is a correctness fix
+rather than polish — without it, clicking and then opening the console leaves `+attack`
+held. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is a
 breadth move: unblocked, but not on the boot path. `materialsystem` stage 6
 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked, but not
 on the boot path.

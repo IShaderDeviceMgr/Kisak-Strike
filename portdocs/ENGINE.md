@@ -618,12 +618,15 @@ reached.** Remaining, in dependency order:
    precedence decision in §6. **Planned in `portdocs/ENGINE_INPUT.md`**, which lands it as
    its own module: stages 1-2 (keyboard, mouse, mouse look) need nothing that does not
    exist; bindings want `console/`, and controllers (`gilrs`) are deferred to stage 5.
-2. **`console/`** (§7.4) — **stage 1 done.** Cvars, the command buffer, both
-   tokenizers, dispatch, aliases, `exec` and `stuffcmds`, with `map`/`quit`/`restart`
-   reached through a `CommandTarget`; `sp_a1_intro1` now boots through the shipped
-   `cfg/valve.rc` rather than from a launcher branch. Stages 2-5 remain:
-   bindings (which is `input/` stage 3), config persistence, the `egui` dialog, and the
-   list commands. See `portdocs/ENGINE_CONSOLE.md` and `rustdocs/ENGINE.md`.
+2. **`console/`** (§7.4) — **stages 1-3 of five done.** Stage 1: cvars, the command
+   buffer, both tokenizers, dispatch, aliases, `exec` and `stuffcmds`, with
+   `map`/`quit`/`restart` reached through a `CommandTarget` — `sp_a1_intro1` boots through
+   the shipped `cfg/valve.rc` rather than from a launcher branch. Stage 2: bindings,
+   jointly with `input/` stage 3, so WASD comes from `cfg/config_default.cfg`. Stage 3:
+   config persistence, so `config.cfg` is written on a clean exit and preferred at
+   startup. **Stages 4-5 remain: the `egui` dialog (which is one integration with
+   `input/` stage 4 and must land with it), and the list commands.** See
+   `portdocs/ENGINE_CONSOLE.md` and `rustdocs/ENGINE.md`.
 3. **`materialsystem` stage 5** (lightmaps) — no longer blocked; there is a `.bsp` to
    pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
    from checkerboard into content. **Highest visual return of anything on this list.**
