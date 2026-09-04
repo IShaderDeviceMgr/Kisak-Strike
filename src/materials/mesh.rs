@@ -74,6 +74,14 @@ pub enum VertexLayout {
     /// (`DrawScreenSpaceQuad`), sprites, debug overlays, and the fade quad at
     /// `engine/gl_rmain.cpp:926`.
     Simple,
+
+    /// World brush geometry: position, base and lightmap coordinates, colour.
+    /// [`WorldVertex`].
+    ///
+    /// `LightmappedGeneric`'s `VertexShaderVertexFormat( VERTEX_POSITION,
+    /// numTexCoords, 0, 0 )` (`lightmappedgeneric_dx9_helper.cpp:681`), where
+    /// `numTexCoords` is 2 or, when the material has a `$bumpmap`, 3.
+    World,
 }
 
 impl VertexLayout {
@@ -86,6 +94,7 @@ impl VertexLayout {
     pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static> {
         match self {
             VertexLayout::Simple => SimpleVertex::LAYOUT,
+            VertexLayout::World => WorldVertex::LAYOUT,
         }
     }
 
@@ -93,6 +102,7 @@ impl VertexLayout {
     pub fn stride(self) -> u64 {
         match self {
             VertexLayout::Simple => size_of::<SimpleVertex>() as u64,
+            VertexLayout::World => size_of::<WorldVertex>() as u64,
         }
     }
 }
@@ -151,6 +161,89 @@ impl SimpleVertex {
 
 impl Vertex for SimpleVertex {
     const LAYOUT: VertexLayout = VertexLayout::Simple;
+}
+
+/// Position, base texture coordinate, lightmap coordinate, lightmap block
+/// offset, colour. [`VertexLayout::World`].
+///
+/// What `BuildMSurfaceVertexArrays` (`engine/matsys_interface.cpp:1550`)
+/// writes for every world surface, minus the attributes nothing in scope
+/// reads. Positions are already in world space, which is why
+/// [`World::draw`](crate::engine::world::World::draw) passes the identity
+/// model matrix.
+///
+/// # What is left out, and why
+///
+/// The original also writes a normal and, for materials that ask for tangent
+/// space, `tangentS`/`tangentT`. **The diffuse lightmap path needs none of
+/// them**, and that is not an approximation — it is what the shader declares.
+/// `LightmappedGeneric`'s shadow phase adds `VERTEX_TANGENT_S |
+/// VERTEX_TANGENT_T | VERTEX_NORMAL` to its vertex format *only* when the
+/// material has an `$envmap` (`lightmappedgeneric_dx9_helper.cpp:670`),
+/// because radiosity normal mapping dots the **tangent-space** normal straight
+/// out of `$bumpmap` against a constant basis
+/// (`lightmappedgeneric_ps2_3_x.h:665`) and never leaves tangent space. The
+/// world-space frame is a specular concern.
+///
+/// So bumped and unbumped `LightmappedGeneric` read the *same* layout, and
+/// `portdocs/MATERIALSYSTEM.md` §10's prediction that the bumped variant would
+/// force a second layout — and with it the first real pipeline variant — does
+/// not hold. Bumped lighting is a flag in a uniform, which is §7.3's bucket 2.
+/// The envmap variant is where the prediction comes true.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct WorldVertex {
+    pub position: [f32; 3],
+    /// `TEXCOORD0`, already divided by the texture's mapping size.
+    pub texcoord: [f32; 2],
+    /// `TEXCOORD1`, normalized into the surface's lightmap *page*. Points at
+    /// the flat lightmap block; the directional ones follow it to the right.
+    pub lightmap_texcoord: [f32; 2],
+    /// `TEXCOORD2`, `SurfaceCtx_t::m_BumpSTexCoordOffset`: the width of one
+    /// lightmap block as a fraction of the page, so that the shader can step
+    /// from the flat block to each directional one by adding it.
+    ///
+    /// Valve's is a `float2` whose `y` is unconditionally zero in both
+    /// branches that write it (`matsys_interface.cpp:1498` and `:1503`), so it
+    /// is one float here. We own both ends of this one — the struct and the
+    /// shader that reads it — which is `PORTING.md`'s test for a format that
+    /// is ours to change.
+    pub lightmap_offset: f32,
+    /// `COLOR0`. Read when `$vertexcolor` is set; the original also uses it to
+    /// blend `$basetexture2`, which is not ported.
+    pub color: [f32; 4],
+}
+
+impl WorldVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x2,
+        2 => Float32x2,
+        3 => Float32,
+        4 => Float32x4,
+    ];
+
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: size_of::<WorldVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &WorldVertex::ATTRIBUTES,
+    };
+
+    /// White, unlit, at the origin — a base to override fields of, so that
+    /// adding an attribute does not have to be echoed at every literal.
+    pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> WorldVertex {
+        WorldVertex {
+            position,
+            texcoord,
+            lightmap_texcoord: [0.0, 0.0],
+            lightmap_offset: 0.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+impl Vertex for WorldVertex {
+    const LAYOUT: VertexLayout = VertexLayout::World;
 }
 
 /// Vertices that live on the GPU for longer than a frame.
@@ -602,6 +695,49 @@ mod tests {
         assert_eq!(
             VertexLayout::Simple.stride(),
             size_of::<SimpleVertex>() as u64
+        );
+    }
+
+    #[test]
+    fn the_world_vertex_has_no_padding() {
+        // Three floats, two, two, one, four -- and no gap, which `Pod` insists
+        // on and the GPU stride depends on.
+        assert_eq!(size_of::<WorldVertex>(), (3 + 2 + 2 + 1 + 4) * 4);
+        assert_eq!(
+            VertexLayout::World.stride(),
+            size_of::<WorldVertex>() as u64
+        );
+    }
+
+    /// The attribute offsets against the struct they describe. `wgpu` derives
+    /// them by accumulating format sizes, so a reordered field or a wrong
+    /// format shifts everything after it and the shader reads a lightmap
+    /// coordinate out of the middle of a position — a wrong picture, not an
+    /// error.
+    #[test]
+    fn the_world_layout_offsets_match_the_struct() {
+        let vertex = WorldVertex::new([1.0, 2.0, 3.0], [4.0, 5.0]);
+        let bytes: &[u8] = bytemuck::bytes_of(&vertex);
+        let layout = VertexLayout::World.buffer_layout();
+        let offset = |location: u32| {
+            layout
+                .attributes
+                .iter()
+                .find(|a| a.shader_location == location)
+                .expect("declared")
+                .offset as usize
+        };
+
+        let float_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(float_at(offset(0)), 1.0, "position.x");
+        assert_eq!(float_at(offset(1)), 4.0, "texcoord.u");
+        assert_eq!(float_at(offset(2)), 0.0, "lightmap_texcoord.u");
+        assert_eq!(float_at(offset(3)), 0.0, "lightmap_offset");
+        assert_eq!(float_at(offset(4)), 1.0, "color.r");
+        assert_eq!(
+            offset(4) + 16,
+            layout.array_stride as usize,
+            "the colour is the last attribute"
         );
     }
 

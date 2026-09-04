@@ -69,6 +69,34 @@ struct VertexInput {
     @location(2) color: vec4<f32>,
 }
 
+// `mesh::WorldVertex` / `VertexLayout::World`: what `BuildMSurfaceVertexArrays`
+// writes for a brush surface. `lightmap_offset` is one float rather than
+// Valve's float2 because the second component is unconditionally zero
+// (`matsys_interface.cpp:1498`).
+
+struct WorldVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) texcoord: vec2<f32>,
+    @location(2) lightmap_texcoord: vec2<f32>,
+    @location(3) lightmap_offset: f32,
+    @location(4) color: vec4<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// Lightmaps
+// ---------------------------------------------------------------------------
+
+// The radiosity normal-mapping basis: three unit vectors in tangent space,
+// each 54.7 degrees off the surface normal. `bumpBasis` (`common_fxc.h:59`),
+// transcribed to the digit — the shipped lightmaps were baked against exactly
+// these, so a "tidier" spelling of 1/sqrt(3) would shift every bumped surface.
+const OO_SQRT_3: f32 = 0.57735025882720947;
+const BUMP_BASIS = array<vec3<f32>, 3>(
+    vec3<f32>(0.81649661064147949, 0.0, OO_SQRT_3),
+    vec3<f32>(-0.40824833512306213, 0.70710676908493042, OO_SQRT_3),
+    vec3<f32>(-0.40824821591377258, -0.7071068286895752, OO_SQRT_3),
+);
+
 // ---------------------------------------------------------------------------
 // Fog and tone mapping
 // ---------------------------------------------------------------------------

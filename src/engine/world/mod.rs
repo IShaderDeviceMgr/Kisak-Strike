@@ -29,7 +29,9 @@ use glam::Vec3;
 
 use crate::filesystem::Vfs;
 use crate::materials::context::Pass;
-use crate::materials::mesh::{IndexBuffer, SimpleVertex, Vertex, VertexBuffer};
+use crate::materials::lightmap::{Allocation, LightmapAtlas, LightmapPages, WHITE_PAGE};
+use crate::materials::mesh::{IndexBuffer, SimpleVertex, VertexBuffer, VertexLayout, WorldVertex};
+use crate::materials::shader::Lighting;
 use crate::materials::{Material, MaterialCache};
 
 use bsp::{Bsp, BspError, Face};
@@ -74,6 +76,15 @@ pub enum WorldError {
 /// buffers stay and the index buffers become dynamic.
 pub struct Batch {
     pub material: Arc<Material>,
+    /// The lightmap atlas page every surface in this batch was packed into.
+    ///
+    /// This is what makes a batch a batch: Valve's *sort ID* is exactly the
+    /// pair (material, lightmap page) — `AllocateLightmap` returns one and
+    /// increments it whenever either half changes (`cmatlightmaps.cpp:306`) —
+    /// because the page is one texture binding and cannot vary within a draw.
+    /// A material whose surfaces did not all fit on one page is several
+    /// batches.
+    pub lightmap_page: u32,
     vertices: VertexBuffer,
     indices: IndexBuffer,
 }
@@ -102,9 +113,24 @@ pub struct WorldStats {
     pub vertices: usize,
     pub triangles: usize,
     pub materials: usize,
-    /// Materials that resolved to the error checkerboard. Expect this to be
-    /// most of them until `LightmappedGeneric` exists.
+    /// Materials that resolved to the error checkerboard.
     pub materials_missing: usize,
+    /// Faces that got a real lightmap block.
+    pub faces_lit: usize,
+    /// Faces that asked for a lightmap and could not have one — no samples in
+    /// the lump, `SURF_NOLIGHT`, or a block too big for a page. They bind the
+    /// white page and draw fullbright.
+    pub faces_fullbright: usize,
+    /// Atlas pages, including the 1x1 white one.
+    pub lightmap_pages: usize,
+    /// Faces carrying more than one lightstyle — switchable or animated lights.
+    ///
+    /// Only style 0 is baked into the atlas, so these draw with their
+    /// switchable lights in whatever state `vrad` compiled them. Summing the
+    /// rest needs `LightStyleValue( style )` and a per-frame page rebuild
+    /// (`R_BuildLightMap`, `gl_lightmap.cpp:1623`), which is the whole dynamic
+    /// lighting path.
+    pub faces_with_lightstyles: usize,
     /// Faces carrying explicit primitives, which are fan-triangulated here
     /// instead. See [`build_meshes`].
     pub faces_with_primitives: usize,
@@ -124,6 +150,15 @@ pub struct World {
     /// `worldspawn`'s `skyname`. Read, recorded, and not yet drawn — the 3D
     /// skybox is a second camera over a second set of geometry.
     pub sky_name: Option<String>,
+    /// Which lighting lump the atlas was built from. Portal 2 ships HDR-only
+    /// maps; a map with only LDR lighting is dimmer by the overbright factor
+    /// the LDR encoding divided out, which is worth knowing before blaming the
+    /// exposure. See [`Bsp::lighting_is_hdr`](bsp::Bsp::lighting_is_hdr).
+    pub lighting_is_hdr: bool,
+    /// The lightmap atlas, one texture per page. Held by the world because it
+    /// is built from the world's `.bsp` and dies with it — `CleanupLightmaps`
+    /// (`cmatlightmaps.cpp:216`) is `Drop`.
+    pub lightmaps: LightmapPages,
     pub stats: WorldStats,
 }
 
@@ -142,50 +177,58 @@ impl World {
         name: &str,
     ) -> Result<World, WorldError> {
         let bsp = Bsp::load(vfs, name)?;
-        let (meshes, mut stats) = build_meshes(&bsp);
 
+        // Materials are resolved *before* the geometry, which is a change from
+        // stage 4 and is forced: how wide a lightmap block a surface reserves
+        // depends on whether its material has a `$bumpmap`
+        // (`RegisterLightmappedSurface`, `gl_matsysiface.cpp:216`), and its
+        // vertex layout depends on which shader the material named. Neither is
+        // answerable from the `.bsp`.
+        let (groups, mut stats) = group_faces(&bsp);
+        let error_material = materials.error_material();
+        let mut resolved: BTreeMap<&str, (Arc<Material>, MaterialInfo)> = BTreeMap::new();
+        for name in groups.keys() {
+            let material = materials.load(vfs, name);
+            stats.materials += 1;
+            if Arc::ptr_eq(&material, &error_material) {
+                stats.materials_missing += 1;
+            }
+            let info = MaterialInfo {
+                layout: material.shader.vertex_layout(),
+                lighting: material.lighting,
+            };
+            resolved.insert(name, (material, info));
+        }
+
+        let mut lightmaps = LightmapAtlas::new();
+        let meshes = build_meshes(&bsp, &groups, &mut lightmaps, &mut stats, |name| {
+            resolved[name].1
+        });
         if meshes.is_empty() {
             return Err(WorldError::NothingToDraw {
                 map: name.to_owned(),
             });
         }
+        stats.lightmap_pages = lightmaps.page_count() as usize;
 
-        let error_material = materials.error_material();
-        let mut batches = Vec::with_capacity(meshes.len());
-        let mut last_material: Option<&str> = None;
-
-        for mesh in &meshes {
-            let material = materials.load(vfs, &mesh.material);
-
-            // Count each distinct material once, not once per batch: a material
-            // covering more than 65,536 vertices produces several batches.
-            if last_material != Some(mesh.material.as_str()) {
-                last_material = Some(mesh.material.as_str());
-                stats.materials += 1;
-                if Arc::ptr_eq(&material, &error_material) {
-                    stats.materials_missing += 1;
+        let batches = meshes
+            .iter()
+            .map(|mesh| {
+                let material = Arc::clone(&resolved[mesh.material.as_str()].0);
+                let vertices = match &mesh.vertices {
+                    MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
+                    MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
+                };
+                Batch {
+                    material,
+                    lightmap_page: mesh.lightmap_page,
+                    vertices,
+                    indices: IndexBuffer::new(device, &mesh.material, &mesh.indices),
                 }
-            }
+            })
+            .collect();
 
-            // `Pass::draw` panics on a layout mismatch, by design — see
-            // `rustdocs/MATERIALS.md` gotcha #8. Every shader in the set today
-            // reads `Simple`, so this cannot fire; it is here because the first
-            // shader that reads a different layout (`LightmappedGeneric`, which
-            // wants lightmap coordinates) will need this builder to produce that
-            // vertex struct, and drawing its geometry through the wrong one
-            // should be a checkerboard rather than a panic.
-            let material = if material.shader.vertex_layout() == <SimpleVertex as Vertex>::LAYOUT {
-                material
-            } else {
-                Arc::clone(&error_material)
-            };
-
-            batches.push(Batch {
-                material,
-                vertices: VertexBuffer::new(device, &mesh.material, &mesh.vertices),
-                indices: IndexBuffer::new(device, &mesh.material, &mesh.indices),
-            });
-        }
+        let lightmaps = lightmaps.upload(device, materials.queue(), materials.layouts());
 
         let model = bsp.world_model();
         let entities = bsp.entities();
@@ -202,6 +245,8 @@ impl World {
                 .find(|e| e.classname() == Some("worldspawn"))
                 .and_then(|e| e.get("skyname"))
                 .map(str::to_owned),
+            lighting_is_hdr: bsp.lighting_is_hdr,
+            lightmaps,
             stats,
         })
     }
@@ -213,6 +258,12 @@ impl World {
     /// brush models that are not drawn yet.
     pub fn draw(&self, pass: &mut Pass<'_>) {
         for batch in &self.batches {
+            // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
+            // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
+            // batches are page-ordered within a material, so consecutive draws
+            // usually name the same page, and a shader that does not read one
+            // ignores it.
+            pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
             pass.draw(
                 &batch.material,
                 &batch.vertices.slice(),
@@ -240,7 +291,8 @@ impl World {
             "{} (bsp v{}, revision {}): {}/{} faces drawn \
              ({} hidden, {} displacement{primitives}), \
              {} vertices, {} triangles, {} batches, \
-             {} materials ({} missing)",
+             {} materials ({} missing), \
+             {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {})",
             self.name,
             self.bsp_version,
             self.bsp_revision,
@@ -253,28 +305,103 @@ impl World {
             self.batches.len(),
             s.materials,
             s.materials_missing,
+            s.faces_lit,
+            s.faces_with_lightstyles,
+            s.faces_fullbright,
+            self.lightmaps.len(),
+            self.lightmaps.bytes() / (1024 * 1024),
+            if self.lighting_is_hdr { "hdr" } else { "ldr" },
         )
     }
 }
 
-/// Geometry for one batch, before it reaches the GPU.
+/// What the geometry builder needs to know about a material.
 ///
-/// Split out from [`World::load`] so that face selection, texture-coordinate
-/// generation and batch splitting are testable without a device — the
-/// interesting logic is all here, and none of it needs a GPU to be wrong.
-struct Mesh {
-    material: String,
-    vertices: Vec<SimpleVertex>,
-    indices: Vec<u16>,
+/// Both answers come from the material and neither from the `.bsp`, which is
+/// why materials are resolved first: the shader decides the vertex layout, and
+/// `$bumpmap` decides how wide a lightmap block the surface reserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaterialInfo {
+    layout: VertexLayout,
+    lighting: Lighting,
 }
 
-/// Turns the world model's faces into per-material meshes.
+/// Geometry for one batch, before it reaches the GPU.
 ///
-/// Faces are grouped by material name and emitted in name order, so the same
-/// `.bsp` always produces the same batches. Valve sorted by the material
-/// *pointer* and re-sorted per frame; sorting by name once at load costs
-/// nothing and makes the output reproducible.
-fn build_meshes(bsp: &Bsp) -> (Vec<Mesh>, WorldStats) {
+/// Split out from [`World::load`] so that face selection, coordinate
+/// generation, lightmap packing and batch splitting are testable without a
+/// device — the interesting logic is all here, and none of it needs a GPU to
+/// be wrong.
+struct Mesh {
+    material: String,
+    vertices: MeshVertices,
+    indices: Vec<u16>,
+    lightmap_page: u32,
+}
+
+/// A batch's vertices, in whichever layout its shader declared.
+///
+/// Two arms because a map draws two shaders: world surfaces are
+/// `LightmappedGeneric` and read [`WorldVertex`], and the tool textures and
+/// error materials among them are `UnlitGeneric` and read [`SimpleVertex`].
+/// [`Pass::draw`](crate::materials::context::Pass::draw) panics on a mismatch
+/// by design, so the builder emits what the material asked for rather than one
+/// layout and a hope.
+enum MeshVertices {
+    Simple(Vec<SimpleVertex>),
+    World(Vec<WorldVertex>),
+}
+
+impl MeshVertices {
+    fn empty(layout: VertexLayout) -> MeshVertices {
+        match layout {
+            VertexLayout::Simple => MeshVertices::Simple(Vec::new()),
+            VertexLayout::World => MeshVertices::World(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            MeshVertices::Simple(v) => v.len(),
+            MeshVertices::World(v) => v.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Appends one vertex, dropping whichever attributes this layout has no
+    /// room for.
+    fn push(&mut self, vertex: WorldVertex) {
+        match self {
+            MeshVertices::Simple(v) => {
+                v.push(SimpleVertex {
+                    position: vertex.position,
+                    texcoord: vertex.texcoord,
+                    color: vertex.color,
+                });
+            }
+            MeshVertices::World(v) => v.push(vertex),
+        }
+    }
+
+    fn take(&mut self) -> MeshVertices {
+        match self {
+            MeshVertices::Simple(v) => MeshVertices::Simple(std::mem::take(v)),
+            MeshVertices::World(v) => MeshVertices::World(std::mem::take(v)),
+        }
+    }
+}
+
+/// Selects the faces worth drawing and groups them by material name.
+///
+/// Face *selection* is separate from geometry building because it runs twice
+/// over: once to learn which materials the map uses, and again once those are
+/// resolved. Groups are keyed by name so the output is ordered and a `.bsp`
+/// always produces the same batches; Valve sorted by the material's
+/// enumeration ID, which is allocation order and therefore not reproducible.
+fn group_faces(bsp: &Bsp) -> (BTreeMap<&str, Vec<&Face>>, WorldStats) {
     let mut stats = WorldStats::default();
     let mut groups: BTreeMap<&str, Vec<&Face>> = BTreeMap::new();
 
@@ -315,103 +442,261 @@ fn build_meshes(bsp: &Bsp) -> (Vec<Mesh>, WorldStats) {
         groups.entry(material).or_default().push(face);
     }
 
+    (groups, stats)
+}
+
+/// Packs every face's lightmap, then turns the faces into per-batch meshes.
+///
+/// One material at a time, which is what the atlas allocator expects: it closes
+/// all but the most recent page whenever the material changes, so that a
+/// material's surfaces cluster onto as few pages as possible
+/// (`CMatLightmaps::AllocateLightmap`, `cmatlightmaps.cpp:306`).
+fn build_meshes(
+    bsp: &Bsp,
+    groups: &BTreeMap<&str, Vec<&Face>>,
+    lightmaps: &mut LightmapAtlas,
+    stats: &mut WorldStats,
+    info: impl Fn(&str) -> MaterialInfo,
+) -> Vec<Mesh> {
     let mut meshes = Vec::new();
-    for (material, faces) in groups {
-        let mut vertices: Vec<SimpleVertex> = Vec::new();
-        let mut indices: Vec<u16> = Vec::new();
 
+    for (&material, faces) in groups {
+        let info = info(material);
+        lightmaps.begin_material();
+
+        // `LightmapLess` (`gl_matsysiface.cpp:262`) restricted to one material,
+        // which is where this runs: lit surfaces before unlit ones, then
+        // largest lightmap first. The area sort is a packing heuristic —
+        // Valve's comment says greatest-area-first produced fewer material
+        // splits than the minimum-height rule it replaced — and the lit-first
+        // rule keeps the white-page surfaces in one run at the end, where they
+        // become a single extra batch instead of interleaving.
+        let mut faces: Vec<&Face> = faces.clone();
+        faces.sort_by_key(|face| {
+            let lit = bsp.face_lightmap_samples(face).is_some() && info.lighting.needs_lightmap();
+            let (width, height) = Bsp::face_lightmap_size(face);
+            (!lit, std::cmp::Reverse(width * height))
+        });
+
+        // Pack first, because a face's lightmap coordinates depend on where it
+        // landed, and its *batch* depends on which page that was.
+        let mut placed: BTreeMap<u32, Vec<(&Face, Option<Allocation>)>> = BTreeMap::new();
         for face in faces {
-            let count = face.num_edges as usize;
-
-            // Split before the face that would overflow 16-bit indices, never
-            // in the middle of one: a face's vertices have to be contiguous for
-            // the fan below to index them.
-            if vertices.len() + count > MAX_BATCH_VERTICES {
-                stats.vertices += vertices.len();
-                stats.triangles += indices.len() / 3;
-                meshes.push(Mesh {
-                    material: material.to_owned(),
-                    vertices: std::mem::take(&mut vertices),
-                    indices: std::mem::take(&mut indices),
-                });
-            }
-
-            let base = vertices.len() as u16;
-            for position in bsp.face_vertices(face) {
-                vertices.push(SimpleVertex::new(
-                    position.to_array(),
-                    bsp.texture_coordinate(face, position),
-                ));
-            }
-
-            // `BuildIndicesForSurface` (`engine/gl_rsurf.h:145`): a face is a
-            // convex polygon, so it triangulates as a fan from its first
-            // vertex. Valve's `FastPolygon` is this loop with the bounds
-            // checks removed.
-            //
-            // **The fan is emitted in reverse**, and that is a real
-            // divergence rather than a slip. Measured against
-            // `sp_a1_intro1`: in file order every world surface is
-            // back-facing here and the map draws as an empty clear colour.
-            // Why, precisely:
-            //
-            //   - Valve sets `D3DRS_CULLMODE = D3DCULL_CCW`
-            //     (`shaderapidx9/shaderapidx8.cpp:4067`), and its own D3D→GL
-            //     layer translates that to `glFrontFace(GL_CCW)` with back-face
-            //     culling on (`shaderapidx9/dxabstract.cpp:4107`) — which reads
-            //     exactly like this port's `front_face: Ccw, cull_mode: Back`.
-            //   - It is not the same thing. GL's framebuffer origin is
-            //     bottom-left and WebGPU's is top-left, and facing is decided
-            //     *after* the viewport transform that flips between them. The
-            //     same `Ccw` therefore names the opposite set of triangles, so
-            //     Valve's content is `Cw`-front here.
-            //
-            // The reversal is done here, once, at the boundary where external
-            // content enters — the same treatment `rustdocs/MATERIALS.md`
-            // gives Valve's row-major matrices, which are transposed on the
-            // way in and never again.
-            //
-            // **The alternative is to flip `front_face` in `PipelineCache`**,
-            // which is arguably the more correct fix since it would let every
-            // future Valve-authored mesh (`.mdl` next) load in file order. It
-            // is not done here because `src/materials/` has no Valve-authored
-            // geometry yet — every vertex it draws is hand-wound in
-            // `preview.rs` for the current convention — so flipping it fails 17
-            // of the stage-4 GPU tests and would have to re-wind the preview
-            // cube, the ground quad and every test quad with it. That is a
-            // material-system decision, not a map-loading one.
-            //
-            // **A face with primitives is fanned anyway, which is an
-            // approximation.** `BuildIndicesForWorldSurface`
-            // (`engine/gl_rsurf.h:170`) reads an explicit index list out of
-            // `LUMP_PRIMINDICES` for those, and Valve's own assert there says
-            // it always holds `(vertCount - 2) * 3` indices — the same count a
-            // fan produces. So the triangle *count* is right and only the
-            // *arrangement* differs, which is visible solely on the non-convex
-            // surfaces the primitive list exists for (water, mainly).
-            // `WorldStats::faces_with_primitives` counts them so that a map
-            // where this matters is visible rather than merely wrong.
-            //
-            // The vertices are emitted in file order and the fan preserves it,
-            // which is what keeps the port's culling agreeing with Valve's —
-            // see `Pass`'s `front_face: Ccw, cull_mode: Back`.
-            for i in 1..count as u16 - 1 {
-                indices.extend_from_slice(&[base, base + i + 1, base + i]);
-            }
+            let allocation = place_lightmap(bsp, lightmaps, face, info.lighting, stats);
+            let page = allocation.map_or(WHITE_PAGE, |a| a.page);
+            placed.entry(page).or_default().push((face, allocation));
         }
 
-        if !vertices.is_empty() {
-            stats.vertices += vertices.len();
-            stats.triangles += indices.len() / 3;
-            meshes.push(Mesh {
-                material: material.to_owned(),
-                vertices,
-                indices,
-            });
+        for (page, faces) in placed {
+            build_page_meshes(bsp, lightmaps, material, info, page, &faces, stats, &mut meshes);
         }
     }
 
-    (meshes, stats)
+    meshes
+}
+
+/// Reserves a face's block in the atlas and writes its samples into it.
+///
+/// `RegisterLightmappedSurface` / `RegisterUnlightmappedSurface`
+/// (`gl_matsysiface.cpp:216`, `:256`). `None` means the surface gets the white
+/// page: it has no samples, its material is not lit, or its block is too big
+/// for a page — the last of which the original treated as a fatal `Error()`.
+fn place_lightmap(
+    bsp: &Bsp,
+    lightmaps: &mut LightmapAtlas,
+    face: &Face,
+    lighting: Lighting,
+    stats: &mut WorldStats,
+) -> Option<Allocation> {
+    if !lighting.needs_lightmap() {
+        return None;
+    }
+    if Bsp::face_lightstyle_count(face) > 1 {
+        stats.faces_with_lightstyles += 1;
+    }
+    let Some(samples) = bsp.face_lightmap_samples(face) else {
+        stats.faces_fullbright += 1;
+        return None;
+    };
+
+    let (width, height) = Bsp::face_lightmap_size(face);
+    let blocks = lighting.blocks();
+    let Some(allocation) = lightmaps.allocate(width * blocks, height) else {
+        eprintln!(
+            "source-engine: world: a {}x{} lightmap does not fit a page; drawing fullbright",
+            width * blocks,
+            height
+        );
+        stats.faces_fullbright += 1;
+        return None;
+    };
+
+    lightmaps.write(allocation, width, height, blocks, samples);
+    stats.faces_lit += 1;
+    Some(allocation)
+}
+
+/// Emits the meshes for one (material, page) pair — one, or more if the
+/// vertices overflow a 16-bit index.
+#[allow(clippy::too_many_arguments)]
+fn build_page_meshes(
+    bsp: &Bsp,
+    lightmaps: &LightmapAtlas,
+    material: &str,
+    info: MaterialInfo,
+    page: u32,
+    faces: &[(&Face, Option<Allocation>)],
+    stats: &mut WorldStats,
+    meshes: &mut Vec<Mesh>,
+) {
+    let page_size = lightmaps.page_size(page);
+    let mut vertices = MeshVertices::empty(info.layout);
+    let mut indices: Vec<u16> = Vec::new();
+
+    let mut flush = |vertices: &mut MeshVertices, indices: &mut Vec<u16>, stats: &mut WorldStats| {
+        if vertices.is_empty() {
+            return;
+        }
+        stats.vertices += vertices.len();
+        stats.triangles += indices.len() / 3;
+        meshes.push(Mesh {
+            material: material.to_owned(),
+            vertices: vertices.take(),
+            indices: std::mem::take(indices),
+            lightmap_page: page,
+        });
+    };
+
+    for &(face, allocation) in faces {
+        let count = face.num_edges as usize;
+
+        // Split before the face that would overflow 16-bit indices, never in
+        // the middle of one: a face's vertices have to be contiguous for the
+        // fan below to index them.
+        if vertices.len() + count > MAX_BATCH_VERTICES {
+            flush(&mut vertices, &mut indices, stats);
+        }
+
+        let base = vertices.len() as u16;
+        let lightmap_offset = lightmap_block_offset(face, info.lighting, page_size);
+        for position in bsp.face_vertices(face) {
+            let mut vertex = WorldVertex::new(
+                position.to_array(),
+                bsp.texture_coordinate(face, position),
+            );
+            vertex.lightmap_texcoord =
+                lightmap_texcoord(bsp, face, position, allocation, page_size);
+            vertex.lightmap_offset = lightmap_offset;
+            vertices.push(vertex);
+        }
+
+        // `BuildIndicesForSurface` (`engine/gl_rsurf.h:145`): a face is a
+        // convex polygon, so it triangulates as a fan from its first vertex.
+        // Valve's `FastPolygon` is this loop with the bounds checks removed.
+        //
+        // **The fan is emitted in reverse**, and that is a real divergence
+        // rather than a slip. Measured against `sp_a1_intro1`: in file order
+        // every world surface is back-facing here and the map draws as an
+        // empty clear colour. Why, precisely:
+        //
+        //   - Valve sets `D3DRS_CULLMODE = D3DCULL_CCW`
+        //     (`shaderapidx9/shaderapidx8.cpp:4067`), and its own D3D->GL
+        //     layer translates that to `glFrontFace(GL_CCW)` with back-face
+        //     culling on (`shaderapidx9/dxabstract.cpp:4107`) — which reads
+        //     exactly like this port's `front_face: Ccw, cull_mode: Back`.
+        //   - It is not the same thing. GL's framebuffer origin is
+        //     bottom-left and WebGPU's is top-left, and facing is decided
+        //     *after* the viewport transform that flips between them. The
+        //     same `Ccw` therefore names the opposite set of triangles, so
+        //     Valve's content is `Cw`-front here.
+        //
+        // The reversal is done here, once, at the boundary where external
+        // content enters — the same treatment `rustdocs/MATERIALS.md` gives
+        // Valve's row-major matrices, which are transposed on the way in and
+        // never again.
+        //
+        // **The alternative is to flip `front_face` in `PipelineCache`**,
+        // which is arguably the more correct fix since it would let every
+        // future Valve-authored mesh (`.mdl` next) load in file order. It is
+        // not done here because `src/materials/` has no Valve-authored
+        // geometry yet — every vertex it draws is hand-wound in `preview.rs`
+        // for the current convention — so flipping it fails the stage-4 GPU
+        // tests and would have to re-wind the preview cube, the ground quad
+        // and every test quad with it. That is a material-system decision, not
+        // a map-loading one.
+        //
+        // **A face with primitives is fanned anyway, which is an
+        // approximation.** `BuildIndicesForWorldSurface` (`gl_rsurf.h:170`)
+        // reads an explicit index list out of `LUMP_PRIMINDICES` for those, and
+        // Valve's own assert there says it always holds `(vertCount - 2) * 3`
+        // indices — the same count a fan produces. So the triangle *count* is
+        // right and only the *arrangement* differs, which is visible solely on
+        // the non-convex surfaces the primitive list exists for (water,
+        // mainly). `WorldStats::faces_with_primitives` counts them so that a
+        // map where this matters is visible rather than merely wrong.
+        for i in 1..count as u16 - 1 {
+            indices.extend_from_slice(&[base, base + i + 1, base + i]);
+        }
+    }
+
+    flush(&mut vertices, &mut indices, stats);
+}
+
+/// The lightmap coordinate for one vertex, normalized into its page.
+///
+/// `SurfComputeLightmapCoordinate` + `SurfSetupSurfaceContext`
+/// (`engine/matsys_interface.cpp:1956`, `:2000`). Three cases, all Valve's:
+///
+/// - no lightmap: the middle of the 1x1 white page;
+/// - a lightmap one luxel wide: the middle of that luxel, with no projection —
+///   the plane projection is degenerate for a surface that thin;
+/// - otherwise the luxel coordinate, scaled by the page and offset to the
+///   block, then clamped into the page.
+fn lightmap_texcoord(
+    bsp: &Bsp,
+    face: &Face,
+    position: Vec3,
+    allocation: Option<Allocation>,
+    page_size: (u32, u32),
+) -> [f32; 2] {
+    let Some(allocation) = allocation else {
+        return [0.5, 0.5];
+    };
+    let scale = (1.0 / page_size.0 as f32, 1.0 / page_size.1 as f32);
+    let offset = (
+        allocation.x as f32 * scale.0,
+        allocation.y as f32 * scale.1,
+    );
+
+    // `else if ( MSurf_LightmapExtents( surfID )[0] == 0 )` — Valve tests the
+    // s extent only, and takes the luxel centre on both axes when it is zero.
+    let luxel = if face.lightmap_size[0] == 0 {
+        [0.5, 0.5]
+    } else {
+        bsp.lightmap_coordinate(face, position)
+    };
+
+    [
+        (luxel[0] * scale.0 + offset.0).clamp(0.0, 1.0),
+        (luxel[1] * scale.1 + offset.1).clamp(0.0, 1.0),
+    ]
+}
+
+/// `SurfaceCtx_t::m_BumpSTexCoordOffset`: the width of one lightmap block as a
+/// fraction of the page, so the shader can step from the flat block to each
+/// directional one by adding it.
+///
+/// Zero unless the material is bumped, matching `BuildMSurfaceVertexArrays`'
+/// two branches (`matsys_interface.cpp:1493`) — whose `else` carries the
+/// comment *"PORTAL 2 FIX - paint shader assumes it can use 3 lightmapped
+/// coordinates in all cases, so set the offset to something reasonable"*, which
+/// is why the attribute exists on every world vertex rather than only on
+/// bumped ones.
+fn lightmap_block_offset(face: &Face, lighting: Lighting, page_size: (u32, u32)) -> f32 {
+    if lighting != Lighting::BumpedLightmap || page_size.0 == 0 {
+        return 0.0;
+    }
+    Bsp::face_lightmap_size(face).0 as f32 / page_size.0 as f32
 }
 
 /// The player start, if the map has one.
@@ -442,9 +727,50 @@ mod tests {
         Bsp::parse("test.bsp".into(), &bsp::one_face_bsp()).expect("valid")
     }
 
+    fn lit_bsp(bumped: bool) -> Bsp {
+        Bsp::parse("lit.bsp".into(), &bsp::lit_face_bsp(bumped)).expect("valid")
+    }
+
+    /// An `UnlitGeneric`-shaped material: `Simple` vertices, no lightmap.
+    const UNLIT: MaterialInfo = MaterialInfo {
+        layout: VertexLayout::Simple,
+        lighting: Lighting::None,
+    };
+
+    /// A `LightmappedGeneric` without a `$bumpmap`.
+    const LIGHTMAPPED: MaterialInfo = MaterialInfo {
+        layout: VertexLayout::World,
+        lighting: Lighting::Lightmap,
+    };
+
+    /// A `LightmappedGeneric` with one.
+    const BUMPED: MaterialInfo = MaterialInfo {
+        layout: VertexLayout::World,
+        lighting: Lighting::BumpedLightmap,
+    };
+
+    /// [`build_meshes`] with the two things a caller normally has to resolve
+    /// first supplied directly: one material description for every material in
+    /// the map, and a fresh atlas.
+    fn meshes_of(bsp: &Bsp, info: MaterialInfo) -> (Vec<Mesh>, WorldStats, LightmapAtlas) {
+        let (groups, mut stats) = group_faces(bsp);
+        let mut lightmaps = LightmapAtlas::new();
+        let meshes = build_meshes(bsp, &groups, &mut lightmaps, &mut stats, |_| info);
+        stats.lightmap_pages = lightmaps.page_count() as usize;
+        (meshes, stats, lightmaps)
+    }
+
+    /// The world vertices of the first mesh, for the tests that read them.
+    fn world_vertices(mesh: &Mesh) -> &[WorldVertex] {
+        match &mesh.vertices {
+            MeshVertices::World(v) => v,
+            MeshVertices::Simple(_) => panic!("expected the World layout"),
+        }
+    }
+
     #[test]
     fn one_face_becomes_one_batch_of_two_triangles() {
-        let (meshes, stats) = build_meshes(&test_bsp());
+        let (meshes, stats, _) = meshes_of(&test_bsp(), UNLIT);
         assert_eq!(meshes.len(), 1);
         assert_eq!(meshes[0].material, "tools/toolsblack");
         assert_eq!(meshes[0].vertices.len(), 4);
@@ -463,17 +789,130 @@ mod tests {
     /// back faces. That is what it did before this test existed.
     #[test]
     fn a_quad_triangulates_as_a_reversed_fan_from_its_first_vertex() {
-        let (meshes, _) = build_meshes(&test_bsp());
+        let (meshes, _, _) = meshes_of(&test_bsp(), UNLIT);
         assert_eq!(meshes[0].indices, [0, 2, 1, 0, 3, 2]);
     }
 
     #[test]
     fn texture_coordinates_reach_the_vertices() {
-        let (meshes, _) = build_meshes(&test_bsp());
+        let (meshes, _, _) = meshes_of(&test_bsp(), LIGHTMAPPED);
         // The fixture's face is a 64-unit square at one texel per unit over a
         // 64-texel texture, so its corners are the corners of the 0..1 square.
-        let uvs: Vec<[f32; 2]> = meshes[0].vertices.iter().map(|v| v.texcoord).collect();
+        let uvs: Vec<[f32; 2]> = world_vertices(&meshes[0])
+            .iter()
+            .map(|v| v.texcoord)
+            .collect();
         assert_eq!(uvs, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+    }
+
+    /// The whole point of the stage: a lit surface's vertices carry a
+    /// coordinate that lands on its own block of its own page.
+    #[test]
+    fn a_lit_face_gets_lightmap_coordinates_inside_its_block() {
+        let bsp = lit_bsp(false);
+        let (meshes, stats, lightmaps) = meshes_of(&bsp, LIGHTMAPPED);
+        assert_eq!(stats.faces_lit, 1);
+        assert_eq!(stats.faces_fullbright, 0);
+        assert_eq!(meshes.len(), 1);
+        assert_ne!(meshes[0].lightmap_page, WHITE_PAGE, "not the white page");
+
+        let (page_width, page_height) = lightmaps.page_size(meshes[0].lightmap_page);
+        let uvs: Vec<[f32; 2]> = world_vertices(&meshes[0])
+            .iter()
+            .map(|v| v.lightmap_texcoord)
+            .collect();
+
+        // A 2x2-luxel block at the page origin, sampled at luxel centres: the
+        // 0.5 offset in `SurfComputeLightmapCoordinate` is what puts the first
+        // corner half a luxel in rather than on the block boundary.
+        let texel = |u: f32, v: f32| [u / page_width as f32, v / page_height as f32];
+        assert_eq!(uvs[0], texel(0.5, 0.5));
+        assert_eq!(uvs[2], texel(2.5, 2.5));
+        for uv in uvs {
+            assert!((0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]));
+        }
+    }
+
+    /// A surface whose material has no lightmap, or whose face has no samples,
+    /// binds the 1x1 white page and samples its middle. Getting this wrong is
+    /// a black surface, not a missing one.
+    #[test]
+    fn an_unlit_face_binds_the_white_page() {
+        // The fixture without lighting, through a lightmapped material.
+        let (meshes, stats, _) = meshes_of(&test_bsp(), LIGHTMAPPED);
+        assert_eq!(stats.faces_lit, 0);
+        assert_eq!(stats.faces_fullbright, 1);
+        assert_eq!(meshes[0].lightmap_page, WHITE_PAGE);
+        for vertex in world_vertices(&meshes[0]) {
+            assert_eq!(vertex.lightmap_texcoord, [0.5, 0.5]);
+        }
+
+        // And a lit face through an unlit material: no allocation at all.
+        let (meshes, stats, lightmaps) = meshes_of(&lit_bsp(false), UNLIT);
+        assert_eq!(stats.faces_lit, 0);
+        assert_eq!(meshes[0].lightmap_page, WHITE_PAGE);
+        assert_eq!(lightmaps.page_count(), 1, "only the white page exists");
+    }
+
+    /// A bumped material reserves four blocks and the vertices carry the step
+    /// between them. Without the step every bumped surface samples the same
+    /// block three times and the normal map does nothing.
+    #[test]
+    fn a_bumped_material_reserves_four_blocks_and_says_how_wide_one_is() {
+        let bsp = lit_bsp(true);
+        let (meshes, stats, lightmaps) = meshes_of(&bsp, BUMPED);
+        assert_eq!(stats.faces_lit, 1);
+
+        let (page_width, _) = lightmaps.page_size(meshes[0].lightmap_page);
+        let expected = 2.0 / page_width as f32; // the block is 2 luxels wide
+        for vertex in world_vertices(&meshes[0]) {
+            assert_eq!(vertex.lightmap_offset, expected);
+        }
+
+        // An unbumped material never steps, whatever the face holds.
+        let (meshes, _, _) = meshes_of(&bsp, LIGHTMAPPED);
+        for vertex in world_vertices(&meshes[0]) {
+            assert_eq!(vertex.lightmap_offset, 0.0);
+        }
+    }
+
+    /// A batch is a (material, page) pair, so a material whose surfaces did
+    /// not all fit on one page is more than one batch — which is what Valve's
+    /// sort ID encodes.
+    #[test]
+    fn a_material_that_overflows_a_page_becomes_several_batches() {
+        // Two faces, each a full-page-wide half-height block. The second
+        // cannot go above the first, because `AddBlock` reserves the last row.
+        let mut bsp = lit_bsp(false);
+        let face = bsp::Face {
+            lightmap_size: [511, 127],
+            ..bsp.faces[0]
+        };
+        bsp.faces = vec![face; 2];
+        bsp.models[0].num_faces = 2;
+        bsp.lighting = vec![
+            crate::materials::lightmap::ColorRgbExp32 {
+                r: 4,
+                g: 4,
+                b: 4,
+                exponent: 0,
+            };
+            1 + 2 * 512 * 128
+        ];
+
+        let (meshes, stats, lightmaps) = meshes_of(&bsp, LIGHTMAPPED);
+        assert_eq!(stats.faces_lit, 2);
+        assert!(lightmaps.page_count() > 2, "the white page plus two more");
+        assert!(
+            meshes.len() > 1,
+            "one material over two pages is two batches, got {}",
+            meshes.len()
+        );
+        let pages: Vec<u32> = meshes.iter().map(|m| m.lightmap_page).collect();
+        assert!(
+            pages.windows(2).all(|w| w[0] < w[1]),
+            "batches are emitted in page order: {pages:?}"
+        );
     }
 
     /// Every one of these flags means "this is not world geometry", and each
@@ -491,7 +930,7 @@ mod tests {
         ] {
             let mut bsp = test_bsp();
             bsp.texinfo[0].flags = flag;
-            let (meshes, stats) = build_meshes(&bsp);
+            let (meshes, stats, _) = meshes_of(&bsp, UNLIT);
             assert!(meshes.is_empty(), "flag {flag:#x} was drawn");
             assert_eq!(stats.faces_not_drawn, 1, "flag {flag:#x}");
             assert_eq!(stats.faces_drawn, 0, "flag {flag:#x}");
@@ -505,7 +944,7 @@ mod tests {
         // missing once displacements matter.
         let mut bsp = test_bsp();
         bsp.faces[0].disp_info = 0;
-        let (meshes, stats) = build_meshes(&bsp);
+        let (meshes, stats, _) = meshes_of(&bsp, UNLIT);
         assert!(meshes.is_empty());
         assert_eq!(stats.faces_displaced, 1);
         assert_eq!(stats.faces_not_drawn, 0);
@@ -522,7 +961,7 @@ mod tests {
         bsp.faces = vec![face; copies];
         bsp.models[0].num_faces = copies as i32;
 
-        let (meshes, stats) = build_meshes(&bsp);
+        let (meshes, stats, _) = meshes_of(&bsp, UNLIT);
         assert_eq!(meshes.len(), 2, "should have split exactly once");
         for mesh in &meshes {
             assert!(
@@ -582,7 +1021,7 @@ mod tests {
         ];
         bsp.models[0].num_faces = 3;
 
-        let (meshes, stats) = build_meshes(&bsp);
+        let (meshes, stats, _) = meshes_of(&bsp, UNLIT);
         let names: Vec<&str> = meshes.iter().map(|m| m.material.as_str()).collect();
         assert_eq!(names, ["aaa/first", "tools/toolsblack", "zzz/last"]);
         assert_eq!(stats.faces_drawn, 3);

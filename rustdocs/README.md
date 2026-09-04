@@ -20,13 +20,16 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
 
 - [`FILESYSTEM.md`](FILESYSTEM.md) — `src/filesystem/`. `Vfs`, `PathId`, mounts,
   `gameinfo.txt` parsing, the KeyValues reader, and VPK reading.
-- [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer`, the frame boundary, the
-  `wgpu` decisions the rest of the renderer inherits, and the texture path: `Vtf`,
-  `ImageFormat`, `Texture` and `TextureCache`. Its porting doc is
+- [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer` and the frame boundary,
+  the `wgpu` decisions the rest of the renderer inherits, the texture path (`Vtf`,
+  `ImageFormat`, `Texture`, `TextureCache`), the material path (`Vmt`, `MaterialVar`,
+  `ShaderKind`, `PipelineCache`, `Material`), meshes and the render context, and the
+  lightmap atlas. Its porting doc is
   [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named after the C++
   module, while this one is named after the Rust module.
-- [`ENGINE.md`](ENGINE.md) — `src/engine/`. Only `window` exists so far: the `winit`
-  event loop, `VideoConfig`, and where frame pacing is going to live.
+- [`ENGINE.md`](ENGINE.md) — `src/engine/`. Three modules so far: `window` (the `winit`
+  event loop, `VideoConfig`, frame pacing), `host` (the state machine and frame clock),
+  and `world` (the `.bsp` reader, lightmap packing, and the batches a map draws as).
 
 ## Why these exist
 

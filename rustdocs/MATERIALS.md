@@ -1,9 +1,10 @@
 # `src/materials/` — API reference
 
-The material system. Right now that means five things: the GPU device and the frame
+The material system. Right now that means six things: the GPU device and the frame
 boundary; the texture path from a `.vtf` on disk to a sampler on the GPU; the material
-path from a `.vmt` to a compiled pipeline; the geometry that pipeline draws; and the
-render context that opens a pass and puts a camera behind it.
+path from a `.vmt` to a compiled pipeline; the geometry that pipeline draws; the render
+context that opens a pass and puts a camera behind it; and the lightmap atlas a map's
+baked lighting is packed into.
 
 Porting design doc: [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named
 after the *original* module (`materialsystem/`), while this file is named after the Rust
@@ -12,10 +13,10 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~10,400 Rust including tests, plus ~260 of WGSL |
-| Tests | 124 (`cargo test materials`) — 19 of them run on a real GPU |
+| Lines | ~12,100 Rust including tests, plus ~500 of WGSL |
+| Tests | 143 (`cargo test materials`) — 19 of them run on a real GPU |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror` |
-| Status | **Stages 1-4 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context and a depth buffer. Stages 5+ not started |
+| Status | **Stages 1-5 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, and lightmaps. Stages 6+ not started |
 
 ```
 src/materials/
@@ -29,12 +30,14 @@ src/materials/
   uniforms.rs      FrameUniforms, DrawUniforms, from_mat4, from_row_major — the constant ABI (§7.4)
   pipeline.rs      RenderState, PipelineKey, TargetFormat, PipelineCache, BindLayouts
   material.rs      Material, MaterialCache — a .vmt bound to a shader and its textures
-  mesh.rs          SimpleVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers, slices
+  lightmap.rs      ImagePacker, LightmapAtlas, LightmapPages, ColorRgbExp32 — the lightmap atlas
+  mesh.rs          SimpleVertex, WorldVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers, slices
   target.rs        DepthBuffer, RenderTarget, DEPTH_FORMAT — what a pass draws into
   context.rs       RenderContext, Pass, Camera, Load, StateOverride — passes and the constants under them
   preview.rs       MaterialPreview — the stage-4 verification draw. Temporary
-  shaders/prelude.wgsl        the shared prelude (§7.5)
-  shaders/unlitgeneric.wgsl   the one shader
+  shaders/prelude.wgsl             the shared prelude (§7.5)
+  shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
+  shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
   error.rs         RendererError, VtfError, VmtError, TextureError
 ```
 
@@ -479,7 +482,14 @@ pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> MaterialCache;
 pub fn load(&mut self, vfs: &Vfs, name: &str) -> Arc<Material>;
 pub fn error_material(&self) -> Arc<Material>;
 pub fn pipelines(&mut self) -> &mut PipelineCache;
+pub fn queue(&self) -> &wgpu::Queue;
+pub fn layouts(&self) -> &BindLayouts;
 ```
+
+`queue` and `layouts` exist for the lightmap atlas, which is built by
+`src/engine/world/` and has to upload through the same device and bind against the same
+layouts. They are immutable, unlike `pipelines`, so a caller can hold both at once —
+`LightmapAtlas::upload` needs exactly that.
 
 **`load` cannot fail**, for the same reason `TextureCache::load` cannot: a missing file, a
 malformed one, an unresolvable patch chain and an unknown shader all resolve to the error
@@ -509,6 +519,7 @@ pub struct Material {
     pub flags: MaterialFlags,
     pub state: RenderState,       // what the shadow phase decided
     pub modulation: [f32; 4],     // $color * $color2, with $alpha in w
+    pub lighting: Lighting,       // how wide a lightmap block its surfaces reserve
 }
 
 pub fn bind_group(&self) -> &wgpu::BindGroup;               // group 1
@@ -650,14 +661,21 @@ all).
 ### `ShaderKind`
 
 ```rust
-pub enum ShaderKind { UnlitGeneric }
+pub enum ShaderKind { UnlitGeneric, LightmappedGeneric }
 
 pub fn from_name(name: &str) -> Option<ShaderKind>;
 pub fn name(self) -> &'static str;
+pub fn vertex_layout(self) -> VertexLayout;
+pub fn reads_lightmap(self) -> bool;          // does this shader want bind group 3
 pub fn params(self) -> impl Iterator<Item = &'static ShaderParam>;
 pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
+
+Two deep. `UnlitGeneric` is sprites, tool textures and anything whose colour is entirely
+in its texture; `LightmappedGeneric` is world brush surfaces — 62 of `sp_a1_intro1`'s 66
+world materials — and multiplies a base texture by a baked lightmap, flat or
+radiosity-normal-mapped.
 
 Replaces `CShaderSystem::FindShader`'s `CUtlDict`, filled by whichever `shaderapi.so` had
 been `dlopen`ed. There is no registration step and no way to fail to be registered.
@@ -675,7 +693,9 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest>;
 pub fn param_value(kind: ShaderKind, vmt: &Vmt, name: &str) -> Option<MaterialVar>;
 pub fn render_state(kind: ShaderKind, vmt: &Vmt, base: Option<&Texture>) -> RenderState;
 pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4];
+pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting;
 pub fn unlit_uniforms(vmt: &Vmt) -> UnlitUniforms;
+pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms;
 ```
 
 `param_value` is `InitShaderParameters` (`shadersystem.cpp:838`): the var if the file set
@@ -687,6 +707,25 @@ does not mention `$alpha` will read as fully transparent.
 it — `TextureIsTranslucent` asks whether the `.vtf` has an alpha channel *and* whether
 some other flag has already claimed it (`$selfillum`, `$basealphaenvmapmask`,
 `$opaquetexture`).
+
+<a id="lighting"></a>
+
+```rust
+pub enum Lighting { None, Lightmap, BumpedLightmap }
+impl Lighting {
+    pub fn blocks(self) -> u32;          // 1, or BUMP_BLOCKS for the bumped case
+    pub fn needs_lightmap(self) -> bool;
+}
+```
+
+`lighting` is `MATERIAL_VAR2_LIGHTING_LIGHTMAP` and `..._BUMPED_LIGHTMAP` as one answer,
+because nothing asks them separately. It reaches the engine as
+[`Material::lighting`](#material), and **it is a material-system property with an
+engine-side consequence**: `BumpedLightmap` means every surface wearing this material
+reserves *four* lightmap blocks instead of one, so a `$bumpmap` in a `.vmt` changes how
+the `.bsp`'s lighting lump is read. The rule is
+`InitParamsLightmappedGeneric_DX9`'s: bumped iff `$bumpmap` is defined and
+`$nodiffusebumplighting` is 0.
 
 **`ShaderParam::declared_default` is documentation, not behaviour** — worth knowing
 because `portdocs/MATERIALSYSTEM.md` §7.2 reads as though it were live. In the whole
@@ -707,9 +746,12 @@ Valve's register map is really a *frequency* map, and that frequency is the bind
 | 0 | `FrameUniforms` | once a frame | VS `c2`, `c8..c11`, `c16`; PS `c29`, `c30`, `c32` |
 | 1 | the shader's own block, plus its textures and samplers | once a material | the shader-specific block |
 | 2 | `DrawUniforms` | once a draw | VS `c4..c7`, `c47` |
-| 3 | skinning + morph storage buffers | once a skinned draw | VS `c58+`, `c1024+` |
+| 3 | the lightmap atlas page, for the shaders that read one | once a batch | PS `s1` (`TEXTURE_LIGHTMAP`) |
 
-Group 3 does not exist yet — nothing is skinned until `studiorender` is ported. Group 1's
+**Group 3 is the lightmap page**, not skinning as stage 4 reserved it for. It is declared
+only by shaders whose `reads_lightmap()` is true, because a pipeline layout is per shader
+and declaring it everywhere would oblige every draw of every shader to bind something
+there. Skinning takes the next free group when `studiorender` lands. Group 1's
 *layout* is the shader's, which is the one thing that genuinely differs between shaders;
 groups 0 and 2 are shared, which is what makes them worth being groups.
 
@@ -757,6 +799,12 @@ pub struct TargetFormat { pub color: TextureFormat, pub depth: Option<TextureFor
 
 pub fn get(&mut self, key: &PipelineKey) -> Arc<wgpu::RenderPipeline>;
 pub fn layouts(&self) -> &BindLayouts;
+
+// BindLayouts
+pub fn frame(&self) -> &wgpu::BindGroupLayout;                    // group 0
+pub fn material(&self, shader: ShaderKind) -> &wgpu::BindGroupLayout;  // group 1
+pub fn draw(&self) -> &wgpu::BindGroupLayout;                     // group 2
+pub fn lightmap(&self) -> &wgpu::BindGroupLayout;                 // group 3
 ```
 
 `RenderState` is `StateSnapshot_t`, and `PipelineCache` is the deduplication half of
@@ -793,7 +841,7 @@ struct, its GPU layout is derived from the struct, and filling a buffer is
 ### Vertices and layouts
 
 ```rust
-pub enum VertexLayout { Simple }
+pub enum VertexLayout { Simple, World }
 impl VertexLayout {
     pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static>;
     pub fn stride(self) -> u64;
@@ -804,7 +852,34 @@ pub trait Vertex: Pod { const LAYOUT: VertexLayout; }
 #[repr(C)]
 pub struct SimpleVertex { pub position: [f32; 3], pub texcoord: [f32; 2], pub color: [f32; 4] }
 impl SimpleVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> SimpleVertex; }
+
+#[repr(C)]
+pub struct WorldVertex {
+    pub position: [f32; 3],
+    pub texcoord: [f32; 2],           // TEXCOORD0, base texture
+    pub lightmap_texcoord: [f32; 2],  // TEXCOORD1, into the atlas page
+    pub lightmap_offset: f32,         // TEXCOORD2.x, one block as a fraction of the page
+    pub color: [f32; 4],
+}
+impl WorldVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> WorldVertex; }
 ```
+
+`WorldVertex` is what `BuildMSurfaceVertexArrays` writes for a brush surface, minus the
+attributes nothing in scope reads. `new` gives white, unlit, at the origin — a base to
+override fields of, so adding an attribute does not have to be echoed at every literal.
+
+**`lightmap_offset` is one float where Valve's is a `float2`**, because the second
+component is unconditionally zero in both branches that write it
+(`matsys_interface.cpp:1498`). We own both ends of that one, which is `PORTING.md`'s test
+for a format that is ours to change.
+
+**Bumped and unbumped `LightmappedGeneric` read the same layout**, which corrects what
+`portdocs/MATERIALSYSTEM.md` §10 predicted. The bumped diffuse path dots a *tangent-space*
+normal straight out of `$bumpmap` against a constant basis
+(`lightmappedgeneric_ps2_3_x.h:665`) and never needs a world-space frame, so the shadow
+phase adds `VERTEX_TANGENT_S | VERTEX_TANGENT_T | VERTEX_NORMAL` only for an `$envmap`
+(`lightmappedgeneric_dx9_helper.cpp:670`). Bumped lighting is therefore a flag in a
+uniform — §7.3's bucket 2 — and the envmap variant is what will force the second layout.
 
 `VertexLayout` is `VertexFormat_t` (a `uint64` of flags plus per-texcoord sizes) reduced
 to what it was used for. It is an enum, not a bitfield, because the set is not open: a
@@ -1004,8 +1079,15 @@ pub fn set_depth_range(&mut self, x: f32, y: f32, width: f32, height: f32,
                        near: f32, far: f32);
 pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 pub fn set_state_override(&mut self, overrides: StateOverride);
+pub fn bind_lightmap_page(&mut self, page: &LightmapPage);
 pub fn target_format(&self) -> TargetFormat;
 ```
+
+`bind_lightmap_page` is `IMatRenderContext::BindLightmapPage( lightmapPageID )`. It is
+pass state, like `set_state_override`, and applies from the call to the end of the pass;
+draws of a shader whose `reads_lightmap()` is false ignore it. A lit draw with no page
+bound gets the 1x1 white page rather than a validation error, which is what
+`AllocateWhiteLightmap` hands unlit surfaces anyway.
 
 The pass ends when it drops. `model` is object space to world space — the
 `MATERIAL_MODEL` matrix, as a parameter rather than a stack, because unlike view and
@@ -1043,6 +1125,155 @@ pub struct StateOverride {
 of the pass. `FlipCullMode` is not a debug feature: a mirror or a portal view flips the
 view matrix horizontally, reversing every triangle's winding, and without the flip the
 whole reflected world is back-face culled.
+
+---
+
+## Lightmaps
+
+`src/materials/lightmap.rs`. Replaces `materialsystem/cmatlightmaps.cpp` (2,465 lines),
+`materialsystem/imagepacker.cpp` (169) and the lightmap half of
+`materialsystem/colorspace.h`.
+
+A `.bsp` stores each surface's baked light as a small rectangle of samples. The atlas
+packs those rectangles into a handful of GPU textures, and a surface's *page* plus its
+*offset within that page* become its lightmap texture coordinates. That is why the packer
+is ported faithfully rather than replaced: a different packer is not wrong, but it is a
+different atlas, a different page count and a different set of draw batches.
+
+`src/engine/world/` is the only caller; see [`rustdocs/ENGINE.md`](ENGINE.md).
+
+### The page format, and the one number that matters
+
+A page texel is **linear radiance in `Rgba16Float`, sampled with no sRGB decode**.
+
+Valve picked the format from `GetHDRType()` (`cmatlightmaps.cpp:481`): `RGBA8888` plus an
+sRGB read for LDR, `RGBA16161616` for HDR-integer, `RGBA16161616F` for HDR-float.
+**Portal 2 ships HDR-only maps** — `sp_a1_intro1.bsp` has an empty `LUMP_LIGHTING` and
+5.4 MB of `LUMP_LIGHTING_HDR` — so the LDR path is not available, and of the two HDR ones
+the float path is the one whose page holds just the numbers: `GetLightMapScaleFactor` is
+1.0 for it (`hardwareconfig.cpp:832`) against 16.0 for the integer path, so nothing is
+pre-divided and nothing has to be multiplied back.
+
+`Rgba16Float` is filterable at the portable capability floor, which `Rgba16Unorm`
+(`Features::TEXTURE_FORMAT_16BIT_NORM`) and `Rgba32Float` (`Features::FLOAT32_FILTERABLE`)
+are not, so this costs nothing from the single capability tier. `f32` is converted to
+binary16 in `lightmap.rs` rather than by a crate; it is twenty lines and `half` would be a
+seventh dependency.
+
+### `ColorRgbExp32` — and the decode that is 255x wrong
+
+```rust
+#[repr(C)]
+pub struct ColorRgbExp32 { pub r: u8, pub g: u8, pub b: u8, pub exponent: i8 }
+impl ColorRgbExp32 { pub fn to_linear(self) -> [f32; 3]; }
+```
+
+`to_linear` is `c * 2^e / 255` — `TexLightToLinear` (`public/mathlib/mathlib.h:1453`)
+against a table documented as `2^(index - 128) / 255`.
+
+**It is not `ColorRGBExp32ToVector`**, and this is the trap the whole section exists for.
+That function is the obvious-looking "decode this colour", it sits immediately below the
+table, and it is the same thing *times 255* — with Valve's own comment on the extra factor
+reading *"FIXME: Why is there a factor of 255 built into this?"*. It is for
+`dworldlight_t` intensities, ambient cubes and particle colours; the lightmap path calls
+`TexLightToLinear` directly (`gl_lightmap.cpp:572`). Using the wrong one makes every lit
+surface 255 times too bright, which is a **uniformly white screen** — not something that
+reads as a decoding error from either end, since the samples are plausible and the shader
+is correct. It cost a screenshot to find. `a_full_mantissa_at_exponent_zero_is_one` pins
+it.
+
+The decoded range is the `[0..16]` that `LightmapBitsToPixelWriter_HDRI`'s comment names.
+Measured over `sp_a1_intro1`: 96.7% of luxels are below 0.25 and the maximum is 1.32.
+
+### `ImagePacker`
+
+```rust
+pub fn new(width: u32, height: u32) -> ImagePacker;
+pub fn add_block(&mut self, width: u32, height: u32) -> Option<(u32, u32)>;
+pub fn efficiency(&self) -> f32;
+```
+
+`CImagePacker`, a skyline packer: `wavefront[x]` is the highest occupied row in column
+`x`, and a block goes at the leftmost position whose maximum wavefront over its width is
+lowest. Two details are Valve's and are reproduced rather than tidied, because both move
+blocks between pages and therefore move texture coordinates:
+
+- **`GetMaxYIndex` prefers the *last* column of a tied run** (`>=`, not `>`). It is what
+  lets the search jump past a whole run of equal columns instead of retrying each.
+- **The height test is `y + height >= page_height - 1`**, so a page is full one row
+  early. A port using `>` would place blocks the original spilled onto the next page.
+
+### `LightmapAtlas` and `LightmapPages`
+
+```rust
+pub const PAGE_WIDTH: u32 = 512;
+pub const PAGE_HEIGHT: u32 = 256;
+pub const BUMP_BLOCKS: u32 = 4;
+pub const WHITE_PAGE: u32 = 0;
+
+pub struct Allocation { pub page: u32, pub x: u32, pub y: u32 }
+
+impl LightmapAtlas {
+    pub fn new() -> LightmapAtlas;
+    pub fn begin_material(&mut self);
+    pub fn allocate(&mut self, width: u32, height: u32) -> Option<Allocation>;
+    pub fn write(&mut self, allocation: Allocation, width: u32, height: u32,
+                 blocks: u32, samples: &[ColorRgbExp32]);
+    pub fn page_size(&self, page: u32) -> (u32, u32);
+    pub fn page_count(&self) -> u32;
+    pub fn upload(self, device: &wgpu::Device, queue: &wgpu::Queue,
+                  layouts: &BindLayouts) -> LightmapPages;
+}
+
+impl LightmapPages {
+    pub fn page(&self, page: u32) -> &LightmapPage;   // out of range -> the white page
+    pub fn len(&self) -> usize;
+    pub fn bytes(&self) -> usize;
+}
+```
+
+The CPU half and the GPU half are separate on purpose: allocating and writing are pure and
+testable without a device, and `upload` is the single point that touches `wgpu`. A page is
+512x256 because `GetMaxLightmapPageWidth`'s comment says so — "512x256 textures because
+that's the only way bumped lighting on displacements can work given the 128x128
+allowance".
+
+**`begin_material` is not optional and is not a hint.** `AllocateLightmap`
+(`cmatlightmaps.cpp:306`) closes every open page but the most recent whenever the material
+changes, so that one material's surfaces cluster onto as few pages as possible. Skipping
+it produces a correct atlas with many more batches; calling it mid-material produces the
+opposite. Call it once per material run, before that material's first `allocate`.
+
+**Page 0 is always the 1x1 white page.** `MATERIAL_SYSTEM_LIGHTMAP_PAGE_WHITE`, which
+`AllocateWhiteLightmap` hands to unlit surfaces. Valve made it a negative page ID;
+here it is a real page so that nothing downstream has to special-case it.
+
+### A material and a face can disagree about bumpedness
+
+Two independent things decide how many blocks are involved, and they can differ:
+
+| Question | Answered by | Why that one |
+|---|---|---|
+| How wide a block to **reserve** | the material's [`Lighting`](#lighting) | Valve's rule (`RegisterLightmappedSurface`). Keeping it is what keeps every surface of one material sampling the same way |
+| How many blocks the file **holds** | `SURF_BUMPLIGHT` in the face's `texinfo` | it is the file describing its own layout |
+
+Valve derives the second from the first as well, so a `.vmt` edited after the map was
+compiled makes its engine read the lighting lump at the wrong stride. Reading the flag is
+both simpler and right by construction — checked against `sp_a1_intro1`, where the flag
+agrees with the byte spacing between consecutive light offsets on all 4,982 lit faces,
+with zero disagreements. `write` reconciles the two cases: material wants four and the
+file has one, the flat map is copied into all four blocks; material wants one and the file
+has four, only the flat map is written.
+
+### The bumped correction
+
+`write` applies `ColorSpace::LinearToBumpedLightmap`'s float overload: the three
+directional maps are scaled so their average matches the flat one, so that a surface with
+a normal map is as bright as the same surface without one. Two comments in the original
+are worth carrying and are reproduced at the site — one saying the maths is *"completely
+wrong"* according to Alex (it is reproduced anyway, because the shipped lightmaps were
+baked against it), and one noting the correction was *"entirely missing in the float path
+as of September '11"*.
 
 ---
 
@@ -1106,73 +1337,88 @@ Ordered by how likely each is to bite.
    with an identity view, no visible difference at all, which is why
    `preview.rs`'s `the_model_matrix_places_the_quad` uses a view projection that is *not*
    the identity.
-2. **`ColorSpace` is decided by the shader, and nothing checks it.** Getting it wrong
+2. **A lightmap sample decodes with `TexLightToLinear`, not `ColorRGBExp32ToVector`.**
+   The two differ by a factor of 255 and the wrong one is the one that looks right in the
+   source. See [`ColorRgbExp32`](#colorrgbexp32--and-the-decode-that-is-255x-wrong); the
+   symptom is a uniformly white screen rather than anything that reads as a bad decode.
+3. **`ColorSpace` is decided by the shader, and nothing checks it.** Getting it wrong
    produces a picture that looks *plausible* — a washed-out albedo, or a normal map that
    lights slightly wrong — rather than anything that errors.
    [`shader::texture_requests`](#texture_requests) is where the answer lives; a call site
    that decides for itself is a bug waiting to diverge from the shader that samples it.
-3. **Read parameters through `shader::param_value`, not `Vmt::var`.** A `.vmt` that does
+4. **Read parameters through `shader::param_value`, not `Vmt::var`.** A `.vmt` that does
    not mention `$alpha` has no `$alpha` var, and treating that as zero makes every such
    material invisible. `param_value` is where `InitShaderParameters`' defaults live.
-4. **Per-draw constants must go in distinct arena slots, and this is not obvious.**
+5. **Per-draw constants must go in distinct arena slots, and this is not obvious.**
    `Queue::write_buffer` stages its copy to run before the *whole* command buffer, not at
    the point in the recording where it was called — so one uniform buffer rewritten
    between draws gives every draw in the frame the last values written. `RenderContext`
    handles it; anything that adds a new per-draw block must too. See
    [Uniforms are arenas](#uniforms-are-arenas-not-single-buffers).
-5. **`RenderContext::begin_frame` must run before anything allocates, once a frame.** It
+6. **`RenderContext::begin_frame` must run before anything allocates, once a frame.** It
    resets the uniform and geometry arenas. A slice held over from the previous frame
    reads whatever overwrites it — silently, and only under load, because the arena has to
    wrap round to the same offset first.
-6. **A `Frame` borrows the renderer.** `resize` and a second `begin_frame` have to happen
+7. **A `Frame` borrows the renderer.** `resize` and a second `begin_frame` have to happen
    outside that borrow: `Surface::configure` panics if a frame is alive, so the borrow
    checker is enforcing a real `wgpu` rule. Drawing is unaffected — `RenderContext` holds
    its own device handles.
-7. **`wgpu` render passes do not nest**, so a render target is filled by a pass that has
+8. **`wgpu` render passes do not nest**, so a render target is filled by a pass that has
    *ended* before the pass that samples it begins. See
    [Passes replace three stacks](#passes-replace-three-stacks).
-8. **`Pass::draw` panics on a vertex-layout mismatch.** The layout comes from the
+9. **`Pass::draw` panics on a vertex-layout mismatch.** The layout comes from the
    material's shader (`ShaderKind::vertex_layout`), not from the buffer, and drawing
    model data through a world shader would otherwise reinterpret bone weights as
    coordinates and draw something merely wrong.
-9. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
+10. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
    it.** Minimizing a window reports width or height 0. `resize(w, 0)` marks the surface
    unconfigured and `begin_frame` then returns `None` until real dimensions arrive. If you
    add another path that configures the surface, replicate that guard.
-10. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
+11. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
    window, so it cannot make the call itself. It must happen immediately before
    `Frame::present`; skipping it costs compositor scheduling accuracy, not correctness.
-11. **Sizes are physical pixels.** See `Renderer::new` above.
-12. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
+12. **Sizes are physical pixels.** See `Renderer::new` above.
+13. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
    macOS/Metal). That is the replacement for `IShaderDevice::SetHardwareGammaRamp`: the
    hardware encodes on write instead of the engine warping the display's gamma ramp
    process-wide — and leaving it warped if it crashed. **Consequence:** values written by
    a shader are treated as *linear* and encoded on the way out. Do not apply an sRGB curve
    in shader code as well.
-13. **Copies into a compressed texture use the level's *physical* size, not its logical
+14. **Copies into a compressed texture use the level's *physical* size, not its logical
     one.** The tail of a DXT mip chain is levels smaller than a 4x4 block (a 64x64 DXT1
     texture ends 2x2, 1x1), and WebGPU requires a copy to be a whole number of blocks —
     writing the logical 2x2 is a validation error, not a silent truncation.
     `ImageFormat::mem_required` rounds the same way, because `GetMemRequired` did, so the
     byte counts agree. This bit once; `Texture::from_vtf` handles it.
-14. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
+15. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
     texture Valve ships is DXT, and there is no fallback tier — decompressing on the CPU
     would quadruple both load time and video memory for the whole game. An adapter without
     it fails at startup with `RendererError::NoBlockCompression` rather than half-working.
-15. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
+16. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
     adapter's ceiling.** Deliberate: §4.6 replaces `IMaterialSystemHardwareConfig`'s ~50
     caps queries and the `dxlevel` ladder with one fixed capability tier, and asking every
     machine for the same limits is what makes that tier mean anything. Raise it
     deliberately when a shader needs more; never adapter-by-adapter.
-16. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
+17. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
     and HDR is still an open question (`portdocs/MATERIALSYSTEM.md` §10). Switching it on
     means a float format and a tonemap pass, not just changing this field.
-17. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
+18. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
     merely unreachable, per `PORTING.md`'s POSIX-only rule. `WGPU_BACKEND` still overrides
     at runtime (as do `WGPU_ADAPTER_NAME` and `WGPU_DEBUG`) — those are left enabled on
     purpose as the modern equivalent of the old `-gl`/`-dx9` switches.
-18. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
+19. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
     Fine at startup, on the main thread, once. Do not call it from a frame.
+20. **`LightmapAtlas::begin_material` must bracket each material's run of allocations.**
+    Forgetting it costs draw batches, not correctness; calling it inside a run costs more
+    of them. See [`LightmapAtlas`](#lightmapatlas-and-lightmappages).
+21. **The lightmap page is not a material property.** One material's surfaces are spread
+    over as many atlas pages as the packer needed, so the page is bound per *batch* with
+    `Pass::bind_lightmap_page` — that is what Valve's sort ID encodes. Putting it in the
+    material's bind group would mean one `Material` per page.
+22. **HDR lightmaps reach the shader unexposed.** `cLightScale.x` is 1.0 because there is
+    no tone mapper, so a map is as bright as `vrad` left it — dimmer than the shipped
+    game, which auto-exposes. It is one uniform field, not a redesign; see the divergence
+    table.
 
 ## Deliberate divergences from Valve's behavior
 
@@ -1195,19 +1441,34 @@ Each of these changes what the engine does, and each names the thing that revers
 | The matrix, render-target and scissor stacks do not exist | a `wgpu` render pass already *is* the saved state those stacks restored, and it is scoped by the borrow checker. A nested render target becomes a pass that ends before the one sampling it begins | — |
 | Render targets are not in the texture dictionary | `CreateNamedRenderTargetTextureEx` shared a namespace with `.vtf` files, so a file could silently shadow a target. Binding one is now an explicit act | — |
 | The depth buffer is `Depth24PlusStencil8` for everything | Portal's stencil, and `DepthBias::Decal`'s constant being in 24-bit depth units. Valve chose the format per render target | `target::DEPTH_FORMAT` |
+| Lightmap pages are `Rgba16Float` and never LDR | Portal 2's maps have no `LUMP_LIGHTING` at all, so the LDR encoding (`LinearToLightmap`'s gamma-and-overbright table plus an sRGB page) has nothing to encode. A map with only LDR lighting loads and draws dimmer by the overbright factor that encoding divides out | `lightmap.rs`'s page format, plus an `sRGB` page and `GetLightMapScaleFactor`'s `GammaToLinearFullRange(2.0)` |
+| The last atlas page is not shrunk | `GetMinimumDimensions` (`imagepacker.cpp:156`) trims the final page to a power-of-two height, which saves at most one page and makes every surface's coordinates depend on how full its page ended up. The aspect clamp it applies also reads `MaxTextureAspectRatio()`, a caps query that no longer exists | `LightmapAtlas::page_size`, which is already per page |
+| Bumpedness is read from `SURF_BUMPLIGHT`, not re-derived from the material | the flag is the file describing its own layout; Valve's engine re-derives it and reads the lump at the wrong stride if a `.vmt` changed after compilation. The two are reconciled rather than assumed equal | `LightmapAtlas::write` |
+| Only lightstyle 0 is baked into the atlas | the other three are switchable and animated lights, and summing them needs `LightStyleValue( style )` and a per-frame page rebuild (`R_BuildLightMap`) — the whole dynamic lighting path. `WorldStats::faces_with_lightstyles` counts the surfaces this understates | — |
+| A map with interleaved lightmap alpha is refused | `LVLFLAGS_LIGHTMAP_ALPHA` puts a CS:GO-era cascaded-shadow term between every face's samples, so the stride changes for the whole lump. Portal 2 does not set it; misreading it would draw noise | `BspError::UnsupportedLightmapAlpha` |
+| No tone mapping: `cLightScale` is all ones | HDR lightmaps arrive in `[0..16]` and `SetToneMappingScaleLinear` normally carries the exposure the tone-map controller chose. There is no controller, so a map is as bright as `vrad` left it | `FrameUniforms::light_scale` |
 | The dynamic geometry arena grows instead of overflowing | `CDynamicVB` was a fixed allocation and callers split batches to fit. The `*_remaining` queries are still there for callers that want to | `mesh::ARENA_BYTES` |
 
 ## Not implemented
 
-Stages 5-8: lightmaps, the rest of the shader set, paint maps, GPU morph. The shader set
-is one shader deep, so most `.vmt` files in shipped content resolve to the error material
-because they name a shader that does not exist yet. Also deliberately absent, and listed
-so nobody looks for them:
+Stages 6-8: the rest of the shader set, paint maps, GPU morph. The shader set is two
+shaders deep, so a `.vmt` naming any of the other 160-odd still resolves to the error
+material. Also deliberately absent, and listed so nobody looks for them:
 
-- **`WorldVertex` and `ModelVertex`.** The layouts are enumerated on `VertexLayout` — the
-  reading is done — but the structs arrive with `LightmappedGeneric` and
-  `VertexLitGeneric`, because a vertex struct with no shader to read it cannot be checked
-  against anything.
+- **Everything `LightmappedGeneric` can do past a base texture, a bump map and a
+  lightmap.** `$basetexture2`/`$bumpmap2` two-layer blending and `$blendmodulatetexture`,
+  `$detail`, `$envmap`/`$envmapmask` (the one that needs tangent space, and therefore a
+  second vertex layout), `$selfillum`, phong, seamless mapping, the flashlight, cascaded
+  shadow maps, and Portal 2's paint layer. Each is declared in
+  `lightmappedgeneric_dx9_helper.cpp` and each is left out of the parameter table rather
+  than declared-and-ignored.
+- **Dynamic lights and lightstyle animation.** `R_BuildLightMap` rebuilt a page every
+  frame from `LightStyleValue( style )` and the visible `dlight_t`s; a page here is
+  written once at load. `LockLightmap`/`UpdateLightmap` and the ring of dynamic pages go
+  with it.
+- **`ModelVertex`.** The layout is enumerated on `VertexLayout` — the reading is done —
+  but the struct arrives with `VertexLitGeneric`, because a vertex struct with no shader
+  to read it cannot be checked against anything.
 - **Vertex compression** (`VERTEX_FORMAT_COMPRESSED`, packed normals and bone weights).
   Still open, and answered *with* skinning: the shaders unpack what the vertex format
   packs, so the two halves are one decision.
@@ -1271,8 +1532,9 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
 
 A missing or broken name draws the error material — magenta checkerboard — which is
-itself worth seeing. Most Portal 2 world materials name `LightmappedGeneric` and will do
-exactly that until stage 6.
+itself worth seeing. `-vmt` draws through `UnlitGeneric` only: it has no lightmap page and
+no world geometry, so a `LightmappedGeneric` material previewed this way is lit by the
+white page and comes out fullbright.
 
 Two things it pins down that are worth reading before writing the real one:
 
@@ -1285,18 +1547,22 @@ Two things it pins down that are worth reading before writing the real one:
   path is what every immediate-mode draw in the engine uses, and a path only the tests
   exercise is a path that rots.
 
-**Do not grow this.** When map loading lands, delete `preview.rs` and the `-vmt` switch
-together, and move the GPU tests at the bottom of that file onto whatever draws the world
-— they are the only place the whole path is checked against real pixels.
+**Do not grow this.** Map loading has landed, so the deletion this asked for is now
+possible and is deliberately *not* part of stage 5: the nineteen GPU tests at the bottom
+of `preview.rs` are the only place the whole path is checked against real pixels, and
+moving them onto the world draw means giving them a `.bsp` — which means shipping content
+into the test suite or making them skip without it. Delete `preview.rs` and `-vmt`
+together with whatever answers that, not before.
 
 ## Test coverage
 
-124 tests, in two groups.
+143 tests, in two groups.
 
-**Pure logic, no GPU** (105) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (124) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
+| `lightmap` (17) | the `ColorRGBExp32` decode including the 255 factor, the packer's two Valve-specific edge rules, page allocation and the material-change rule, the block layout a bumped surface writes, the bump correction, and the `f32` -> binary16 encoding at the magnitudes lightmaps actually use |
 | `vtf` (18) | every version 7.0-7.5, the seventh cubemap face, partial mip chains, the thumbnail, flag masking, and each way a file can be malformed |
 | `vmt` (17) | the type sniffing, conditional keys, flags-are-not-vars, fallback blocks, and patch expansion against a real temp-directory `Vfs` |
 | `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
@@ -1306,7 +1572,7 @@ together, and move the GPU tests at the bottom of that file onto whatever draws 
 | `uniforms` (7) | the uniform block sizes WGSL expects, the no-fog packing, and the row-major/column-major conversion in both directions |
 | `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout |
 | `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
-| `mesh` (4) | the vertex layout against the struct it describes, and the copy-alignment padding at every remainder |
+| `mesh` (6) | both vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
 
 The `vtf` tests build files with an in-memory writer that can produce *archaic* and

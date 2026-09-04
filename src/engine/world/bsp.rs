@@ -24,6 +24,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
 use crate::filesystem::Vfs;
+use crate::materials::lightmap::ColorRgbExp32;
 
 /// `IDBSPHEADER` — `'VBSP'` (`public/bspfile.h:23`).
 const BSP_IDENT: u32 = u32::from_le_bytes(*b"VBSP");
@@ -44,14 +45,36 @@ const LUMP_TEXDATA: usize = 2;
 const LUMP_VERTEXES: usize = 3;
 const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
+const LUMP_LIGHTING: usize = 8;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
+const LUMP_LIGHTING_HDR: usize = 53;
+const LUMP_FACES_HDR: usize = 58;
+const LUMP_MAP_FLAGS: usize = 59;
 
-/// Surface flags, from `public/bspflags.h`. Only the ones that decide whether a
-/// face is drawn are here; `SURF_BUMPLIGHT` and friends arrive with lightmaps.
+/// `LVLFLAGS_LIGHTMAP_ALPHA` (`public/bspfile.h:400`) — "indicates that
+/// lightmap alpha data is interleved in the lighting lump".
+///
+/// The CS:GO-era cascaded-shadow-map term, one byte per luxel, written after
+/// each lightstyle's colour samples. Cascaded shadow maps are not ported, but
+/// the *stride* matters regardless: with this set, every face's samples start
+/// somewhere different. Portal 2 does not set it —`sp_a1_intro1`'s
+/// `LUMP_MAP_FLAGS` is 2, `LVLFLAGS_BAKED_STATIC_PROP_LIGHTING_HDR` alone — so
+/// a map that does is refused rather than misread. See
+/// [`BspError::UnsupportedLightmapAlpha`].
+const LVLFLAGS_LIGHTMAP_ALPHA: u32 = 0x0000_0004;
+/// `LVLFLAGS_LIGHTMAP_ALPHA_3` — three sets of the above.
+const LVLFLAGS_LIGHTMAP_ALPHA_3: u32 = 0x0000_0010;
+
+/// `MAXLIGHTMAPS` (`public/bspfile.h:773`): how many lightstyles one face can
+/// carry. A style of 255 means "no more".
+const MAX_LIGHTMAPS: usize = 4;
+const NO_LIGHTSTYLE: u8 = 255;
+
+/// Surface flags, from `public/bspflags.h`. Only the ones this reader acts on.
 pub mod surf {
     /// Don't draw, but add to the skybox.
     pub const SKY: i32 = 0x0004;
@@ -65,6 +88,25 @@ pub mod surf {
     pub const SKIP: i32 = 0x0200;
     /// An Xbox-era hack that kept trigger surfaces in the tree for occluders.
     pub const TRIGGER: i32 = 0x0040;
+
+    /// Don't calculate light: the surface has no lightmap and binds the white
+    /// page. `SurfHasLightmap` (`engine/gl_matsysiface.cpp:573`) tests it.
+    pub const NOLIGHT: i32 = 0x0400;
+    /// The surface's lighting lump entry holds four blocks — the flat lightmap
+    /// and one per bump-basis vector — rather than one.
+    ///
+    /// Set by VBSP when it compiled the map against a material with a
+    /// `$bumpmap`. **Valve's engine never reads it for this**: it re-derives
+    /// the same answer at load from the live material
+    /// (`SurfNeedsBumpedLightmaps`, `gl_matsysiface.cpp:565`), so a material
+    /// edited after the map was compiled makes the engine read the lighting
+    /// lump with the wrong stride. Reading the flag instead is both simpler and
+    /// right by construction, because it is the file describing its own layout.
+    ///
+    /// Checked against the data on `sp_a1_intro1`: over all 4,982 lit faces the
+    /// flag agrees with the byte spacing between consecutive light offsets,
+    /// 4,982 to 0.
+    pub const BUMPLIGHT: i32 = 0x0800;
 
     /// Every flag that means "this surface is not world geometry".
     ///
@@ -228,6 +270,12 @@ pub enum BspError {
         stride: usize,
     },
 
+    #[error(
+        "{path} has interleaved lightmap alpha data (level flags {level_flags:#010x}); \
+         only maps without it are supported"
+    )]
+    UnsupportedLightmapAlpha { path: String, level_flags: u32 },
+
     #[error("{path} has no {what} lump, so it has no geometry to draw")]
     MissingLump { path: String, what: &'static str },
 
@@ -274,6 +322,30 @@ pub struct Bsp {
     /// `.vmt` extension.
     pub texdata_string_table: Vec<String>,
     pub models: Vec<Model>,
+    /// `LUMP_LIGHTING_HDR` if the map has one, else `LUMP_LIGHTING`: the baked
+    /// light samples every lit face indexes with its `light_ofs`.
+    ///
+    /// Empty for a map compiled without `vrad`, which is legal and draws
+    /// fullbright.
+    pub lighting: Vec<ColorRgbExp32>,
+    /// Which of the two lighting lumps [`lighting`](Bsp::lighting) came from.
+    ///
+    /// Recorded because it decides the exposure the samples are in, not just
+    /// where they were read: LDR samples are pre-divided by the overbright
+    /// factor and HDR ones are not. **Portal 2 ships HDR-only maps** — this is
+    /// always true for them — and the LDR case is here for maps that are not
+    /// Portal 2's.
+    pub lighting_is_hdr: bool,
+    /// `LUMP_MAP_FLAGS`' `m_LevelFlags` (`dflagslump_t`), or 0 when the lump is
+    /// absent, which it is on maps older than this feature.
+    ///
+    /// Read at parse time for the lightmap-alpha bits and kept because the
+    /// rest of it is what `Map_CheckFeatureFlags` (`modelloader.cpp:1178`)
+    /// hands to the subsystems that arrive later —
+    /// `LVLFLAGS_BAKED_STATIC_PROP_LIGHTING_HDR` to static props,
+    /// `LVLFLAGS_LIGHTSTYLES_WITH_CSM` to the light-style animator.
+    #[allow(dead_code)]
+    pub level_flags: u32,
 }
 
 impl Bsp {
@@ -345,12 +417,44 @@ impl Bsp {
             lumps: &lumps,
         };
 
+        // `Map_CheckFeatureFlags` (`engine/modelloader.cpp:1178`). Read before
+        // anything else, because it says how the lighting lump is laid out.
+        let level_flags = match reader.raw(LUMP_MAP_FLAGS) {
+            Ok(bytes) if bytes.len() >= 4 => {
+                u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"))
+            }
+            _ => 0,
+        };
+        if level_flags & (LVLFLAGS_LIGHTMAP_ALPHA | LVLFLAGS_LIGHTMAP_ALPHA_3) != 0 {
+            return Err(BspError::UnsupportedLightmapAlpha { path, level_flags });
+        }
+
+        // `Mod_LoadFaces` picks `LUMP_FACES_HDR` whenever HDR is on and the
+        // lump is non-empty (`modelloader.cpp:2188`), because the HDR faces
+        // carry different `light_ofs` values — and, in an HDR-only map,
+        // *only* the HDR ones are meaningful: `sp_a1_intro1`'s LDR faces all
+        // have `light_ofs` 0 against an empty `LUMP_LIGHTING`.
+        let lighting_is_hdr = !reader.is_empty(LUMP_LIGHTING_HDR);
+        let faces_lump = if lighting_is_hdr && !reader.is_empty(LUMP_FACES_HDR) {
+            LUMP_FACES_HDR
+        } else {
+            LUMP_FACES
+        };
+        let lighting_lump = if lighting_is_hdr {
+            LUMP_LIGHTING_HDR
+        } else {
+            LUMP_LIGHTING
+        };
+
         let bsp = Bsp {
             entity_lump: reader.text(LUMP_ENTITIES)?,
+            lighting: reader.records(lighting_lump)?,
+            lighting_is_hdr,
+            level_flags,
             vertices: reader.records(LUMP_VERTEXES)?,
             edges: reader.records(LUMP_EDGES)?,
             surfedges: reader.records(LUMP_SURFEDGES)?,
-            faces: reader.records(LUMP_FACES)?,
+            faces: reader.records(faces_lump)?,
             texinfo: reader.records(LUMP_TEXINFO)?,
             texdata: reader.records(LUMP_TEXDATA)?,
             texdata_string_table: reader.texdata_strings()?,
@@ -536,6 +640,104 @@ impl Bsp {
         ]
     }
 
+    /// How many lightstyles a face carries, and therefore how many copies of
+    /// its samples the lighting lump holds.
+    ///
+    /// `for ( maps = 0; maps < MAXLIGHTMAPS && styles[maps] != 255; ++maps )`
+    /// (`gl_lightmap.cpp:1366`). Style 0 is the always-on one; the rest are
+    /// switchable lights, which are not animated here — see
+    /// [`face_lightmap_samples`](Bsp::face_lightmap_samples).
+    pub fn face_lightstyle_count(face: &Face) -> usize {
+        face.styles
+            .iter()
+            .position(|&style| style == NO_LIGHTSTYLE)
+            .unwrap_or(MAX_LIGHTMAPS)
+    }
+
+    /// How many lightmap blocks a face's samples occupy: 4 when the surface
+    /// was compiled bumped, else 1. See [`surf::BUMPLIGHT`].
+    pub fn face_lightmap_blocks(&self, face: &Face) -> u32 {
+        let bumped = self
+            .texinfo
+            .get(face.tex_info.max(0) as usize)
+            .is_some_and(|info| info.flags & surf::BUMPLIGHT != 0);
+        if bumped {
+            crate::materials::lightmap::BUMP_BLOCKS
+        } else {
+            1
+        }
+    }
+
+    /// The face's lightmap dimensions in luxels.
+    ///
+    /// `MSurf_LightmapExtents + 1` (`gl_matsysiface.cpp:223`): `lightmap_size`
+    /// is the extent, so a face whose light varies over a single luxel records
+    /// zero.
+    pub fn face_lightmap_size(face: &Face) -> (u32, u32) {
+        (
+            (face.lightmap_size[0].max(0) as u32) + 1,
+            (face.lightmap_size[1].max(0) as u32) + 1,
+        )
+    }
+
+    /// The face's baked light samples, or `None` if it has none.
+    ///
+    /// The returned slice is `blocks * width * height` samples of **lightstyle
+    /// 0 only**. The other styles follow it in the lump and are deliberately
+    /// not returned: they are the switchable and animated lights, and summing
+    /// them needs `LightStyleValue( style )` from a light-style animator that
+    /// does not exist (`R_BuildLightMap`, `gl_lightmap.cpp:1623`, is a
+    /// per-frame rebuild of the whole page). Style 0 is what a map looks like
+    /// with every switchable light in its compiled-in state, which is what
+    /// `vrad` bakes it as.
+    ///
+    /// `light_ofs` points *past* the per-style average colours — one
+    /// `ColorRGBExp32` per style — that `vrad` writes ahead of the samples, so
+    /// no adjustment is needed here. Verified against `sp_a1_intro1`, where
+    /// consecutive faces' offsets differ by exactly the sample bytes plus the
+    /// next face's average colours.
+    pub fn face_lightmap_samples(&self, face: &Face) -> Option<&[ColorRgbExp32]> {
+        if face.light_ofs < 0 || self.lighting.is_empty() {
+            return None;
+        }
+        let info = self.texinfo.get(face.tex_info.max(0) as usize)?;
+        if info.flags & surf::NOLIGHT != 0 {
+            return None;
+        }
+        let (width, height) = Bsp::face_lightmap_size(face);
+        let count = (self.face_lightmap_blocks(face) * width * height) as usize;
+        // `light_ofs` is a byte offset into a lump of 4-byte samples.
+        let first = (face.light_ofs as usize).checked_div(size_of::<ColorRgbExp32>())?;
+        self.lighting.get(first..first.checked_add(count)?)
+    }
+
+    /// The lightmap coordinate for a world position on a face, in **luxels**.
+    ///
+    /// `SurfComputeLightmapCoordinate` (`engine/matsys_interface.cpp:1956`)
+    /// without its final scale into page space, which the caller applies
+    /// because only it knows which page the face landed on:
+    ///
+    /// ```text
+    /// uv = dot( pos, lightmapVecs[i].xyz ) + lightmapVecs[i][3]
+    ///      - lightmapMins[i] + 0.5
+    /// ```
+    ///
+    /// The `+ 0.5` is the half-luxel that puts the coordinate at the *centre*
+    /// of the first luxel rather than its corner; without it every lit surface
+    /// is offset by half a luxel and the bilinear filter samples across the
+    /// block boundary into whatever the packer put next door.
+    pub fn lightmap_coordinate(&self, face: &Face, position: Vec3) -> [f32; 2] {
+        let Some(info) = self.texinfo.get(face.tex_info.max(0) as usize) else {
+            return [0.5, 0.5];
+        };
+        let luxel = |axis: usize| {
+            let v = info.lightmap_vecs[axis];
+            position.dot(Vec3::new(v[0], v[1], v[2]) ) + v[3] - face.lightmap_mins[axis] as f32
+                + 0.5
+        };
+        [luxel(0), luxel(1)]
+    }
+
     /// The entity lump, parsed.
     pub fn entities(&self) -> Vec<Entity> {
         parse_entities(&self.entity_lump)
@@ -559,6 +761,12 @@ struct LumpReader<'a> {
 }
 
 impl LumpReader<'_> {
+    /// Whether a lump is absent or zero-length, which the directory does not
+    /// distinguish and neither does anything that asks.
+    fn is_empty(&self, lump: usize) -> bool {
+        self.lumps[lump].length == 0
+    }
+
     fn raw(&self, lump: usize) -> Result<&[u8], BspError> {
         let entry = self.lumps[lump];
         if entry.four_cc != 0 {
@@ -747,6 +955,22 @@ fn parse_entities(text: &str) -> Vec<Entity> {
 /// Shared with the geometry builder's tests in [`super`].
 #[cfg(test)]
 pub(crate) fn one_face_bsp() -> Vec<u8> {
+    face_bsp(None)
+}
+
+/// The same map with HDR lighting for its one face: a 2x2 lightmap, or four
+/// 2x2 blocks when `bumped`, over the 64-unit square.
+///
+/// `light_ofs` points past one average-colour sample, which is how `vrad`
+/// writes it — see [`Bsp::face_lightmap_samples`].
+#[cfg(test)]
+pub(crate) fn lit_face_bsp(bumped: bool) -> Vec<u8> {
+    face_bsp(Some(bumped))
+}
+
+#[cfg(test)]
+fn face_bsp(lit: Option<bool>) -> Vec<u8> {
+    let bumped = lit == Some(true);
     let mut lumps: Vec<(usize, Vec<u8>)> = Vec::new();
 
     lumps.push((
@@ -777,8 +1001,13 @@ pub(crate) fn one_face_bsp() -> Vec<u8> {
         bytemuck::bytes_of(&TexInfo {
             // One texel per world unit in s, likewise in t.
             texture_vecs: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
-            lightmap_vecs: [[0.0; 4], [0.0; 4]],
-            flags: 0,
+            // One luxel per 32 units, so the 64-unit square spans 0..2 luxels
+            // and its `lightmap_size` extent of 1 is right.
+            lightmap_vecs: [
+                [1.0 / 32.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0 / 32.0, 0.0, 0.0],
+            ],
+            flags: if bumped { surf::BUMPLIGHT } else { 0 },
             tex_data: 0,
         })
         .to_vec(),
@@ -812,7 +1041,8 @@ pub(crate) fn one_face_bsp() -> Vec<u8> {
             disp_info: -1,
             surface_fog_volume_id: -1,
             styles: [0, 255, 255, 255],
-            light_ofs: -1,
+            // Past the one average-colour sample `vrad` writes per style.
+            light_ofs: if lit.is_some() { 4 } else { -1 },
             area: 4096.0,
             lightmap_mins: [0, 0],
             lightmap_size: [1, 1],
@@ -823,6 +1053,31 @@ pub(crate) fn one_face_bsp() -> Vec<u8> {
         })
         .to_vec(),
     ));
+    if lit.is_some() {
+        // One average colour, then 4 luxels per block. Each block is a
+        // distinguishable flat grey: 1, 2, 3, 4 at exponent 0.
+        let blocks = if bumped { 4 } else { 1 };
+        let mut lighting = vec![ColorRgbExp32 {
+            r: 1,
+            g: 1,
+            b: 1,
+            exponent: 0,
+        }];
+        for block in 0..blocks {
+            let value = (block + 1) as u8;
+            lighting.extend([ColorRgbExp32 {
+                r: value,
+                g: value,
+                b: value,
+                exponent: 0,
+            }; 4]);
+        }
+        lumps.push((
+            LUMP_LIGHTING_HDR,
+            bytemuck::cast_slice(&lighting).to_vec(),
+        ));
+    }
+
     lumps.push((
         LUMP_MODELS,
         bytemuck::bytes_of(&Model {

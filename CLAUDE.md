@@ -49,11 +49,12 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 252 tests), and the binary now **runs and
+There is a unit test suite (`cargo test`, 275 tests), and the binary now **runs and
 loads a map**: it mounts the game filesystem, opens a window, runs an engine frame loop
-with a real host state machine, reads a Portal 2 `.bsp`, and draws its world geometry.
-It is **not a runnable game** — there is no input, simulation, sound or netcode — but the
-boot path is continuous from `main` to a rendered level.
+with a real host state machine, reads a Portal 2 `.bsp`, packs its baked lightmaps into an
+atlas, and draws its world geometry **lit**. It is **not a runnable game** — there is no
+input, simulation, sound or netcode — but the boot path is continuous from `main` to a
+rendered, lit level.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -62,11 +63,13 @@ cargo run --release -- -basedir /path/to/game -game portal2 -window +map sp_a1_i
 cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
 
-**Most of what a map draws is the magenta error checkerboard**, and that is expected, not
-a bug: 62 of `sp_a1_intro1`'s 66 world materials name `LightmappedGeneric`, which is not
-written yet (the shader set is one deep). `tools/toolsblack` and `vgui/white` are real
-`UnlitGeneric` materials in the shipped content. The camera **turns slowly on the spot**
-because there is no input yet; that is a placeholder and is documented as one.
+**`sp_a1_intro1` draws lit**: 5,512 of 5,638 faces, 58 of its 66 materials resolving,
+4,828 surfaces with real baked lighting over 12 atlas pages. The 8 materials that still
+draw as the magenta error checkerboard are `maps/<map>/…` cubemap patches living in the
+`.bsp`'s embedded pak lump, which the `Vfs` does not mount yet. The scene is **dimmer than
+the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
+unexposed. The camera **turns slowly on the spot** because there is no input yet; that is
+a placeholder and is documented as one.
 
 Verification is otherwise still mostly against the reference: read `legacy/`, compare
 behavior, reason it through. There is no hybrid binary to run.
@@ -120,7 +123,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-4 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-5 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
@@ -140,23 +143,31 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   saved and restored, so a target, a camera and a viewport are the arguments to opening
   one, and nesting becomes sequencing. `glam` arrives here as the `mathlib` substitution.
   `-vmt <name>` draws two cubes and a ground quad; that switch and
-  `preview.rs` are the verification path and are deleted when map loading lands.
-  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the four
+  `preview.rs` hold the nineteen GPU tests and stay until something else can run them
+  against real pixels. Stage 5 added lightmaps: `lightmap` (a faithful `CImagePacker`
+  port, `Rgba16Float` atlas pages of linear radiance, the `ColorRGBExp32` decode and the
+  bumped-lightmap correction), `mesh::WorldVertex`, a fourth bind group holding the atlas
+  page, and `LightmappedGeneric` in WGSL — flat and radiosity-normal-mapped.
+  **API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the five
   conventions that produce a plausible wrong picture rather than an error: **matrices are
-  column-major and multiply on the left** (Valve's are the reverse on both counts);
-  **`ColorSpace` is a load-time decision the shader makes**, because Valve made it
-  per-sampler in the shader; **per-draw constants need distinct arena slots**, because
-  `Queue::write_buffer` stages its copy ahead of the whole command buffer and a rewritten
-  uniform would reach every draw in the frame; and **`glam`'s `near`/`far` are distances
-  along `-z`**, so a hand-built projection can silently invert the depth comparison.
+  column-major and multiply on the left** (Valve's are the reverse on both counts); **a
+  lightmap sample decodes with `TexLightToLinear`, not `ColorRGBExp32ToVector`**, which is
+  the same thing times 255 and gives a uniformly white screen; **`ColorSpace` is a
+  load-time decision the shader makes**, because Valve made it per-sampler in the shader;
+  **per-draw constants need distinct arena slots**, because `Queue::write_buffer` stages
+  its copy ahead of the whole command buffer and a rewritten uniform would reach every
+  draw in the frame; and **`glam`'s `near`/`far` are distances along `-z`**, so a
+  hand-built projection can silently invert the depth comparison.
   Plan: `portdocs/MATERIALSYSTEM.md`.
-  Stages 5-8 (lightmaps, the rest of the shader set, paint maps) are not started, and
-  stage 5 is gated on map loading. Still settled for those: the shaders are
-  **rewritten in WGSL** from the `.fxc` HLSL in `stdshaders/`, and
-  Valve's static/dynamic shader-combo system is deleted with them — `UnlitGeneric`
-  needed no source-text variants at all, so §10's "how are variants expressed" question
-  is still open and still unforced.
-- **`src/engine/` — 3 of 13 modules ported: `window/`, `host/`, `world/`'s geometry**
+  Stages 6-8 (the rest of the shader set, paint maps, GPU morph) are not started. Still
+  settled for those: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in
+  `stdshaders/`, and Valve's static/dynamic shader-combo system is deleted with them —
+  two shaders in, neither needed a source-text variant, so §10's "how are variants
+  expressed" question is still open and still unforced. **`LightmappedGeneric` was
+  expected to force it and did not**: bumped and unbumped share one vertex layout, because
+  the bumped diffuse path never leaves tangent space.
+- **`src/engine/` — 3 of 13 modules ported: `window/`, `host/`, `world/`'s geometry and
+  lightmaps**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 13 surviving, ~45,700 lines deleted outright.
@@ -165,12 +176,16 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `FilterTime`'s policy; it depends on `std` alone, because loading a level is a `Level`
   trait, and is tested without a GPU. **`CEngine`'s outer `m_nDLLState`/`m_nQuitting`
   machine is deleted** — quit-vs-restart is a return value that reaches the launcher as
-  `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks and groups
-  faces into per-material batches at load. The **`winit` control-flow inversion is
+  `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks, packs each
+  surface's baked light into the material system's lightmap atlas, and groups faces into
+  per-(material, page) batches at load — which is exactly what Valve's *sort ID* was.
+  **Materials are resolved before the geometry**, because a surface's vertex layout comes
+  from its shader and how wide a lightmap block it reserves comes from whether its
+  material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
   resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
   (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
   Not implemented: input, simulation, visibility, collision, displacements, brush
-  entities, static props, lightmaps, the skybox.
+  entities, static props, the skybox, dynamic lights and lightstyle animation.
   **The one divergence that will bite:** world triangles are emitted with their **winding
   reversed**, because Valve's `D3DCULL_CCW` and this port's `front_face: Ccw` read
   identically and are not the same thing (GL's framebuffer is Y-up, WebGPU's is Y-down,
@@ -179,10 +194,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: **input**, then **`console/`** (now earned —
-`map`, `fps_max`, `restart` and `quit` all exist as engine operations with no way to type
-them), then **`materialsystem` stage 5** (lightmaps), which is no longer blocked and has
-the highest visual return of anything outstanding.
+Next on the boot path per `PORTING.md`: **input** (planned in
+`portdocs/ENGINE_INPUT.md`), then **`console/`** (now earned — `map`, `fps_max`, `restart`
+and `quit` all exist as engine operations with no way to type them). `materialsystem`
+stage 6 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked,
+but not on the boot path.
 
 ### Known warts, and what triggers fixing them
 

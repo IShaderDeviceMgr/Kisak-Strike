@@ -348,8 +348,8 @@ Rules of thumb:
   groundwork — stages 1-4 of `portdocs/MATERIALSYSTEM.md` §9: a cleared window with the
   frame boundary the host loop has to fit, the texture path, the material path, and the
   meshes and render context designed against the engine's real draw paths — is done. The
-  next material-system stage is lightmaps, which needs a `.bsp`, so the host loop and map
-  loading came first. Both have since landed, so stage 5 is unblocked.*
+  next material-system stage was lightmaps, which needs a `.bsp`, so the host loop and map
+  loading came first; stage 5 has since landed on top of them.*
 - **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
   (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
   of the raw line count evaporates this way — roughly half of the compiled
@@ -485,9 +485,16 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   ahead of the whole command buffer and a rewritten uniform would reach every draw in the
   frame. Not yet: input, the engine tick, MSAA, stencil, exclusive fullscreen modes,
   `mat_picmip`, and texture streaming.
-- **`materialsystem` (stages 5-8) — documented, not started.** Stage 5 (lightmaps) is
-  gated on map loading, so the next thing on the boot path is the engine host loop rather
-  than another material-system stage.  `portdocs/MATERIALSYSTEM.md`: inventory,
+- **`materialsystem` stage 5 (lightmaps) — done; stages 6-8 documented, not started.**
+  A faithful `CImagePacker` port, `Rgba16Float` atlas pages holding linear radiance, the
+  `ColorRGBExp32` decode and the bumped-lightmap correction, and `LightmappedGeneric` in
+  WGSL — flat and radiosity-normal-mapped. A draw batch is now a (material, lightmap page)
+  pair, which is what Valve's *sort ID* was, and the page is bind group 3 rather than part
+  of the material, because one material spans as many pages as its surfaces needed.
+  **Portal 2 ships HDR-only maps** (`sp_a1_intro1`'s `LUMP_LIGHTING` is empty), which
+  narrows the HDR open question to the render path: the lightmaps are HDR either way, and
+  what is still missing is a float target and a tone mapper.
+  `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the
   "rendering" step of the boot path below** — there is no separate renderer. Settled: the
@@ -524,9 +531,9 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   into `Pod` structs transcribed from `public/bspfile.h`, then grouped into per-material
   batches at load rather than re-sorted per frame. The hunk allocator (`zone.cpp`,
   `mem.cpp`) is deleted as planned — `Vec` and `Drop` are what it was for. **`+map
-  sp_a1_intro1` draws the Portal 2 intro room**, at 5,512 of 5,638 faces and 14.5k
-  triangles. Not loaded: visibility (every face is drawn every frame), collision,
-  displacements, brush entities, static props, lightmaps, the 3D skybox.
+  sp_a1_intro1` draws the Portal 2 intro room, lit**, at 5,512 of 5,638 faces and
+  14.5k triangles, with 4,828 surfaces carrying real baked lighting over 12 atlas pages. Not loaded: visibility (every face is drawn every frame), collision,
+  displacements, brush entities, static props, the 3D skybox, dynamic lights.
 
   **One divergence that is not cosmetic**, recorded in full in `rustdocs/ENGINE.md`
   gotcha #1: **world triangles are emitted with their winding reversed.** Valve's
@@ -543,9 +550,10 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
 **Next on the boot path:** input (the largest remaining gap in `window/`, and what
 retires the placeholder turntable camera), then `console/` — now genuinely earned, since
 `map`, `fps_max`, `restart` and `quit` all exist as engine operations with no way to type
-them — then `materialsystem` stage 5 (lightmaps), which is no longer blocked and has the
-highest visual return of anything outstanding: it is what turns 62 of `sp_a1_intro1`'s 66
-materials from magenta checkerboard into content.
+them. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
+visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
+magenta checkerboard into lit content.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`

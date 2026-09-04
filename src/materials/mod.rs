@@ -12,7 +12,7 @@
 //!
 //! # Status
 //!
-//! Stages 1 to 3 of `portdocs/MATERIALSYSTEM.md` §9.
+//! Stages 1 to 5 of `portdocs/MATERIALSYSTEM.md` §9.
 //!
 //! - [`Renderer`] brings up the GPU and owns the frame boundary.
 //! - [`Vtf`](vtf::Vtf) reads `.vtf` files,
@@ -24,9 +24,10 @@
 //! - [`Vmt`](vmt::Vmt) reads `.vmt` files, [`MaterialVar`](var::MaterialVar)
 //!   holds what they say, and [`MaterialCache`] turns a material name into a
 //!   [`Material`] — or into the error material, likewise.
-//! - [`ShaderKind`](shader::ShaderKind) is the shader set, one deep so far:
-//!   `UnlitGeneric`, written in WGSL against the constant ABI in [`uniforms`]
-//!   and compiled through the cache in [`pipeline`].
+//! - [`ShaderKind`](shader::ShaderKind) is the shader set, two deep so far:
+//!   `UnlitGeneric` and `LightmappedGeneric`, written in WGSL against the
+//!   constant ABI in [`uniforms`] and compiled through the cache in
+//!   [`pipeline`].
 //! - [`mesh`] is geometry: [`SimpleVertex`](mesh::SimpleVertex) and the
 //!   [`VertexLayout`](mesh::VertexLayout) a shader declares,
 //!   [`VertexBuffer`](mesh::VertexBuffer)/[`IndexBuffer`](mesh::IndexBuffer)
@@ -41,11 +42,21 @@
 //! - [`MaterialPreview`] draws one material on a cube. That is a
 //!   *verification* path, not a scene graph; see its docs.
 //!
-//! Stage 5 (lightmaps) is not started, and needs map loading before it.
+//! - [`lightmap`] packs a map's baked light samples into atlas pages:
+//!   [`ImagePacker`](lightmap::ImagePacker) is `CImagePacker`,
+//!   [`LightmapAtlas`](lightmap::LightmapAtlas) is the CPU half and
+//!   [`LightmapPages`](lightmap::LightmapPages) the GPU one, and a page is
+//!   bound per batch with
+//!   [`Pass::bind_lightmap_page`](context::Pass::bind_lightmap_page) rather
+//!   than living in a material.
+//!
+//! Stages 6-8 (the rest of the shader set, paint maps, GPU morph) are not
+//! started.
 
 pub mod context;
 pub mod error;
 pub mod image_format;
+pub mod lightmap;
 pub mod material;
 pub mod mesh;
 pub mod pipeline;

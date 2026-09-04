@@ -6,14 +6,16 @@ module into 23 subsystems, 13 of which become modules here. **Three exist so far
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry done; no visibility, collision or props |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window + event loop done; input not started |
 | `net/`, `console/`, `client/`, `server/`, `audio/`, … | the other 10 | not started |
 
-The binary now loads a real Portal 2 `.bsp` and draws it. Most of what it draws is the
-magenta error checkerboard, because most Portal 2 world materials name
-`LightmappedGeneric` and the shader set is still one deep — see
-[Known limits](#known-limits-of-what-is-drawn).
+The binary now loads a real Portal 2 `.bsp` and draws it **lit**: base textures multiplied
+by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` that is
+5,512 of 5,638 faces over 77 batches, 58 of its 66 materials resolving, and 4,828 surfaces
+with real lighting across 12 atlas pages. What is still missing is listed under
+[Known limits](#known-limits-of-what-is-drawn); the largest items are visibility (every
+face is drawn every frame), displacements, props and input.
 
 ---
 
@@ -181,8 +183,8 @@ A loaded map and the geometry it draws.
 | | |
 |---|---|
 | Module | `crate::engine::world` |
-| Lines | ~1,600 including tests |
-| Tests | 20 (`cargo test engine::world`) |
+| Lines | ~2,000 including tests |
+| Tests | 23 (`cargo test engine::world`) |
 | Dependencies | `bytemuck`, `glam`, `crate::filesystem`, `crate::materials` |
 
 ### `World`
@@ -202,6 +204,8 @@ pub struct World {
     pub bounds: (Vec3, Vec3),
     pub spawn: Option<Spawn>,
     pub sky_name: Option<String>,
+    pub lighting_is_hdr: bool,
+    pub lightmaps: LightmapPages,
     pub stats: WorldStats,
 }
 ```
@@ -211,20 +215,35 @@ into the one step that currently has meaning. **A material that fails to load is
 error** — `MaterialCache::load` cannot fail — so the only failures are a missing or
 malformed `.bsp`.
 
-`draw` records every batch with an identity model matrix: world geometry is already in
-world space, which is the whole difference between the world model and the brush models
-that are not drawn yet.
+`draw` binds each batch's lightmap page and then records the batch with an identity model
+matrix: world geometry is already in world space, which is the whole difference between
+the world model and the brush models that are not drawn yet.
+
+**Materials are resolved before the geometry is built**, which is forced rather than
+stylistic: a surface's vertex layout comes from the shader its material named, and how
+wide a lightmap block it reserves comes from whether that material has a `$bumpmap`
+(`RegisterLightmappedSurface`, `gl_matsysiface.cpp:216`). Neither is answerable from the
+`.bsp`. `load` therefore groups faces by material name, loads every material, and only
+then packs lightmaps and emits vertices.
 
 ### `Batch`
 
 ```rust
 pub struct Batch {
     pub material: Arc<Material>,
+    pub lightmap_page: u32,
     // private: one VertexBuffer, one IndexBuffer
 }
 ```
 
-Every face sharing a material, up to 65,536 vertices. Both halves are **static**, which
+**A batch is a (material, lightmap page) pair**, which is exactly Valve's *sort ID*:
+`AllocateLightmap` returns one and increments it whenever either half changes
+(`cmatlightmaps.cpp:306`), because the page is one texture binding and cannot vary within
+a draw. A material whose surfaces did not all fit on one atlas page is several batches,
+emitted in page order. On `sp_a1_intro1` that is 77 batches for 66 materials over 12
+pages.
+
+Every face sharing a material and a page, up to 65,536 vertices. Both halves are **static**, which
 is a deliberate difference from the engine: Valve keeps static vertices and gathers the
 *visible* faces' indices into a dynamic buffer each frame from the PVS
 (`gl_rsurf.cpp:1168`). There is no visibility here yet, so every face is drawn every
@@ -247,8 +266,16 @@ pub struct WorldStats {
     pub triangles: usize,
     pub materials: usize,
     pub materials_missing: usize,     // resolved to the error checkerboard
+    pub faces_lit: usize,             // got a real lightmap block
+    pub faces_fullbright: usize,      // wanted one and could not have one
+    pub faces_with_lightstyles: usize,// more than style 0; only style 0 is baked
+    pub lightmap_pages: usize,        // including the 1x1 white page
 }
 ```
+
+`faces_lit + faces_fullbright` does not reach `faces_drawn`: the difference is the faces
+whose *material* is not lit at all — tool textures, and anything that fell back to the
+error material. Those never ask for a block, so neither counter moves.
 
 `Spawn` is `info_player_start`'s origin raised by `VEC_VIEW` (64 units) — the entity's
 origin is at the player's feet, and a camera placed there looks at the floor.
@@ -272,6 +299,9 @@ pub struct Bsp {
     pub texdata: Vec<TexData>,
     pub texdata_string_table: Vec<String>,
     pub models: Vec<Model>,
+    pub lighting: Vec<ColorRgbExp32>,
+    pub lighting_is_hdr: bool,
+    pub level_flags: u32,
 }
 
 pub fn world_model(&self) -> &Model;
@@ -279,8 +309,24 @@ pub fn model_faces(&self, model: &Model) -> &[Face];
 pub fn face_material(&self, face: &Face) -> Option<&str>;
 pub fn face_vertices(&self, face: &Face) -> impl Iterator<Item = Vec3> + '_;
 pub fn texture_coordinate(&self, face: &Face, position: Vec3) -> [f32; 2];
+pub fn lightmap_coordinate(&self, face: &Face, position: Vec3) -> [f32; 2];  // in luxels
+pub fn face_lightmap_samples(&self, face: &Face) -> Option<&[ColorRgbExp32]>;
+pub fn face_lightmap_blocks(&self, face: &Face) -> u32;   // 1, or 4 for SURF_BUMPLIGHT
+pub fn face_lightmap_size(face: &Face) -> (u32, u32);     // extents + 1, in luxels
+pub fn face_lightstyle_count(face: &Face) -> usize;
 pub fn entities(&self) -> Vec<Entity>;
 ```
+
+**Which lighting lump, and which faces lump, are one decision.** `LUMP_LIGHTING_HDR` wins
+whenever it is non-empty, and `LUMP_FACES_HDR` comes with it — the HDR faces carry
+different `light_ofs` values, and in an HDR-only map the LDR ones are meaningless.
+`sp_a1_intro1` is exactly that: `LUMP_LIGHTING` is empty, and every face in `LUMP_FACES`
+has `light_ofs` 0. `Mod_LoadFaces` (`modelloader.cpp:2188`) makes the same choice.
+
+`face_lightmap_samples` returns **lightstyle 0 only**, and `light_ofs` needs no adjusting
+to find it: `vrad` writes one average colour per style *ahead* of the samples and points
+`light_ofs` past them. Verified against `sp_a1_intro1`, where consecutive faces' offsets
+differ by exactly the sample bytes plus the next face's average colours.
 
 Versions 19–21 are accepted (`MINBSPVERSION`/`BSPVERSION`); Portal 2 ships 21. The record
 structs are `#[repr(C)]` + `bytemuck::Pod` transcriptions of `public/bspfile.h`, and their
@@ -335,7 +381,18 @@ Ordered by how likely each is to bite.
    bounds. Valve validated lump *counts* and trusted the indices.
 8. **A batch splits at 65,536 vertices**, before the face that would overflow and never
    in the middle of one, because a face's vertices must be contiguous for its fan.
-9. **LZMA-compressed lumps are refused, not decoded.** Console builds compress
+9. **A face's lightmap stride comes from `SURF_BUMPLIGHT`, not from its material.** The
+   flag is the file describing its own layout; Valve re-derives the same answer from the
+   live material and reads the lump at the wrong stride if a `.vmt` changed after the map
+   was compiled. Checked against `sp_a1_intro1`: the flag agrees with the byte spacing
+   between consecutive light offsets on all 4,982 lit faces, with zero disagreements. How
+   wide a block to *reserve* still comes from the material, because that is what keeps one
+   material's surfaces sampling the same way — `LightmapAtlas::write` reconciles the two.
+10. **A map with `LVLFLAGS_LIGHTMAP_ALPHA` is refused, not misread.** That CS:GO-era flag
+   interleaves a cascaded-shadow term between every face's samples, changing the stride
+   for the whole lump. Portal 2 does not set it (`sp_a1_intro1`'s `LUMP_MAP_FLAGS` is 2,
+   the baked-static-prop-lighting bit alone), and reading past it would draw noise.
+11. **LZMA-compressed lumps are refused, not decoded.** Console builds compress
    individual lumps and stash the uncompressed size in the unused `fourCC`
    (`bsplib.cpp:5513`). Consoles are out of scope, and the alternative is reading
    compressed bytes as geometry and drawing noise.
@@ -346,8 +403,9 @@ Not bugs; each names what it waits on.
 
 | Not drawn | Why |
 |---|---|
-| **Most world materials** | 62 of `sp_a1_intro1`'s 66 name `LightmappedGeneric`, which is not written. They are the magenta checkerboard. This is the single biggest visual gap and it closes with `materialsystem` stage 5. |
-| Lightmaps | `LUMP_LIGHTING` is read by stage 5. Everything is fullbright. |
+| Materials patched into the `.bsp` | 8 of `sp_a1_intro1`'s 66 are `maps/<map>/…` cubemap patches that live in the `.bsp`'s embedded pak lump, which `Vfs` does not mount. They are the magenta checkerboard; the rest resolve. |
+| Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
+| Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
 | Displacements | Geometry lives in `LUMP_DISPINFO`/`LUMP_DISP_VERTS`; `world/disp/` (§7.15). Counted in `WorldStats::faces_displaced`. |
 | Brush entities (models 1..n) | Positioned by the entity that names them, so they need the entity system, not just the lump. |
 | Static props, `.mdl` models | `staticpropmgr.cpp`, `studiorender`. |
@@ -369,6 +427,13 @@ conversion. `angles` are Valve's `(pitch, yaw, roll)` and **pitch is positive do
 
 The turntable goes away with the first commit that can move the view, and takes
 `Engine::camera` with it — `CViewRender::SetUpView` is its real replacement.
+
+**A black screen on some maps is this, not a lighting bug.** `info_player_start` is only
+where the *engine* puts the player; several Portal 2 maps spawn inside a sealed box in the
+void and rely on a VScript to teleport the player into the level. `sp_a2_laser_intro` is
+one. Until entities and scripting exist there is nothing to run that teleport, so the
+camera sits in the box and sees its inside faces. `sp_a1_intro1` spawns in the room it
+draws and is the map to check a rendering change against.
 
 ## Open question: the culling convention
 

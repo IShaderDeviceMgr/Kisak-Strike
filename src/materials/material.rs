@@ -33,7 +33,7 @@ use crate::filesystem::{keyvalues, Vfs};
 
 use super::error::VmtError;
 use super::pipeline::{BindLayouts, PipelineCache, RenderState};
-use super::shader::{self, ShaderKind};
+use super::shader::{self, Lighting, ShaderKind};
 use super::texture::{Texture, TextureCache};
 use super::var::MaterialFlags;
 use super::vmt::Vmt;
@@ -54,6 +54,16 @@ pub struct Material {
     /// multiplies it by a per-instance modulation before it reaches the GPU,
     /// which is why it is not baked into the material's own uniform block.
     pub modulation: [f32; 4],
+
+    /// How this material is lit, and therefore how wide a lightmap block its
+    /// surfaces reserve in the atlas.
+    ///
+    /// `IMaterial::GetPropertyFlag( MATERIAL_PROPERTY_NEEDS_LIGHTMAP )` and
+    /// `..._NEEDS_BUMPED_LIGHTMAPS` (`cmaterial.cpp:2946`) as one answer,
+    /// because the two are never asked separately: `RegisterLightmappedSurface`
+    /// (`gl_matsysiface.cpp:216`) asks the second only after the first said
+    /// yes. See [`Lighting`].
+    pub lighting: Lighting,
 
     /// Kept so the views the bind group holds stay alive.
     #[allow(dead_code)]
@@ -132,6 +142,10 @@ impl Material {
                 let block = shader::unlit_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
+            ShaderKind::LightmappedGeneric => {
+                let block = shader::lightmapped_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
         };
         entries.push(wgpu::BindGroupEntry {
             binding: shader::BINDING_MATERIAL_UNIFORMS,
@@ -165,6 +179,7 @@ impl Material {
             flags: vmt.flags,
             state: shader::render_state(shader, vmt, base_texture),
             modulation: shader::modulation_color(shader, vmt),
+            lighting: shader::lighting(shader, vmt),
             textures: textures.into_iter().map(|(_, texture)| texture).collect(),
             uniforms,
             bind_group,
@@ -253,6 +268,24 @@ impl MaterialCache {
             materials: HashMap::new(),
             error: Arc::new(error),
         }
+    }
+
+    /// The queue the cache uploads through.
+    ///
+    /// Exposed for the lightmap atlas, which is built by `src/engine/world/`
+    /// against this cache's bind group layouts and so has to upload through
+    /// the same device. It is a cheap refcounted handle, not ownership.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The bind group layouts every pipeline is built against.
+    ///
+    /// Immutable, unlike [`pipelines`](MaterialCache::pipelines), so that a
+    /// caller can hold it alongside [`queue`](MaterialCache::queue) — which the
+    /// lightmap atlas needs, since building a page's bind group takes both.
+    pub fn layouts(&self) -> &BindLayouts {
+        self.pipelines.layouts()
     }
 
     /// The pipeline cache. A caller needs it at draw time to turn a material's

@@ -251,6 +251,22 @@ pub struct RenderContext {
     /// One slot per draw.
     draws: UniformArena,
     dynamic: DynamicBuffers,
+    /// Group 3 for a pass that has not bound a real lightmap page.
+    ///
+    /// `MATERIAL_SYSTEM_LIGHTMAP_PAGE_WHITE`, which `AllocateWhiteLightmap`
+    /// (`cmatlightmaps.cpp:562`) hands to unlit surfaces. A lit shader with no
+    /// page bound is a caller mistake, but the cheap answer to it is fullbright
+    /// rather than a `wgpu` validation error, and the white page is what the
+    /// engine binds for exactly that case anyway.
+    white_lightmap: WhiteLightmap,
+}
+
+/// The one-texel white page and the bind group over it.
+struct WhiteLightmap {
+    /// Held so the view the bind group refers to stays alive.
+    #[allow(dead_code)]
+    texture: super::texture::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 // `target_pass` and `offscreen_pass` are the render-target half of stage 4 and
@@ -265,6 +281,7 @@ impl RenderContext {
     ) -> RenderContext {
         let layouts = pipelines.layouts();
         RenderContext {
+            white_lightmap: white_lightmap(device, queue, layouts),
             frames: UniformArena::new(
                 device,
                 "frame uniforms",
@@ -435,7 +452,55 @@ impl RenderContext {
             pipelines,
             target,
             overrides: StateOverride::default(),
+            white_lightmap: self.white_lightmap.bind_group.clone(),
+            lightmap: None,
         }
+    }
+}
+
+/// Builds [`RenderContext::white_lightmap`]: one opaque white texel in the
+/// page format, so that binding it is indistinguishable from binding a real
+/// page whose surface happens to be fullbright.
+fn white_lightmap(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layouts: &super::pipeline::BindLayouts,
+) -> WhiteLightmap {
+    // 1.0 as IEEE binary16, four channels. Matches `lightmap`'s page 0.
+    const ONE: u16 = 0x3C00;
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("white lightmap"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..wgpu::SamplerDescriptor::default()
+    });
+    let texture = super::texture::Texture::from_pixels(
+        device,
+        queue,
+        "white lightmap",
+        1,
+        1,
+        wgpu::TextureFormat::Rgba16Float,
+        bytemuck::cast_slice(&[ONE; 4]),
+        sampler,
+    );
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("white lightmap"),
+        layout: layouts.lightmap(),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(texture.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(texture.sampler()),
+            },
+        ],
+    });
+    WhiteLightmap {
+        texture,
+        bind_group,
     }
 }
 
@@ -458,6 +523,11 @@ pub struct Pass<'a> {
     dynamic: &'a mut DynamicBuffers,
     target: TargetFormat,
     overrides: StateOverride,
+    /// The fallback for a lit draw with no page bound. Cloned for the same
+    /// reason `frame_bind_group` is.
+    white_lightmap: wgpu::BindGroup,
+    /// The page [`bind_lightmap_page`](Pass::bind_lightmap_page) last named.
+    lightmap: Option<wgpu::BindGroup>,
 }
 
 // Viewport, scissor and depth range are per-pass state the engine sets and
@@ -493,6 +563,21 @@ impl Pass<'_> {
     /// `m_ScissorRectStack`'s entry, with the stack replaced by the pass.
     pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) {
         self.pass.set_scissor_rect(x, y, width, height);
+    }
+
+    /// Binds the lightmap atlas page every subsequent lit draw samples.
+    ///
+    /// `IMatRenderContext::BindLightmapPage( lightmapPageID )`, which the world
+    /// draw calls once per sort ID before the batch that uses it
+    /// (`gl_rsurf.cpp:1150`). It is render-context state rather than a material
+    /// property because it is not one: a material's surfaces are spread over
+    /// however many atlas pages the packer needed.
+    ///
+    /// Applies from here to the end of the pass, like
+    /// [`set_state_override`](Pass::set_state_override). Draws of a shader that
+    /// does not read a lightmap ignore it.
+    pub fn bind_lightmap_page(&mut self, page: &super::lightmap::LightmapPage) {
+        self.lightmap = Some(page.bind_group().clone());
     }
 
     /// Overrides part of every subsequent draw's pipeline state.
@@ -614,6 +699,13 @@ impl Pass<'_> {
         self.pass.set_bind_group(1, material.bind_group(), &[]);
         self.pass
             .set_bind_group(2, self.draws.bind_group(), &[offset]);
+        if material.shader.reads_lightmap() {
+            self.pass.set_bind_group(
+                3,
+                self.lightmap.as_ref().unwrap_or(&self.white_lightmap),
+                &[],
+            );
+        }
         self.pass.set_vertex_buffer(0, vertices.buffer_slice());
         self.pass
             .set_index_buffer(indices.buffer_slice(), wgpu::IndexFormat::Uint16);

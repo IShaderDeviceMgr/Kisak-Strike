@@ -252,6 +252,12 @@ decoded from a bitfield at runtime. What *does* carry across:
 
 ### 4.5 Textures and lightmaps
 
+*The lightmap half is ported; see `../rustdocs/MATERIALS.md`'s "Lightmaps" section. The
+instruction below to port the packing faithfully was followed, and the reason turned out
+to be sharper than stated: the page and the offset within it are not merely baked into
+BSP-derived draw data, they are computed from the packer at load and* become *the texture
+coordinates.*
+
 - `ctexture.cpp` / `texturemanager.cpp` — a name→texture dictionary with refcounting,
   VTF loading, mipmap handling, render-target creation, procedural (CPU-written)
   textures, the error checkerboard, and texture exclusion/streaming lists.
@@ -749,17 +755,68 @@ milestone the project has.
    multiple colour attachments, 32-bit indices, stencil operations, and the `WorldVertex`
    and `ModelVertex` structs — whose layouts are enumerated on `VertexLayout` but which
    arrive with the shaders that read them.
-5. **Lightmaps.** `imagepacker` port, atlas pages, `colorspace` math, then
-   `LightmappedGeneric`. **Deliverable: a lit BSP surface.** (Requires BSP loading, so
-   this stage is gated on map loading landing.)
-6. **`VertexLitGeneric` + the remaining core shader set** (§7).
+5. ~~**Lightmaps.**~~ **Done.** `imagepacker` port, atlas pages, the `colorspace` math,
+   and `LightmappedGeneric` — flat *and* bumped. Landed as `src/materials/lightmap.rs`
+   plus `shaders/lightmappedgeneric.wgsl`, `mesh::WorldVertex`, a fourth bind group, and
+   the atlas driving in `src/engine/world/`. **Deliverable met:** `sp_a1_intro1` draws
+   5,512 faces with real baked lighting — 4,828 lit surfaces over 12 atlas pages, 58 of
+   66 materials resolving where 4 did before. **API: `../rustdocs/MATERIALS.md`.**
+
+   Decisions made here that the later stages inherit:
+
+   - **Portal 2 ships HDR-only maps, so the LDR lightmap path is not available.**
+     `sp_a1_intro1.bsp` has an empty `LUMP_LIGHTING` and 5.4 MB of `LUMP_LIGHTING_HDR`,
+     and its `LUMP_FACES` entries all carry `light_ofs` 0 — only `LUMP_FACES_HDR` is
+     meaningful. This *narrows* §10's HDR question rather than answering it: the
+     lightmaps are HDR, the render path still is not, so `cLightScale` is 1.0 and a map
+     is as bright as `vrad` left it. The float-target-and-tonemap half is still open.
+   - **A page is `Rgba16Float` holding linear radiance.** Of Valve's three page formats
+     the HDR-float one is the only one whose contents are just the numbers
+     (`GetLightMapScaleFactor` is 1.0 for it against 16.0 for HDR-integer), and
+     `Rgba16Float` is the only float format filterable at §4.6's capability tier.
+   - **`CImagePacker` is ported line for line, edge cases included** — the `>=` in
+     `GetMaxYIndex` and the off-by-one in the height test. It is not an implementation
+     detail: the page a surface lands on and its offset within that page *are* its
+     texture coordinates, so a different packer is a different atlas, a different page
+     count and a different number of draw batches.
+   - **A batch is a (material, lightmap page) pair, which is what a sort ID was.**
+     `AllocateLightmap`'s material-change rule — close every open page but the last —
+     is kept, because it is what makes that pair coarse.
+   - **The lightmap page is bind group 3, not part of the material.** One material spans
+     as many pages as its surfaces needed, so the page is per batch;
+     `Pass::bind_lightmap_page` is `IMatRenderContext::BindLightmapPage`. Group 3 was
+     reserved for skinning in stage 4 and is declared only by shaders that read a
+     lightmap, since a pipeline layout is per shader.
+   - **Bumpedness is read from the `.bsp`'s `SURF_BUMPLIGHT`, not re-derived from the
+     material.** Valve does the latter and therefore reads the lighting lump at the wrong
+     stride if a `.vmt` changed after the map was compiled. The flag agrees with the data
+     on all 4,982 of `sp_a1_intro1`'s lit faces. How wide a block to *reserve* still comes
+     from the material, and the two are reconciled rather than assumed equal.
+   - **Only lightstyle 0 is baked.** The other three are switchable and animated lights,
+     which need `LightStyleValue` and a per-frame page rebuild — the whole dynamic
+     lighting path. `WorldStats::faces_with_lightstyles` counts what this understates.
+
+   **The finding that corrects §10, and the one that cost the most:** a lightmap sample
+   decodes with `TexLightToLinear` (`c * 2^e / 255`), **not** `ColorRGBExp32ToVector`,
+   which is the same thing times 255. The second is the obvious-looking "decode this
+   colour", sits immediately below the table, and carries Valve's own *"FIXME: Why is
+   there a factor of 255 built into this?"*. It is for world-light intensities and ambient
+   cubes; the lightmap path calls the first directly (`gl_lightmap.cpp:572`). Getting it
+   wrong is a uniformly white screen — no error, no warning, and plausible from either
+   end. It was found by taking a screenshot.
+
+   Still owed from this stage: dynamic lights and lightstyle animation, the last page's
+   `GetMinimumDimensions` shrink, and everything `LightmappedGeneric` can do past a base
+   texture, a bump map and a lightmap (`$basetexture2` blending, detail, envmap,
+   selfillum, phong, seamless, flashlight, CSM, paint).
+6. **`VertexLitGeneric` + the remaining core shader set** (§7). This is where the vertex
+   layout question §10 expected `LightmappedGeneric` to force actually lands — see below.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–4 are done. Stage 5 is **gated on map loading** — there is no lightmap without a
-`.bsp` — so the next thing on the boot path is the engine host loop and map loading, not
-another material-system stage. `PORTING.md`'s ordering rule applies: follow the boot path
-depth-first.
+Stages 1–5 are done. `PORTING.md`'s ordering rule — follow the boot path depth-first —
+puts **input** next, then `console/`; stage 6 is a breadth move and is not gated on
+either.
 
 ## 10. Open questions and risks
 
@@ -793,7 +850,8 @@ depth-first.
   `VERTEX_FORMAT_COMPRESSED` — `VertexLitGeneric` is the first that will
   (`vertexlitgeneric_dx9_helper.cpp:893`) — and `common_vs_fxc.h`'s
   `DecompressBoneWeights` is the other half of the same decision, so **answer it with
-  skinning, not before it**.
+  skinning, not before it**. *Stage 5 update: still open.* `LightmappedGeneric`'s
+  `WorldVertex` is uncompressed and so is Valve's — brush geometry never declared the flag.
 - ~~**Render-target stack semantics.**~~ **Resolved in stage 4, and the answer was
   simpler than the question.** `wgpu` render passes are not nestable, so the stack was
   deleted rather than restructured: a target, a viewport and a camera are the arguments

@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::shader::{
-    ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_MATERIAL_UNIFORMS,
+    ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BUMP_SAMPLER,
+    BINDING_BUMP_TEXTURE, BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE,
+    BINDING_MATERIAL_UNIFORMS,
 };
 
 /// Fixed pipeline state, as a material asks for it.
@@ -217,6 +219,8 @@ pub struct BindLayouts {
     frame: wgpu::BindGroupLayout,
     draw: wgpu::BindGroupLayout,
     unlit_material: wgpu::BindGroupLayout,
+    lightmapped_material: wgpu::BindGroupLayout,
+    lightmap: wgpu::BindGroupLayout,
 }
 
 impl BindLayouts {
@@ -255,6 +259,34 @@ impl BindLayouts {
                     },
                 ],
             }),
+            lightmapped_material: device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material: LightmappedGeneric"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: BINDING_MATERIAL_UNIFORMS,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        texture_entry(BINDING_BASE_TEXTURE),
+                        sampler_entry(BINDING_BASE_SAMPLER),
+                        texture_entry(BINDING_BUMP_TEXTURE),
+                        sampler_entry(BINDING_BUMP_SAMPLER),
+                    ],
+                },
+            ),
+            lightmap: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("lightmap page"),
+                entries: &[
+                    texture_entry(BINDING_LIGHTMAP_TEXTURE),
+                    sampler_entry(BINDING_LIGHTMAP_SAMPLER),
+                ],
+            }),
         }
     }
 
@@ -272,7 +304,42 @@ impl BindLayouts {
     pub fn material(&self, shader: ShaderKind) -> &wgpu::BindGroupLayout {
         match shader {
             ShaderKind::UnlitGeneric => &self.unlit_material,
+            ShaderKind::LightmappedGeneric => &self.lightmapped_material,
         }
+    }
+
+    /// Group 3, for the shaders that read a lightmap page.
+    ///
+    /// One layout rather than one per shader, because the page is not the
+    /// shader's: it is render-context state that several lit shaders will
+    /// share. See
+    /// [`BINDING_LIGHTMAP_TEXTURE`](super::shader::BINDING_LIGHTMAP_TEXTURE).
+    pub fn lightmap(&self) -> &wgpu::BindGroupLayout {
+        &self.lightmap
+    }
+}
+
+/// A filterable 2D texture at `binding`.
+const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// The sampler that goes with it, one binding later.
+const fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
     }
 }
 
@@ -349,15 +416,22 @@ impl PipelineCache {
                 })
         });
 
+        // Group 3 exists only for the shaders that read a lightmap page. A
+        // pipeline layout is per shader, so declaring it unconditionally would
+        // oblige every draw of every shader to bind something there.
+        let mut groups = vec![
+            Some(&self.layouts.frame),
+            Some(self.layouts.material(key.shader)),
+            Some(&self.layouts.draw),
+        ];
+        if key.shader.reads_lightmap() {
+            groups.push(Some(&self.layouts.lightmap));
+        }
         let layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(key.shader.name()),
-                bind_group_layouts: &[
-                    Some(&self.layouts.frame),
-                    Some(self.layouts.material(key.shader)),
-                    Some(&self.layouts.draw),
-                ],
+                bind_group_layouts: &groups,
                 // No immediate (push-constant) data. Everything per-draw is in
                 // group 2, which is what `portdocs/MATERIALSYSTEM.md` §7.4's
                 // frequency split asks for.

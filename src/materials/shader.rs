@@ -77,6 +77,15 @@ pub enum ShaderKind {
     /// is entirely in its texture. The first shader ported, because it is the
     /// smallest thing that exercises the whole path.
     UnlitGeneric,
+
+    /// World brush surfaces: a base texture multiplied by a baked lightmap.
+    /// The shader almost every wall, floor and ceiling in a Source map names —
+    /// 62 of `sp_a1_intro1`'s 66 world materials.
+    ///
+    /// `stdshaders/lightmappedgeneric_dx9.cpp` through
+    /// `lightmappedgeneric_dx9_helper.cpp`, `lightmappedgeneric_vs20.fxc` and
+    /// `lightmappedgeneric_ps2_3_x.h`.
+    LightmappedGeneric,
 }
 
 impl ShaderKind {
@@ -95,6 +104,9 @@ impl ShaderKind {
     pub fn from_name(name: &str) -> Option<ShaderKind> {
         match name {
             n if n.eq_ignore_ascii_case("UnlitGeneric") => Some(ShaderKind::UnlitGeneric),
+            n if n.eq_ignore_ascii_case("LightmappedGeneric") => {
+                Some(ShaderKind::LightmappedGeneric)
+            }
             _ => None,
         }
     }
@@ -103,6 +115,7 @@ impl ShaderKind {
     pub fn name(self) -> &'static str {
         match self {
             ShaderKind::UnlitGeneric => "UnlitGeneric",
+            ShaderKind::LightmappedGeneric => "LightmappedGeneric",
         }
     }
 
@@ -114,11 +127,17 @@ impl ShaderKind {
     /// keeping it there is what lets [`PipelineKey`](super::pipeline::PipelineKey)
     /// stay a `ShaderKind` plus state instead of growing a layout field.
     ///
-    /// It grows a field the day a shader has two layouts. That will be
-    /// `LightmappedGeneric`, whose bumped variant adds tangents and a third
-    /// texture coordinate (`lightmappedgeneric_dx9_helper.cpp:617,672`) — which
-    /// is `portdocs/MATERIALSYSTEM.md` §7.3's bucket 3, and the first real
-    /// pipeline variant this port will have.
+    /// It grows a field the day a shader has two layouts, and
+    /// `portdocs/MATERIALSYSTEM.md` §10 expected `LightmappedGeneric`'s bumped
+    /// variant to be it. **It is not**, and the reason is worth knowing: the
+    /// bumped diffuse path dots a *tangent-space* normal against a constant
+    /// basis (`lightmappedgeneric_ps2_3_x.h:665`) and never needs a
+    /// world-space frame, so the shadow phase adds `VERTEX_TANGENT_S |
+    /// VERTEX_TANGENT_T | VERTEX_NORMAL` only for an `$envmap`
+    /// (`lightmappedgeneric_dx9_helper.cpp:670`). Bumped and unbumped read the
+    /// same layout, and bumped lighting is a flag in a uniform — §7.3's bucket
+    /// 2 rather than bucket 3. The envmap variant is what will force the
+    /// question.
     pub fn vertex_layout(self) -> VertexLayout {
         match self {
             // `unlitgeneric_vs20.fxc`'s `VS_INPUT` also declares `vNormal`,
@@ -126,6 +145,13 @@ impl ShaderKind {
             // — which is what `unlitgeneric_dx9.cpp` asks the shared helper for
             // — nothing reads them.
             ShaderKind::UnlitGeneric => VertexLayout::Simple,
+            // `VertexShaderVertexFormat( VERTEX_POSITION, numTexCoords, 0, 0 )`
+            // (`lightmappedgeneric_dx9_helper.cpp:681`). The third texture
+            // coordinate is the bumped one, and Portal 2 writes it in both
+            // cases anyway — "PORTAL 2 FIX - paint shader assumes it can use 3
+            // lightmapped coordinates in all cases"
+            // (`matsys_interface.cpp:1502`).
+            ShaderKind::LightmappedGeneric => VertexLayout::World,
         }
     }
 
@@ -137,6 +163,7 @@ impl ShaderKind {
     pub fn params(self) -> impl Iterator<Item = &'static ShaderParam> {
         let own = match self {
             ShaderKind::UnlitGeneric => UNLIT_GENERIC_PARAMS,
+            ShaderKind::LightmappedGeneric => LIGHTMAPPED_GENERIC_PARAMS,
         };
         STANDARD_PARAMS.iter().chain(own)
     }
@@ -144,6 +171,15 @@ impl ShaderKind {
     /// The declared parameter of that name, if the shader has one.
     pub fn param(self, name: &str) -> Option<&'static ShaderParam> {
         self.params().find(|p| p.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether draws of this shader bind a lightmap page in group 3.
+    ///
+    /// `IMatRenderContext::BindLightmapPage` applied to every shader whether
+    /// it read one or not; here it decides a pipeline layout, so it has to be
+    /// answerable per shader.
+    pub fn reads_lightmap(self) -> bool {
+        matches!(self, ShaderKind::LightmappedGeneric)
     }
 
     /// The complete WGSL for this shader: the shared prelude, then the body.
@@ -158,6 +194,7 @@ impl ShaderKind {
     pub fn wgsl(self) -> String {
         let body = match self {
             ShaderKind::UnlitGeneric => include_str!("shaders/unlitgeneric.wgsl"),
+            ShaderKind::LightmappedGeneric => include_str!("shaders/lightmappedgeneric.wgsl"),
         };
         format!("{}\n{}", include_str!("shaders/prelude.wgsl"), body)
     }
@@ -326,6 +363,55 @@ const UNLIT_GENERIC_PARAMS: &[ShaderParam] = &[
     },
 ];
 
+/// `LightmappedGeneric`'s own parameters
+/// (`stdshaders/lightmappedgeneric_dx9.cpp:12`), restricted to the ones this
+/// port reads.
+///
+/// The declaration there has around sixty more. They belong to `$basetexture2`
+/// blending, detail texturing, environment maps, self-illumination, phong,
+/// seamless mapping, the paint shader and the flashlight — every one of them
+/// listed as deferred in this module's header — and are left out rather than
+/// declared-and-ignored, because a table that lists a parameter is a promise
+/// that setting it does something.
+const LIGHTMAPPED_GENERIC_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$bumpmap",
+        kind: ParamKind::Texture,
+        declared_default: "models/shadertest/shader1_normal",
+        help: "bump map",
+    },
+    ShaderParam {
+        name: "$bumpframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $bumpmap",
+    },
+    ShaderParam {
+        name: "$bumptransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$bumpmap texcoord transform",
+    },
+    ShaderParam {
+        name: "$nodiffusebumplighting",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "0 == diffuse bumpmapping, 1 == no diffuse bumpmapping",
+    },
+    ShaderParam {
+        name: "$forcebump",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "0 == Do bumpmapping if the config allows it, 1 == do it regardless",
+    },
+    ShaderParam {
+        name: "$alphatestreference",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "alpha below which $alphatest discards a pixel",
+    },
+];
+
 /// The value of a parameter, or the default an undefined one takes.
 ///
 /// `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:838`) in one
@@ -351,10 +437,29 @@ pub fn param_value(kind: ShaderKind, vmt: &Vmt, name: &str) -> Option<MaterialVa
     kind.param(name)?.kind.default_value()
 }
 
-/// Where the base texture is bound within group 1.
+/// Where each texture is bound within group 1. A texture's sampler always
+/// goes in the binding after it, which is what lets
+/// [`Material::new`](super::material::Material::new) fill the group from
+/// [`texture_requests`] alone.
 pub const BINDING_MATERIAL_UNIFORMS: u32 = 0;
 pub const BINDING_BASE_TEXTURE: u32 = 1;
 pub const BINDING_BASE_SAMPLER: u32 = 2;
+pub const BINDING_BUMP_TEXTURE: u32 = 3;
+pub const BINDING_BUMP_SAMPLER: u32 = 4;
+
+/// Where the lightmap page is bound, in group **3**.
+///
+/// Not in the material's group, and that is structural rather than a
+/// preference: a lightmapped material spans as many atlas pages as its
+/// surfaces needed, so the page is not a property of the material. Valve had
+/// the same split — the page is render-context state, set by
+/// `IMatRenderContext::BindLightmapPage( lightmapPageID )` once per sort ID,
+/// and the shader binds it as the standard texture `TEXTURE_LIGHTMAP`
+/// (`lightmappedgeneric_dx9_helper.cpp:583`). Here that is
+/// [`Pass::bind_lightmap_page`](super::context::Pass::bind_lightmap_page) and
+/// a fourth bind group, which group 3 is free for until skinning lands.
+pub const BINDING_LIGHTMAP_TEXTURE: u32 = 0;
+pub const BINDING_LIGHTMAP_SAMPLER: u32 = 1;
 
 /// A texture a material of this kind needs, and how to read it.
 #[derive(Debug, Clone, Copy)]
@@ -383,6 +488,23 @@ pub struct TextureRequest {
 /// sets it on the error material itself (`cmaterialsystem.cpp:469`).
 pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
     match kind {
+        // `$basetexture` is bound with `SRGBReadMask( !bShaderSrgbRead )` —
+        // sRGB on the PC path — and `$bumpmap` with a plain `EnableTexture`,
+        // no sRGB (`lightmappedgeneric_dx9_helper.cpp:731`). A normal map is
+        // three signed directions stored as bytes, not a colour; decoding it
+        // as one bends every normal towards the surface.
+        ShaderKind::LightmappedGeneric => vec![
+            TextureRequest {
+                param: "$basetexture",
+                binding: BINDING_BASE_TEXTURE,
+                color_space: ColorSpace::Srgb,
+            },
+            TextureRequest {
+                param: "$bumpmap",
+                binding: BINDING_BUMP_TEXTURE,
+                color_space: ColorSpace::Linear,
+            },
+        ],
         ShaderKind::UnlitGeneric => {
             let gamma_read =
                 param_value(kind, vmt, "$gammacolorread").is_some_and(|var| var.as_bool());
@@ -445,13 +567,7 @@ pub fn unlit_uniforms(vmt: &Vmt) -> UnlitUniforms {
         .map(|var| var.as_matrix())
         .unwrap_or(super::var::IDENTITY);
 
-    // The fixed-function alpha reference `SetDefaultState` leaves in place
-    // (`shadershadowdx8.cpp:233`); the helper only overrides it when
-    // `$alphatestreference` is above zero (`vertexlitgeneric_dx9_helper.cpp:765`).
-    let reference = param_value(kind, vmt, "$alphatestreference")
-        .map(|var| var.as_f32())
-        .filter(|value| *value > 0.0)
-        .unwrap_or(DEFAULT_ALPHA_TEST_REFERENCE);
+    let reference = alpha_test_reference(kind, vmt);
 
     let mut flags = 0;
     if vmt.flags.contains(MaterialFlags::VERTEXCOLOR) {
@@ -474,6 +590,165 @@ pub fn unlit_uniforms(vmt: &Vmt) -> UnlitUniforms {
 
 /// `AlphaFunc( SHADER_ALPHAFUNC_GEQUAL, 0.7f )` in `CShaderShadowDX8::SetDefaultState`.
 const DEFAULT_ALPHA_TEST_REFERENCE: f32 = 0.7;
+
+/// The alpha a `discard` compares against.
+///
+/// The fixed-function reference `SetDefaultState` leaves in place
+/// (`shadershadowdx8.cpp:233`), unless the material raised it: both helpers
+/// override it only when `$alphatestreference` is above zero
+/// (`vertexlitgeneric_dx9_helper.cpp:765`,
+/// `lightmappedgeneric_dx9_helper.cpp:659`).
+fn alpha_test_reference(kind: ShaderKind, vmt: &Vmt) -> f32 {
+    param_value(kind, vmt, "$alphatestreference")
+        .map(|var| var.as_f32())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(DEFAULT_ALPHA_TEST_REFERENCE)
+}
+
+/// How a material is lit, and therefore what the world builder has to allocate
+/// for the surfaces that wear it.
+///
+/// `MATERIAL_VAR2_LIGHTING_LIGHTMAP` and
+/// `MATERIAL_VAR2_LIGHTING_BUMPED_LIGHTMAP`, which reach the engine as
+/// `IMaterial::GetPropertyFlag( MATERIAL_PROPERTY_NEEDS_LIGHTMAP )` and
+/// `..._NEEDS_BUMPED_LIGHTMAPS` (`cmaterial.cpp:2946`). Those two answers are
+/// what `RegisterLightmappedSurface` (`gl_matsysiface.cpp:216`) asks before it
+/// decides how wide a block to reserve in the atlas, so this is a
+/// material-system property with an engine-side consequence, not a rendering
+/// detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lighting {
+    /// Nothing baked. The surface binds the white page.
+    None,
+    /// One lightmap block per surface.
+    Lightmap,
+    /// Four blocks per surface: the flat map and one per basis vector.
+    BumpedLightmap,
+}
+
+impl Lighting {
+    /// How many lightmap blocks wide a surface's allocation is.
+    pub fn blocks(self) -> u32 {
+        match self {
+            Lighting::BumpedLightmap => super::lightmap::BUMP_BLOCKS,
+            _ => 1,
+        }
+    }
+
+    pub fn needs_lightmap(self) -> bool {
+        !matches!(self, Lighting::None)
+    }
+}
+
+/// How a `.vmt` of this shader is lit.
+///
+/// `InitParamsLightmappedGeneric_DX9` (`lightmappedgeneric_dx9_helper.cpp:168`)
+/// in two lines:
+///
+/// ```text
+/// SET_FLAGS2( MATERIAL_VAR2_LIGHTING_LIGHTMAP );
+/// bool bShouldUseBump = g_pConfig->UseBumpmapping() || $forcebump;
+/// if ( bShouldUseBump && $bumpmap is defined && $nodiffusebumplighting == 0 )
+///     SET_FLAGS2( MATERIAL_VAR2_LIGHTING_BUMPED_LIGHTMAP );
+/// ```
+///
+/// `g_pConfig->UseBumpmapping()` is `mat_bumpmap`, a video option that does not
+/// exist here; it defaults on, so it is taken as on, which also makes
+/// `$forcebump` redundant. The parameter is still declared because content
+/// sets it and a table that omits it would send the next reader back to the
+/// C++.
+///
+/// **A `.vmt` that names a `$bumpmap` therefore changes how the `.bsp`'s
+/// lighting lump is read**, four bytes per luxel at a time. That coupling is
+/// Valve's, and it is the reason this answer lives on the material rather than
+/// being derived where it is used.
+pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
+    match kind {
+        ShaderKind::UnlitGeneric => Lighting::None,
+        ShaderKind::LightmappedGeneric => {
+            let has_bump = vmt
+                .var("$bumpmap")
+                .and_then(|var| var.as_str())
+                .is_some_and(|name| !name.is_empty());
+            let no_diffuse_bump = param_value(kind, vmt, "$nodiffusebumplighting")
+                .is_some_and(|var| var.as_bool());
+            if has_bump && !no_diffuse_bump {
+                Lighting::BumpedLightmap
+            } else {
+                Lighting::Lightmap
+            }
+        }
+    }
+}
+
+/// Flags in [`LightmappedUniforms::flags`].
+#[allow(dead_code)]
+pub struct LightmappedFlags;
+
+impl LightmappedFlags {
+    /// `VERTEXCOLOR`, a static combo of `lightmappedgeneric_vs20.fxc`. Set by
+    /// `$vertexcolor`.
+    pub const VERTEX_COLOR: u32 = 1 << 0;
+    /// Alpha testing, fixed-function state in D3D9.
+    pub const ALPHA_TEST: u32 = 1 << 1;
+    /// `SHADER_FOGMODE_DISABLED`. Set by `$nofog`.
+    pub const NO_FOG: u32 = 1 << 2;
+    /// `BUMPMAP` plus `MATERIAL_VAR2_LIGHTING_BUMPED_LIGHTMAP` — radiosity
+    /// normal mapping, sampling the three directional lightmap blocks instead
+    /// of the flat one. [`Lighting::BumpedLightmap`].
+    pub const BUMPED_LIGHTMAP: u32 = 1 << 3;
+}
+
+/// `LightmappedGeneric`'s material block — group 1, binding 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct LightmappedUniforms {
+    /// `$basetexturetransform`, two rows dotted against `(u, v, 0, 1)`.
+    pub base_texture_transform: [[f32; 4]; 2],
+    /// `$bumptransform`, the same shape. Applied to the *base* texture
+    /// coordinate, which is what `lightmappedgeneric_vs20.fxc:205` does — the
+    /// bump map shares texture space with the albedo.
+    pub bump_transform: [[f32; 4]; 2],
+    /// `$alphatestreference`, or the fixed-function default of 0.7.
+    pub alpha_test_reference: f32,
+    /// [`LightmappedFlags`].
+    pub flags: u32,
+    pub _padding: [u32; 2],
+}
+
+/// Builds the material block for a `.vmt`.
+pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms {
+    let kind = ShaderKind::LightmappedGeneric;
+    let transform = |name| {
+        param_value(kind, vmt, name)
+            .map(|var| var.as_matrix())
+            .unwrap_or(super::var::IDENTITY)
+    };
+    let base = transform("$basetexturetransform");
+    let bump = transform("$bumptransform");
+
+    let mut flags = 0;
+    if vmt.flags.contains(MaterialFlags::VERTEXCOLOR) {
+        flags |= LightmappedFlags::VERTEX_COLOR;
+    }
+    if vmt.flags.contains(MaterialFlags::ALPHATEST) {
+        flags |= LightmappedFlags::ALPHA_TEST;
+    }
+    if vmt.flags.contains(MaterialFlags::NOFOG) {
+        flags |= LightmappedFlags::NO_FOG;
+    }
+    if lighting(kind, vmt) == Lighting::BumpedLightmap {
+        flags |= LightmappedFlags::BUMPED_LIGHTMAP;
+    }
+
+    LightmappedUniforms {
+        base_texture_transform: [base[0], base[1]],
+        bump_transform: [bump[0], bump[1]],
+        alpha_test_reference: alpha_test_reference(kind, vmt),
+        flags,
+        _padding: [0; 2],
+    }
+}
 
 /// The colour a draw is modulated by: `$color * $color2`, with `$alpha` in `w`.
 ///
@@ -534,7 +809,6 @@ pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4] {
 /// there is, this becomes an argument and [`RenderState`] stays exactly as it
 /// is — the pipeline cache already keys on it.
 pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>) -> RenderState {
-    let ShaderKind::UnlitGeneric = kind;
     let flags = vmt.flags;
     let mut state = RenderState::default();
 
@@ -605,7 +879,16 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
 
     // `IS_FLAG_SET( MATERIAL_VAR_MULTIPLY )` at the end of the shadow block
     // (`vertexlitgeneric_dx9_helper.cpp:1210`), after everything above.
-    if flags.contains(MaterialFlags::MULTIPLY) {
+    //
+    // **`UnlitGeneric` only, and that asymmetry is the original's.**
+    // `$multiply` is handled by the shared helper `vertexlitgeneric` reaches
+    // and by `CBaseShader::SetInitialShadowState` not at all
+    // (`shaderlib/BaseShader.cpp:183` has no `MATERIAL_VAR_MULTIPLY` case), so
+    // a `LightmappedGeneric` material that sets `$multiply` gets ordinary
+    // blending in Valve's engine too. Content does not set it on world
+    // surfaces; reproducing the gap costs nothing and diverging from it would
+    // be a silent change to how a wall blends.
+    if kind == ShaderKind::UnlitGeneric && flags.contains(MaterialFlags::MULTIPLY) {
         state.blend = BlendMode::Multiply;
         state.depth_write = false;
     }
@@ -669,9 +952,14 @@ mod tests {
             ShaderKind::from_name("UnlitGeneric"),
             Some(ShaderKind::UnlitGeneric)
         );
+        assert_eq!(
+            ShaderKind::from_name("lightmappedgeneric"),
+            Some(ShaderKind::LightmappedGeneric)
+        );
         // A fallback name is not a shader: that mechanism is deleted.
         assert_eq!(ShaderKind::from_name("UnlitGeneric_dx9"), None);
-        assert_eq!(ShaderKind::from_name("LightmappedGeneric"), None);
+        assert_eq!(ShaderKind::from_name("LightmappedGeneric_dx9"), None);
+        assert_eq!(ShaderKind::from_name("VertexLitGeneric"), None);
     }
 
     #[test]

@@ -396,13 +396,58 @@ impl Texture {
         sampler: wgpu::Sampler,
     ) -> Texture {
         debug_assert_eq!(pixels.len(), (size * size * 4) as usize);
-
         // `TEXTUREFLAGS_SRGB` in the original, and these are colours a human
         // picked, so the hardware should decode them.
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        Texture::from_pixels(
+            device,
+            queue,
+            name,
+            size,
+            size,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            pixels,
+            sampler,
+        )
+    }
+
+    /// A texture of any format built from bytes the CPU already has.
+    ///
+    /// The general form of [`procedural`](Texture::procedural), split out for
+    /// the lightmap atlas, whose pages are neither square nor 8-bit and are
+    /// assembled a surface at a time before any of this is reached. Both are
+    /// what is left of `ITextureRegenerator` (`texturemanager.cpp:178`) —
+    /// an interface with a `RegenerateTextureBits` callback, so that D3D9
+    /// could ask for the pixels again after a lost device. There is no lost
+    /// device, so there is no callback: just the bytes.
+    ///
+    /// One mip level, because everything that reaches this has exactly one.
+    /// `pixels` must be tightly packed at `format`'s block size; the caller is
+    /// assumed to have laid it out, so there is no padding step here.
+    // Eight parameters, one over clippy's bar: every one is a distinct
+    // property of the texture being built and bundling them into a struct
+    // would only move the same list somewhere less local.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        pixels: &[u8],
+        sampler: wgpu::Sampler,
+    ) -> Texture {
+        // `block_copy_size`, not `target_pixel_byte_cost`: the latter is
+        // `wgpu`'s render-target memory estimate and is twice the texel size
+        // for the 8-bit formats.
+        let bytes_per_texel = format
+            .block_copy_size(None)
+            .expect("a CPU-built texture is uncompressed");
+        debug_assert_eq!(pixels.len(), (width * height * bytes_per_texel) as usize);
+
         let extent = wgpu::Extent3d {
-            width: size,
-            height: size,
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -426,8 +471,8 @@ impl Texture {
             pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size * 4),
-                rows_per_image: Some(size),
+                bytes_per_row: Some(width * bytes_per_texel),
+                rows_per_image: Some(height),
             },
             extent,
         );
@@ -439,16 +484,16 @@ impl Texture {
 
         Texture {
             name: name.to_owned(),
-            width: size,
-            height: size,
+            width,
+            height,
             depth: 1,
             mip_count: 1,
             format,
             view_dimension: wgpu::TextureViewDimension::D2,
             frame: 0,
-            // Neither is created with an alpha flag (`texturemanager.cpp:651`),
-            // so a material falling back to one stays opaque rather than
-            // turning translucent.
+            // Nothing built here is created with an alpha flag
+            // (`texturemanager.cpp:651`), so a material falling back to one
+            // stays opaque rather than turning translucent.
             translucent: false,
             texture,
             view,
