@@ -49,11 +49,11 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 317 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 382 tests), and the binary now **runs, loads a
 map and lets you fly around it**: it mounts the game filesystem, opens a window, runs an
-engine frame loop with a real host state machine, reads a Portal 2 `.bsp`, packs its
-baked lightmaps into an atlas, draws its world geometry **lit**, and moves the view with
-WASD and the mouse. It is **not a runnable game** — there is no simulation, sound or
+engine frame loop with a real host state machine, **reads the shipped `cfg/valve.rc` and
+boots through it**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
+draws its world geometry **lit**, and moves the view with WASD and the mouse. It is **not a runnable game** — there is no simulation, sound or
 netcode, and nothing that moves is a player — but the boot path is continuous from
 `main` to a rendered, lit level you can look around.
 
@@ -168,8 +168,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   expressed" question is still open and still unforced. **`LightmappedGeneric` was
   expected to force it and did not**: bumped and unbumped share one vertex layout, because
   the bumped diffuse path never leaves tangent space.
-- **`src/engine/` — 4 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, and `input/`**
+- **`src/engine/` — 5 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
+  lightmaps, `input/`, and `console/` (stage 1 of 5)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -204,15 +204,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: **`console/`** — now doubly earned, since `map`,
-`fps_max`, `restart` and `quit` all exist as engine operations with no way to type them,
-and `input/` stage 3 (`bind`) is waiting on the command buffer. **Planned in
-`portdocs/ENGINE_CONSOLE.md`** — read it before starting: the system is spread over
-`tier1/`, `vstdlib/` and `engine/` rather than living in `engine/` alone, and its headline
-decision (**no global cvar registry**; a cvar is an `Arc`-held cell) reverses what
-`portdocs/ENGINE.md` §7.4 originally said. `materialsystem`
-stage 6 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked,
-but not on the boot path.
+Next on the boot path: **`console/` stage 2 — bindings**, which is the same work as
+`input/` stage 3. The command buffer it was waiting on now exists, `console/` supplies the
+`CommandSink`, and the table itself lives in `input/`; the deliverable is that WASD comes
+from the shipped `cfg/config_default.cfg` instead of `FlyCamera`'s hard-coded keys.
+**Stage 3 (config persistence) is small and can follow immediately**; stage 4 (the console
+dialog) is gated on `egui`, which is unscheduled, and should be done together with
+`input/` stage 4 since they share one integration. `materialsystem` stage 6
+(`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked, but not
+on the boot path.
 
 ### Known warts, and what triggers fixing them
 
@@ -220,13 +220,13 @@ Deliberate small compromises, recorded so nobody has to rediscover them and nobo
 "fixes" one prematurely. Each names the condition that makes it worth doing. Both are
 also commented at the site.
 
-- **`CommandLine` lives in `src/launcher/` but is read from `src/engine/window/`.** The
-  dependency direction is backwards — the launcher boots the engine, so the engine
-  importing from it is upside down. It sits there because that is where it is built, but
-  Valve kept `CommandLine()` in `tier0` precisely because *everything* reads it, and this
-  port will end up the same way. **Move it to a crate-level `src/cmdline.rs` when a third
-  subsystem needs it** — not before, since the only cost today is one odd-looking import,
-  and the only benefit of moving early is churn in reviewed code.
+**Resolved:** `CommandLine` used to live in `src/launcher/` and be read from
+`src/engine/window/`, to be moved "when a third subsystem needs it". `console/` was that
+third subsystem — `stuffcmds` and the `+<cvar>` default seeding both read it — so it now
+lives at `src/cmdline.rs`. The move also fixed a real divergence: `CCommandLine::ParmValue`
+refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the port's
+`value()` did not, which would have had `-window` swallow `+map`.
+
 - **The view angles and the free-fly camera live in `src/engine/input/view.rs`.** They
   belong to the client: `CInput::AdjustAngles` reads and writes them through
   `engine->GetViewAngles`/`SetViewAngles`, which resolve to `CClientState::viewangles`

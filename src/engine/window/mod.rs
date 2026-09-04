@@ -55,15 +55,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-// `CommandLine` sits under `launcher` because that is where it is built, but
-// Valve kept `CommandLine()` in tier0 precisely because everything reads it.
-// If a third subsystem needs it, move it to a crate-level `src/cmdline.rs`
-// rather than growing more of these imports.
+use crate::cmdline::CommandLine;
 use crate::engine::host::Outcome;
 use crate::engine::input::{self, Button, MouseButton};
 use crate::engine::Engine;
 use crate::filesystem::Vfs;
-use crate::launcher::cmdline::CommandLine;
 use crate::materials::{Renderer, RendererOptions};
 
 /// Fallback window title, from `CGame::CreateGameWindow`
@@ -301,12 +297,13 @@ pub enum RunOutcome {
 pub struct Boot<'a> {
     /// The mounted game content, or `None` if it failed to mount.
     pub vfs: Option<&'a Vfs>,
-    /// `+map <name>` — the map to load at startup.
-    pub map: Option<&'a str>,
+    /// The process arguments, which the console reads twice: `stuffcmds` turns
+    /// every `+`-prefixed one into a command, and cvar registration seeds a
+    /// default from `+<name> <value>`. This replaced the separate `map` and
+    /// `fps_max` fields, which were those two paths open-coded.
+    pub command_line: Option<&'a CommandLine>,
     /// `-vmt <name>` — draw one material instead of the world.
     pub test_material: Option<&'a str>,
-    /// `+fps_max <n>`.
-    pub fps_max: f32,
 }
 
 /// How the cursor is held while the mouse is driving the view.
@@ -448,17 +445,14 @@ impl<'a> GameWindow<'a> {
             renderer.device(),
             renderer.queue(),
             self.boot.vfs,
-            self.boot.fps_max,
+            self.boot.command_line,
             self.boot.test_material,
         );
 
-        // `+map` is the console command spelled as a command-line argument,
-        // which is how Source has always started on a map. It is queued rather
-        // than loaded: the host state machine loads it on the first frame, so
-        // startup and a later `map` command take exactly the same path.
-        if let Some(map) = self.boot.map {
-            engine.request_new_game(map);
-        }
+        // `Host_Init`'s last act: queue `exec valve.rc`. Everything about how
+        // the game starts — including `+map`, by way of `stuffcmds` — is in
+        // that file rather than here.
+        engine.boot();
 
         self.focused = window.has_focus();
         self.engine = Some(engine);

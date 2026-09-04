@@ -3,8 +3,8 @@
 //! `portdocs/ENGINE.md` breaks the original `engine/` module into 23
 //! subsystems and concludes it must not be ported as one unit: each subsystem
 //! becomes its own module here, 13 of them surviving, with ~45,700 lines
-//! deleted outright. Four exist so far — [`window`], [`host`], [`world`] and
-//! [`input`] — and this file is what §1 calls `mod.rs`: the thing that owns
+//! deleted outright. Five exist so far — [`window`], [`host`], [`world`],
+//! [`input`] and [`console`] — and this file is what §1 calls `mod.rs`: the thing that owns
 //! them and hands out `&mut` where one needs another, in place of the ambient
 //! `g_p*` globals the C++ used to find everything.
 //!
@@ -22,6 +22,7 @@
 //! window: WindowEvent     -> Engine::push_input  -> queued, not acted on
 //! window: about_to_wait   -> Engine::deadline    -> ControlFlow::WaitUntil
 //! window: RedrawRequested -> Engine::frame       -> host clock + state machine
+//!                                                -> Console::run, then fps_max
 //!                                                -> Input::frame, then the view
 //!                         -> Renderer::begin_frame
 //!                         -> Engine::render      -> one pass, the world in it
@@ -34,7 +35,10 @@
 //! `portdocs/ENGINE_INPUT.md` §6.4's: input is drained **inside**
 //! [`Engine::frame`], after the host has agreed a frame is happening, so that
 //! events pile up rather than being sampled by a frame that never runs.
+//! [`Console::run`] is drained in the same place and for the same reason —
+//! one run is one tick, which is what makes `wait 1` mean "next frame".
 
+pub mod console;
 pub mod host;
 pub mod input;
 pub mod window;
@@ -45,11 +49,16 @@ use std::time::Instant;
 
 use glam::Vec3;
 
-use crate::filesystem::Vfs;
+use crate::cmdline::CommandLine;
+use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::{Camera, Load};
 use crate::materials::renderer::Frame;
 use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
 
+use console::{
+    Command, CommandSpec, CommandTarget, ConfigFiles, Console, Cvar, CvarFlags, Dispatch,
+    ExecContext, Source,
+};
 use host::{Host, Level, Outcome};
 use input::view::FlyCamera;
 use input::{Button, Input, Key, MouseButton};
@@ -73,6 +82,16 @@ const DEFAULT_FOV: f32 = 75.0;
 /// launcher and outlives this. It is an `Option` because a failed mount is
 /// survivable — see [`window::run`].
 pub struct Engine<'a> {
+    /// Cvars, commands, and the buffer that turns typed or scripted text into
+    /// them. Drained once per frame by [`Engine::frame`].
+    console: Console<'a>,
+    /// The engine's own handle to `fps_max`, per `ENGINE_CONSOLE.md` §6.1: a
+    /// subsystem holds the one cvar it reads rather than a way to look one up.
+    fps_max: Cvar,
+    /// What [`Cvar::changed`] was last told. `fps_max` had an
+    /// `FnChangeCallback_t` in the original (`engine/sys_engine.cpp:78`); this
+    /// counter is what replaces it.
+    fps_max_generation: u32,
     host: Host,
     /// Everything the host drives when it changes level. Separate from [`Host`]
     /// so that `host.frame(&mut self.scene)` is a split borrow of two fields
@@ -119,9 +138,41 @@ impl<'a> Engine<'a> {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         vfs: Option<&'a Vfs>,
-        fps_max: f32,
+        command_line: Option<&CommandLine>,
         test_material: Option<&str>,
     ) -> Engine<'a> {
+        let mut console = Console::new(
+            Box::new(VfsConfigFiles(vfs)),
+            command_line.map(|c| c.args().to_vec()).unwrap_or_default(),
+        );
+
+        // `ConVar fps_max( "fps_max", "300", FCVAR_RELEASE, "Frame rate
+        // limiter", fps_max_callback )` (`engine/sys_engine.cpp:78`).
+        // `FCVAR_RELEASE` is deleted (§4.6, a CS:GO-era allowlist) and the
+        // callback becomes [`Engine::fps_max_generation`].
+        let fps_max = console.cvar(
+            "fps_max",
+            &host::DEFAULT_FPS_MAX.to_string(),
+            CvarFlags::NONE,
+            "Frame rate limiter.",
+        );
+
+        // The engine's commands. Declared here as data and run by
+        // [`EngineCommands`]; `ENGINE_CONSOLE.md` §6.3 is why they are not
+        // callbacks.
+        for spec in [
+            CommandSpec::new("map", "Load a map.").with_completion(console::Completion::Files {
+                dir: "maps",
+                ext: "bsp",
+            }),
+            CommandSpec::new("quit", "Exit the engine."),
+            CommandSpec::new("restart", "Restart the engine."),
+        ] {
+            console
+                .register_command(spec)
+                .expect("the engine's commands are unique");
+        }
+
         let mut materials = MaterialCache::new(device, queue);
         let context = RenderContext::new(device, queue, materials.pipelines());
 
@@ -144,7 +195,10 @@ impl<'a> Engine<'a> {
         });
 
         Engine {
-            host: Host::new(fps_max),
+            fps_max_generation: fps_max.generation(),
+            host: Host::new(fps_max.float()),
+            console,
+            fps_max,
             scene: Scene {
                 vfs,
                 device: device.clone(),
@@ -159,9 +213,37 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Queues the startup command line. `Host_Init`'s last act.
+    ///
+    /// Everything about how the engine starts is in `cfg/valve.rc`, which execs
+    /// `joystick.cfg` and `autoexec.cfg` (Portal 2 ships neither, and both fail
+    /// silently by design), runs `stuffcmds` — which is where `+map` takes
+    /// effect — and then `startupmenu`, which is GameUI's and is not ported.
+    ///
+    /// **This replaces the launcher's `+map` block.** The map now loads the
+    /// same way it does in the shipped game, through the config files, rather
+    /// than from a command-line argument read directly.
+    pub fn boot(&mut self) {
+        self.console.enqueue("exec valve.rc", Source::Code);
+    }
+
     /// Queues a map. See [`Host::request_new_game`].
+    #[allow(dead_code)] // reached through the `map` command; kept for tests
     pub fn request_new_game(&mut self, map: &str) {
         self.host.request_new_game(map);
+    }
+
+    /// The console, for the things that will drive it from outside the frame:
+    /// `input/` stage 3 enqueues a binding's command text, and the `egui`
+    /// console reads the log ring and the completion data.
+    #[allow(dead_code)] // consumers arrive with `ENGINE_CONSOLE.md` stages 2 and 4
+    pub fn console(&self) -> &Console<'a> {
+        &self.console
+    }
+
+    #[allow(dead_code)] // as above
+    pub fn console_mut(&mut self) -> &mut Console<'a> {
+        &mut self.console
     }
 
     /// Asks the engine to shut down, unloading the level on the way out.
@@ -217,6 +299,34 @@ impl<'a> Engine<'a> {
         let outcome = self.host.frame(now, &mut self.scene)?;
         let seconds = self.host.frame_time();
         self.scene.curtime += seconds;
+
+        // `Cbuf_Execute`. **Inside the frame**, so that one run is one tick and
+        // `wait 1` means "next frame" — running it per window event instead
+        // would tick the command buffer at the display's rate.
+        //
+        // The borrow is `ENGINE_CONSOLE.md` §6.6: `self.console.run(&mut self)`
+        // cannot compile, so a struct of disjoint field borrows is the target.
+        // It is the same move `host.frame(&mut self.scene)` above already
+        // makes.
+        let Engine { console, host, .. } = self;
+        console.run(&mut EngineCommands { host });
+
+        // What `fps_max_callback` did. A poll rather than a callback, because a
+        // callback would have to own `&mut Host` — §6.2.
+        if self.fps_max.changed(&mut self.fps_max_generation) {
+            self.host.clock_mut().set_fps_max(self.fps_max.float());
+        }
+
+        // Configs name cvars from subsystems that do not exist yet, so an
+        // unrecognised name from a file is counted rather than printed
+        // (§9 open question 6). One line beats sixty, and zero hides typos.
+        let unknown = self.console.take_unknown_count();
+        if unknown > 0 {
+            eprintln!(
+                "source-engine: console: {unknown} command(s) in the startup configs \
+                 are not implemented yet"
+            );
+        }
 
         // `DispatchAllStoredGameMessages`' place in `MainLoop`
         // (`sys_mainwind.cpp:509`): after the frame is agreed, before anything
@@ -428,6 +538,68 @@ impl Level for Scene<'_> {
         // Materials outlive the level deliberately: `UncacheUnusedMaterials`
         // was called only under memory pressure on consoles, and a map change
         // between two Portal 2 chambers shares most of its content.
+    }
+}
+
+/// What the console hands a command back to.
+///
+/// A struct of field borrows rather than `Engine` itself, because `Console` is
+/// one of `Engine`'s fields — `ENGINE_CONSOLE.md` §6.6. That is not only a
+/// borrow-checker workaround: it makes the set of state a command may touch
+/// explicit, where the C++ answer was "all of it".
+///
+/// It grows a field per subsystem that gains commands. Today `map`, `quit` and
+/// `restart` are all [`Host`] requests, so it holds one.
+struct EngineCommands<'e> {
+    host: &'e mut Host,
+}
+
+impl CommandTarget for EngineCommands<'_> {
+    fn execute(&mut self, cmd: &Command, cx: &mut ExecContext<'_>) -> Dispatch {
+        match cmd.name().to_ascii_lowercase().as_str() {
+            // `CON_COMMAND_F( map, ... )` (`engine/host_cmd.cpp`), reduced to
+            // the argument that currently means anything. Queued rather than
+            // loaded: the host state machine loads it on the next frame, so
+            // startup and a later `map` take exactly the same path — including
+            // going *through* `GameShutdown`, which is the invariant
+            // `rustdocs/ENGINE.md` records for the host.
+            "map" => match cmd.arg(1) {
+                Some(name) => self.host.request_new_game(name),
+                None => cx.print("map <mapname> : load a map"),
+            },
+            // `CON_COMMAND_F( quit, "Exit the engine.", FCVAR_NONE )`
+            // (`engine/host_cmd.cpp:2750`).
+            "quit" => self.host.request_shutdown(),
+            "restart" => self.host.request_restart(),
+            _ => return Dispatch::Unknown,
+        }
+        Dispatch::Handled
+    }
+}
+
+/// `exec`'s window onto the mounted content.
+///
+/// The whole of why `console/` names no filesystem type: it declares
+/// [`ConfigFiles`] and this implements it. A console built for a test uses an
+/// in-memory one instead and needs no mount.
+struct VfsConfigFiles<'a>(Option<&'a Vfs>);
+
+impl ConfigFiles for VfsConfigFiles<'_> {
+    fn read_config(&self, path: &str, path_id: Option<&str>) -> Option<Vec<u8>> {
+        let vfs = self.0?;
+        // `exec <file> [path id]`, where Valve spells the path ID as the
+        // `//<pathid>/` prefix on the path and `*` means "any mount".
+        match path_id.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("*") => vfs.read(path).ok(),
+            Some("mod") => vfs.scoped(PathId::Mod).read(path).ok(),
+            Some("game") => vfs.scoped(PathId::Game).read(path).ok(),
+            Some("gamebin") => vfs.scoped(PathId::GameBin).read(path).ok(),
+            Some("platform") => vfs.scoped(PathId::Platform).read(path).ok(),
+            Some("executable_path") => vfs.scoped(PathId::ExecutablePath).read(path).ok(),
+            // An unknown ID searches everything rather than nothing: a config
+            // naming a path this port does not have should still be read.
+            Some(_) => vfs.read(path).ok(),
+        }
     }
 }
 

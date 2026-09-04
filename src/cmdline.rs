@@ -45,13 +45,25 @@ impl CommandLine {
         self.position(name).is_some()
     }
 
-    /// The token following `name`, if both exist. (Valve: `ParmValue`.)
+    /// The token following `name`, if it is a value rather than another
+    /// switch. (Valve: `ParmValue`.)
     ///
-    /// Returns `None` when `name` is absent *or* is the final token, matching
-    /// the original's behavior of only reading a value when one follows.
+    /// Returns `None` when `name` is absent, is the final token, **or is
+    /// followed by another `-`/`+` argument** — `CCommandLine::ParmValue`
+    /// (`tier0/commandline.cpp:646`): "*Probably another cmdline parameter
+    /// instead of a valid arg if it starts with '+' or '-'*".
+    ///
+    /// That last clause is load-bearing rather than cosmetic. `stuffcmds`
+    /// walks the arguments skipping each `-switch` **and its value**, so
+    /// without it `-window +map sp_a1_intro1` has `-window` swallow `+map` and
+    /// the map never loads. See `engine::console`'s
+    /// `a_valueless_option_does_not_eat_the_next_command`.
     pub fn value(&self, name: &str) -> Option<&str> {
         let idx = self.position(name)?;
-        self.args.get(idx + 1).map(String::as_str)
+        self.args
+            .get(idx + 1)
+            .map(String::as_str)
+            .filter(|value| !value.starts_with('-') && !value.starts_with('+'))
     }
 
     /// `value()` with a fallback.
@@ -136,12 +148,21 @@ mod tests {
         assert!(c.has("-novid"));
         assert_eq!(
             c.value("-novid"),
-            Some("-game"),
-            "value is just the next token"
+            None,
+            "a following switch is another parameter, not this one's value"
         );
         assert_eq!(c.value("-game"), None, "trailing parm has no value");
         assert_eq!(c.value("-absent"), None);
         assert_eq!(c.value_or("-absent", "fallback"), "fallback");
+    }
+
+    /// The clause `stuffcmds` depends on: a switch with no value must not eat
+    /// the `+command` that follows it.
+    #[test]
+    fn a_switch_is_never_read_as_another_switch_s_value() {
+        let c = cl(&["game", "-window", "+map", "sp_a1_intro1"]);
+        assert_eq!(c.value("-window"), None);
+        assert_eq!(c.value("+map"), Some("sp_a1_intro1"));
     }
 
     #[test]

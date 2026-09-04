@@ -6,14 +6,12 @@
 //! chain of shared libraries. In a single statically-linked binary there's
 //! nothing to load, so what's left is ordinary startup code.
 
-pub mod cmdline;
 pub mod dialog;
 pub mod single_instance;
 
-use crate::engine;
+use crate::cmdline::CommandLine;
 use crate::engine::window::{self, Boot, RunOutcome, VideoConfig};
 use crate::filesystem;
-use cmdline::CommandLine;
 use single_instance::{LockError, SingleInstanceLock};
 
 /// The mod that boots when `-game` isn't given.
@@ -113,24 +111,18 @@ pub fn run() -> i32 {
     let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
     let boot = Boot {
         vfs: vfs.as_ref(),
-        // `+map <name>` and `+fps_max <n>` are console commands spelled as
-        // command-line arguments, which is how Source has always taken them:
-        // `CCommandLine` copies every `+`-prefixed argument into the command
-        // buffer at startup. There is no command buffer yet — `console/` is
-        // unported (portdocs/ENGINE.md §7.4) — so the two the engine needs to
-        // boot are read directly, and this block is what `Cbuf_AddText` of the
-        // startup line replaces.
-        map: cmdline.value("+map"),
+        // Every `+`-prefixed argument reaches the engine as command text, the
+        // way `CCommandLine` has always fed them to the command buffer: the
+        // console's `stuffcmds` reads this, and cvar registration seeds
+        // `+<name> <value>` defaults from it. The `+map`/`+fps_max` block that
+        // used to stand in for that is gone — see `engine::Engine::boot`.
+        command_line: Some(&cmdline),
         // `-vmt <name>`: draws one material on two cubes instead of the world.
         // portdocs/MATERIALSYSTEM.md §9 calls for this to be deleted once there
         // is a map to draw instead, and there now is — it is kept because it is
         // the only way to inspect a single material in isolation, and because
         // `src/materials/preview.rs` carries the module's GPU regression tests.
         test_material: cmdline.value("-vmt"),
-        fps_max: cmdline
-            .value("+fps_max")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(engine::host::DEFAULT_FPS_MAX),
     };
 
     match window::run(video, boot) {

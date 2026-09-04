@@ -1,10 +1,20 @@
 # Porting console, cvars & commands → `src/engine/console/`
 
-**Status: not started.** This is the plan, written before the port, per
-`PORTING.md`'s per-module rule. When the module lands it also gets an API
-reference in `rustdocs/ENGINE.md`'s `src/engine/console/` section, which is the
-document to read in order to *use* it; this one says why it is shaped the way it
-is.
+**Status: stage 1 landed** (§8.1 — cvars, the command buffer, both tokenizers,
+dispatch, aliases, `exec`, `stuffcmds`, the log sink, and `map`/`quit`/`restart`
+through a `CommandTarget`). Stages 2-5 are not started. This is the plan,
+written before the port, per `PORTING.md`'s per-module rule; **the API reference
+in `rustdocs/ENGINE.md`'s `src/engine/console/` section is the document to read
+in order to *use* the module**, and it is authoritative where the two disagree.
+
+Four things in this plan turned out to be wrong at the code, and are corrected
+there rather than rewritten here — see its "Corrections to
+`portdocs/ENGINE_CONSOLE.md`" list. In short: **§4.5's file-extension check is a
+blocklist, not a `.cfg`/`.rc` allowlist**; **§6.4's `Command<'a>` cannot borrow
+from the buffer** (Valve's own `memcpy` at `convar.cpp:421` is the same problem);
+**§4.2's queue cap does not catch an alias that expands to itself**, which needs
+a separate per-round budget; and `CCommandLine::ParmValue` refuses a value
+starting with `-`/`+`, which `src/cmdline.rs` did not and `stuffcmds` depends on.
 
 Written against the current architecture (single crate, no FFI, `winit`/`wgpu`);
 nothing here assumes the old FFI-bridged model.

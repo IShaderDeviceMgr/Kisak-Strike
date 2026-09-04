@@ -1,15 +1,16 @@
 # `src/engine/` — API reference
 
 The engine. [`portdocs/ENGINE.md`](../portdocs/ENGINE.md) breaks the original `engine/`
-module into 23 subsystems, 14 of which become modules here. **Four exist so far.**
+module into 23 subsystems, 14 of which become modules here. **Five exist so far.**
 
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
 | [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look and a free-fly camera done; no bindings, UI precedence or controllers |
+| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds` done; no bindings, config writing or UI |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop and input translation done |
-| `net/`, `console/`, `client/`, `server/`, `audio/`, … | the other 10 | not started |
+| `net/`, `client/`, `server/`, `audio/`, … | the other 9 | not started |
 
 The binary now loads a real Portal 2 `.bsp` and draws it **lit**: base textures multiplied
 by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` that is
@@ -29,9 +30,8 @@ use crate::engine::window::{self, Boot, RunOutcome, VideoConfig};
 let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
 let boot = Boot {
     vfs: vfs.as_ref(),
-    map: cmdline.value("+map"),
+    command_line: Some(&cmdline),        // stuffcmds and +<cvar> seeding read this
     test_material: cmdline.value("-vmt"),
-    fps_max: engine::host::DEFAULT_FPS_MAX,
 };
 match window::run(video, boot)? {          // returns when the engine quits
     RunOutcome::Quit => 0,
@@ -609,6 +609,372 @@ Ordered by how likely each is to bite.
 The cursor grab, the `winit` event arms and `device_event` need a window and cannot be
 tested here; they are verified by running the binary.
 
+## `src/engine/console/`
+
+Cvars, commands, the buffer that turns typed or scripted text into them, and the output
+they print to. Replaces `tier1/convar.cpp` + `tier1/commandbuffer.cpp` (the objects and
+the queue), `vstdlib/cvar.cpp` (the registry), `engine/cmd.cpp` + `engine/cvar.cpp` (the
+policy) and the print half of `engine/console.cpp`. The design is
+[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stage 1 of its §8.
+
+| | |
+|---|---|
+| Module | `crate::engine::console`, with `console::{buffer, cvar, log, token}` |
+| Lines | ~3,250 including tests |
+| Tests | 64 (`cargo test engine::console`) |
+| Dependencies | **`std` only** — no `wgpu`, no `winit`, no `crate::filesystem` |
+
+**It names no engine type and no filesystem type**, which is what lets it be constructed,
+driven and asserted on with no window, no GPU and no mount. Two traits buy that:
+[`CommandTarget`](#commandtarget-and-execcontext) for commands it does not own, and
+[`ConfigFiles`](#configfiles) for the files `exec` reads.
+
+### Quick start
+
+```rust
+use crate::engine::console::{Console, CommandSpec, CvarFlags, Source, NoTarget};
+
+let mut console = Console::new(Box::new(VfsConfigFiles(vfs)), cmdline.args().to_vec());
+
+// Registration hands back a handle. Keep the handle, not a way to look one up.
+let fps_max = console.cvar("fps_max", "300", CvarFlags::NONE, "Frame rate limiter.");
+console.register_command(CommandSpec::new("map", "Load a map."))?;
+
+console.enqueue("exec valve.rc", Source::Code);
+console.run(&mut target);        // once per frame; one run is one tick
+
+if fps_max.changed(&mut generation) { clock.set_fps_max(fps_max.float()); }
+```
+
+### `Cvar` — a handle, not a lookup
+
+```rust
+pub struct Cvar(Arc<CvarCell>);          // Clone, Send, Sync
+
+pub fn name(&self) -> &str;
+pub fn help(&self) -> &str;
+pub fn default_value(&self) -> &str;
+pub fn flags(&self) -> CvarFlags;
+pub fn bounds(&self) -> (Option<f32>, Option<f32>);
+
+pub fn float(&self) -> f32;              // atomic load
+pub fn int(&self) -> i32;
+pub fn bool(&self) -> bool;              // GetInt() != 0
+pub fn string(&self) -> Arc<str>;
+
+pub fn set_string(&self, value: &str);   // InternalSetValue
+pub fn set_float(&self, value: f32);
+pub fn set_int(&self, value: i32);
+pub fn set_bool(&self, value: bool);
+pub fn revert(&self);                    // back to default_value()
+
+pub fn generation(&self) -> u32;         // bumped on every change
+pub fn changed(&self, last: &mut u32) -> bool;
+```
+
+**This is the headline decision and it reverses `portdocs/ENGINE.md` §7.4.** That document
+called the cvar registry "the one piece of ambient global state that is genuinely
+process-global"; `ENGINE_CONSOLE.md` §6.1 reverses it. What is shared is each cvar's
+*value*, not the registry, so a subsystem holds the one cvar it reads and reading it is an
+atomic load through its own handle — no lock, no hash probe, **no `&Console` in the
+reader's signature**, callable from any thread. The registry is left serving name lookup
+for exactly one caller, the dispatcher.
+
+Two consequences worth knowing:
+
+- **`FCVAR_MATERIAL_SYSTEM_THREAD` has nothing to solve.** Its whole purpose was
+  `CCvar::QueueMaterialThreadSetValue` (`vstdlib/cvar.cpp:774`), a deferred-write queue for
+  a cvar read off-thread. Deleted, with `FCVAR_ACCESSIBLE_FROM_THREADS`.
+- **`generation` replaces change callbacks.** `FnChangeCallback_t` is not ported: a
+  callback that must touch `&mut` engine state cannot be owned by a registry the engine
+  owns. `fps_max` is the worked example — it had a real callback
+  (`engine/sys_engine.cpp:78`) and is now a poll in `Engine::frame`.
+
+**Keep the invariant: callers hold `Cvar`, never `&CvarCell`.** §9 open question 1 records
+that this is what keeps the fallback design (a console-owned registry with index handles)
+a mechanical change rather than a rewrite of every caller.
+
+### `CvarFlags` and `CommandFlags`
+
+Only the six flags §4.6 marks "Keep" exist: `DEVELOPMENTONLY`, `HIDDEN`, `ARCHIVE`,
+`NEVER_AS_STRING`, `CHEAT`, `SPONLY`. The untrusted-source set (`REPLICATED`,
+`SERVER_CAN_EXECUTE`, `USERINFO`, …) is deliberately **absent rather than
+present-and-ignored** — those are a security model, and a flag that exists but is never
+checked reads as though it were enforced.
+
+**The bit values are ours** and are packed densely from zero, not copied from
+`public/tier1/iconvar.h`. Nothing in shipped content spells a flag numerically, so only
+the meanings are fixed.
+
+They are **two types on purpose**. In the original, bit 10 is `FCVAR_PRINTABLEONLY` on a
+`ConVar` and `FCVAR_GAMEDLL_FOR_REMOTE_CLIENTS` on a `ConCommand` — one bit meaning two
+things depending on what holds it, which is exactly what a faithful transliteration
+reproduces by accident. Separate types make the collision unrepresentable.
+
+### `Console`
+
+```rust
+pub struct Console<'a>;                  // 'a is the mounted content's
+
+pub fn new(files: Box<dyn ConfigFiles + 'a>, command_line: Vec<String>) -> Console<'a>;
+pub fn detached() -> Console<'static>;   // no files, no command line; for tests
+
+pub fn cvar(&mut self, name: &str, default: &str, flags: CvarFlags, help: &str) -> Cvar;
+pub fn cvar_bounded(&mut self, name: &str, default: &str, flags: CvarFlags, help: &str,
+                    min: Option<f32>, max: Option<f32>) -> Cvar;
+pub fn try_cvar(..) -> Result<Cvar, RegisterError>;         // as above, recoverable
+pub fn try_cvar_bounded(..) -> Result<Cvar, RegisterError>;
+pub fn register_command(&mut self, spec: CommandSpec) -> Result<(), RegisterError>;
+
+pub fn find_cvar(&self, name: &str) -> Option<&Cvar>;       // case-insensitive
+pub fn find_command(&self, name: &str) -> Option<&CommandSpec>;
+pub fn cvars(&self) -> &CvarRegistry;
+pub fn commands(&self) -> impl Iterator<Item = &CommandSpec>;
+pub fn log(&self) -> &Log;
+pub fn log_mut(&mut self) -> &mut Log;
+pub fn buffer(&self) -> &CommandBuffer;
+pub fn can_cheat(&self) -> bool;                            // sv_cheats
+
+pub fn enqueue(&mut self, text: &str, source: Source);      // Cbuf_AddText
+pub fn run(&mut self, target: &mut dyn CommandTarget);      // Cbuf_Execute
+pub fn take_unknown_count(&mut self) -> u32;
+```
+
+`cvar`/`cvar_bounded` panic on a duplicate name; `try_cvar`/`try_cvar_bounded` return it.
+**A duplicate is a bug**, not a runtime condition: `vstdlib/cvar.cpp:361-450` linked a
+same-named newcomer as a *child* of the incumbent so that `sv_cheats`, declared separately
+in `engine`, `client.so` and `server.so`, resolved to one value. One binary, one
+declaration — that machinery is the single largest deletion in the module, and takes
+`ConVarRef`, `CVarDLLIdentifier_t` and `IConCommandBaseAccessor` with it.
+
+### Dispatch order
+
+`Cmd_ExecuteCommand` (`engine/cmd.cpp:929`) minus the deleted steps:
+
+```
+alias -> command -> cvar -> unknown
+```
+
+- **Alias before command**, so an alias shadows a command of the same name. An alias is
+  *text substitution re-entering the whole of dispatch*, not a call, so it can expand to
+  further aliases.
+- **A cvar set never reaches the target.** `fps_max 60` needs nothing but the cvar;
+  `map sp_a1_intro1` needs `&mut Host`. That split is the reason `CommandTarget` exists.
+- **Only registered names reach the target.** An unregistered name falls through to the
+  cvar step and then to "unknown", so a target's `Dispatch::Unknown` means "I registered
+  this and then did not handle it", which is a bug in the target.
+
+Deleted from the original: execution markers (`CMDSTR_ADD_EXECUTION_MARKER`, which serves
+`ClientCmd_Unrestricted`), `FCVAR_GAMEDLL` forwarding to the server, and the
+forward-to-server fallback. All three return with `net/` and `client/`.
+
+### `CommandTarget` and `ExecContext`
+
+```rust
+pub trait CommandTarget {
+    fn execute(&mut self, cmd: &Command, cx: &mut ExecContext<'_>) -> Dispatch;
+}
+pub enum Dispatch { Handled, Unknown }
+pub struct NoTarget;                     // handles nothing
+
+impl ExecContext<'_> {
+    pub fn enqueue(&mut self, text: &str);                  // with the command's source
+    pub fn enqueue_delayed(&mut self, text: &str, ticks: i32);
+    pub fn print(&mut self, text: &str);
+    pub fn warn(&mut self, text: &str);
+    pub fn error(&mut self, text: &str);
+    pub fn developer_print(&mut self, level: i32, text: &str);
+    pub fn source(&self) -> Source;
+}
+```
+
+**A command is not a callback.** `ConCommand` holds an `FnCommandCallback_t` — a bare
+function pointer reaching its state through globals. There are no globals here, and a
+closure capturing `&mut Engine` cannot be stored in a registry `Engine` owns. So commands
+are declared as data ([`CommandSpec`]) and executed by whoever owns the state.
+
+`Console` is a field of `Engine`, so `self.console.run(&mut self)` cannot compile. The
+target is **a struct of disjoint field borrows**, constructed per call — the same move
+`host.frame(&mut self.scene)` already makes. In `src/engine/mod.rs` that is
+`EngineCommands { host }`, and it grows a field per subsystem that gains commands. That is
+a genuine improvement on the C++, where the answer to "what state may a command touch" was
+"all of it".
+
+`ExecContext` exists for re-entrancy: a command that queues more text writes into field
+borrows of the console the dispatcher is already inside.
+
+### `ConfigFiles`
+
+```rust
+pub trait ConfigFiles {
+    fn read_config(&self, path: &str, path_id: Option<&str>) -> Option<Vec<u8>>;
+}
+pub struct NoConfigFiles;                // reads nothing
+```
+
+The seam that keeps `console/` off `crate::filesystem`. `path` arrives assembled
+(`cfg/valve.rc`); `path_id` is `exec`'s optional second argument, which Valve spells as the
+`//<pathid>/` prefix and defaults to `*` (any mount). `VfsConfigFiles` in
+`src/engine/mod.rs` is the real implementation; tests use an in-memory map.
+
+> **This resolves a contradiction in the plan.** `ENGINE_CONSOLE.md` §0.1 asks for a module
+> testable "without a mounted filesystem" while §3 and §4.5 have `exec` reading
+> `cfg/*.cfg`. Both hold only if the read goes through a trait, so it does.
+
+### `CommandBuffer` and the tick model
+
+```rust
+pub fn add_text(&mut self, text: &str, source: Source, tick_delay: i32) -> bool;
+pub fn begin_processing(&mut self, delta_ticks: i32);
+pub fn dequeue(&mut self) -> Option<Command>;
+pub fn end_processing(&mut self);
+pub fn delay_all(&mut self, delay: i32);
+pub fn set_wait_enabled(&mut self, enabled: bool);
+pub fn take_overflow(&mut self) -> bool;
+pub fn clear(&mut self);
+```
+
+**One `Console::run` is one tick.** That is the spoof `engine/cmd.cpp:288` performs by
+passing 1 to `BeginProcessingCommands` every time, and it is what makes `wait 1` mean
+"next frame". The shipped `.cfg` files assume it, so it is kept — and it is why `run` is
+called *inside* `Engine::frame` rather than per window event.
+
+### Invariants and gotchas (console)
+
+Ordered by how likely each is to bite.
+
+1. **There are two splitters and they disagree.** `buffer::split_commands` divides text
+   into *commands* on `;` and newlines; `token`'s tokenizer divides one command into
+   *argv* with the break set `` {}()': ``. A `;` inside quotes does **not** split a
+   command, but **a newline does, even inside quotes** — Valve flags that in its own
+   source as legacy (`commandbuffer.cpp:194`) and shipped configs were written against it.
+   `;` is an ordinary word character to the argv tokenizer, because splitting already
+   happened.
+2. **An alias body must be quoted to contain a `;`.** `alias pair a; b` sets `pair` to
+   `a` and runs `b` immediately, because `add_text` splits before the `alias` command
+   ever sees the text. `alias pair "a; b"` is what you meant. This is Valve's behaviour
+   and the reason every multi-command alias in a shipped `.cfg` is quoted.
+3. **`Command::tail` is not `args().join(" ")`.** It is `ArgS()`: the raw remainder after
+   argv[0], *as typed*, with quotes intact. The tokenizer strips quotes; the tail does
+   not, which is the whole reason both exist — `hostname "  a b  "` keeps its interior
+   spaces only because the set path reads the tail and then strips quotes in Valve's
+   order (unquote, trim, unquote: `strip_set_value`). Rebuilding it from tokens loses
+   exactly the information it carries. `"foo"bar` parses as two args with a tail of `bar`.
+4. **Insertion during processing goes to the head, and repeated inserts keep their
+   order.** Valve's `InsertImmediateCommand` links before `m_hNextCommand`, which is
+   re-pointed only by `BeginProcessingCommands` and `DequeueNextCommand` — *not by the
+   insert*. So a three-command alias body runs in the order written. Pushing each to the
+   front instead reverses them, which is the plausible-but-wrong ordering §4.2 warns
+   about; it is guarded by
+   `several_immediate_inserts_keep_their_order`.
+5. **`wait` is handled at insert time and the command is dropped.** It adds its delay to a
+   running tick that the *rest of the same text* inherits — a scheduling primitive, not a
+   sleep. It therefore never reaches dispatch.
+6. **A clamped set stores the reformatted number, not the text typed.** `ClampValue` runs
+   before the string is decided, so `fps_max -1` against a minimum of 0 reads back as
+   `"0.000000"` (`printf("%f")`), not `"-1"`. An unclamped set keeps the text exactly,
+   which is what lets a string cvar hold something non-numeric.
+7. **Cvar values parse like `atof`, not like `str::parse`.** The longest numeric prefix
+   wins and anything else yields 0. Strictness would be wrong: this reads shipped `.cfg`
+   files where a trailing unit or comment must not turn a real value into a failure.
+8. **An unknown name from `Source::Code` is counted, not printed.** Shipped configs name
+   cvars from subsystems that do not exist yet, so a printed error per line is a wall at
+   every launch (§9 open question 6). `Source::UserInput` always prints — silence on a
+   typed mistake just looks broken. `take_unknown_count` is the summary.
+9. **`exec` is line-at-a-time and immediate**, not "append the file to the buffer". Each
+   line is drained completely before the next is read, which is why a nested `exec`
+   finishes before the outer file continues (`valve.rc` depends on this) and why a bad
+   line does not stop the lines after it.
+10. **`autoexec.cfg`, `joystick.cfg` and `game.cfg` fail silently.** This looks like a
+    hack and is exactly right: Portal 2 ships none of them and `valve.rc` execs two of
+    them, so without the special case every launch prints two errors. Verified against
+    the depot.
+11. **`exec`'s extension check is a blocklist, not an allowlist** — see the plan
+    corrections below.
+12. **`Command` is owned where Valve's `CCommand` points into the buffer.** Forced, and
+    Valve hit the same problem from the other side: its `memcpy` at `tier1/convar.cpp:421`
+    exists "to avoid the pointers returned by `DequeueNextCommand` to become invalid by
+    calling `AddText`". Dispatching can insert text, so the borrow could not survive
+    dispatch. `ENGINE_CONSOLE.md` §6.4 sketches `Command<'a>`; owning it is the
+    correction.
+
+### Two guards Valve does not have
+
+Both are runaway protection, and they catch different shapes:
+
+- **`MAX_QUEUED_COMMANDS` (1,024)** catches an alias that expands to *many* commands.
+- **`MAX_COMMANDS_PER_ROUND` (10,000)** catches one that expands to **itself**. The queue
+  cap cannot: each round removes one command and inserts one, so the length never grows
+  and the loop runs forever at one. `alias x x; x` hangs the shipped engine. When the
+  budget trips, the rest of the queue is dropped so the loop does not resume next frame.
+- **`MAX_EXEC_DEPTH` (16)** catches a `.cfg` that execs itself, which recurses through
+  Rust's stack rather than through the queue.
+
+### Not implemented, and what each waits on
+
+| Missing | Waits on |
+|---|---|
+| `bind`/`unbind`/`bind_osx`, `kb_def.lst` defaults, the `+`/`-` convention | stage 2 — the table lives in `input/` |
+| `config.cfg` reading and writing, `FCVAR_ARCHIVE` persistence | stage 3 |
+| The console dialog, scrollback rendering, history, completion *algorithm* | stage 4 — wants `egui` |
+| `cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar` | stage 5 |
+| The flag-versus-source permission matrix | `net/` — the check is already a function returning "allowed" (§9 q4) |
+| `con_logfile`, `Con_NPrintf`, colour cvars | later; the notify area is the HUD's |
+| Splitscreen: per-target buffers, `FCVAR_SS`, `cmd1`…`cmd4` | deliberately deleted (§5) |
+
+### Corrections to `portdocs/ENGINE_CONSOLE.md`
+
+Found while implementing, and recorded because the plan is otherwise the reference:
+
+- **§4.5 says non-`.cfg`/`.rc` extensions are refused. They are not.**
+  `IsValidFileExtension` (`engine/cmd.cpp:438`) is a **blocklist** of `.exe`, `.vbs`,
+  `.com`, `.bat`, `.dll`, `.ini`, `.gcf`, `.sys`, `.blob`. An allowlist would reject
+  `valve.rc`, which is exec'd by name. The port keeps the blocklist and matches it
+  case-insensitively, where Valve's `Q_strstr` is case-sensitive — deliberate, since this
+  is a trust check and `FOO.EXE` should not pass one.
+- **§6.4 sketches `Command<'a>` borrowing from the buffer.** It cannot; see gotcha 12.
+- **§4.2's queue cap does not catch a self-recursive alias.** See "Two guards" above.
+- **`CCommandLine::ParmValue` refuses a value starting with `-` or `+`**
+  (`tier0/commandline.cpp:646`), and `src/cmdline.rs` did not. `stuffcmds` skips each
+  `-switch` *and its value*, so without that clause `-window +map foo` has `-window`
+  swallow `+map` and the map never loads. Fixed with the move, and guarded by
+  `a_switch_is_never_read_as_another_switch_s_value` and
+  `a_valueless_option_does_not_eat_the_next_command`.
+- **One deliberate behavioural divergence:** `alias <name>` with no body **prints the
+  current definition** where Valve sets an *empty* one. Valve's reading means a typo at
+  the console silently shadows a command with nothing until you restart.
+
+### Test coverage (console)
+
+64 tests, `cargo test engine::console`.
+
+| Test | Guards |
+|---|---|
+| `splits_on_semicolons_and_newlines`, `a_semicolon_inside_quotes_does_not_split`, `a_newline_splits_even_inside_quotes` | the command splitter, including Valve's legacy newline quirk |
+| `comments_are_trimmed_off_the_command_not_the_line`, `a_comment_inside_quotes_is_not_a_comment` | `//` handling in the splitter |
+| `a_quoted_argument_is_one_token_without_its_quotes`, `break_characters_are_their_own_tokens`, `a_semicolon_is_an_ordinary_character_here` | the argv tokenizer, and that the two splitters differ |
+| `quoted_argv0_followed_immediately_by_a_word`, `tail_is_the_raw_remainder_not_the_rejoined_tokens` | `ArgS`/`m_nArgv0Size` arithmetic |
+| `wait_defers_the_rest_of_the_same_text`, `wait_takes_an_explicit_count`, `wait_can_be_disabled` | `wait` scheduling |
+| `insertion_during_processing_goes_to_the_head`, `several_immediate_inserts_keep_their_order` | alias ordering, both halves |
+| `an_alias_shadows_a_command_of_the_same_name`, `an_alias_is_text_substitution_and_re_enters_dispatch` | dispatch order |
+| `an_alias_body_is_split_on_semicolons_unless_it_is_quoted` | gotcha 2 |
+| `an_alias_that_expands_to_itself_stops_the_round`, `an_alias_that_expands_without_end_overflows_the_queue` | both runaway guards |
+| `a_nested_exec_completes_before_the_outer_file_continues`, `a_bad_line_does_not_stop_the_lines_after_it` | `exec` line-at-a-time |
+| `the_three_optional_configs_fail_silently_and_others_do_not` | `engine/cmd.cpp:572` |
+| `dangerous_extensions_are_refused`, `exec_refuses_to_recurse_without_end`, `exec_refuses_a_file_over_a_megabyte` | `exec`'s trust and resource limits |
+| `the_set_path_strips_surrounding_quotes_but_keeps_interior_spaces` | `strip_set_value`'s ordering |
+| `bounds_clamp_on_every_set_including_the_default` | `ClampValue`, and the reformat on clamp |
+| `the_generation_counter_reports_changes` | the change-callback replacement |
+| `a_duplicate_registration_is_refused` | §4.8, the deleted parent/child linkage |
+| `cheat_cvars_need_sv_cheats_and_revert_when_it_goes_off` | `CHEAT` and `RevertFlaggedConVars` |
+| `unknown_names_from_a_config_are_counted_quietly_and_typed_ones_are_not` | §9 q6 |
+| `stuffcmds_turns_plus_arguments_into_commands`, `a_valueless_option_does_not_eat_the_next_command`, `map_takes_a_second_argument_from_the_command_line` | `stuffcmds` |
+| `a_plus_argument_seeds_a_cvar_at_registration` | `GetCommandLineValue`, distinct from `stuffcmds` |
+| `valve_rc_boots_a_map_through_stuffcmds` | stage 1's deliverable, end to end |
+| `filter_mode_one_drops_and_mode_two_dims`, `developer_is_a_level_not_a_bool`, `the_ring_is_bounded` | the log sink |
+
+---
+
 ## Invariants and gotchas
 
 Ordered by how likely each is to bite. Input has its own list, with the module:
@@ -735,7 +1101,7 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 | Module | `crate::engine::window`, with `window::translate` |
 | Lines | ~1,230 including tests (`mod.rs` + `translate.rs`) |
 | Tests | 17 (`cargo test engine::window`) |
-| Dependencies | `winit` 0.30, `crate::engine`, `crate::materials`, `crate::filesystem`, `crate::launcher::cmdline` |
+| Dependencies | `winit` 0.30, `crate::engine`, `crate::materials`, `crate::filesystem`, `crate::cmdline` |
 
 ### `run`, `Boot` and `RunOutcome`
 
@@ -744,9 +1110,8 @@ pub fn run(config: VideoConfig, boot: Boot<'_>) -> Result<RunOutcome, WindowErro
 
 pub struct Boot<'a> {
     pub vfs: Option<&'a Vfs>,
-    pub map: Option<&'a str>,           // +map <name>
+    pub command_line: Option<&'a CommandLine>,
     pub test_material: Option<&'a str>, // -vmt <name>
-    pub fps_max: f32,                   // +fps_max <n>
 }
 
 pub enum RunOutcome { Quit, Restart }
@@ -763,10 +1128,13 @@ exits.
 `Restart` yet — the `restart` console command is what will — but the path exists all the
 way out to the launcher, because a path that cannot be exercised is a path that is wrong.
 
-`+map` and `+fps_max` are console commands spelled as command-line arguments, which is
-how Source has always taken them: `CCommandLine` copies every `+`-prefixed argument into
-the command buffer at startup. There is no command buffer yet, so the two the engine
-needs to boot are read directly; `console/` replaces this.
+`command_line` replaced the separate `map` and `fps_max` fields, which were two
+open-codings of one thing. Every `+`-prefixed argument now reaches the engine as command
+text the way `CCommandLine` has always fed them to the command buffer: `Engine::boot`
+queues `exec valve.rc`, and the shipped file's `stuffcmds` is what turns `+map foo` into a
+`map` command. Cvar registration separately seeds `+<name> <value>` defaults, which is why
+`+fps_max 60` is in effect before `valve.rc` runs. See
+[`console`](#srcengineconsole).
 
 ### `VideoConfig`
 
@@ -815,14 +1183,17 @@ which is now the order of the statements in `Engine::new`.
 
 ```rust
 pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, vfs: Option<&'a Vfs>,
-           fps_max: f32, test_material: Option<&str>) -> Engine<'a>;
+           command_line: Option<&CommandLine>, test_material: Option<&str>) -> Engine<'a>;
 
+pub fn boot(&mut self);                 // queues `exec valve.rc`; Host_Init's last act
 pub fn frame(&mut self, now: Instant) -> Option<Outcome>;
 pub fn render(&mut self, frame: &mut Frame<'_>);
 pub fn deadline(&self) -> Option<Instant>;
 pub fn request_new_game(&mut self, map: &str);
 pub fn request_shutdown(&mut self);
 pub fn host(&self) -> &Host;
+pub fn console(&self) -> &Console<'a>;
+pub fn console_mut(&mut self) -> &mut Console<'a>;
 
 pub fn push_input(&mut self, event: input::Event);  // from window/, between ticks
 pub fn wants_mouse_capture(&self) -> bool;          // window/ turns this into a grab
@@ -832,13 +1203,21 @@ The renderer stays with the window because the surface is tied to the window han
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
 refcounted clones.
 
-Internally `Engine` is three fields: the `Host`, the `Input`, and a private `Scene`
+Internally `Engine` is five fields: the `Console`, the `Host`, the `Input`, the engine's
+own `fps_max` handle with the generation it last saw, and a private `Scene`
 holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`,
 the view and `curtime`. `Scene` is what implements [`Level`], so
 `host.frame(&mut self.scene)` is a split borrow of two fields rather than `&mut self`
 twice — that is the whole reason for the split. The view lives in `Scene` rather than
 beside the `Input` because it is level state: loading a map puts it at that map's
 `info_player_start`.
+
+`Engine::frame` runs the console **inside** the frame, after the host has agreed one is
+happening — one `Console::run` is one command-buffer tick, so running it per window event
+would tick `wait` at the display's rate. A command queued this frame is therefore acted on
+by the next frame's state machine, which is one frame of latency at startup and is why
+`map` goes through `Host::request_new_game` rather than loading in place. `EngineCommands`
+is the `CommandTarget`: a struct of field borrows, holding `&mut Host` today.
 
 `Engine::update_view` is where input becomes movement, and `mouse_look_after` is the
 whole of the UI-precedence policy until there is a UI: Escape frees the cursor, a click
@@ -853,9 +1232,9 @@ system's GPU regression suite.
 
 ## Test coverage
 
-93 tests across the four modules; 317 in the crate. **42 of those arrived with input** —
-34 in `input/`, 5 for the `winit` key table and 3 for the cursor-release policy — and
-have [their own table](#test-coverage-input).
+157 tests across the five modules; 382 in the crate. **64 of those arrived with
+`console/`** and have [their own table](#test-coverage-console); the 42 that arrived with
+input have [theirs](#test-coverage-input).
 
 | Test | Guards |
 |---|---|

@@ -9,7 +9,14 @@
 //! `filesystem` (search paths, VPKs), `materials` (the GPU device) and
 //! `engine::window` (the game window) exist so far; the rest of `engine` and
 //! the game layer arrive as they're ported.
+//!
+//! `cmdline` is the exception to "one module per Valve module": Valve kept
+//! `CommandLine()` in `tier0` because *everything* reads it, and it sits at the
+//! crate root here for the same reason. It moved out of `launcher/` when
+//! `engine::console` became its third consumer — `stuffcmds` and the `+<cvar>`
+//! default seeding both read it (`portdocs/ENGINE_CONSOLE.md` §6.5).
 
+mod cmdline;
 mod engine;
 mod filesystem;
 mod launcher;
