@@ -16,24 +16,23 @@
 //! the call when `FilterTime` says the frame is early — which would mean
 //! sleeping inside a callback `winit` scheduled.
 //!
-//! Where that has landed so far, and what is still open:
+//! Where that has landed:
 //!
 //! - `about_to_wait` decides *when* the next frame happens and asks for it;
-//!   `RedrawRequested` runs it. Today that frame is a clear; when the host
-//!   loop lands it becomes one engine tick, and `draw` is the seam.
-//! - **The `WaitUntil` mechanism is already here**, one stage earlier than §6
-//!   expected, because a skipped frame has to back off (see [`SKIP_RETRY`]).
-//!   `FilterTime`'s *policy* — `fps_max` and the convars that tune it — is not
-//!   yet: vsync is currently the only frame limiter (see [`VideoConfig`]).
-//!   When it lands it applies in the same place, as a second deadline.
-//!   **Nothing in this module sleeps**, which is the point: the two-systems-
-//!   both-pacing failure §6 warns about is avoided by having exactly one of
-//!   them own it, and it is this one.
-//! - **Quit vs. restart is not modelled yet.** `event_loop.exit()` currently
-//!   always means "exit". `SetQuitting(QUIT_RESTART)` has to survive as a
-//!   distinct outcome for `src/launcher/`'s restart loop; that distinction
-//!   belongs in the return type of [`run`] when there is an engine to request
-//!   it.
+//!   `RedrawRequested` runs one engine tick through
+//!   [`Engine::frame`](crate::engine::Engine::frame).
+//! - **`FilterTime` is split in two.** Its *policy* — should this frame run,
+//!   and if not, when may the next one — lives in
+//!   [`crate::engine::host::FrameClock`]; its *mechanism* is
+//!   `ControlFlow::WaitUntil`, here. That is exactly the division §6 asks for,
+//!   and it is why **nothing in this module sleeps** and nothing in the host
+//!   knows what a control flow is. Two deadlines can be outstanding at once —
+//!   the engine's `fps_max` and this module's [`SKIP_RETRY`] — and
+//!   [`GameWindow::about_to_wait`] takes the later.
+//! - **Quit vs. restart is modelled**: [`run`] returns a [`RunOutcome`], which
+//!   is `CEngineAPI::MainLoop`'s `RUN_OK`/`RUN_RESTART`. Closing the window
+//!   does not exit the loop directly — it asks the engine to shut down, so the
+//!   host state machine still unloads the level on the way out.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,11 +47,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 // Valve kept `CommandLine()` in tier0 precisely because everything reads it.
 // If a third subsystem needs it, move it to a crate-level `src/cmdline.rs`
 // rather than growing more of these imports.
+use crate::engine::host::Outcome;
+use crate::engine::Engine;
 use crate::filesystem::Vfs;
 use crate::launcher::cmdline::CommandLine;
-use crate::materials::{
-    Material, MaterialCache, MaterialPreview, RenderContext, Renderer, RendererOptions, CLEAR_COLOR,
-};
+use crate::materials::{Renderer, RendererOptions};
 
 /// Fallback window title, from `CGame::CreateGameWindow`
 /// (`engine/sys_mainwind.cpp:1266`) — used when `gameinfo.txt` has no `game`
@@ -264,33 +263,56 @@ pub enum WindowError {
     Renderer(#[from] crate::materials::RendererError),
 }
 
-/// Creates the game window and runs the event loop until the game quits.
+/// How the engine stopped.
 ///
-/// Returns when the window closes. This is `CEngineAPI::MainLoop`'s place in
-/// the boot sequence (`engine/sys_dll2.cpp:1132`), and on POSIX it must be
-/// called from the main thread — a hard requirement of macOS's AppKit that
-/// `winit` enforces.
-pub fn run(
-    config: VideoConfig,
-    vfs: Option<&Vfs>,
-    test_material: Option<&str>,
-) -> Result<(), WindowError> {
+/// `CEngineAPI::MainLoop`'s return value (`engine/sys_dll2.cpp:1132`), which
+/// distinguished `RUN_OK` from `RUN_RESTART` so that the launcher's restart
+/// loop could tell "the user quit" from "the engine wants to come back". That
+/// distinction is what `PORTING.md` requires to survive the `winit` inversion,
+/// and this is where it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// `QUIT_TODESKTOP`, or the window was closed.
+    Quit,
+    /// `QUIT_RESTART`.
+    Restart,
+}
+
+/// What the engine needs at startup, beyond the video settings.
+///
+/// `run`'s signature grew a struct at the point predicted in this module's
+/// first version: these are `CEngineAPI::Run`'s arguments, and they are a value
+/// rather than four positional parameters because they are about to keep
+/// growing — the client, the server and the console each add one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Boot<'a> {
+    /// The mounted game content, or `None` if it failed to mount.
+    pub vfs: Option<&'a Vfs>,
+    /// `+map <name>` — the map to load at startup.
+    pub map: Option<&'a str>,
+    /// `-vmt <name>` — draw one material instead of the world.
+    pub test_material: Option<&'a str>,
+    /// `+fps_max <n>`.
+    pub fps_max: f32,
+}
+
+/// Creates the game window and runs the frame loop until the game quits.
+///
+/// This is `CEngineAPI::MainLoop`'s place in the boot sequence
+/// (`engine/sys_dll2.cpp:1132`), and on POSIX it must be called from the main
+/// thread — a hard requirement of macOS's AppKit that `winit` enforces.
+pub fn run(config: VideoConfig, boot: Boot<'_>) -> Result<RunOutcome, WindowError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = GameWindow::new(
-        config,
-        event_loop.owned_display_handle(),
-        vfs,
-        test_material,
-    );
+    let mut app = GameWindow::new(config, event_loop.owned_display_handle(), boot);
     event_loop.run_app(&mut app)?;
 
     // A failure inside a `winit` callback cannot be returned from it, so it is
     // parked on the handler and re-raised here.
     match app.startup_error {
         Some(err) => Err(err),
-        None => Ok(()),
+        None => Ok(app.outcome),
     }
 }
 
@@ -301,58 +323,33 @@ struct GameWindow<'a> {
     /// The display connection, kept because the renderer is built later, in
     /// `resumed`, and `wgpu` wants it on the instance.
     display: OwnedDisplayHandle,
-    /// The mounted game content, if it mounted. `None` is survivable — see
-    /// [`GameWindow::load_test_material`].
-    vfs: Option<&'a Vfs>,
-    /// `-vmt <name>`: the stage-3 verification switch. See
-    /// [`GameWindow::load_test_material`].
-    test_material: Option<&'a str>,
+    boot: Boot<'a>,
     /// Declared before `window` so the surface is torn down before the window
     /// it points at.
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
-    /// The material dictionary, and the texture and pipeline caches under it.
-    /// Owns what the preview draws, so it outlives the draw rather than being
-    /// a local in [`GameWindow::create`].
-    materials: Option<MaterialCache>,
-    /// The uniform arenas, the dynamic geometry buffers and the pass factory.
-    /// Built with the renderer, because it needs the device.
-    context: Option<RenderContext>,
-    /// The cube and its buffers.
-    preview: Option<MaterialPreview>,
-    /// When the first frame was drawn, so the preview camera can orbit. The
-    /// engine's own clock replaces this with the host loop.
-    started: Instant,
-    /// Built only when `-vmt` asked for one.
-    material: Option<Arc<Material>>,
+    /// Built in `resumed`, once there is a device to build it against.
+    engine: Option<Engine<'a>>,
     /// When to try again after a skipped frame. See [`SKIP_RETRY`].
     retry_at: Option<Instant>,
     /// Whether the milestone line has been printed. See [`GameWindow::draw`].
     presented: bool,
+    outcome: RunOutcome,
     startup_error: Option<WindowError>,
 }
 
 impl<'a> GameWindow<'a> {
-    fn new(
-        config: VideoConfig,
-        display: OwnedDisplayHandle,
-        vfs: Option<&'a Vfs>,
-        test_material: Option<&'a str>,
-    ) -> Self {
+    fn new(config: VideoConfig, display: OwnedDisplayHandle, boot: Boot<'a>) -> Self {
         GameWindow {
             config,
             display,
-            vfs,
-            test_material,
+            boot,
             renderer: None,
             window: None,
-            materials: None,
-            context: None,
-            preview: None,
-            started: Instant::now(),
-            material: None,
+            engine: None,
             retry_at: None,
             presented: false,
+            outcome: RunOutcome::Quit,
             startup_error: None,
         }
     }
@@ -371,60 +368,40 @@ impl<'a> GameWindow<'a> {
             &self.config.renderer_options(),
         )?;
 
-        let mut materials = MaterialCache::new(renderer.device(), renderer.queue());
-        self.context = Some(RenderContext::new(
+        let mut engine = Engine::new(
             renderer.device(),
             renderer.queue(),
-            materials.pipelines(),
-        ));
-        self.preview = Some(MaterialPreview::new(renderer.device()));
-        self.material = self.load_test_material(&mut materials);
-        self.materials = Some(materials);
+            self.boot.vfs,
+            self.boot.fps_max,
+            self.boot.test_material,
+        );
+
+        // `+map` is the console command spelled as a command-line argument,
+        // which is how Source has always started on a map. It is queued rather
+        // than loaded: the host state machine loads it on the first frame, so
+        // startup and a later `map` command take exactly the same path.
+        if let Some(map) = self.boot.map {
+            engine.request_new_game(map);
+        }
+
+        self.engine = Some(engine);
         self.window = Some(window);
         self.renderer = Some(renderer);
         Ok(())
     }
 
-    /// Loads `-vmt <name>` and prepares to draw it over the frame.
+    /// One frame: the engine tick, then the picture it produced.
     ///
-    /// **Stage 3 verification only.** `portdocs/MATERIALSYSTEM.md` §9 makes the
-    /// deliverable of the material stage "a quad drawn through a real `.vmt`
-    /// and a real WGSL shader"; this is the switch that asks for one, and it
-    /// goes away with [`crate::materials::MaterialPreview`] when stage 4's
-    /// render context can draw real geometry.
+    /// The order here is the frame boundary `rustdocs/MATERIALS.md` describes,
+    /// with the engine wrapped around it:
     ///
-    /// Failure is deliberately not an error. A missing material, a malformed
-    /// one, or one naming a shader this port does not have resolves to the
-    /// error material — magenta checkerboard — exactly as
-    /// `CMaterialSystem::FindMaterial` did, because "one material is broken"
-    /// must never be "the game does not start". Seeing the checkerboard is
-    /// itself evidence that the fallback path works.
-    fn load_test_material(&mut self, materials: &mut MaterialCache) -> Option<Arc<Material>> {
-        let name = self.test_material?;
-
-        let material = match self.vfs {
-            Some(vfs) => materials.load(vfs, name),
-            None => {
-                eprintln!("source-engine: materials: -vmt {name}: no game content is mounted");
-                materials.error_material()
-            }
-        };
-
-        eprintln!(
-            "source-engine: materials: -vmt {} -> {} ({}), flags {}",
-            name,
-            material.shader.name(),
-            material.name,
-            material.flags
-        );
-        Some(material)
-    }
-
-    /// One frame.
-    ///
-    /// When the engine host loop lands, the tick goes here: the frame boundary
-    /// is `begin_frame` ... `present`, and everything the engine draws is
-    /// recorded in between.
+    /// 1. `Engine::frame` — the clock decides whether a frame runs at all, then
+    ///    the host state machine runs it. **Before** the surface is acquired, so
+    ///    a refused frame costs nothing and a map load does not hold a
+    ///    swap-chain image across it.
+    /// 2. `Renderer::begin_frame` — acquire, or back off.
+    /// 3. `Engine::render` — one pass.
+    /// 4. `present`.
     ///
     /// Prints one milestone line the first time a frame reaches the screen.
     /// Creating a device and creating a window both succeed on machines where
@@ -432,17 +409,31 @@ impl<'a> GameWindow<'a> {
     /// the GPU path works; this line is. It is the startup-log equivalent of
     /// the `COM_TimestampedLog` calls that bracketed `CreateGameWindow`
     /// (`engine/sys_getmodes.cpp:537`).
-    fn draw(&mut self) {
-        let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
+    fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(renderer), Some(engine)) =
+            (&self.window, &mut self.renderer, &mut self.engine)
+        else {
             return;
         };
 
-        // Reclaimed before the frame is acquired, not after it is presented:
-        // this is the point at which the previous frame is certainly finished
-        // being *recorded*, and it keeps the reset in one place rather than on
-        // every path out of `draw`.
-        if let Some(context) = &mut self.context {
-            context.begin_frame();
+        // `None` means this frame is early. `about_to_wait` reads the engine's
+        // deadline and waits it out; nothing sleeps here.
+        let Some(outcome) = engine.frame(Instant::now()) else {
+            return;
+        };
+
+        match outcome {
+            Outcome::Continue => {}
+            Outcome::Quit | Outcome::Restart => {
+                self.outcome = match outcome {
+                    Outcome::Restart => RunOutcome::Restart,
+                    _ => RunOutcome::Quit,
+                };
+                // The level has already been torn down by the state machine on
+                // its way through `GameShutdown`.
+                event_loop.exit();
+                return;
+            }
         }
 
         // `None` is the ordinary "not on screen right now" answer, not a
@@ -453,28 +444,7 @@ impl<'a> GameWindow<'a> {
             return;
         };
 
-        // Stage 4's verification draw. Deleted with `-vmt` and
-        // `MaterialPreview` when there is a map to draw instead.
-        let scene = (
-            &self.material,
-            &self.preview,
-            &mut self.context,
-            &mut self.materials,
-        );
-        match scene {
-            (Some(material), Some(preview), Some(context), Some(materials)) => {
-                context.draw_preview(
-                    &mut frame,
-                    materials.pipelines(),
-                    preview,
-                    material,
-                    self.started.elapsed().as_secs_f32(),
-                );
-            }
-            // Nothing to draw: clear and present anyway, so the window is a
-            // window rather than whatever was behind it.
-            _ => frame.clear(CLEAR_COLOR),
-        }
+        engine.render(&mut frame);
 
         // Tells the compositor a frame is imminent, so it can schedule
         // accordingly. Must be immediately before the present.
@@ -510,7 +480,21 @@ impl ApplicationHandler for GameWindow<'_> {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // Not an immediate exit: the engine is asked to shut down and the
+            // state machine unloads the level on its way out, which is what
+            // `HostState_Shutdown` does. The frame that carries it out is the
+            // next one, so the backoff is cleared and a redraw asked for
+            // rather than waiting for the retry deadline.
+            WindowEvent::CloseRequested => match &mut self.engine {
+                Some(engine) => {
+                    engine.request_shutdown();
+                    self.retry_at = None;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                None => event_loop.exit(),
+            },
 
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
@@ -522,7 +506,7 @@ impl ApplicationHandler for GameWindow<'_> {
             // do here; the surface is sized in physical pixels either way.
             WindowEvent::ScaleFactorChanged { .. } => {}
 
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::RedrawRequested => self.draw(event_loop),
 
             // Input arrives here. `portdocs/ENGINE.md` §6 has the chain it
             // replaces and the open question about UI event precedence, which
@@ -533,21 +517,40 @@ impl ApplicationHandler for GameWindow<'_> {
 
     /// Decides when the next frame happens.
     ///
-    /// `portdocs/ENGINE.md` §6 predicted that `FilterTime`'s policy would
-    /// become `ControlFlow::WaitUntil` here rather than a sleep down in
-    /// `CEngine::Frame`. That mechanism has arrived a stage early, for the
-    /// reason in [`SKIP_RETRY`], and it is where `fps_max` will eventually be
-    /// applied too.
+    /// Two deadlines can be outstanding, and the later one wins because both
+    /// are "do not come back before":
     ///
-    /// Note that no redraw is requested while backing off: a pending redraw
-    /// request wakes the loop, which would defeat the deadline.
+    /// - **The renderer's**, when a frame was skipped ([`SKIP_RETRY`]). The
+    ///   window owns this one; the engine cannot, because a surface that
+    ///   refuses to hand over an image is not an engine concept.
+    /// - **The engine's**, when `FilterTime` refused a frame as early
+    ///   (`fps_max`). The engine owns the *policy* and this owns the
+    ///   *mechanism*, which is the split `portdocs/ENGINE.md` §6 asks for:
+    ///   `CEngine::Frame` slept inside itself, and a callback `winit`
+    ///   scheduled must not sleep.
+    ///
+    /// **Nothing in this module sleeps.** Note also that no redraw is requested
+    /// while waiting: a pending redraw request wakes the loop, which would
+    /// defeat the deadline entirely.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let engine_deadline = self.engine.as_ref().and_then(Engine::deadline);
+
         if let Some(deadline) = self.retry_at {
-            if Instant::now() < deadline {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                return;
+            if now >= deadline {
+                self.retry_at = None;
             }
-            self.retry_at = None;
+        }
+
+        let deadline = [self.retry_at, engine_deadline]
+            .into_iter()
+            .flatten()
+            .filter(|&deadline| deadline > now)
+            .max();
+
+        if let Some(deadline) = deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
         }
 
         event_loop.set_control_flow(ControlFlow::Poll);

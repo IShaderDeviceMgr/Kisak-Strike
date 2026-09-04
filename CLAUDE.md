@@ -49,24 +49,27 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 217 tests), and the binary now **runs**: it
-mounts the game filesystem, opens a window, and draws real geometry — an orbiting
-perspective camera, two overlapping cubes resolved by a depth buffer, and a ground quad
-built into per-frame dynamic buffers — textured with a real `.vmt` from the game's own
-content (`-vmt <name>`). It is **not a runnable game** and won't be until the rest of the boot
-path exists — engine host loop, map loading, game layer. Verification is still mostly against the reference: read
-`legacy/`, compare behavior, reason it through. There is no hybrid binary to run.
+There is a unit test suite (`cargo test`, 252 tests), and the binary now **runs and
+loads a map**: it mounts the game filesystem, opens a window, runs an engine frame loop
+with a real host state machine, reads a Portal 2 `.bsp`, and draws its world geometry.
+It is **not a runnable game** — there is no input, simulation, sound or netcode — but the
+boot path is continuous from `main` to a rendered level.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
 ```
-cargo run -- -basedir /path/to/game -game portal2 -window -width 1280 -height 720
+cargo run --release -- -basedir /path/to/game -game portal2 -window +map sp_a1_intro1
 cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
 
-Most Portal 2 world materials name `LightmappedGeneric`, which is not ported, so they
-draw the magenta error checkerboard. `tools/toolsblack` and `vgui/white` are real
-`UnlitGeneric` materials in the shipped content.
+**Most of what a map draws is the magenta error checkerboard**, and that is expected, not
+a bug: 62 of `sp_a1_intro1`'s 66 world materials name `LightmappedGeneric`, which is not
+written yet (the shader set is one deep). `tools/toolsblack` and `vgui/white` are real
+`UnlitGeneric` materials in the shipped content. The camera **turns slowly on the spot**
+because there is no input yet; that is a placeholder and is documented as one.
+
+Verification is otherwise still mostly against the reference: read `legacy/`, compare
+behavior, reason it through. There is no hybrid binary to run.
 
 ## The port: standing decisions
 
@@ -153,22 +156,33 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   Valve's static/dynamic shader-combo system is deleted with them — `UnlitGeneric`
   needed no source-text variants at all, so §10's "how are variants expressed" question
   is still open and still unforced.
-- **`src/engine/` — `window/` ported, the other 12 subsystems not started**
-  (`portdocs/ENGINE.md`, `rustdocs/ENGINE.md`). Conclusion stands: don't port `engine` as
-  one unit. Each of its 23 subsystems becomes its own Rust module under `src/engine/`
-  (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules surviving, ~45,700
-  lines deleted outright. `window/` is the `winit` event loop plus `VideoConfig`; input
-  and the engine tick are not implemented, and frame pacing lives here rather than in the
-  engine (see `rustdocs/ENGINE.md` gotcha #3).
+- **`src/engine/` — 3 of 13 modules ported: `window/`, `host/`, `world/`'s geometry**
+  (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
+  Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
+  its own module, 13 surviving, ~45,700 lines deleted outright.
+  `host/` is `CHostState`'s state machine (eight states become five, keeping the
+  invariant that every path to a new level goes *through* `GameShutdown`) plus
+  `FilterTime`'s policy; it depends on `std` alone, because loading a level is a `Level`
+  trait, and is tested without a GPU. **`CEngine`'s outer `m_nDLLState`/`m_nQuitting`
+  machine is deleted** — quit-vs-restart is a return value that reaches the launcher as
+  `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks and groups
+  faces into per-material batches at load. The **`winit` control-flow inversion is
+  resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
+  (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
+  Not implemented: input, simulation, visibility, collision, displacements, brush
+  entities, static props, lightmaps, the skybox.
+  **The one divergence that will bite:** world triangles are emitted with their **winding
+  reversed**, because Valve's `D3DCULL_CCW` and this port's `front_face: Ccw` read
+  identically and are not the same thing (GL's framebuffer is Y-up, WebGPU's is Y-down,
+  and facing is decided after the flip). In file order a map draws as an empty clear
+  colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
+  fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path per `PORTING.md`: **the engine host loop and map loading**, not
-another material-system stage. Stage 5 is lightmaps, which needs a `.bsp` before it has
-anything to pack, so the `wgpu` groundwork that had to come first is finished and the
-ordering hands back to `portdocs/ENGINE.md`. The frame boundary the host loop has to fit
-inside is `RenderContext::begin_frame` → `Renderer::begin_frame` → passes →
-`Frame::present`; `rustdocs/MATERIALS.md` states it precisely, including why that
-ordering is not arbitrary.
+Next on the boot path per `PORTING.md`: **input**, then **`console/`** (now earned —
+`map`, `fps_max`, `restart` and `quit` all exist as engine operations with no way to type
+them), then **`materialsystem` stage 5** (lightmaps), which is no longer blocked and has
+the highest visual return of anything outstanding.
 
 ### Known warts, and what triggers fixing them
 

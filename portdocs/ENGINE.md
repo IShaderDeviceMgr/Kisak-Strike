@@ -5,7 +5,11 @@ Porting design doc for `engine/` → `src/engine/`.
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: design/scoping. Not started, and deliberately not next.**
+**Status: three of thirteen modules landed** — `window/` (§7.3), `host/` (§7.2) and the
+geometry slice of `world/` (§7.14). The binary loads a real Portal 2 `.bsp` and draws it.
+**What exists is documented in [`../rustdocs/ENGINE.md`](../rustdocs/ENGINE.md)**, which
+is the doc to read before calling in; this one remains the map of what is still ahead.
+§6's control-flow inversion is resolved — see the note at the end of it.
 
 Two headline decisions:
 
@@ -24,11 +28,13 @@ The subsystems in §7 are not just a reading aid — they are the module boundar
 PORTING.md's one-crate architecture there is no `.so` seam between them, so the seams that
 matter are Rust ones: `mod`, `pub(crate)`, and real types crossing between them.
 
+Modules marked **done** exist in `src/`; the rest are the plan.
+
 ```
 src/engine/
-  mod.rs          Engine construction + ownership of the subsystems below
-  host/           frame loop, host state machine, level/map lifecycle        (§7.2)
-  window/         winit integration, video mode, input translation           (§7.3)
+  mod.rs          Engine construction + ownership of the subsystems below    **done**
+  host/           frame loop, host state machine, level/map lifecycle        (§7.2) **done**
+  window/         winit integration, video mode, input translation           (§7.3) **done, minus input**
   console/        cvars, command buffer, dev console, key binding            (§7.4)
   client/         client connection lifecycle, entity parsing, prediction    (§7.5)
   server/         server lifecycle, connected clients, snapshot writing      (§7.6)
@@ -36,7 +42,7 @@ src/engine/
     datatable/    SendTable/RecvTable entity delta encoding                  (§7.8)
     stringtable/  replicated string↔index tables                             (§7.9)
   events/         the named game-event bus                                   (§7.10)
-  world/          BSP + model loading, visibility, collision hulls           (§7.14)
+  world/          BSP + model loading, visibility, collision hulls           (§7.14) **geometry only**
     disp/         displacement (terrain) surfaces                            (§7.15)
   trace/          ray/hull traces, spatial partition                         (§7.17)
   render/         thin front-end over src/materials — view setup, draw lists (§7.16)
@@ -263,6 +269,24 @@ scheduled — is the specific failure mode to design against.
 Note the frame loop also constrains `src/materials/`: surface acquire and present have to
 sit at a well-defined point in the tick. MATERIALSYSTEM.md stage 1 establishes that
 boundary, which is why it lands first.
+
+### Resolved
+
+All four target-shape bullets above landed as written, with one refinement worth
+recording: **`FilterTime` split into a policy half and a mechanism half.**
+`host::FrameClock` decides whether a frame runs and when the next may
+(`fps_max`, `MAX_FPS`, the frame-time clamps); `window::about_to_wait` turns that answer
+into `ControlFlow::WaitUntil`. Neither half can sleep, which is what makes the
+two-systems-both-pacing failure structurally impossible rather than merely avoided.
+
+`SetQuitting`'s restart-vs-exit distinction survives as `host::Outcome` →
+`window::RunOutcome`, out to the launcher. The *outer* `CEngine` state machine
+(`m_nDLLState`/`m_nQuitting`) is deleted outright: it existed only to carry that decision
+across the `IEngine` boundary by polling, and there is no such boundary.
+
+The input path (the left column above) is **still not started** — `WindowEvent`'s
+keyboard and mouse variants are dropped, and the `egui` precedence question is untouched.
+That is now the largest single gap in `window/`.
 
 ## 7. Subsystem breakdown
 
@@ -560,23 +584,29 @@ removing SDL2 touches this module in two unrelated places.
 
 ## 10. Sequencing
 
-**`engine` is not next.** PORTING.md's boot path puts it after rendering, and that hasn't
-changed. Current position:
+Done: `filesystem`, `materialsystem` stages 1-4, and then — out of the order below, and
+deliberately — `host/` + `world/` geometry ahead of `console/`. The reason: `console/`'s
+value is that everything registers cvars, and nothing did yet. Two cvars were actually
+needed (`map`, `fps_max`), and both are reachable as `+map`/`+fps_max` command-line
+arguments, which is how Source spells them anyway. Porting a cvar registry to serve two
+readers would have been scaffolding; it is worth doing when the third and fourth
+subsystems want it.
 
-1. **`filesystem`** — [`FILESYSTEM.md`](FILESYSTEM.md), next module on the boot path.
-   Everything below needs it.
-2. **`winit` + `wgpu` groundwork, inside `materialsystem`** —
-   [`MATERIALSYSTEM.md`](MATERIALSYSTEM.md) stages 1–3. This subsumes most of §7.3
-   (windowing) and sets the frame boundary §6 has to fit. **Do this before engine's frame
-   loop, not after.**
-3. **Then engine, in dependency order**, each subsystem a module per §1:
-   - `console/` (§7.4) — everything registers cvars; port it first and cheaply.
-   - `host/` (§7.2) + what's left of `window/` (§7.3) — the `winit` inversion of §6.
-     `host_state.cpp`'s state machine is the spine.
-   - `world/` (§7.14, §7.15) + `trace/` (§7.17) — map loading. **First point at which
-     something recognizable appears on screen.**
+**§10.3's "first point at which something recognizable appears on screen" has been
+reached.** Remaining, in dependency order:
+
+1. **Input** (§7.3's remainder) — the largest gap in `window/`, and the thing that makes
+   the placeholder camera in `rustdocs/ENGINE.md` unnecessary. Needs the `egui`
+   precedence decision in §6.
+2. **`console/`** (§7.4) — now genuinely earned: `map`, `fps_max`, `restart` and
+   `quit` all exist as engine operations with no way to type them.
+3. **`materialsystem` stage 5** (lightmaps) — no longer blocked; there is a `.bsp` to
+   pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
+   from checkerboard into content. **Highest visual return of anything on this list.**
+4. **The rest of `world/`** (§7.14, §7.15) — visibility (every face is drawn every frame
+   today), displacements, brush entities, static props — plus `trace/` (§7.17).
    - `render/` (§7.16) + `paint/` — as the consumer side of the `src/materials/` work,
-     not as a separate port.
+     not as a separate port. `Engine::camera` and `World::draw` are its seed.
    - `audio/` (§7.18) — large but self-contained, no `winit`/`wgpu` entanglement, and the
      existing backend abstraction makes it substitutable. Can proceed in parallel with the
      above once `filesystem` lands.

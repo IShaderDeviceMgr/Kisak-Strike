@@ -349,7 +349,7 @@ Rules of thumb:
   frame boundary the host loop has to fit, the texture path, the material path, and the
   meshes and render context designed against the engine's real draw paths — is done. The
   next material-system stage is lightmaps, which needs a `.bsp`, so the host loop and map
-  loading come first.*
+  loading came first. Both have since landed, so stage 5 is unblocked.*
 - **Don't port anything slated for replacement.** Renderer front-end (→ `wgpu`), UI
   (→ `egui`), tier libs (→ `std`), zip/compression/etc. (→ crates). A large fraction
   of the raw line count evaporates this way — roughly half of the compiled
@@ -497,15 +497,55 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   lines — leaving a real port target around 30–35k. Also settled: **the shaders are
   rewritten in WGSL** from the `.fxc` HLSL, and the static/dynamic combo system is deleted
   (see below).
-- **`engine` — documented, not started.** `portdocs/ENGINE.md`: 23 subsystems enumerated
-  with files and sizes, plus the frame-loop/`winit` analysis. Conclusion stands: don't
-  port it as one unit. **Each subsystem becomes its own Rust module under `src/engine/`**
-  (`audio/`, `net/`, `host/`, `world/`, `console/`, …) — 13 modules from 23 subsystems,
-  with ~45,700 lines deleted outright (HLTV, replay, VGui panels, dev tooling, tool
-  framework, console platform code). Its `paint.cpp` is essential for Portal 2. Corrected
-  while rewriting: **sound is ~97,200 lines, not the ~48,000 previously recorded** — the
-  largest subsystem in the module by a wide margin.
+- **`engine` — 3 of 13 modules ported: `window/`, `host/`, and `world/`'s geometry.**
+  `portdocs/ENGINE.md` enumerates all 23 subsystems; **API: `rustdocs/ENGINE.md`**.
+  Conclusion stands: don't port it as one unit. Each subsystem is its own module under
+  `src/engine/` — 13 modules from 23 subsystems, ~45,700 lines deleted outright. Its
+  `paint.cpp` is essential for Portal 2. Corrected while rewriting: **sound is ~97,200
+  lines, not the ~48,000 previously recorded.**
+
+  *`host/` — the frame clock and the level state machine.* `CHostState`'s eight states
+  become five (`HS_LOAD_GAME` and the two `HS_CHANGE_LEVEL_*` have nothing to reach until
+  `save/` and a server exist), keeping the invariant that every path from `Run` to a new
+  level goes *through* `GameShutdown`. **`CEngine`'s outer state machine
+  (`m_nDLLState`/`m_nQuitting`) is deleted**, not ported: it existed to carry the
+  quit-vs-restart decision across the `IEngine` boundary by polling, and there is no such
+  boundary — it is a return value now, and it reaches the launcher as
+  `window::RunOutcome`. The module depends on `std` alone: loading a level is the
+  `Level` trait, which is why the state machine is tested without a GPU.
+
+  *The `winit` control-flow inversion is resolved.* `FilterTime` split in two —
+  `host::FrameClock` owns the *policy* (`fps_max`, `MAX_FPS`, the frame-time clamps),
+  `window::about_to_wait` owns the *mechanism* (`ControlFlow::WaitUntil`). Neither may
+  sleep, which makes the two-systems-both-pacing failure this file warned about
+  structurally impossible rather than merely avoided.
+
+  *`world/` — `.bsp` reading and world geometry.* The lumps the renderer walks, parsed
+  into `Pod` structs transcribed from `public/bspfile.h`, then grouped into per-material
+  batches at load rather than re-sorted per frame. The hunk allocator (`zone.cpp`,
+  `mem.cpp`) is deleted as planned — `Vec` and `Drop` are what it was for. **`+map
+  sp_a1_intro1` draws the Portal 2 intro room**, at 5,512 of 5,638 faces and 14.5k
+  triangles. Not loaded: visibility (every face is drawn every frame), collision,
+  displacements, brush entities, static props, lightmaps, the 3D skybox.
+
+  **One divergence that is not cosmetic**, recorded in full in `rustdocs/ENGINE.md`
+  gotcha #1: **world triangles are emitted with their winding reversed.** Valve's
+  `D3DCULL_CCW` maps, through Valve's own D3D→GL layer, to `glFrontFace(GL_CCW)` — which
+  reads identically to the port's `front_face: Ccw, cull_mode: Back` and is not the same
+  thing, because GL's framebuffer origin is bottom-left and WebGPU's is top-left and
+  facing is decided after the flip between them. In file order the map draws as an empty
+  clear colour. The reversal is done once at the content boundary; **flipping
+  `front_face` in `PipelineCache` is arguably the better fix and is left as an open
+  question**, since it fails 17 stage-4 GPU tests whose geometry is hand-wound for the
+  present convention.
 - **Everything else is unported** and lives in `legacy/`.
+
+**Next on the boot path:** input (the largest remaining gap in `window/`, and what
+retires the placeholder turntable camera), then `console/` — now genuinely earned, since
+`map`, `fps_max`, `restart` and `quit` all exist as engine operations with no way to type
+them — then `materialsystem` stage 5 (lightmaps), which is no longer blocked and has the
+highest visual return of anything outstanding: it is what turns 62 of `sp_a1_intro1`'s 66
+materials from magenta checkerboard into content.
 
 **Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
 `launcher_main` were deleted before the restructure, so `legacy/` no longer links a

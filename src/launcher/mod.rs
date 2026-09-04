@@ -10,7 +10,8 @@ pub mod cmdline;
 pub mod dialog;
 pub mod single_instance;
 
-use crate::engine::window::{self, VideoConfig};
+use crate::engine;
+use crate::engine::window::{self, Boot, RunOutcome, VideoConfig};
 use crate::filesystem;
 use cmdline::CommandLine;
 use single_instance::{LockError, SingleInstanceLock};
@@ -109,23 +110,46 @@ pub fn run() -> i32 {
 
     // Create the window and run the frame loop. This is where
     // `CEngineAPI::Run`/`MainLoop` (`engine/sys_dll2.cpp:1132`) took over.
-    //
-    // TODO: the engine itself is still unported, so the loop clears a frame
-    // and presents it. `run` returning `Ok` therefore always means "the window
-    // was closed"; `QUIT_RESTART` has to become a distinct outcome here before
-    // the original's restart loop can exist. See portdocs/ENGINE.md §6.
     let video = VideoConfig::from_command_line(&cmdline, game_title.as_deref());
-    // `-vmt <name>`: stage 3's verification switch, which draws one material
-    // out of the game's content over the frame. See
-    // `GameWindow::load_test_material`; it goes away when stage 4's render
-    // context can draw real geometry.
-    let test_material = cmdline.value("-vmt");
-    if let Err(err) = window::run(video, vfs.as_ref(), test_material) {
-        dialog::report_error("Source - Error", &err.to_string());
-        return 1;
-    }
+    let boot = Boot {
+        vfs: vfs.as_ref(),
+        // `+map <name>` and `+fps_max <n>` are console commands spelled as
+        // command-line arguments, which is how Source has always taken them:
+        // `CCommandLine` copies every `+`-prefixed argument into the command
+        // buffer at startup. There is no command buffer yet — `console/` is
+        // unported (portdocs/ENGINE.md §7.4) — so the two the engine needs to
+        // boot are read directly, and this block is what `Cbuf_AddText` of the
+        // startup line replaces.
+        map: cmdline.value("+map"),
+        // `-vmt <name>`: draws one material on two cubes instead of the world.
+        // portdocs/MATERIALSYSTEM.md §9 calls for this to be deleted once there
+        // is a map to draw instead, and there now is — it is kept because it is
+        // the only way to inspect a single material in isolation, and because
+        // `src/materials/preview.rs` carries the module's GPU regression tests.
+        test_material: cmdline.value("-vmt"),
+        fps_max: cmdline
+            .value("+fps_max")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(engine::host::DEFAULT_FPS_MAX),
+    };
 
-    0
+    match window::run(video, boot) {
+        Ok(RunOutcome::Quit) => 0,
+        // `QUIT_RESTART`. The original's restart loop re-entered
+        // `CEngineAPI::Run` with the same command line
+        // (`launcher/launcher.cpp`, `RUN_RESTART`); nothing requests it yet,
+        // and reproducing the loop before anything can ask for it would be
+        // untestable scaffolding. Reported rather than silently treated as a
+        // clean exit, so that the first thing to request it is visible.
+        Ok(RunOutcome::Restart) => {
+            eprintln!("source-engine: engine requested a restart, which is not implemented yet");
+            0
+        }
+        Err(err) => {
+            dialog::report_error("Source - Error", &err.to_string());
+            1
+        }
+    }
 }
 
 /// Builds the [`Vfs`] from the command line, and reads the game's display
