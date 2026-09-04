@@ -333,8 +333,17 @@ enum state machine — a good place to start.
 `portdocs/ENGINE_INPUT.md`), `cmd.cpp` (1,171),
 `ipc_console.cpp` (294), `netconsole.cpp` (258), `cl_bounded_cvars.cpp` (163),
 `cheatcodes.cpp` (162), `baseautocompletefilelist.cpp` (97).
-**Port early — everything depends on it.** The cvar registry is the one piece of ambient
-global state that is genuinely process-global and justifies a `OnceLock`.
+**Port early — everything depends on it.** **Planned in
+`portdocs/ENGINE_CONSOLE.md`**, which corrects this entry in two ways. First the sizing:
+only ~5,500 of the system is in `engine/`, and the objects, the registry and the command
+buffer are in `tier1/convar.cpp` (1,531), `vstdlib/cvar.cpp` (1,317) and
+`tier1/commandbuffer.cpp` (407) — ~12,200 lines in scope, not 5,600. Second the design:
+the claim that the cvar registry "is the one piece of ambient global state that is
+genuinely process-global and justifies a `OnceLock`" **is reversed there**. What is shared
+is each cvar's *value*, not the registry — a cvar becomes an `Arc`-held cell with atomics
+inside, so a subsystem holds a handle to the one cvar it wants and the registry is left
+serving only name lookup, for one caller. No global, and `console/` depends on `std`
+alone.
 
 ### 7.5 Client connection & state — ~13,600 → `client/`
 `cl_main.cpp` (3,919), `baseclientstate.cpp` (3,819), `cdll_engine_int.cpp` (3,059 — hosts
@@ -609,7 +618,11 @@ reached.** Remaining, in dependency order:
    its own module: stages 1-2 (keyboard, mouse, mouse look) need nothing that does not
    exist; bindings want `console/`, and controllers (`gilrs`) are deferred to stage 5.
 2. **`console/`** (§7.4) — now genuinely earned: `map`, `fps_max`, `restart` and
-   `quit` all exist as engine operations with no way to type them.
+   `quit` all exist as engine operations with no way to type them, and `input/` stage 3
+   (bindings) is waiting on the command buffer. **Planned in
+   `portdocs/ENGINE_CONSOLE.md`**: five stages, of which stage 1 (cvars, the command
+   buffer, dispatch, `exec`, `stuffcmds`) needs nothing unbuilt and stage 4 (the console
+   dialog) wants `egui`.
 3. **`materialsystem` stage 5** (lightmaps) — no longer blocked; there is a `.bsp` to
    pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
    from checkerboard into content. **Highest visual return of anything on this list.**

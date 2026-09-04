@@ -568,7 +568,16 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
 **Next on the boot path:** `console/` — doubly earned now, since `map`, `fps_max`,
 `restart` and `quit` all exist as engine operations with no way to type them, and
 `input/` stage 3 (`bind`, and the `+`/`-` command convention) is waiting on the command
-buffer. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+buffer. **Planned in `portdocs/ENGINE_CONSOLE.md`**, which lands it as `src/engine/console/`
+and finds the system spread over three original modules rather than one — `tier1/convar.cpp`
+and `tier1/commandbuffer.cpp` hold the objects and the queue, `vstdlib/cvar.cpp` the
+registry, `engine/cmd.cpp` and `cvar.cpp` only the policy. Its headline decision is that
+**there is no global cvar registry**: a cvar is an `Arc`-held cell with atomics inside, so
+a subsystem holds a handle to the one cvar it reads and the registry is left serving name
+lookup for a single caller — which also deletes the `FCVAR_MATERIAL_SYSTEM_THREAD` queue
+and keeps `console/` a `std`-only module testable without an engine. Stage 1 boots
+`sp_a1_intro1` through `exec valve.rc` → `stuffcmds`; stage 4 (the console dialog) wants
+`egui`. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
 unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
 visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
 magenta checkerboard into lit content.

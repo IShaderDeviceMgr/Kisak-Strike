@@ -35,6 +35,15 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   macOS only), the key-up latch that must survive, and a five-stage plan whose first two
   stages depend on nothing unbuilt. Controllers (`gilrs`) are stage 5, deliberately
   deferred. Concludes input should be **its own module**, revising `ENGINE.md` §1.
+- [`ENGINE_CONSOLE.md`](ENGINE_CONSOLE.md) — console, cvars and commands: `engine/cmd.cpp`
+  and `cvar.cpp`, plus `tier1/convar.cpp`, `tier1/commandbuffer.cpp` and `vstdlib/cvar.cpp`,
+  which is where the system actually lives. Inventory across all six, the command buffer's
+  tick/`wait` model, the two tokenizers, the dispatch order, a flag-by-flag disposition of
+  the 32 `FCVAR_*` bits, and the decision that **there is no global cvar registry** — a cvar
+  is a shared cell, so the registry only serves name lookup. Five stages; stage 1 boots
+  `sp_a1_intro1` through `exec valve.rc` → `stuffcmds` and deletes the launcher's `+map`
+  block. Concludes cvar sets are handled inside `console/` and commands are handed back out
+  through a `CommandTarget` trait, the way `host::Level` works.
 
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.

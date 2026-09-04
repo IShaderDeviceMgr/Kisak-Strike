@@ -206,7 +206,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
 
 Next on the boot path per `PORTING.md`: **`console/`** — now doubly earned, since `map`,
 `fps_max`, `restart` and `quit` all exist as engine operations with no way to type them,
-and `input/` stage 3 (`bind`) is waiting on the command buffer. `materialsystem`
+and `input/` stage 3 (`bind`) is waiting on the command buffer. **Planned in
+`portdocs/ENGINE_CONSOLE.md`** — read it before starting: the system is spread over
+`tier1/`, `vstdlib/` and `engine/` rather than living in `engine/` alone, and its headline
+decision (**no global cvar registry**; a cvar is an `Arc`-held cell) reverses what
+`portdocs/ENGINE.md` §7.4 originally said. `materialsystem`
 stage 6 (`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked,
 but not on the boot path.
 
