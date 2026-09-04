@@ -1,13 +1,15 @@
 # Porting console, cvars & commands → `src/engine/console/`
 
-**Status: stages 1 and 2 landed.** Stage 1 (§8.1) is cvars, the command buffer, both
+**Status: stages 1-4 landed; only stage 5 is left.** Stage 1 (§8.1) is cvars, the command
+buffer, both
 tokenizers, dispatch, aliases, `exec`, `stuffcmds`, the log sink, and
 `map`/`quit`/`restart` through a `CommandTarget`. Stage 2 (§8.2) is bindings, which is the
 same work as `ENGINE_INPUT.md` stage 3: `console/` supplies `CommandSink`, the table lives
 in `input/`, and WASD now comes from the shipped `cfg/config_default.cfg`. Stage 3 (§8.3)
 is config persistence: `FCVAR_ARCHIVE`, `host_writeconfig`, `execifexists`, and the
 `config.cfg`-over-`config_default.cfg` preference at startup, with both of Valve's guards.
-Stages 4-5 (the `egui` dialog, the list commands) are not started. This is the plan,
+Stage 4 (§8.4) is the `egui` dialog, which landed together with `ENGINE_INPUT.md` stage 4
+as this plan said it must. Stage 5 (the list commands) is not started. This is the plan,
 written before the port, per `PORTING.md`'s per-module rule; **the API reference
 in `rustdocs/ENGINE.md`'s `src/engine/console/` section is the document to read
 in order to *use* the module**, and it is authoritative where the two disagree.
@@ -750,17 +752,34 @@ Each stage is independently reviewable and independently useful.
    writes a `config.cfg`; the second reads that `config.cfg` back; `+quit`
    writes on the way out.
 
-4. **The dev console UI.** *Wants `egui`*, which is unscheduled. The ring, the
-   input line, history, the completion popup and `toggleconsole` — plus
-   `ENGINE_INPUT.md` stage 4's UI precedence and key-up latch, which lands with
-   the same integration and is the reason the two stages should be done
-   together.
+4. **The dev console UI.** — **done.** `egui`, `egui-winit` and `egui-wgpu` added as
+   three dependencies, split across three layers: `window/` translates, `console/ui.rs`
+   decides, `materials/ui.rs` draws. The ring, the entry line, history, the completion
+   list and `toggleconsole`/`showconsole`/`hideconsole` — plus `ENGINE_INPUT.md` stage
+   4's UI precedence and key-up latch, which landed with the same integration exactly as
+   this said they must.
+   Three things the plan did not anticipate, recorded because a later stage inherits
+   them:
+   - **`RebuildCompletionList` belongs in `Console`, not in the dialog.** It is a
+     question about the registry; only the *history* half is the widget's. So
+     `Console::complete` is the algorithm and `ConfigFiles` grew `list_files` for
+     `Completion::Files`, which is the third method that trait has needed and the last
+     one it should.
+   - **The `KEY_BACKQUOTE` bypass is not optional and is not a curiosity.**
+     `Key_Event` skips the whole UI chain for it (`keys.cpp:1319`); without the
+     equivalent, the key that opens the console cannot close it and types a backquote
+     into the entry on the way. Generalised to "whatever is bound to `toggleconsole`".
+   - **Escape did not need a bypass after all.** The first design gave it one, so the
+     engine could close the dialog; letting `egui` have it and closing the dialog from
+     inside `ConsoleUi` is simpler and means the game never sees it, so Escape does not
+     also hand the cursor back.
 
 5. **The list/diagnostic commands.** `cvarlist`, `help`, `find`, `differences`,
    `toggle`, `incrementvar`. Trivial once 1 and 4 exist, useless before.
 
 Stages 1 and 2 are what "port `console/`" means for the boot path. 3 is small
-and can follow immediately; 4 is gated on a decision that is not this module's.
+and followed immediately; 4 was gated on a decision that was not this module's, and that
+decision (`egui`) is now taken.
 
 ---
 

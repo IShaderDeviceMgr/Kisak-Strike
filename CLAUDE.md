@@ -18,7 +18,7 @@ is not compiled, not linked, and not edited.
   src/launcher/    process bootstrap
   src/filesystem/  search paths, gameinfo.txt, VPK reading
   src/materials/   the GPU device and frame boundary (wgpu), textures, materials
-  src/engine/      the engine; window/ (winit) so far
+  src/engine/      the engine; window/ (winit), host/, world/, input/, console/ (egui)
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -40,20 +40,24 @@ cargo build
 cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and six
-direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam` (each
-justified in a comment in `Cargo.toml`). Release builds use full LTO and one codegen unit.
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and nine
+direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam`, and
+`egui`/`egui-winit`/`egui-wgpu` (each justified in a comment in `Cargo.toml`). Release
+builds use full LTO and one codegen unit.
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 412 tests), and the binary now **runs, loads a
-map and lets you fly around it**: it mounts the game filesystem, opens a window, runs an
+There is a unit test suite (`cargo test`, 437 tests), and the binary now **runs, loads a
+map, lets you fly around it and has a working developer console**: it mounts the game
+filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
 `cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
-draws its world geometry **lit**, and moves the view with WASD and the mouse. It is **not a runnable game** — there is no simulation, sound or
+draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
+`egui` console over the top of it on `` ` `` — scrollback, history, tab completion, and
+every cvar and command the port has registered. It is **not a runnable game** — there is no simulation, sound or
 netcode, and nothing that moves is a player — but the boot path is continuous from
 `main` to a rendered, lit level you can look around.
 
@@ -72,6 +76,11 @@ the shipped game** because there is no tone mapper: HDR lightmaps reach the shad
 unexposed. The camera is a **free-fly noclip camera** — WASD, space and left control,
 left shift to walk, mouse to look, **Escape to release the cursor** — standing in for a
 player that does not exist yet; it is a placeholder and is documented as one.
+
+`` ` `` opens the console (Escape or `` ` `` closes it), which releases the cursor for as
+long as it is up. Tab and the arrow keys cycle completions; an empty entry cycles history
+instead. `+toggleconsole` on the command line opens it at startup, which is how it can be
+inspected without touching the keyboard.
 
 Verification is otherwise still mostly against the reference: read `legacy/`, compare
 behavior, reason it through. There is no hybrid binary to run.
@@ -101,7 +110,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   disregard the rest.
 - **Replacements, all decided:** `wgpu` replaces `materialsystem/shaderapidx9` + `togl`;
   `winit` replaces `ILauncherMgr`/SDL2/Cocoa; `egui` replaces vgui2, RocketUI, and
-  ScaleformUI at once.
+  ScaleformUI at once — **and has now landed**, as three crates split across three layers:
+  `window/` is the `winit` boundary, `console/ui.rs` is the widgets, `materials/ui.rs` is
+  the `wgpu` boundary.
 - **`tier0`–`tier3` are not tasks.** They're replaced by `std` and crates as a side
   effect of porting everything else, never translated. Same for anything else the Rust
   ecosystem does better — compression, hashing, thread pools, HTTP, serialization.
@@ -161,6 +172,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   draw in the frame; and **`glam`'s `near`/`far` are distances along `-z`**, so a
   hand-built projection can silently invert the depth comparison.
   Plan: `portdocs/MATERIALSYSTEM.md`.
+  Stage 5 also brought `src/materials/ui.rs` with the console — `UiRenderer`, an
+  `egui_wgpu::Renderer` over the frame's encoder. **It is not part of the material
+  system**: `egui` owns its own pipeline, font atlas and vertex format, and it lives in
+  `materials/` only because `Frame::parts` is `pub(super)` and opening a pass belongs on
+  this side of that boundary.
   Stages 6-8 (the rest of the shader set, paint maps, GPU morph) are not started. Still
   settled for those: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in
   `stdshaders/`, and Valve's static/dynamic shader-combo system is deleted with them —
@@ -169,7 +185,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   expected to force it and did not**: bumped and unbumped share one vertex layout, because
   the bumped diffuse path never leaves tangent space.
 - **`src/engine/` — 5 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `input/`, and `console/` (stage 1 of 5)**
+  lightmaps, `input/` (stages 1-4 of 5), and `console/` (stages 1-4 of 5)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -186,16 +202,28 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
   resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
   (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
-  `input/` is stages 1-3 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
+  `input/` is stages 1-4 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
   space with Valve's shipped key names, an event queue **pushed between ticks and
   drained once per tick** inside `Engine::frame`, `ViewAngles`' faithful
-  `ApplyMouse`/`ClampAngles`/`AngleVectors`, and a free-fly camera at
-  `FullNoClipMove`'s speeds that **deleted the turntable**. It names no `winit` type —
+  `ApplyMouse`/`ClampAngles`/`AngleVectors`, a free-fly camera at
+  `FullNoClipMove`'s speeds that **deleted the turntable**, bindings, and UI precedence.
+  It names no `winit` type and no `egui` type —
   `window/` translates, `input/` decides — so it is tested without a window, which is
-  also what leaves room for `gilrs` at stage 5. Bindings (stage 3) want `console/`; UI
-  precedence and the key-up latch (stage 4) want `egui`.
+  also what leaves room for `gilrs` at stage 5. **Stage 4 is `FilterKey`'s key-up latch**
+  (`keys.cpp:1189`): the target that consumed a *press* is recorded per button and the
+  matching *release* goes there and nowhere else, whoever wants it by then. That is a
+  correctness fix rather than polish — without it, clicking and then opening the console
+  leaves `+attack` held forever, which is what every stuck-key bug in a Source-like
+  engine is. `console/` stage 4 is the `egui` dialog it pairs with: `Console::complete`
+  is `RebuildCompletionList` (a question about the registry, not about a widget) and
+  `ConsoleUi` is the dialog, naming `egui` and nothing else, so it is unit-tested against
+  a headless `egui::Context` with no window and no GPU.
   Not implemented: simulation, visibility, collision, displacements, brush
   entities, static props, the skybox, dynamic lights and lightstyle animation.
+  **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
+  key bound to `toggleconsole` is never shown to `egui` at all, on either edge
+  (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
+  cannot close it, and types a backquote into the entry on the way.
   **The one divergence that will bite:** world triangles are emitted with their **winding
   reversed**, because Valve's `D3DCULL_CCW` and this port's `front_face: Ccw` read
   identically and are not the same thing (GL's framebuffer is Y-up, WebGPU's is Y-down,
@@ -204,17 +232,18 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next on the boot path: **the `egui` console UI — `console/` stage 4 and `input/` stage 4,
-which are one integration and must land together.** `egui` is already a decided
-replacement (see "Replacements, all decided"), so this is unscheduled rather than blocked,
-and everything it needs is waiting: `` ` `` is bound to `toggleconsole`, `Log` holds the
-ring, `Console::enqueue` takes the input line, and `Completion` is declared on every
-`CommandSpec`. `input/` stage 4 brings **the key-up latch**, which is a correctness fix
-rather than polish — without it, clicking and then opening the console leaves `+attack`
-held. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is a
-breadth move: unblocked, but not on the boot path. `materialsystem` stage 6
-(`VertexLitGeneric` and the rest of the shader set) is a breadth move: unblocked, but not
-on the boot path.
+Next: **nothing in `console/` or `input/` blocks the boot path any more.** The candidates,
+in the order they are worth doing:
+
+- **`console/` stage 5 — the list commands** (`cvarlist`, `help`, `find`, `differences`,
+  `toggle`, `incrementvar`). Trivial now that there is a dialog to print into, useless
+  before there was, and what turns the console from present into useful. Not on the boot
+  path.
+- **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
+  breadth move: unblocked, needed by every model, not on the boot path.
+- **`client/`** (`ENGINE.md` §7.5) is what the boot path itself wants next, and it is the
+  module that finally takes `ViewAngles`, `FlyCamera` and `MoveButtons` out of `input/` —
+  see the wart below.
 
 ### Known warts, and what triggers fixing them
 

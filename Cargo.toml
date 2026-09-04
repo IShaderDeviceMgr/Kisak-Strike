@@ -78,6 +78,49 @@ winit = "0.30.13"
 # port's convention rather than a thing to convert out of. Valve's row-major
 # VMatrix is what needs converting, and `uniforms::from_row_major` is where.
 glam = "0.33.6"
+# The UI. Replaces vgui2 (`vgui2/vgui_controls/`, and `consoledialog.cpp` in
+# particular), RocketUI and ScaleformUI at once -- ../PORTING.md's
+# "Replacements, all decided". Arrives with the dev console
+# (`portdocs/ENGINE_CONSOLE.md` stage 4), which is the first thing in the port
+# that needs a widget at all.
+#
+# Three crates because the integration is deliberately three-layered, the same
+# way the input path already is: `egui` is the widgets and knows nothing about
+# a platform, `egui-winit` is the winit boundary, `egui-wgpu` the wgpu one.
+# That maps exactly onto `window/` translating, `console/ui.rs` deciding and
+# `materials/ui.rs` drawing, and it is why the console dialog can be built and
+# asserted on with no window and no GPU.
+#
+# 0.36.1 requires `wgpu ^30.0` and `winit ^0.30.13`, which are the versions
+# already pinned above; an egui upgrade is therefore coupled to those two and
+# is a deliberate change rather than a version bump.
+#
+# The footprint is real and is worth stating: unlike `glam` and `bytemuck`,
+# these are not zero-dependency. `egui` brings `epaint`/`emath`, `ahash`,
+# `smallvec`, `unicode-segmentation`, `itertools`, `accesskit` and `log`;
+# `egui-winit` brings `arboard` (the system clipboard, which a console entry
+# genuinely wants) and `raw-window-handle`. The alternative is hand-writing a
+# text entry, a scrolling text view, font rasterization and clipboard
+# integration, which is what the 1,553 lines of `consoledialog.cpp` plus the
+# whole of `vgui2/` were.
+#
+# `default-features = false` on the two integration crates drops what this
+# port does not want: `egui-winit`'s `links` feature pulls `webbrowser` in to
+# open hyperlinks, and a game console has no business launching a browser;
+# `egui-wgpu`'s defaults add `wgpu/webgl`, which is dead weight in a native
+# binary. `clipboard`, `wayland` and `x11` are kept because Linux is the
+# primary target and all three are load-bearing there.
+egui = "0.36.1"
+egui-winit = { version = "0.36.1", default-features = false, features = [
+    "clipboard",
+    "wayland",
+    "x11",
+] }
+egui-wgpu = { version = "0.36.1", default-features = false, features = [
+    # `wgpu/metal`, under a name that says what it is for. macOS is a supported
+    # target and this is the fix for a live-resize artifact there.
+    "macos-window-resize-jitter-fix",
+] }
 
 [profile.release]
 lto = true

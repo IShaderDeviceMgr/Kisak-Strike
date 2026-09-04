@@ -55,32 +55,40 @@
 //! name, and an alias is *text substitution re-entering dispatch*, not a call,
 //! so it can expand to further aliases.
 
-// The module is complete against stage 1 of `portdocs/ENGINE_CONSOLE.md` §8,
-// and stage 1 is deliberately larger than its callers: `Source`'s remote
-// variants are the security model §4.7 says to port *before* `net/` needs it,
-// `Completion` is declared with the commands that will be completed in stage 4,
-// and `Cvar`'s typed setters, the log's accessors and `NoTarget`/`NoConfigFiles`
-// are the surface the next four stages and the tests call.
+// **Why this is still here after stage 4.** The first version of this comment
+// predicted the allow could go once the console UI landed, on the grounds that
+// the ring, the completion data and the input path would then have real
+// consumers. They do — and the allow is still needed, for a reason that is not
+// going away on its own:
 //
-// **Remove this once the console UI (stage 4) lands** — at that point the ring,
-// the completion data and the input path all have real consumers, and anything
-// still unused here is genuinely dead.
+// - `rustc`'s dead-code analysis does not count uses from `#[cfg(test)]`, and
+//   a leaf module tested without an engine has a lot of those:
+//   `Console::detached`, `NoTarget`, `NoConfigFiles`, most of
+//   `CommandBuffer`'s accessors.
+// - Several items exist *before* their consumer by design, which
+//   `ENGINE_CONSOLE.md` argues for rather than apologises for: `Source`'s
+//   remote variants are the security model §4.7 says to port before `net/`
+//   needs it, `SPONLY` is a flag §4.6 keeps as a no-op predicate, and
+//   `ExecContext`'s queueing half is what `exec` will hand to commands the
+//   engine has not grown yet.
+//
+// **Trigger for removing it:** `net/` and `server/`, which take most of the
+// second list. Not a stage of this module.
 #![allow(dead_code)]
 
 pub mod buffer;
 pub mod cvar;
 pub mod log;
 pub mod token;
+pub mod ui;
 
 use std::collections::HashMap;
 
 pub use buffer::CommandBuffer;
 pub use cvar::{CommandFlags, Cvar, CvarFlags, CvarRegistry, RegisterError};
-// `Color` and `Line` are the scrollback's shape, re-exported for the console
-// UI (stage 4) that will render it. Nothing in the crate reads them yet.
-#[allow(unused_imports)]
 pub use log::{Color, Line, Log};
 pub use token::{Command, Source};
+pub use ui::ConsoleUi;
 
 /// How far `exec` may nest before it is treated as a loop.
 ///
@@ -99,6 +107,10 @@ const MAX_EXEC_DEPTH: u32 = 16;
 /// hangs the shipped engine. This is the depth guard to the buffer's breadth
 /// guard, and both are needed.
 const MAX_COMMANDS_PER_ROUND: u32 = 10_000;
+
+/// `COMMAND_COMPLETION_MAXITEMS` (`public/tier1/convar.h:154`). The cap is on
+/// the list the UI is handed, not on what is searched.
+const MAX_COMPLETION_ITEMS: usize = 64;
 
 /// `exec` refuses anything larger, as Valve does: "probably not a valid file
 /// to exec" (`engine/cmd.cpp:558`).
@@ -120,6 +132,19 @@ pub enum Completion {
     },
     /// A fixed set, for the toggles.
     Values(&'static [&'static str]),
+}
+
+/// One entry in the completion list. `CompletionItem`
+/// (`public/vgui_controls/consoledialog.h:66`), minus the widget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    /// What replaces the input line when this is chosen. For an argument
+    /// completion it is the whole line — `exec config_default`, not
+    /// `config_default` — which is what `AutoCompletionFunc` builds.
+    pub text: String,
+    /// A cvar's current value, shown beside the name. `None` for a command,
+    /// which is also how the UI tells the two apart.
+    pub value: Option<String>,
 }
 
 /// What a command *is*, as data.
@@ -281,6 +306,24 @@ pub trait ConfigFiles {
     fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
         let _ = (path, contents);
         Err("no writable game directory is mounted".to_string())
+    }
+
+    /// Immediate children of `dir` ending in `.<ext>`, **with the extension
+    /// stripped**, in any order.
+    ///
+    /// `CBaseAutoCompleteFileList::AutoCompletionFunc`
+    /// (`engine/baseautocompletefilelist.cpp:23`), which is a
+    /// `Sys_FindFirst`/`Sys_FindNext` walk of `<subdir>/*.<ext>` ending in
+    /// `commands[i][strlen(commands[i]) - 4] = 0` — chopping four characters
+    /// to remove the extension, which is why every one Valve completes happens
+    /// to be three letters long. Stripping it properly is the same behavior
+    /// for `cfg` and `bsp` and correct for anything else.
+    ///
+    /// Defaults to nothing, so a console with no content mounted completes
+    /// commands and cvars and offers no filenames, rather than failing.
+    fn list_files(&self, dir: &str, ext: &str) -> Vec<String> {
+        let _ = (dir, ext);
+        Vec::new()
     }
 }
 
@@ -559,6 +602,137 @@ impl<'a> Console<'a> {
     /// resetting the count. See [`Console::unknown_from_code`].
     pub fn take_unknown_count(&mut self) -> u32 {
         std::mem::take(&mut self.unknown_from_code)
+    }
+
+    // ---- completion -------------------------------------------------------
+
+    /// The completion list for a partially typed line.
+    /// `CConsolePanel::RebuildCompletionList` (`consoledialog.cpp:510`).
+    ///
+    /// The rules, all of which are worth keeping even though the widget is
+    /// not:
+    ///
+    /// - **Empty input returns nothing**, because empty input lists *history*
+    ///   and history is the UI's — see
+    ///   [`ConsoleUi`](super::console::ui::ConsoleUi).
+    /// - **Input containing a space** first asks whether the command named by
+    ///   the first token completes its own arguments ([`Completion`]). `exec `
+    ///   listing `cfg/*.cfg` and `map ` listing `maps/*.bsp` are that path.
+    /// - **Otherwise, prefix match** — and if there *was* a space and no
+    ///   command claimed it, fall back to space-separated substring matching
+    ///   ([`matches_text`]), so that `draw wire` finds `mat_wireframe`.
+    /// - `DEVELOPMENTONLY` and `HIDDEN` are excluded from both lists.
+    /// - Sorted by name, capped at [`MAX_COMPLETION_ITEMS`].
+    ///
+    /// Completion is **data on the [`CommandSpec`]**, not a callback
+    /// (`ENGINE_CONSOLE.md` §4.10): `FnCommandCompletionCallback` reached the
+    /// filesystem through a global, and there is none here.
+    pub fn complete(&self, partial: &str) -> Vec<Suggestion> {
+        if partial.is_empty() {
+            return Vec::new();
+        }
+
+        // `FindAutoCompleteCommmandFromPartial` (`consoledialog.cpp:427`):
+        // only once there is a space, and only for a command that claims its
+        // arguments. Anything else falls through to the name search with
+        // substring matching turned on.
+        let mut substrings = false;
+        if partial.contains(' ') {
+            substrings = true;
+            let name = partial.split(' ').next().unwrap_or_default();
+            if let Some(spec) = self.find_command(name) {
+                if spec.completion != Completion::None {
+                    return self.complete_argument(spec.completion, partial);
+                }
+            }
+        }
+
+        let mut out: Vec<Suggestion> = Vec::new();
+
+        for spec in self.commands.values() {
+            if spec
+                .flags
+                .intersects(CommandFlags::DEVELOPMENTONLY | CommandFlags::HIDDEN)
+            {
+                continue;
+            }
+            if matches_text(spec.name, partial, substrings) {
+                out.push(Suggestion {
+                    text: spec.name.to_string(),
+                    value: None,
+                });
+            }
+        }
+
+        for cvar in self.cvars.iter() {
+            if cvar
+                .flags()
+                .intersects(CvarFlags::DEVELOPMENTONLY | CvarFlags::HIDDEN)
+            {
+                continue;
+            }
+            if matches_text(cvar.name(), partial, substrings) {
+                out.push(Suggestion {
+                    text: cvar.name().to_string(),
+                    // `FCVAR_NEVER_AS_STRING` displays a formatted number
+                    // instead of the string, which for those cvars is not a
+                    // meaningful thing to show (`consoledialog.cpp:587`).
+                    value: Some(match cvar.flags().contains(CvarFlags::NEVER_AS_STRING) {
+                        true => format_number(cvar.float()),
+                        false => cvar.string().to_string(),
+                    }),
+                });
+            }
+        }
+
+        // A `HashMap` has no order, so the sort is what makes the list stable
+        // between two identical keystrokes rather than merely tidy.
+        out.sort_by(|a, b| {
+            a.text
+                .to_ascii_lowercase()
+                .cmp(&b.text.to_ascii_lowercase())
+        });
+        out.truncate(MAX_COMPLETION_ITEMS);
+        out
+    }
+
+    /// The argument half of [`complete`](Console::complete), for a command
+    /// that declared how its arguments complete.
+    ///
+    /// `AutoCompletionFunc` builds `"<command> <candidate>"`, matching the
+    /// candidate against everything after the *first* space — so `exec  con`,
+    /// with two spaces, matches nothing, exactly as it does in the original.
+    fn complete_argument(&self, completion: Completion, partial: &str) -> Vec<Suggestion> {
+        let (name, arg) = match partial.split_once(' ') {
+            Some(split) => split,
+            None => (partial, ""),
+        };
+
+        let candidates = match completion {
+            Completion::None => return Vec::new(),
+            Completion::Files { dir, ext } => self.files.list_files(dir, ext),
+            Completion::Values(values) => values.iter().map(|v| v.to_string()).collect(),
+        };
+
+        let mut out: Vec<Suggestion> = candidates
+            .into_iter()
+            .filter(|candidate| has_prefix(candidate, arg))
+            .map(|candidate| Suggestion {
+                text: format!("{name} {candidate}"),
+                value: None,
+            })
+            .collect();
+
+        out.sort_by(|a, b| {
+            a.text
+                .to_ascii_lowercase()
+                .cmp(&b.text.to_ascii_lowercase())
+        });
+        // Two mounts can serve the same `cfg/*.cfg`, and `Vfs::list` merges
+        // rather than deduplicating by name.
+        out.dedup();
+        out.truncate(MAX_COMPLETION_ITEMS);
+        out
     }
 
     // ---- driving ----------------------------------------------------------
@@ -1009,6 +1183,45 @@ impl<'a> Console<'a> {
     }
 }
 
+/// `CConsolePanel::CommandMatchesText` (`consoledialog.cpp:451`).
+///
+/// Two modes, and the second one is the non-obvious pleasant behavior worth
+/// keeping: with `check_substrings`, `text` is split on spaces and **every
+/// piece must appear somewhere in `command`**, so `"draw wire"` matches
+/// `mat_wireframe` and `"vsync mat"` matches `mat_vsync`. Without it, it is a
+/// plain case-insensitive prefix test.
+fn matches_text(command: &str, text: &str, check_substrings: bool) -> bool {
+    if !check_substrings {
+        return has_prefix(command, text);
+    }
+
+    text.split(' ').filter(|piece| !piece.is_empty()).all(|piece| {
+        let piece = piece.to_ascii_lowercase();
+        command.to_ascii_lowercase().contains(&piece)
+    })
+}
+
+/// Case-insensitive prefix test over bytes, which is what `Q_strnicmp` is.
+///
+/// Byte-wise rather than `char`-wise on purpose: cvar and command names are
+/// ASCII by construction, and slicing a `&str` at a byte offset taken from
+/// another string is a panic waiting for the first multi-byte character a user
+/// types.
+fn has_prefix(name: &str, prefix: &str) -> bool {
+    let (name, prefix) = (name.as_bytes(), prefix.as_bytes());
+    name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// `consoledialog.cpp:594`: an integral value prints as an integer, anything
+/// else as a float. Otherwise every `FCVAR_NEVER_AS_STRING` cvar in the
+/// completion list reads `1.000000`.
+fn format_number(value: f32) -> String {
+    match value == value.trunc() && value.is_finite() {
+        true => format!("{}", value as i64),
+        false => value.to_string(),
+    }
+}
+
 /// `CCvarUtilities::WriteVariables` (`engine/cvar.cpp:637`): every
 /// `FCVAR_ARCHIVE` cvar as `<name> "<value>"`, **sorted case-insensitively by
 /// name** (`CVarSortFunc`, `:629`).
@@ -1152,6 +1365,19 @@ mod tests {
     impl ConfigFiles for FakeConfigs {
         fn read_config(&self, path: &str, _path_id: Option<&str>) -> Option<Vec<u8>> {
             self.0.get(path).map(|text| text.as_bytes().to_vec())
+        }
+
+        /// Every file the map holds under `<dir>/`, so that `exec `
+        /// completion can be tested with the same fixture `exec` itself uses.
+        fn list_files(&self, dir: &str, ext: &str) -> Vec<String> {
+            let prefix = format!("{dir}/");
+            let suffix = format!(".{ext}");
+            self.0
+                .keys()
+                .filter_map(|path| path.strip_prefix(&prefix))
+                .filter_map(|name| name.strip_suffix(&suffix))
+                .map(str::to_string)
+                .collect()
         }
     }
 
@@ -1763,4 +1989,139 @@ mod tests {
         console.set_config_was_read(true);
         assert!(console.config_was_read());
     }
+
+    // ---- completion (stage 4) ---------------------------------------------
+
+    fn completing_console() -> Console<'static> {
+        let mut console = Console::new(
+            FakeConfigs::new(&[
+                ("cfg/valve.rc", ""),
+                ("cfg/config_default.cfg", ""),
+                ("cfg/chapter1.cfg", ""),
+                ("cfg/notes.txt", ""),
+            ]),
+            Vec::new(),
+        );
+        console.log_mut().set_echo_to_stderr(false);
+        for spec in [
+            CommandSpec::new("mat_wireframe_toggle", "Toggle wireframe."),
+            CommandSpec::new("map", "Load a map.").with_completion(Completion::Files {
+                dir: "maps",
+                ext: "bsp",
+            }),
+            CommandSpec::new("secret", "").with_flags(CommandFlags::HIDDEN),
+            CommandSpec::new("internal", "").with_flags(CommandFlags::DEVELOPMENTONLY),
+        ] {
+            console.register_command(spec).expect("unique");
+        }
+        console.cvar("mat_wireframe", "0", CvarFlags::NONE, "Draw wireframe.");
+        console.cvar("mat_luxels", "0", CvarFlags::HIDDEN, "");
+        console
+    }
+
+    fn texts(suggestions: &[Suggestion]) -> Vec<&str> {
+        suggestions.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn completion_prefix_matches_commands_and_cvars_and_sorts_them() {
+        let console = completing_console();
+        let found = console.complete("mat_");
+        assert_eq!(
+            texts(&found),
+            ["mat_wireframe", "mat_wireframe_toggle"],
+            "sorted by name; `mat_luxels` is HIDDEN"
+        );
+        assert_eq!(
+            found[0].value.as_deref(),
+            Some("0"),
+            "a cvar carries its current value; a command does not"
+        );
+        assert_eq!(found[1].value, None);
+    }
+
+    #[test]
+    fn completion_hides_developmentonly_and_hidden() {
+        let console = completing_console();
+        assert!(console.complete("secret").is_empty());
+        assert!(console.complete("internal").is_empty());
+        assert!(console.complete("mat_lux").is_empty());
+    }
+
+    #[test]
+    fn an_empty_line_completes_to_nothing_because_history_is_the_uis() {
+        assert!(completing_console().complete("").is_empty());
+    }
+
+    /// `CommandMatchesText`'s substring mode: once there is a space and no
+    /// command claimed the line, every space-separated piece has to appear
+    /// somewhere in the name.
+    #[test]
+    fn a_space_with_no_claiming_command_matches_substrings() {
+        let console = completing_console();
+        assert_eq!(
+            texts(&console.complete("wire frame")),
+            ["mat_wireframe", "mat_wireframe_toggle"]
+        );
+        assert!(
+            console.complete("wire nope").is_empty(),
+            "every piece has to match, not any"
+        );
+    }
+
+    /// `exec ` completes from `cfg/*.cfg`, extension stripped, whole-line
+    /// replacement — `CBaseAutoCompleteFileList::AutoCompletionFunc`.
+    #[test]
+    fn a_command_that_claims_its_arguments_completes_files() {
+        let console = completing_console();
+        assert_eq!(
+            texts(&console.complete("exec c")),
+            ["exec chapter1", "exec config_default"],
+            "sorted, `.cfg` stripped, `notes.txt` not a candidate"
+        );
+        assert_eq!(
+            texts(&console.complete("exec ")),
+            ["exec chapter1", "exec config_default"],
+            "an empty argument offers everything the extension allows -- and \
+             `valve.rc` is not a `.cfg`, which is Valve's list too"
+        );
+    }
+
+    /// A `Completion::Files` command whose directory has nothing in it falls
+    /// back to no suggestions rather than to the name search, which would
+    /// otherwise offer `map` for `map de_`.
+    #[test]
+    fn a_claiming_command_with_no_files_offers_nothing() {
+        let console = completing_console();
+        assert!(console.complete("map de_").is_empty());
+    }
+
+    #[test]
+    fn the_completion_list_is_capped() {
+        let mut console = Console::detached();
+        for index in 0..MAX_COMPLETION_ITEMS + 20 {
+            console.cvar(
+                Box::leak(format!("test_cvar_{index:03}").into_boxed_str()),
+                "0",
+                CvarFlags::NONE,
+                "",
+            );
+        }
+        assert_eq!(console.complete("test_cvar_").len(), MAX_COMPLETION_ITEMS);
+    }
+
+    #[test]
+    fn never_as_string_cvars_show_a_number_rather_than_their_string() {
+        let mut console = Console::detached();
+        console.cvar("test_bits", "3.5", CvarFlags::NEVER_AS_STRING, "");
+        console.cvar("test_whole", "2", CvarFlags::NEVER_AS_STRING, "");
+        let found = console.complete("test_");
+        assert_eq!(found[0].value.as_deref(), Some("3.5"));
+        assert_eq!(
+            found[1].value.as_deref(),
+            Some("2"),
+            "an integral value is not printed as 2.000000"
+        );
+    }
+
 }

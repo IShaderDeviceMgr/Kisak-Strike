@@ -135,6 +135,24 @@ impl Bindings {
         }
     }
 
+    /// Whether this button must reach the game whatever the UI wants.
+    ///
+    /// `Key_Event` bypasses the whole VGui chain for a `KEY_BACKQUOTE` press
+    /// (`engine/keys.cpp:1319`), and it has to: otherwise the key that opens
+    /// the console cannot close it, and it types a backquote into the entry on
+    /// the way. Generalised from "the backquote" to "whatever is bound to
+    /// `toggleconsole`", which is the same rule with the key no longer
+    /// hard-coded — `bind p toggleconsole` then behaves like the shipped
+    /// binding rather than like a key that opens a console it cannot close.
+    ///
+    /// Read by `window/`, which is where the UI's answer is decided; the
+    /// engine reaches it through
+    /// [`Engine::ui_bypasses`](crate::engine::Engine::ui_bypasses).
+    pub fn bypasses_ui(&self, button: Button) -> bool {
+        self.get(button)
+            .is_some_and(|command| command.eq_ignore_ascii_case("toggleconsole"))
+    }
+
     /// Every button bound to `command`, compared case-insensitively.
     /// `key_findbinding`.
     pub fn find(&self, command: &str) -> impl Iterator<Item = Button> + '_ {

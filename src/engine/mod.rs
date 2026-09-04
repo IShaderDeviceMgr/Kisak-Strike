@@ -19,13 +19,15 @@
 //! # The frame
 //!
 //! ```text
-//! window: WindowEvent     -> Engine::push_input  -> queued, not acted on
+//! window: WindowEvent     -> egui first refusal  -> Consumer::{Ui, Game}
+//!                         -> Engine::push_input  -> queued, not acted on
 //! window: about_to_wait   -> Engine::deadline    -> ControlFlow::WaitUntil
 //! window: RedrawRequested -> Engine::frame       -> host clock + state machine
 //!                                                -> Console::run, then fps_max
 //!                                                -> Input::frame, then the view
 //!                         -> Renderer::begin_frame
 //!                         -> Engine::render      -> one pass, the world in it
+//!                         -> Engine::run_ui      -> the console, over the top
 //!                         -> Frame::present
 //! ```
 //!
@@ -56,13 +58,13 @@ use crate::materials::renderer::Frame;
 use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
 
 use console::{
-    Command, CommandSpec, CommandTarget, ConfigFiles, Console, Cvar, CvarFlags, CvarRegistry,
-    Dispatch, ExecContext, Source,
+    Command, CommandSpec, CommandTarget, ConfigFiles, Console, ConsoleUi, Cvar, CvarFlags,
+    CvarRegistry, Dispatch, ExecContext, Source,
 };
 use host::{Host, Level, Outcome};
 use input::view::{FlyCamera, MOVE_COMMANDS, SENSITIVITY, SENSITIVITY_MAX, SENSITIVITY_MIN};
 use input::Bindings;
-use input::{Button, CommandSink, Input, Key, MouseButton};
+use input::{Button, CommandSink, Consumer, Input, Key, MouseButton};
 use world::World;
 
 /// `VIEW_NEARZ` (`game/client/view.h:27`).
@@ -113,6 +115,15 @@ pub struct Engine<'a> {
     /// What the platform reported. Filled by [`window`] between ticks and
     /// drained by [`Engine::frame`]; see [`input`].
     input: Input,
+    /// The developer console dialog: scrollback, entry line, history and
+    /// completion.
+    ///
+    /// State, not output — the scrollback itself belongs to
+    /// [`Console`]'s log, because output exists whether or not anything is
+    /// displaying it. Kept here rather than inside [`Console`] so that
+    /// `console/`'s machinery stays usable with no `egui` pass at all, and so
+    /// that the borrow in [`Engine::run_ui`] is two disjoint fields.
+    console_ui: ConsoleUi,
 }
 
 /// What a loaded level consists of, and what loading one needs.
@@ -201,6 +212,11 @@ impl<'a> Engine<'a> {
                 "key_findbinding",
                 "Find key bound to specified command string.",
             ),
+            // `engine/console.cpp:1642`. `FCVAR_DONTRECORD` is deferred with
+            // `demo/` (`ENGINE_CONSOLE.md` §4.6), so all three are flagless.
+            CommandSpec::new("toggleconsole", "Show/hide the console."),
+            CommandSpec::new("showconsole", "Show the console."),
+            CommandSpec::new("hideconsole", "Hide the console."),
         ] {
             console
                 .register_command(spec)
@@ -259,6 +275,7 @@ impl<'a> Engine<'a> {
                 curtime: 0.0,
             },
             input: Input::new(),
+            console_ui: ConsoleUi::new(),
         }
     }
 
@@ -363,13 +380,18 @@ impl<'a> Engine<'a> {
         &self.host
     }
 
-    /// Queues one input event. `CInputSystem::PostEvent`.
+    /// Queues one input event, with the answer the UI gave for it.
+    /// `CInputSystem::PostEvent`.
     ///
     /// Called from [`window`] as events arrive, which is **between** ticks:
     /// nothing here acts on it, and [`Engine::frame`] dispatches the queue
     /// once the host has agreed a frame is happening.
-    pub fn push_input(&mut self, event: input::Event) {
-        self.input.push(event);
+    ///
+    /// `consumer` is `CGame::DispatchInputEvent`'s five-target precedence
+    /// chain (`sys_mainwind.cpp:399`) collapsed to `egui`'s one answer. The
+    /// key-up latch that makes it safe is [`Input::frame`]'s.
+    pub fn push_input(&mut self, event: input::Event, consumer: Consumer) {
+        self.input.push_from(event, consumer);
     }
 
     /// Whether the game wants the mouse.
@@ -378,8 +400,51 @@ impl<'a> Engine<'a> {
     /// the window also has focus. Splitting it this way is what keeps
     /// "the game wants the mouse" (which survives an alt-tab) apart from
     /// "the cursor is held right now" (which must not).
+    ///
+    /// **The console takes the cursor back while it is up**, which is what
+    /// Source does and is the only way to click in the dialog. It is a
+    /// separate term from [`Input::mouse_look`] rather than a write to it, so
+    /// that closing the console restores whatever the game had rather than
+    /// deciding for it.
     pub fn wants_mouse_capture(&self) -> bool {
-        self.input.mouse_look()
+        self.input.mouse_look() && !self.console_ui.is_open()
+    }
+
+    /// Whether the UI is claiming input.
+    ///
+    /// `window/` folds this into `egui`'s own "did I consume this" answer,
+    /// because that answer is per-widget: with the console up but the entry
+    /// unfocused, `egui` would say no and `w` would walk the camera. A dialog
+    /// that is up owns the keyboard, which is what VGui's modal input context
+    /// meant.
+    pub fn ui_has_focus(&self) -> bool {
+        self.console_ui.is_open()
+    }
+
+    /// Whether this button must reach the game whatever the UI wants.
+    ///
+    /// `Key_Event` bypasses the whole VGui chain for a `KEY_BACKQUOTE` press
+    /// (`engine/keys.cpp:1319`) so that the console key can always close the
+    /// console it opened, and so that it is never typed into the entry.
+    /// Generalised here from "the backquote" to "whatever is bound to
+    /// `toggleconsole`", which is the same rule without the hard-coded key.
+    pub fn ui_bypasses(&self, button: Button) -> bool {
+        self.input.bindings().bypasses_ui(button)
+    }
+
+    /// Builds this frame's UI. `CEngineVGui::Paint`'s place in the frame.
+    ///
+    /// Called by [`window`] between [`Engine::render`] and the present, with
+    /// the `egui` pass already open. The borrow is the same split
+    /// [`Engine::frame`] uses: the dialog and the console it drives are two
+    /// fields, not `&mut self` twice.
+    pub fn run_ui(&mut self, ctx: &egui::Context) {
+        let Engine {
+            console,
+            console_ui,
+            ..
+        } = self;
+        console_ui.draw(ctx, console);
     }
 
     /// When the next frame may run, if the last one was refused.
@@ -427,9 +492,14 @@ impl<'a> Engine<'a> {
             console,
             host,
             input,
+            console_ui,
             ..
         } = self;
-        console.run(&mut EngineCommands { host, input });
+        console.run(&mut EngineCommands {
+            host,
+            input,
+            ui: console_ui,
+        });
 
         // What `fps_max_callback` did. A poll rather than a callback, because a
         // callback would have to own `&mut Host` — §6.2.
@@ -499,7 +569,17 @@ impl<'a> Engine<'a> {
     /// it; and the camera moves after, so a tap of a movement key on the same
     /// tick as a click is not lost.
     fn update_view(&mut self, seconds: f32, dx: f32, dy: f32) {
-        if self.input.mouse_look() {
+        // **[`wants_mouse_capture`](Engine::wants_mouse_capture), not
+        // `Input::mouse_look`.** They differ by exactly one term — the console
+        // being up — and using the wrong one is a bug you see rather than one
+        // you read: `DeviceEvent::MouseMotion` arrives from the *device*
+        // whether or not the cursor is grabbed, so moving the mouse to click
+        // in the console would spin the view underneath it.
+        //
+        // Discarding this tick's delta rather than suppressing it at `push` is
+        // safe because `Input::frame` resets the accumulator every tick, so
+        // nothing piles up to arrive in one lump when the console closes.
+        if self.wants_mouse_capture() {
             self.scene.view.look(dx, dy, self.sensitivity.float());
         }
         // What is held is now what the `+command`s left held, not which
@@ -595,12 +675,15 @@ impl<'a> Engine<'a> {
 /// Escape half**: with no UI there is otherwise no way to get the cursor out
 /// of a grabbed window.
 ///
-/// This is the placeholder for `CGame::DispatchInputEvent`'s precedence chain
-/// (`sys_mainwind.cpp:399`), which walked VGui, then RocketUI, then GameUI,
-/// then the client, asking each whether it wanted the event. Under `egui` that
-/// chain becomes one "did the UI consume this" answer
-/// (`portdocs/ENGINE_INPUT.md` §8.3), and until there is a UI it is these two
-/// keys.
+/// **Only what the UI did not take reaches here.** `CGame::DispatchInputEvent`'s
+/// precedence chain (`sys_mainwind.cpp:399`) is decided in `window/` and
+/// applied by [`Input::frame`](input::Input::frame)'s key-up latch, so with the
+/// console up neither key is in this list: Escape closes the dialog inside
+/// `egui` (which is why it does not also hand the cursor back), and a click is
+/// the dialog's. The cursor is given back for the console's benefit by
+/// [`Engine::wants_mouse_capture`], which is a separate term rather than a
+/// write to `mouse_look` — so closing the console restores whatever the game
+/// had.
 ///
 /// Last event wins, so a click and an Escape in the same tick resolve in the
 /// order they arrived rather than by precedence.
@@ -700,6 +783,9 @@ impl Level for Scene<'_> {
 struct EngineCommands<'e> {
     host: &'e mut Host,
     input: &'e mut Input,
+    /// `toggleconsole`/`showconsole`/`hideconsole`. The dialog is the engine's
+    /// state, not the console's — see [`Engine::console_ui`].
+    ui: &'e mut ConsoleUi,
 }
 
 /// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
@@ -742,6 +828,14 @@ impl CommandTarget for EngineCommands<'_> {
             // (`engine/host_cmd.cpp:2750`).
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
+
+            // `Con_ToggleConsole_f` and friends (`engine/console.cpp:257`).
+            // `toggleconsole` is what the backquote is bound to, and the one
+            // command `Key_Event` lets through the UI chain whatever else is
+            // on screen — see [`Engine::ui_bypasses`].
+            "toggleconsole" => self.ui.toggle(),
+            "showconsole" => self.ui.set_open(true),
+            "hideconsole" => self.ui.set_open(false),
 
             // `BindHelper` (`engine/keys.cpp:280`). `bind_osx` is the same
             // command gated on the platform, and it is not a curiosity:
@@ -902,6 +996,36 @@ impl ConfigFiles for VfsConfigFiles<'_> {
     /// a read searches every mount in order. That asymmetry is why
     /// `DEFAULT_WRITE_PATH` was not ported as a search path
     /// (`rustdocs/FILESYSTEM.md`), and it is why this does not take a path ID.
+    /// `cfg/*.cfg` for `exec`, `maps/*.bsp` for `map` — the completion half of
+    /// `CBaseAutoCompleteFileList`.
+    ///
+    /// Merged across every mount, which is what makes a map inside a VPK
+    /// complete the same way one loose on disk does; `Sys_FindFirst` searched
+    /// the same search paths for the same reason. Directories are skipped:
+    /// `maps/` has subdirectories in a real install and neither command takes
+    /// one.
+    fn list_files(&self, dir: &str, ext: &str) -> Vec<String> {
+        let Some(vfs) = self.0 else {
+            return Vec::new();
+        };
+        let Ok(entries) = vfs.list(dir) else {
+            return Vec::new();
+        };
+
+        let suffix = format!(".{}", ext.to_ascii_lowercase());
+        entries
+            .into_iter()
+            .filter(|entry| !entry.is_dir)
+            .filter_map(|entry| {
+                let lowered = entry.name.to_ascii_lowercase();
+                match lowered.ends_with(&suffix) {
+                    true => Some(entry.name[..entry.name.len() - suffix.len()].to_string()),
+                    false => None,
+                }
+            })
+            .collect()
+    }
+
     fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
         let vfs = self.0.ok_or("no game content is mounted")?;
         let target = vfs.write_path(path).map_err(|err| err.to_string())?;
@@ -963,6 +1087,7 @@ mod tests {
         let mut console = Console::detached();
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
 
         for spec in [
             console::CommandSpec::new("bind", ""),
@@ -977,6 +1102,7 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
 
@@ -992,6 +1118,7 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
         assert!(input.move_buttons().forward.is_down());
 
@@ -1002,8 +1129,77 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
         assert!(!input.move_buttons().forward.is_down());
+    }
+
+    /// Stage 4 end to end without a GPU: the console key is bound by the
+    /// shipped config, pressing it becomes command text, the console executes
+    /// it, and the dialog opens. Every seam in the chain is exercised —
+    /// bindings, the command buffer, `EngineCommands` — and none is mocked.
+    #[test]
+    fn the_console_key_opens_the_dialog_through_the_command_buffer() {
+        use console::{Console, Source};
+
+        let mut console = Console::detached();
+        let mut host = Host::new(host::DEFAULT_FPS_MAX);
+        let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
+        for spec in [
+            console::CommandSpec::new("bind", ""),
+            console::CommandSpec::new("toggleconsole", ""),
+        ] {
+            console.register_command(spec).expect("unique");
+        }
+
+        // The line `config_default.cfg` ships.
+        console.enqueue("bind \"`\" \"toggleconsole\"", Source::Code);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+            ui: &mut ui,
+        });
+        assert!(!ui.is_open());
+
+        let backquote = Button::Key(Key::Backquote);
+        input.push(pressed(backquote));
+        input.frame();
+        input.dispatch_bindings(&mut console);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+            ui: &mut ui,
+        });
+        assert!(ui.is_open(), "the console key opened the console");
+
+        // And it closes again, which is the half that needs the key to bypass
+        // the UI — see `Engine::ui_bypasses`.
+        input.push(input::Event::Released(backquote));
+        input.push(pressed(backquote));
+        input.frame();
+        input.dispatch_bindings(&mut console);
+        console.run(&mut EngineCommands {
+            host: &mut host,
+            input: &mut input,
+            ui: &mut ui,
+        });
+        assert!(!ui.is_open());
+    }
+
+    /// The rule `window/` reads to decide that a key is never the UI's.
+    #[test]
+    fn only_the_key_bound_to_toggleconsole_bypasses_the_ui() {
+        let mut bindings = Bindings::new();
+        bindings.bind(Button::Key(Key::Backquote), "toggleconsole");
+        bindings.bind(Button::Key(Key::W), "+forward");
+
+        assert!(bindings.bypasses_ui(Button::Key(Key::Backquote)));
+        assert!(!bindings.bypasses_ui(Button::Key(Key::W)));
+        assert!(
+            !bindings.bypasses_ui(Button::Key(Key::F1)),
+            "unbound keys are the UI's"
+        );
     }
 
     #[test]
@@ -1013,6 +1209,7 @@ mod tests {
         let mut console = Console::detached();
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
         for spec in [
             console::CommandSpec::new("bind", ""),
             console::CommandSpec::new("unbindall", ""),
@@ -1029,6 +1226,7 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), None);
@@ -1097,6 +1295,7 @@ mod tests {
         let (mut console, sensitivity) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
         console.set_config_was_read(true);
         console.enqueue(
             "bind \"w\" \"+forward\"; bind \"MOUSE1\" \"+attack\"; bind \"F6\" \"save quick\"",
@@ -1106,12 +1305,14 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
         sensitivity.set_string("6");
         console.enqueue("host_writeconfig", Source::Code);
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
 
         let written = store
@@ -1130,10 +1331,12 @@ mod tests {
         let (mut console, sensitivity) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
         console.enqueue("exec config.cfg", Source::Code);
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -1159,6 +1362,7 @@ mod tests {
         let (mut console, _) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
 
         console.enqueue(
             "bind \"w\" \"+forward\"; bind \"s\" \"+back\"",
@@ -1168,6 +1372,7 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
 
         assert!(
@@ -1184,6 +1389,7 @@ mod tests {
         let (mut console, _) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
+        let mut ui = ConsoleUi::new();
         console.set_config_was_read(true);
 
         console.enqueue("bind \"w\" \"+forward\"", Source::Code);
@@ -1191,6 +1397,7 @@ mod tests {
         console.run(&mut EngineCommands {
             host: &mut host,
             input: &mut input,
+            ui: &mut ui,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());
     }

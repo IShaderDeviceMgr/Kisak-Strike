@@ -7,9 +7,9 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
 | [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
-| [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings and a free-fly camera done; no UI precedence or controllers |
-| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg` done; no UI |
-| [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop and input translation done |
+| [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
+| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg` and the `egui` dialog done; no list commands |
+| [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
 | `net/`, `client/`, `server/`, `audio/`, … | the other 9 | not started |
 
 The binary now loads a real Portal 2 `.bsp` and draws it **lit**: base textures multiplied
@@ -52,19 +52,22 @@ cargo run --release -- -basedir /path/to/game -game portal2 -window +map sp_a1_i
 This is the whole control flow, and the part worth holding in your head:
 
 ```
-WindowEvent      -> Engine::push_input()    -> queued, not acted on
-DeviceEvent      -> Engine::push_input()    -> raw motion, ditto
-about_to_wait    -> Engine::deadline()      -> ControlFlow::WaitUntil
-RedrawRequested  -> Engine::frame(now)      -> None: too early, return and wait
-                                            -> Input::frame()
-                                            -> Input::dispatch_bindings(console)
-                                            -> Console::run(EngineCommands)
-                                            -> fps_max, then the view
-                                            -> Some(Quit | Restart): exit
-                                            -> Some(Continue): carry on
-                 -> apply_capture()         -> the cursor grab follows the engine
-                 -> Renderer::begin_frame() -> None: back off SKIP_RETRY
-                 -> Engine::render(&mut frame)
+WindowEvent      -> GameWindow::offer_to_ui()  -> Consumer::{Ui, Game}
+                 -> Engine::push_input(e, c)   -> queued, not acted on
+DeviceEvent      -> Engine::push_input()       -> raw motion, always Game
+about_to_wait    -> Engine::deadline()         -> ControlFlow::WaitUntil
+RedrawRequested  -> Engine::frame(now)         -> None: too early, return and wait
+                                               -> Input::frame()   [key-up latch]
+                                               -> Input::dispatch_bindings(console)
+                                               -> Console::run(EngineCommands)
+                                               -> fps_max, then the view
+                                               -> Some(Quit | Restart): exit
+                                               -> Some(Continue): carry on
+                 -> apply_capture()            -> the cursor grab follows the engine
+                 -> Renderer::begin_frame()    -> None: back off SKIP_RETRY
+                 -> Engine::render(&mut frame) -> the world
+                 -> Context::run_ui(|| Engine::run_ui())
+                 -> UiRenderer::draw(&mut frame, …)  -> the console, over the top
                  -> Frame::present()
 ```
 
@@ -86,6 +89,11 @@ Five orderings in there are load-bearing:
    makes `wait 1` mean "next frame"; running the console per window event would tick it at
    the display's rate instead.
 6. **Nothing sleeps.** See [Pacing](#pacing-is-split-in-two).
+7. **The UI is built and drawn inside the acquired frame**, after the world. `egui`'s
+   `TexturesDelta` must be applied by whoever built it (`epaint` asserts on drop that it
+   was), so a pass built for a frame that then found no swap-chain image would leave an
+   upload owed to nobody. A skipped frame therefore skips `egui` entirely and its events
+   stay queued for the next one.
 
 <a id="engine-host"></a>
 
@@ -366,16 +374,16 @@ which has real internal pointers.
 Buttons, the event queue, and where the view points. Replaces `inputsystem/` (10,649
 lines), `engine/keys.cpp` (1,392) and `sys_mainwind.cpp`'s `DispatchInputEvent`, and
 stands in for `game/client/in_*.cpp` (7,402) until `client/` exists.
-[`portdocs/ENGINE_INPUT.md`](../portdocs/ENGINE_INPUT.md) is the plan; **stages 1-3 of its
-five are done** — translation, button state, mouse look, a free-fly camera, and bindings.
-UI precedence (stage 4) wants `egui`, and controllers (stage 5) want `gilrs`.
+[`portdocs/ENGINE_INPUT.md`](../portdocs/ENGINE_INPUT.md) is the plan; **stages 1-4 of its
+five are done** — translation, button state, mouse look, a free-fly camera, bindings and
+UI precedence. Only controllers (stage 5, `gilrs`) are left.
 
 | | |
 |---|---|
 | Module | `crate::engine::input`, with `input::bind`, `input::button` and `input::view` |
-| Lines | ~1,960 including tests |
-| Tests | 52 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
-| Dependencies | `std` and `glam`. **Not `winit`** — see [the seam](#the-seam-window-translates-input-decides) |
+| Lines | ~2,100 including tests |
+| Tests | 58 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
+| Dependencies | `std` and `glam`. **Not `winit`, and not `egui`** — see [the seam](#the-seam-window-translates-input-decides) |
 
 ### Quick start
 
@@ -449,14 +457,29 @@ reporting of the same fact; `winit`'s `KeyEvent` carries all three facts in one 
 `FocusGained` is not in Valve's set — this port needs it because X11 delivers raw motion
 whether or not the window is focused.
 
+### `Consumer` — who an event was given to
+
+```rust
+pub enum Consumer { Ui, Game }
+```
+
+`KeyUpTarget_t` (`engine/keys.cpp:41`), collapsed from five targets to two. Valve asked
+tools, VGui, RocketUI/Scaleform, GameUI and the client in turn; under `egui` there is one
+UI, so the chain is one answer. `window/` decides it per event, at the moment `egui` saw
+the event, and it travels into the queue with it.
+
+**`None` in the latch is `KEY_UP_ANYTARGET`, which is not `Consumer::Game`**: it means
+nothing claimed the press. See the latch below.
+
 ### `Input`
 
 ```rust
 impl Input {
     pub fn new() -> Input;
-    pub fn push(&mut self, event: Event);           // between ticks, from window/
+    pub fn push(&mut self, event: Event);                          // == push_from(_, Game)
+    pub fn push_from(&mut self, event: Event, consumer: Consumer); // between ticks, from window/
     pub fn frame(&mut self) -> (f32, f32);          // once a tick; returns summed motion
-    pub fn events(&self) -> &[Event];               // this tick's, until the next frame()
+    pub fn events(&self) -> &[Event];               // this tick's, for the *game*
     pub fn is_down(&self, button: Button) -> bool;
     pub fn mouse_look(&self) -> bool;
     pub fn set_mouse_look(&mut self, on: bool);
@@ -468,6 +491,31 @@ impl Input {
 makes the sampling rule structural rather than remembered. `frame` is also
 `GetAccumulatedMouseDeltasAndResetAccumulators`: it is the **single** point at which the
 motion accumulator resets, and a second one would silently halve the turn rate.
+
+`events()` returns **only what the game gets**. Everything the UI claimed is gone, which
+is what stops typing `w` in the console from walking the camera; `is_down` is unaffected,
+because `m_bKeyDown` is set before the chain runs (`keys.cpp:1288`) and records what is
+physically held.
+
+### The key-up latch
+
+`FilterKey` (`engine/keys.cpp:1189`), and the one algorithm in `keys.cpp` that has to
+survive intact. `Input::frame` records which target consumed a **press**, per button, and
+delivers the matching **release to that target and no other** — whatever anyone wants by
+the time it arrives. Valve's comment is the rule: *"It is illegal to trap up key events.
+The system will do it for us."*
+
+The failure it prevents, and the reason stage 4 is a correctness fix rather than polish:
+
+```
+bind mouse1 +attack ; click in game ; open the console ; let go
+```
+
+Without the latch the console eats the release, `-attack` never runs, and the player
+fires forever. Every stuck-key bug in a Source-like engine is this invariant violated.
+So: **a release reaches the game unless the press that matched it was taken by the UI —
+not unless the UI wants it now.** `Input::clear` resets the latch with the down-state,
+because a claim that outlived the window it was made in would misroute the next release.
 
 ### `ViewAngles` and `FlyCamera`
 
@@ -528,7 +576,8 @@ Ordered by how likely each is to bite.
 1. **View look comes from `DeviceEvent::MouseMotion`, never from `CursorMoved`.**
    `CursorMoved` is clamped to the window and quantised to pixels, so a view driven from
    it stalls at the screen edge — the classic "cannot turn past 180°" bug. `CursorMoved`
-   is translated and queued for the UI that does not exist yet, and nothing reads it.
+   is translated and queued, and only `egui` reads it — through its own `winit`
+   integration, not through this queue.
 2. **Input is sampled at the frame rate, not the event rate.** The queue is drained
    inside `Engine::frame`, *after* `Host::frame` agrees a frame is happening, so a frame
    `fps_max` refuses samples nothing and **a lower `fps_max` is a higher input latency**.
@@ -547,9 +596,14 @@ Ordered by how likely each is to bite.
    `NSEvent.deltaX`, already through the OS ballistics curve**. The same `sensitivity`
    therefore feels different on macOS, and that is recorded rather than corrected —
    Valve answered the same problem with convars, not by inverting the curve.
-5. **Escape is the only way to get the cursor back**, until there is a UI. A click takes
-   it again. If that policy is ever moved or "simplified", a grabbed window becomes one
-   the user cannot leave.
+5. **Escape gets the cursor back and a click takes it again — but only when the console
+   is closed.** With the console up, both events are the UI's and never reach
+   `Input::events`: Escape closes the dialog inside `egui`, and a click is the dialog's.
+   The cursor is instead given back by `Engine::wants_mouse_capture`, which is
+   `mouse_look && !console_open`. That is deliberately a **separate term** rather than a
+   write to `mouse_look`, so closing the console restores whatever the game had rather
+   than deciding for it. If either half is ever "simplified", a grabbed window becomes
+   one the user cannot leave.
 6. **Neither cursor grab mode works on both platforms.** `CursorGrabMode::Locked` is
    unimplemented on X11, `Confined` is unimplemented on macOS
    (`winit-0.30.13/src/window.rs:1682`), and which applies is a *runtime* property of the
@@ -575,8 +629,33 @@ Ordered by how likely each is to bite.
    the accumulator would deliver one enormous delta on the frame the grab returns.
 10. **`repeat` is passed through, not filtered.** The console wants auto-repeat and
     bindings must not have it (`kbutton_t`'s `KeyDown` returns early on one,
-    `in_main.cpp:434`), so the consumer decides. Likewise `Text` is unfiltered, control
-    characters included — what counts as typable is the console's question.
+    `in_main.cpp:434`), so the consumer decides. `Text` reaches this queue only when the
+    UI did not claim it; the console gets its own text from `egui_winit`, built from the
+    same `KeyEvent`, so the two paths never both see a character.
+12. **`egui` sees every event that is not bypassed, whoever ends up owning it.** The
+    latch decides what the *game* sees, not what `egui` sees — those are two different
+    questions here, where Valve's one chain answered both at once. A consequence: after
+    clicking in the world and opening the console, `egui` receives a mouse release for a
+    press it never got. That is harmless (it just clears pointer state), and it is the
+    price of the console being able to answer "did you want this" from its own state.
+13. **View look is gated on `Engine::wants_mouse_capture`, not on `Input::mouse_look`.**
+    They differ by exactly one term — the console being up — and using the wrong one is a
+    bug you see rather than one you read: `DeviceEvent::MouseMotion` arrives from the
+    *device* whether or not the cursor is grabbed, so moving the mouse to click in the
+    console would spin the view underneath it. Discarding the tick's delta rather than
+    suppressing it at `push` is safe, because `Input::frame` resets the accumulator every
+    tick and nothing piles up to arrive in one lump when the console closes.
+14. **A movement key held when the console opens stays held, and the camera keeps
+    moving.** That is faithful — Source does the same, because the press already went to
+    the game and only its *release* is latched — and the release, when it comes, still
+    reaches the game and stops it. It is listed here because it looks like a stuck-key
+    bug and is the opposite: it is the latch working.
+15. **The key bound to `toggleconsole` never reaches the UI at all.** `Key_Event`
+    bypasses the whole VGui chain for a `KEY_BACKQUOTE` press (`keys.cpp:1319`), because
+    otherwise the key that opens the console cannot close it and types a backquote into
+    the entry on the way. `Bindings::bypasses_ui` generalises that from the backquote to
+    whatever is bound to the command, and `window/` skips `egui` for both edges — so
+    `egui` never has a half-open key state to go with a release it will not see either.
 11. **Wheel notches are accumulated before becoming button presses.** A mouse reports
     lines and a trackpad reports pixels, continuously; `MWHEELUP`/`MWHEELDOWN` are
     discrete. `window/`'s `PIXELS_PER_NOTCH` (50, a chosen constant — Valve never saw a
@@ -681,7 +760,6 @@ empty**, so button code 0 could never hold anything. This uses `Option`.
 
 | Missing | Waits on |
 |---|---|
-| UI event precedence, and the **key-up latch** (`FilterKey`, `keys.cpp:1189`) that delivers a key-up to whoever consumed the key-down | `egui` — stage 4. Every "stuck key" bug in a Source-like engine is that invariant being violated: press `mouse1`, open the console, release. |
 | Controllers, hot-plug, analog axes | `gilrs` — stage 5. `in_joystick.cpp`'s response curves and deadzones are content-tuned client behavior and come with `client/`, not with the device layer. |
 | `CUserCmd`, the fractional `KeyState` model, `CreateMove`, prediction | `client/`. `kbutton_t`'s two-holder set [now exists](#movebuttons) because the index argument needs it; the fractional key state does not, and building *that* against a camera instead of a player would bake in the wrong consumer. |
 | `unbindalljoystick`, `unbindallmousekeyboard`, `Key_SetBinding`'s splitscreen joystick remap | controllers (stage 5) and co-op. |
@@ -715,6 +793,13 @@ empty**, so button code 0 could never hold anything. This uses `Option`.
 | `auto_repeat_never_reaches_the_binding` | that the transition guard already covers `KeyDown`'s repeat check |
 | `focus_loss_releases_what_the_commands_are_holding` | that clearing the key down-state is *not* enough — the command holds the button |
 | `a_bound_key_moves_the_camera_through_the_command_buffer` | the whole chain, `bind` → press → command text → console → `MoveButtons`, with nothing mocked |
+| `a_release_goes_to_whoever_took_the_press` | **the latch, and the bug it exists for**: click, open the console, let go, and `-attack` still runs |
+| `a_press_the_ui_took_never_reaches_the_game` | the other direction — clicking in the console does not send a bare `-attack` on the way out |
+| `the_down_state_records_what_is_held_whoever_took_it` | that `m_bKeyDown` is set before the chain runs, which is what `client/` will read |
+| `text_and_wheel_the_ui_took_are_dropped` | that typing `w` in the console does not walk the camera |
+| `losing_focus_forgets_who_was_owed_a_release` | a claim outliving the window it was made in |
+| `only_the_key_bound_to_toggleconsole_bypasses_the_ui` | `Bindings::bypasses_ui`, gotcha #15 |
+| `the_console_key_opens_the_dialog_through_the_command_buffer` | stage 4 end to end: binding → command text → console → dialog, and closing again |
 
 The cursor grab, the `winit` event arms and `device_event` need a window and cannot be
 tested here; they are verified by running the binary.
@@ -725,22 +810,28 @@ Cvars, commands, the buffer that turns typed or scripted text into them, and the
 they print to. Replaces `tier1/convar.cpp` + `tier1/commandbuffer.cpp` (the objects and
 the queue), `vstdlib/cvar.cpp` (the registry), `engine/cmd.cpp` + `engine/cvar.cpp` (the
 policy) and the print half of `engine/console.cpp`. The design is
-[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stages 1-3 of its
+[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stages 1-4 of its
 §8 — stage 2 being bindings, which is the same work as `input/` stage 3 and is documented
-[there](#bindings-and-commandsink), and stage 3 being
-[config persistence](#config-persistence).
+[there](#bindings-and-commandsink), stage 3 being
+[config persistence](#config-persistence), and stage 4 being the
+[`egui` dialog](#consoleui--the-dialog). Only stage 5, the list commands, is left.
 
 | | |
 |---|---|
-| Module | `crate::engine::console`, with `console::{buffer, cvar, log, token}` |
-| Lines | ~3,250 including tests |
-| Tests | 69 (`cargo test engine::console`) |
-| Dependencies | **`std` only** — no `wgpu`, no `winit`, no `crate::filesystem` |
+| Module | `crate::engine::console`, with `console::{buffer, cvar, log, token, ui}` |
+| Lines | ~4,150 including tests |
+| Tests | 85 (`cargo test engine::console`), 8 of them the dialog's |
+| Dependencies | **`std`, plus `egui` in `console::ui` alone** — no `wgpu`, no `winit`, no `crate::filesystem` |
 
 **It names no engine type and no filesystem type**, which is what lets it be constructed,
 driven and asserted on with no window, no GPU and no mount. Two traits buy that:
 [`CommandTarget`](#commandtarget-and-execcontext) for commands it does not own, and
 [`ConfigFiles`](#configfiles) for the files `exec` reads.
+
+`console::ui` is the one submodule with a dependency, and it is `egui` and nothing else —
+no `winit`, no `wgpu`, no engine type. That keeps the property, rather than spending it:
+a headless `egui::Context` is a complete `egui`, so the dialog is driven and asserted on
+in unit tests exactly as the rest of the module is.
 
 ### Quick start
 
@@ -923,6 +1014,7 @@ pub trait ConfigFiles {
     fn read_config(&self, path: &str, path_id: Option<&str>) -> Option<Vec<u8>>;
     fn config_exists(&self, path: &str, path_id: Option<&str>) -> bool;      // defaulted
     fn write_config(&self, path: &str, contents: &str) -> Result<(), String>; // defaulted
+    fn list_files(&self, dir: &str, ext: &str) -> Vec<String>;                // defaulted
 }
 pub struct NoConfigFiles;                // reads nothing, writes nothing
 ```
@@ -937,6 +1029,13 @@ The seam that keeps `console/` off `crate::filesystem`. `path` arrives assembled
 (`cfg/valve.rc`); `path_id` is `exec`'s optional second argument, which Valve spells as the
 `//<pathid>/` prefix and defaults to `*` (any mount). `VfsConfigFiles` in
 `src/engine/mod.rs` is the real implementation; tests use an in-memory map.
+
+`list_files` is the completion half — `CBaseAutoCompleteFileList::AutoCompletionFunc`
+(`engine/baseautocompletefilelist.cpp:23`), which walks `<subdir>/*.<ext>` and chops four
+characters off each name to remove the extension (which is why every extension Valve
+completes happens to be three letters long). It returns names **with the extension
+stripped**, merged across every mount, and defaults to nothing — so a console with no
+content mounted completes commands and cvars and simply offers no filenames.
 
 > **This resolves a contradiction in the plan.** `ENGINE_CONSOLE.md` §0.1 asks for a module
 > testable "without a mounted filesystem" while §3 and §4.5 have `exec` reading
@@ -1026,6 +1125,101 @@ passing 1 to `BeginProcessingCommands` every time, and it is what makes `wait 1`
 "next frame". The shipped `.cfg` files assume it, so it is kept — and it is why `run` is
 called *inside* `Engine::frame` rather than per window event.
 
+### Completion
+
+```rust
+pub struct Suggestion {
+    pub text: String,          // what replaces the input line
+    pub value: Option<String>, // a cvar's current value; None for a command
+}
+
+impl Console<'_> {
+    pub fn complete(&self, partial: &str) -> Vec<Suggestion>;
+}
+```
+
+`CConsolePanel::RebuildCompletionList` (`consoledialog.cpp:510`), moved out of the widget
+because it is a question about the registry rather than about a dialog. The rules, all of
+which are Valve's:
+
+- **Empty input returns nothing** — empty input lists *history*, and history belongs to
+  [`ConsoleUi`](#consoleui--the-dialog).
+- **Input containing a space** first asks whether the command named by the first token
+  completes its own arguments (`Completion::Files`/`Values` on its `CommandSpec`).
+  `exec ` listing `cfg/*.cfg` and `map ` listing `maps/*.bsp` are that path, and the
+  suggestion is the **whole line** (`exec config_default`), which is what
+  `AutoCompletionFunc` builds.
+- **Otherwise prefix match**; and if there *was* a space and no command claimed it, fall
+  back to space-separated substring matching (`CommandMatchesText`, `:451`), so
+  `draw wire` finds `mat_wireframe`. Non-obvious and pleasant.
+- `DEVELOPMENTONLY` and `HIDDEN` are excluded from both the command and the cvar list.
+- Sorted by name, capped at 64 (`COMMAND_COMPLETION_MAXITEMS`).
+
+**Completion is data on the `CommandSpec`, not a callback.**
+`FnCommandCompletionCallback` reached the filesystem through a global; there is none here,
+so `Completion::Files { dir, ext }` names what to list and
+[`ConfigFiles::list_files`](#configfiles) does the listing.
+
+Two divergences worth knowing: the argument list is **sorted and deduplicated** where
+Valve's is in filesystem order (two mounts can serve the same `cfg/*.cfg`, and `Vfs::list`
+merges rather than deduplicating); and a cvar's displayed value uses an integer format for
+an integral `FCVAR_NEVER_AS_STRING` number rather than `1.000000`, which is Valve's own
+rule at `:594`.
+
+<a id="consoleui--the-dialog"></a>
+
+### `ConsoleUi` — the dialog
+
+```rust
+pub struct ConsoleUi;
+impl ConsoleUi {
+    pub fn new() -> ConsoleUi;
+    pub fn is_open(&self) -> bool;
+    pub fn set_open(&mut self, open: bool);   // showconsole / hideconsole
+    pub fn toggle(&mut self);                 // toggleconsole
+    pub fn draw(&mut self, ctx: &egui::Context, console: &mut Console<'_>);
+    pub fn input(&self) -> &str;
+    pub fn history(&self) -> &[String];
+    pub fn completion(&self) -> &[Suggestion];
+}
+```
+
+`vgui2/vgui_controls/consoledialog.cpp` (1,371 lines) plus its game-side wrappers. **The
+widget tree does not survive; three algorithms do**: `RebuildCompletionList` (above),
+`AddToHistory` (`:1075`) and `OnAutoComplete` (`:648`).
+
+Owned by `Engine`, not by `Console` — the scrollback is the console's (output exists
+whether or not anything displays it), the dialog's own state is the engine's, and keeping
+them apart is what makes `Engine::run_ui`'s borrow two disjoint fields.
+
+Keys, all of them Valve's:
+
+| Key | Does |
+|---|---|
+| the key bound to `toggleconsole` | opens and closes; **never reaches `egui`** (gotcha #15 in [input](#invariants-and-gotchas-input)) |
+| Enter, or Submit | runs the line as `Source::UserInput`, echoes it as `] <line>`, adds it to history |
+| Tab / ↓ | next completion; Shift-Tab / ↑ the previous. Both wrap |
+| Escape | closes the dialog. Taken with `consume_key` *before* the entry is built, because a focused `TextEdit` surrenders focus on Escape and the dialog would stay up with nothing focused |
+
+Three behaviours that look like details and are the design:
+
+1. **Empty input cycles history, and that is why there is no separate history key.**
+   `RebuildCompletionList` fills the completion list from history when the entry is empty,
+   so ↑ on an empty line is already the most recent command. History is offered **oldest
+   first**, which looks backwards and is not: `OnAutoComplete`'s reverse case starts at the
+   *end* of the list, so "up from nothing" lands on the newest and the behaviour falls out
+   of the ordering rather than being special-cased.
+2. **Cycling must not rebuild the list.** The entry text changes while cycling, and a naive
+   "rebuild when the text changed" narrows the list to one item and stops. `ConsoleUi`
+   keeps what the *user* typed (`m_szPartialText`) separately from what it last wrote
+   (`m_bAutoCompleteMode` under another name), and only a user edit rebuilds.
+3. **A completion gets a trailing space unless it already contains one** (`:715`), so
+   `mat_wireframe ` is ready for a value while `exec valve.rc` is ready to run.
+
+Deliberately not here: the **notify area** (`CConPanel`, the fading lines at the top of
+the screen — a HUD element), `m_bStatusVersion`'s one-line layout (the dedicated server's),
+and `DumpConsoleTextToFile`, which arrives with `con_logfile`.
+
 ### Invariants and gotchas (console)
 
 Ordered by how likely each is to bite.
@@ -1105,8 +1299,7 @@ Both are runaway protection, and they catch different shapes:
 
 | Missing | Waits on |
 |---|---|
-| The console dialog, scrollback rendering, history, completion *algorithm* | stage 4 — wants `egui` |
-| `cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar` | stage 5 |
+| `cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar` | stage 5 — trivial now that the dialog exists to print into, and useless before it did |
 | The flag-versus-source permission matrix | `net/` — the check is already a function returning "allowed" (§9 q4) |
 | `con_logfile`, `Con_NPrintf`, colour cvars | later; the notify area is the HUD's |
 | Splitscreen: per-target buffers, `FCVAR_SS`, `cmd1`…`cmd4` | deliberately deleted (§5) |
@@ -1135,7 +1328,7 @@ Found while implementing, and recorded because the plan is otherwise the referen
 
 ### Test coverage (console)
 
-64 tests, `cargo test engine::console`.
+85 tests, `cargo test engine::console`.
 
 | Test | Guards |
 |---|---|
@@ -1168,6 +1361,16 @@ Found while implementing, and recorded because the plan is otherwise the referen
 | `writing_is_refused_until_startup_has_read_a_config`, `writing_is_refused_when_almost_nothing_is_bound` | both guards |
 | `the_config_opens_with_unbindall_then_bindings_then_cvars` | the file's shape |
 | `the_written_config_reads_back_as_the_same_table` | `Key_WriteBindings`' exact lines |
+| `completion_prefix_matches_commands_and_cvars_and_sorts_them`, `completion_hides_developmentonly_and_hidden` | `RebuildCompletionList`'s filter and sort |
+| `a_space_with_no_claiming_command_matches_substrings` | `CommandMatchesText`'s second mode — every piece must match, not any |
+| `a_command_that_claims_its_arguments_completes_files`, `a_claiming_command_with_no_files_offers_nothing` | `AutoCompletionFunc`, including that a claiming command does not fall back to the name search |
+| `an_empty_line_completes_to_nothing_because_history_is_the_uis` | the split between the registry's job and the dialog's |
+| `the_completion_list_is_capped`, `never_as_string_cvars_show_a_number_rather_than_their_string` | `COMMAND_COMPLETION_MAXITEMS`, and `:594`'s number format |
+| `a_typed_line_reaches_the_command_buffer` | the dialog end to end with no window and no GPU: type, Enter, and find it queued, echoed and in history |
+| `tab_cycles_the_completions` | that cycling wraps and does **not** rebuild the list from the completed text |
+| `an_empty_line_cycles_history_instead` | `RebuildCompletionList`'s empty-input rule, and that ↑ lands on the newest |
+| `history_keeps_the_newest_copy_of_a_repeated_command`, `history_is_bounded` | `AddToHistory` |
+| `escape_closes_the_console`, `closing_forgets_the_completion_state` | the Escape path and `CConsolePanel::Hide` |
 
 ---
 
@@ -1298,9 +1501,9 @@ The game window and the event loop that drives the frame. Replaces `CGame`
 | | |
 |---|---|
 | Module | `crate::engine::window`, with `window::translate` |
-| Lines | ~1,230 including tests (`mod.rs` + `translate.rs`) |
+| Lines | ~1,350 including tests (`mod.rs` + `translate.rs`) |
 | Tests | 17 (`cargo test engine::window`) |
-| Dependencies | `winit` 0.30, `crate::engine`, `crate::materials`, `crate::filesystem`, `crate::cmdline` |
+| Dependencies | `winit` 0.30, `egui-winit`, `crate::engine`, `crate::materials`, `crate::filesystem`, `crate::cmdline` |
 
 ### `run`, `Boot` and `RunOutcome`
 
@@ -1357,6 +1560,39 @@ and on every focus change, and picks its mode at runtime — see
 [`input`](#engine-input) gotchas #5, #6 and #8, which are the ones that bite. A grab the
 platform refuses is reported once and not retried every frame.
 
+### The `egui` boundary
+
+`window/` is also `egui`'s `winit` side, and it owns three things: one `egui::Context`
+(cheap to clone; it is an `Arc` inside), an `egui_winit::State`, and a
+[`UiRenderer`](MATERIALS.md#uirenderer).
+
+```rust
+fn offer_to_ui(&mut self, event: &WindowEvent) -> Consumer;
+```
+
+is the whole of `CGame::DispatchInputEvent`'s precedence chain (`sys_mainwind.cpp:399`) —
+VGui, then Scaleform or RocketUI, then GameUI, then the client, each asked in turn —
+collapsed to one answer. Every window event goes through it before it is translated, and
+two things are folded into `egui`'s own `consumed`:
+
+- **The key bound to `toggleconsole` is never the UI's**, and is not shown to `egui` at
+  all. See [`input`](#engine-input) gotcha #15.
+- **A dialog that is up owns the keyboard** (`Engine::ui_has_focus`). `egui`'s `consumed`
+  is per-widget — it is "something has focus" — so with the console open but the entry
+  unfocused it would say no and `w` would walk the camera. VGui's answer was a modal
+  input context; this is that.
+
+That the answer reflects the *previous* frame's UI state is normal: it is what every
+`egui` integration does, and it is what Valve's chain did too, since each target answered
+from the state its last frame left. The [key-up latch](#the-key-up-latch) is what makes
+one boolean safe.
+
+**`handle_platform_output` is skipped while the game holds the cursor.** It is what sets
+the cursor icon, and `egui_winit` calls `set_cursor_visible(true)` alongside
+(`egui-winit/src/lib.rs:1286`), which would undo the hide that goes with a grab. Nothing
+is lost: while the cursor is captured there is by construction no UI to interact with,
+because the console gives the cursor back before it can be clicked in.
+
 ### Two deadlines, and why the later wins
 
 `about_to_wait` can have two outstanding "do not come back before" times:
@@ -1394,15 +1630,20 @@ pub fn host(&self) -> &Host;
 pub fn console(&self) -> &Console<'a>;
 pub fn console_mut(&mut self) -> &mut Console<'a>;
 
-pub fn push_input(&mut self, event: input::Event);  // from window/, between ticks
+pub fn push_input(&mut self, event: input::Event, consumer: Consumer); // from window/
 pub fn wants_mouse_capture(&self) -> bool;          // window/ turns this into a grab
+
+pub fn run_ui(&mut self, ctx: &egui::Context);      // builds this frame's UI
+pub fn ui_has_focus(&self) -> bool;                 // the console is up
+pub fn ui_bypasses(&self, button: Button) -> bool;  // the toggleconsole key
 ```
 
 The renderer stays with the window because the surface is tied to the window handle, and
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
 refcounted clones.
 
-Internally `Engine` is seven fields: the `Console`, the `Host`, the `Input` (which owns the
+Internally `Engine` is eight fields: the `Console`, the `ConsoleUi` that draws it, the
+`Host`, the `Input` (which owns the
 binding table and the movement buttons), `sensitivity` — the port's first `FCVAR_ARCHIVE`
 cvar, and therefore the first thing `config.cfg` persists that is not a binding — the
 engine's
@@ -1419,9 +1660,11 @@ happening — one `Console::run` is one command-buffer tick, so running it per w
 would tick `wait` at the display's rate. A command queued this frame is therefore acted on
 by the next frame's state machine, which is one frame of latency at startup and is why
 `map` goes through `Host::request_new_game` rather than loading in place. `EngineCommands`
-is the `CommandTarget`: a struct of field borrows, holding `&mut Host` and `&mut Input`.
+is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut Input` and
+`&mut ConsoleUi`.
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
-`key_findbinding`, and the `+`/`-` movement pair.
+`key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, and the `+`/`-` movement
+pair.
 
 `Engine::boot` prefers `//mod/cfg/config.cfg` and falls back to `config_default.cfg`, then
 queues `exec valve.rc` — see [config persistence](#config-persistence). `Engine::frame`
@@ -1429,9 +1672,17 @@ completes the handshake on its first pass: it binds the backquote to `togglecons
 nothing else did (`host.cpp:2085`), sets `config_was_read`, and writes a config if startup
 fell back to the defaults. A clean `Outcome::Quit` or `Restart` writes one too.
 
-`Engine::update_view` is where input becomes movement, and `mouse_look_after` is the
-whole of the UI-precedence policy until there is a UI: Escape frees the cursor, a click
-takes it back, last event of the tick wins.
+`Engine::update_view` is where input becomes movement. `mouse_look_after` now sees **only
+what the UI did not take**: with the console up, Escape closes the dialog inside `egui`
+and a click is the dialog's, so neither reaches it. With the console closed it is
+unchanged — Escape frees the cursor, a click takes it back, last event of the tick wins.
+The cursor is given back *for* the console by `wants_mouse_capture`, which is
+`mouse_look && !console_open`; keeping that a separate term rather than a write to
+`mouse_look` is what makes closing the console restore whatever the game had.
+
+`Engine::run_ui` is called by `window/` between `render` and the present, with the `egui`
+pass already open. It is one line — the dialog and the console it drives are two disjoint
+fields, which is the same split `host.frame(&mut self.scene)` makes.
 
 `-vmt` is owned here too: when set, `render` draws the material preview *instead of* the
 world, because it is an inspector for one material and anything else in the shot defeats
@@ -1442,10 +1693,15 @@ system's GPU regression suite.
 
 ## Test coverage
 
-187 tests across the five modules; 412 in the crate. **69 arrived with `console/`** and
-have [their own table](#test-coverage-console); the input tests, now 52, have
-[theirs](#test-coverage-input). The 21 that arrived with bindings are split across both,
-because the feature is.
+210 tests across the five modules; 437 in the crate. **85 are `console/`'s** and have
+[their own table](#test-coverage-console); the input tests, now 58, have
+[theirs](#test-coverage-input). The tests that arrived with bindings, and those that
+arrived with UI precedence, are split across both — because both features are.
+
+The `egui` path itself is tested in two places and neither needs a window: the dialog's
+behaviour against a headless `egui::Context` (`engine::console::ui`), and the
+`egui`-to-`wgpu` half against a real device and an offscreen target
+(`materials::ui` — see [`MATERIALS.md`](MATERIALS.md#uirenderer)).
 
 | Test | Guards |
 |---|---|

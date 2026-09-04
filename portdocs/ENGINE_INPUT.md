@@ -1,11 +1,10 @@
 # Porting input → `src/engine/input/`
 
-**Status: stages 1 and 2 of §9's five are done** — translation, button state, mouse
-capture, mouse look and a free-fly camera. **The API they landed is
-`rustdocs/ENGINE.md`'s `src/engine/input/` section; read that to *use* the module, and
-this to understand why it is shaped that way.** Stage 3 (bindings) wants `console/`,
-stage 4 (UI precedence) wants `egui`, stage 5 (controllers) wants `gilrs`; §9 and §10
-still stand as written for all three.
+**Status: stages 1-4 of §9's five are done** — translation, button state, mouse
+capture, mouse look, a free-fly camera, bindings and UI precedence. **The API they landed
+is `rustdocs/ENGINE.md`'s `src/engine/input/` section; read that to *use* the module, and
+this to understand why it is shaped that way.** Only stage 5 (controllers, `gilrs`) is
+left; §10 still stands as written for it.
 
 Written against the current architecture (single crate, no FFI, `winit`/`wgpu`); nothing
 here assumes the old FFI-bridged model.
@@ -585,13 +584,27 @@ Each stage is independently reviewable and independently useful.
    The actual defaults are `cfg/config_default.cfg`, which `exec` reads. It comes back
    with an options UI, not before.
 
-4. **UI precedence.** egui's consumed-answer plus the key-up latch (§4.3, §8.3). *Wants
-   the egui integration*, which is not scheduled.
+4. **UI precedence.** — **done**, with `ENGINE_CONSOLE.md` stage 4, which is the pairing
+   this plan predicted. `Consumer::{Ui, Game}` travels with each event from `window/`,
+   and `Input::frame` applies `FilterKey`'s latch: the target that consumed a press is
+   recorded per button and the matching release goes there and nowhere else.
+   Three things §8.3 did not say, worth recording:
+   - **`egui`'s `consumed` alone is not enough.** It is per-widget — it means "something
+     has focus" — so with the console up but the entry unfocused it says no and `w` walks
+     the camera. The answer `window/` posts is `egui`'s `consumed` **or** the engine's
+     `ui_has_focus`, which is VGui's modal input context by another name.
+   - **`egui` sees events the latch gives to the game, and vice versa.** The latch decides
+     what the *game* sees, not what `egui` sees; Valve's one chain answered both questions
+     at once and this port answers them separately. The visible consequence is that `egui`
+     can receive a mouse release for a press it never got, which is harmless.
+   - **The `toggleconsole` key is not shown to `egui` at all** (`keys.cpp:1319`'s
+     `KEY_BACKQUOTE` bypass), on both edges, so `egui` never holds a half-open key.
 
 5. **Controllers.** §10.
 
-Stages 1 and 2 are the first landing and are what "port input over" means in this
-request. 3 onwards are gated on modules that do not exist.
+Stages 1 and 2 were the first landing and are what "port input over" meant in that
+request. 3 and 4 followed with `console/`; only 5 is gated on a module that does not
+exist.
 
 **Stages 1-3 landed as planned.** Stage 3 (bindings) arrived with `console/` stage 2, as
 this plan expected — `console/` supplies `CommandSink`, the table lives in `input/`, and
@@ -693,10 +706,12 @@ Other notes for whoever does this:
    `MWHEELUP`/`MWHEELDOWN` are *discrete* buttons. Pixel deltas need a threshold-and-latch
    to avoid firing hundreds of `MWHEELUP` presses per trackpad swipe. Not hard; easy to
    miss until a Mac trackpad is tried.
-5. **Text entry versus bindings, on the same key.** `winit` gives `text` alongside the key
-   event, so both are available on one event — but the console needs "w types a w" while
-   the game needs "w is `+forward`", and the switch between them is the egui-consumed
-   answer of stage 4. Until then, stage 3 must not route `Text` anywhere.
+5. **Text entry versus bindings, on the same key.** ~~`winit` gives `text` alongside the
+   key event...~~ **Answered by stage 4, and not the way this expected.** The two paths do
+   not share an event at all: `egui_winit` builds its own text events from the same
+   `KeyEvent` on `window/`'s side of the seam, and `input::Event::Text` only ever carries
+   what the UI did not claim. So there is no switch — there are two consumers, and the
+   `Consumer` answer decides which one the event reaches.
 6. **Key repeat.** `event.repeat` is passed through in §8.2 rather than filtered, because
    the console wants repeat and bindings must not have it (`kbutton_t`'s KeyDown returns
    early on a repeat, `in_main.cpp:434`). Whoever consumes the event decides; do not

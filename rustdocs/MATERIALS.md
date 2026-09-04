@@ -13,9 +13,9 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~12,100 Rust including tests, plus ~500 of WGSL |
-| Tests | 143 (`cargo test materials`) — 19 of them run on a real GPU |
-| Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror` |
+| Lines | ~12,300 Rust including tests, plus ~500 of WGSL |
+| Tests | 145 (`cargo test materials`) — 21 of them run on a real GPU |
+| Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
 | Status | **Stages 1-5 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, and lightmaps. Stages 6+ not started |
 
 ```
@@ -35,6 +35,7 @@ src/materials/
   target.rs        DepthBuffer, RenderTarget, DEPTH_FORMAT — what a pass draws into
   context.rs       RenderContext, Pass, Camera, Load, StateOverride — passes and the constants under them
   preview.rs       MaterialPreview — the stage-4 verification draw. Temporary
+  ui.rs            UiRenderer — the egui pass over the frame. Not part of the material system
   shaders/prelude.wgsl             the shared prelude (§7.5)
   shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
@@ -1553,6 +1554,57 @@ of `preview.rs` are the only place the whole path is checked against real pixels
 moving them onto the world draw means giving them a `.bsp` — which means shipping content
 into the test suite or making them skip without it. Delete `preview.rs` and `-vmt`
 together with whatever answers that, not before.
+
+<a id="uirenderer"></a>
+
+## `UiRenderer` — the `egui` pass
+
+```rust
+pub struct UiRenderer;
+impl UiRenderer {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: TargetFormat) -> UiRenderer;
+    pub fn draw(&mut self, frame: &mut Frame<'_>, primitives: &[egui::ClippedPrimitive],
+                textures: egui::TexturesDelta, pixels_per_point: f32);
+}
+```
+
+**This is not part of the material system.** Nothing here goes through `PipelineCache`,
+`Material` or the constant ABI: `egui_wgpu::Renderer` owns its own pipeline, its own font
+atlas and its own vertex format, and wrapping any of that in Valve's shapes would buy
+nothing. It is a separate renderer that happens to draw into the same frame — which is
+exactly what `vgui2` was to `materialsystem`.
+
+It lives here for one concrete reason: [`Frame::parts`](#framea) is `pub(super)`, because
+opening a pass means deciding what its constants are and that decision belongs in one
+place. The UI is the one caller that legitimately opens a pass this module did not build
+the pipeline for, and it belongs on this side of that boundary rather than widening it.
+`window/` owns the instance and calls it; see [`ENGINE.md`](ENGINE.md#the-egui-boundary).
+
+Four things about it are worth knowing, in the order they will bite:
+
+1. **It loads, it does not clear.** The UI is an overlay over a world that has already
+   been drawn into the frame.
+2. **No depth attachment.** `egui`'s pipeline is built without depth-stencil state, so a
+   pass carrying a depth attachment fails validation against it. `UiRenderer` opens its
+   own pass with `depth_stencil_attachment: None` rather than reusing the frame's.
+3. **`TexturesDelta` is taken by value and emptied.** `epaint` asserts on drop that every
+   delta in it was applied (`epaint/src/textures.rs:335`); borrowing it would leave the
+   caller holding something that panics in a debug build the moment it goes out of scope.
+   The same rule is why the UI is built *inside* the acquired frame — see
+   [`ENGINE.md`](ENGINE.md#the-frame) ordering #7.
+4. **The target format decides the fragment shader.** `egui` works in gamma space, and
+   `egui_wgpu` picks between two entry points on `output_color_format.is_srgb()`. This
+   port's surface is sRGB (`Renderer::new` prefers one — that is what replaced
+   `SetHardwareGammaRamp`), so passing the surface's real format is both necessary and
+   sufficient. Getting it wrong is not an error; it is a visibly washed-out UI.
+
+Its two tests (`cargo test materials::ui`) draw a real `egui` pass into an offscreen
+target on a real device and read the pixels back, at both an `Rgba8Unorm` and an
+`Rgba8UnormSrgb` target. They are the **only** tests that can see a `wgpu` validation
+error in the UI path — the dialog's own tests in `engine::console::ui` run against a
+headless `egui::Context` and never touch a GPU. The split that makes both possible is
+`UiRenderer::record`, which takes an encoder and a view instead of a `Frame`, because a
+`Frame` needs a swap chain and a swap chain needs a window.
 
 ## Test coverage
 

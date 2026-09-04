@@ -59,6 +59,25 @@ const MODIFIERS: &[Key] = &[
     Key::RightAlt,
 ];
 
+/// Who an event was given to. `KeyUpTarget_t` (`engine/keys.cpp:41`).
+///
+/// Valve's chain had five targets — tools, VGui, RocketUI/Scaleform, GameUI
+/// and the client — and asked each in turn whether it wanted the event
+/// (`CGame::DispatchInputEvent`, `sys_mainwind.cpp:399`). Under `egui` there
+/// is one UI, so the chain collapses to one answer
+/// (`portdocs/ENGINE_INPUT.md` §8.3) and the enum collapses to two variants.
+///
+/// **`None` in the latch is `KEY_UP_ANYTARGET`**, which is not the same as
+/// [`Consumer::Game`]: it means nothing claimed the press, so the release goes
+/// to the game by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consumer {
+    /// The UI took it. It never reaches bindings or the camera.
+    Ui,
+    /// Nothing above the game wanted it.
+    Game,
+}
+
 /// One thing the platform reported.
 ///
 /// `InputEvent_t` (`public/inputsystem/InputEnums.h`) minus the
@@ -112,13 +131,23 @@ pub enum Event {
 /// cheap to defer as long as nothing bakes a player slot into [`Event`] or
 /// [`Button`] (`portdocs/ENGINE_INPUT.md` §11.1).
 pub struct Input {
-    /// Posted since the last tick, in arrival order.
-    queue: Vec<Event>,
+    /// Posted since the last tick, in arrival order, each with the answer the
+    /// UI gave when it arrived.
+    queue: Vec<(Event, Consumer)>,
     /// The last tick's surviving events. Reused, so a steady frame allocates
-    /// nothing.
+    /// nothing. **Only what the game gets** — what the UI took is dropped by
+    /// [`Input::frame`].
     tick: Vec<Event>,
     /// `CKeyInfo::m_bKeyDown`, one per button.
+    ///
+    /// Updated **regardless of who consumed the event**, which is what
+    /// `Key_Event` does before the chain runs (`keys.cpp:1288`): this is what
+    /// is physically held, not what the game was told about.
     down: [bool; Button::COUNT],
+    /// `CKeyInfo::m_nKeyUpTarget` — who took the press, so the release can go
+    /// to the same place. `None` is `KEY_UP_ANYTARGET`. See
+    /// [`Input::frame`] and [`Consumer`].
+    key_up_target: [Option<Consumer>; Button::COUNT],
     /// Summed raw motion since the last [`frame`](Input::frame).
     mouse: (f32, f32),
     /// Whether the mouse is driving the view. `CInput::m_fMouseActive`, and
@@ -143,6 +172,7 @@ impl Input {
             queue: Vec::new(),
             tick: Vec::new(),
             down: [false; Button::COUNT],
+            key_up_target: [None; Button::COUNT],
             mouse: (0.0, 0.0),
             // A game window that has just opened owns the mouse, as Source's
             // does. Escape gives it back; see `Engine::frame`.
@@ -201,7 +231,31 @@ impl Input {
         }
     }
 
-    /// Posts one event, between ticks. `CInputSystem::PostEvent`.
+    /// Posts one event the UI did not want. `CInputSystem::PostEvent`.
+    ///
+    /// Shorthand for [`push_from`](Input::push_from) with [`Consumer::Game`],
+    /// which is what every event was before there was a UI.
+    ///
+    /// `window/` always has a UI answer to pass, so it uses `push_from`; this
+    /// is what a second event source with no UI above it wants, which is
+    /// `gilrs` at stage 5 (`portdocs/ENGINE_INPUT.md` §10 — the queue staying
+    /// reachable from outside `window/` is the one thing that plan asks stage
+    /// 1 not to get wrong). Tests use it throughout.
+    #[allow(dead_code)]
+    pub fn push(&mut self, event: Event) {
+        self.push_from(event, Consumer::Game);
+    }
+
+    /// Posts one event, between ticks, with the answer the UI gave for it.
+    ///
+    /// `consumer` is `CGame::DispatchInputEvent`'s precedence chain collapsed
+    /// to one answer (`portdocs/ENGINE_INPUT.md` §8.3). It is decided by
+    /// `window/` at the moment the event arrives — which is when `egui` saw
+    /// it — rather than at drain time, so that the answer and the event agree
+    /// about what was on screen.
+    ///
+    /// **A release's answer is ignored.** Who gets it is decided by the latch
+    /// in [`frame`](Input::frame), not by who wants it now.
     ///
     /// Raw motion is **dropped rather than accumulated** unless the mouse is
     /// actually driving the view. It is meaningless without a grab, and X11's
@@ -210,7 +264,7 @@ impl Input {
     /// the view. Dropping it at the door is also what keeps the accumulator
     /// from delivering one enormous delta on the frame the grab comes back —
     /// `CInput::ResetMouse`'s job (`in_mouse.cpp:342`).
-    pub fn push(&mut self, event: Event) {
+    pub fn push_from(&mut self, event: Event, consumer: Consumer) {
         match event {
             Event::MouseMotion { dx, dy } => {
                 if !self.mouse_look || !self.focused {
@@ -229,7 +283,7 @@ impl Input {
             }
             _ => {}
         }
-        self.queue.push(event);
+        self.queue.push((event, consumer));
     }
 
     /// Dispatches everything posted since the last tick, and returns the
@@ -242,32 +296,71 @@ impl Input {
     /// halve the motion.
     ///
     /// Events that do not change the down-state are **dropped here**, not
-    /// passed on — see [`Input::events`].
+    /// passed on — and so is everything the UI took. See [`Input::events`].
+    ///
+    /// # The key-up latch
+    ///
+    /// `FilterKey` (`engine/keys.cpp:1189`) is the one algorithm in
+    /// `keys.cpp` that has to survive intact, and it is easy to mistake for
+    /// plumbing. When a target consumes a **press**, which target it was is
+    /// recorded; the matching **release is delivered to that target and to no
+    /// other**, whatever anyone wants by the time it arrives. Valve's comment
+    /// is the rule: *"It is illegal to trap up key events. The system will do
+    /// it for us."*
+    ///
+    /// The failure it prevents: `bind mouse1 +attack`, click in game, open the
+    /// console *before* letting go. Without the latch the console eats the
+    /// release, `-attack` never runs, and the player fires forever. Every
+    /// stuck-key bug in a Source-like engine is this invariant violated.
+    ///
+    /// So a release reaches the game unless the press that matched it was
+    /// taken by the UI — **not** unless the UI wants it now.
     pub fn frame(&mut self) -> (f32, f32) {
         // Swapped out rather than borrowed, so dispatch can touch `self`. The
         // emptied queue goes back afterwards with its allocation intact.
         let mut queue = std::mem::take(&mut self.queue);
         self.tick.clear();
 
-        for event in queue.drain(..) {
-            match event {
+        for (event, consumer) in queue.drain(..) {
+            // Who this event is actually for. Only presses and releases go
+            // through the latch; the rest is the UI's answer as given.
+            let consumer = match event {
                 Event::Pressed { button, .. } => {
                     if !self.transition(button, true) {
                         continue;
                     }
+                    // `FilterKey`'s down case: record the claim, or leave
+                    // `KEY_UP_ANYTARGET` when nobody made one.
+                    self.key_up_target[button.index()] = match consumer {
+                        Consumer::Ui => Some(Consumer::Ui),
+                        Consumer::Game => None,
+                    };
+                    consumer
                 }
                 Event::Released(button) => {
                     if !self.transition(button, false) {
                         continue;
                     }
+                    // `FilterKey`'s up case: the claim decides, and clearing it
+                    // is what `m_nKeyUpTarget = KEY_UP_ANYTARGET` did.
+                    match self.key_up_target[button.index()].take() {
+                        Some(target) => target,
+                        None => Consumer::Game,
+                    }
                 }
                 // `CInput::ClearStates` (`in_mouse.cpp:828`). Alt-tabbing with
                 // `+forward` held and coming back to a player who has walked
                 // into a wall for thirty seconds is the failure this prevents.
-                Event::FocusLost => self.clear(),
-                _ => {}
+                Event::FocusLost => {
+                    self.clear();
+                    Consumer::Game
+                }
+                _ => consumer,
+            };
+
+            if consumer == Consumer::Game {
+                self.tick.push(event);
             }
-            self.tick.push(event);
         }
 
         self.queue = queue;
@@ -293,11 +386,14 @@ impl Input {
         true
     }
 
-    /// This tick's events, in arrival order, as [`frame`](Input::frame) left
-    /// them.
+    /// This tick's events **for the game**, in arrival order, as
+    /// [`frame`](Input::frame) left them.
     ///
     /// Valid until the next `frame`. Redundant transitions are already gone,
-    /// so a consumer that turns a press into `+attack` cannot send it twice.
+    /// so a consumer that turns a press into `+attack` cannot send it twice,
+    /// and so is everything the UI claimed — the console's own key presses are
+    /// not in here, which is what stops typing `w` in the console from walking
+    /// forwards.
     pub fn events(&self) -> &[Event] {
         &self.tick
     }
@@ -335,6 +431,10 @@ impl Input {
     /// wants the mouse.
     pub fn clear(&mut self) {
         self.down = [false; Button::COUNT];
+        // With nothing held, nothing is owed a release. Leaving stale claims
+        // here would send the next release for that button to a UI that is no
+        // longer up.
+        self.key_up_target = [None; Button::COUNT];
         self.mouse = (0.0, 0.0);
         // The `+command`s a binding sent are held by the *command*, not by the
         // key, so clearing the down-state is not enough: without this, alt-tab
@@ -572,6 +672,102 @@ mod tests {
         });
         input.frame();
         assert!(dispatched(&input).is_empty());
+    }
+
+    // ---- the key-up latch (stage 4) ---------------------------------------
+
+    /// **The bug the latch exists for.** `bind mouse1 +attack`, click in game,
+    /// open the console before letting go: without the latch the console eats
+    /// the release, `-attack` never runs, and the player fires forever.
+    #[test]
+    fn a_release_goes_to_whoever_took_the_press() {
+        let mut input = Input::new();
+        let mouse1 = Button::Mouse(MouseButton::Left);
+        input.bindings_mut().bind(mouse1, "+attack");
+
+        // Pressed with no UI up.
+        input.push_from(pressed(mouse1), Consumer::Game);
+        input.frame();
+        assert_eq!(dispatched(&input), [format!("+attack {}", mouse1.index())]);
+
+        // The console opens, so the UI now wants the mouse -- and the release
+        // still has to reach the game.
+        input.push_from(Event::Released(mouse1), Consumer::Ui);
+        input.frame();
+        assert_eq!(
+            dispatched(&input),
+            [format!("-attack {}", mouse1.index())],
+            "the release follows the press, not the current UI"
+        );
+    }
+
+    /// The other direction: a press the UI took must not reach the game, and
+    /// neither must its release — otherwise clicking in the console and
+    /// releasing over the world sends a bare `-attack`.
+    #[test]
+    fn a_press_the_ui_took_never_reaches_the_game() {
+        let mut input = Input::new();
+        let mouse1 = Button::Mouse(MouseButton::Left);
+        input.bindings_mut().bind(mouse1, "+attack");
+
+        input.push_from(pressed(mouse1), Consumer::Ui);
+        input.frame();
+        assert!(input.events().is_empty());
+        assert!(dispatched(&input).is_empty());
+
+        input.push_from(Event::Released(mouse1), Consumer::Game);
+        input.frame();
+        assert!(
+            dispatched(&input).is_empty(),
+            "the release belongs to the UI, which claimed the press"
+        );
+    }
+
+    /// `m_bKeyDown` is set before the chain runs (`keys.cpp:1288`), so the
+    /// down-state is what is physically held rather than what the game was
+    /// told about. `client/` will read this to build `CUserCmd`.
+    #[test]
+    fn the_down_state_records_what_is_held_whoever_took_it() {
+        let mut input = Input::new();
+        let w = Button::Key(Key::W);
+        input.push_from(pressed(w), Consumer::Ui);
+        input.frame();
+        assert!(input.is_down(w), "the key is down; the game just was not told");
+        assert!(input.events().is_empty());
+    }
+
+    /// Typing in the console must not walk the camera.
+    #[test]
+    fn text_and_wheel_the_ui_took_are_dropped() {
+        let mut input = Input::new();
+        input.push_from(Event::Text('w'), Consumer::Ui);
+        input.push_from(Event::Wheel(1.0), Consumer::Ui);
+        input.push_from(Event::Text('x'), Consumer::Game);
+        input.frame();
+        assert_eq!(input.events(), [Event::Text('x')]);
+    }
+
+    /// A claim that outlives the window it was made in would send the next
+    /// release for that button to a UI that is no longer up.
+    #[test]
+    fn losing_focus_forgets_who_was_owed_a_release() {
+        let mut input = Input::new();
+        let w = Button::Key(Key::W);
+        input.bindings_mut().bind(w, "+forward");
+
+        input.push_from(pressed(w), Consumer::Ui);
+        input.push(Event::FocusLost);
+        input.frame();
+
+        // The key comes back down with nobody claiming it, and its release is
+        // the game's.
+        input.push(Event::FocusGained);
+        input.push_from(pressed(w), Consumer::Game);
+        input.frame();
+        assert_eq!(dispatched(&input), [format!("+forward {}", w.index())]);
+        input.push_from(Event::Released(w), Consumer::Game);
+        input.frame();
+        assert_eq!(dispatched(&input), [format!("-forward {}", w.index())]);
     }
 
     /// Losing focus with `+forward` held must not leave the view walking: the

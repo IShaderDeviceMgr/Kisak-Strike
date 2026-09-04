@@ -42,6 +42,17 @@
 //! windowing type precisely so that it can be tested without a window
 //! (`portdocs/ENGINE_INPUT.md` §8.1). The one thing this module does own is
 //! the cursor grab, because that is a `winit` call: see [`Capture`].
+//!
+//! # The UI
+//!
+//! `egui` is split the same way, and this module is its `winit` boundary. Every
+//! window event is offered to `egui_winit` before it is translated, and its
+//! answer — folded together with the engine's own
+//! [`ui_has_focus`](Engine::ui_has_focus) — is what
+//! `CGame::DispatchInputEvent`'s five-target precedence chain
+//! (`sys_mainwind.cpp:399`) collapses to. See
+//! [`GameWindow::offer_to_ui`], and [`Input::frame`](input::Input::frame) for
+//! the key-up latch that makes one boolean safe.
 
 mod translate;
 
@@ -57,10 +68,10 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use crate::cmdline::CommandLine;
 use crate::engine::host::Outcome;
-use crate::engine::input::{self, Button, MouseButton};
+use crate::engine::input::{self, Button, Consumer, MouseButton};
 use crate::engine::Engine;
 use crate::filesystem::Vfs;
-use crate::materials::{Renderer, RendererOptions};
+use crate::materials::{Renderer, RendererOptions, UiRenderer};
 
 /// Fallback window title, from `CGame::CreateGameWindow`
 /// (`engine/sys_mainwind.cpp:1266`) — used when `gameinfo.txt` has no `game`
@@ -373,6 +384,17 @@ struct GameWindow<'a> {
     window: Option<Arc<Window>>,
     /// Built in `resumed`, once there is a device to build it against.
     engine: Option<Engine<'a>>,
+    /// The one `egui` context. Cheap to clone (it is an `Arc` inside), and
+    /// cloned once into [`GameWindow::egui`] at creation, which is why it can
+    /// live here and be used while that is borrowed.
+    egui_ctx: egui::Context,
+    /// `egui`'s `winit` half: event translation, the clipboard, IME, and the
+    /// cursor icon. Built with the window, because it needs one to read a
+    /// scale factor from.
+    egui: Option<egui_winit::State>,
+    /// `egui`'s `wgpu` half. Declared after `renderer` for the same reason
+    /// `renderer` is declared before `window`: it holds device handles.
+    ui: Option<UiRenderer>,
     /// When to try again after a skipped frame. See [`SKIP_RETRY`].
     retry_at: Option<Instant>,
     /// Whether the milestone line has been printed. See [`GameWindow::draw`].
@@ -414,6 +436,9 @@ impl<'a> GameWindow<'a> {
             renderer: None,
             window: None,
             engine: None,
+            egui_ctx: egui::Context::default(),
+            egui: None,
+            ui: None,
             retry_at: None,
             presented: false,
             // Replaced by `Window::has_focus` as soon as there is a window.
@@ -454,8 +479,24 @@ impl<'a> GameWindow<'a> {
         // that file rather than here.
         engine.boot();
 
+        // `egui` is built here rather than in `GameWindow::new` because both
+        // halves want something that does not exist until now: the `winit`
+        // half reads the window's scale factor and the device's maximum
+        // texture size, and the `wgpu` half needs the back-buffer format.
+        let egui = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(renderer.device().limits().max_texture_dimension_2d as usize),
+        );
+        let ui = UiRenderer::new(renderer.device(), renderer.queue(), renderer.target_format());
+
         self.focused = window.has_focus();
         self.engine = Some(engine);
+        self.egui = Some(egui);
+        self.ui = Some(ui);
         self.window = Some(window);
         self.renderer = Some(renderer);
 
@@ -463,11 +504,14 @@ impl<'a> GameWindow<'a> {
         // motion arrives from the device even when the window is not focused,
         // and a window the desktop never activated never gets a `Focused`
         // event to correct an assumption with.
-        self.push(if self.focused {
-            input::Event::FocusGained
-        } else {
-            input::Event::FocusLost
-        });
+        self.push(
+            if self.focused {
+                input::Event::FocusGained
+            } else {
+                input::Event::FocusLost
+            },
+            Consumer::Game,
+        );
         Ok(())
     }
 
@@ -523,9 +567,18 @@ impl<'a> GameWindow<'a> {
         self.apply_capture();
         self.warp_cursor();
 
-        let (Some(window), Some(renderer), Some(engine)) =
-            (&self.window, &mut self.renderer, &mut self.engine)
-        else {
+        // Read before the field borrows below. The game holding the cursor is
+        // what decides whether `egui` is allowed to touch it — see the
+        // `handle_platform_output` call.
+        let capture_wanted = self.capture_wanted;
+
+        let (Some(window), Some(renderer), Some(engine), Some(egui), Some(ui)) = (
+            &self.window,
+            &mut self.renderer,
+            &mut self.engine,
+            &mut self.egui,
+            &mut self.ui,
+        ) else {
             return;
         };
 
@@ -539,6 +592,37 @@ impl<'a> GameWindow<'a> {
 
         engine.render(&mut frame);
 
+        // The UI, over the top of the world. **Inside the acquired frame on
+        // purpose**: `TexturesDelta` has to be applied by whoever built it, so
+        // building a pass that then found no swap-chain image would leave an
+        // upload owed to nobody. A skipped frame therefore skips `egui`
+        // entirely and its events stay queued for the next one.
+        let raw_input = egui.take_egui_input(window);
+        let output = self
+            .egui_ctx
+            .run_ui(raw_input, |pass| engine.run_ui(pass.ctx()));
+
+        // **Only when the game is not holding the cursor.** This is what sets
+        // the cursor icon, and `egui_winit` sets `set_cursor_visible(true)`
+        // along with it (`egui-winit/src/lib.rs:1286`) — which would undo the
+        // hide that goes with a grab. While the cursor is captured there is by
+        // construction no UI to interact with, so nothing is lost: the console
+        // gives the cursor back before it can be clicked in
+        // ([`Engine::wants_mouse_capture`]).
+        if !capture_wanted {
+            egui.handle_platform_output(window, output.platform_output);
+        }
+
+        let primitives = self
+            .egui_ctx
+            .tessellate(output.shapes, output.pixels_per_point);
+        ui.draw(
+            &mut frame,
+            &primitives,
+            output.textures_delta,
+            output.pixels_per_point,
+        );
+
         // Tells the compositor a frame is imminent, so it can schedule
         // accordingly. Must be immediately before the present.
         window.pre_present_notify();
@@ -551,15 +635,78 @@ impl<'a> GameWindow<'a> {
         }
     }
 
-    /// Posts one translated event into the engine's queue.
+    /// Posts one translated event into the engine's queue, with the UI's
+    /// answer for it.
     ///
     /// `CInputSystem::PostEvent`. Events that arrive before the engine exists
     /// are dropped, which is the same thing `CGame::WindowProc` did before
     /// `CEngineAPI::Run`.
-    fn push(&mut self, event: input::Event) {
+    fn push(&mut self, event: input::Event, consumer: Consumer) {
         if let Some(engine) = &mut self.engine {
-            engine.push_input(event);
+            engine.push_input(event, consumer);
         }
+    }
+
+    /// Offers one window event to the UI and reports who gets it.
+    ///
+    /// This is the whole of `CGame::DispatchInputEvent`'s precedence chain
+    /// (`sys_mainwind.cpp:399`) — VGui, then Scaleform or RocketUI, then
+    /// GameUI, then the client, each asked in turn — collapsed to one answer,
+    /// which is what `portdocs/ENGINE_INPUT.md` §8.3 says it collapses to when
+    /// there is one UI.
+    ///
+    /// Two things are folded into `egui`'s own answer, and both matter:
+    ///
+    /// - **The console key is never the UI's.** `Key_Event` bypasses the
+    ///   entire chain for a `KEY_BACKQUOTE` press (`engine/keys.cpp:1319`),
+    ///   and it has to: otherwise the key that opens the console cannot close
+    ///   it, and it types a backquote into the entry on the way. The event is
+    ///   not shown to `egui` at all, so `egui` has no half-open key state to
+    ///   go with the release it will also not see.
+    /// - **A dialog that is up owns the keyboard.** `egui`'s `consumed` is
+    ///   per-widget — it is `wants_keyboard_input()`, i.e. "something has
+    ///   focus" — so with the console open but the entry unfocused it says no
+    ///   and `w` would walk the camera. VGui's answer was a modal input
+    ///   context; [`Engine::ui_has_focus`] is that.
+    ///
+    /// The stale-by-one-frame nature of `egui`'s answer is not a defect: it is
+    /// what every `egui` integration does, and it is also what Valve's chain
+    /// did, since each target answered from the state its last frame left.
+    fn offer_to_ui(&mut self, event: &WindowEvent) -> Consumer {
+        if let WindowEvent::KeyboardInput { event: key, .. } = event {
+            if self.is_console_key(key) {
+                return Consumer::Game;
+            }
+        }
+
+        let ui_focus = self
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.ui_has_focus());
+
+        let (Some(window), Some(egui)) = (&self.window, &mut self.egui) else {
+            return Consumer::Game;
+        };
+        let consumed = egui.on_window_event(window, event).consumed;
+
+        match consumed || ui_focus {
+            true => Consumer::Ui,
+            false => Consumer::Game,
+        }
+    }
+
+    /// Whether this key is the one bound to `toggleconsole`. See
+    /// [`offer_to_ui`](GameWindow::offer_to_ui).
+    fn is_console_key(&self, event: &KeyEvent) -> bool {
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return false;
+        };
+        let Some(key) = translate::key(code) else {
+            return false;
+        };
+        self.engine
+            .as_ref()
+            .is_some_and(|engine| engine.ui_bypasses(Button::Key(key)))
     }
 
     /// One key press or release, plus the text it produced.
@@ -574,28 +721,34 @@ impl<'a> GameWindow<'a> {
     /// report keys already held when a window gains focus, and
     /// `Input::frame`'s redundant-transition guard already makes a repeated
     /// press into nothing.
-    fn push_key(&mut self, event: KeyEvent) {
+    fn push_key(&mut self, event: KeyEvent, consumer: Consumer) {
         let down = event.state.is_pressed();
 
         if let PhysicalKey::Code(code) = event.physical_key {
             if let Some(key) = translate::key(code) {
                 let button = Button::Key(key);
-                self.push(if down {
-                    input::Event::Pressed {
-                        button,
-                        repeat: event.repeat,
-                    }
-                } else {
-                    input::Event::Released(button)
-                });
+                self.push(
+                    if down {
+                        input::Event::Pressed {
+                            button,
+                            repeat: event.repeat,
+                        }
+                    } else {
+                        input::Event::Released(button)
+                    },
+                    consumer,
+                );
             }
         }
 
         // Unfiltered, control characters included: what counts as typable is
-        // the console's question, and it does not exist yet.
+        // the console's question, and the console answers it through `egui`
+        // rather than through this queue — `egui_winit` builds its own text
+        // events from the same `KeyEvent`. What reaches `input/` here is
+        // therefore only ever what the UI did *not* take.
         if down {
             for character in event.text.iter().flat_map(|text| text.chars()) {
-                self.push(input::Event::Text(character));
+                self.push(input::Event::Text(character), consumer);
             }
         }
     }
@@ -607,7 +760,7 @@ impl<'a> GameWindow<'a> {
     /// continuously. Both become notches, and the button presses come off an
     /// accumulator so that a fractional line delta is not lost and a trackpad
     /// swipe is not hundreds of presses. See [`PIXELS_PER_NOTCH`].
-    fn push_wheel(&mut self, delta: MouseScrollDelta) {
+    fn push_wheel(&mut self, delta: MouseScrollDelta, consumer: Consumer) {
         let notches = match delta {
             MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(position) => position.y as f32 / PIXELS_PER_NOTCH,
@@ -617,7 +770,7 @@ impl<'a> GameWindow<'a> {
         if notches == 0.0 || !notches.is_finite() {
             return;
         }
-        self.push(input::Event::Wheel(notches));
+        self.push(input::Event::Wheel(notches), consumer);
 
         self.wheel += notches;
         let whole = self.wheel.trunc();
@@ -629,11 +782,14 @@ impl<'a> GameWindow<'a> {
             MouseButton::WheelDown
         });
         for _ in 0..whole.abs() as u32 {
-            self.push(input::Event::Pressed {
-                button,
-                repeat: false,
-            });
-            self.push(input::Event::Released(button));
+            self.push(
+                input::Event::Pressed {
+                    button,
+                    repeat: false,
+                },
+                consumer,
+            );
+            self.push(input::Event::Released(button), consumer);
         }
     }
 
@@ -733,6 +889,11 @@ impl ApplicationHandler for GameWindow<'_> {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Before anything else: `egui` gets first refusal, and its answer
+        // travels with the event into the queue. See
+        // [`offer_to_ui`](GameWindow::offer_to_ui).
+        let consumer = self.offer_to_ui(&event);
+
         match event {
             // Not an immediate exit: the engine is asked to shut down and the
             // state machine unloads the level on its way out, which is what
@@ -767,40 +928,51 @@ impl ApplicationHandler for GameWindow<'_> {
             // `DispatchAllStoredGameMessages` sat in `MainLoop`
             // (`sys_mainwind.cpp:509`) and is what keeps sampling independent
             // of how many events `fps_max` let pile up.
-            WindowEvent::KeyboardInput { event, .. } => self.push_key(event),
+            WindowEvent::KeyboardInput { event, .. } => self.push_key(event, consumer),
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(button) = translate::mouse(button) {
                     let button = Button::Mouse(button);
-                    self.push(if state.is_pressed() {
-                        input::Event::Pressed {
-                            button,
-                            repeat: false,
-                        }
-                    } else {
-                        input::Event::Released(button)
-                    });
+                    self.push(
+                        if state.is_pressed() {
+                            input::Event::Pressed {
+                                button,
+                                repeat: false,
+                            }
+                        } else {
+                            input::Event::Released(button)
+                        },
+                        consumer,
+                    );
                 }
             }
 
-            WindowEvent::MouseWheel { delta, .. } => self.push_wheel(delta),
+            WindowEvent::MouseWheel { delta, .. } => self.push_wheel(delta, consumer),
 
             // **Never view look.** `CursorMoved` is clamped to the window and
             // quantised to pixels, so a view driven from it stalls at the
             // screen edge; that is `DeviceEvent::MouseMotion`'s job. This is
             // for the UI, which does not exist yet.
-            WindowEvent::CursorMoved { position, .. } => self.push(input::Event::CursorMoved {
-                x: position.x as f32,
-                y: position.y as f32,
-            }),
+            WindowEvent::CursorMoved { position, .. } => self.push(
+                input::Event::CursorMoved {
+                    x: position.x as f32,
+                    y: position.y as f32,
+                },
+                consumer,
+            ),
 
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
-                self.push(if focused {
-                    input::Event::FocusGained
-                } else {
-                    input::Event::FocusLost
-                });
+                // Always the game's: losing focus has to release what is held
+                // whatever is on screen, and the latch is cleared with it.
+                self.push(
+                    if focused {
+                        input::Event::FocusGained
+                    } else {
+                        input::Event::FocusLost
+                    },
+                    Consumer::Game,
+                );
                 // Not deferred to the next tick: the cursor has to come back
                 // now, whether or not a frame is due.
                 self.apply_capture();
@@ -832,10 +1004,18 @@ impl ApplicationHandler for GameWindow<'_> {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            self.push(input::Event::MouseMotion {
-                dx: dx as f32,
-                dy: dy as f32,
-            });
+            // Never offered to the UI: `egui` is driven by `CursorMoved`, and
+            // raw motion is view look and nothing else
+            // (`portdocs/ENGINE_INPUT.md` §6.3). `Input` drops it anyway
+            // whenever the mouse is not driving the view, which is exactly
+            // when the console is up.
+            self.push(
+                input::Event::MouseMotion {
+                    dx: dx as f32,
+                    dy: dy as f32,
+                },
+                Consumer::Game,
+            );
         }
     }
 

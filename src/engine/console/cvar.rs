@@ -124,6 +124,12 @@ impl CommandFlags {
     pub const fn contains(self, other: CommandFlags) -> bool {
         (self.0 & other.0) == other.0
     }
+
+    /// Whether *any* of `other`'s bits are set. Completion wants this, to
+    /// exclude `DEVELOPMENTONLY | HIDDEN` in one test.
+    pub const fn intersects(self, other: CommandFlags) -> bool {
+        (self.0 & other.0) != 0
+    }
 }
 
 impl std::ops::BitOr for CommandFlags {
