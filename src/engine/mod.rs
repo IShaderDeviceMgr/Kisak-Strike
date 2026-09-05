@@ -181,9 +181,9 @@ impl<'a> Engine<'a> {
             "Frame rate limiter.",
         );
 
-        // `ConVar sensitivity( "sensitivity", "2.5", FCVAR_ARCHIVE | FCVAR_SS,
-        // "Mouse sensitivity.", true, 0.0001f, true, 10000000 )`. `FCVAR_SS` is
-        // splitscreen and is deleted (`ENGINE_CONSOLE.md` §5).
+        // `ConVar sensitivity( "sensitivity","2.5", FCVAR_ARCHIVE, "Mouse
+        // sensitivity.", true, 0.0001f, true, 1000 )`
+        // (`game/client/in_mouse.cpp:100`) — the tree's only declaration of it.
         let sensitivity = console.cvar_bounded(
             "sensitivity",
             &SENSITIVITY.to_string(),

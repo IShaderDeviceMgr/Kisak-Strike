@@ -45,6 +45,18 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   block. Concludes cvar sets are handled inside `console/` and commands are handed back out
   through a `CommandTarget` trait, the way `host::Level` works.
 
+- [`CLIENT.md`](CLIENT.md) — the **game client**: `game/client/in_*.cpp`, `view.cpp`,
+  `game/shared/usercmd.h` and the movement half of `gamemovement.cpp`. Resolves the
+  two-clients problem — this is `client.so`'s local player and view, landing at
+  `src/client/`, while `ENGINE.md` §7.5's *client connection* (`CClientState`, blocked on
+  `net/`) stays `src/engine/client/`. Inventory, the frame's two input sample points and
+  the keyboard-sample-time budget that exists because of them, `CUserCmd` as the module's
+  only output, `kbutton_t`'s fractional `KeyState`, the three places movement is computed,
+  and `SetUpView`. Concludes the player starts as `MOVETYPE_NOCLIP` rather than as a
+  camera, and **takes Valve's own `// FIXME, move entirely to client .dll`** on the view
+  angles. Five stages; stages 1-3 are unblocked and delete `src/engine/input/view.rs`
+  along with `CLAUDE.md`'s view-angles wart.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current

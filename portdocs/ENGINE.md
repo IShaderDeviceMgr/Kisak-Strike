@@ -345,13 +345,24 @@ inside, so a subsystem holds a handle to the one cvar it wants and the registry 
 serving only name lookup, for one caller. No global, and `console/` depends on `std`
 alone.
 
-### 7.5 Client connection & state — ~13,600 → `client/`
+### 7.5 Client connection & state — ~13,600 → `engine/client/`
 `cl_main.cpp` (3,919), `baseclientstate.cpp` (3,819), `cdll_engine_int.cpp` (3,059 — hosts
 `IVEngineClient`), `client.cpp` (2,349 — `CClientState`), `servermsghandler.cpp` (997),
 `cl_ents_parse.cpp` (763), `cl_pluginhelpers.cpp` (641), `cl_entityreport.cpp` (614),
 `cl_splitscreen.cpp` (418), `LocalNetworkBackdoor.cpp` (414), `cl_steamauth.cpp` (336),
 `clientframe.cpp` (281), `clockdriftmgr.cpp` (238), `cl_null.cpp` (203),
 `cl_parse_event.cpp` (135), `cl_pred.cpp` (75), `cl_localnetworkbackdoor.cpp` (43).
+
+**Renamed, and this matters.** This entry said `client/`, and so does `portdocs/CLIENT.md`
+— for a different module. This one is the *client connection*: signon state, snapshot
+parsing, the netchannel's view of a server, all of it blocked on `net/`. The **game
+client** — Valve's `client.so`, the local player, `CUserCmd`, movement and the view — is
+`portdocs/CLIENT.md` and lands at top-level **`src/client/`**, blocked on nothing. In
+prose, say *the client connection* and *the game client*; a bare "the client" will be read
+as the wrong one. `CLIENT.md` §1 has the split in full, and §4.7 takes the view angles out
+of `CClientState` on the strength of Valve's own `// FIXME, move entirely to client .dll`
+(`cdll_engine_int.cpp:1048`) — so this module, when it lands, asks the game client for
+them rather than storing a second copy.
 
 ### 7.6 Server & game boundary — ~22,500 → `server/`
 `baseserver.cpp` (4,551), `sv_main.cpp` (3,541), `sv_client.cpp` (2,534),
@@ -537,7 +548,7 @@ console files: `engine_helper_ps3.cpp` (378), `buildworldlists_PS3.cpp` (173),
 | 2 | Host / frame orchestration | 15,000 | `host/` | The `winit` work |
 | 11 | Demo record & playback | 14,700 | `demo/` | ~8.9k after deleting editor panels |
 | 7 | Network transport | 13,700 | `net/` | Port faithfully |
-| 5 | Client connection & state | 13,600 | `client/` | Ports with `game/client` |
+| 5 | Client connection & state | 13,600 | `engine/client/` | Blocked on `net/`; the *game* client is `src/client/`, `portdocs/CLIENT.md` |
 | 20 | Profiling & dev tooling | 8,300 | — | **Mostly delete** (`tracing`) |
 | 8 | Entity serialization | 8,200 | `net/datatable/` | Format fixed until game DLLs land |
 | 12 | HLTV / SourceTV | 7,300 | — | **Delete** |
@@ -637,9 +648,11 @@ reached.** Remaining, in dependency order:
    - `audio/` (§7.18) — large but self-contained, no `winit`/`wgpu` entanglement, and the
      existing backend abstraction makes it substitutable. Can proceed in parallel with the
      above once `filesystem` lands.
-   - `net/` (§7.7–7.9) + `client/` (§7.5) + `server/` (§7.6) — multiplayer/listen-server
-     machinery. A single-player Portal 2 still needs a listen server, but this is the last
-     of the core path.
+   - `net/` (§7.7–7.9) + `engine/client/` (§7.5) + `server/` (§7.6) — multiplayer/listen-
+     server machinery. A single-player Portal 2 still needs a listen server, but this is
+     the last of the core path. **The *game* client went first and separately**: it needs
+     none of this, and it is what takes the placeholder camera out of `input/`. See
+     `portdocs/CLIENT.md`.
    - `save/` (§7.21), `events/` (§7.10), `demo/` (§7.11) — as needed.
 
 Each module above deserves its own portdoc once it's actually scheduled —

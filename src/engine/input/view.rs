@@ -35,9 +35,13 @@ use glam::Vec3;
 /// `ConVar`'s clamp is given.
 pub const SENSITIVITY: f32 = 2.5;
 
-/// `sensitivity`'s clamp (`in_mouse.cpp:100`): `true, 0.0001f, true, 10000000`.
+/// `sensitivity`'s clamp (`in_mouse.cpp:100`): `true, 0.0001f, true, 1000`.
+///
+/// Every one of `in_mouse.cpp`'s mouse-factor cvars carries the same
+/// `[0.0001, 1000]` pair — `m_yaw`, `m_pitch`, `m_side`, `m_forward` — so an
+/// out-of-range `sensitivity` in a shipped `.cfg` clamps rather than applying.
 pub const SENSITIVITY_MIN: f32 = 0.0001;
-pub const SENSITIVITY_MAX: f32 = 10_000_000.0;
+pub const SENSITIVITY_MAX: f32 = 1000.0;
 
 /// `m_yaw` (`in_mouse.cpp:103`): degrees of yaw per unit of scaled motion.
 const M_YAW: f32 = 0.022;

@@ -246,9 +246,15 @@ The candidates, in the order they are worth doing:
 
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
-- **`client/`** (`ENGINE.md` §7.5) is what the boot path itself wants next, and it is the
-  module that finally takes `ViewAngles`, `FlyCamera` and `MoveButtons` out of `input/` —
-  see the wart below.
+- **The game client**, at top-level **`src/client/`** and **planned in
+  `portdocs/CLIENT.md`** — read that before starting it. This is what the boot path itself
+  wants next, and it is the module that finally takes `ViewAngles`, `FlyCamera` and
+  `MoveButtons` out of `input/` (see the wart below). **Not `ENGINE.md` §7.5**, which is
+  the client *connection* (`CClientState`, snapshot parsing), lands at
+  `src/engine/client/`, and is blocked on `net/`; the two share a name and nothing else.
+  Stages 1-3 of `CLIENT.md` are blocked on nothing — `CUserCmd` built from `kbutton_t`'s
+  fractional `KeyState` and run through `FullNoClipMove`, which makes the placeholder
+  camera a real `MOVETYPE_NOCLIP` player. Walking is stage 4 and waits for `trace/`.
 
 ### Known warts, and what triggers fixing them
 
@@ -268,9 +274,13 @@ refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the 
   `engine->GetViewAngles`/`SetViewAngles`, which resolve to `CClientState::viewangles`
   (`engine/cdll_engine_int.cpp:1050`), and only the client DLL mutates them. They sit in
   `input/` because there is nowhere else — the alternative, `engine/mod.rs`, spreads the
-  same code over two modules instead of one. **Move them to `client/` when it exists**,
-  along with `FlyCamera`, whose real replacements are `CUserCmd`, `CGameMovement` and
-  `CViewRender::SetUpView`. Until then, do not grow `FlyCamera` towards `CUserCmd`:
+  same code over two modules instead of one. **Move them to `src/client/` when it
+  exists** — `portdocs/CLIENT.md` stage 1 deletes `view.rs` outright — along with
+  `FlyCamera`, whose real replacements are `CUserCmd`, `CGameMovement` and
+  `CViewRender::SetUpView`. Valve stores the angles in `CClientState` over a comment
+  reading `// FIXME, move entirely to client .dll` (`engine/cdll_engine_int.cpp:1048`);
+  with no DLL boundary here, `CLIENT.md` §4.7 simply takes the FIXME, so they end up in
+  the game client and the engine never gets a copy. Until then, do not grow `FlyCamera` towards `CUserCmd`:
   `kbutton_t`'s `down[2]` and its fractional `KeyState` are correct and are the right
   design, but building them against a camera instead of a player bakes in the wrong
   consumer.
