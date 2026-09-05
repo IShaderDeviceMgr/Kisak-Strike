@@ -10,10 +10,10 @@ Read `PORTING.md` first; this doc assumes its standing decisions. Read
 three deliberate deferrals land, and it says why they were deferred rather than
 attempted.
 
-**Status: stages 1 and 2 of 5 are done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
+**Status: stages 1, 2 and 3 of 5 are done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
 `src/engine/input/view.rs` is deleted, which closes the view-angles wart `CLAUDE.md` and
 `ENGINE_INPUT.md` §11.2 recorded. **The API reference is `rustdocs/CLIENT.md`; read that
-to *use* the module.** Stage 3 is unblocked; stage 4 waits for `trace/`.
+to *use* the module.** Stage 4 waits for `trace/`; stage 5 waits for `net/`.
 
 ---
 
@@ -513,10 +513,9 @@ impl Client {
 
 Two deviations from the sketch this section originally carried, both from building it:
 
-- **`create_move` takes no frame time.** Valve's takes `input_sample_frametime` for
-  `AdjustAngles` and `ControllerMove`; neither exists until stage 3, and an always-unused
-  parameter is scaffolding. It comes back with the sample-time budget. `run_move` takes
-  the frame time, because that is where it is used.
+- **~~`create_move` takes no frame time.~~ It does again, as of stage 3** — `AdjustAngles`
+  needs it. Leaving it out for two stages cost one signature change and no confusion,
+  which is the trade an always-unused parameter loses.
 - **`create_move` takes no `active` flag.** Valve's third argument is `!cl.IsPaused()`;
   there is no pause.
 
@@ -664,15 +663,55 @@ aspect ratio feeds both the FOV scaling and the projection, because `Render` set
 `m_flAspectRatio` from `GetScreenAspectRatio` two lines after scaling the FOV with it
 (`view.cpp:1106`).
 
-### Stage 3 — the second sample point (unblocked, ~150 lines) — next
+### Stage 3 — keyboard look and the sample-time budget — **DONE** (~350 lines, 9 tests)
 
-- Keyboard look: `AdjustYaw`/`AdjustPitch`, `cl_yawspeed` 210, `cl_pitchspeed` 225,
-  `cl_anglespeedkey` 0.67, `cl_mouselook`.
-- `IN_SetSampleTime` / `DetermineKeySpeed`'s budget and `ExtraMouseSample` (§4.1). This is
-  the stage that makes the budget mean something, and it should land with the frame-rate
-  mouse sample rather than before it.
+- Keyboard look: `AdjustAngles`, `AdjustYaw`, `AdjustPitch`, `ClampAngles`,
+  `cl_yawspeed` 210, `cl_pitchspeed` 225, `cl_anglespeedkey` 0.67, `cl_mouselook`.
+- `IN_SetSampleTime` / `DetermineKeySpeed`'s budget, as `Client::set_sample_time` plus a
+  private `determine_key_speed`. `create_move` takes the frame time again, exactly as
+  stage 1 predicted it would.
 
-### Stage 4 — walking (blocked on `trace/`, large)
+**`ExtraMouseSample` is not ported, and this section was wrong to assume it would be.**
+The plan said the budget "should land with the frame-rate mouse sample rather than before
+it". There is no frame-rate mouse sample to land with, for two independent reasons:
+
+1. **The latency it recovers is not lost here.** Valve builds the real command early in
+   `_Host_RunFrame_Input`, simulates, and only then samples the mouse again just before
+   rendering (`host.cpp:4359`), so the picture uses angles newer than the command's. This
+   port's `Engine::update_client` runs immediately before `Engine::render`, in the same
+   `winit` callback, with nothing between them.
+2. **It could not be done anyway.** `AccumulateMouse` re-polls the OS mid-frame
+   (`in_mouse.cpp:719`, "Sample mouse one more time"); `winit` delivers one batch of
+   events per frame and cannot be pumped re-entrantly from inside a handler, so a second
+   drain would return `(0.0, 0.0)`.
+
+**Revisit when simulation lands between input and rendering** — which is when reason 1
+stops holding, and when the budget stops being a no-op for the other reason too.
+
+So the budget is currently a no-op: refilled once per frame with the frame time, drawn
+down once per command by the same amount. It is implemented anyway, because it is the
+shape `DetermineKeySpeed` has the moment there is more than one command per frame, and
+because "turning is twice as fast at 30 fps" is an expensive bug report to work backwards
+from. Its failure mode is silent and is documented at the site: **forget the refill and
+keyboard look does nothing, for ever.**
+
+**Two things found by building it**, both now in `rustdocs/CLIENT.md`:
+
+- **`cl_mouselook 0` does not turn the mouse off.** `ControllerMove` gates `MouseMove` on
+  `cl_mouseenable` and on the cursor being grabbed (`in_main.cpp:1199`), never on
+  `cl_mouselook`. Turning it off *adds* keyboard pitch — it is the only thing that makes
+  `+lookup`, `+lookdown` and `+klook` do anything.
+- **The destructive `KeyState` reads never collide, and it is not luck.** `AdjustYaw`
+  reads `+left`/`+right` only when `+strafe` is up and `ComputeSideMove` only when it is
+  down; `AdjustPitch` reads `+forward`/`+back` only when `+klook` is down and
+  `ComputeForwardMove` only when it is up. Each pair is mutually exclusive on its
+  condition, which is what lets `CreateMove` call them in sequence.
+
+**Nothing visible changed out of the box**, and that is expected:
+`cfg/config_default.cfg` binds no key to `+left`, `+right`, `+lookup`, `+lookdown` or
+`+klook`, and `cl_mouselook` defaults to 1. `bind LEFTARROW "+left"` reaches it.
+
+### Stage 4 — walking (blocked on `trace/`, large) — next
 
 `FullWalkMove`, gravity, friction, `CategorizePosition`, ducking, jumping, the hulls, and
 `CheckParameters`' speed clip. **This is where the player stops being a noclip camera**,

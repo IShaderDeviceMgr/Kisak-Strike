@@ -245,7 +245,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   and facing is decided after the flip). In file order a map draws as an empty clear
   colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
   fixing it in `PipelineCache` instead.
-- **`src/client/` — the game client, stages 1-2 of 5 ported** (`portdocs/CLIENT.md`,
+- **`src/client/` — the game client, stages 1-3 of 5 ported** (`portdocs/CLIENT.md`,
   **`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
   tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
   **It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
@@ -264,9 +264,19 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   4:3* and scales it by `aspect / (4/3)` before projecting (`view.cpp:1084`), which the
   port was not doing, so 16:9 was showing a 46.7° vertical FOV where the shipped game
   shows 59.8°.
-  Five rules that produce a plausible wrong answer rather than an error:
+  Stage 3 is keyboard look — `AdjustAngles`/`AdjustYaw`/`AdjustPitch`, `cl_yawspeed`,
+  `cl_pitchspeed`, `cl_anglespeedkey`, `cl_mouselook` — plus `IN_SetSampleTime`'s budget.
+  **`ExtraMouseSample` is deliberately not ported**, and the plan was wrong to assume it
+  would be: the latency it recovers is not lost here (`update_client` runs immediately
+  before `render`, with nothing between), and `winit` gives one batch of events per frame
+  where Valve re-polls the OS mid-frame, so a second drain would return nothing. Revisit
+  when simulation lands between input and rendering.
+  Seven rules that produce a plausible wrong answer rather than an error:
   **`ViewSetup::fov` is horizontal and already width-ratio scaled**, so anything reading
-  `default_fov` for a projection is reintroducing that bug;
+  `default_fov` for a projection is reintroducing that bug; **`set_sample_time` must be
+  called once per frame before `create_move`** or keyboard look silently does nothing for
+  ever; **`cl_mouselook 0` does not turn the mouse off** — it *adds* keyboard pitch, and
+  `cl_mouseenable 0` is the switch it gets mistaken for;
   **`KeyState` is destructive and the read order matters** — the movement axes are
   computed before the button bits, so a tap shorter than a frame reaches `forwardmove` and
   *not* `IN_FORWARD`, and reversing them is a difference a server would see; **the first
@@ -277,18 +287,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   frame time and a one-second step removes more speed than a second of acceleration adds.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next: **`client/` stages 1-2 have landed; the view is the client's and the last wart on
-the boot path is closed.** The candidates, in the order they are worth doing:
+Next: **`client/` stages 1-3 have landed — everything in it that is not blocked on
+another module.** The candidates, in the order they are worth doing:
 
-- **`client/` stage 3** (`portdocs/CLIENT.md` §8), unblocked and small: keyboard look
-  (`cl_yawspeed`, `cl_pitchspeed`, `cl_anglespeedkey`, `cl_mouselook`) and the
-  `IN_SetSampleTime` budget, which only means something once the mouse is sampled a
-  second time per frame for smoothness.
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
 - **`trace/`** (`ENGINE.md` §7.17) is what `client/` stage 4 needs, and stage 4 —
   `FullWalkMove`, gravity, collision, ducking — is what turns the noclip player into a
-  player.
+  player. It is the only thing left on the boot path proper.
 
 ### Known warts, and what triggers fixing them
 

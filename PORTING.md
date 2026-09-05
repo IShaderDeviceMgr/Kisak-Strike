@@ -609,7 +609,7 @@ spells the same six flags in *three* different tables, two of them listing diffe
 subsets. One table with a long name and a short one replaces all three. `findflags` was
 not ported — it searches the twenty-two flags this port does not have.
 
-**The game client has landed — stages 1 and 2 of `portdocs/CLIENT.md`'s five.** It is
+**The game client has landed — stages 1, 2 and 3 of `portdocs/CLIENT.md`'s five.** It is
 `src/client/`, top-level and a sibling of `src/engine/`, because `client.so` was a sibling
 of `engine.so`; it is the first *game* module in the tree and `src/server/` will follow it
 there. It is **not** `ENGINE.md` §7.5's client *connection*, which is `src/engine/client/`
@@ -631,8 +631,15 @@ narrow since there was a camera at all: **Source quotes FOV horizontally at 4:3*
 widens it by `aspect / (4/3)` before projecting, so 16:9 had been showing 46.7° of
 vertical where the shipped game shows 59.8°.
 
-Stage 3 (keyboard look and the sample-time budget) is unblocked and small. Stage 4 is
-walking, and waits for `trace/`.
+Stage 3 is keyboard look — `AdjustAngles` and friends, `cl_mouselook`, and
+`IN_SetSampleTime`'s budget. It also settled a question the plan had got wrong:
+**`ExtraMouseSample` is not ported**, because the latency it recovers is not lost in this
+port's frame (input is sampled immediately before rendering, with nothing between) and
+because `winit` delivers one batch of events per frame where Valve re-polls the OS
+mid-frame. It comes back on the table when simulation lands between the two.
+
+**That is everything in `client/` that is not blocked on another module.** Stage 4 is
+walking and waits for `trace/`; stage 5 is prediction and waits for `net/` and `server/`.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`

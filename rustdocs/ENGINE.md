@@ -1718,7 +1718,10 @@ nothing else did (`host.cpp:2085`), sets `config_was_read`, and writes a config 
 fell back to the defaults. A clean `Outcome::Quit` or `Restart` writes one too.
 
 `Engine::update_client` is where input becomes movement: it is `CL_Move`
-(`cl_main.cpp:2734`), and it calls `Client::create_move` then `Client::run_move`. It also
+(`cl_main.cpp:2734`), and it calls `Client::set_sample_time`, then `Client::create_move`,
+then `Client::run_move`. **The refill comes first and is not optional** — Valve makes that
+call from the host once per frame (`host.cpp:4192`) because a frame can hold several
+ticks; drop it here and keyboard look silently stops working. It also
 makes the second half of `CInput::ClearStates` — `Input::clear` released the *keys*, and
 `Client::clear_buttons` releases what the `+command`s are holding, which is why
 `Event::FocusLost` has to survive into `Input::events`.

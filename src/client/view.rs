@@ -59,6 +59,16 @@ pub const CL_PITCHDOWN: f32 = 89.0;
 /// `cl_pitchup` (`in_main.cpp:50`), applied as `-cl_pitchup`.
 pub const CL_PITCHUP: f32 = 89.0;
 
+/// `cl_yawspeed` (`in_main.cpp:47`) and `cl_pitchspeed` (`:48`): degrees per
+/// second for **keyboard** look — `+left`/`+right` and `+lookup`/`+lookdown`.
+pub const CL_YAWSPEED: f32 = 210.0;
+pub const CL_PITCHSPEED: f32 = 225.0;
+
+/// `cl_anglespeedkey` (`in_main.cpp:46`): what `+speed` multiplies keyboard
+/// turn speed by. It is **0.67, not 0.5** — `+speed` walks at half speed but
+/// turns at two thirds.
+pub const CL_ANGLESPEEDKEY: f32 = 0.67;
+
 /// `ScaleMouse`'s default path (`in_mouse.cpp:459`): the raw delta times
 /// `sensitivity`.
 ///
@@ -249,17 +259,22 @@ impl ViewAngles {
         self.clamp_pitch(down, up);
     }
 
-    /// `CInput::ClampAngles` (`in_main.cpp:975`) is not here yet: its callers
-    /// are `AdjustAngles` and keyboard look, which are stage 3. What is
-    /// reachable now is its pitch half, applied inline by
-    /// [`apply_mouse_pitch`](ViewAngles::apply_mouse_pitch) exactly as
-    /// `ApplyMouse` applies it (`in_mouse.cpp:577`), and
-    /// [`normalize`](ViewAngles::normalize) for the yaw wrap.
+    /// `CInput::ClampAngles` (`in_main.cpp:975`), plus the yaw wrap
+    /// `SetViewAngles` applies on the way back.
     ///
-    /// **Roll is deliberately not clamped when that arrives.** Every other
-    /// Source game limits it to ±50 degrees; Portal excludes itself with a
-    /// comment that says why — *"Don't constrain Roll in Portal because the
-    /// player can be upside down! -Jeep"*.
+    /// Called at the end of `AdjustAngles`. The *mouse* path does not go
+    /// through here — [`apply_mouse_pitch`](ViewAngles::apply_mouse_pitch)
+    /// clamps inline, exactly as `ApplyMouse` does (`in_mouse.cpp:577`) — and
+    /// the two are kept separate so that the callers stay distinguishable.
+    ///
+    /// **Roll is deliberately not clamped.** Every other Source game limits it
+    /// to ±50 degrees; Portal excludes itself with a comment that says why —
+    /// *"Don't constrain Roll in Portal because the player can be upside down!
+    /// -Jeep"*.
+    pub fn clamp(&mut self, pitch_down: f32, pitch_up: f32) {
+        self.clamp_pitch(pitch_down, pitch_up);
+        self.normalize();
+    }
     fn clamp_pitch(&mut self, pitch_down: f32, pitch_up: f32) {
         if self.pitch > pitch_down {
             self.pitch = pitch_down;

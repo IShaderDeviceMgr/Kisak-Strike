@@ -587,7 +587,15 @@ impl<'a> Engine<'a> {
             false => (0.0, 0.0),
         };
 
-        let command = self.scene.client.create_move(mouse);
+        // `IN_SetSampleTime` (`host.cpp:4192`), which the engine calls once per
+        // *frame* while the client spends it once per *command*. One frame is
+        // one command here, so the two cancel — but the split is Valve's and
+        // the ordering is load-bearing: without the refill,
+        // `DetermineKeySpeed` returns 0 for ever and keyboard look silently
+        // stops working.
+        self.scene.client.set_sample_time(seconds);
+
+        let command = self.scene.client.create_move(seconds, mouse);
         self.scene.client.run_move(&command, seconds);
 
         let mouse_look = mouse_look_after(self.input.mouse_look(), self.input.events());
@@ -1152,7 +1160,7 @@ mod tests {
             client: &mut client,
         });
         assert!(
-            client.create_move((0.0, 0.0)).forwardmove > 0.0,
+            client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove > 0.0,
             "the command the client builds now asks to move forward"
         );
 
@@ -1166,7 +1174,7 @@ mod tests {
             ui: &mut ui,
             client: &mut client,
         });
-        assert_eq!(client.create_move((0.0, 0.0)).forwardmove, 0.0);
+        assert_eq!(client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove, 0.0);
     }
 
     /// Stage 4 end to end without a GPU: the console key is bound by the

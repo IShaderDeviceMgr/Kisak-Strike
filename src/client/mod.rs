@@ -85,6 +85,11 @@ struct Cvars {
     cl_mouseenable: Cvar,
     cl_pitchdown: Cvar,
     cl_pitchup: Cvar,
+    cl_yawspeed: Cvar,
+    cl_pitchspeed: Cvar,
+    cl_anglespeedkey: Cvar,
+    cl_mouselook: Cvar,
+    in_usekeyboardsampletime: Cvar,
     cl_forwardspeed: Cvar,
     cl_backspeed: Cvar,
     cl_sidespeed: Cvar,
@@ -119,6 +124,14 @@ pub struct Client {
     /// `in_impulse` (`in_main.cpp:44`): set by the `impulse` command, latched
     /// onto the next command and cleared.
     impulse: u8,
+    /// `PerUserInput_t::m_flKeyboardSampleTime` (`in_main.cpp:861`, `:877`) —
+    /// how much real time this frame still owes keyboard look.
+    ///
+    /// Refilled once per **frame** by
+    /// [`set_sample_time`](Client::set_sample_time) and drawn down once per
+    /// **command** by `DetermineKeySpeed`. See both for why the two are not the
+    /// same thing.
+    keyboard_sample_time: f32,
 }
 
 impl Client {
@@ -202,6 +215,39 @@ impl Client {
                 &view::CL_PITCHUP.to_string(),
                 CvarFlags::CHEAT,
                 "How far up the view may look.",
+            ),
+            cl_yawspeed: console.cvar(
+                "cl_yawspeed",
+                &view::CL_YAWSPEED.to_string(),
+                CvarFlags::NONE,
+                "Degrees per second `+left`/`+right` turn the view.",
+            ),
+            cl_pitchspeed: console.cvar(
+                "cl_pitchspeed",
+                &view::CL_PITCHSPEED.to_string(),
+                CvarFlags::NONE,
+                "Degrees per second `+lookup`/`+lookdown` turn the view.",
+            ),
+            cl_anglespeedkey: console.cvar(
+                "cl_anglespeedkey",
+                &view::CL_ANGLESPEEDKEY.to_string(),
+                CvarFlags::NONE,
+                "What `+speed` multiplies keyboard turn speed by.",
+            ),
+            // `FCVAR_NOT_CONNECTED` in the original — "Cannot be set while
+            // connected to a server" — which this port has no flag for and no
+            // server to be connected to.
+            cl_mouselook: console.cvar(
+                "cl_mouselook",
+                "1",
+                CvarFlags::ARCHIVE,
+                "Set to 1 to use mouse for look, 0 for keyboard look.",
+            ),
+            in_usekeyboardsampletime: console.cvar(
+                "in_usekeyboardsampletime",
+                "1",
+                CvarFlags::NONE,
+                "Use keyboard sample time smoothing.",
             ),
             cl_forwardspeed: console.cvar(
                 "cl_forwardspeed",
@@ -289,6 +335,7 @@ impl Client {
             command_number: 0,
             tick_count: 0,
             impulse: 0,
+            keyboard_sample_time: 0.0,
         }
     }
 
@@ -305,6 +352,32 @@ impl Client {
     /// held by the **command**, not by the key.
     pub fn clear_buttons(&mut self) {
         self.buttons.clear();
+    }
+
+    /// `CInput::IN_SetSampleTime` (`in_main.cpp:861`): gives keyboard look a
+    /// frame's worth of real time to spend.
+    ///
+    /// **Call this once per frame, before [`create_move`](Client::create_move),
+    /// or keyboard look silently does nothing.** `DetermineKeySpeed` returns 0
+    /// with an empty budget and `AdjustAngles` returns early on a 0, so the
+    /// failure is a `+left` that does not turn rather than an error.
+    ///
+    /// # Why it is not just `create_move`'s frame time
+    ///
+    /// Valve refills once per frame with `host_frametime` (`host.cpp:4192`) and
+    /// spends it in `CreateMove`, which runs once per **tick** — and a frame
+    /// can hold several ticks. The budget is what stops a two-tick frame from
+    /// turning the view twice as far as a one-tick frame covering the same real
+    /// time, and what leaves nothing for the end-of-frame `ExtraMouseSample` to
+    /// spend a third time.
+    ///
+    /// This port runs exactly one command per frame and has no
+    /// `ExtraMouseSample`, so today the refill and the draw-down cancel exactly
+    /// and this is a no-op. It is here because it is the shape the function has
+    /// the moment either of those changes, and because rediscovering it from a
+    /// "turning is twice as fast at 30 fps" bug report would be expensive.
+    pub fn set_sample_time(&mut self, frametime: f32) {
+        self.keyboard_sample_time = frametime;
     }
 
     /// Puts the player at a spawn point. `origin` is the **feet**.
@@ -430,20 +503,27 @@ impl Client {
     /// The mouse comes last, after the axes, because with `+strafe` held it
     /// *adds* to them (`ApplyMouse`, `in_mouse.cpp:534`).
     ///
+    /// `AdjustAngles` runs **first**, and that is not arbitrary: it and the
+    /// `Compute*Move` calls read the same `KeyState`s, which are destructive.
+    /// The two never collide, because each pair is mutually exclusive —
+    /// `AdjustYaw` reads `+left`/`+right` only when `+strafe` is *up* and
+    /// `ComputeSideMove` reads them only when it is *down*; `AdjustPitch` reads
+    /// `+forward`/`+back` only when `+klook` is *down* and `ComputeForwardMove`
+    /// only when it is *up*. Reorder them and nothing breaks; change either
+    /// condition and everything does.
+    ///
     /// # Not here yet
     ///
-    /// `AdjustAngles` (`in_main.cpp:1006`) — keyboard look, `cl_yawspeed` and
-    /// the `IN_SetSampleTime` budget — is stage 3, so `+left`, `+right`,
-    /// `+lookup` and `+lookdown` are registered and held but do not yet turn
-    /// the view. `ScaleMovements` (`:1161`) is **dead in the original** (its
-    /// body is `return;` under a `// FIXME FIXME: This doesn't work`) and is
-    /// not ported. Weapon selection, the client mode's `CreateMove` override
-    /// and `CheckPaused` need systems that do not exist.
-    pub fn create_move(&mut self, mouse: (f32, f32)) -> UserCmd {
+    /// `ScaleMovements` (`:1161`) is **dead in the original** (its body is
+    /// `return;` under a `// FIXME FIXME: This doesn't work`) and is not
+    /// ported. Weapon selection, the client mode's `CreateMove` override and
+    /// `CheckPaused` need systems that do not exist.
+    pub fn create_move(&mut self, dt: f32, mouse: (f32, f32)) -> UserCmd {
         self.command_number += 1;
         self.tick_count += 1;
         let mut cmd = UserCmd::new(self.command_number, self.tick_count);
 
+        self.adjust_angles(dt);
         self.compute_side_move(&mut cmd);
         self.compute_upward_move(&mut cmd);
         self.compute_forward_move(&mut cmd);
@@ -454,6 +534,110 @@ impl Client {
         // Last, because `mouse_move` has just turned the view.
         cmd.viewangles = self.player.angles;
         cmd
+    }
+
+    /// `CInput::DetermineKeySpeed` (`in_main.cpp:877`): how many seconds of
+    /// keyboard turning this command may do, and the draw-down half of the
+    /// budget [`set_sample_time`](Client::set_sample_time) fills.
+    ///
+    /// Returns 0 when the budget is spent, which is `AdjustAngles`' signal to
+    /// do nothing at all. `in_usekeyboardsampletime 0` removes the budget and
+    /// hands back the raw frame time.
+    ///
+    /// `+speed` scales it by `cl_anglespeedkey` — **0.67, not the 0.5 that
+    /// halves movement**. Holding the walk key turns at two thirds speed and
+    /// moves at one half.
+    fn determine_key_speed(&mut self, frametime: f32) -> f32 {
+        let mut frametime = frametime;
+        if self.cvars.in_usekeyboardsampletime.bool() {
+            if self.keyboard_sample_time <= 0.0 {
+                return 0.0;
+            }
+            frametime = frametime.min(self.keyboard_sample_time);
+            self.keyboard_sample_time -= frametime;
+        }
+
+        match self.buttons.is_down(MoveButton::Speed) {
+            true => frametime * self.cvars.cl_anglespeedkey.float(),
+            false => frametime,
+        }
+    }
+
+    /// `CInput::AdjustAngles` (`in_main.cpp:1006`) — keyboard look.
+    ///
+    /// Deleted from it: the view *tilt* round-trip. Valve subtracts last
+    /// frame's tilt, has `CViewEffects` recompute and reapply it, and stores
+    /// the delta back — because tilt affects aim and so has to be inside the
+    /// angles the command carries. `CViewEffects` is the shake/tilt/punch
+    /// system, which needs entities. **In scope for Portal 2**, which tilts the
+    /// view; this is where it attaches.
+    fn adjust_angles(&mut self, frametime: f32) {
+        let speed = self.determine_key_speed(frametime);
+        if speed <= 0.0 {
+            return;
+        }
+
+        self.adjust_yaw(speed);
+        self.adjust_pitch(speed);
+
+        self.player.angles.clamp(
+            self.cvars.cl_pitchdown.float(),
+            self.cvars.cl_pitchup.float(),
+        );
+    }
+
+    /// `CInput::AdjustYaw` (`in_main.cpp:908`), minus third-person.
+    ///
+    /// **Not gated on `cl_mouselook`** — arrow-key turning works whether or not
+    /// the mouse is looking, which is the Quake-lineage behaviour Valve kept.
+    /// `+strafe` suppresses it, because that is what makes `+left`/`+right`
+    /// strafe instead ([`compute_side_move`](Client::compute_side_move)).
+    fn adjust_yaw(&mut self, speed: f32) {
+        if self.buttons.is_down(MoveButton::Strafe) {
+            return;
+        }
+        let yawspeed = speed * self.cvars.cl_yawspeed.float();
+        let right = self.buttons.key_state(MoveButton::Right);
+        let left = self.buttons.key_state(MoveButton::Left);
+        self.player.angles.yaw -= yawspeed * right;
+        self.player.angles.yaw += yawspeed * left;
+    }
+
+    /// `CInput::AdjustPitch` (`in_main.cpp:942`).
+    ///
+    /// **All of it is gated on `cl_mouselook` being off**, which defaults to on
+    /// — so out of the shipped configuration `+lookup`, `+lookdown` and
+    /// `+klook` do nothing, and that is correct. They are keyboard-look keys.
+    ///
+    /// The surprise worth knowing: **`cl_mouselook 0` does not disable the
+    /// mouse.** `ControllerMove` gates `MouseMove` on `cl_mouseenable` and on
+    /// the mouse being grabbed (`in_main.cpp:1199`), never on `cl_mouselook`.
+    /// Setting it to 0 *adds* keyboard pitch; `cl_mouseenable 0` is what takes
+    /// the mouse away.
+    ///
+    /// `view->StopPitchDrift()` is dropped with the pitch drift itself
+    /// (`portdocs/CLIENT.md` §5) — it re-centres the view for keyboard-only
+    /// play and defaults off.
+    fn adjust_pitch(&mut self, speed: f32) {
+        if self.cvars.cl_mouselook.bool() {
+            return;
+        }
+        let pitchspeed = speed * self.cvars.cl_pitchspeed.float();
+
+        // With `+klook` held, forward and back are pitch rather than movement —
+        // and `ComputeForwardMove` returns early for the same reason, so the
+        // two never read these key states in the same command.
+        if self.buttons.is_down(MoveButton::KLook) {
+            let forward = self.buttons.key_state(MoveButton::Forward);
+            let back = self.buttons.key_state(MoveButton::Back);
+            self.player.angles.pitch -= pitchspeed * forward;
+            self.player.angles.pitch += pitchspeed * back;
+        }
+
+        let up = self.buttons.key_state(MoveButton::LookUp);
+        let down = self.buttons.key_state(MoveButton::LookDown);
+        self.player.angles.pitch -= pitchspeed * up;
+        self.player.angles.pitch += pitchspeed * down;
     }
 
     /// `ComputeSideMove` (`in_main.cpp:1051`), minus third-person.
@@ -620,6 +804,15 @@ mod tests {
         Client::new(&mut console)
     }
 
+    /// One frame at 60 Hz: refill the keyboard-look budget, then build the
+    /// command — the pair `Engine::update_client` makes, in that order.
+    const TICK: f32 = 1.0 / 60.0;
+
+    fn frame(client: &mut Client, mouse: (f32, f32)) -> UserCmd {
+        client.set_sample_time(TICK);
+        client.create_move(TICK, mouse)
+    }
+
     fn hold(client: &mut Client, commands: &[&str]) {
         for (index, name) in commands.iter().enumerate() {
             assert!(
@@ -638,11 +831,11 @@ mod tests {
         // of it. This is the whole point of the fractional model and it is the
         // first thing to look at if a movement number looks wrong by a factor
         // of two.
-        let first = client.create_move((0.0, 0.0));
+        let first = frame(&mut client, (0.0, 0.0));
         assert_eq!(first.forwardmove, CL_FORWARDSPEED * 0.5);
         assert!(first.buttons.contains(ButtonBits::FORWARD));
 
-        let second = client.create_move((0.0, 0.0));
+        let second = frame(&mut client, (0.0, 0.0));
         assert_eq!(
             second.forwardmove, CL_FORWARDSPEED,
             "held for the whole of the next one, so the full speed"
@@ -653,7 +846,7 @@ mod tests {
     fn opposite_keys_cancel() {
         let mut client = client();
         hold(&mut client, &["forward", "back", "moveleft", "moveright"]);
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.forwardmove, 0.0);
         assert_eq!(cmd.sidemove, 0.0);
     }
@@ -667,7 +860,7 @@ mod tests {
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
 
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.forwardmove, CL_FORWARDSPEED * 0.25);
     }
 
@@ -685,7 +878,7 @@ mod tests {
         let mut client = Client::new(&mut console);
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         client.run_move(&cmd, 1.0 / 60.0);
         assert_eq!(client.player.origin, Vec3::ZERO);
 
@@ -696,7 +889,7 @@ mod tests {
             .set_string("0");
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         client.run_move(&cmd, 1.0 / 60.0);
         assert!(client.player.origin.x > 0.0);
     }
@@ -710,7 +903,7 @@ mod tests {
         let mut client = client();
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
-            let cmd = client.create_move((0.0, 0.0));
+            let cmd = frame(&mut client, (0.0, 0.0));
             client.run_move(&cmd, 1.0 / 60.0);
         }
 
@@ -779,7 +972,7 @@ mod tests {
         let mut client = client();
         hold(&mut client, &["forward"]);
         for _ in 0..10 {
-            let cmd = client.create_move((0.0, 0.0));
+            let cmd = frame(&mut client, (0.0, 0.0));
             client.run_move(&cmd, 1.0 / 60.0);
         }
         assert!(client.player.velocity.length() > 0.0);
@@ -791,7 +984,7 @@ mod tests {
     #[test]
     fn the_mouse_turns_the_view_and_reaches_the_command() {
         let mut client = client();
-        let cmd = client.create_move((100.0, 0.0));
+        let cmd = frame(&mut client, (100.0, 0.0));
         assert!(cmd.viewangles.yaw < 0.0, "right turns are negative yaw");
         assert_eq!(cmd.viewangles, client.player.angles);
         assert_eq!(cmd.mousedx, (100.0 * view::SENSITIVITY) as i16);
@@ -802,7 +995,7 @@ mod tests {
     fn holding_strafe_moves_with_the_mouse_instead_of_turning() {
         let mut client = client();
         hold(&mut client, &["strafe"]);
-        let cmd = client.create_move((100.0, 50.0));
+        let cmd = frame(&mut client, (100.0, 50.0));
 
         assert_eq!(cmd.viewangles.yaw, 0.0, "the view did not turn");
         assert_eq!(cmd.viewangles.pitch, 0.0);
@@ -822,7 +1015,7 @@ mod tests {
             .expect("registered")
             .set_string("1");
 
-        let cmd = client.create_move((100.0, 50.0));
+        let cmd = frame(&mut client, (100.0, 50.0));
         assert_eq!(cmd.viewangles.yaw, 0.0, "the view did not turn");
         assert!(cmd.viewangles.pitch > 0.0, "but it still looked down");
         assert!(cmd.sidemove > 0.0);
@@ -838,13 +1031,13 @@ mod tests {
             .expect("registered")
             .set_string("0");
 
-        client.create_move((500.0, 0.0));
+        frame(&mut client, (500.0, 0.0));
         console
             .cvars()
             .find("cl_mouseenable")
             .expect("registered")
             .set_string("1");
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.viewangles.yaw, 0.0, "nothing arrived in one lump");
     }
 
@@ -859,23 +1052,23 @@ mod tests {
             .set_string("400");
 
         client.buttons_mut().apply("forward", true, Some(1));
-        client.create_move((0.0, 0.0)); // the frame the press landed in
-        assert_eq!(client.create_move((0.0, 0.0)).forwardmove, 400.0);
+        frame(&mut client, (0.0, 0.0)); // the frame the press landed in
+        assert_eq!(frame(&mut client, (0.0, 0.0)).forwardmove, 400.0);
     }
 
     #[test]
     fn an_impulse_is_latched_onto_one_command_and_cleared() {
         let mut client = client();
         client.set_impulse(101);
-        assert_eq!(client.create_move((0.0, 0.0)).impulse, 101);
-        assert_eq!(client.create_move((0.0, 0.0)).impulse, 0);
+        assert_eq!(frame(&mut client, (0.0, 0.0)).impulse, 101);
+        assert_eq!(frame(&mut client, (0.0, 0.0)).impulse, 0);
     }
 
     #[test]
     fn commands_are_numbered_from_one_and_never_repeat() {
         let mut client = client();
-        let first = client.create_move((0.0, 0.0));
-        let second = client.create_move((0.0, 0.0));
+        let first = frame(&mut client, (0.0, 0.0));
+        let second = frame(&mut client, (0.0, 0.0));
         assert_eq!(first.command_number, 1);
         assert_eq!(second.command_number, 2);
     }
@@ -889,14 +1082,14 @@ mod tests {
 
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
-            let cmd = client.create_move((0.0, 0.0));
+            let cmd = frame(&mut client, (0.0, 0.0));
             client.run_move(&cmd, 1.0 / 60.0);
         }
         assert_eq!(client.player.origin, Vec3::ZERO);
 
         assert_eq!(client.toggle_noclip(), MoveType::Noclip);
         for _ in 0..60 {
-            let cmd = client.create_move((0.0, 0.0));
+            let cmd = frame(&mut client, (0.0, 0.0));
             client.run_move(&cmd, 1.0 / 60.0);
         }
         assert!(client.player.origin.length() > 0.0);
@@ -909,9 +1102,165 @@ mod tests {
         let mut client = client();
         hold(&mut client, &["forward"]);
         client.clear_buttons();
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.forwardmove, 0.0);
         assert_eq!(cmd.buttons, ButtonBits::NONE);
+    }
+
+    /// `AdjustYaw`. `+left` turns *left*, which is increasing yaw — the mirror
+    /// of the mouse, where right is decreasing yaw.
+    #[test]
+    fn the_arrow_keys_turn_the_view() {
+        let mut client = client();
+        hold(&mut client, &["left"]);
+
+        // Pressed during this frame, so half of it: 210 / 60 / 2.
+        frame(&mut client, (0.0, 0.0));
+        assert!((client.player.angles.yaw - 1.75).abs() < 1e-4, "{}", client.player.angles.yaw);
+
+        // Held throughout the next.
+        frame(&mut client, (0.0, 0.0));
+        assert!((client.player.angles.yaw - 5.25).abs() < 1e-4, "{}", client.player.angles.yaw);
+    }
+
+    /// `+strafe` suppresses `AdjustYaw` and hands `+left`/`+right` to
+    /// `ComputeSideMove` instead — the two never read the same `KeyState`.
+    #[test]
+    fn holding_strafe_makes_the_arrow_keys_strafe_rather_than_turn() {
+        let mut client = client();
+        hold(&mut client, &["strafe", "left"]);
+
+        let cmd = frame(&mut client, (0.0, 0.0));
+        assert_eq!(client.player.angles.yaw, 0.0, "the view did not turn");
+        assert_eq!(cmd.sidemove, -CL_SIDESPEED * 0.5, "it strafed instead");
+    }
+
+    /// `AdjustPitch` is gated on `cl_mouselook` being **off**, and it defaults
+    /// on — so out of the shipped configuration these keys do nothing, which is
+    /// correct rather than broken.
+    #[test]
+    fn keyboard_pitch_needs_cl_mouselook_off() {
+        let mut console = Console::detached();
+        let mut client = Client::new(&mut console);
+        client.buttons_mut().apply("lookdown", true, Some(1));
+
+        frame(&mut client, (0.0, 0.0));
+        assert_eq!(client.player.angles.pitch, 0.0, "mouselook is on");
+
+        console
+            .cvars()
+            .find("cl_mouselook")
+            .expect("registered")
+            .set_string("0");
+        frame(&mut client, (0.0, 0.0));
+        // Held for the whole of that frame: 225 / 60. Positive is downwards.
+        assert!(
+            (client.player.angles.pitch - 3.75).abs() < 1e-4,
+            "{}",
+            client.player.angles.pitch
+        );
+    }
+
+    /// The surprise in `cl_mouselook`: turning it off does **not** take the
+    /// mouse away. `ControllerMove` gates the mouse on `cl_mouseenable`
+    /// (`in_main.cpp:1199`), never on this.
+    #[test]
+    fn cl_mouselook_off_still_lets_the_mouse_look() {
+        let mut console = Console::detached();
+        let mut client = Client::new(&mut console);
+        console
+            .cvars()
+            .find("cl_mouselook")
+            .expect("registered")
+            .set_string("0");
+
+        let cmd = frame(&mut client, (100.0, 0.0));
+        assert!(cmd.viewangles.yaw < 0.0, "the mouse still turns the view");
+    }
+
+    /// `+klook` makes forward and back pitch instead of moving, and
+    /// `ComputeForwardMove` steps aside for it.
+    #[test]
+    fn klook_turns_forward_and_back_into_pitch() {
+        let mut console = Console::detached();
+        let mut client = Client::new(&mut console);
+        console
+            .cvars()
+            .find("cl_mouselook")
+            .expect("registered")
+            .set_string("0");
+        hold(&mut client, &["klook", "forward"]);
+
+        let cmd = frame(&mut client, (0.0, 0.0));
+        assert_eq!(cmd.forwardmove, 0.0, "it did not walk");
+        assert!(
+            client.player.angles.pitch < 0.0,
+            "it looked up: {}",
+            client.player.angles.pitch
+        );
+    }
+
+    /// `cl_anglespeedkey` is **0.67**, where `+speed` halves *movement*.
+    #[test]
+    fn walking_turns_at_two_thirds_speed_and_moves_at_one_half() {
+        let mut fast = client();
+        hold(&mut fast, &["left"]);
+        frame(&mut fast, (0.0, 0.0));
+
+        let mut slow = client();
+        hold(&mut slow, &["left", "speed"]);
+        frame(&mut slow, (0.0, 0.0));
+
+        let ratio = slow.player.angles.yaw / fast.player.angles.yaw;
+        assert!((ratio - view::CL_ANGLESPEEDKEY).abs() < 1e-4, "{ratio}");
+    }
+
+    /// The budget: one frame's worth of real time, however many commands are
+    /// built from it. Today that is one, so the second turns nothing.
+    #[test]
+    fn the_keyboard_budget_is_spent_once_per_frame() {
+        let mut client = client();
+        hold(&mut client, &["left"]);
+
+        client.set_sample_time(TICK);
+        client.create_move(TICK, (0.0, 0.0));
+        let after_first = client.player.angles.yaw;
+        assert!(after_first > 0.0);
+
+        client.create_move(TICK, (0.0, 0.0));
+        assert_eq!(
+            client.player.angles.yaw, after_first,
+            "the frame's budget was already spent"
+        );
+    }
+
+    /// **The failure mode `set_sample_time` documents**: forget the refill and
+    /// keyboard look silently does nothing, for ever.
+    #[test]
+    fn without_a_refill_keyboard_look_does_nothing() {
+        let mut client = client();
+        hold(&mut client, &["left"]);
+        client.create_move(TICK, (0.0, 0.0));
+        assert_eq!(client.player.angles.yaw, 0.0);
+    }
+
+    #[test]
+    fn in_usekeyboardsampletime_zero_removes_the_budget() {
+        let mut console = Console::detached();
+        let mut client = Client::new(&mut console);
+        console
+            .cvars()
+            .find("in_usekeyboardsampletime")
+            .expect("registered")
+            .set_string("0");
+        client.buttons_mut().apply("left", true, Some(1));
+
+        // No refill at all, and two commands both turn.
+        client.create_move(TICK, (0.0, 0.0));
+        let after_first = client.player.angles.yaw;
+        assert!(after_first > 0.0);
+        client.create_move(TICK, (0.0, 0.0));
+        assert!(client.player.angles.yaw > after_first);
     }
 
     /// The documented placeholder: Portal 2 binds no key to `+moveup`, so
@@ -920,7 +1269,7 @@ mod tests {
     fn jump_and_duck_drive_the_placeholder_vertical_axis() {
         let mut client = client();
         hold(&mut client, &["jump"]);
-        let cmd = client.create_move((0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.upmove, CL_UPSPEED);
         assert!(
             cmd.buttons.contains(ButtonBits::JUMP),
