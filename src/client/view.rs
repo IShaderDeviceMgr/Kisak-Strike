@@ -77,6 +77,100 @@ pub fn scale_mouse(dx: f32, dy: f32, sensitivity: f32) -> (f32, f32) {
     (dx * sensitivity, dy * sensitivity)
 }
 
+/// `VIEW_NEARZ` (`game/client/view.h:27`).
+pub const VIEW_NEARZ: f32 = 7.0;
+
+/// `r_mapextents`' default (`view.cpp:119`), "the max dimension for the map".
+///
+/// **It is a plain cheat cvar and nothing sets it from the `.bsp`** — the name
+/// suggests otherwise and the porting plan originally assumed otherwise. A
+/// mapper who needs a bigger far plane sets it; the far plane is
+/// `r_mapextents × √3`, the diagonal of a cube that size, which is the furthest
+/// two points in a map that big can be apart.
+pub const R_MAPEXTENTS: f32 = 16384.0;
+
+/// √3 — `1.73205080757f` at `view.cpp:645`, spelled out there rather than
+/// derived, so it is spelled out here.
+pub const MAP_DIAGONAL: f32 = 1.732_050_8;
+
+/// The aspect ratio Valve's field-of-view numbers are quoted at.
+///
+/// `default_fov` 75 is a **4:3 horizontal** FOV; `CViewRender::Render`
+/// (`view.cpp:1084`) widens it for the real screen. See
+/// [`scale_fov_by_width_ratio`].
+pub const FOV_ASPECT: f32 = 4.0 / 3.0;
+
+/// `ScaleFOVByWidthRatio` (`view.cpp:923`): `2·atan(tan(fov/2) · ratio)`.
+///
+/// **This is the function that decides how much of the world you see**, and
+/// leaving it out is a mistake you can look straight at without noticing. FOV
+/// numbers in Source are horizontal and quoted at 4:3; `Render` scales them by
+/// `aspect / (4/3)` before the projection is built (`view.cpp:1084`). The
+/// composition is the classic Hor+ behaviour — the *vertical* FOV comes out
+/// constant at `2·atan(tan(fov/2) · 0.75)` and the horizontal grows with the
+/// screen.
+///
+/// Skip it and 75 goes straight into a `PerspectiveX`, which at 16:9 gives a
+/// 46.7° vertical FOV where the shipped game gives 59.9°. The picture is not
+/// obviously wrong — it is a plausible, slightly-too-narrow view.
+pub fn scale_fov_by_width_ratio(fov_degrees: f32, ratio: f32) -> f32 {
+    let half_angle = fov_degrees.to_radians() * 0.5;
+    (half_angle.tan() * ratio).atan().to_degrees() * 2.0
+}
+
+/// `GetScreenAspect` (`engine/gl_rmain.cpp:127`) — the **physical** aspect
+/// ratio of the screen, which is what both the FOV scaling and the projection
+/// use (`view.cpp:1084`, `:1106`).
+///
+/// Two of Valve's terms are deliberately missing, and they coincide with this
+/// one on every square-pixel display:
+///
+/// - `AspectRatioInfo_t::m_flFrameBuffertoPhysicalScalar`, which corrects for
+///   non-square pixels — 1280×1024 shown on a physically 4:3 monitor. It is the
+///   material system's, and `src/materials/` has no counterpart yet.
+/// - The `r_aspectratio` override (`gl_rmain.cpp:46`), which is a *renderer*
+///   cvar; registering it from the game client to read it here would put it in
+///   the wrong module. It arrives with `render/`.
+pub fn screen_aspect(width: u32, height: u32) -> f32 {
+    match height {
+        0 => 1.0,
+        height => width as f32 / height as f32,
+    }
+}
+
+/// `CViewSetup` (`public/view_shared.h:44`), reduced to what a single
+/// perspective view of a world needs.
+///
+/// Valve's carries about fifty fields. The ones left out are all attached to
+/// something that does not exist: the viewmodel pair (`fovViewmodel`,
+/// `zNearViewmodel`), the ortho box, the custom view and projection matrices
+/// that portals and monitors set, the depth-of-field and motion-blur
+/// parameters, and `x`/`y`, which are only non-zero for a split-screen inset.
+///
+/// **This is data, not a camera.** Turning it into a projection matrix is
+/// `src/materials/`'s convention to choose — see
+/// [`Engine::camera`](crate::engine) — and keeping that on the other side of
+/// the boundary is what stops `client/` depending on `wgpu` for the sake of
+/// five numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewSetup {
+    /// The eye, in world space. `CViewSetup::origin`.
+    pub origin: Vec3,
+    pub angles: ViewAngles,
+    /// **Horizontal**, in degrees, and **already scaled** by
+    /// [`scale_fov_by_width_ratio`] — this is the number to hand a
+    /// `PerspectiveX`, not `default_fov`.
+    pub fov: f32,
+    pub z_near: f32,
+    pub z_far: f32,
+    pub width: u32,
+    pub height: u32,
+    /// [`screen_aspect`], used for *both* the FOV scaling above and the
+    /// projection — Valve sets `m_flAspectRatio` from the same call two lines
+    /// after scaling the FOV with it (`view.cpp:1106`).
+    pub aspect: f32,
+}
+
 /// Valve's `QAngle`: `(pitch, yaw, roll)` in degrees.
 ///
 /// **Pitch is positive downwards.** That is the sign error to watch for, and it
@@ -279,6 +373,60 @@ mod tests {
             angles.normalize();
         }
         assert!(angles.yaw > -180.0 && angles.yaw <= 180.0, "{}", angles.yaw);
+    }
+
+    /// The vertical field of view a `PerspectiveX` would build from a
+    /// horizontal one — `Camera::perspective`'s conversion, replicated so that
+    /// the composition below can be asserted on.
+    fn vertical_fov(fov_x_degrees: f32, aspect: f32) -> f32 {
+        let half = fov_x_degrees.to_radians() * 0.5;
+        (2.0 * (half.tan() / aspect).atan()).to_degrees()
+    }
+
+    #[test]
+    fn a_four_by_three_screen_leaves_the_field_of_view_alone() {
+        let aspect = 4.0 / 3.0;
+        let fov = scale_fov_by_width_ratio(75.0, aspect / FOV_ASPECT);
+        assert!((fov - 75.0).abs() < 1e-3, "{fov}");
+    }
+
+    #[test]
+    fn a_wider_screen_widens_the_horizontal_field_of_view() {
+        let aspect = 16.0 / 9.0;
+        let fov = scale_fov_by_width_ratio(75.0, aspect / FOV_ASPECT);
+        assert!(fov > 91.0 && fov < 91.6, "{fov}");
+    }
+
+    /// **The property the whole scaling exists for**, and the regression this
+    /// guards: without it, `default_fov` goes straight into a `PerspectiveX`
+    /// and the vertical field of view *shrinks* as the screen gets wider —
+    /// 59.8 degrees at 4:3 but only 46.7 at 16:9. The picture is not obviously
+    /// broken, just quietly too narrow.
+    #[test]
+    fn the_vertical_field_of_view_is_the_same_at_every_aspect_ratio() {
+        let scaled: Vec<f32> = [4.0 / 3.0, 16.0 / 10.0, 16.0 / 9.0, 21.0 / 9.0]
+            .into_iter()
+            .map(|aspect| {
+                vertical_fov(
+                    scale_fov_by_width_ratio(75.0, aspect / FOV_ASPECT),
+                    aspect,
+                )
+            })
+            .collect();
+
+        for fov_y in &scaled {
+            assert!((fov_y - scaled[0]).abs() < 1e-3, "{scaled:?}");
+        }
+        assert!((scaled[0] - 59.84).abs() < 0.05, "{}", scaled[0]);
+
+        // And what it would be without the scaling, at 16:9.
+        assert!((vertical_fov(75.0, 16.0 / 9.0) - 46.7).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_zero_height_viewport_does_not_divide_by_it() {
+        assert_eq!(screen_aspect(1280, 0), 1.0);
+        assert!((screen_aspect(1280, 720) - 16.0 / 9.0).abs() < 1e-6);
     }
 
     /// `SetViewAngles`' `IsValid` check. A NaN reaching the view matrix is a

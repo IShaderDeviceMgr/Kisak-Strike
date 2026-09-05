@@ -65,14 +65,6 @@ use input::Bindings;
 use input::{Button, CommandSink, Consumer, Input, Key, MouseButton};
 use world::World;
 
-/// `VIEW_NEARZ` (`game/client/view.h:27`).
-const VIEW_NEAR_Z: f32 = 7.0;
-
-/// `CViewRender::GetZFar` (`game/client/view.cpp:644`): the map's extents times
-/// the diagonal of a cube, which is the furthest two points in a map can be
-/// apart. `r_mapextents` defaults to 16384.
-const VIEW_FAR_Z: f32 = 16384.0 * 1.732_050_8;
-
 /// The engine.
 ///
 /// The lifetime is the mounted game content's: the [`Vfs`] is built by the
@@ -646,38 +638,38 @@ impl<'a> Engine<'a> {
         world.draw(&mut pass);
     }
 
-    /// Where the view is.
+    /// Where the view is: [`ViewSetup`](crate::client::ViewSetup) turned into
+    /// the material system's [`Camera`].
     ///
-    /// **A partial [`CViewRender::SetUpView`]** (`game/client/view.cpp:668`):
-    /// the eye and the angles come from the client, and the field of view is
-    /// `default_fov`, but the near and far planes are still constants here
-    /// rather than `GetZNear`/`GetZFar` — the far plane is derived from the
-    /// map's extents in the original, and making it so is `portdocs/CLIENT.md`
-    /// stage 2, along with the `ViewSetup` this should be returning.
+    /// **The client decides what the view is; this decides how to project it.**
+    /// Everything above the conversion — the eye, the angles, the field of view
+    /// and both clip planes — is `CViewRender::SetUpView`'s and lives in
+    /// [`Client::view`](crate::client::Client::view). What is left here is
+    /// `CViewSetup::ComputeViewMatrices` (`public/view_shared.h:186`), and it
+    /// stays here because a projection matrix is a `wgpu` convention —
+    /// handedness, depth range, which way `y` points — and `client/` has no
+    /// business knowing any of it.
     ///
-    /// What is faithful is the coordinate system: Source is **Z-up,
-    /// right-handed**, so the view is built with `Z` as the up axis and world
-    /// geometry needs no conversion on the way to the GPU. The basis comes from
-    /// `AngleVectors` rather than being rebuilt here, so that the direction the
-    /// player looks and the direction it moves are the same arithmetic — and so
-    /// that a rolled view (Portal 2 rolls constantly) tilts the picture rather
-    /// than only the movement. **Pitch is positive downwards**, which is the
-    /// sign error to watch for if the view ever looks at the ceiling when it
-    /// should look at the floor.
+    /// Two things to know if the picture looks wrong rather than broken.
+    /// **`fov` is horizontal and already width-ratio scaled**, so it goes
+    /// straight to `Camera::perspective`, which does the horizontal-to-vertical
+    /// conversion with the same aspect. And the basis comes from
+    /// `AngleVectors`, so the direction the player looks and the direction it
+    /// moves are the same arithmetic — Source is **Z-up right-handed** and
+    /// **pitch is positive downwards**, which is the sign error to watch for if
+    /// the view looks at the ceiling when it should look at the floor.
     fn camera(&self, size: (u32, u32)) -> Camera {
         let (width, height) = size;
-        let aspect = width.max(1) as f32 / height.max(1) as f32;
-
-        let eye = self.scene.client.eye();
-        let (forward, _, up) = self.scene.client.angles().vectors();
+        let view = self.scene.client.view(width.max(1), height.max(1));
+        let (forward, _, up) = view.angles.vectors();
 
         Camera::perspective(
-            eye,
-            glam::camera::rh::view::look_at_mat4(eye, eye + forward, up),
-            self.scene.client.fov(),
-            aspect,
-            VIEW_NEAR_Z,
-            VIEW_FAR_Z,
+            view.origin,
+            glam::camera::rh::view::look_at_mat4(view.origin, view.origin + forward, up),
+            view.fov,
+            view.aspect,
+            view.z_near,
+            view.z_far,
         )
     }
 }

@@ -46,7 +46,7 @@ pub use button::{ButtonBits, Buttons, MoveButton, BUTTONS};
 pub use movement::MoveData;
 pub use player::{MoveType, Player};
 pub use usercmd::UserCmd;
-pub use view::ViewAngles;
+pub use view::{ViewAngles, ViewSetup};
 
 use glam::Vec3;
 
@@ -90,6 +90,8 @@ struct Cvars {
     cl_sidespeed: Cvar,
     cl_upspeed: Cvar,
     default_fov: Cvar,
+    r_farz: Cvar,
+    r_mapextents: Cvar,
     sv_maxspeed: Cvar,
     sv_friction: Cvar,
     sv_noclipspeed: Cvar,
@@ -231,6 +233,19 @@ impl Client {
                 CvarFlags::CHEAT,
                 "",
             ),
+            r_farz: console.cvar(
+                "r_farz",
+                "-1",
+                CvarFlags::CHEAT,
+                "Override the far clipping plane. -1 means to use the value in \
+                 env_fog_controller.",
+            ),
+            r_mapextents: console.cvar(
+                "r_mapextents",
+                &view::R_MAPEXTENTS.to_string(),
+                CvarFlags::CHEAT,
+                "Set the max dimension for the map. This determines the far clipping plane",
+            ),
             sv_maxspeed: console.cvar(
                 "sv_maxspeed",
                 &movement::SV_MAXSPEED.to_string(),
@@ -320,20 +335,82 @@ impl Client {
         self.player.move_type
     }
 
-    /// Where the eye is, for the renderer. [`Player::eye`].
-    pub fn eye(&self) -> Vec3 {
-        self.player.eye()
+    /// `CViewRender::SetUpView` (`game/client/view.cpp:668`) plus the field-of-
+    /// view scaling `CViewRender::Render` applies straight afterwards
+    /// (`view.cpp:1084`).
+    ///
+    /// `width`/`height` are the render target's, in pixels. The result is data:
+    /// turning it into a projection matrix is the material system's convention
+    /// to choose, and keeping that on the other side of the boundary is what
+    /// stops this module depending on `wgpu` for the sake of five numbers.
+    ///
+    /// # The two halves are one call here, and are two in the original
+    ///
+    /// `SetUpView` leaves `fov` at `default_fov` — a **4:3** number — and
+    /// `Render` scales it by `aspect / (4/3)` a few hundred lines later, once
+    /// it knows the viewport. Splitting them bought Valve a place for the
+    /// client mode and the tool framework to intervene between; there is
+    /// nothing to intervene, and a `ViewSetup` whose `fov` still needs scaling
+    /// is a trap. So the scaling happens here and
+    /// [`ViewSetup::fov`](ViewSetup) is the number to hand a `PerspectiveX`.
+    ///
+    /// # Not here
+    ///
+    /// `CalcView`'s additions — view bob, view roll, punch and aim punch — need
+    /// a player that can be shot, and `C_Portal_Player::CalcView`'s eye
+    /// interpolation through a portal needs portals. They attach at
+    /// [`Player::eye`], which is why this asks the player for its eye rather
+    /// than adding `VEC_VIEW` itself.
+    pub fn view(&self, width: u32, height: u32) -> ViewSetup {
+        let aspect = view::screen_aspect(width, height);
+        ViewSetup {
+            origin: self.player.eye(),
+            angles: self.player.angles,
+            fov: view::scale_fov_by_width_ratio(
+                self.cvars.default_fov.float(),
+                aspect / view::FOV_ASPECT,
+            ),
+            z_near: self.z_near(width, height),
+            z_far: self.z_far(),
+            width,
+            height,
+            aspect,
+        }
     }
 
-    /// Where the eye points.
-    pub fn angles(&self) -> ViewAngles {
-        self.player.angles
+    /// `CViewRender::GetZNear` (`view.cpp:620`).
+    ///
+    /// **The near plane moves to 1 on a mega-wide screen**, from `VIEW_NEARZ`'s
+    /// 7. A very wide viewport pushes the left and right edges of the frustum
+    /// far enough out that a 7-unit near plane clips geometry the player is
+    /// standing next to. Valve's test is literally `width / (height + 1) > 2`;
+    /// the `+ 1` is a divide-by-zero guard and is kept.
+    ///
+    /// `r_nearz`'s override is `#ifdef _DEBUG` only and is not ported. The
+    /// secondary `r_aspectratio > 2` test is not either — see
+    /// [`view::screen_aspect`].
+    fn z_near(&self, width: u32, height: u32) -> f32 {
+        let mega_wide = width as f32 / (height as f32 + 1.0) > 2.0;
+        match mega_wide {
+            true => 1.0,
+            false => view::VIEW_NEARZ,
+        }
     }
 
-    /// `default_fov` — horizontal, which is how every Valve entry point spells
-    /// a field of view.
-    pub fn fov(&self) -> f32 {
-        self.cvars.default_fov.float()
+    /// `CViewRender::GetZFar` (`view.cpp:639`).
+    ///
+    /// `r_farz` under 1 — the default is -1 — means "use the map's", which is
+    /// `r_mapextents × √3`: the diagonal of a cube that size, and so the
+    /// furthest apart two points in such a map can be. **Nothing sets
+    /// `r_mapextents` from the `.bsp`**; it is a cheat cvar a mapper sets.
+    ///
+    /// Missing: the `env_fog_controller`'s `farz`, which overrides this when
+    /// positive and needs entities.
+    fn z_far(&self) -> f32 {
+        match self.cvars.r_farz.float() {
+            far if far >= 1.0 => far,
+            _ => self.cvars.r_mapextents.float() * view::MAP_DIAGONAL,
+        }
     }
 
     /// `CInput::CreateMove` (`in_main.cpp:1350`).
@@ -643,10 +720,58 @@ mod tests {
     }
 
     #[test]
-    fn the_eye_is_the_origin_plus_the_view_offset() {
+    fn the_view_is_the_players_eye_not_its_feet() {
         let mut client = client();
         client.spawn(Vec3::new(10.0, 20.0, 30.0), 0.0, 0.0);
-        assert_eq!(client.eye(), Vec3::new(10.0, 20.0, 30.0) + player::VEC_VIEW);
+        let view = client.view(1280, 720);
+        assert_eq!(view.origin, Vec3::new(10.0, 20.0, 30.0) + player::VEC_VIEW);
+        assert_eq!(view.angles, client.player.angles);
+    }
+
+    /// The regression `view::scale_fov_by_width_ratio` exists for: a 16:9
+    /// window sees a **91-degree** horizontal field of view, not the 75 the
+    /// cvar says, because 75 is a 4:3 number.
+    #[test]
+    fn a_widescreen_view_is_wider_than_default_fov_says() {
+        let client = client();
+        let wide = client.view(1280, 720);
+        assert!(wide.fov > 91.0 && wide.fov < 91.6, "{}", wide.fov);
+
+        let square = client.view(1024, 768);
+        assert!((square.fov - DEFAULT_FOV).abs() < 1e-3, "{}", square.fov);
+    }
+
+    #[test]
+    fn the_far_plane_is_the_maps_diagonal_and_r_farz_overrides_it() {
+        let mut console = Console::detached();
+        let client = Client::new(&mut console);
+        assert_eq!(
+            client.view(1280, 720).z_far,
+            view::R_MAPEXTENTS * view::MAP_DIAGONAL
+        );
+
+        console
+            .cvars()
+            .find("r_mapextents")
+            .expect("registered")
+            .set_string("32768");
+        assert_eq!(client.view(1280, 720).z_far, 32768.0 * view::MAP_DIAGONAL);
+
+        console
+            .cvars()
+            .find("r_farz")
+            .expect("registered")
+            .set_string("5000");
+        assert_eq!(client.view(1280, 720).z_far, 5000.0, "the override wins");
+    }
+
+    /// `GetZNear`: a very wide viewport pushes the frustum edges out far enough
+    /// that a 7-unit near plane clips what the player is standing next to.
+    #[test]
+    fn the_near_plane_moves_in_on_a_mega_wide_screen() {
+        let client = client();
+        assert_eq!(client.view(1280, 720).z_near, view::VIEW_NEARZ);
+        assert_eq!(client.view(3840, 1080).z_near, 1.0);
     }
 
     #[test]
@@ -668,7 +793,7 @@ mod tests {
         let mut client = client();
         let cmd = client.create_move((100.0, 0.0));
         assert!(cmd.viewangles.yaw < 0.0, "right turns are negative yaw");
-        assert_eq!(cmd.viewangles, client.angles());
+        assert_eq!(cmd.viewangles, client.player.angles);
         assert_eq!(cmd.mousedx, (100.0 * view::SENSITIVITY) as i16);
     }
 

@@ -10,10 +10,10 @@ Read `PORTING.md` first; this doc assumes its standing decisions. Read
 three deliberate deferrals land, and it says why they were deferred rather than
 attempted.
 
-**Status: stage 1 of 5 is done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
+**Status: stages 1 and 2 of 5 are done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
 `src/engine/input/view.rs` is deleted, which closes the view-angles wart `CLAUDE.md` and
 `ENGINE_INPUT.md` §11.2 recorded. **The API reference is `rustdocs/CLIENT.md`; read that
-to *use* the module.** Stages 2 and 3 are unblocked; stage 4 waits for `trace/`.
+to *use* the module.** Stage 3 is unblocked; stage 4 waits for `trace/`.
 
 ---
 
@@ -634,14 +634,37 @@ three visible differences: movement has momentum and coasts (that is
 computed as feet-plus-`VEC_VIEW` rather than handed over as an eye, and every cvar above
 now works, including `cl_forwardspeed 400`.
 
-### Stage 2 — the view is the client's (unblocked, ~200 lines) — next
+### Stage 2 — the view is the client's — **DONE** (~200 lines, 7 tests)
 
-- `ViewSetup` and `Client::view`: eye = origin + view offset, `default_fov`, `GetZFar`
-  from `r_mapextents`/`r_farz` rather than a constant, `zNear` from `GetZNear`.
+- `ViewSetup` and `Client::view(width, height)`: eye = origin + view offset,
+  `default_fov`, `GetZFar` from `r_mapextents`/`r_farz` rather than a constant, `zNear`
+  from `GetZNear` including the mega-wide branch.
 - `Engine::camera` shrinks to a `ViewSetup` → `materials::Camera` conversion.
-- `r_mapextents` comes from the map; `world/` supplies it.
+- ~~`r_mapextents` comes from the map; `world/` supplies it.~~ **Wrong, and corrected by
+  building it.** `r_mapextents` is a plain `FCVAR_CHEAT` cvar defaulting to 16384
+  (`view.cpp:119`) and **nothing in the tree sets it from the `.bsp`** — the name suggests
+  otherwise. It is a knob a mapper turns. So stage 2 has no `world/` dependency at all,
+  and the far plane is `r_mapextents × √3` exactly as before, but now reachable.
 
-### Stage 3 — the second sample point (unblocked, ~150 lines)
+**The thing this stage was actually for, and the plan did not mention it.**
+`SetUpView` leaves `fov` at `default_fov`, and `CViewRender::Render` scales it by
+`aspect / (4/3)` a few hundred lines later (`view.cpp:1084`, `ScaleFOVByWidthRatio` at
+`:923`). **Source's FOV numbers are horizontal and quoted at 4:3**, and the composition is
+classic Hor+: the *vertical* FOV comes out constant at `2·atan(tan(fov/2) · 0.75)` and the
+horizontal grows with the screen. The port was handing 75 straight to a `PerspectiveX`,
+which at 16:9 gives a **46.7-degree vertical FOV where the shipped game gives 59.8** — a
+view that is not obviously wrong, just quietly too narrow. That is the visible change in
+this stage, and it is why the scaling is applied inside `Client::view` rather than left
+for a caller: a `ViewSetup` whose `fov` still needs scaling is a trap.
+
+Two more details worth having found: `GetZNear` returns **1 rather than 7 on a mega-wide
+viewport** (`width / (height + 1) > 2`), because a wide frustum's edges reach far enough
+out that a 7-unit near plane clips what the player is standing beside; and the *same*
+aspect ratio feeds both the FOV scaling and the projection, because `Render` sets
+`m_flAspectRatio` from `GetScreenAspectRatio` two lines after scaling the FOV with it
+(`view.cpp:1106`).
+
+### Stage 3 — the second sample point (unblocked, ~150 lines) — next
 
 - Keyboard look: `AdjustYaw`/`AdjustPitch`, `cl_yawspeed` 210, `cl_pitchspeed` 225,
   `cl_anglespeedkey` 0.67, `cl_mouselook`.

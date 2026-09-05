@@ -1478,33 +1478,39 @@ Not bugs; each names what it waits on.
 
 ### The camera is the player's eye
 
-`Engine::camera` asks [`Client`](CLIENT.md) where the eye is (`client.eye()`), where it
-points (`client.angles()`) and how wide it is (`client.fov()`, which is `default_fov`).
+`Engine::camera` is now only the conversion: it asks [`Client::view`](CLIENT.md) for a
+`ViewSetup` and turns it into a `materials::Camera`. Everything above that — the eye, the
+angles, the field of view and both clip planes — is `CViewRender::SetUpView`'s and lives
+in `src/client/`. The conversion stays here because a projection matrix is a `wgpu`
+convention (handedness, depth range, which way `y` points) and `client/` has no business
+knowing any of it.
+
 The player it reads is a real one — a `Player` in `MOVETYPE_NOCLIP`, positioned at
 `info_player_start` and moved by `FullNoClipMove` from a `UserCmd` — rather than the
 free-fly camera that stood here before `src/client/` landed.
 
 **Which keys move it comes from `cfg/config_default.cfg`**, not from this file: WASD is
 `+forward`/`+back`/`+moveleft`/`+moveright`, SPACE and CTRL are `+jump`/`+duck` and drive
-the vertical axis (a placeholder divergence — see `CLIENT.md` gotcha 11), the mouse looks,
-and Escape releases the cursor. `+speed` walks but Portal 2 binds no key to it.
+the vertical axis (a placeholder divergence — see `CLIENT.md` gotcha 12), the mouse looks,
+and Escape releases the cursor.
 
-**Noclip has momentum now**, which it did not when this was a camera: `sv_noclipaccelerate`
+**Noclip has momentum**, which it did not when this was a camera: `sv_noclipaccelerate`
 defaults to 5, so movement accelerates over ~0.6 s and coasts on release. `CLIENT.md`
-gotcha 4 has the arithmetic; `sv_noclipaccelerate 0` restores the old instant-stop feel.
+gotcha 5 has the arithmetic; `sv_noclipaccelerate 0` restores the old instant-stop feel.
 
-What is faithful in this function is the projection — `VIEW_NEARZ` 7
-(`game/client/view.h:27`), and Portal's `default_fov` 75 — and the coordinate system:
-Source is **Z-up right-handed**, so the view is built with `Z` as up and world geometry
-needs no conversion. The basis comes from `AngleVectors`, so the direction the player
-looks and the direction it moves are the same arithmetic, and **pitch is positive
-downwards**.
+**The field of view is wider than `default_fov` says**, and that is correct:
+`ViewSetup::fov` has been through `ScaleFOVByWidthRatio`, because Source quotes FOV
+horizontally at 4:3. At 16:9 Portal's 75 becomes 91.3 horizontal and 59.8 vertical.
+`CLIENT.md` gotcha 1 — and passing `view.aspect` rather than a locally computed one is
+part of it.
 
-What is *not* faithful: the far plane is still the constant `16384 × √3` rather than
-`r_mapextents × √3` read from the map (`view.cpp:644`), and this returns a `Camera`
-instead of the `ViewSetup` that `CViewRender::SetUpView` builds. Both are
-`portdocs/CLIENT.md` stage 2. There is also still no collision, no gravity and no
-prediction — `MOVETYPE_WALK` is stage 4 and waits for `trace/`.
+What is faithful here is the coordinate system: Source is **Z-up right-handed**, so the
+view is built with `Z` as up and world geometry needs no conversion. The basis comes from
+`AngleVectors`, so the direction the player looks and the direction it moves are the same
+arithmetic, and **pitch is positive downwards**.
+
+What is *not*: there is still no collision, no gravity and no prediction —
+`MOVETYPE_WALK` is `portdocs/CLIENT.md` stage 4 and waits for `trace/`.
 
 **A black screen on some maps is this, not a lighting bug.** `info_player_start` is only
 where the *engine* puts the player; several Portal 2 maps spawn inside a sealed box in the

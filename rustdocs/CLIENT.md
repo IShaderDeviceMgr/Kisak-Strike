@@ -8,11 +8,11 @@ Porting plan and the C++ inventory: [`portdocs/CLIENT.md`](../portdocs/CLIENT.md
 | | |
 |---|---|
 | Module | `crate::client`, with `client::{button, movement, player, usercmd, view}` |
-| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `game/shared/usercmd.h`, `in_buttons.h`, and `FullNoClipMove`/`Accelerate` from `game/shared/gamemovement.cpp` |
-| Lines | 2,114 including tests |
-| Tests | 49 (`cargo test client::`) |
+| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, and `FullNoClipMove`/`Accelerate` from `game/shared/gamemovement.cpp` |
+| Lines | 2,400 including tests |
+| Tests | 56 (`cargo test client::`) |
 | Dependencies | `std`, `glam`, and `crate::engine::console` for cvar handles. **Not `winit`, not `egui`, not `wgpu`, not `crate::engine::input`** |
-| Status | **Stage 1 of 5 done** (`portdocs/CLIENT.md` §8). Stages 2-3 are unblocked; stage 4 waits for `trace/` |
+| Status | **Stages 1-2 of 5 done** (`portdocs/CLIENT.md` §8). Stage 3 is unblocked; stage 4 waits for `trace/` |
 
 ## This is not `src/engine/client/`
 
@@ -42,9 +42,12 @@ client.spawn(spawn.origin, spawn.pitch, spawn.yaw);
 let command = client.create_move(mouse_delta); // CInput::CreateMove
 client.run_move(&command, seconds);            // CGameMovement::ProcessMovement
 
-// For the renderer.
-let camera = Camera::perspective(client.eye(), look_at(client.eye(), client.angles()),
-                                 client.fov(), aspect, near, far);
+// For the renderer. `ViewSetup` is data; turning it into a projection matrix is
+// the material system's convention to choose, so the engine does that bit.
+let view = client.view(width, height);          // CViewRender::SetUpView
+let (forward, _, up) = view.angles.vectors();
+let camera = Camera::perspective(view.origin, look_at_mat4(view.origin, view.origin + forward, up),
+                                 view.fov, view.aspect, view.z_near, view.z_far);
 ```
 
 `+forward` and its eighteen siblings arrive through the **command buffer**, not through a
@@ -90,9 +93,7 @@ impl Client {
     pub fn set_impulse(&mut self, impulse: u8);
     pub fn toggle_noclip(&mut self) -> MoveType;
 
-    pub fn eye(&self) -> Vec3;
-    pub fn angles(&self) -> ViewAngles;
-    pub fn fov(&self) -> f32;                                     // default_fov
+    pub fn view(&self, width: u32, height: u32) -> ViewSetup;     // CViewRender::SetUpView
 }
 ```
 
@@ -191,6 +192,39 @@ pub fn full_noclip_move(mv: &mut MoveData, dt: f32, factor: f32, max_acceleratio
 same command must produce the same position on both or prediction mispredicts. Nothing in
 it may name a cvar, a console or a view — everything arrives in `MoveData`.
 
+### `ViewSetup`
+
+```rust
+pub struct ViewSetup {
+    pub origin: Vec3,        // the eye
+    pub angles: ViewAngles,
+    pub fov: f32,            // HORIZONTAL degrees, ALREADY width-ratio scaled
+    pub z_near: f32,
+    pub z_far: f32,
+    pub width: u32,
+    pub height: u32,
+    pub aspect: f32,         // used for both the FOV scaling and the projection
+}
+
+pub fn scale_fov_by_width_ratio(fov_degrees: f32, ratio: f32) -> f32;  // view.cpp:923
+pub fn screen_aspect(width: u32, height: u32) -> f32;                  // gl_rmain.cpp:127
+
+pub const VIEW_NEARZ: f32 = 7.0;
+pub const R_MAPEXTENTS: f32 = 16384.0;
+pub const MAP_DIAGONAL: f32 = 1.732_050_8;   // √3
+pub const FOV_ASPECT: f32 = 4.0 / 3.0;
+```
+
+`CViewSetup` (`public/view_shared.h:44`) carries about fifty fields; this carries the
+eight a single perspective view of a world needs. What is left out is attached to
+something that does not exist — the viewmodel pair, the ortho box, the custom view and
+projection matrices portals and monitors set, depth-of-field and motion blur, and `x`/`y`,
+which are only non-zero for a split-screen inset.
+
+**It is data, not a camera.** Building a projection matrix from it is a `wgpu`
+convention — handedness, depth range, which way `y` points — so `Engine::camera` does it
+and `client/` never names a `materials` type.
+
 ### `ViewAngles`
 
 ```rust
@@ -232,7 +266,9 @@ dropped rather than approximated.
 | `cl_pitchdown` / `cl_pitchup` | 89 | cheat | `in_main.cpp:49`, `:50` |
 | `cl_forwardspeed` / `cl_backspeed` / `cl_sidespeed` | 175 | cheat | `in_main.cpp:61-63` |
 | `cl_upspeed` | 320 | cheat | `in_main.cpp:51` |
-| `default_fov` | **75** | cheat | `clientmode_portal.cpp:32` |
+| `default_fov` | **75**, and it is a **4:3 horizontal** number | cheat | `clientmode_portal.cpp:32` |
+| `r_farz` | -1 (meaning "use the map's") | cheat | `view.cpp:135` |
+| `r_mapextents` | 16384 | cheat | `view.cpp:119` |
 | `sv_maxspeed` | 320 | — | `movevars_shared.cpp:29` |
 | `sv_friction` | 5.2 | — | `movevars_shared.cpp:44` |
 | `sv_stopspeed` | 80 | — | `movevars_shared.cpp:23` |
@@ -245,26 +281,38 @@ Commands, registered by the engine alongside its own: the 22 `+`/`-` pairs from
 
 Ordered by how likely each is to bite.
 
-1. **`KeyState` is destructive, and the read order changes what the command says.**
+1. **`ViewSetup::fov` is horizontal, is already width-ratio scaled, and `default_fov` is
+   not.** Source's FOV numbers are quoted at **4:3**; `CViewRender::Render` scales them by
+   `aspect / (4/3)` before the projection is built (`view.cpp:1084`). The composition is
+   Hor+: the *vertical* FOV comes out constant at `2·atan(tan(fov/2) · 0.75)` — 59.8° for
+   Portal's 75 — and the horizontal grows with the screen, reaching 91.3° at 16:9. Hand
+   `default_fov` straight to a `PerspectiveX` and you get a 46.7° vertical FOV at 16:9: a
+   view that is not obviously wrong, just quietly too narrow. `Client::view` does the
+   scaling, so **use `view.fov` and never `default_fov`** — and pass `view.aspect` to the
+   projection, because the same ratio has to appear on both sides for the vertical FOV to
+   come out constant.
+
+2. **`KeyState` is destructive, and the read order changes what the command says.**
    `KButton::key_state` clears both impulse bits; `Buttons::bits` clears only the
    *pressed* bit. `create_move` computes the movement axes first and the bitfield second,
    which is Valve's order, and it means **a tap shorter than one frame contributes to
    `forwardmove` and not to `IN_FORWARD`**. Reverse the two and it contributes to both —
    a difference a server would see. Call `key_state` once per button per command.
 
-2. **The first frame after a press is worth half.** `KeyState` returns 0.5 for
+3. **The first frame after a press is worth half.** `KeyState` returns 0.5 for
    "pressed this frame and still held", 1.0 only once the button has been held across a
    whole frame, 0.25 for a press-and-release inside one frame, 0.75 for a
    release-and-re-press. A movement value that looks wrong by a factor of two is almost
    always this, working correctly.
 
-3. **`origin` is the feet; `eye()` is 64 units higher.** `Player::origin` is what
+4. **`origin` is the feet; `eye()` is 64 units higher.** `Player::origin` is what
    movement moves and what `world::Spawn::origin` supplies. Conflating them is a 64-unit
-   error that reads as a level built slightly wrong rather than as a bug. Ask the player
-   for its eye — do not add `VEC_VIEW` at the call site, because that seam is where view
-   bob, punch angles and Portal's through-a-portal eye interpolation attach.
+   error that reads as a level built slightly wrong rather than as a bug. Ask
+   `Client::view` for the eye — do not add `VEC_VIEW` at a call site, because
+   `Player::eye` is the seam where view bob, punch angles and Portal's through-a-portal
+   eye interpolation attach.
 
-4. **Noclip has momentum, and a tap does not move it.** `sv_noclipaccelerate` defaults to
+5. **Noclip has momentum, and a tap does not move it.** `sv_noclipaccelerate` defaults to
    **5, not 0**. `FullNoClipMove`'s friction bleed floors `control` at `maxspeed / 4`, so
    at 60 Hz it removes ~34.7 units of speed every frame whatever the player is doing,
    while a quarter-speed wish only accelerates by ~20.8. This is Valve's arithmetic. The
@@ -274,41 +322,41 @@ Ordered by how likely each is to bite.
    `addspeed` cap balance below the ask. Set `sv_noclipaccelerate 0` for the instant-stop
    feel the old placeholder camera had.
 
-5. **A frame time of 1.0 does not move the player at all.** The friction bleed scales
+6. **A frame time of 1.0 does not move the player at all.** The friction bleed scales
    with `dt`, so a one-second step removes more speed than a second of acceleration adds.
    Tests must step at a realistic rate (`1.0 / 60.0`); a one-shot `run_move(&cmd, 1.0)`
    asserts nothing useful.
 
-6. **Pitch is positive downwards.** `vectors()` negates it (`forward.z = -sin(pitch)`)
+7. **Pitch is positive downwards.** `vectors()` negates it (`forward.z = -sin(pitch)`)
    and `apply_mouse_pitch` *adds* the mouse's Y. If the view looks at the ceiling when it
    should look at the floor, this is the sign.
 
-7. **"Right" is `-Y` when facing `+X`.** Source is Z-up right-handed. Get it backwards
+8. **"Right" is `-Y` when facing `+X`.** Source is Z-up right-handed. Get it backwards
    and strafing goes the wrong way while everything else looks correct.
 
-8. **`m_pitch` is deliberately unbounded** where its four neighbours are clamped to
+9. **`m_pitch` is deliberately unbounded** where its four neighbours are clamped to
    `[0.0001, 1000]`: a *negative* value is how "reverse mouse" is spelled. Copying the
    clamp from the line above would silently break that option. In the original it is a
    `ConVar_ServerBounded` that returns `±0.022` with `sv_cheats` off — an anti-cheat
    measure, and one that needs `sv_cheats`, which does not exist yet.
 
-9. **Focus loss needs two calls, not one.** `Input::clear` releases the *keys*;
+10. **Focus loss needs two calls, not one.** `Input::clear` releases the *keys*;
    `Client::clear_buttons` releases what the `+command`s are holding. A button is held by
    the command, not by the key, so alt-tabbing with `+forward` down leaves the player
    walking for ever if the second call is missed. `Engine::update_client` makes it when
    `Event::FocusLost` reaches the tick.
 
-10. **`turning noclip off freezes the player`**, it does not drop them. `MOVETYPE_WALK`
+11. **`turning noclip off freezes the player`**, it does not drop them. `MOVETYPE_WALK`
     is stage 4 and needs `trace/`; there is no ground to stand on, so doing nothing is
     the honest placeholder. The `noclip` command says so when it is turned off.
 
-11. **`+jump` and `+duck` also drive the vertical axis**, and that is a documented
+12. **`+jump` and `+duck` also drive the vertical axis**, and that is a documented
     placeholder, not Valve's behaviour: `ComputeUpwardMove` reads `+moveup`/`+movedown`
     only, and Portal 2's shipped config binds neither. It reads `is_down` rather than
     `key_state` precisely so that reading it does not disturb `IN_JUMP`/`IN_DUCK`. It
     dies at stage 4.
 
-12. **`ScaleMovements` is dead in the original** — its body is `return;` above a
+13. **`ScaleMovements` is dead in the original** — its body is `return;` above a
     commented-out block, under a `// FIXME FIXME: This doesn't work`. It is not ported,
     and it should not be "fixed": the clip it was going to apply is `CheckParameters`',
     which happens in the right place already (and is skipped entirely for noclip).
@@ -320,6 +368,10 @@ Ordered by how likely each is to bite.
 | `AdjustAngles`, `cl_yawspeed`/`cl_pitchspeed`/`cl_anglespeedkey`, `cl_mouselook` | Keyboard look — stage 3. `+left`, `+right`, `+lookup`, `+lookdown` and `+klook` are registered and held, and are read by nothing yet. |
 | `IN_SetSampleTime` / `DetermineKeySpeed`'s budget, `ExtraMouseSample` | The budget exists to stop continuous input being applied twice when the mouse is sampled a *second* time per frame for smoothness (`host.cpp:4359`). Meaningless until that second sample point exists — stage 3. |
 | `FullWalkMove`, gravity, ducking, jumping, the hulls | Stage 4. Needs `trace/`. |
+| `env_fog_controller`'s `farz`, which overrides `GetZFar` when positive | Entities. |
+| `r_aspectratio`, and `AspectRatioInfo_t`'s non-square-pixel scalar | `r_aspectratio` is a *renderer* cvar (`gl_rmain.cpp:46`); registering it from the game client to read it in `screen_aspect` would put it in the wrong module. The pixel-shape scalar is the material system's. Both coincide with `width / height` on every square-pixel display, which is the only case this port supports. |
+| `fovViewmodel`, `zNearViewmodel`, the ortho box, custom view/projection matrices, depth of field, motion blur | A viewmodel, portals, monitors and post-processing. `ViewSetup` carries eight fields where `CViewSetup` carries fifty. |
+| `r_nearz` | `#ifdef _DEBUG` in the original. |
 | Prediction, `MULTIPLAYER_BACKUP`, `CVerifiedUserCmd`, the command ring | Stage 5. Needs `net/` and `server/`. Keep `run_move`'s shape and it wraps rather than rewrites. |
 | `UserCmd::random_seed` | It is `MD5_PseudoRandom(command_number) & 0x7fffffff`, and its only purpose is making two ends draw the same "random" numbers. A value that is not Valve's MD5 would look like it worked. Left 0 until there are two ends. |
 | The wire encoding (`ReadUsercmd`/`WriteUsercmd`) | `net/`'s. The format is **not pinned yet** — per `PORTING.md` it becomes ours once both ends are Rust, and both ends will be. |
@@ -350,7 +402,7 @@ Ordered by how likely each is to bite.
 |---|---|
 | `client::button::the_table_is_indexed_by_its_own_enum` | `BUTTONS` stays in `MoveButton` order and both spellings match the name |
 | `a_button_held_for_the_whole_frame_is_worth_one`, `a_tap_shorter_than_a_frame_is_worth_a_quarter`, `a_release_and_a_re_press_in_one_frame_is_worth_three_quarters`, `releasing_is_worth_nothing_for_the_frame_it_happens_in` | all four `KeyState` cases |
-| `a_tap_that_key_state_already_read_does_not_reach_the_bitfield` | gotcha 1 — the read order |
+| `a_tap_that_key_state_already_read_does_not_reach_the_bitfield` | gotcha 2 — the read order |
 | `two_keys_bound_to_one_command_do_not_cancel_each_other` | `down[2]`, and why `+command` carries an index |
 | `a_bare_minus_command_releases_unconditionally` | the way out of a stuck key |
 | `the_axis_only_buttons_contribute_no_bits` | the six modifiers that never reach the server |
@@ -358,15 +410,20 @@ Ordered by how likely each is to bite.
 | `walking_halves_the_speed` | `+speed` halves the factor *after* the clamp is computed from the unhalved one |
 | `the_wish_velocity_is_clamped_to_the_server_maximum` | `sv_maxspeed × sv_noclipspeed` |
 | `rising_is_along_world_up_whatever_the_view_is_doing` | `upmove` on world `+Z`, not along `up` |
-| `with_acceleration_the_first_frame_is_slower_than_the_steady_state`, `releasing_everything_coasts_to_an_exact_stop` | gotcha 4 — the shipped defaults, and the `speed < 1.0` exact stop |
+| `with_acceleration_the_first_frame_is_slower_than_the_steady_state`, `releasing_everything_coasts_to_an_exact_stop` | gotcha 5 — the shipped defaults, and the `speed < 1.0` exact stop |
 | `acceleration_does_not_add_to_a_velocity_that_already_exceeds_the_wish` | `Accelerate`'s veer clause |
-| `client::view::positive_pitch_looks_down`, `a_zero_angle_looks_down_positive_x` | gotchas 6 and 7 |
+| `client::view::positive_pitch_looks_down`, `a_zero_angle_looks_down_positive_x` | gotchas 7 and 8 |
+| `the_vertical_field_of_view_is_the_same_at_every_aspect_ratio` | **gotcha 1**, as the property rather than a number: the composition is Hor+ at 4:3, 16:10, 16:9 and 21:9, and the same test pins what the unscaled value would have been (46.7°) |
+| `a_widescreen_view_is_wider_than_default_fov_says`, `a_four_by_three_screen_leaves_the_field_of_view_alone` | that the scaling is applied, and that it is a no-op at the aspect the number is quoted at |
+| `the_far_plane_is_the_maps_diagonal_and_r_farz_overrides_it` | `GetZFar`'s two branches |
+| `the_near_plane_moves_in_on_a_mega_wide_screen` | `GetZNear`'s mega-wide branch |
+| `the_view_is_the_players_eye_not_its_feet` | gotcha 4 |
 | `a_non_finite_angle_is_refused_rather_than_stored` | `SetViewAngles`' `IsValid` check — a NaN in the view matrix is a black screen with no error |
-| `a_command_carries_the_speed_cvars_rather_than_an_axis` | gotcha 2, both halves |
-| `a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration` | gotcha 4, and that `sv_noclipaccelerate 0` restores the old feel |
+| `a_command_carries_the_speed_cvars_rather_than_an_axis` | gotcha 3, both halves |
+| `a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration` | gotcha 5, and that `sv_noclipaccelerate 0` restores the old feel |
 | `holding_strafe_moves_with_the_mouse_instead_of_turning`, `lookstrafe_redirects_only_the_horizontal_axis` | `ApplyMouse`'s three cases and the asymmetry between the axes |
 | `cl_mouseenable_zero_drops_the_motion_rather_than_banking_it` | nothing arrives in one lump when it is turned back on |
-| `turning_noclip_off_leaves_a_player_that_cannot_move_yet` | gotcha 10 |
-| `jump_and_duck_drive_the_placeholder_vertical_axis` | gotcha 11, including that the button bit survives |
-| `clearing_the_buttons_stops_the_player` | gotcha 9's second half |
+| `turning_noclip_off_leaves_a_player_that_cannot_move_yet` | gotcha 11 |
+| `jump_and_duck_drive_the_placeholder_vertical_axis` | gotcha 12, including that the button bit survives |
+| `clearing_the_buttons_stops_the_player` | gotcha 10's second half |
 | `engine::tests::a_bound_key_moves_the_camera_through_the_command_buffer` | the whole chain with nothing mocked: `bind` → press → command text → console → `Buttons` → `UserCmd` |

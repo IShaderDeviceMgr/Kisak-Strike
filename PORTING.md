@@ -609,7 +609,7 @@ spells the same six flags in *three* different tables, two of them listing diffe
 subsets. One table with a long name and a short one replaces all three. `findflags` was
 not ported — it searches the twenty-two flags this port does not have.
 
-**The game client has landed — stage 1 of `portdocs/CLIENT.md`'s five.** It is
+**The game client has landed — stages 1 and 2 of `portdocs/CLIENT.md`'s five.** It is
 `src/client/`, top-level and a sibling of `src/engine/`, because `client.so` was a sibling
 of `engine.so`; it is the first *game* module in the tree and `src/server/` will follow it
 there. It is **not** `ENGINE.md` §7.5's client *connection*, which is `src/engine/client/`
@@ -624,8 +624,15 @@ it takes Valve's own `// FIXME, move entirely to client .dll`
 (`engine/cdll_engine_int.cpp:1048`): the angles are the client's and the engine never gets
 a copy. **API: `rustdocs/CLIENT.md`.**
 
-Stages 2 (the `ViewSetup` proper) and 3 (keyboard look and the sample-time budget) are
-unblocked and small. Stage 4 is walking, and waits for `trace/`.
+Stage 2 is `CViewRender::SetUpView`: a `ViewSetup`, both clip planes from their cvars,
+and `Engine::camera` reduced to a conversion — the client decides what the view is, the
+engine decides how to project it. It also corrected a field of view that had been too
+narrow since there was a camera at all: **Source quotes FOV horizontally at 4:3** and
+widens it by `aspect / (4/3)` before projecting, so 16:9 had been showing 46.7° of
+vertical where the shipped game shows 59.8°.
+
+Stage 3 (keyboard look and the sample-time budget) is unblocked and small. Stage 4 is
+walking, and waits for `trace/`.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`
