@@ -49,8 +49,7 @@ pub mod world;
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::Vec3;
-
+use crate::client::{Client, MoveType, BUTTONS};
 use crate::cmdline::CommandLine;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::{Camera, Load};
@@ -62,7 +61,6 @@ use console::{
     CvarRegistry, Dispatch, ExecContext, Source,
 };
 use host::{Host, Level, Outcome};
-use input::view::{FlyCamera, MOVE_COMMANDS, SENSITIVITY, SENSITIVITY_MAX, SENSITIVITY_MIN};
 use input::Bindings;
 use input::{Button, CommandSink, Consumer, Input, Key, MouseButton};
 use world::World;
@@ -74,10 +72,6 @@ const VIEW_NEAR_Z: f32 = 7.0;
 /// the diagonal of a cube, which is the furthest two points in a map can be
 /// apart. `r_mapextents` defaults to 16384.
 const VIEW_FAR_Z: f32 = 16384.0 * 1.732_050_8;
-
-/// `default_fov` for Portal (`game/client/portal/clientmode_portal.cpp:32`).
-/// Horizontal, which is how every Valve entry point spells a field of view.
-const DEFAULT_FOV: f32 = 75.0;
 
 /// The engine.
 ///
@@ -95,10 +89,6 @@ pub struct Engine<'a> {
     /// `FnChangeCallback_t` in the original (`engine/sys_engine.cpp:78`); this
     /// counter is what replaces it.
     fps_max_generation: u32,
-    /// `sensitivity` (`game/client/in_mouse.cpp:100`). The port's first
-    /// `FCVAR_ARCHIVE` cvar, and therefore the first thing `config.cfg`
-    /// persists that is not a binding.
-    sensitivity: Cvar,
     /// Whether the startup config exec has been through the buffer yet.
     /// `Host_Init` runs `Cbuf_Execute` and only then calls
     /// `Host_SetConfigCfgExecuted` (`engine/host.cpp:2092`); this is that
@@ -142,9 +132,15 @@ struct Scene<'a> {
     /// `-vmt <name>`: one material on two cubes, drawn *instead of* the world.
     /// See [`Engine::render`].
     preview: Option<(MaterialPreview, Arc<Material>)>,
-    /// Where the view is. Level state, because loading a map puts it at the
-    /// map's spawn point; see [`Scene::load`].
-    view: FlyCamera,
+    /// The game client: the local player, its buttons, and the command that
+    /// moves it (`src/client/`, `rustdocs/CLIENT.md`).
+    ///
+    /// Here rather than beside [`Host`] for the same reason the material cache
+    /// is: **loading a map is the only thing that positions a player**, and
+    /// [`Level::load`] is handed a `&mut Scene`. It is not level state — the
+    /// cvar handles and the button state outlive any map — but its one
+    /// level-scoped field is what decides where it has to be reachable from.
+    client: Client,
     /// Seconds of simulated time since startup — `gpGlobals->curtime`,
     /// accumulated from the host's frame times rather than read from the clock,
     /// so that it advances with the game and not with the wall.
@@ -181,17 +177,11 @@ impl<'a> Engine<'a> {
             "Frame rate limiter.",
         );
 
-        // `ConVar sensitivity( "sensitivity","2.5", FCVAR_ARCHIVE, "Mouse
-        // sensitivity.", true, 0.0001f, true, 1000 )`
-        // (`game/client/in_mouse.cpp:100`) — the tree's only declaration of it.
-        let sensitivity = console.cvar_bounded(
-            "sensitivity",
-            &SENSITIVITY.to_string(),
-            CvarFlags::ARCHIVE,
-            "Mouse sensitivity.",
-            Some(SENSITIVITY_MIN),
-            Some(SENSITIVITY_MAX),
-        );
+        // The game client's cvars — `sensitivity`, the mouse factors, the
+        // movement speeds — are registered by the client itself, because it is
+        // what reads them (`ENGINE_CONSOLE.md` §6.1). This is the line where
+        // the port's first *game* module comes up.
+        let client = Client::new(&mut console);
 
         // The engine's commands. Declared here as data and run by
         // [`EngineCommands`]; `ENGINE_CONSOLE.md` §6.3 is why they are not
@@ -217,6 +207,12 @@ impl<'a> Engine<'a> {
             CommandSpec::new("toggleconsole", "Show/hide the console."),
             CommandSpec::new("showconsole", "Show the console."),
             CommandSpec::new("hideconsole", "Hide the console."),
+            // The game client's. `noclip` is a *server* command in the
+            // original (`game/server/`), because move type is server state
+            // that gets networked down; with no server it lives on the client
+            // and moves when there is one (`portdocs/CLIENT.md` §9.2).
+            CommandSpec::new("noclip", "Toggle. Player becomes non-solid and flies."),
+            CommandSpec::new("impulse", "Issue an impulse command."),
         ] {
             console
                 .register_command(spec)
@@ -226,12 +222,12 @@ impl<'a> Engine<'a> {
         // The `+command`s a binding sends. Both signs are registered, because
         // dispatch only consults the target for names it has been told about —
         // an unregistered `-forward` would fall through to "unknown" and the
-        // camera would never stop.
-        for (down, up) in MOVE_COMMANDS {
-            for name in [down, up] {
+        // player would never stop.
+        for spec in BUTTONS {
+            for name in [spec.down, spec.up] {
                 console
-                    .register_command(CommandSpec::new(name, "Movement button."))
-                    .expect("the movement commands are unique");
+                    .register_command(CommandSpec::new(name, "Button."))
+                    .expect("the client's buttons are unique");
             }
         }
 
@@ -260,7 +256,6 @@ impl<'a> Engine<'a> {
             fps_max_generation: fps_max.generation(),
             booted: false,
             save_config: false,
-            sensitivity,
             host: Host::new(fps_max.float()),
             console,
             fps_max,
@@ -271,7 +266,7 @@ impl<'a> Engine<'a> {
                 context,
                 world: None,
                 preview,
-                view: FlyCamera::new(Vec3::ZERO, 0.0, 0.0),
+                client,
                 curtime: 0.0,
             },
             input: Input::new(),
@@ -493,12 +488,14 @@ impl<'a> Engine<'a> {
             host,
             input,
             console_ui,
+            scene,
             ..
         } = self;
         console.run(&mut EngineCommands {
             host,
             input,
             ui: console_ui,
+            client: &mut scene.client,
         });
 
         // What `fps_max_callback` did. A poll rather than a callback, because a
@@ -543,11 +540,12 @@ impl<'a> Engine<'a> {
             );
         }
 
-        // `DispatchAllStoredGameMessages`' place in `MainLoop`
-        // (`sys_mainwind.cpp:509`): after the frame is agreed, before anything
-        // uses what it says. It is *after* the host, so a frame that loaded a
-        // level moves the view the level put it at, not the previous one's.
-        self.update_view(seconds, dx, dy);
+        // `CL_Move` (`engine/cl_main.cpp:2734`), which is
+        // `_Host_RunFrame_Input`'s third step — after the client processed
+        // input and after `Cbuf_Execute`, so a key pressed this tick moves the
+        // player this tick. It is *after* the host, so a frame that loaded a
+        // level moves the player the level put there, not the previous one.
+        self.update_client(seconds, dx, dy);
 
         // Reclaims the previous frame's uniform and geometry arenas. Must
         // happen before anything allocates out of them and after the previous
@@ -557,35 +555,48 @@ impl<'a> Engine<'a> {
         Some(outcome)
     }
 
-    /// Dispatches this tick's input and moves the view with it.
+    /// Builds this tick's command and runs it. `CL_Move`
+    /// (`engine/cl_main.cpp:2734`).
     ///
-    /// The stand-in for `CInput::CreateMove` plus `CViewRender::SetUpView`,
-    /// and it is a stand-in twice over: there is no player to move and no
-    /// binding table to ask, so the camera flies and the keys are the ones
-    /// Portal 2 ships defaults for. [`FlyCamera`] has the details.
+    /// Two calls rather than one, because in a game with a server the command
+    /// goes over the wire between them — see
+    /// [`Client::run_move`](crate::client::Client::run_move).
     ///
     /// Two orderings matter. The mouse is applied under the capture state the
-    /// motion was *accumulated* under, before this tick's events can change
-    /// it; and the camera moves after, so a tap of a movement key on the same
-    /// tick as a click is not lost.
-    fn update_view(&mut self, seconds: f32, dx: f32, dy: f32) {
+    /// motion was *accumulated* under, before this tick's events can change it;
+    /// and the player moves after the console has run, so a tap of a movement
+    /// key on the same tick as a click is not lost.
+    fn update_client(&mut self, seconds: f32, dx: f32, dy: f32) {
+        // `CInput::ClearStates`' other half (`in_mouse.cpp:828`).
+        // [`Input::clear`] released the *keys*; what is held is held by the
+        // `+command`, so alt-tabbing with `+forward` down would otherwise leave
+        // the player walking into a wall until focus came back.
+        let focus_lost = self
+            .input
+            .events()
+            .iter()
+            .any(|event| matches!(event, input::Event::FocusLost));
+        if focus_lost {
+            self.scene.client.clear_buttons();
+        }
+
         // **[`wants_mouse_capture`](Engine::wants_mouse_capture), not
         // `Input::mouse_look`.** They differ by exactly one term — the console
         // being up — and using the wrong one is a bug you see rather than one
         // you read: `DeviceEvent::MouseMotion` arrives from the *device*
-        // whether or not the cursor is grabbed, so moving the mouse to click
-        // in the console would spin the view underneath it.
+        // whether or not the cursor is grabbed, so moving the mouse to click in
+        // the console would spin the view underneath it.
         //
         // Discarding this tick's delta rather than suppressing it at `push` is
         // safe because `Input::frame` resets the accumulator every tick, so
         // nothing piles up to arrive in one lump when the console closes.
-        if self.wants_mouse_capture() {
-            self.scene.view.look(dx, dy, self.sensitivity.float());
-        }
-        // What is held is now what the `+command`s left held, not which
-        // physical keys are down — so which keys move the view is
-        // `config_default.cfg`'s answer rather than this file's.
-        self.scene.view.step(self.input.move_buttons(), seconds);
+        let mouse = match self.wants_mouse_capture() {
+            true => (dx, dy),
+            false => (0.0, 0.0),
+        };
+
+        let command = self.scene.client.create_move(mouse);
+        self.scene.client.run_move(&command, seconds);
 
         let mouse_look = mouse_look_after(self.input.mouse_look(), self.input.events());
         self.input.set_mouse_look(mouse_look);
@@ -637,31 +648,33 @@ impl<'a> Engine<'a> {
 
     /// Where the view is.
     ///
-    /// **A placeholder for [`CViewRender::SetUpView`]**, which is
-    /// `game/client/view.cpp` and arrives with the client. What is faithful
-    /// here is the projection — Valve's near and far planes and Portal's field
-    /// of view — and the coordinate system: Source is **Z-up, right-handed**,
-    /// so the view is built with `Z` as the up axis and world geometry needs no
-    /// conversion on the way to the GPU.
+    /// **A partial [`CViewRender::SetUpView`]** (`game/client/view.cpp:668`):
+    /// the eye and the angles come from the client, and the field of view is
+    /// `default_fov`, but the near and far planes are still constants here
+    /// rather than `GetZNear`/`GetZFar` — the far plane is derived from the
+    /// map's extents in the original, and making it so is `portdocs/CLIENT.md`
+    /// stage 2, along with the `ViewSetup` this should be returning.
     ///
-    /// The basis comes from `AngleVectors` (`mathlib/mathlib_base.cpp:1027`)
-    /// rather than being rebuilt here, so that the direction the camera looks
-    /// and the direction it moves are the same arithmetic — and so that a
-    /// rolled view (Portal 2 rolls constantly) tilts the picture rather than
-    /// only the movement. **Pitch is positive downwards**, which is the sign
-    /// error to watch for if the view ever looks at the ceiling when it should
-    /// look at the floor.
+    /// What is faithful is the coordinate system: Source is **Z-up,
+    /// right-handed**, so the view is built with `Z` as the up axis and world
+    /// geometry needs no conversion on the way to the GPU. The basis comes from
+    /// `AngleVectors` rather than being rebuilt here, so that the direction the
+    /// player looks and the direction it moves are the same arithmetic — and so
+    /// that a rolled view (Portal 2 rolls constantly) tilts the picture rather
+    /// than only the movement. **Pitch is positive downwards**, which is the
+    /// sign error to watch for if the view ever looks at the ceiling when it
+    /// should look at the floor.
     fn camera(&self, size: (u32, u32)) -> Camera {
         let (width, height) = size;
         let aspect = width.max(1) as f32 / height.max(1) as f32;
 
-        let eye = self.scene.view.origin;
-        let (forward, _, up) = self.scene.view.angles.vectors();
+        let eye = self.scene.client.eye();
+        let (forward, _, up) = self.scene.client.angles().vectors();
 
         Camera::perspective(
             eye,
             glam::camera::rh::view::look_at_mat4(eye, eye + forward, up),
-            DEFAULT_FOV,
+            self.scene.client.fov(),
             aspect,
             VIEW_NEAR_Z,
             VIEW_FAR_Z,
@@ -721,10 +734,13 @@ impl Level for Scene<'_> {
         // close as anything gets to a spawn until entities exist. A map
         // without one is not an error: the middle of the map is a better place
         // to look from than the origin, which is usually outside the level.
-        self.view = match world.spawn {
-            Some(spawn) => FlyCamera::new(spawn.eye, spawn.pitch, spawn.yaw),
-            None => FlyCamera::new(world.center(), 0.0, 0.0),
-        };
+        match world.spawn {
+            Some(spawn) => self.client.spawn(spawn.origin, spawn.pitch, spawn.yaw),
+            // The centre of the map is where a `Player` is *stood*, so the eye
+            // ends up `VEC_VIEW` above it. Sixty-four units up from the middle
+            // of a room is a better guess than the middle of the room.
+            None => self.client.spawn(world.center(), 0.0, 0.0),
+        }
 
         // Valve bracketed the load with `COM_TimestampedLog`; the interesting
         // number now is how much of the map actually draws, which is what
@@ -741,8 +757,8 @@ impl Level for Scene<'_> {
         );
         match world.spawn {
             Some(spawn) => eprintln!(
-                "source-engine: world: view at ({:.0} {:.0} {:.0}) pitch {:.0} yaw {:.0}",
-                spawn.eye.x, spawn.eye.y, spawn.eye.z, spawn.pitch, spawn.yaw
+                "source-engine: world: player at ({:.0} {:.0} {:.0}) pitch {:.0} yaw {:.0}",
+                spawn.origin.x, spawn.origin.y, spawn.origin.z, spawn.pitch, spawn.yaw
             ),
             None => eprintln!(
                 "source-engine: world: no info_player_start; \
@@ -778,11 +794,15 @@ impl Level for Scene<'_> {
 /// borrow-checker workaround: it makes the set of state a command may touch
 /// explicit, where the C++ answer was "all of it".
 ///
-/// It grows a field per subsystem that gains commands. Today `map`, `quit` and
-/// `restart` are all [`Host`] requests, so it holds one.
+/// It grows a field per subsystem that gains commands: `map`, `quit` and
+/// `restart` are [`Host`] requests, `bind` and friends are [`Input`]'s, the
+/// `+`/`-` pairs and `noclip` are the [`Client`]'s.
 struct EngineCommands<'e> {
     host: &'e mut Host,
     input: &'e mut Input,
+    /// The game client. A field of a field of [`Engine`] — `scene.client` —
+    /// which borrows disjointly from `console` and `host` just as the rest do.
+    client: &'e mut Client,
     /// `toggleconsole`/`showconsole`/`hideconsole`. The dialog is the engine's
     /// state, not the console's — see [`Engine::console_ui`].
     ui: &'e mut ConsoleUi,
@@ -807,7 +827,7 @@ impl CommandTarget for EngineCommands<'_> {
         if let Some(name) = cmd.name().strip_prefix(['+', '-']) {
             let down = cmd.name().starts_with('+');
             let index = cmd.arg(1).and_then(|arg| arg.trim().parse().ok());
-            return match self.input.move_buttons_mut().apply(name, down, index) {
+            return match self.client.buttons_mut().apply(name, down, index) {
                 true => Dispatch::Handled,
                 false => Dispatch::Unknown,
             };
@@ -826,6 +846,22 @@ impl CommandTarget for EngineCommands<'_> {
             },
             // `CON_COMMAND_F( quit, "Exit the engine.", FCVAR_NONE )`
             // (`engine/host_cmd.cpp:2750`).
+            // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )`. Walking is stage 4
+            // of `portdocs/CLIENT.md`, so turning it off leaves a player who
+            // cannot move rather than one who falls: there is no ground.
+            "noclip" => match self.client.toggle_noclip() {
+                MoveType::Noclip => cx.print("noclip ON"),
+                MoveType::Walk => cx.print(
+                    "noclip OFF - MOVETYPE_WALK is not implemented \
+                     (portdocs/CLIENT.md stage 4); the player will not move",
+                ),
+            },
+            // `IN_Impulse` (`game/client/in_main.cpp:757`). Latched onto the
+            // next command and cleared; nothing consumes impulses yet.
+            "impulse" => match cmd.arg(1).and_then(|arg| arg.trim().parse().ok()) {
+                Some(impulse) => self.client.set_impulse(impulse),
+                None => cx.print("impulse <number>"),
+            },
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
 
@@ -1088,6 +1124,7 @@ mod tests {
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
+        let mut client = Client::new(&mut console);
 
         for spec in [
             console::CommandSpec::new("bind", ""),
@@ -1103,6 +1140,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
 
@@ -1119,8 +1157,12 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
-        assert!(input.move_buttons().forward.is_down());
+        assert!(
+            client.create_move((0.0, 0.0)).forwardmove > 0.0,
+            "the command the client builds now asks to move forward"
+        );
 
         // Releasing the key stops it again.
         input.push(input::Event::Released(Button::Key(Key::W)));
@@ -1130,8 +1172,9 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
-        assert!(!input.move_buttons().forward.is_down());
+        assert_eq!(client.create_move((0.0, 0.0)).forwardmove, 0.0);
     }
 
     /// Stage 4 end to end without a GPU: the console key is bound by the
@@ -1146,6 +1189,7 @@ mod tests {
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
+        let mut client = Client::new(&mut console);
         for spec in [
             console::CommandSpec::new("bind", ""),
             console::CommandSpec::new("toggleconsole", ""),
@@ -1159,6 +1203,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         assert!(!ui.is_open());
 
@@ -1170,6 +1215,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         assert!(ui.is_open(), "the console key opened the console");
 
@@ -1183,6 +1229,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         assert!(!ui.is_open());
     }
@@ -1210,6 +1257,7 @@ mod tests {
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
+        let mut client = Client::new(&mut console);
         for spec in [
             console::CommandSpec::new("bind", ""),
             console::CommandSpec::new("unbindall", ""),
@@ -1227,6 +1275,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), None);
@@ -1267,9 +1316,14 @@ mod tests {
         }
     }
 
-    /// A console with the engine's persistence-related commands registered and
-    /// one archived cvar to carry across.
-    fn config_console(store: &std::sync::Arc<MemoryConfigs>) -> (Console<'static>, Cvar) {
+    /// A console with the engine's persistence-related commands registered, and
+    /// a client to supply the archived cvars that get carried across.
+    ///
+    /// The cvars are the client's real ones rather than a stand-in, so this
+    /// exercises what a session actually persists.
+    fn config_console(
+        store: &std::sync::Arc<MemoryConfigs>,
+    ) -> (Console<'static>, Client, Cvar) {
         let mut console = Console::new(Box::new(store.clone()), Vec::new());
         console.log_mut().set_echo_to_stderr(false);
         for spec in [
@@ -1279,8 +1333,13 @@ mod tests {
         ] {
             console.register_command(spec).expect("unique");
         }
-        let sensitivity = console.cvar("sensitivity", "2.5", CvarFlags::ARCHIVE, "");
-        (console, sensitivity)
+        let client = Client::new(&mut console);
+        let sensitivity = console
+            .cvars()
+            .find("sensitivity")
+            .expect("the client registers it")
+            .clone();
+        (console, client, sensitivity)
     }
 
     /// The whole of stage 3: what the writer produces, the reader reproduces.
@@ -1292,7 +1351,7 @@ mod tests {
         let store = std::sync::Arc::new(MemoryConfigs::default());
 
         // Session one: bind some keys, change a setting, write it out.
-        let (mut console, sensitivity) = config_console(&store);
+        let (mut console, mut client, sensitivity) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
@@ -1306,6 +1365,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         sensitivity.set_string("6");
         console.enqueue("host_writeconfig", Source::Code);
@@ -1313,6 +1373,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
 
         let written = store
@@ -1328,7 +1389,7 @@ mod tests {
         );
 
         // Session two: a fresh console and a fresh binding table, reading it.
-        let (mut console, sensitivity) = config_console(&store);
+        let (mut console, mut client, sensitivity) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
@@ -1337,6 +1398,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -1359,7 +1421,7 @@ mod tests {
     #[test]
     fn writing_is_refused_until_startup_has_read_a_config() {
         let store = std::sync::Arc::new(MemoryConfigs::default());
-        let (mut console, _) = config_console(&store);
+        let (mut console, mut client, _) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
@@ -1373,6 +1435,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
 
         assert!(
@@ -1386,7 +1449,7 @@ mod tests {
     #[test]
     fn writing_is_refused_when_almost_nothing_is_bound() {
         let store = std::sync::Arc::new(MemoryConfigs::default());
-        let (mut console, _) = config_console(&store);
+        let (mut console, mut client, _) = config_console(&store);
         let mut host = Host::new(host::DEFAULT_FPS_MAX);
         let mut input = Input::new();
         let mut ui = ConsoleUi::new();
@@ -1398,6 +1461,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            client: &mut client,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());
     }

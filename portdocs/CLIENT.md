@@ -10,10 +10,10 @@ Read `PORTING.md` first; this doc assumes its standing decisions. Read
 three deliberate deferrals land, and it says why they were deferred rather than
 attempted.
 
-**Status: planned, not started.** Nothing under `src/client/` exists yet. What exists is
-the placeholder this replaces: `src/engine/input/view.rs`'s `ViewAngles`, `FlyCamera`,
-`KButton` and `MoveButtons`, recorded as a known wart in `CLAUDE.md` and in
-`ENGINE_INPUT.md` §11.2.
+**Status: stage 1 of 5 is done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
+`src/engine/input/view.rs` is deleted, which closes the view-angles wart `CLAUDE.md` and
+`ENGINE_INPUT.md` §11.2 recorded. **The API reference is `rustdocs/CLIENT.md`; read that
+to *use* the module.** Stages 2 and 3 are unblocked; stage 4 waits for `trace/`.
 
 ---
 
@@ -471,13 +471,16 @@ that it is a count and not yet a simulation rate.
 
 ```
 src/client/
-  mod.rs      Client — owns the player, the command, the frame entry points
-  button.rs   KButton (full kbutton_t), Buttons (the IN_* set), the +/- commands
-  usercmd.rs  UserCmd
-  view.rs     ViewAngles, and stage 2's ViewSetup
-  move.rs     MoveData, Accelerate, FullNoClipMove; stage 4's FullWalkMove
-  player.rs   Player: origin, velocity, angles, move type, view offset
+  mod.rs        Client — owns the player, the command, the frame entry points
+  button.rs     KButton (full kbutton_t), Buttons, ButtonBits (the IN_* set), BUTTONS
+  usercmd.rs    UserCmd
+  view.rs       ViewAngles, scale_mouse; stage 2's ViewSetup
+  movement.rs   MoveData, accelerate, full_noclip_move; stage 4's full_walk_move
+  player.rs     Player: origin, velocity, angles, move type, view offset
 ```
+
+**As built.** One name changed: `move.rs` is `movement.rs`, because `move` is a keyword
+and `mod r#move;` is not worth it.
 
 `src/engine/input/view.rs` **is deleted** by stage 1: `ViewAngles` moves to
 `client/view.rs`, `KButton` to `client/button.rs`, `MoveButtons` becomes `Buttons`, and
@@ -488,50 +491,38 @@ the wart in `CLAUDE.md` and `ENGINE_INPUT.md` §11.2 is closed rather than moved
 
 Sketches, not signatures — the point is the shape.
 
+**As built** (`rustdocs/CLIENT.md` has the full signatures):
+
 ```rust
 pub struct Client {
     player: Player,
-    buttons: Buttons,          // the kbutton_t set the +/- commands drive
+    buttons: Buttons,
+    cvars: Cvars,          // ~19 handles
     command_number: i32,
     tick_count: i32,
     impulse: u8,
-    // cvar handles: sensitivity, m_yaw, m_pitch, cl_forwardspeed, ...
 }
 
 impl Client {
-    /// `CInput::CreateMove` (`in_main.cpp:1350`). Consumes this tick's mouse
-    /// delta and the button impulses; produces the command.
-    pub fn create_move(&mut self, dt: f32, mouse: (f32, f32), active: bool) -> UserCmd;
-
-    /// `CGameMovement::ProcessMovement` (`gamemovement.cpp:1325`).
-    pub fn run_move(&mut self, cmd: &UserCmd, dt: f32);
-
-    /// `CViewRender::SetUpView` (`view.cpp:668`). Stage 2.
-    pub fn view(&self, aspect: f32) -> ViewSetup;
-}
-
-pub struct Player {
-    origin: Vec3,
-    velocity: Vec3,
-    angles: ViewAngles,
-    move_type: MoveType,   // Noclip only, until stage 4
-    view_offset: Vec3,     // VEC_VIEW / VEC_DUCK_VIEW
-}
-
-pub struct UserCmd { /* §4.2 */ }
-
-pub struct KButton {
-    down: [Option<i32>; 2],
-    down_now: bool,      // state & 1
-    pressed: bool,       // state & 2, cleared on read
-    released: bool,      // state & 4, cleared on read
-}
-
-impl KButton {
-    /// `KeyState` (`in_main.cpp:813`). **Destructive** — clears the impulses.
-    pub fn key_state(&mut self) -> f32;
+    pub fn new(console: &mut Console<'_>) -> Client;
+    pub fn create_move(&mut self, mouse: (f32, f32)) -> UserCmd;  // CInput::CreateMove
+    pub fn run_move(&mut self, cmd: &UserCmd, dt: f32);           // ProcessMovement
+    pub fn eye(&self) -> Vec3;                                    // stage 2 makes this a ViewSetup
 }
 ```
+
+Two deviations from the sketch this section originally carried, both from building it:
+
+- **`create_move` takes no frame time.** Valve's takes `input_sample_frametime` for
+  `AdjustAngles` and `ControllerMove`; neither exists until stage 3, and an always-unused
+  parameter is scaffolding. It comes back with the sample-time budget. `run_move` takes
+  the frame time, because that is where it is used.
+- **`create_move` takes no `active` flag.** Valve's third argument is `!cl.IsPaused()`;
+  there is no pause.
+
+`Player` is a field of `Client` rather than of `Engine`'s `Scene` directly, and `Client`
+itself lives in `Scene` — because `Level::load` is handed a `&mut Scene` and loading a map
+is the only thing that positions a player.
 
 `state`'s three bits become three `bool`s rather than a bitfield: nothing indexes them,
 `state & 3` is one `||`, and the C++'s `data.state &= clearmask` trick in `CalcButtonBits`
@@ -596,9 +587,10 @@ because it means the design really is free:
 Each stage compiles, passes `cargo test`, and leaves the binary in a better state than it
 found it.
 
-### Stage 1 — the player exists (unblocked, ~600–800 lines)
+### Stage 1 — the player exists — **DONE** (2,114 lines, 49 tests)
 
-`src/client/` is created; `src/engine/input/view.rs` is deleted.
+`src/client/` is created; `src/engine/input/view.rs` is deleted. What actually landed,
+against what this section asked for:
 
 - `UserCmd`, `Buttons` (the `IN_*` set), `KButton` with the impulse bits and the
   destructive `key_state()`.
@@ -624,12 +616,25 @@ found it.
 - `engine/mod.rs`'s `update_view` becomes `create_move` + `run_move`. `Scene::view`
   becomes `Client::player`.
 
-**Behaviour after stage 1 is deliberately almost identical to today's** — fly around with
-WASD — with three visible differences: a tap shorter than a frame now moves you (that is
-`KeyState`), the movement has momentum (that is `sv_noclipaccelerate`, set it to 0 for the
-old feel), and `cl_forwardspeed 400` now works.
+Two things the plan did not anticipate, both found by building it:
 
-### Stage 2 — the view is the client's (unblocked, ~200 lines)
+- **A tap shorter than a frame reaches the command but does not move the player.** It was
+  supposed to be the headline demonstration of `KeyState`. `FullNoClipMove`'s friction
+  bleed floors `control` at `maxspeed / 4`, so it removes ~34.7 units of speed per frame
+  at 60 Hz while a quarter-speed wish only accelerates by ~20.8 — the tap is real, reaches
+  `forwardmove`, and is then eaten. That is Valve's arithmetic, and it is only visible
+  because stage 1 restored the acceleration branch. `sv_noclipaccelerate 0` shows the tap
+  moving the player.
+- **The steady-state noclip speed is ~768, not the 875 the wish asks for**, because the
+  friction bleed and `Accelerate`'s `addspeed` cap balance below it.
+
+**Behaviour after stage 1 is close to what came before** — fly around with WASD — with
+three visible differences: movement has momentum and coasts (that is
+`sv_noclipaccelerate` 5, which the placeholder camera hard-coded to 0), the eye is
+computed as feet-plus-`VEC_VIEW` rather than handed over as an eye, and every cvar above
+now works, including `cl_forwardspeed 400`.
+
+### Stage 2 — the view is the client's (unblocked, ~200 lines) — next
 
 - `ViewSetup` and `Client::view`: eye = origin + view offset, `default_fov`, `GetZFar`
   from `r_mapextents`/`r_farz` rather than a constant, `zNear` from `GetZNear`.

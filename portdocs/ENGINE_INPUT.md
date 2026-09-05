@@ -116,14 +116,14 @@ Novint), before any porting judgment is applied.
 | `keys.h` | 38 | Becomes `input/`'s public surface. |
 | `sys_mainwind.cpp` `DispatchInputEvent` | ~150 of 2,744 | The UI precedence chain (`:399`); collapses into egui's one answer (§8.3). |
 
-### `game/client/in_*.cpp` — 7,402 (all deferred to `client/`)
+### `game/client/in_*.cpp` — 7,402 (the client's; see `portdocs/CLIENT.md`)
 
 | File | Lines | Disposition |
 |---|---|---|
-| `in_main.cpp` | 2,102 | `kbutton_t`, `KeyState`'s fractional model (§4.4), `AdjustAngles`, `CreateMove`. **Stage 2 borrows the angle math only.** |
+| `in_main.cpp` | 2,102 | `kbutton_t`, `KeyState`'s fractional model (§4.4), `AdjustAngles`, `CreateMove`. **Ported by `client/` stage 1**, except `AdjustAngles` (its stage 3). |
 | `in_joystick.cpp` | 2,016 | Response curves, deadzones, auto-aim dampening. **Client-layer, content-tuned; stage 5+ at the earliest** (§10). |
 | `in_camera.cpp` | 1,079 | Third-person orbit camera. Portal 2 is first-person; effectively out of scope. |
-| `in_mouse.cpp` | 843 | Accumulate/scale/apply (§4.5). **Stage 2 borrows the accumulate and apply halves.** |
+| `in_mouse.cpp` | 843 | Accumulate/scale/apply (§4.5). **The accumulate half is this module's** and is done; scale and apply are `client/` stage 1's and are done there. |
 | `in_forcefeedback.cpp` | 833 | **Deleted.** X360 rumble. Revisit via `gilrs`'s `ff` feature if rumble is ever wanted. |
 | `in_steamcontroller.cpp` | 282 | Deferred with Steam. |
 | `in_trackir.cpp` | 226 | **Deleted.** TrackIR head tracking. |
@@ -691,11 +691,14 @@ Other notes for whoever does this:
    whether the *down-state and view angles* are one object or an array, which is cheap to
    defer **provided nothing bakes "one player" into `Event` or `Button`.** Recommendation:
    build for one player, keep the seam, do not add a slot field until co-op is scheduled.
-2. **`ViewAngles` in `input/` is a wart with a known end.** They belong in
-   `CClientState` (§4.6). **Move them to `client/` when it exists**; until then there is
-   nowhere else, and the alternative — putting them in `engine/mod.rs` — spreads the same
-   code over two modules instead of one. Comment it at the site, in the style of
-   `CLAUDE.md`'s "Known warts" section, and add it to that section when stage 2 lands.
+2. **~~`ViewAngles` in `input/` is a wart with a known end.~~ Resolved.**
+   `src/client/` exists (`portdocs/CLIENT.md` stage 1) and `input::view` is **deleted**:
+   `ViewAngles`, `KButton`, `MoveButtons` and `FlyCamera` are all the game client's now.
+   §4.6's conclusion needs one correction, though — it says "the engine owning view
+   angles is faithful". It is faithful to the *code*, but Valve's own comment two lines
+   above the getter (`cdll_engine_int.cpp:1048`) is `// FIXME, move entirely to client
+   .dll`, and with no DLL boundary here the port simply takes the FIXME. The engine never
+   gets a copy.
 3. **`fps_max` versus input latency.** With `fps_max` 300 and a 1000 Hz mouse, several
    motion events accumulate per frame — correct, and the accumulator handles it. But
    `Host::frame` refusing frames means input is sampled at the *frame* rate, not the

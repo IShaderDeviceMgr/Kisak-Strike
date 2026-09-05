@@ -372,16 +372,22 @@ which has real internal pointers.
 ## `src/engine/input/`
 
 Buttons, the event queue, and where the view points. Replaces `inputsystem/` (10,649
-lines), `engine/keys.cpp` (1,392) and `sys_mainwind.cpp`'s `DispatchInputEvent`, and
-stands in for `game/client/in_*.cpp` (7,402) until `client/` exists.
+lines), `engine/keys.cpp` (1,392) and `sys_mainwind.cpp`'s `DispatchInputEvent`.
 [`portdocs/ENGINE_INPUT.md`](../portdocs/ENGINE_INPUT.md) is the plan; **stages 1-4 of its
-five are done** — translation, button state, mouse look, a free-fly camera, bindings and
-UI precedence. Only controllers (stage 5, `gilrs`) are left.
+five are done** — translation, button state, mouse look, bindings and UI precedence. Only
+controllers (stage 5, `gilrs`) are left.
+
+**The movement layer is no longer here.** `game/client/in_*.cpp`'s view angles,
+`kbutton_t`s and the free-fly camera lived in `input::view` as a placeholder until
+`src/client/` existed; they are now [`rustdocs/CLIENT.md`](CLIENT.md)'s, where the
+`CUserCmd` that gives them meaning is. What crosses the boundary is a `+command` in the
+command buffer and two floats of mouse delta — **this module names no client type and the
+client names no input type**.
 
 | | |
 |---|---|
-| Module | `crate::engine::input`, with `input::bind`, `input::button` and `input::view` |
-| Lines | ~2,100 including tests |
+| Module | `crate::engine::input`, with `input::bind` and `input::button` |
+| Lines | ~1,500 including tests |
 | Tests | 58 (`cargo test engine::input`), plus 5 for the `winit` table (`engine::window::translate`) |
 | Dependencies | `std` and `glam`. **Not `winit`, and not `egui`** — see [the seam](#the-seam-window-translates-input-decides) |
 
@@ -517,41 +523,23 @@ So: **a release reaches the game unless the press that matched it was taken by t
 not unless the UI wants it now.** `Input::clear` resets the latch with the down-state,
 because a claim that outlived the window it was made in would misroute the next release.
 
-### `ViewAngles` and `FlyCamera`
+### The view angles and the camera are gone from here
 
-```rust
-pub const SENSITIVITY: f32 = 2.5;                   // `sensitivity`
+`ViewAngles`, `KButton`, `MoveButtons` and `FlyCamera` were `input::view`, and are now
+`crate::client` — see [`rustdocs/CLIENT.md`](CLIENT.md). `FlyCamera` in particular no
+longer exists in any form: a real `Player` in `MOVETYPE_NOCLIP`, moved by
+`FullNoClipMove` from a `UserCmd`, replaced it rather than being renamed into it.
 
-pub struct ViewAngles { pub pitch: f32, pub yaw: f32, pub roll: f32 }
+The two facts that used to live here and still matter to anyone reading `input/`:
 
-impl ViewAngles {
-    pub fn new(pitch: f32, yaw: f32) -> ViewAngles;
-    pub fn apply_mouse(&mut self, dx: f32, dy: f32, sensitivity: f32);
-    pub fn vectors(&self) -> (Vec3, Vec3, Vec3);    // AngleVectors: forward, right, up
-}
-
-pub struct FlyCamera { pub origin: Vec3, pub angles: ViewAngles }
-
-impl FlyCamera {
-    pub fn new(origin: Vec3, pitch: f32, yaw: f32) -> FlyCamera;
-    pub fn look(&mut self, dx: f32, dy: f32);
-    pub fn step(&mut self, input: &Input, seconds: f32);
-}
-```
-
-`ViewAngles` is faithful: `ScaleMouse`/`ApplyMouse` (`in_mouse.cpp:412`, `:470`),
-`ClampAngles` (`in_main.cpp:975`) and `AngleVectors` (`mathlib_base.cpp:1027`), with
-Valve's shipped constants — `sensitivity` 2.5, `m_yaw`/`m_pitch` 0.022,
-`cl_pitchdown`/`cl_pitchup` 89. Roll is deliberately *not* clamped, because Portal
-excludes itself from the ±50° limit every other Source game applies ("the player can be
-upside down! -Jeep").
-
-`FlyCamera` is not faithful and is not meant to be: it is `CUserCmd` + `CGameMovement` +
-`CViewRender::SetUpView` collapsed to eight lines, moving at `FullNoClipMove`'s speeds
-(`cl_forwardspeed` 175 — Portal 2's `MAX_LINEAR_SPEED`, where other Source games get 450
-— times `sv_noclipspeed` 5, halved by `+speed`, clamped to `sv_maxspeed * 5`) with no
-acceleration. **It replaced the turntable camera**, and it is replaced in turn by
-`client/`.
+- **The mouse delta this module returns is raw device units**, summed since the last
+  tick. Scaling by `sensitivity` and turning it into angles is the client's
+  (`ScaleMouse`/`ApplyMouse`), and the client is also what decides whether `+strafe`
+  makes it movement instead.
+- **Whether the delta should be applied at all is the engine's question**, not this
+  module's: `Engine::wants_mouse_capture` (which includes "the console is not up") gates
+  it, and `Input::mouse_look` alone is the wrong term — see the gotcha in
+  `Engine::update_client`.
 
 ### The seam: `window/` translates, `input/` decides
 
@@ -683,8 +671,6 @@ pub fn dispatch(&self, button: Button, down: bool, modifier_down: bool,
 pub fn bindings(&self) -> &Bindings;
 pub fn bindings_mut(&mut self) -> &mut Bindings;
 pub fn dispatch_bindings(&self, sink: &mut dyn CommandSink);
-pub fn move_buttons(&self) -> &MoveButtons;
-pub fn move_buttons_mut(&mut self) -> &mut MoveButtons;
 ```
 
 `Key_SetBinding` (`keys.cpp:117`) and `Key_Event`'s dispatch tail (`:1130`).
@@ -696,7 +682,10 @@ both. `Console::enqueue` with `Source::UserInput` is the whole implementation.
 `+forward <index>` on press and `-forward <index>` on release; **any other binding fires
 on press only**, because `bind F5 jpeg` must not take two screenshots.
 
-**The index argument is load-bearing**, not decoration — see [`MoveButtons`](#movebuttons).
+**The index argument is load-bearing**, not decoration: `KButton` records up to *two*
+holders, so two keys bound to `+forward` do not cancel each other. Valve says it outright
+— "*Button commands include the kenum as a parameter, so multiple downs can be matched
+with ups*" (`keys.cpp:1132`). What consumes it is [`Buttons`](CLIENT.md).
 
 Three of Valve's special cases are kept and each one is a usability guarantee rather than
 a quirk:
@@ -715,59 +704,17 @@ And one more: `toggleconsole` is **swallowed while a shift, control or alt is he
 `bind_osx` is not a curiosity — `config_default.cfg` ships `bind_osx "z" "+zoom"` and
 macOS is a supported target. It is `bind` gated on `cfg!(target_os = "macos")`.
 
-### `MoveButtons`
-
-`kbutton_t` (`in_main.cpp:424`) reduced to the half that can exist without a player, in
-`input::view` because it moves to `client/` with [`FlyCamera`](#the-camera-is-a-placeholder).
-
-```rust
-pub struct KButton;                 // one +command's holders
-pub fn press(&mut self, index: Option<i32>);
-pub fn release(&mut self, index: Option<i32>);
-pub fn is_down(&self) -> bool;
-
-pub struct MoveButtons { pub forward, back, move_left, move_right, up, down, speed: KButton }
-pub fn apply(&mut self, name: &str, down: bool, index: Option<i32>) -> bool;
-pub fn clear(&mut self);
-pub const MOVE_COMMANDS: &[(&str, &str)];   // ("+forward", "-forward"), …
-```
-
-**Why the index argument exists.** `KButton` records up to *two* holders, so two keys
-bound to `+forward` do not cancel each other: releasing one leaves the other holding the
-movement. Valve says it outright — "*Button commands include the kenum as a parameter, so
-multiple downs can be matched with ups*" (`keys.cpp:1132`). Without it, `bind UPARROW
-+forward` alongside `bind w +forward` makes tapping either one stop the other.
-
-A `-command` with **no** index releases unconditionally (Valve's `if ( !c || !c[0] )`
-branch), which is what makes typing `-forward` at the console the way out of a stuck key.
-
-**Deliberately not ported:** `state`'s impulse bits and `KeyState`'s
-fraction-of-a-frame (`in_main.cpp:813`), which is what stops a 30 Hz frame from swallowing
-a fast tap. That is good design and it is genuinely `client/`'s — it exists to fill in
-`CUserCmd`'s float move values.
-
-One divergence that fixes a latent bug: Valve stores holders as `int` with **0 meaning
-empty**, so button code 0 could never hold anything. This uses `Option`.
-
-> **Placeholder divergence: `+jump` and `+duck` fly the camera up and down.**
-> `ComputeUpwardMove` (`in_main.cpp:1101`) reads `+moveup`/`+movedown` only, and Portal 2
-> binds **neither** — vertical movement is a noclip-only concept with no shipped key. So
-> `MoveButtons` also accepts `+jump` and `+duck` (SPACE and CTRL in the shipped config),
-> so that a camera standing in for a player flies with the keys the player's config
-> actually binds. **This dies with `client/`.**
-
 ### Not implemented, and what each waits on
 
 | Missing | Waits on |
 |---|---|
 | Controllers, hot-plug, analog axes | `gilrs` — stage 5. `in_joystick.cpp`'s response curves and deadzones are content-tuned client behavior and come with `client/`, not with the device layer. |
-| `CUserCmd`, the fractional `KeyState` model, `CreateMove`, prediction | `client/`. `kbutton_t`'s two-holder set [now exists](#movebuttons) because the index argument needs it; the fractional key state does not, and building *that* against a camera instead of a player would bake in the wrong consumer. |
+| `CUserCmd`, `kbutton_t`, the fractional `KeyState` model, `CreateMove`, prediction | **Done, in [`crate::client`](CLIENT.md)** — not here. `input/` produces `+forward <index>` text and a raw mouse delta; everything downstream of that is the game client's. |
 | `unbindalljoystick`, `unbindallmousekeyboard`, `Key_SetBinding`'s splitscreen joystick remap | controllers (stage 5) and co-op. |
 | The guard refusing every binding except `toggleconsole` while not connected (`keys.cpp:1139`) | `client/` — it needs `engineClient->IsConnected()`. |
-| `m_customaccel` 1-4, `m_mousespeed`/`m_mouseaccel1`/`m_mouseaccel2` | Nothing — deliberately dropped. Per-user feel tuning with no default behavior, and the latter three are Windows `SPI_SETMOUSE` overrides, inert on POSIX. |
-| `cl_mouselook_roll_compensation` — rotating the mouse delta by the inverse of the view roll | Something that rolls the view. **In scope for Portal 2**, which rolls constantly (gels, portals through non-vertical surfaces); `ViewAngles::roll` is where it attaches. |
+| `m_customaccel`, `cl_mouselook_roll_compensation`, and the rest of the mouse-shaping cvars | The client's, not this module's — [`CLIENT.md`](CLIENT.md) records which are dropped and which are deferred. |
 | `Key_StartTrapMode` ("press a key to bind it") | An options UI. ~35 lines, trivially re-added. |
-| Split-screen: per-player down-state and view angles | Co-op being scheduled. The binding table was global even in the original, so the cost is deferred as long as nothing bakes a player slot into `Event` or `Button` — nothing does. |
+| Split-screen: per-player down-state | Co-op being scheduled. The binding table was global even in the original, so the cost is deferred as long as nothing bakes a player slot into `Event` or `Button` — nothing does. |
 | IME, cursor icons, `IInputStackSystem`, X360/PS3/TrackIR/Novint hardware | Deleted, not deferred. See `portdocs/ENGINE_INPUT.md` §5. |
 
 ### Test coverage (input)
@@ -788,15 +735,13 @@ empty**, so button code 0 could never hold anything. This uses `Option`.
 | `a_plus_binding_sends_both_edges_with_the_button_index`, `a_plain_binding_fires_on_the_way_down_only` | the `+`/`-` convention, both halves of its asymmetry |
 | `escape_always_binds_to_cancelselect`, `escape_cannot_be_unbound_and_unbindall_spares_the_console_key` | the three Valve special cases that guarantee a way out |
 | `toggleconsole_is_swallowed_under_a_modifier`, `a_modifier_held_swallows_toggleconsole` | `keys.cpp:1170`, at both layers |
-| `two_keys_bound_to_one_command_do_not_cancel_each_other` | why the index argument exists |
-| `a_bare_minus_command_releases_unconditionally` | the way out of a stuck key |
 | `auto_repeat_never_reaches_the_binding` | that the transition guard already covers `KeyDown`'s repeat check |
-| `focus_loss_releases_what_the_commands_are_holding` | that clearing the key down-state is *not* enough — the command holds the button |
-| `a_bound_key_moves_the_camera_through_the_command_buffer` | the whole chain, `bind` → press → command text → console → `MoveButtons`, with nothing mocked |
+| `focus_loss_releases_the_keys_and_is_still_reported` | that clearing the key down-state is *not* enough — the command holds the button, so the event has to reach the tick for the engine to clear the client's too |
+| `a_bound_key_moves_the_camera_through_the_command_buffer` | the whole chain, `bind` → press → command text → console → `Buttons` → `UserCmd`, with nothing mocked |
 | `a_release_goes_to_whoever_took_the_press` | **the latch, and the bug it exists for**: click, open the console, let go, and `-attack` still runs |
 | `a_press_the_ui_took_never_reaches_the_game` | the other direction — clicking in the console does not send a bare `-attack` on the way out |
-| `the_down_state_records_what_is_held_whoever_took_it` | that `m_bKeyDown` is set before the chain runs, which is what `client/` will read |
-| `text_and_wheel_the_ui_took_are_dropped` | that typing `w` in the console does not walk the camera |
+| `the_down_state_records_what_is_held_whoever_took_it` | that `m_bKeyDown` is set before the chain runs |
+| `text_and_wheel_the_ui_took_are_dropped` | that typing `w` in the console does not walk the player |
 | `losing_focus_forgets_who_was_owed_a_release` | a claim outliving the window it was made in |
 | `only_the_key_bound_to_toggleconsole_bypasses_the_ui` | `Bindings::bypasses_ui`, gotcha #15 |
 | `the_console_key_opens_the_dialog_through_the_command_buffer` | stage 4 end to end: binding → command text → console → dialog, and closing again |
@@ -1529,27 +1474,37 @@ Not bugs; each names what it waits on.
 | Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. Now that the camera flies, it is also possible to fly *out* of the level and look back in, which nothing culls. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
 | Collision, traces | `cmodel.cpp`, `enginetrace.cpp` — needed by gameplay, not by drawing. |
-| Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. Input exists but moves a camera, not a player. |
+| Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. There is a player, but it can only noclip: nothing collides, falls or is simulated. |
 
-### The camera is a placeholder
+### The camera is the player's eye
 
-`Engine::camera` reads the [`FlyCamera`](#engine-input) the level put at
-`info_player_start` and that input moves. **Which keys those are now comes from
-`cfg/config_default.cfg`**, not from this file: WASD is `+forward`/`+back`/`+moveleft`/
-`+moveright`, SPACE and CTRL are `+jump`/`+duck` and fly the camera up and down (a
-[placeholder divergence](#movebuttons)), the mouse looks, and Escape releases the cursor.
-`+speed` walks but Portal 2 binds no key to it. (The turntable that stood here before
-input landed is gone.) What is faithful is the projection —
-`VIEW_NEARZ` 7 (`game/client/view.h:27`), far = `r_mapextents` × √3 (`view.cpp:644`),
-and Portal's `default_fov` 75 (`clientmode_portal.cpp:32`) — and the coordinate system:
+`Engine::camera` asks [`Client`](CLIENT.md) where the eye is (`client.eye()`), where it
+points (`client.angles()`) and how wide it is (`client.fov()`, which is `default_fov`).
+The player it reads is a real one — a `Player` in `MOVETYPE_NOCLIP`, positioned at
+`info_player_start` and moved by `FullNoClipMove` from a `UserCmd` — rather than the
+free-fly camera that stood here before `src/client/` landed.
+
+**Which keys move it comes from `cfg/config_default.cfg`**, not from this file: WASD is
+`+forward`/`+back`/`+moveleft`/`+moveright`, SPACE and CTRL are `+jump`/`+duck` and drive
+the vertical axis (a placeholder divergence — see `CLIENT.md` gotcha 11), the mouse looks,
+and Escape releases the cursor. `+speed` walks but Portal 2 binds no key to it.
+
+**Noclip has momentum now**, which it did not when this was a camera: `sv_noclipaccelerate`
+defaults to 5, so movement accelerates over ~0.6 s and coasts on release. `CLIENT.md`
+gotcha 4 has the arithmetic; `sv_noclipaccelerate 0` restores the old instant-stop feel.
+
+What is faithful in this function is the projection — `VIEW_NEARZ` 7
+(`game/client/view.h:27`), and Portal's `default_fov` 75 — and the coordinate system:
 Source is **Z-up right-handed**, so the view is built with `Z` as up and world geometry
-needs no conversion. The basis comes from `AngleVectors`, so the direction the camera
+needs no conversion. The basis comes from `AngleVectors`, so the direction the player
 looks and the direction it moves are the same arithmetic, and **pitch is positive
 downwards**.
 
-What is *not* faithful is that there is no player: no collision, no gravity, no
-`CUserCmd`, no prediction. `CViewRender::SetUpView` and `client/` are the real
-replacement, and `FlyCamera` and [`MoveButtons`](#movebuttons) go with them.
+What is *not* faithful: the far plane is still the constant `16384 × √3` rather than
+`r_mapextents × √3` read from the map (`view.cpp:644`), and this returns a `Camera`
+instead of the `ViewSetup` that `CViewRender::SetUpView` builds. Both are
+`portdocs/CLIENT.md` stage 2. There is also still no collision, no gravity and no
+prediction — `MOVETYPE_WALK` is stage 4 and waits for `trace/`.
 
 **A black screen on some maps is this, not a lighting bug.** `info_player_start` is only
 where the *engine* puts the player; several Portal 2 maps spawn inside a sealed box in the
@@ -1724,29 +1679,31 @@ The renderer stays with the window because the surface is tied to the window han
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
 refcounted clones.
 
-Internally `Engine` is eight fields: the `Console`, the `ConsoleUi` that draws it, the
-`Host`, the `Input` (which owns the
-binding table and the movement buttons), `sensitivity` — the port's first `FCVAR_ARCHIVE`
-cvar, and therefore the first thing `config.cfg` persists that is not a binding — the
-engine's
-own `fps_max` handle with the generation it last saw, and a private `Scene`
-holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`,
-the view and `curtime`. `Scene` is what implements [`Level`], so
+Internally `Engine` is seven fields: the `Console`, the `ConsoleUi` that draws it, the
+`Host`, the `Input` (which owns the binding table), the engine's own `fps_max` handle with
+the generation it last saw, the two booleans that sequence startup, and a private `Scene`
+holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`, the
+[`Client`](CLIENT.md) and `curtime`. `Scene` is what implements [`Level`], so
 `host.frame(&mut self.scene)` is a split borrow of two fields rather than `&mut self`
-twice — that is the whole reason for the split. The view lives in `Scene` rather than
-beside the `Input` because it is level state: loading a map puts it at that map's
-`info_player_start`.
+twice — that is the whole reason for the split.
+
+**The `Client` lives in `Scene` for that same reason**: loading a map is the only thing
+that positions a player, and `Level::load` is handed a `&mut Scene`. It is not level state
+— its ~19 cvar handles and its button state outlive any map — but its one level-scoped
+field decides where it has to be reachable from. `sensitivity` and the rest of the mouse
+and movement cvars are registered by `Client::new` and are no longer the engine's.
 
 `Engine::frame` runs the console **inside** the frame, after the host has agreed one is
 happening — one `Console::run` is one command-buffer tick, so running it per window event
 would tick `wait` at the display's rate. A command queued this frame is therefore acted on
 by the next frame's state machine, which is one frame of latency at startup and is why
 `map` goes through `Host::request_new_game` rather than loading in place. `EngineCommands`
-is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut Input` and
-`&mut ConsoleUi`.
+is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut Input`,
+`&mut ConsoleUi` and `&mut Client` (which is `scene.client` — a field of a field, and
+disjoint from the rest).
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
-`key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, and the `+`/`-` movement
-pair.
+`key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`, and
+the 22 `+`/`-` button pairs from `client::BUTTONS`.
 
 `Engine::boot` prefers `//mod/cfg/config.cfg` and falls back to `config_default.cfg`, then
 queues `exec valve.rc` — see [config persistence](#config-persistence). `Engine::frame`
@@ -1754,7 +1711,13 @@ completes the handshake on its first pass: it binds the backquote to `togglecons
 nothing else did (`host.cpp:2085`), sets `config_was_read`, and writes a config if startup
 fell back to the defaults. A clean `Outcome::Quit` or `Restart` writes one too.
 
-`Engine::update_view` is where input becomes movement. `mouse_look_after` now sees **only
+`Engine::update_client` is where input becomes movement: it is `CL_Move`
+(`cl_main.cpp:2734`), and it calls `Client::create_move` then `Client::run_move`. It also
+makes the second half of `CInput::ClearStates` — `Input::clear` released the *keys*, and
+`Client::clear_buttons` releases what the `+command`s are holding, which is why
+`Event::FocusLost` has to survive into `Input::events`.
+
+`mouse_look_after` now sees **only
 what the UI did not take**: with the console up, Escape closes the dialog inside `egui`
 and a click is the dialog's, so neither reaches it. With the console closed it is
 unchanged — Escape frees the cursor, a click takes it back, last event of the tick wins.

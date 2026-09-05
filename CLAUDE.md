@@ -19,6 +19,7 @@ is not compiled, not linked, and not edited.
   src/filesystem/  search paths, gameinfo.txt, VPK reading
   src/materials/   the GPU device and frame boundary (wgpu), textures, materials
   src/engine/      the engine; window/ (winit), host/, world/, input/, console/ (egui)
+  src/client/      the game client — the player, CUserCmd, movement, the view
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -58,9 +59,10 @@ engine frame loop with a real host state machine, **reads the shipped `cfg/confi
 draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
 `egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
 list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), and
-every cvar and command the port has registered. It is **not a runnable game** — there is no simulation, sound or
-netcode, and nothing that moves is a player — but the boot path is continuous from
-`main` to a rendered, lit level you can look around.
+every cvar and command the port has registered. **There is now a player** — a real one, in
+`MOVETYPE_NOCLIP`, built from a `CUserCmd` and moved by `FullNoClipMove` — but it is
+**still not a runnable game**: no collision, no simulation, no sound, no netcode. The boot
+path is continuous from `main` to a rendered, lit level you can fly around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -74,9 +76,13 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 draw as the magenta error checkerboard are `maps/<map>/…` cubemap patches living in the
 `.bsp`'s embedded pak lump, which the `Vfs` does not mount yet. The scene is **dimmer than
 the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
-unexposed. The camera is a **free-fly noclip camera** — WASD, space and left control,
-left shift to walk, mouse to look, **Escape to release the cursor** — standing in for a
-player that does not exist yet; it is a placeholder and is documented as one.
+unexposed. The view is the **player's eye**: WASD, space and left control, left shift to
+walk, mouse to look, **Escape to release the cursor**. The player is in `MOVETYPE_NOCLIP`,
+which is a real Source movetype rather than a camera pretending to be one — so **it has
+momentum**, because `sv_noclipaccelerate` is 5 and not 0. Set `sv_noclipaccelerate 0` for
+an instant stop. `noclip` toggles, and says so when it turns off, because `MOVETYPE_WALK`
+needs collision and is not implemented. Space and control are a documented placeholder:
+`ComputeUpwardMove` reads `+moveup`/`+movedown`, and Portal 2 binds neither.
 
 `` ` `` opens the console (Escape or `` ` `` closes it), which releases the cursor for as
 long as it is up. Tab and the arrow keys cycle completions; an empty entry cycles history
@@ -205,10 +211,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
   `input/` is stages 1-4 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
   space with Valve's shipped key names, an event queue **pushed between ticks and
-  drained once per tick** inside `Engine::frame`, `ViewAngles`' faithful
-  `ApplyMouse`/`ClampAngles`/`AngleVectors`, a free-fly camera at
-  `FullNoClipMove`'s speeds that **deleted the turntable**, bindings, and UI precedence.
-  It names no `winit` type and no `egui` type —
+  drained once per tick** inside `Engine::frame`, bindings, and UI precedence. **The
+  movement layer that lived here as a placeholder is gone** — `input::view` is deleted and
+  its contents are `src/client/`'s. It names no `winit` type, no `egui` type and no client
+  type —
   `window/` translates, `input/` decides — so it is tested without a window, which is
   also what leaves room for `gilrs` at stage 5. **Stage 4 is `FilterKey`'s key-up latch**
   (`keys.cpp:1189`): the target that consumed a *press* is recorded per button and the
@@ -239,28 +245,57 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   and facing is decided after the flip). In file order a map draws as an empty clear
   colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
   fixing it in `PipelineCache` instead.
+- **`src/client/` — the game client, stage 1 of 5 ported** (`portdocs/CLIENT.md`,
+  **`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
+  tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
+  **It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
+  snapshot parsing), lands at `src/engine/client/` and is blocked on `net/`; the two share
+  a name and nothing else. Stage 1 is the input→command→movement→view spine: `UserCmd`,
+  `kbutton_t`'s two-holder set **with its fractional `KeyState`** (the half `input/`
+  deliberately refused to build against a camera), the 22 `+`/`-` buttons and their `IN_*`
+  bits, `FullNoClipMove` and `Accelerate`, a `Player` in `MOVETYPE_NOCLIP`, and ~19 cvars
+  with Valve's names, defaults, bounds and flags. **Valve's own
+  `// FIXME, move entirely to client .dll`** (`engine/cdll_engine_int.cpp:1048`) is taken:
+  the view angles are the client's and the engine never gets a copy.
+  Four rules that produce a plausible wrong answer rather than an error:
+  **`KeyState` is destructive and the read order matters** — the movement axes are
+  computed before the button bits, so a tap shorter than a frame reaches `forwardmove` and
+  *not* `IN_FORWARD`, and reversing them is a difference a server would see; **the first
+  frame after a press is worth half a frame**, so a movement number wrong by a factor of
+  two is usually this working correctly; **`Player::origin` is the feet** and `eye()` is
+  64 units higher, so conflating them reads as a level built slightly wrong; and **a `dt`
+  of 1.0 does not move the player at all**, because the friction bleed scales with the
+  frame time and a one-second step removes more speed than a second of acceleration adds.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next: **`console/` is finished and nothing in `input/` blocks the boot path any more.**
-The candidates, in the order they are worth doing:
+Next: **`client/` stage 1 has landed and closed the last wart on the boot path.** The
+candidates, in the order they are worth doing:
 
+- **`client/` stages 2 and 3** (`portdocs/CLIENT.md` §8), both unblocked and both small.
+  Stage 2 is `CViewRender::SetUpView` proper — a `ViewSetup`, the far plane derived from
+  `r_mapextents` instead of a constant, and `Engine::camera` reduced to a conversion.
+  Stage 3 is keyboard look and the `IN_SetSampleTime` budget, which only means something
+  once the mouse is sampled a second time per frame.
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
-- **The game client**, at top-level **`src/client/`** and **planned in
-  `portdocs/CLIENT.md`** — read that before starting it. This is what the boot path itself
-  wants next, and it is the module that finally takes `ViewAngles`, `FlyCamera` and
-  `MoveButtons` out of `input/` (see the wart below). **Not `ENGINE.md` §7.5**, which is
-  the client *connection* (`CClientState`, snapshot parsing), lands at
-  `src/engine/client/`, and is blocked on `net/`; the two share a name and nothing else.
-  Stages 1-3 of `CLIENT.md` are blocked on nothing — `CUserCmd` built from `kbutton_t`'s
-  fractional `KeyState` and run through `FullNoClipMove`, which makes the placeholder
-  camera a real `MOVETYPE_NOCLIP` player. Walking is stage 4 and waits for `trace/`.
+- **`trace/`** (`ENGINE.md` §7.17) is what `client/` stage 4 needs, and stage 4 —
+  `FullWalkMove`, gravity, collision, ducking — is what turns the noclip player into a
+  player.
 
 ### Known warts, and what triggers fixing them
 
 Deliberate small compromises, recorded so nobody has to rediscover them and nobody
-"fixes" one prematurely. Each names the condition that makes it worth doing. Both are
+"fixes" one prematurely. Each names the condition that makes it worth doing, and each is
 also commented at the site.
+
+**Resolved:** the **view angles and the free-fly camera** used to live in
+`src/engine/input/view.rs`, to be moved "to `client/` when it exists". `client/` stage 1
+is that, and the file is deleted rather than moved: `ViewAngles` is the client's,
+`MoveButtons` became `Buttons` with the fractional `KeyState` the wart said not to build
+against a camera, and `FlyCamera` became a `Player` in `MOVETYPE_NOCLIP` moved by
+`FullNoClipMove`. One placeholder outlived it and is documented at the site: `+jump` and
+`+duck` still drive the vertical axis, because `ComputeUpwardMove` reads
+`+moveup`/`+movedown` and Portal 2 binds neither. That dies at stage 4.
 
 **Resolved:** `CommandLine` used to live in `src/launcher/` and be read from
 `src/engine/window/`, to be moved "when a third subsystem needs it". `console/` was that
@@ -269,21 +304,12 @@ lives at `src/cmdline.rs`. The move also fixed a real divergence: `CCommandLine:
 refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the port's
 `value()` did not, which would have had `-window` swallow `+map`.
 
-- **The view angles and the free-fly camera live in `src/engine/input/view.rs`.** They
-  belong to the client: `CInput::AdjustAngles` reads and writes them through
-  `engine->GetViewAngles`/`SetViewAngles`, which resolve to `CClientState::viewangles`
-  (`engine/cdll_engine_int.cpp:1050`), and only the client DLL mutates them. They sit in
-  `input/` because there is nowhere else — the alternative, `engine/mod.rs`, spreads the
-  same code over two modules instead of one. **Move them to `src/client/` when it
-  exists** — `portdocs/CLIENT.md` stage 1 deletes `view.rs` outright — along with
-  `FlyCamera`, whose real replacements are `CUserCmd`, `CGameMovement` and
-  `CViewRender::SetUpView`. Valve stores the angles in `CClientState` over a comment
-  reading `// FIXME, move entirely to client .dll` (`engine/cdll_engine_int.cpp:1048`);
-  with no DLL boundary here, `CLIENT.md` §4.7 simply takes the FIXME, so they end up in
-  the game client and the engine never gets a copy. Until then, do not grow `FlyCamera` towards `CUserCmd`:
-  `kbutton_t`'s `down[2]` and its fractional `KeyState` are correct and are the right
-  design, but building them against a camera instead of a player bakes in the wrong
-  consumer.
+- **`noclip` is registered by the game client, and it is a *server* command.** Move type
+  is server state that gets networked down, so `ConCommand noclip` lives in
+  `game/server/` in the original. With one process and no server it has to live
+  somewhere, and `src/client/` is where the move type is. **Move it when `src/server/`
+  exists**, which is also when `MOVETYPE_WALK` stops being the state that freezes the
+  player. `portdocs/CLIENT.md` §9.2.
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
   `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The

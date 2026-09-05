@@ -609,20 +609,23 @@ spells the same six flags in *three* different tables, two of them listing diffe
 subsets. One table with a long name and a short one replaces all three. `findflags` was
 not ported — it searches the twenty-two flags this port does not have.
 
-**Next on the boot path:** the **game client**, planned in `portdocs/CLIENT.md` and
-landing at top-level **`src/client/`** — Valve's `client.so`, not `ENGINE.md` §7.5's
-client *connection*, which is `src/engine/client/` and is blocked on `net/`. It is what
-takes `ViewAngles`, `FlyCamera` and `MoveButtons` out of `input/` and replaces the
-placeholder camera with a player: `CUserCmd` built from `kbutton_t`'s fractional
-`KeyState`, run through `FullNoClipMove` as a real `MOVETYPE_NOCLIP` player rather than
-imitated by a camera. Stages 1-3 there are blocked on nothing; walking is stage 4 and
-waits for `trace/`. It is also the first *game* module in the tree, which is why it is a
-sibling of `src/engine/` and not a child of it — `client.so` was a sibling of
-`engine.so`, and `src/server/` will follow it there.
-`materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
-unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
-visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
-magenta checkerboard into lit content.
+**The game client has landed — stage 1 of `portdocs/CLIENT.md`'s five.** It is
+`src/client/`, top-level and a sibling of `src/engine/`, because `client.so` was a sibling
+of `engine.so`; it is the first *game* module in the tree and `src/server/` will follow it
+there. It is **not** `ENGINE.md` §7.5's client *connection*, which is `src/engine/client/`
+and is blocked on `net/`; the two share a name and nothing else.
+
+Stage 1 is the input→command→movement→view spine: `CUserCmd`, `kbutton_t` with its
+fractional `KeyState`, the 22 `+`/`-` buttons and their `IN_*` bits, `FullNoClipMove` and
+`Accelerate`, and a `Player` in `MOVETYPE_NOCLIP` — a real Source movetype rather than a
+camera imitating one, which is what made it possible to be faithful rather than
+approximate. It deletes `src/engine/input/view.rs` and with it the view-angles wart, and
+it takes Valve's own `// FIXME, move entirely to client .dll`
+(`engine/cdll_engine_int.cpp:1048`): the angles are the client's and the engine never gets
+a copy. **API: `rustdocs/CLIENT.md`.**
+
+Stages 2 (the `ViewSetup` proper) and 3 (keyboard look and the sample-time budget) are
+unblocked and small. Stage 4 is walking, and waits for `trace/`.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`

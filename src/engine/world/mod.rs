@@ -47,12 +47,6 @@ use bsp::{Bsp, BspError, Face};
 /// wider indices.
 const MAX_BATCH_VERTICES: usize = 1 << 16;
 
-/// The player's eye height above `info_player_start`'s origin.
-///
-/// `VEC_VIEW` (`game/shared/shareddefs.h`) — the entity's origin is at the
-/// player's feet, and a camera placed there looks at the floor.
-const EYE_HEIGHT: f32 = 64.0;
-
 /// Anything that stops a map from loading.
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
@@ -89,11 +83,16 @@ pub struct Batch {
     indices: IndexBuffer,
 }
 
-/// Where the view starts when a map is loaded.
+/// Where the player starts when a map is loaded.
 #[derive(Debug, Clone, Copy)]
 pub struct Spawn {
-    /// Eye position in world space — the entity origin plus [`EYE_HEIGHT`].
-    pub eye: Vec3,
+    /// The entity's origin, in world space — **the player's feet**.
+    ///
+    /// Not the eye. How far above this the view sits is `VEC_VIEW`
+    /// (`game/shared/gamerules.cpp:38`), which is the game client's constant
+    /// and lives in [`client::player`](crate::client::player); a map knows
+    /// where a player stands and nothing about how tall one is.
+    pub origin: Vec3,
     /// Valve's `angles` are `pitch yaw roll`, in degrees.
     pub pitch: f32,
     pub yaw: f32,
@@ -713,7 +712,7 @@ fn find_spawn(entities: &[bsp::Entity]) -> Option<Spawn> {
     let origin = entity.vector("origin")?;
     let angles = entity.vector("angles").unwrap_or(Vec3::ZERO);
     Some(Spawn {
-        eye: origin + Vec3::Z * EYE_HEIGHT,
+        origin,
         pitch: angles.x,
         yaw: angles.y,
     })
@@ -1028,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn the_spawn_point_is_the_player_start_raised_to_eye_height() {
+    fn the_spawn_point_is_the_player_start_entity_origin() {
         let entities = bsp::Bsp::parse("t.bsp".into(), &bsp::one_face_bsp())
             .expect("valid")
             .entities();
@@ -1042,7 +1041,7 @@ mod tests {
             ],
         };
         let spawn = find_spawn(&[entities]).expect("a start");
-        assert_eq!(spawn.eye, Vec3::new(16.0, 32.0, EYE_HEIGHT));
+        assert_eq!(spawn.origin, Vec3::new(16.0, 32.0, 0.0), "feet, not eye");
         assert_eq!(spawn.yaw, 90.0);
         assert_eq!(spawn.pitch, 0.0);
     }

@@ -45,7 +45,8 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   block. Concludes cvar sets are handled inside `console/` and commands are handed back out
   through a `CommandTarget` trait, the way `host::Level` works.
 
-- [`CLIENT.md`](CLIENT.md) — the **game client**: `game/client/in_*.cpp`, `view.cpp`,
+- [`CLIENT.md`](CLIENT.md) — the **game client**. **Stage 1 of 5 done; see
+  `rustdocs/CLIENT.md` for the API.** `game/client/in_*.cpp`, `view.cpp`,
   `game/shared/usercmd.h` and the movement half of `gamemovement.cpp`. Resolves the
   two-clients problem — this is `client.so`'s local player and view, landing at
   `src/client/`, while `ENGINE.md` §7.5's *client connection* (`CClientState`, blocked on

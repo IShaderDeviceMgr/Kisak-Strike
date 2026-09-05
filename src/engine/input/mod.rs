@@ -1,9 +1,15 @@
 //! Input: what the platform reported, what is held, and where the view points.
 //!
-//! Replaces `inputsystem/` (the device layer), `engine/keys.cpp` and
-//! `sys_mainwind.cpp`'s `DispatchInputEvent` (the dispatch layer), and stands
-//! in for `game/client/in_*.cpp` (the movement layer) until `client/` exists.
+//! Replaces `inputsystem/` (the device layer) and `engine/keys.cpp` plus
+//! `sys_mainwind.cpp`'s `DispatchInputEvent` (the dispatch layer).
 //! `portdocs/ENGINE_INPUT.md` is the standing analysis.
+//!
+//! **The movement layer is not here.** It was, as a placeholder, until
+//! `src/client/` existed; `game/client/in_*.cpp`'s view angles, `kbutton_t`s
+//! and camera now live there, where the `CUserCmd` that gives them meaning
+//! does. What crosses the boundary is a `+command` in the command buffer and
+//! two floats of mouse delta — this module names no client type and the client
+//! names no input type.
 //!
 //! # Three layers, and where they live
 //!
@@ -11,7 +17,7 @@
 //! |---|---|---|
 //! | Device | `inputsystem/` (10,649 lines) | `winit`, translated in [`window`](crate::engine::window) |
 //! | Dispatch | `keys.cpp` + `DispatchInputEvent` | this module |
-//! | Movement | `in_main.cpp`, `in_mouse.cpp` | [`view`]'s placeholder camera, until `client/` |
+//! | Movement | `in_main.cpp`, `in_mouse.cpp` | [`client`](crate::client) |
 //!
 //! **This module names no windowing type.** `window/` translates
 //! `WindowEvent` into [`Event`] and pushes; everything here is `std` and
@@ -43,11 +49,9 @@
 
 pub mod bind;
 pub mod button;
-pub mod view;
 
 pub use bind::{Bindings, CommandSink};
 pub use button::{Button, Key, MouseButton};
-pub use view::MoveButtons;
 
 /// The modifiers `toggleconsole` is swallowed under (`engine/keys.cpp:1172`).
 const MODIFIERS: &[Key] = &[
@@ -158,12 +162,6 @@ pub struct Input {
     /// Button to command text. Global even in the original — `s_KeyContext`
     /// held one table, not one per splitscreen player.
     bindings: Bindings,
-    /// What the `+command`s a binding sends have left held.
-    ///
-    /// Client state living in `input/` for the same reason
-    /// [`view`](crate::engine::input::view) does: there is nowhere else yet.
-    /// **Moves to `client/` with [`view::FlyCamera`]**.
-    move_buttons: MoveButtons,
 }
 
 impl Input {
@@ -183,7 +181,6 @@ impl Input {
             // event to correct an assumption with.
             focused: true,
             bindings: Bindings::new(),
-            move_buttons: MoveButtons::default(),
         }
     }
 
@@ -193,14 +190,6 @@ impl Input {
 
     pub fn bindings_mut(&mut self) -> &mut Bindings {
         &mut self.bindings
-    }
-
-    pub fn move_buttons(&self) -> &MoveButtons {
-        &self.move_buttons
-    }
-
-    pub fn move_buttons_mut(&mut self) -> &mut MoveButtons {
-        &mut self.move_buttons
     }
 
     /// Turns this tick's presses and releases into command text.
@@ -429,6 +418,14 @@ impl Input {
     /// Deliberately does *not* touch [`mouse_look`](Input::mouse_look): losing
     /// focus suspends the grab, it does not decide that the game no longer
     /// wants the mouse.
+    ///
+    /// **It also does not release what the `+command`s are holding**, which is
+    /// the other half of the same failure and lives in
+    /// [`Client::clear_buttons`](crate::client::Client::clear_buttons): a
+    /// button is held by the *command*, not by the key, so clearing the key
+    /// down-state here is not enough. [`Event::FocusLost`] survives this
+    /// function and reaches [`events`](Input::events), which is how the engine
+    /// knows to make the other call.
     pub fn clear(&mut self) {
         self.down = [false; Button::COUNT];
         // With nothing held, nothing is owed a release. Leaving stale claims
@@ -436,11 +433,6 @@ impl Input {
         // longer up.
         self.key_up_target = [None; Button::COUNT];
         self.mouse = (0.0, 0.0);
-        // The `+command`s a binding sent are held by the *command*, not by the
-        // key, so clearing the down-state is not enough: without this, alt-tab
-        // with `+forward` held leaves the camera walking forever, which is the
-        // exact failure `CInput::ClearStates` exists to prevent.
-        self.move_buttons.clear();
     }
 }
 
@@ -770,16 +762,24 @@ mod tests {
         assert_eq!(dispatched(&input), [format!("-forward {}", w.index())]);
     }
 
-    /// Losing focus with `+forward` held must not leave the view walking: the
-    /// command holds the button, so clearing the key down-state is not enough.
+    /// Losing focus releases the keys **and reaches the tick**, which is what
+    /// lets the engine release what the `+command`s are holding — a button is
+    /// held by the command, not by the key, so this half alone is not enough.
+    /// The other half is tested in `engine/mod.rs`.
     #[test]
-    fn focus_loss_releases_what_the_commands_are_holding() {
+    fn focus_loss_releases_the_keys_and_is_still_reported() {
         let mut input = Input::new();
-        input.move_buttons_mut().apply("forward", true, Some(3));
-        assert!(input.move_buttons().forward.is_down());
+        input.push(pressed(key(Key::W)));
+        input.frame();
+        assert!(input.is_down(key(Key::W)));
 
         input.push(Event::FocusLost);
         input.frame();
-        assert!(!input.move_buttons().forward.is_down());
+        assert!(!input.is_down(key(Key::W)));
+        assert_eq!(
+            input.events(),
+            [Event::FocusLost],
+            "the engine has to see it to clear the client's buttons"
+        );
     }
 }

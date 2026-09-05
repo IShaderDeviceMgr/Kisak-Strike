@@ -27,9 +27,15 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
   lightmap atlas. Its porting doc is
   [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named after the C++
   module, while this one is named after the Rust module.
-- [`ENGINE.md`](ENGINE.md) — `src/engine/`. Three modules so far: `window` (the `winit`
-  event loop, `VideoConfig`, frame pacing), `host` (the state machine and frame clock),
-  and `world` (the `.bsp` reader, lightmap packing, and the batches a map draws as).
+- [`ENGINE.md`](ENGINE.md) — `src/engine/`. `window` (the `winit` event loop,
+  `VideoConfig`, frame pacing), `host` (the state machine and frame clock), `world` (the
+  `.bsp` reader, lightmap packing, and the batches a map draws as), `input` (buttons,
+  bindings, the key-up latch) and `console` (cvars, the command buffer, the dialog), plus
+  `Engine` itself and how the frame is composed.
+- [`CLIENT.md`](CLIENT.md) — `src/client/`. The **game client**, and the first game module
+  in the tree: `Client`, `UserCmd`, `Buttons`/`KButton`'s fractional `KeyState`, `Player`
+  and `MOVETYPE_NOCLIP`, `FullNoClipMove`, and `ViewAngles`. Not to be confused with
+  `ENGINE.md` §7.5's *client connection*, which does not exist yet.
 
 ## Why these exist
 
