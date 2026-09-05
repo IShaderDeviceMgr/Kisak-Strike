@@ -34,9 +34,12 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
   depends on), `input` (buttons, bindings, the key-up latch) and `console` (cvars, the
   command buffer, the dialog), plus `Engine` itself and how the frame is composed.
 - [`CLIENT.md`](CLIENT.md) — `src/client/`. The **game client**, and the first game module
-  in the tree: `Client`, `UserCmd`, `Buttons`/`KButton`'s fractional `KeyState`, `Player`
-  and `MOVETYPE_NOCLIP`, `FullNoClipMove`, and `ViewAngles`. Not to be confused with
-  `ENGINE.md` §7.5's *client connection*, which does not exist yet.
+  in the tree: `Client`, `UserCmd`, `Buttons`/`KButton`'s fractional `KeyState`, `Player`,
+  `ViewAngles`, and the movement — `FullNoClipMove` and `FullWalkMove` with gravity,
+  friction, stair stepping, jumping and ducking. Records the ten places
+  **`CPortalGameMovement` differs from `CGameMovement`** in ways that have nothing to do
+  with portals. Not to be confused with `ENGINE.md` §7.5's *client connection*, which does
+  not exist yet.
 
 ## Why these exist
 

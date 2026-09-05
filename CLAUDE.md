@@ -51,7 +51,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 517 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 529 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -59,13 +59,13 @@ engine frame loop with a real host state machine, **reads the shipped `cfg/confi
 draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
 `egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
 list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), and
-every cvar and command the port has registered. **There is now a player** — a real one, in
-`MOVETYPE_NOCLIP`, built from a `CUserCmd` and moved by `FullNoClipMove` — and **the world
-can now be traced against**: `trace` in the console fires a ray or sweeps the player hull
-and reports what it hit, which is what `client/` stage 4 needs to make the player walk. It
-is **still not a runnable game**: nothing consumes the traces yet, and there is no
-simulation, no sound and no netcode. The boot
-path is continuous from `main` to a rendered, lit level you can fly around.
+every cvar and command the port has registered. **There is now a player who walks.** A real one, in
+`MOVETYPE_WALK`, built from a `CUserCmd` and moved by `FullWalkMove`: it falls under
+gravity, stands on the floor, is stopped by walls and slides along them, climbs stairs
+under `sv_stepsize`, jumps 45 units, and crouches under things it does not fit past.
+`noclip` still flies. It is **still not a runnable game** — no simulation of anything but
+the player, no entities, no sound, no netcode — but the boot path is continuous from
+`main` to a rendered, lit level you can walk around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -79,13 +79,13 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 draw as the magenta error checkerboard are `maps/<map>/…` cubemap patches living in the
 `.bsp`'s embedded pak lump, which the `Vfs` does not mount yet. The scene is **dimmer than
 the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
-unexposed. The view is the **player's eye**: WASD, space and left control, left shift to
-walk, mouse to look, **Escape to release the cursor**. The player is in `MOVETYPE_NOCLIP`,
-which is a real Source movetype rather than a camera pretending to be one — so **it has
-momentum**, because `sv_noclipaccelerate` is 5 and not 0. Set `sv_noclipaccelerate 0` for
-an instant stop. `noclip` toggles, and says so when it turns off, because `MOVETYPE_WALK`
-needs collision and is not implemented. Space and control are a documented placeholder:
-`ComputeUpwardMove` reads `+moveup`/`+movedown`, and Portal 2 binds neither.
+unexposed. The view is the **player's eye**: WASD to walk, space to jump, left control to
+crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
+`noclip` toggles a real `MOVETYPE_NOCLIP` rather than a camera pretending to be one — so
+**it has momentum**, because `sv_noclipaccelerate` is 5 and not 0; set
+`sv_noclipaccelerate 0` for an instant stop, and fly up by looking up, because Portal 2
+binds no key to `+moveup`. `trace` in the console reports what is under and in front of
+the player.
 
 `` ` `` opens the console (Escape or `` ` `` closes it), which releases the cursor for as
 long as it is up. Tab and the arrow keys cycle completions; an empty entry cycles history
@@ -266,7 +266,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   and facing is decided after the flip). In file order a map draws as an empty clear
   colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
   fixing it in `PipelineCache` instead.
-- **`src/client/` — the game client, stages 1-3 of 5 ported** (`portdocs/CLIENT.md`,
+- **`src/client/` — the game client, stages 1-4 of 5 ported** (`portdocs/CLIENT.md`,
   **`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
   tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
   **It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
@@ -292,6 +292,22 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   before `render`, with nothing between), and `winit` gives one batch of events per frame
   where Valve re-polls the OS mid-frame, so a second drain would return nothing. Revisit
   when simulation lands between input and rendering.
+  **Stage 4 is walking**, and its headline finding is that the reference is
+  **`CPortalGameMovement`, not `CGameMovement`**: Portal 2 overrides two dozen of the base
+  class's methods and ten of the overrides change behaviour that has nothing to do with
+  portals. Jump height is **45 units, not 21**; the air-control cap is **60, not 30**;
+  ducking takes **400 ms, not CS:GO's 200**; gravity is **600, not 800**; jumping while
+  ducked is **refused** where the base class allows it; **edge friction** doubles friction
+  over a ledge and the base class has none; and walking into a standable slope **slides up
+  it** rather than stepping. Where Portal's override only generalises world `+Z` to a
+  paint-gel "stick normal", the two are the same function with no paint and the world-`+Z`
+  form is what is ported. Stage 4 also **found a live stage-1 bug**: a Portal 2 player's
+  max speed is `min(sv_maxspeed, MaxSpeed())` = **175**, not `sv_maxspeed`'s 320, so noclip
+  had been flying at 1600 where the shipped game flies at 875. Not ported and documented:
+  water, base velocity, the unstick passes, fall damage — and **ladders and the duck-jump
+  state machine are deleted rather than deferred**, because `GameHasLadders()` is `false`
+  for Portal and `CheckJumpButton` sets `bSetDuckJump = false` over a Valve FIXME, making
+  every branch that reads them unreachable.
   Seven rules that produce a plausible wrong answer rather than an error:
   **`ViewSetup::fov` is horizontal and already width-ratio scaled**, so anything reading
   `default_fov` for a projection is reintroducing that bug; **`set_sample_time` must be
@@ -306,22 +322,30 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   64 units higher, so conflating them reads as a level built slightly wrong; and **a `dt`
   of 1.0 does not move the player at all**, because the friction bleed scales with the
   frame time and a one-second step removes more speed than a second of acceleration adds.
+  Stage 4 adds four more: **`mv.max_speed` is 175 and not `sv_maxspeed`**, which bounds
+  noclip as well as walking; **`old_buttons` lives on the `Player`**, because jump and duck
+  both ask about the *previous* command and a `MoveData` built fresh each frame has to
+  round-trip it; **`speed_cropped` must start false every command** or a crouched player
+  moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
+  before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
+  test is only ever reachable from the air.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next: **`client/` stage 4 — walking.** `trace/` stage 1 was what it was blocked on and
-it has landed, so `FullWalkMove`, gravity, friction, `CategorizePosition`, ducking,
-jumping and the hulls are all now unblocked. That is what turns the noclip player into a
-player, it kills the `+jump`/`+duck`-as-up/down placeholder wart, and it is the only thing
-left on the boot path proper. See `portdocs/CLIENT.md` §8 stage 4.
+Next: **the boot path is complete as far as one player can take it.** `client/` stage 5
+and everything below it needs `net/` and `server/`, which is the last of the core path and
+a long way from here. The candidates, in the order they are worth doing:
 
-After it, in the order they are worth doing:
-
+- **`trace/` stage 2** (brush models — `CM_TransformedBoxTrace`). Small, unblocked, and it
+  is what makes doors, platforms and the moving parts of a test chamber solid.
+  `Model::head_node` is already parsed. Nothing *moves* them yet, but they stop being
+  scenery you walk through.
+- **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
+  read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
+  neither drawn nor collided with.
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
-- **`trace/` stage 2** (brush models — `CM_TransformedBoxTrace`). Small, and it is what
-  makes doors and platforms solid. `Model::head_node` is already parsed.
-- **`trace/` stage 3** (displacements), jointly with `world/disp/` — one lump read, two
-  consumers.
+- **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
+  `cmodel.cpp` and belong to it). Every face is still drawn every frame.
 
 ### Known warts, and what triggers fixing them
 
@@ -334,9 +358,12 @@ also commented at the site.
 is that, and the file is deleted rather than moved: `ViewAngles` is the client's,
 `MoveButtons` became `Buttons` with the fractional `KeyState` the wart said not to build
 against a camera, and `FlyCamera` became a `Player` in `MOVETYPE_NOCLIP` moved by
-`FullNoClipMove`. One placeholder outlived it and is documented at the site: `+jump` and
-`+duck` still drive the vertical axis, because `ComputeUpwardMove` reads
-`+moveup`/`+movedown` and Portal 2 binds neither. That dies at stage 4.
+`FullNoClipMove`. **The one placeholder that outlived it is also gone**: `+jump` and
+`+duck` used to drive the vertical axis, because `ComputeUpwardMove` reads
+`+moveup`/`+movedown` and Portal 2 binds neither, so without the hack a noclip player
+could not rise. Stage 4 made walking real, which makes jump and duck buttons; a noclip
+player now flies up the way the shipped game does it, by looking up and holding forward.
+`bind SPACE +moveup` brings the axis back.
 
 **Resolved:** `CommandLine` used to live in `src/launcher/` and be read from
 `src/engine/window/`, to be moved "when a third subsystem needs it". `console/` was that

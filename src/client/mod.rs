@@ -51,6 +51,7 @@ pub use view::{ViewAngles, ViewSetup};
 use glam::Vec3;
 
 use crate::engine::console::{Console, Cvar, CvarFlags};
+use crate::engine::trace::Tracer;
 
 /// `default_fov` for Portal (`game/client/portal/clientmode_portal.cpp:32`).
 ///
@@ -98,7 +99,16 @@ struct Cvars {
     r_farz: Cvar,
     r_mapextents: Cvar,
     sv_maxspeed: Cvar,
+    sv_speed_normal: Cvar,
+    sv_gravity: Cvar,
     sv_friction: Cvar,
+    sv_stopspeed: Cvar,
+    sv_accelerate: Cvar,
+    sv_airaccelerate: Cvar,
+    sv_stepsize: Cvar,
+    sv_maxvelocity: Cvar,
+    sv_edgefriction: Cvar,
+    sv_use_edgefriction: Cvar,
     sv_noclipspeed: Cvar,
     sv_noclipaccelerate: Cvar,
 }
@@ -298,11 +308,71 @@ impl Client {
                 CvarFlags::NONE,
                 "",
             ),
+            // `sv_speed_normal` (`portal_gamemovement.cpp:54`) is Portal 2's
+            // and is the number that actually limits a player: 175, against
+            // `sv_maxspeed`'s 320 ceiling.
+            sv_speed_normal: console.cvar(
+                "sv_speed_normal",
+                &movement::SV_SPEED_NORMAL.to_string(),
+                CvarFlags::CHEAT,
+                "For tweaking the normal speed when off speed paint.",
+            ),
+            sv_gravity: console.cvar(
+                "sv_gravity",
+                &movement::SV_GRAVITY.to_string(),
+                CvarFlags::NONE,
+                "World gravity.",
+            ),
             sv_friction: console.cvar(
                 "sv_friction",
                 &movement::SV_FRICTION.to_string(),
                 CvarFlags::NONE,
                 "World friction.",
+            ),
+            sv_stopspeed: console.cvar(
+                "sv_stopspeed",
+                &movement::SV_STOPSPEED.to_string(),
+                CvarFlags::NONE,
+                "Minimum stopping speed when on ground.",
+            ),
+            sv_accelerate: console.cvar(
+                "sv_accelerate",
+                &movement::SV_ACCELERATE.to_string(),
+                CvarFlags::NONE,
+                "Linear acceleration amount (old value is 5.6)",
+            ),
+            sv_airaccelerate: console.cvar(
+                "sv_airaccelerate",
+                &movement::SV_AIRACCELERATE.to_string(),
+                CvarFlags::NONE,
+                "",
+            ),
+            sv_stepsize: console.cvar(
+                "sv_stepsize",
+                &movement::SV_STEPSIZE.to_string(),
+                CvarFlags::DEVELOPMENTONLY,
+                "",
+            ),
+            sv_maxvelocity: console.cvar(
+                "sv_maxvelocity",
+                &movement::SV_MAXVELOCITY.to_string(),
+                CvarFlags::NONE,
+                "Maximum speed any ballistically moving object is allowed to attain per axis.",
+            ),
+            sv_edgefriction: console.cvar(
+                "sv_edgefriction",
+                &movement::SV_EDGEFRICTION.to_string(),
+                CvarFlags::CHEAT,
+                "",
+            ),
+            sv_use_edgefriction: console.cvar(
+                "sv_use_edgefriction",
+                match movement::SV_USE_EDGEFRICTION {
+                    true => "1",
+                    false => "0",
+                },
+                CvarFlags::CHEAT,
+                "",
             ),
             sv_noclipspeed: console.cvar(
                 "sv_noclipspeed",
@@ -317,16 +387,6 @@ impl Client {
                 "",
             ),
         };
-
-        // `sv_stopspeed` is walking's (`gamemovement.cpp`'s `Friction`) and is
-        // registered without a handle so that a `.cfg` setting it is not
-        // reported as an unknown command. Stage 4 takes the handle.
-        console.cvar(
-            "sv_stopspeed",
-            &movement::SV_STOPSPEED.to_string(),
-            CvarFlags::NONE,
-            "Minimum stopping speed when on ground.",
-        );
 
         Client {
             player: Player::new(Vec3::ZERO, 0.0, 0.0),
@@ -664,31 +724,22 @@ impl Client {
         cmd.sidemove -= side * self.buttons.key_state(MoveButton::MoveLeft);
     }
 
-    /// `ComputeUpwardMove` (`in_main.cpp:1099`), plus one placeholder.
+    /// `ComputeUpwardMove` (`in_main.cpp:1099`).
     ///
-    /// **The placeholder:** `cfg/config_default.cfg` binds neither `+moveup`
-    /// nor `+movedown` — vertical movement is a noclip-only concept and the
-    /// shipped game has no key for it — so `+jump` and `+duck` (SPACE and CTRL
-    /// in that config) also drive the axis. That is not Valve's behaviour:
-    /// jump is a *button* on the command, not a movement axis, and in the real
-    /// game you fly up by looking up. It dies at stage 4, with walking
-    /// (`portdocs/CLIENT.md` §8).
-    ///
-    /// It reads `is_down` rather than `key_state` on purpose: `key_state`
-    /// clears the impulse bits that `IN_JUMP` and `IN_DUCK` are about to be
-    /// read from, so a placeholder written the obvious way would quietly change
-    /// what the command says about jumping.
+    /// **Stage 4 deleted the placeholder that used to live here.** Until
+    /// walking existed, `+jump` and `+duck` also drove this axis, because
+    /// `cfg/config_default.cfg` binds neither `+moveup` nor `+movedown` and
+    /// noclip was the only movetype — so without the hack there was no way to
+    /// fly upwards. That is now wrong twice over: jump and duck are *buttons*
+    /// on the command and walking reads them as such, and a noclip player flies
+    /// up the way the shipped game does it, by looking up and holding forward
+    /// (`FullNoClipMove` uses the full 3D view basis, not the flattened one
+    /// walking uses). `bind SPACE +moveup` brings the axis back for anyone who
+    /// wants it, which is what the bind system is for.
     fn compute_upward_move(&mut self, cmd: &mut UserCmd) {
         let up = self.cvars.cl_upspeed.float();
         cmd.upmove += up * self.buttons.key_state(MoveButton::MoveUp);
         cmd.upmove -= up * self.buttons.key_state(MoveButton::MoveDown);
-
-        if self.buttons.is_down(MoveButton::Jump) {
-            cmd.upmove += up;
-        }
-        if self.buttons.is_down(MoveButton::Duck) {
-            cmd.upmove -= up;
-        }
     }
 
     /// `ComputeForwardMove` (`in_main.cpp:1111`), minus third-person.
@@ -763,7 +814,7 @@ impl Client {
     /// created. That is the whole difference from the original, and it is why
     /// this is a separate call from [`create_move`](Client::create_move):
     /// prediction wraps this function rather than rewriting it.
-    pub fn run_move(&mut self, cmd: &UserCmd, dt: f32) {
+    pub fn run_move(&mut self, cmd: &UserCmd, dt: f32, tracer: Option<&mut Tracer<'_>>) {
         let mut mv = MoveData {
             origin: self.player.origin,
             velocity: self.player.velocity,
@@ -772,33 +823,60 @@ impl Client {
             sidemove: cmd.sidemove,
             upmove: cmd.upmove,
             buttons: cmd.buttons,
-            max_speed: self.cvars.sv_maxspeed.float(),
-            friction: self.cvars.sv_friction.float(),
+            old_buttons: self.player.old_buttons,
+            // `mv->m_flMaxSpeed = pPlayer->GetPlayerMaxSpeed()`
+            // (`gamemovement.cpp:1349`), which is
+            // `min( sv_maxspeed, MaxSpeed() )` — **175 for a Portal 2 player,
+            // not `sv_maxspeed`'s 320.** See [`movement::SV_SPEED_NORMAL`].
+            max_speed: self
+                .cvars
+                .sv_maxspeed
+                .float()
+                .min(self.cvars.sv_speed_normal.float()),
+            move_type: self.player.move_type,
+            ground: self.player.ground,
+            surface_friction: self.player.surface_friction,
+            ducked: self.player.ducked,
+            ducking: self.player.ducking,
+            duck_time_msecs: self.player.duck_time_msecs,
+            view_offset: self.player.view_offset,
+            speed_cropped: false,
         };
 
-        // `CheckParameters` (`gamemovement.cpp:1137`), for a noclip player:
-        // the max-speed clip is **skipped entirely** for `MOVETYPE_NOCLIP`,
-        // `ISOMETRIC` and `OBSERVER` (`:1140`), and roll is forced to zero
-        // (`:1219`) so that a rolled *view* does not roll the *movement*. The
-        // punch-angle addition it also does needs a player who can be shot.
-        mv.angles.roll = 0.0;
-
-        match self.player.move_type {
-            MoveType::Noclip => movement::full_noclip_move(
-                &mut mv,
-                dt,
-                self.cvars.sv_noclipspeed.float(),
-                self.cvars.sv_noclipaccelerate.float(),
-            ),
-            // `FullWalkMove` is stage 4 and needs `trace/`. Doing nothing is
-            // the honest placeholder: there is no ground to stand on, so
-            // anything else would be inventing physics.
-            MoveType::Walk => {}
-        }
+        movement::player_move(&mut mv, tracer, &self.move_vars(), dt);
 
         // `FinishMove` — the results go back on the player.
         self.player.origin = mv.origin;
         self.player.velocity = mv.velocity;
+        self.player.ground = mv.ground;
+        self.player.surface_friction = mv.surface_friction;
+        self.player.ducked = mv.ducked;
+        self.player.ducking = mv.ducking;
+        self.player.duck_time_msecs = mv.duck_time_msecs;
+        self.player.view_offset = mv.view_offset;
+        self.player.old_buttons = mv.old_buttons;
+    }
+
+    /// The `sv_*` movement variables, read from the cvars once per command.
+    ///
+    /// `movevars_shared.cpp` is a file of globals that `gamemovement.cpp`
+    /// reaches through `ConVar::GetFloat()` at every use; reading them once
+    /// into a struct is what keeps [`movement`] free of cvar handles, which is
+    /// what lets it compile into a server later.
+    fn move_vars(&self) -> movement::MoveVars {
+        movement::MoveVars {
+            gravity: self.cvars.sv_gravity.float(),
+            friction: self.cvars.sv_friction.float(),
+            stopspeed: self.cvars.sv_stopspeed.float(),
+            accelerate: self.cvars.sv_accelerate.float(),
+            airaccelerate: self.cvars.sv_airaccelerate.float(),
+            stepsize: self.cvars.sv_stepsize.float(),
+            maxvelocity: self.cvars.sv_maxvelocity.float(),
+            edgefriction: self.cvars.sv_edgefriction.float(),
+            use_edgefriction: self.cvars.sv_use_edgefriction.float() != 0.0,
+            noclipspeed: self.cvars.sv_noclipspeed.float(),
+            noclipaccelerate: self.cvars.sv_noclipaccelerate.float(),
+        }
     }
 }
 
@@ -874,23 +952,37 @@ mod tests {
         assert_eq!(cmd.forwardmove, CL_FORWARDSPEED * 0.25);
     }
 
-    /// ...and what noclip then does with it, which is nothing.
+    /// ...and what noclip then does with it, which is almost nothing.
     ///
     /// `FullNoClipMove`'s friction bleed floors `control` at `maxspeed / 4`, so
-    /// at 60 Hz it removes 34.7 units of speed per frame whatever the player is
-    /// doing, while a quarter-speed wish only accelerates by 20.8. **This is
-    /// Valve's arithmetic, not a bug**: noclip has momentum, and it is why
+    /// at 60 Hz it removes 18.96 units of speed per frame whatever the player
+    /// is doing, while a quarter-speed wish only accelerates by 20.83. The tap
+    /// nets 1.875 units a second — a thirty-second of a unit of travel. **This
+    /// is Valve's arithmetic, not a bug**: noclip has momentum, and it is why
     /// `sv_noclipaccelerate` exists. Set it to 0 for the instant-stop feel the
     /// placeholder camera had.
+    ///
+    /// **Stage 4 changed these numbers**, and the old ones are why: this used
+    /// to assert the tap moved the player *exactly* nowhere, because
+    /// `max_speed` was `sv_maxspeed`'s 320 rather than the 175 a Portal 2
+    /// player actually has. At 320 the friction floor is 400 and removes 34.7 a
+    /// frame, which swallows the tap whole. See
+    /// [`movement::SV_SPEED_NORMAL`].
     #[test]
-    fn a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration() {
+    fn a_tap_barely_overcomes_noclip_friction_and_clears_it_with_no_acceleration() {
         let mut console = Console::detached();
         let mut client = Client::new(&mut console);
+        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
         let cmd = frame(&mut client, (0.0, 0.0));
-        client.run_move(&cmd, 1.0 / 60.0);
-        assert_eq!(client.player.origin, Vec3::ZERO);
+        client.run_move(&cmd, 1.0 / 60.0, None);
+        let crawled = client.player.origin.x;
+        assert!(
+            (0.0..0.05).contains(&crawled),
+            "a tap crawls rather than moves: {crawled}"
+        );
+        assert_eq!(client.player.origin.y, 0.0);
 
         console
             .cvars()
@@ -900,8 +992,10 @@ mod tests {
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
         let cmd = frame(&mut client, (0.0, 0.0));
-        client.run_move(&cmd, 1.0 / 60.0);
-        assert!(client.player.origin.x > 0.0);
+        client.run_move(&cmd, 1.0 / 60.0, None);
+        // Straight to the wish velocity: 43.75 * 5 = 218.75 a second, which is
+        // 3.65 units in a frame — two orders of magnitude past the crawl.
+        assert!(client.player.origin.x > crawled + 3.0);
     }
 
     /// One second of holding forward at 60 Hz. **Not one frame of one second**:
@@ -911,10 +1005,13 @@ mod tests {
     #[test]
     fn a_command_moves_the_player_along_the_view() {
         let mut client = client();
+        // A player spawns walking (stage 4), and these tests have no map to
+        // walk on — so this one asks for the movetype it is about.
+        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0);
+            client.run_move(&cmd, 1.0 / 60.0, None);
         }
 
         let origin = client.player.origin;
@@ -980,10 +1077,11 @@ mod tests {
     #[test]
     fn spawning_drops_the_last_levels_momentum() {
         let mut client = client();
+        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
         hold(&mut client, &["forward"]);
         for _ in 0..10 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0);
+            client.run_move(&cmd, 1.0 / 60.0, None);
         }
         assert!(client.player.velocity.length() > 0.0);
 
@@ -1083,24 +1181,24 @@ mod tests {
         assert_eq!(second.command_number, 2);
     }
 
-    /// Walking is stage 4, so turning noclip off freezes the player rather than
-    /// dropping them through the floor.
+    /// A player spawns walking, and with no map loaded there is nothing to
+    /// walk on — so they stay put until `noclip` is turned on.
     #[test]
-    fn turning_noclip_off_leaves_a_player_that_cannot_move_yet() {
+    fn a_walking_player_without_a_map_stays_put_and_noclip_frees_them() {
         let mut client = client();
-        assert_eq!(client.toggle_noclip(), MoveType::Walk);
+        assert_eq!(client.player.move_type, MoveType::Walk);
 
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0);
+            client.run_move(&cmd, 1.0 / 60.0, None);
         }
         assert_eq!(client.player.origin, Vec3::ZERO);
 
         assert_eq!(client.toggle_noclip(), MoveType::Noclip);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0);
+            client.run_move(&cmd, 1.0 / 60.0, None);
         }
         assert!(client.player.origin.length() > 0.0);
     }
@@ -1273,17 +1371,26 @@ mod tests {
         assert!(client.player.angles.yaw > after_first);
     }
 
-    /// The documented placeholder: Portal 2 binds no key to `+moveup`, so
-    /// `+jump` flies. Reading it must not disturb `IN_JUMP`.
+    /// `+jump` is a button, not a movement axis — the stage-1 placeholder that
+    /// made it one is gone.
     #[test]
-    fn jump_and_duck_drive_the_placeholder_vertical_axis() {
+    fn jump_is_a_button_and_not_the_vertical_axis() {
         let mut client = client();
         hold(&mut client, &["jump"]);
         let cmd = frame(&mut client, (0.0, 0.0));
+        assert_eq!(cmd.upmove, 0.0);
+        assert!(cmd.buttons.contains(ButtonBits::JUMP));
+    }
+
+    /// ...and `+moveup` still is one, for anyone who binds it. Half the speed
+    /// on the first frame, for the reason
+    /// [`a_command_carries_the_speed_cvars_rather_than_an_axis`] explains.
+    #[test]
+    fn moveup_drives_the_vertical_axis() {
+        let mut client = client();
+        hold(&mut client, &["moveup"]);
+        frame(&mut client, (0.0, 0.0));
+        let cmd = frame(&mut client, (0.0, 0.0));
         assert_eq!(cmd.upmove, CL_UPSPEED);
-        assert!(
-            cmd.buttons.contains(ButtonBits::JUMP),
-            "and the button bit survives the placeholder reading it"
-        );
     }
 }

@@ -610,7 +610,17 @@ impl<'a> Engine<'a> {
         self.scene.client.set_sample_time(seconds);
 
         let command = self.scene.client.create_move(seconds, mouse);
-        self.scene.client.run_move(&command, seconds);
+
+        // The tracer borrows `scene.world` while `run_move` borrows
+        // `scene.client` exclusively. **The fields have to be named
+        // separately** — an accessor on `Scene` returning a `Tracer` would
+        // borrow all of `Scene` and the next line would not compile. Same
+        // shape as the destructuring `Engine::frame` already does for the
+        // command target (`portdocs/CLIENT.md` §6.4).
+        let mut tracer = self.scene.world.as_ref().map(|w| w.collision.tracer());
+        self.scene
+            .client
+            .run_move(&command, seconds, tracer.as_mut());
 
         let mouse_look = mouse_look_after(self.input.mouse_look(), self.input.events());
         self.input.set_mouse_look(mouse_look);
@@ -1006,15 +1016,10 @@ impl CommandTarget for EngineCommands<'_> {
             },
             // `CON_COMMAND_F( quit, "Exit the engine.", FCVAR_NONE )`
             // (`engine/host_cmd.cpp:2750`).
-            // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )`. Walking is stage 4
-            // of `portdocs/CLIENT.md`, so turning it off leaves a player who
-            // cannot move rather than one who falls: there is no ground.
+            // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )`.
             "noclip" => match self.client.toggle_noclip() {
                 MoveType::Noclip => cx.print("noclip ON"),
-                MoveType::Walk => cx.print(
-                    "noclip OFF - MOVETYPE_WALK is not implemented \
-                     (portdocs/CLIENT.md stage 4); the player will not move",
-                ),
+                MoveType::Walk => cx.print("noclip OFF"),
             },
             // `IN_Impulse` (`game/client/in_main.cpp:757`). Latched onto the
             // next command and cleared; nothing consumes impulses yet.

@@ -45,7 +45,7 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   block. Concludes cvar sets are handled inside `console/` and commands are handed back out
   through a `CommandTarget` trait, the way `host::Level` works.
 
-- [`CLIENT.md`](CLIENT.md) — the **game client**. **Stages 1-3 of 5 done; see
+- [`CLIENT.md`](CLIENT.md) — the **game client**. **Stages 1-4 of 5 done; see
   `rustdocs/CLIENT.md` for the API.** `game/client/in_*.cpp`, `view.cpp`,
   `game/shared/usercmd.h` and the movement half of `gamemovement.cpp`. Resolves the
   two-clients problem — this is `client.so`'s local player and view, landing at
@@ -55,8 +55,12 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   only output, `kbutton_t`'s fractional `KeyState`, the three places movement is computed,
   and `SetUpView`. Concludes the player starts as `MOVETYPE_NOCLIP` rather than as a
   camera, and **takes Valve's own `// FIXME, move entirely to client .dll`** on the view
-  angles. Five stages; stages 1-3 are unblocked and delete `src/engine/input/view.rs`
-  along with `CLAUDE.md`'s view-angles wart.
+  angles. Stage 4 is walking, and its headline finding is that the reference is
+  **`CPortalGameMovement`, not `CGameMovement`** — Portal 2 jumps 45 units where the base
+  class jumps 21, caps air control at 60 where it caps at 30, refuses to jump while
+  ducked, has edge friction, and bounds the player at 175 rather than `sv_maxspeed`'s
+  320. Five stages; stages 1-4 are done, and they delete `src/engine/input/view.rs` along
+  with `CLAUDE.md`'s view-angles and `+jump`/`+duck` warts.
 
 - [`ENGINE_TRACE.md`](ENGINE_TRACE.md) — collision and tracing. **Stage 1 of 5 done; see
   `rustdocs/ENGINE.md` for the API.** `engine/cmodel*.cpp` (the

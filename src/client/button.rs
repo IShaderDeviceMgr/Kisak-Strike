@@ -52,6 +52,27 @@ impl ButtonBits {
     const fn union(self, other: ButtonBits) -> ButtonBits {
         ButtonBits(self.0 | other.0)
     }
+
+    /// `bits |= other` — what `mv->m_nOldButtons |= IN_JUMP` says.
+    pub const fn insert(self, other: ButtonBits) -> ButtonBits {
+        ButtonBits(self.0 | other.0)
+    }
+
+    /// `bits &= ~other`.
+    pub const fn remove(self, other: ButtonBits) -> ButtonBits {
+        ButtonBits(self.0 & !other.0)
+    }
+
+    /// The bits set in both.
+    pub const fn intersection(self, other: ButtonBits) -> ButtonBits {
+        ButtonBits(self.0 & other.0)
+    }
+
+    /// The bits set in one and not the other — `m_nOldButtons ^ m_nButtons`,
+    /// which is how `Duck` finds the press and release edges.
+    pub const fn changed(self, other: ButtonBits) -> ButtonBits {
+        ButtonBits(self.0 ^ other.0)
+    }
 }
 
 /// A `+command` this module answers to.

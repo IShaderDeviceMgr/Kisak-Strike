@@ -12,7 +12,7 @@ Porting plan and the C++ inventory: [`portdocs/CLIENT.md`](../portdocs/CLIENT.md
 | Lines | 2,750 including tests |
 | Tests | 65 (`cargo test client::`) |
 | Dependencies | `std`, `glam`, and `crate::engine::console` for cvar handles. **Not `winit`, not `egui`, not `wgpu`, not `crate::engine::input`** |
-| Status | **Stages 1-3 of 5 done** (`portdocs/CLIENT.md` §8). Stage 4 waits for `trace/`; stage 5 waits for `net/` |
+| Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8). Stage 5 waits for `net/` |
 
 ## This is not `src/engine/client/`
 
@@ -167,7 +167,12 @@ mentions them.
 ### `Player` and `MoveData`
 
 ```rust
-pub const VEC_VIEW: Vec3 = Vec3::new(0.0, 0.0, 64.0);
+pub const VEC_VIEW: Vec3 = Vec3::new(0.0, 0.0, 64.0);          // the standing eye
+pub const VEC_DUCK_VIEW: Vec3 = Vec3::new(0.0, 0.0, 28.0);     // the crouched one
+pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);   // 32 x 32 x 72
+pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 72.0);
+pub const VEC_DUCK_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);
+pub const VEC_DUCK_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 36.0);
 
 pub enum MoveType { Walk, Noclip }
 
@@ -177,23 +182,78 @@ pub struct Player {
     pub angles: ViewAngles,
     pub move_type: MoveType,
     pub view_offset: Vec3,
+    pub ground: Option<Vec3>,      // the normal underfoot, None when airborne
+    pub surface_friction: f32,
+    pub ducked: bool,
+    pub ducking: bool,             // mid-transition, either direction
+    pub duck_time_msecs: i32,
+    pub old_buttons: ButtonBits,   // what the PREVIOUS command held
 }
 
 impl Player {
-    pub fn new(origin: Vec3, pitch: f32, yaw: f32) -> Player;  // MoveType::Noclip
+    pub fn new(origin: Vec3, pitch: f32, yaw: f32) -> Player;  // MoveType::Walk
     pub fn eye(&self) -> Vec3;                                 // origin + view_offset
 }
+```
 
+### `movement` — `MoveData`, `MoveVars` and the move itself
+
+```rust
+/// `movevars_shared.cpp`: the `sv_*` set, read once per command.
+pub struct MoveVars { gravity, friction, stopspeed, accelerate, airaccelerate,
+                      stepsize, maxvelocity, edgefriction, use_edgefriction,
+                      noclipspeed, noclipaccelerate }
+impl MoveVars { pub const PORTAL2: MoveVars; }
+
+/// `CMoveData` plus the parts of `player->m_Local` movement writes.
 pub struct MoveData { /* origin, velocity, angles, forwardmove, sidemove, upmove,
-                        buttons, max_speed, friction */ }
+                        buttons, old_buttons, max_speed, move_type, ground,
+                        surface_friction, ducked, ducking, duck_time_msecs,
+                        view_offset, speed_cropped */ }
 
+pub fn player_move(mv: &mut MoveData, tracer: Option<&mut Tracer<'_>>,
+                   vars: &MoveVars, dt: f32);
+pub fn full_walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>,
+                      vars: &MoveVars, dt: f32);
+pub fn full_noclip_move(mv: &mut MoveData, vars: &MoveVars, dt: f32);
 pub fn accelerate(mv: &mut MoveData, wishdir: Vec3, wishspeed: f32, accel: f32, dt: f32);
-pub fn full_noclip_move(mv: &mut MoveData, dt: f32, factor: f32, max_acceleration: f32);
+pub fn air_accelerate(mv: &mut MoveData, wishdir: Vec3, wishspeed: f32, accel: f32, dt: f32);
+pub fn check_parameters(mv: &mut MoveData);
+pub fn check_velocity(mv: &mut MoveData, vars: &MoveVars);
+pub fn player_mins(ducked: bool) -> Vec3;
+pub fn player_maxs(ducked: bool) -> Vec3;
+pub fn player_view_offset(ducked: bool) -> Vec3;
 ```
 
 `movement.rs` is **shared code**: `gamemovement.cpp` compiles into both binaries, and the
 same command must produce the same position on both or prediction mispredicts. Nothing in
-it may name a cvar, a console or a view — everything arrives in `MoveData`.
+it may name a cvar, a console or a view — everything arrives in `MoveData` and `MoveVars`.
+That is why the `sv_*` values are read into a struct by `Client::move_vars` rather than
+reached through cvar handles at each use, the way the C++ does.
+
+### It is `CPortalGameMovement`, not `CGameMovement`
+
+Portal 2 overrides two dozen of the base class's methods and **several of the overrides
+change behaviour that has nothing to do with portals**. Porting the base class produces a
+player who moves plausibly and wrongly. What survives into this port:
+
+| | `CGameMovement` | `CPortalGameMovement` |
+|---|---|---|
+| Jump height | 21 units | **45** |
+| Bunny-hop speed boost on jump | yes (HL2) | **none** |
+| Jump while ducked | allowed, at a fixed speed | **refused** |
+| Air-control speed cap | 30 | **60** |
+| Duck transition | 200 ms (CS:GO) | **400 ms** |
+| Gravity | 800 | **600** |
+| Edge friction | absent | **on**, doubling friction over a ledge |
+| `ClipVelocity`'s re-push | at least `DIST_EPSILON` | cancels the residual only |
+| `StayOnGround`'s up-probe | 2 units | **1 unit** |
+| Walking into a standable slope | `StepMove` | **slides up the ramp** |
+
+Where Portal's override differs only by generalising world `+Z` to an arbitrary "stick
+normal" — its paint-gel gravity reorientation — the two are the same function with no
+paint, because `m_vGravityDirection = -stickNormal` and the stick normal is world up.
+Those are ported in the world-`+Z` form.
 
 ### `ViewSetup`
 
@@ -384,6 +444,57 @@ Ordered by how likely each is to bite.
     and it should not be "fixed": the clip it was going to apply is `CheckParameters`',
     which happens in the right place already (and is skipped entirely for noclip).
 
+### Walking's own, added by stage 4
+
+Same ordering: most likely to bite first.
+
+- **A Portal 2 player's max speed is 175, not `sv_maxspeed`'s 320.**
+  `mv->m_flMaxSpeed` is `GetPlayerMaxSpeed()`, which is
+  `min( sv_maxspeed, MaxSpeed() )`, and a Portal player's `MaxSpeed()` is
+  `sv_speed_normal` = 175 (`portal_player_shared.cpp:1591`). It bounds walking *and*
+  noclip, whose ceiling is therefore `175 * sv_noclipspeed` = 875 rather than 1600.
+  **Stage 1 had this wrong** and flew at 1600; the fix also changed what a sub-frame tap
+  does, because `FullNoClipMove`'s friction floor is `maxspeed / 4`.
+
+- **`old_buttons` lives on the `Player`, not in the `UserCmd`.** Jump reads it to refuse a
+  pogo stick and duck reads it for press and release edges — both are questions about the
+  *previous* command, so a `MoveData` built fresh each frame has to carry it in and out.
+  Drop the round-trip and jump fires every frame the key is held.
+
+- **`speed_cropped` must be false at the start of every command.** It is
+  `m_iSpeedCropped`, and it exists so the ducking speed crop applies once; leave it set
+  and a crouched player moves at full speed, leave it perpetually clear and they move at
+  a third of a third.
+
+- **`ground` is `Option<Vec3>` and `None` is airborne** — not `Some(Vec3::ZERO)`. Valve
+  stores an entity pointer and tests it against null; the normal is what a world-only port
+  can carry instead, and `Vec3::ZERO` would be a plane that is standable by no test and
+  grounded by every `is_some()`.
+
+- **`full_walk_move` zeroes the vertical velocity of a grounded player before anything
+  else runs.** That is why `CategorizePosition`'s `NON_JUMP_VELOCITY` test can only ever
+  be reached from the air: the only way to arrive there rising is to have already left the
+  ground, which is what the jump does one line before. A test that sets a rising velocity
+  on a grounded player and expects to lose the ground is testing a state the function
+  cannot be in.
+
+- **`set_ducked_eye_offset` splines the fraction twice.** Both callers pass
+  `SimpleSpline( fraction )` and it applies `SimpleSpline` again
+  (`gamemovement.cpp:4710`). Ported as written: it is the shape of the shipped crouch.
+
+- **The duck timer counts *down* from 1000 ms and the transition is 400.**
+  `GAMEMOVEMENT_DUCK_TIME` is the timer's full value, not the duration;
+  `TIME_TO_DUCK_MSECS` is the duration, and reading the wrong one gives a crouch two and a
+  half times too slow. It is also decremented in **whole milliseconds**, so a 300 fps
+  frame truncates to 3 ms and a crouch takes marginally longer than at 60 fps.
+
+- **`player_move` takes `Option<&mut Tracer>` and a walking player without one does not
+  move.** That is not a stub: with no map there is nothing to stand on. Noclip still flies.
+
+- **Trace results are in the caller's frame and `Ray`'s start is the box centre.** This is
+  `rustdocs/ENGINE.md`'s trace gotcha 1, and every one of this module's ~14 traces goes
+  through `trace_player_bbox`, which is the only place that pairing is written down.
+
 ## Not implemented, and why
 
 | | Why, and what unblocks it |
@@ -391,7 +502,15 @@ Ordered by how likely each is to bite.
 | `ExtraMouseSample` (`in_main.cpp:1246`) and the second mouse sample per frame | **Two independent reasons, and both would have to change.** It exists to recover latency: Valve builds the real command early in `_Host_RunFrame_Input`, then simulates, then samples the mouse again just before rendering (`host.cpp:4359`) so the picture uses the freshest angles. This port's `Engine::update_client` runs immediately before `Engine::render` in the same callback, so there is no staleness to recover. And it could not be done anyway: `winit` delivers one batch of events per frame and cannot be pumped re-entrantly from inside a handler, where Valve's `AccumulateMouse` re-polls the OS mid-frame — a second drain here would return `(0.0, 0.0)`. **Revisit when simulation lands between input and rendering.** |
 | The view *tilt* round-trip in `AdjustAngles` | `CViewEffects` (shake, tilt, punch), which needs entities. **In scope for Portal 2**, which tilts the view; `AdjustAngles` is where it attaches, and it belongs there rather than in the renderer because tilt affects aim. |
 | `view->StopPitchDrift()`, `DriftPitch` | Deleted with the pitch drift itself — it re-centres the view for keyboard-only play and `lookspring` defaults to 0. |
-| `FullWalkMove`, gravity, ducking, jumping, the hulls | Stage 4. Needs `trace/`. |
+| Water — `CheckWater`, `WaterMove`, `WaterJump`, `CheckWaterJump`, water level and type | Needs a water level, which needs `CategorizePosition`'s water probes and the leaf water data the `.bsp` reader does not load. `full_walk_move` keeps the shape of the branch and takes the not-in-water side. Portal 2's goo is a `trigger_hurt` over a water brush, so this is a *drowning* feature more than a swimming one. |
+| Ladders — `LadderMove`, `MOVETYPE_LADDER`, `OnLadder` | **Deleted, not deferred.** `CPortalGameMovement::GameHasLadders()` returns `false` (`portal_gamemovement.h:132`), so none of it is reachable in Portal 2. |
+| The duck-jump machinery — `m_bInDuckJump`, `StartUnDuckJump`, `CanUnDuckJump`, `FinishUnDuckJump`, `UpdateDuckJumpEyeOffset`, `m_nJumpTimeMsecs` | **Unreachable in Portal 2**, and by Valve's choice: `CheckJumpButton` sets `bSetDuckJump = false` over a comment reading "temp fix for camera snapping when ducking in the air ( NO DUCKJUMP for now )". Nothing sets the timer, so every branch that reads it is dead. |
+| `CheckStuck`, `FixPlayerCrouchStuck`, `IsMovingPlayerStuck`, `UnblockPusher` | The unstick passes. They nudge a player out of geometry they should never have been in, and every path into that state needs entities — a door closing on you, a platform rising through you. |
+| `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | Fall damage, the landing sound and the landing animation. Needs health, sound and animation. |
+| Base velocity — conveyors, moving platforms, `GetBaseVelocity` | Entities. `SetGroundEntity`'s velocity exchange goes with it, and it is the reason Valve adds and subtracts it around every move. |
+| `m_outWishVel`, `m_outJumpVel`, `m_outStepHeight` | Outputs for the view's step smoothing and the animation layer. Carrying fields nothing reads would be carrying fields nothing checks; `view.cpp`'s step smoothing is where `m_outStepHeight` attaches. |
+| Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint and portals. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. |
+| `player->m_surfaceFriction` from a real surface, `jumpFactor`, `maxSpeedFactor` | The physics surface-property database — `vphysics/`. Every surface reads as the default until then, and `surface_friction` still carries `CategorizePosition`'s 0.25. |
 | `env_fog_controller`'s `farz`, which overrides `GetZFar` when positive | Entities. |
 | `r_aspectratio`, and `AspectRatioInfo_t`'s non-square-pixel scalar | `r_aspectratio` is a *renderer* cvar (`gl_rmain.cpp:46`); registering it from the game client to read it in `screen_aspect` would put it in the wrong module. The pixel-shape scalar is the material system's. Both coincide with `width / height` on every square-pixel display, which is the only case this port supports. |
 | `fovViewmodel`, `zNearViewmodel`, the ortho box, custom view/projection matrices, depth of field, motion blur | A viewmodel, portals, monitors and post-processing. `ViewSetup` carries eight fields where `CViewSetup` carries fifty. |
@@ -402,7 +521,7 @@ Ordered by how likely each is to bite.
 | `m_customaccel` 1-4, `m_mousespeed`, `m_mouseaccel1/2` | Per-user feel tuning with no default behaviour; the last three are Windows `SPI_SETMOUSE` overrides, inert on POSIX. |
 | `cl_mouselook_roll_compensation` | Rotates the mouse delta by the inverse of the view roll so "mouse left" stays "screen left" upside down. **In scope for Portal 2**, which rolls constantly; needs something that rolls the view. `ViewAngles::roll` is where it attaches. |
 | Split-screen, third-person (`in_camera.cpp`), HLTV/Replay cameras, TrackIR, force feedback, Sixense, the tool and demo view overrides | Deleted. `portdocs/CLIENT.md` §5. Portal 2 does have split-screen co-op, so that one is a deferral: one player, keep the seam, no slot field until co-op is scheduled. |
-| `Player`'s ducking, `VEC_DUCK_VIEW`, the hulls | Quoted in `player.rs`'s docs rather than declared, because a constant nothing reads is a constant nothing checks. |
+
 
 ## Extending it
 
@@ -420,7 +539,10 @@ Ordered by how likely each is to bite.
 
 ## Which tests guard what
 
-`cargo test client::` — 49 tests, no window, no GPU, no game content.
+`cargo test client::` — 77 tests, no window, no GPU, no game content. Stage 4's build a
+collision model with `engine::trace::fixture::Fixture` rather than loading a `.bsp`: a
+room with a floor, a 16-unit step, a wall nothing can climb and a ceiling only a crouched
+player fits under.
 
 | Test | Guards |
 |---|---|
@@ -432,7 +554,7 @@ Ordered by how likely each is to bite.
 | `the_axis_only_buttons_contribute_no_bits` | the six modifiers that never reach the server |
 | `client::movement::without_acceleration_the_wish_velocity_is_the_velocity` | the arithmetic, exactly: 175 × 5 = 875 units in one second |
 | `walking_halves_the_speed` | `+speed` halves the factor *after* the clamp is computed from the unhalved one |
-| `the_wish_velocity_is_clamped_to_the_server_maximum` | `sv_maxspeed × sv_noclipspeed` |
+| `the_wish_velocity_is_clamped_to_the_server_maximum` | the noclip ceiling — `mv.max_speed × sv_noclipspeed` |
 | `rising_is_along_world_up_whatever_the_view_is_doing` | `upmove` on world `+Z`, not along `up` |
 | `with_acceleration_the_first_frame_is_slower_than_the_steady_state`, `releasing_everything_coasts_to_an_exact_stop` | gotcha 7 — the shipped defaults, and the `speed < 1.0` exact stop |
 | `acceleration_does_not_add_to_a_velocity_that_already_exceeds_the_wish` | `Accelerate`'s veer clause |
@@ -444,6 +566,24 @@ Ordered by how likely each is to bite.
 | `the_view_is_the_players_eye_not_its_feet` | gotcha 6 |
 | `a_non_finite_angle_is_refused_rather_than_stored` | `SetViewAngles`' `IsValid` check — a NaN in the view matrix is a black screen with no error |
 | `a_command_carries_the_speed_cvars_rather_than_an_axis` | gotcha 5, both halves |
+| `client::movement::a_player_falls_until_it_lands_on_the_floor` | gravity, `CategorizePosition` and the landing |
+| `gravity_is_six_hundred_a_second_squared` | Portal 2's gravity, and that both halves are applied |
+| `the_landing_is_the_same_at_any_frame_rate` | why gravity is split in half at all — 300 Hz and 20 Hz land together |
+| `walking_forward_settles_at_the_ground_speed` | 175, not `sv_maxspeed`'s 320 — the first walking gotcha |
+| `releasing_forward_stops_the_player` | `Friction`, and that the stop is exact |
+| `a_step_shorter_than_sv_stepsize_is_walked_up`, `a_wall_taller_than_a_step_stops_the_player` | `StepMove`, both answers |
+| `a_wall_hit_at_an_angle_is_slid_along` | `TryPlayerMove`'s whole purpose |
+| `a_jump_reaches_forty_five_units` | Portal's jump height against the base class's 21 |
+| `a_held_jump_button_does_not_bounce` | `old_buttons` round-tripping — the second walking gotcha |
+| `ducking_lowers_the_hull_and_the_eye`, `the_eye_slides_down_through_a_crouch` | `FinishDuck`, and that the transition interpolates |
+| `a_ducked_player_cannot_stand_up_under_a_low_ceiling` | `CanUnduck`'s trace, and the "reset the timer" branch |
+| `a_ducked_player_moves_at_a_third_speed` | `HandleDuckingSpeedCrop`, and `speed_cropped` |
+| `a_ducked_player_cannot_jump` | Portal's refusal, where the base class jumps |
+| `rising_rapidly_loses_the_ground` | `NON_JUMP_VELOCITY`, at the only place it is reachable |
+| `air_control_is_capped_at_sixty` | Portal's cap against the base class's 30 |
+| `edge_friction_slows_a_player_near_a_ledge` | that it fires over a ledge and nowhere else |
+| `walking_into_things_never_ends_inside_them` | eight directions × 60 frames, asserting the hull is never in solid |
+| `a_walking_player_without_a_map_does_not_move` | the `Option<&mut Tracer>` contract |
 | `a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration` | gotcha 7, and that `sv_noclipaccelerate 0` restores the old feel |
 | `holding_strafe_moves_with_the_mouse_instead_of_turning`, `lookstrafe_redirects_only_the_horizontal_axis` | `ApplyMouse`'s three cases and the asymmetry between the axes |
 | `cl_mouseenable_zero_drops_the_motion_rather_than_banking_it` | nothing arrives in one lump when it is turned back on |

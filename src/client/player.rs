@@ -15,7 +15,7 @@
 
 use glam::Vec3;
 
-use super::ViewAngles;
+use super::{ButtonBits, ViewAngles};
 
 /// `VEC_VIEW` (`game/shared/shareddefs.h:76`, via
 /// `g_DefaultViewVectors`, `game/shared/gamerules.cpp:38`): the eye, standing.
@@ -37,6 +37,18 @@ pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);
 /// See [`VEC_HULL_MIN`].
 pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 72.0);
 
+/// `VEC_DUCK_HULL_MIN`/`VEC_DUCK_HULL_MAX` — the crouched hull
+/// (`game/shared/portal/portal_mp_gamerules.cpp:176`). Half the height and the
+/// **same minimum**: the origin stays on the floor, so crouching lowers the top
+/// of the box rather than moving the player.
+pub const VEC_DUCK_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);
+/// See [`VEC_DUCK_HULL_MIN`].
+pub const VEC_DUCK_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 36.0);
+
+/// `VEC_DUCK_VIEW` (`portal_mp_gamerules.cpp:178`) — the eye while crouched,
+/// which is 28 rather than half of 64.
+pub const VEC_DUCK_VIEW: Vec3 = Vec3::new(0.0, 0.0, 28.0);
+
 /// `MOVETYPE_*` (`public/const.h`), reduced to the two that mean anything yet.
 ///
 /// The other seven — `NONE`, `ISOMETRIC`, `WALK`, `STEP`, `FLY`, `FLYGRAVITY`,
@@ -45,10 +57,10 @@ pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 72.0);
 /// (`gamemovement.cpp:2442`, at `sv_specspeed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveType {
-    /// `MOVETYPE_WALK`. **Not implemented**: `FullWalkMove`
-    /// (`gamemovement.cpp:2287`) needs collision, and `trace/` does not exist.
-    /// A player in this mode does not move — see
-    /// [`Client::run_move`](super::Client::run_move).
+    /// `MOVETYPE_WALK`: gravity, friction, collision, stairs, jumping and
+    /// ducking — `CPortalGameMovement::FullWalkMove`
+    /// (`portal_gamemovement.cpp:3877`). Needs a map: with none loaded a
+    /// walking player has nothing to stand on and does not move.
     Walk,
     /// `MOVETYPE_NOCLIP`. Fly through everything; no gravity, no collision, no
     /// ground. The one movement mode that is complete without `trace/`, which
@@ -69,8 +81,28 @@ pub struct Player {
     pub angles: ViewAngles,
     pub move_type: MoveType,
     /// The eye's offset from [`origin`](Player::origin): [`VEC_VIEW`]
-    /// standing, and `VEC_DUCK_VIEW` `(0,0,28)` once ducking exists.
+    /// standing, [`VEC_DUCK_VIEW`] crouched, and interpolated between the two
+    /// through a duck transition.
     pub view_offset: Vec3,
+
+    /// `player->GetGroundEntity()`, reduced to the normal of what is underfoot
+    /// — `None` when airborne. See
+    /// [`MoveData::ground`](super::MoveData::ground).
+    pub ground: Option<Vec3>,
+    /// `player->m_surfaceFriction`.
+    pub surface_friction: f32,
+    /// `m_Local.m_bDucked` — the hull *is* the crouched one.
+    pub ducked: bool,
+    /// `m_Local.m_bDucking` — mid-transition, in either direction.
+    pub ducking: bool,
+    /// `m_Local.m_nDuckTimeMsecs`.
+    pub duck_time_msecs: i32,
+    /// `mv->m_nOldButtons`: what the *previous* command held.
+    ///
+    /// On the player rather than in the command because jump reads it to
+    /// refuse a pogo stick and duck reads it for press and release edges —
+    /// both of which are questions about the frame before this one.
+    pub old_buttons: ButtonBits,
 }
 
 impl Player {
@@ -81,11 +113,18 @@ impl Player {
             origin,
             velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
-            // Noclip, because walking is stage 4. This is the whole of what
-            // makes the engine flyable today, and it is a real movetype rather
-            // than a camera pretending to be one.
-            move_type: MoveType::Noclip,
+            // `MOVETYPE_WALK`, which is what a player spawns as
+            // (`CBasePlayer::Spawn`). Stage 4 made this reachable; before it
+            // the player spawned in `MOVETYPE_NOCLIP`, because walking had no
+            // ground to stand on.
+            move_type: MoveType::Walk,
             view_offset: VEC_VIEW,
+            ground: None,
+            surface_friction: 1.0,
+            ducked: false,
+            ducking: false,
+            duck_time_msecs: 0,
+            old_buttons: ButtonBits::NONE,
         }
     }
 

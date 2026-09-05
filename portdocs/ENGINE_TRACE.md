@@ -2,8 +2,9 @@
 
 The engine's answer to "what is between here and there?" — ray and swept-box queries
 against the world, against brush models, against displacements, and against entities.
-It is the module `src/client/` stage 4 is blocked on, and the last thing on the boot
-path between a noclip camera and a player who can stand on the floor.
+It is the module `src/client/` stage 4 was blocked on, and the last thing on the boot
+path between a noclip camera and a player who can stand on the floor. **Both have
+landed** — see `portdocs/CLIENT.md` §8 stage 4.
 
 Scope of this doc: `engine/cmodel*.cpp` (the BSP brush trace), `engine/enginetrace.cpp`
 (the dispatch over collideables), `engine/spatialpartition.cpp` (the entity broadphase),
@@ -182,7 +183,8 @@ SIMD shuffles — a CS:GO-era shadow optimization, deleted), ~600 are PVS/areas
 
 **Depended on by:**
 
-- `src/client/` stage 4 — `full_walk_move` and friends. The seam is §7.3.
+- `src/client/` stage 4 — `full_walk_move` and friends, **done**; ~14 traces per
+  command. The seam is §7.3.
 - `world/` later, for the leaf lookup its PVS work needs.
 - `server/`, `render/`, `audio/` eventually. None of them exist.
 

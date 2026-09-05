@@ -372,8 +372,8 @@ which has real internal pointers.
 ## `src/engine/trace/`
 
 Ray and swept-box traces against the world's brushes. Stage 1 of
-[`portdocs/ENGINE_TRACE.md`](../portdocs/ENGINE_TRACE.md); the module `src/client/`
-stage 4 is blocked on.
+[`portdocs/ENGINE_TRACE.md`](../portdocs/ENGINE_TRACE.md), and what `src/client/` stage 4
+walks on — [`rustdocs/CLIENT.md`](CLIENT.md) is its one real consumer.
 
 | | |
 |---|---|
@@ -430,7 +430,7 @@ picking a corner per plane. [`Ray::origin`] undoes the centring, and every field
 
 A newtype over Valve's 32-bit `CONTENTS_*` set (`public/bspflags.h`), with the `MASK_*`
 combinations under Valve's own names so the C++ stays greppable. `Contents::MASK_PLAYERSOLID`
-is `PlayerSolidMask()` and is what every one of `client/` stage 4's traces will pass.
+is `PlayerSolidMask()` and is what every one of `client/`'s ~14 movement traces passes.
 
 ```rust
 pub fn intersects(self, other: Contents) -> bool;  // the test the traversal runs

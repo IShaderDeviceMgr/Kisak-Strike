@@ -10,10 +10,10 @@ Read `PORTING.md` first; this doc assumes its standing decisions. Read
 three deliberate deferrals land, and it says why they were deferred rather than
 attempted.
 
-**Status: stages 1, 2 and 3 of 5 are done** (§8). `src/client/` exists — 2,114 lines, 49 tests — and
+**Status: stages 1-4 of 5 are done** (§8). `src/client/` exists — 3,600 lines, 77 tests — and
 `src/engine/input/view.rs` is deleted, which closes the view-angles wart `CLAUDE.md` and
 `ENGINE_INPUT.md` §11.2 recorded. **The API reference is `rustdocs/CLIENT.md`; read that
-to *use* the module.** Stage 4 waits for `trace/`; stage 5 waits for `net/`.
+to *use* the module.** Stage 5 waits for `net/`.
 
 ---
 
@@ -711,12 +711,67 @@ keyboard look does nothing, for ever.**
 `cfg/config_default.cfg` binds no key to `+left`, `+right`, `+lookup`, `+lookdown` or
 `+klook`, and `cl_mouselook` defaults to 1. `bind LEFTARROW "+left"` reaches it.
 
-### Stage 4 — walking (blocked on `trace/`, large) — next
+### Stage 4 — walking — **DONE** (~1,500 lines, 20 tests)
 
 `FullWalkMove`, gravity, friction, `CategorizePosition`, ducking, jumping, the hulls, and
-`CheckParameters`' speed clip. **This is where the player stops being a noclip camera**,
-where the `+jump`/`+duck`-as-up/down placeholder mapping goes away, and where
-`MoveType::Walk` becomes reachable.
+`CheckParameters`' speed clip. **This is where the player stopped being a noclip camera**,
+where the `+jump`/`+duck`-as-up/down placeholder mapping went away, and where
+`MoveType::Walk` became reachable — and it is now what a player spawns as.
+
+Verified on `sp_a1_intro1`: the player spawns 8.97 units above `MOTEL/HOTEL_CARPET001`,
+**falls onto it**, walks at 175 along the view, is stopped by the `TOOLS/TOOLSPLAYERCLIP`
+brush 127 units ahead and slides along its face, and leaves the ground when `+jump` is
+sent.
+
+#### The headline finding: this is `CPortalGameMovement`, not `CGameMovement`
+
+`CPortalGameMovement` (`game/shared/portal/portal_gamemovement.cpp`, 5,245 lines)
+overrides two dozen of the base class's methods, and **several of the overrides change
+behaviour that has nothing to do with portals**. §4.4 and §4.5 were written against
+`CGameMovement`, and porting that would have produced a player who moves plausibly and
+wrongly:
+
+| | `CGameMovement` | `CPortalGameMovement` |
+|---|---|---|
+| Jump height | 21 (`GAMEMOVEMENT_JUMP_HEIGHT`) | **45** (`:573`) |
+| Bunny-hop speed boost on jump | yes, under `HL2_DLL` | **none** |
+| Jump while ducked | allowed, at a fixed speed | **refused** (`:534`) |
+| Air-control speed cap | 30 (`:1975`) | **60** (`:641`) |
+| Duck transition | 200 ms under `CSTRIKE15` | **400 ms** (`shareddefs.h:100`) |
+| Gravity | 800 | **600** (`movevars_shared.cpp:16`) |
+| Edge friction | absent | **on** (`:3351`), doubling friction over a ledge |
+| `ClipVelocity`'s re-push | at least `DIST_EPSILON` | cancels the residual only (`:4303`) |
+| `StayOnGround`'s up-probe | 2 units | **1 unit** (`:3487`) |
+| Walking into a standable slope | `StepMove` | **slides up the ramp** (`:3824`) |
+
+Where Portal's override differs only by generalising world `+Z` to an arbitrary "stick
+normal" — the paint-gel gravity reorientation — the two are the same function with no
+paint, because `m_vGravityDirection = -stickNormal` (`:440`) and the stick normal is world
+up. Those are ported in the world-`+Z` form.
+
+#### Corrections to this plan, found while implementing
+
+- **§4.4's "`sv_maxspeed` 320" is not the number that bounds a Portal 2 player.**
+  `mv->m_flMaxSpeed` is `GetPlayerMaxSpeed()` = `min( sv_maxspeed, MaxSpeed() )`, and a
+  Portal player's `MaxSpeed()` is `sv_speed_normal` = **175**
+  (`portal_player_shared.cpp:1591`). **This was a live bug in stage 1**, which passed
+  `sv_maxspeed` and flew noclip at 1600 where the shipped game flies at 875. Fixed with
+  stage 4, and one stage-1 test changed with it — see `rustdocs/CLIENT.md`.
+- **The duck-jump state machine is unreachable in Portal 2 and is not ported.**
+  `CheckJumpButton` sets `bSetDuckJump = false` over a Valve comment reading "temp fix for
+  camera snapping when ducking in the air ( NO DUCKJUMP for now )". Nothing sets
+  `m_nJumpTimeMsecs`, so `m_bInDuckJump`, `StartUnDuckJump`, `CanUnDuckJump`,
+  `FinishUnDuckJump` and `UpdateDuckJumpEyeOffset` are all dead. That is most of the
+  length of `Duck()`.
+- **Ladders are deleted, not deferred.** `GameHasLadders()` returns `false` for Portal
+  (`portal_gamemovement.h:132`).
+- **`MoveData` grew a sibling, `MoveVars`.** The `sv_*` set is read once per command into
+  a struct rather than reached through cvar handles at each use, because this module
+  compiles into a server too and a cvar handle is a client-side convenience. It is
+  `movevars_shared.cpp`, which is a file of exactly these.
+- **The `+jump`/`+duck` placeholder is gone and nothing replaced it.** With walking real,
+  jump and duck are buttons; a noclip player flies up the way the shipped game does, by
+  looking up and holding forward. `bind SPACE +moveup` brings the axis back.
 
 ### Stage 5 — prediction and the connection (blocked on `net/` + `server/`)
 
