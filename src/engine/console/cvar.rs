@@ -418,7 +418,7 @@ fn format_float(value: f32) -> String {
 /// shipped `.cfg` files, where a trailing comment or a stray unit would
 /// otherwise turn a real value into a parse failure. `ENGINE_CONSOLE.md` §7 —
 /// the file format is Valve's, so its number grammar is too.
-fn atod(text: &str) -> f64 {
+pub(super) fn atod(text: &str) -> f64 {
     let text = text.trim_start();
     let bytes = text.as_bytes();
     let mut end = 0;

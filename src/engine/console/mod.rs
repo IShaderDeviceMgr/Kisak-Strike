@@ -78,6 +78,7 @@
 
 pub mod buffer;
 pub mod cvar;
+mod describe;
 pub mod log;
 pub mod token;
 pub mod ui;
@@ -458,6 +459,24 @@ impl<'a> Console<'a> {
             // it at insert time (§4.2). The spec is registered so that it is
             // discoverable and so that completion and `help` can see it.
             CommandSpec::new("wait", "Delay the rest of the command text by a tick."),
+            // The list commands (`ENGINE_CONSOLE.md` §8 stage 5). Help text is
+            // Valve's own, verbatim, because it is what `help` and `cvarlist`
+            // print and a reader comparing the two should see the same words.
+            CommandSpec::new("cvarlist", "Show the list of convars/concommands."),
+            CommandSpec::new("help", "Find help about a convar/concommand."),
+            CommandSpec::new(
+                "find",
+                "Find concommands with the specified string in their name/help text.",
+            ),
+            CommandSpec::new(
+                "differences",
+                "Show all convars which are not at their default values.",
+            ),
+            CommandSpec::new(
+                "toggle",
+                "Toggles a convar on or off, or cycles through a set of values.",
+            ),
+            CommandSpec::new("incrementvar", "Increment specified convar value."),
         ] {
             self.register_command(spec)
                 .expect("built-in commands are unique");
@@ -931,7 +950,7 @@ impl<'a> Console<'a> {
         }
 
         if cmd.argc() == 1 {
-            let line = describe_cvar(&cvar);
+            let line = describe::cvar(&cvar);
             self.log.print(&line);
             return true;
         }
@@ -976,6 +995,12 @@ impl<'a> Console<'a> {
             }
             "clear" => self.log.clear(),
             "stuffcmds" => self.cmd_stuffcmds(cmd),
+            "cvarlist" => self.cmd_cvarlist(cmd),
+            "help" => self.cmd_help(cmd),
+            "find" => self.cmd_find(cmd),
+            "differences" => self.cmd_differences(),
+            "toggle" => self.cmd_toggle(cmd),
+            "incrementvar" => self.cmd_incrementvar(cmd),
             // Eaten by the buffer at insert time; reaching dispatch means
             // `wait` was disabled, in which case doing nothing is right.
             "wait" => {}
@@ -1181,6 +1206,359 @@ impl<'a> Console<'a> {
             self.buffer.add_text(&build, cmd.source(), 0);
         }
     }
+
+    // ---- the list commands ------------------------------------------------
+    //
+    // `ENGINE_CONSOLE.md` §8 stage 5. All six are console built-ins rather
+    // than the target's, for the same reason `exec` is: they need the registry
+    // and the log and nothing else. `incrementvar` is the one that also needs
+    // the buffer, and it is here too rather than in the engine, because what
+    // it wants the buffer for is to re-enter dispatch -- which is `exec`'s
+    // problem exactly.
+
+    /// Every cvar and command a listing may show.
+    ///
+    /// The `DEVELOPMENTONLY`/`HIDDEN` filter lives here rather than at each
+    /// call site because every one of the list commands applies it
+    /// (`engine/cvar.cpp:1011`, `:1146`, `vstdlib/cvar.cpp:1077`) and it is the
+    /// one filter that must not be forgotten: a listing is precisely what those
+    /// two flags exist to hide from.
+    ///
+    /// `help` is deliberately **not** a caller. Valve's finds a hidden cvar by
+    /// name and describes it, and that is the point of `HIDDEN` as against
+    /// `DEVELOPMENTONLY`: not discoverable, still usable.
+    fn listable(&self) -> Vec<Entry<'_>> {
+        let commands = self
+            .commands
+            .values()
+            .filter(|spec| {
+                !spec
+                    .flags
+                    .intersects(CommandFlags::DEVELOPMENTONLY | CommandFlags::HIDDEN)
+            })
+            .map(Entry::Command);
+
+        let cvars = self
+            .cvars
+            .iter()
+            .filter(|cvar| {
+                !cvar
+                    .flags()
+                    .intersects(CvarFlags::DEVELOPMENTONLY | CvarFlags::HIDDEN)
+            })
+            .map(Entry::Cvar);
+
+        commands.chain(cvars).collect()
+    }
+
+    /// `CCvarUtilities::CvarList` (`engine/cvar.cpp:952`) —
+    /// `cvarlist [log <file>] [partial]`.
+    fn cmd_cvarlist(&mut self, cmd: &Command) {
+        if cmd.argc() == 2 && cmd.arg(1).is_some_and(|arg| arg.eq_ignore_ascii_case("?")) {
+            self.log.print("cvarlist:  [log logfile] [ partial ]");
+            return;
+        }
+
+        // Valve reads `args[1]` unconditionally -- `CCommand::operator[]`
+        // returns `""` past the end -- so a bare `cvarlist` takes the second
+        // branch with an empty prefix, and an empty prefix matches everything.
+        let logging = cmd.argc() >= 3
+            && cmd
+                .arg(1)
+                .is_some_and(|arg| arg.eq_ignore_ascii_case("log"));
+        let log_file = logging.then(|| cmd.arg(2).unwrap_or_default().to_string());
+        let partial = match logging {
+            true => cmd.arg(3).unwrap_or_default(),
+            false => cmd.arg(1).unwrap_or_default(),
+        };
+
+        let mut matched: Vec<((String, String), String, String)> = self
+            .listable()
+            .into_iter()
+            .filter(|entry| has_prefix(entry.name(), partial))
+            .map(|entry| (describe::list_order(entry.name()), entry.row(), entry.csv()))
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Written before anything is printed, so that a file that will not
+        // open aborts the command rather than half-running it -- which is the
+        // order `CvarList` opens its handle in.
+        if let Some(file) = log_file {
+            // **Divergence, deliberate.** Valve writes wherever it is told.
+            // The path here comes from the same places `exec`'s does -- a
+            // shipped `.cfg` as readily as a person -- so it gets the same
+            // blocklist (§4.5), and `Vfs::write_path` already confines it to
+            // the write root. Nothing legitimately logs cvars to a `.dll`.
+            if !is_valid_config_extension(&file) {
+                let line = format!("cvarlist log {file}: invalid file type.");
+                self.log.error(&line);
+                return;
+            }
+
+            let mut csv = describe::csv_header();
+            csv.push('\n');
+            for (_, _, row) in &matched {
+                csv.push_str(row);
+                csv.push('\n');
+            }
+            if let Err(err) = self.files.write_config(&file, &csv) {
+                let line = format!("Couldn't open '{file}' for writing! ({err})");
+                self.log.error(&line);
+                return;
+            }
+        }
+
+        self.log.print("cvar list\n--------------");
+        for (_, row, _) in &matched {
+            self.log.print(row);
+        }
+
+        let count = matched.len();
+        let footer = match partial.is_empty() {
+            true => format!("--------------\n{count:3} total convars/concommands"),
+            false => format!("--------------\n{count:3} convars/concommands for [{partial}]"),
+        };
+        self.log.print(&footer);
+    }
+
+    /// `CCvarUtilities::CvarHelp` (`engine/cvar.cpp:1109`).
+    fn cmd_help(&mut self, cmd: &Command) {
+        if cmd.argc() != 2 {
+            self.log.print("Usage:  help <cvarname>");
+            return;
+        }
+        let name = cmd.arg(1).unwrap_or_default();
+
+        // **Command before cvar**, which is dispatch's own order: `help x`
+        // describes what typing `x` would actually do. Valve never has to
+        // choose, because `FindCommandBase` searches one table holding both and
+        // a name can only be one thing; here they are two maps, and nothing
+        // stops a name being in both.
+        let found = self
+            .find_command(name)
+            .map(describe::command)
+            .or_else(|| self.cvars.find(name).map(describe::cvar));
+
+        let line = match found {
+            Some(line) => line,
+            None => format!("help:  no cvar or command named {name}"),
+        };
+        self.log.print(&line);
+    }
+
+    /// `CCvar::Find` (`vstdlib/cvar.cpp:1052`) — substring search over names
+    /// and help text.
+    ///
+    /// **Every search string must match**, each of them against *either* the
+    /// name or the help text. Valve's original takes one string; the reference
+    /// tree takes two (a Kisak addition, marked `lwss:` at the call site) while
+    /// printing a usage line promising `[<string>...]`. Taking as many as are
+    /// given is less code than either and is what the usage line already says.
+    fn cmd_find(&mut self, cmd: &Command) {
+        if cmd.argc() < 2 {
+            self.log.print("Usage:  find <string> [<string>...]");
+            return;
+        }
+
+        let needles: Vec<String> = cmd
+            .args()
+            .iter()
+            .map(|arg| arg.to_ascii_lowercase())
+            .collect();
+
+        let mut matched: Vec<(String, String)> = self
+            .listable()
+            .into_iter()
+            .filter(|entry| {
+                let name = entry.name().to_ascii_lowercase();
+                let help = entry.help().to_ascii_lowercase();
+                needles
+                    .iter()
+                    .all(|needle| name.contains(needle.as_str()) || help.contains(needle.as_str()))
+            })
+            .map(|entry| (describe::name_order(entry.name()), entry.describe()))
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, line) in &matched {
+            self.log.print(line);
+        }
+    }
+
+    /// `CCvarUtilities::CvarDifferences` (`engine/cvar.cpp:1139`): every cvar
+    /// not sitting on the value it was declared with.
+    ///
+    /// **Sorted**, where Valve walks its hash table in whatever order it is
+    /// in. A `HashMap` here is seeded per process, so unsorted would mean a
+    /// different order on every launch.
+    fn cmd_differences(&mut self) {
+        let mut matched: Vec<(String, String)> = self
+            .cvars
+            .iter()
+            .filter(|cvar| {
+                !cvar
+                    .flags()
+                    .intersects(CvarFlags::DEVELOPMENTONLY | CvarFlags::HIDDEN)
+            })
+            .filter(|cvar| !describe::is_at_default(cvar))
+            .map(|cvar| (describe::name_order(cvar.name()), describe::cvar(cvar)))
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, line) in &matched {
+            self.log.print(line);
+        }
+    }
+
+    /// `CCvarUtilities::CvarToggle` (`engine/cvar.cpp:1161`) with
+    /// `IsValidToggleCommand` (`:517`) inlined.
+    fn cmd_toggle(&mut self, cmd: &Command) {
+        if cmd.argc() < 2 {
+            self.log
+                .print("Usage:  toggle <cvarname> [value1] [value2] [value3]...");
+            return;
+        }
+        let name = cmd.arg(1).unwrap_or_default();
+
+        let Some(cvar) = self.cvars.find(name).cloned() else {
+            let line = format!("{name} is not a valid cvar");
+            self.log.print(&line);
+            return;
+        };
+
+        // Refused **silently**, as `IsValidToggleCommand` does: these are the
+        // two flags a listing hides, and a message here would be the one place
+        // they surfaced.
+        if cvar
+            .flags()
+            .intersects(CvarFlags::DEVELOPMENTONLY | CvarFlags::HIDDEN)
+        {
+            return;
+        }
+
+        if cvar.flags().contains(CvarFlags::CHEAT) && !self.can_cheat() {
+            let line = format!(
+                "Can't use cheat cvar {} in multiplayer, unless the server has sv_cheats set to 1.",
+                cvar.name()
+            );
+            self.log.error(&line);
+            return;
+        }
+
+        // `IsValidToggleCommand`'s other three refusals -- `SPONLY`,
+        // `NOT_CONNECTED` and `REPLICATED` -- all ask whether a *server* is
+        // connected. There is none, so they return with `net/`.
+
+        let values = cmd.args().get(1..).unwrap_or_default();
+        match values.is_empty() {
+            true => cvar.set_bool(!cvar.bool()),
+            false => {
+                // Case-sensitive (`Q_strcmp`). The search is for the *current*
+                // value, so a cvar sitting on something not in the list starts
+                // the cycle at the list's beginning rather than staying put.
+                let current = describe::value(&cvar);
+                let next = match values.iter().position(|value| *value == current) {
+                    Some(index) if index + 1 < values.len() => index + 1,
+                    _ => 0,
+                };
+                cvar.set_string(&values[next]);
+            }
+        }
+
+        let line = describe::cvar(&cvar);
+        self.log.print(&line);
+    }
+
+    /// `incrementvar` (`engine/host_cmd.cpp:2638`):
+    /// `incrementvar <cvar> <min> <max> <delta>`, wrapping at either end.
+    fn cmd_incrementvar(&mut self, cmd: &Command) {
+        if cmd.argc() != 5 {
+            self.log
+                .warn("Usage: incrementvar varName minValue maxValue delta");
+            return;
+        }
+        let name = cmd.arg(1).unwrap_or_default();
+
+        let Some(cvar) = self.cvars.find(name).cloned() else {
+            let line = format!("cvar \"{name}\" not found");
+            self.log.developer_print(1, &line);
+            return;
+        };
+
+        // `atof`, not `str::parse`: the arguments come from a `.cfg` or from a
+        // binding as often as from a person -- see [`self::cvar::atod`].
+        let number = |index: usize| self::cvar::atod(cmd.arg(index).unwrap_or_default()) as f32;
+        let (start, end, delta) = (number(2), number(3), number(4));
+
+        let mut value = cvar.float() + delta;
+        if value > end {
+            value = start;
+        } else if value < start {
+            value = end;
+        }
+
+        // **Queued as a plain set rather than written here**, which Valve
+        // explains as avoiding "any problems with state in a demo loop": what a
+        // recording then contains is the set, not the increment, so replaying
+        // it does not depend on the value the cvar happened to hold. Kept, and
+        // it costs nothing -- an insert during processing goes to the head, so
+        // the set still runs before anything already queued.
+        let text = format!("{} {value:.6}", cvar.name());
+        self.buffer.add_text(&text, cmd.source(), 0);
+
+        let line = format!("{} = {value:.6}", cvar.name());
+        self.log.developer_print(1, &line);
+    }
+}
+
+/// One row of a listing: the two things a console name can be.
+///
+/// `ConCommandBase` with `IsCommand()`, which is the C++ spelling of a sum
+/// type. The list commands are the only place the distinction is visible,
+/// because they are the only place both are shown at once.
+enum Entry<'a> {
+    Cvar(&'a Cvar),
+    Command(&'a CommandSpec),
+}
+
+impl Entry<'_> {
+    fn name(&self) -> &str {
+        match self {
+            Entry::Cvar(cvar) => cvar.name(),
+            Entry::Command(spec) => spec.name,
+        }
+    }
+
+    fn help(&self) -> &str {
+        match self {
+            Entry::Cvar(cvar) => cvar.help(),
+            Entry::Command(spec) => spec.help,
+        }
+    }
+
+    /// `ConVar_PrintDescription`, for `help`, `find` and `toggle`.
+    fn describe(&self) -> String {
+        match self {
+            Entry::Cvar(cvar) => describe::cvar(cvar),
+            Entry::Command(spec) => describe::command(spec),
+        }
+    }
+
+    /// `PrintCvar`/`PrintCommand`, for `cvarlist`'s console output.
+    fn row(&self) -> String {
+        match self {
+            Entry::Cvar(cvar) => describe::cvar_row(cvar),
+            Entry::Command(spec) => describe::command_row(spec),
+        }
+    }
+
+    /// The same row for `cvarlist log`'s file.
+    fn csv(&self) -> String {
+        match self {
+            Entry::Cvar(cvar) => describe::cvar_csv(cvar),
+            Entry::Command(spec) => describe::command_csv(spec),
+        }
+    }
 }
 
 /// `CConsolePanel::CommandMatchesText` (`consoledialog.cpp:451`).
@@ -1270,29 +1648,6 @@ fn seed_from_command_line(cvar: Cvar, command_line: &[String]) -> Cvar {
         cvar.set_string(value);
     }
     cvar
-}
-
-/// `ConVar_PrintDescription`, shortened to the line that matters.
-fn describe_cvar(cvar: &Cvar) -> String {
-    let value = match cvar.flags().contains(CvarFlags::NEVER_AS_STRING) {
-        true => cvar.float().to_string(),
-        false => cvar.string().to_string(),
-    };
-    let mut line = format!("\"{}\" = \"{}\"", cvar.name(), value);
-    if cvar.default_value() != value {
-        line.push_str(&format!(" ( def. \"{}\" )", cvar.default_value()));
-    }
-    match cvar.bounds() {
-        (Some(min), Some(max)) => line.push_str(&format!(" min. {min} max. {max}")),
-        (Some(min), None) => line.push_str(&format!(" min. {min}")),
-        (None, Some(max)) => line.push_str(&format!(" max. {max}")),
-        (None, None) => {}
-    }
-    if !cvar.help().is_empty() {
-        line.push('\n');
-        line.push_str(cvar.help());
-    }
-    line
 }
 
 /// The value half of a cvar set, taken from [`Command::tail`].
@@ -2123,5 +2478,441 @@ mod tests {
             "an integral value is not printed as 2.000000"
         );
     }
+    // ---- the list commands ------------------------------------------------
 
+    /// Everything the console has printed, oldest first.
+    fn printed(console: &Console) -> Vec<String> {
+        console
+            .log()
+            .lines()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    /// A [`ConfigFiles`] that remembers what was written through it, so that
+    /// `cvarlist log` can be tested without touching a disk.
+    #[derive(Default)]
+    struct RecordingConfigs {
+        written: std::sync::Mutex<Map<String, String>>,
+        refuse: bool,
+    }
+
+    impl ConfigFiles for std::sync::Arc<RecordingConfigs> {
+        fn read_config(&self, _path: &str, _path_id: Option<&str>) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn write_config(&self, path: &str, contents: &str) -> Result<(), String> {
+            if self.refuse {
+                return Err("read-only".to_string());
+            }
+            self.written
+                .lock()
+                .expect("not poisoned")
+                .insert(path.to_string(), contents.to_string());
+            Ok(())
+        }
+    }
+
+    /// A console holding one of each kind of listable thing.
+    fn listing_console() -> Console<'static> {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar("test_speed", "5", CvarFlags::ARCHIVE, "How fast it goes.");
+        console.cvar("test_secret", "1", CvarFlags::HIDDEN, "Not for listings.");
+        console.cvar("test_early", "1", CvarFlags::DEVELOPMENTONLY, "Nor this.");
+        console.cvar("test_noclip", "0", CvarFlags::CHEAT, "Walk through walls.");
+        declare(&mut console, "test_dance");
+        console
+    }
+
+    /// The banner, the rows and the footer, and that `DEVELOPMENTONLY` and
+    /// `HIDDEN` never reach any of them.
+    #[test]
+    fn cvarlist_prints_a_banner_rows_and_a_count() {
+        let mut console = listing_console();
+        console.enqueue("cvarlist test_", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        assert_eq!(text[0], "cvar list");
+        assert_eq!(text[1], "--------------");
+
+        let rows: Vec<&String> = text[2..text.len() - 2].iter().collect();
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|row| row.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            ["test_dance", "test_noclip", "test_speed"],
+            "sorted, and neither the hidden nor the developmentonly cvar: {text:?}"
+        );
+
+        assert!(rows[2].contains(", a"), "the archive flag: {:?}", rows[2]);
+        assert!(rows[2].contains("How fast it goes."), "{:?}", rows[2]);
+        assert!(
+            rows[0].contains(" cmd "),
+            "a command's value column: {:?}",
+            rows[0]
+        );
+
+        assert_eq!(text[text.len() - 2], "--------------");
+        assert_eq!(text[text.len() - 1], "  3 convars/concommands for [test_]");
+    }
+
+    /// With no argument the prefix is empty, which matches everything — and
+    /// the footer says "total" rather than naming a filter.
+    #[test]
+    fn cvarlist_with_no_argument_lists_everything() {
+        let mut console = listing_console();
+        console.enqueue("cvarlist", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        let footer = text.last().expect("a footer");
+        assert!(footer.ends_with("total convars/concommands"), "{footer}");
+        assert!(
+            text.iter().any(|line| line.starts_with("exec ")),
+            "the built-ins are listed too: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.starts_with("test_secret")),
+            "{text:?}"
+        );
+    }
+
+    /// `ConCommandBaseLessFunc` drops a leading `+`/`-`, so the two halves of
+    /// a button command sort next to each other rather than under punctuation.
+    #[test]
+    fn cvarlist_sorts_the_two_halves_of_a_button_together() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar("test_fps", "0", CvarFlags::NONE, "");
+        declare(&mut console, "+test_forward");
+        declare(&mut console, "-test_forward");
+        // Not `cvarlist test`: the prefix filter compares from the first
+        // character, `+` included, so it would exclude both halves — which is
+        // what the shipped engine does too.
+        console.enqueue("cvarlist", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let names: Vec<String> = printed(&console)
+            .iter()
+            .map(|row| row.split(' ').next().unwrap_or_default().to_string())
+            .filter(|name| name.contains("test_"))
+            .collect();
+        assert_eq!(
+            names,
+            ["+test_forward", "-test_forward", "test_fps"],
+            "`forward` sorts before `fps`, and the punctuation is not compared"
+        );
+    }
+
+    #[test]
+    fn cvarlist_help_is_a_usage_line() {
+        let mut console = listing_console();
+        console.enqueue("cvarlist ?", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(printed(&console), ["cvarlist:  [log logfile] [ partial ]"]);
+    }
+
+    #[test]
+    fn cvarlist_log_writes_a_csv_beside_the_listing() {
+        let files = std::sync::Arc::new(RecordingConfigs::default());
+        let mut console = console_with(Box::new(std::sync::Arc::clone(&files)), &[]);
+        console.cvar(
+            "test_speed",
+            "5",
+            CvarFlags::ARCHIVE,
+            "How \"fast\" it goes.",
+        );
+        console.enqueue("cvarlist log cvars.csv test_", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let written = files.written.lock().expect("not poisoned");
+        let csv = written.get("cvars.csv").expect("the file was written");
+        let rows: Vec<&str> = csv.lines().collect();
+        assert!(rows[0].starts_with("\"Name\",\"Value\","), "{}", rows[0]);
+        assert!(rows[0].ends_with(",\"Help Text\""), "{}", rows[0]);
+        assert_eq!(rows.len(), 2, "a header and one cvar: {rows:?}");
+        assert!(rows[1].starts_with("\"test_speed\",\"5\","), "{}", rows[1]);
+        assert!(
+            rows[1].contains("\"archive\""),
+            "the flag column is filled in: {}",
+            rows[1]
+        );
+        assert!(
+            rows[1].ends_with("\"How 'fast' it goes.\""),
+            "a quote inside a field would end it: {}",
+            rows[1]
+        );
+
+        assert!(
+            printed(&console).iter().any(|line| line == "cvar list"),
+            "logging does not replace the console output"
+        );
+    }
+
+    /// A file that will not open stops the command, rather than logging half
+    /// of it — which is why `CvarList` opens its handle before it prints.
+    #[test]
+    fn cvarlist_log_that_cannot_be_written_prints_nothing_else() {
+        let files = std::sync::Arc::new(RecordingConfigs {
+            refuse: true,
+            ..RecordingConfigs::default()
+        });
+        let mut console = console_with(Box::new(std::sync::Arc::clone(&files)), &[]);
+        console.enqueue("cvarlist log /nowhere.csv", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].starts_with("Couldn't open"), "{text:?}");
+    }
+
+    /// The log path reaches the same place `exec`'s does, so it gets the same
+    /// blocklist — which Valve does not apply here.
+    #[test]
+    fn cvarlist_log_refuses_a_dangerous_extension() {
+        let files = std::sync::Arc::new(RecordingConfigs::default());
+        let mut console = console_with(Box::new(std::sync::Arc::clone(&files)), &[]);
+        console.enqueue("cvarlist log bin/evil.DLL", Source::Code);
+        console.run(&mut NoTarget);
+
+        assert!(files.written.lock().expect("not poisoned").is_empty());
+        let text = printed(&console);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("invalid file type"), "{text:?}");
+    }
+
+    #[test]
+    fn help_describes_a_cvar_a_command_and_neither() {
+        let mut console = listing_console();
+        console.enqueue(
+            "help test_speed; help test_dance; help nothing",
+            Source::UserInput,
+        );
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        assert!(
+            text[0].starts_with("\"test_speed\" = \"5\""),
+            "the value, then the flags, then the help: {:?}",
+            text[0]
+        );
+        assert!(text[0].contains(" archive "), "{:?}", text[0]);
+        assert!(text[0].ends_with(" - How fast it goes."), "{:?}", text[0]);
+        assert_eq!(text[1], "\"test_dance\" ", "a command has no value to show");
+        assert_eq!(text[2], "help:  no cvar or command named nothing");
+    }
+
+    /// `HIDDEN` means "not discoverable", not "not usable" — so the listings
+    /// skip it and `help` does not.
+    #[test]
+    fn help_finds_a_hidden_cvar_that_the_listings_hide() {
+        let mut console = listing_console();
+        console.enqueue("help test_secret", Source::UserInput);
+        console.run(&mut NoTarget);
+        let text = printed(&console);
+        assert!(text[0].starts_with("\"test_secret\""), "{text:?}");
+        assert!(text[0].contains(" hidden"), "{text:?}");
+    }
+
+    /// A cvar's `( def. )` clause appears only once the value has moved, and
+    /// the bounds print as `%f`, both of which are what makes two `help` lines
+    /// comparable with the shipped engine's.
+    #[test]
+    fn help_shows_the_default_and_the_bounds_once_the_value_moves() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar_bounded("test_gamma", "2", CvarFlags::NONE, "", Some(1.0), Some(3.0));
+        console.enqueue(
+            "help test_gamma; test_gamma 3; help test_gamma",
+            Source::UserInput,
+        );
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        assert_eq!(
+            text[0],
+            "\"test_gamma\" = \"2\" min. 1.000000 max. 3.000000"
+        );
+        assert_eq!(
+            text.last().expect("a second description"),
+            "\"test_gamma\" = \"3\" ( def. \"2\" ) min. 1.000000 max. 3.000000"
+        );
+    }
+
+    /// Each search term may match the name *or* the help text, and **every**
+    /// term has to match something.
+    #[test]
+    fn find_requires_every_term_and_looks_in_the_help_text() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar("test_wireframe", "0", CvarFlags::NONE, "Draw the edges.");
+        console.cvar("test_vsync", "1", CvarFlags::NONE, "Wait for the display.");
+        console.cvar("test_hidden", "1", CvarFlags::HIDDEN, "Draw the edges.");
+
+        console.enqueue("find edges", Source::UserInput);
+        console.run(&mut NoTarget);
+        let text = printed(&console);
+        assert_eq!(
+            text.len(),
+            1,
+            "help text is searched, and HIDDEN is not: {text:?}"
+        );
+        assert!(text[0].starts_with("\"test_wireframe\""), "{text:?}");
+
+        console.log_mut().clear();
+        console.enqueue("find test draw", Source::UserInput);
+        console.run(&mut NoTarget);
+        let text = printed(&console);
+        assert_eq!(
+            text.len(),
+            1,
+            "`test` from the name, `draw` from the help: {text:?}"
+        );
+
+        console.log_mut().clear();
+        console.enqueue("find test nothing", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert!(printed(&console).is_empty(), "one term missing is no match");
+    }
+
+    #[test]
+    fn find_searches_commands_as_well_as_cvars() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.enqueue("find stuffcmds", Source::UserInput);
+        console.run(&mut NoTarget);
+        let text = printed(&console);
+        assert!(text[0].starts_with("\"stuffcmds\" "), "{text:?}");
+    }
+
+    #[test]
+    fn differences_lists_only_what_has_moved() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar("test_moved", "0", CvarFlags::NONE, "");
+        console.cvar("test_still", "0", CvarFlags::NONE, "");
+        console.enqueue("test_moved 1; differences", Source::UserInput);
+        console.run(&mut NoTarget);
+
+        let text = printed(&console);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].starts_with("\"test_moved\" = \"1\""), "{text:?}");
+    }
+
+    /// The reason `describe::value` exists rather than [`Cvar::string`]: an
+    /// `FCVAR_NEVER_AS_STRING` cvar never updates its string, so comparing
+    /// that would report every one of them as unchanged for ever.
+    #[test]
+    fn differences_sees_a_never_as_string_cvar_move() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        console.cvar("test_bits", "0", CvarFlags::NEVER_AS_STRING, "");
+        console.enqueue("differences", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert!(printed(&console).is_empty(), "still at its default");
+
+        console.enqueue("test_bits 2; differences", Source::UserInput);
+        console.run(&mut NoTarget);
+        let text = printed(&console);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].starts_with("\"test_bits\" = \"2\""), "{text:?}");
+    }
+
+    #[test]
+    fn toggle_with_no_values_flips_between_zero_and_one() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        let flag = console.cvar("test_flag", "0", CvarFlags::NONE, "");
+
+        console.enqueue("toggle test_flag", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(flag.int(), 1);
+
+        console.enqueue("toggle test_flag", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(flag.int(), 0);
+        assert!(printed(&console)
+            .last()
+            .expect("the description is printed each time")
+            .starts_with("\"test_flag\" = \"0\""),);
+    }
+
+    #[test]
+    fn toggle_cycles_a_value_list_and_wraps() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        let mode = console.cvar("test_mode", "low", CvarFlags::NONE, "");
+
+        for expected in ["medium", "high", "low"] {
+            console.enqueue("toggle test_mode low medium high", Source::UserInput);
+            console.run(&mut NoTarget);
+            assert_eq!(&*mode.string(), expected);
+        }
+
+        // A value that is not in the list starts the cycle at its beginning.
+        mode.set_string("other");
+        console.enqueue("toggle test_mode low medium high", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(&*mode.string(), "low");
+    }
+
+    #[test]
+    fn toggle_is_refused_for_a_cheat_cvar_and_for_an_unknown_name() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        let noclip = console.cvar("test_noclip", "0", CvarFlags::CHEAT, "");
+
+        console.enqueue("toggle test_noclip; toggle test_nothing", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(noclip.int(), 0, "no cheating without sv_cheats");
+
+        let text = printed(&console);
+        assert!(text[0].starts_with("Can't use cheat cvar"), "{text:?}");
+        assert_eq!(text[1], "test_nothing is not a valid cvar");
+
+        console.enqueue("sv_cheats 1; toggle test_noclip", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(noclip.int(), 1);
+    }
+
+    /// The wrap at both ends, and that the set arrives **through the buffer**
+    /// rather than being written here — which is what makes it appear in a
+    /// recording as a set rather than as an increment.
+    #[test]
+    fn incrementvar_wraps_at_both_ends_and_sets_through_the_buffer() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        let volume = console.cvar("test_volume", "0.9", CvarFlags::NONE, "");
+
+        console.enqueue("incrementvar test_volume 0 1 0.1", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert!((volume.float() - 1.0).abs() < 0.001, "{}", volume.float());
+
+        console.enqueue("incrementvar test_volume 0 1 0.1", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(volume.float(), 0.0, "past the top wraps to the minimum");
+
+        console.enqueue("incrementvar test_volume 0 1 -0.1", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(volume.float(), 1.0, "below the bottom wraps to the maximum");
+
+        console.enqueue("incrementvar test_volume 0 1", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert!(printed(&console)
+            .last()
+            .expect("a usage line")
+            .starts_with("Usage: incrementvar"),);
+    }
+
+    /// `incrementvar` reaches the cvar by re-entering dispatch, so everything
+    /// dispatch does still applies — here, the cheat gate.
+    #[test]
+    fn incrementvar_goes_through_dispatch_and_so_through_the_cheat_gate() {
+        let mut console = console_with(FakeConfigs::new(&[]), &[]);
+        let noclip = console.cvar("test_noclip", "0", CvarFlags::CHEAT, "");
+        console.enqueue("incrementvar test_noclip 0 1 1", Source::UserInput);
+        console.run(&mut NoTarget);
+        assert_eq!(noclip.int(), 0);
+        assert!(
+            printed(&console)
+                .iter()
+                .any(|line| line.starts_with("Can't use cheat cvar")),
+            "{:?}",
+            printed(&console)
+        );
+    }
 }

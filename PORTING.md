@@ -593,21 +593,34 @@ composition spans two modules, as it does in the original: the bindings are `inp
 the archived cvars are `console/`'s, joined by engine policy. `sensitivity` became the
 first `FCVAR_ARCHIVE` cvar.
 
-**Next on the boot path:** the **`egui` console UI** — `console/` stage 4 and `input/`
-stage 4, which are one integration and must land together. `egui` is already a decided
-replacement, so this is unscheduled rather than blocked. `input/` stage 4 brings the
-key-up latch, which is a correctness fix: without it, clicking and then opening the console
-leaves `+attack` held forever. `materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
+**`console/` stage 4 and `input/` stage 4 are done, and they were one integration** as
+planned. `egui` arrives split across three layers — `window/` translates, `console/ui.rs`
+decides, `materials/ui.rs` draws — and the console opens on `` ` `` with scrollback,
+history and tab completion. `Console::complete` is `RebuildCompletionList` and lives in
+`console/`, not in the dialog, because it is a question about the registry. `input/` stage
+4 brought the key-up latch with it, which is a correctness fix: without it, clicking and
+then opening the console leaves `+attack` held forever.
+
+**`console/` stage 5 is done, and the module is finished.** `cvarlist`, `help`, `find`,
+`differences`, `toggle` and `incrementvar` — all built-ins, because they need the registry
+and the log and nothing else. The one structural thing it produced is `console/describe.rs`:
+`ConVar_PrintDescription` is one function that four commands print through, and the C++
+spells the same six flags in *three* different tables, two of them listing different
+subsets. One table with a long name and a short one replaces all three. `findflags` was
+not ported — it searches the twenty-two flags this port does not have.
+
+**Next on the boot path:** `client/`, which is what takes `ViewAngles`, `FlyCamera` and
+`MoveButtons` out of `input/` and replaces the placeholder camera with a player.
+`materialsystem` stage 6 (`VertexLitGeneric` and the rest of the shader set) is
 unblocked but is a breadth move rather than a boot-path one; stage 5 already took the
 visual return that was outstanding, turning 58 of `sp_a1_intro1`'s 66 materials from
 magenta checkerboard into lit content.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`
-§1 originally had it. **Stages 1 and 2 are done** (translation, button state, mouse look,
-free-fly camera). Stage 3 (bindings) wants `console/` and is its natural first consumer;
-stage 4 (UI precedence, and the key-up latch that goes with it) wants `egui`; stage 5
-(controllers, `gilrs`) is deliberately last.
+§1 originally had it. **Stages 1-4 are done** (translation, button state, mouse look,
+free-fly camera, bindings, UI precedence and the key-up latch). Stage 5 (controllers,
+`gilrs`) is deliberately last and is all that remains.
 
 **Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
 `launcher_main` were deleted before the restructure, so `legacy/` no longer links a

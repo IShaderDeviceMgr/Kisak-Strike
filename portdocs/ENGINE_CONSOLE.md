@@ -1,6 +1,6 @@
 # Porting console, cvars & commands → `src/engine/console/`
 
-**Status: stages 1-4 landed; only stage 5 is left.** Stage 1 (§8.1) is cvars, the command
+**Status: complete — all five stages of §8 have landed.** Stage 1 (§8.1) is cvars, the command
 buffer, both
 tokenizers, dispatch, aliases, `exec`, `stuffcmds`, the log sink, and
 `map`/`quit`/`restart` through a `CommandTarget`. Stage 2 (§8.2) is bindings, which is the
@@ -9,7 +9,8 @@ in `input/`, and WASD now comes from the shipped `cfg/config_default.cfg`. Stage
 is config persistence: `FCVAR_ARCHIVE`, `host_writeconfig`, `execifexists`, and the
 `config.cfg`-over-`config_default.cfg` preference at startup, with both of Valve's guards.
 Stage 4 (§8.4) is the `egui` dialog, which landed together with `ENGINE_INPUT.md` stage 4
-as this plan said it must. Stage 5 (the list commands) is not started. This is the plan,
+as this plan said it must. Stage 5 (§8.5) is the list commands — `cvarlist`, `help`,
+`find`, `differences`, `toggle` and `incrementvar`. This is the plan,
 written before the port, per `PORTING.md`'s per-module rule; **the API reference
 in `rustdocs/ENGINE.md`'s `src/engine/console/` section is the document to read
 in order to *use* the module**, and it is authoritative where the two disagree.
@@ -774,12 +775,50 @@ Each stage is independently reviewable and independently useful.
      inside `ConsoleUi` is simpler and means the game never sees it, so Escape does not
      also hand the cursor back.
 
-5. **The list/diagnostic commands.** `cvarlist`, `help`, `find`, `differences`,
-   `toggle`, `incrementvar`. Trivial once 1 and 4 exist, useless before.
+5. **The list/diagnostic commands.** — **done.** `cvarlist` (including
+   `cvarlist log <file>`'s CSV), `help`, `find`, `differences`, `toggle` and
+   `incrementvar`. All six are console built-ins rather than the target's, for
+   the same reason `exec` is: they need the registry and the log and nothing
+   else. `incrementvar` also needs the buffer, and wants it for exactly what
+   `exec` wants it for — to re-enter dispatch.
+   *Verified against the depot:* `+cvarlist` at startup lists the port's fifty
+   cvars and commands; `help`, `find`, `toggle`, `incrementvar` and
+   `differences` all behave against real content.
+   Four things the plan did not anticipate:
+   - **`ConVar_PrintDescription` is one function and the plan treated it as
+     five.** `help`, `find`, `differences` and `toggle` all print it, and stage
+     1 had already written a shortened copy inline for the "typed a cvar name
+     with no value" path. `console/describe.rs` is the one implementation, and
+     that path now uses it too — so a cvar prints identically however you
+     reached it.
+   - **The same six flags are spelled three ways in the C++.** `g_ConVarFlags`
+     (`engine/cvar.cpp:803`) carries an upper-case name for the CSV and a short
+     one for the column; `g_PrintConVarFlags` (`tier1/convar.cpp:1392`) carries
+     a lower-case long name for `ConVar_PrintDescription` **and lists a
+     different subset**. One table with two columns replaces all three, and the
+     union of the subsets is kept — so `help` on a hidden cvar says it is
+     hidden, which Valve's does not.
+   - **`Cvar::string` is the wrong thing to compare or display.** For an
+     `FCVAR_NEVER_AS_STRING` cvar the port never updates the string, so
+     `differences` would report every one of them as unchanged for ever and
+     `toggle` could never find one in its value list. `describe::value` is the
+     rendered value and `describe::is_at_default` the comparison. Valve lands
+     on the other side of the same split — `ConVar::GetString` returns the
+     *literal string* `"FCVAR_NEVER_AS_STRING"` (`public/tier1/convar.h:620`),
+     so its `differences` lists every one of them, always.
+   - **`differences` has to sort and Valve's does not.** Valve walks its hash
+     table in whatever order it is in; a `HashMap` is seeded per process, so
+     unsorted here means a different order on every launch.
+   `findflags` was **not** ported: it is a search over the twenty-two flags this
+   port does not have (§4.6), and `find` covers what is left of it. `multvar`,
+   `reset_gameconvars` and `getcvars` were not either — the first is
+   `incrementvar` with a different operator and no caller, and the other two
+   belong to `server/` and to the Steam overlay.
 
 Stages 1 and 2 are what "port `console/`" means for the boot path. 3 is small
 and followed immediately; 4 was gated on a decision that was not this module's, and that
-decision (`egui`) is now taken.
+decision (`egui`) is now taken. 5 is what turns the console from present into useful, and
+is off the boot path entirely.
 
 ---
 

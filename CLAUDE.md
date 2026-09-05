@@ -50,13 +50,14 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 437 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 456 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
 `cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
 draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
-`egui` console over the top of it on `` ` `` — scrollback, history, tab completion, and
+`egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
+list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), and
 every cvar and command the port has registered. It is **not a runnable game** — there is no simulation, sound or
 netcode, and nothing that moves is a player — but the boot path is continuous from
 `main` to a rendered, lit level you can look around.
@@ -185,7 +186,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   expected to force it and did not**: bumped and unbumped share one vertex layout, because
   the bumped diffuse path never leaves tangent space.
 - **`src/engine/` — 5 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `input/` (stages 1-4 of 5), and `console/` (stages 1-4 of 5)**
+  lightmaps, `input/` (stages 1-4 of 5), and `console/` (all five stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -217,7 +218,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   engine is. `console/` stage 4 is the `egui` dialog it pairs with: `Console::complete`
   is `RebuildCompletionList` (a question about the registry, not about a widget) and
   `ConsoleUi` is the dialog, naming `egui` and nothing else, so it is unit-tested against
-  a headless `egui::Context` with no window and no GPU.
+  a headless `egui::Context` with no window and no GPU. **`console/` stage 5 finishes the
+  module**: the six list commands, all built-ins because they need the registry and the
+  log and nothing else, plus `console/describe.rs` — the one implementation of
+  `ConVar_PrintDescription`, replacing the shortened copy stage 1 had inlined and
+  collapsing the *three* tables the C++ spells the same six flags in. One rule there
+  produces a plausible wrong answer rather than an error: **`Cvar::string` is stale for an
+  `FCVAR_NEVER_AS_STRING` cvar**, so anything comparing or displaying a value goes through
+  `describe::value`/`describe::is_at_default` — otherwise `differences` reports every such
+  cvar as unchanged for ever.
   Not implemented: simulation, visibility, collision, displacements, brush
   entities, static props, the skybox, dynamic lights and lightstyle animation.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
@@ -232,13 +241,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   fixing it in `PipelineCache` instead.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next: **nothing in `console/` or `input/` blocks the boot path any more.** The candidates,
-in the order they are worth doing:
+Next: **`console/` is finished and nothing in `input/` blocks the boot path any more.**
+The candidates, in the order they are worth doing:
 
-- **`console/` stage 5 — the list commands** (`cvarlist`, `help`, `find`, `differences`,
-  `toggle`, `incrementvar`). Trivial now that there is a dialog to print into, useless
-  before there was, and what turns the console from present into useful. Not on the boot
-  path.
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
 - **`client/`** (`ENGINE.md` §7.5) is what the boot path itself wants next, and it is the

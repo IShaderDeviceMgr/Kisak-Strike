@@ -810,17 +810,18 @@ Cvars, commands, the buffer that turns typed or scripted text into them, and the
 they print to. Replaces `tier1/convar.cpp` + `tier1/commandbuffer.cpp` (the objects and
 the queue), `vstdlib/cvar.cpp` (the registry), `engine/cmd.cpp` + `engine/cvar.cpp` (the
 policy) and the print half of `engine/console.cpp`. The design is
-[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md); this is stages 1-4 of its
-§8 — stage 2 being bindings, which is the same work as `input/` stage 3 and is documented
-[there](#bindings-and-commandsink), stage 3 being
-[config persistence](#config-persistence), and stage 4 being the
-[`egui` dialog](#consoleui--the-dialog). Only stage 5, the list commands, is left.
+[`portdocs/ENGINE_CONSOLE.md`](../portdocs/ENGINE_CONSOLE.md), and **all five stages of
+its §8 have landed** — stage 2 being bindings, which is the same work as `input/` stage 3
+and is documented [there](#bindings-and-commandsink), stage 3 being
+[config persistence](#config-persistence), stage 4 the
+[`egui` dialog](#consoleui--the-dialog), and stage 5
+[the list commands](#the-list-commands).
 
 | | |
 |---|---|
-| Module | `crate::engine::console`, with `console::{buffer, cvar, log, token, ui}` |
-| Lines | ~4,150 including tests |
-| Tests | 85 (`cargo test engine::console`), 8 of them the dialog's |
+| Module | `crate::engine::console`, with `console::{buffer, cvar, log, token, ui}` and the private `console::describe` |
+| Lines | ~5,690 including tests |
+| Tests | 104 (`cargo test engine::console`), 8 of them the dialog's |
 | Dependencies | **`std`, plus `egui` in `console::ui` alone** — no `wgpu`, no `winit`, no `crate::filesystem` |
 
 **It names no engine type and no filesystem type**, which is what lets it be constructed,
@@ -1107,6 +1108,75 @@ this port has no equivalent for.
 `execifexists` (`cmd.cpp:798`) is `exec` with `bOnlyIfExists` — silent about a missing
 file, where `exec` complains.
 
+<a id="the-list-commands"></a>
+
+### The list commands
+
+Six commands, all of them console **built-ins** rather than the target's, for the same
+reason `exec` is: they need the registry and the log and nothing else. Nothing here is new
+public API — they are registered in `register_builtins` and run in `run_builtin`, and the
+only new module is the private `console::describe`, which holds the three formatters they
+share.
+
+| Command | Original | Does |
+|---|---|---|
+| `cvarlist [log <file>] [partial]` | `engine/cvar.cpp:952` | every cvar and command, one per line, optionally also as a CSV |
+| `help <name>` | `:1109` | one description |
+| `find <string> [<string>...]` | `vstdlib/cvar.cpp:1052` | substring search over names **and** help text |
+| `differences` | `engine/cvar.cpp:1139` | every cvar not on its declared default |
+| `toggle <cvar> [values...]` | `:1161` | flip a flag, or cycle a list |
+| `incrementvar <cvar> <min> <max> <delta>` | `engine/host_cmd.cpp:2638` | step a number, wrapping at both ends |
+
+**`DEVELOPMENTONLY` and `HIDDEN` are filtered in one place** — `Console::listable` — rather
+than at each call site, because every listing does it and it is the one filter that must
+not be forgotten: a listing is precisely what those two flags exist to hide from. `help` is
+deliberately *not* a caller, and that is the difference between the two flags: `HIDDEN`
+means not discoverable, not unusable.
+
+Things worth knowing before touching any of them:
+
+- **`describe::value`, never `Cvar::string`, wherever a value is compared or displayed.**
+  The two differ for exactly the `FCVAR_NEVER_AS_STRING` cvars, and there the string is a
+  stale copy that no set ever updates — so `differences` would report every one of them as
+  unchanged for ever, and `toggle` could never find one in its value list. Valve lands on
+  the other side of the same split: `ConVar::GetString` returns the *literal string*
+  `"FCVAR_NEVER_AS_STRING"` (`public/tier1/convar.h:620`), so its `differences` lists every
+  one of them, always. `describe::is_at_default` is the matching comparison, and it is the
+  same predicate that decides whether a description carries its `( def. "…" )` clause — one
+  function, so a cvar can never be listed as differing and then shown without the clause
+  saying how.
+- **`incrementvar` sets through the command buffer rather than writing the cvar.** Valve
+  explains this as avoiding "any problems with state in a demo loop": what a recording then
+  contains is the set, not the increment. Kept, and it costs nothing — an insert during
+  processing goes to the head. It also means everything dispatch does still applies, which
+  is why `incrementvar` on a cheat cvar is refused by the cheat gate rather than by
+  `incrementvar` itself.
+- **`cvarlist` prints a *number* in its value column, even for a string cvar.** `PrintCvar`
+  only ever formats `GetInt()`/`GetFloat()`, so `con_filter_text` reads `0`. That is the
+  shipped engine's output, not a port bug; `help con_filter_text` shows the string.
+- **`toggle` compares case-sensitively** (`Q_strcmp`), and it looks for the *current*
+  value, so a cvar sitting on something not in the list starts the cycle at the beginning.
+- **`cvarlist test_` will not list `+test_forward`.** The prefix filter compares from the
+  first character, `+` included — Valve's does too. The *sort* is the one that ignores
+  leading `+`/`-` (`ConCommandBaseLessFunc`), so the two halves of a button appear together.
+
+Deliberate divergences, with what reverses each:
+
+| Divergence | Why |
+|---|---|
+| `find` takes any number of terms; **every** one must match, each against the name or the help | Valve's takes one, the reference tree two (a Kisak addition) while printing a usage line promising `[<string>...]`. Taking as many as are given is less code than either. |
+| `differences` is **sorted** | Valve walks its hash table in whatever order it is in; a `HashMap` here is seeded per process, so unsorted means a different order every launch. |
+| `cvarlist` fills the flag column **for commands too** | Valve leaves it empty while its own `help` prints a command's flags — an oversight, and seeing which commands are cheat-gated is the point of the listing. |
+| `cvarlist log` applies `exec`'s **extension blocklist** to the log path | The path comes from the same places `exec`'s does. `Vfs::write_path` already confines it to the write root; nothing legitimately logs cvars to a `.dll`. |
+| The CSV has no stray empty column | `PrintListHeader` emits one, because `csvflagstr` already ends in a comma and the format string adds another. The rows carry the same extra comma so the bug is invisible — but nothing reads this file back. |
+| One flag table, not three | `g_ConVarFlags` spells the same six flags twice and `g_PrintConVarFlags` a third time, **listing a different subset**. `describe::FLAGS` is one table with a long name and a short one; the union of the subsets is kept, so `help` on a hidden cvar says it is hidden. |
+| A description with no help text has no trailing padding | `%-80s` pads regardless; nothing follows it. |
+
+`findflags` is **not** ported: it searches the twenty-two flags this port does not have, and
+`find` covers what is left of it. Neither are `multvar` (`incrementvar` with a different
+operator and no caller), `reset_gameconvars` or `getcvars` (`server/`, and the Steam
+overlay).
+
 ### `CommandBuffer` and the tick model
 
 ```rust
@@ -1282,6 +1352,9 @@ Ordered by how likely each is to bite.
     calling `AddText`". Dispatching can insert text, so the borrow could not survive
     dispatch. `ENGINE_CONSOLE.md` §6.4 sketches `Command<'a>`; owning it is the
     correction.
+13. **`Cvar::string` is stale for an `FCVAR_NEVER_AS_STRING` cvar** — the set path does not
+    maintain it. Use `describe::value` and `describe::is_at_default` for anything that
+    compares or displays a value; see [the list commands](#the-list-commands).
 
 ### Two guards Valve does not have
 
@@ -1299,7 +1372,7 @@ Both are runaway protection, and they catch different shapes:
 
 | Missing | Waits on |
 |---|---|
-| `cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar` | stage 5 — trivial now that the dialog exists to print into, and useless before it did |
+| `findflags`, `multvar`, `reset_gameconvars`, `getcvars` | nothing — [deliberately not ported](#the-list-commands) |
 | The flag-versus-source permission matrix | `net/` — the check is already a function returning "allowed" (§9 q4) |
 | `con_logfile`, `Con_NPrintf`, colour cvars | later; the notify area is the HUD's |
 | Splitscreen: per-target buffers, `FCVAR_SS`, `cmd1`…`cmd4` | deliberately deleted (§5) |
@@ -1328,7 +1401,7 @@ Found while implementing, and recorded because the plan is otherwise the referen
 
 ### Test coverage (console)
 
-85 tests, `cargo test engine::console`.
+104 tests, `cargo test engine::console`.
 
 | Test | Guards |
 |---|---|
@@ -1371,6 +1444,15 @@ Found while implementing, and recorded because the plan is otherwise the referen
 | `an_empty_line_cycles_history_instead` | `RebuildCompletionList`'s empty-input rule, and that ↑ lands on the newest |
 | `history_keeps_the_newest_copy_of_a_repeated_command`, `history_is_bounded` | `AddToHistory` |
 | `escape_closes_the_console`, `closing_forgets_the_completion_state` | the Escape path and `CConsolePanel::Hide` |
+| `cvarlist_prints_a_banner_rows_and_a_count`, `cvarlist_with_no_argument_lists_everything`, `cvarlist_help_is_a_usage_line` | `CvarList`'s shape, its prefix filter, and that `DEVELOPMENTONLY`/`HIDDEN` reach no listing |
+| `cvarlist_sorts_the_two_halves_of_a_button_together` | `ConCommandBaseLessFunc` — the sort ignores a leading `+`/`-` where the filter does not |
+| `cvarlist_log_writes_a_csv_beside_the_listing`, `cvarlist_log_that_cannot_be_written_prints_nothing_else`, `cvarlist_log_refuses_a_dangerous_extension` | the CSV, that a refused file aborts the command, and the added blocklist |
+| `help_describes_a_cvar_a_command_and_neither`, `help_finds_a_hidden_cvar_that_the_listings_hide` | `ConVar_PrintDescription` on both kinds, and the `HIDDEN`-vs-`DEVELOPMENTONLY` difference |
+| `help_shows_the_default_and_the_bounds_once_the_value_moves` | the `( def. )` clause and `%f` bounds — what makes a `help` line comparable with the shipped engine's |
+| `find_requires_every_term_and_looks_in_the_help_text`, `find_searches_commands_as_well_as_cvars` | `CCvar::Find`, generalised to N terms |
+| `differences_lists_only_what_has_moved`, `differences_sees_a_never_as_string_cvar_move` | `CvarDifferences`, and gotcha 13 — the reason `describe::value` exists |
+| `toggle_with_no_values_flips_between_zero_and_one`, `toggle_cycles_a_value_list_and_wraps`, `toggle_is_refused_for_a_cheat_cvar_and_for_an_unknown_name` | `CvarToggle`'s two modes, its wrap, and `IsValidToggleCommand` |
+| `incrementvar_wraps_at_both_ends_and_sets_through_the_buffer`, `incrementvar_goes_through_dispatch_and_so_through_the_cheat_gate` | the wrap at either end, and that the set re-enters dispatch rather than being written |
 
 ---
 
@@ -1693,7 +1775,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-210 tests across the five modules; 437 in the crate. **85 are `console/`'s** and have
+229 tests across the five modules; 456 in the crate. **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
 arrived with UI precedence, are split across both — because both features are.
