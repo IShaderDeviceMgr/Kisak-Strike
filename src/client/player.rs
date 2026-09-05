@@ -27,6 +27,16 @@ use super::ViewAngles;
 /// reads is a constant nothing checks.
 pub const VEC_VIEW: Vec3 = Vec3::new(0.0, 0.0, 64.0);
 
+/// `VEC_HULL_MIN`/`VEC_HULL_MAX` — the standing player's collision box,
+/// relative to [`Player::origin`] (`game/shared/portal/portal_mp_gamerules.cpp:173`).
+///
+/// 32 wide, 32 deep, 72 tall, with the origin on the floor between the feet.
+/// The duck hull is the same box 36 tall and arrives with stage 4, along with
+/// everything that sweeps these.
+pub const VEC_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);
+/// See [`VEC_HULL_MIN`].
+pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 72.0);
+
 /// `MOVETYPE_*` (`public/const.h`), reduced to the two that mean anything yet.
 ///
 /// The other seven — `NONE`, `ISOMETRIC`, `WALK`, `STEP`, `FLY`, `FLYGRAVITY`,

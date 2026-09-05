@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
+use crate::engine::trace::CollisionBsp;
 use crate::filesystem::Vfs;
 use crate::materials::context::Pass;
 use crate::materials::lightmap::{Allocation, LightmapAtlas, LightmapPages, WHITE_PAGE};
@@ -158,6 +159,12 @@ pub struct World {
     /// is built from the world's `.bsp` and dies with it — `CleanupLightmaps`
     /// (`cmatlightmaps.cpp:216`) is `Drop`.
     pub lightmaps: LightmapPages,
+    /// The map's collision geometry — the brushes, arranged for tracing.
+    ///
+    /// Built from the same [`Bsp`] the geometry came from, and held here for
+    /// the same reason the lightmap atlas is: it is derived from this map's
+    /// file and dies with it. `trace/` reads it; nothing in `world/` does.
+    pub collision: CollisionBsp,
     pub stats: WorldStats,
 }
 
@@ -246,6 +253,7 @@ impl World {
                 .map(str::to_owned),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
+            collision: CollisionBsp::build(&bsp),
             stats,
         })
     }
@@ -291,7 +299,8 @@ impl World {
              ({} hidden, {} displacement{primitives}), \
              {} vertices, {} triangles, {} batches, \
              {} materials ({} missing), \
-             {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {})",
+             {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
+             collision: {}",
             self.name,
             self.bsp_version,
             self.bsp_revision,
@@ -310,6 +319,7 @@ impl World {
             self.lightmaps.len(),
             self.lightmaps.bytes() / (1024 * 1024),
             if self.lighting_is_hdr { "hdr" } else { "ldr" },
+            self.collision.summary(),
         )
     }
 }

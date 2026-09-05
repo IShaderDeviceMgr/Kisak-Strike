@@ -369,6 +369,284 @@ which has real internal pointers.
 
 <a id="engine-input"></a>
 
+## `src/engine/trace/`
+
+Ray and swept-box traces against the world's brushes. Stage 1 of
+[`portdocs/ENGINE_TRACE.md`](../portdocs/ENGINE_TRACE.md); the module `src/client/`
+stage 4 is blocked on.
+
+| | |
+|---|---|
+| Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
+| Depends on | `world::bsp` (the lumps), `glam`. **No GPU, no window, no I/O** |
+| Status | world brushes only — no brush models, displacements, entities or props |
+
+### Quick start
+
+```rust
+use crate::engine::trace::{Contents, Ray};
+
+// `World::load` builds one; it is `world.collision`.
+let collision = &world.collision;
+
+// A ray from the eye.
+let hit = collision.tracer().trace(
+    &Ray::line(eye, eye + forward * 8192.0),
+    Contents::MASK_SOLID,
+);
+if hit.did_hit() {
+    println!("{} at {:?}", collision.surface_name(hit.surface), hit.end);
+}
+
+// A player hull swept from the feet. Reuse one `Tracer` across a frame's
+// traces: it owns the per-trace scratch, and a fresh one allocates a stamp
+// per brush.
+let mut tracer = collision.tracer();
+let ground = tracer.trace(
+    &Ray::hull(feet, feet - Vec3::Z * 2.0, VEC_HULL_MIN, VEC_HULL_MAX),
+    Contents::MASK_PLAYERSOLID,
+);
+let standing = ground.did_hit() && ground.normal.z > 0.7;
+```
+
+### `Ray` — the query
+
+```rust
+pub fn line(start: Vec3, end: Vec3) -> Ray;
+pub fn hull(start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Ray;
+pub fn origin(&self) -> Vec3;
+```
+
+`mins`/`maxs` are relative to `start`, so a standing player is
+`Ray::hull(feet, target, VEC_HULL_MIN, VEC_HULL_MAX)` with the constants from
+[`client::player`](CLIENT.md).
+
+**Internally the ray's start is the *centre* of the box** (`Ray_t`, `public/cmodel.h`),
+which is what lets the brush clip push a plane out by one `|normal · extents|` instead of
+picking a corner per plane. [`Ray::origin`] undoes the centring, and every field of
+[`Trace`] is already in the caller's frame — see gotcha 1.
+
+### `Contents` — the mask
+
+A newtype over Valve's 32-bit `CONTENTS_*` set (`public/bspflags.h`), with the `MASK_*`
+combinations under Valve's own names so the C++ stays greppable. `Contents::MASK_PLAYERSOLID`
+is `PlayerSolidMask()` and is what every one of `client/` stage 4's traces will pass.
+
+```rust
+pub fn intersects(self, other: Contents) -> bool;  // the test the traversal runs
+pub fn and(self, other: Contents) -> Contents;
+pub fn or(self, other: Contents) -> Contents;
+pub fn is_empty(self) -> bool;
+```
+
+`Display` prints hex, which is how every Valve tool writes it.
+
+### `Trace` — the answer
+
+```rust
+pub struct Trace {
+    pub start: Vec3,               // caller's frame; see gotcha 3
+    pub end: Vec3,
+    pub normal: Vec3,
+    pub plane_dist: f32,
+    pub fraction: f32,
+    pub fraction_left_solid: f32,  // rays only; see gotcha 4
+    pub contents: Contents,
+    pub surface: Option<u16>,      // index; resolve with `surface_name`
+    pub surface_flags: i32,
+    pub all_solid: bool,
+    pub start_solid: bool,
+}
+
+pub fn did_hit(&self) -> bool;     // fraction < 1 || all_solid || start_solid
+```
+
+Absent, and what each waits on: `m_pEnt`, `hitgroup`, `physicsbone`, `hitbox` (entities
+and `.mdl`, stages 4-5), `worldSurfaceIndex` (decals and paint, `render/`'s), and
+`csurface_t::surfaceProps` (the physics surface-property database, which arrives with
+`vphysics/` — a field that was always zero would read as "this surface has the default
+properties", which is a different claim).
+
+### `CollisionBsp` and `Tracer`
+
+```rust
+impl CollisionBsp {
+    pub fn build(bsp: &Bsp) -> CollisionBsp;          // infallible
+    pub fn tracer(&self) -> Tracer<'_>;
+    pub fn point_contents(&self, point: Vec3) -> Contents;
+    pub fn leaf(&self, point: Vec3) -> usize;
+    pub fn surface_name(&self, surface: Option<u16>) -> &str;
+    pub fn is_empty(&self) -> bool;
+    pub fn summary(&self) -> String;
+}
+
+impl Tracer<'_> {
+    pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace;
+}
+```
+
+`build` is infallible because [`Bsp::parse`](#worldbsp) has already checked every
+cross-lump reference the trace walks — that check is what buys the right to index without
+bounds tests in the inner loop, and it is why the collision lumps are validated in
+`world/bsp.rs` rather than here.
+
+`Tracer` is Valve's `BeginTrace`/`EndTrace` pair (`engine/cmodel.cpp:66`, `:111`)
+expressed as a borrow. Those existed to hand out one of a pool of `TraceInfo_t`s and to
+push/pop a depth counter for the one re-entrant case; here the scratch is owned by the
+`Tracer` and re-entrancy is a second `Tracer`, which the borrow checker enforces for free.
+
+`trace` takes `&mut self` because it stamps a visited-brush table — a brush belongs to
+every leaf it touches, so without deduplication a wall spanning eight leaves is clipped
+eight times, which is wasted work *and* wrong for `fraction_left_solid`.
+
+`point_contents` and `leaf` take `&self`: neither needs the scratch, because a point is in
+exactly one leaf and there is nothing to deduplicate.
+
+### Where the data comes from
+
+**`world/bsp.rs` reads the collision lumps; `trace/` derives from them.** Valve has two
+`.bsp` readers (`modelloader.cpp` and `cmodel_bsp.cpp`) because rendering and collision
+lived in code that could not see each other's allocations; one crate has no such excuse.
+`Bsp` gained `planes`, `nodes`, `leaves`, `leaf_brushes`, `brushes` and `brush_sides`
+(lumps 1, 5, 10, 17, 18, 19), all `Pod` struct arrays read by the same bounds-checked
+reader as everything else. What `trace/` builds is the part that is *derived*: the surface
+table, the box brushes, and the contents summary.
+
+Two format notes:
+
+- **`LUMP_LEAFS` has two versions and only the directory says which.** Version 0 carries
+  a `CompressedLightCube` inline at 56 bytes a leaf; version 1 is 32. Portal 2 ships
+  version 1, and a version 0 map is refused with `BspError::UnsupportedLeafVersion` rather
+  than read at the wrong stride — which would produce a plausible tree of nonsense.
+- **`dnode_t` and `dleaf_t` carry an explicit `_pad: u16`.** Their fields sum to 30 bytes
+  at 4-byte alignment, so the compiler that wrote the file put two bytes there.
+  `bytemuck::Pod` refuses a type with *implicit* padding, so naming it is what proves the
+  stride is 32. `collision_lump_strides_match_the_file` asserts all five.
+
+### Invariants and gotchas (trace)
+
+Ordered by how likely each is to bite.
+
+1. **`Ray`'s start is the centre of the box; `Trace`'s is not.** A Portal 2 player hull is
+   72 units tall, so the two differ by 36. Everything on `Trace` is already in the
+   caller's frame — do not add the offset back yourself, and do not feed `Trace::end`
+   into something expecting a box centre. A player who ends up a hull-height above the
+   floor is this.
+
+2. **`fraction` stops `DIST_EPSILON` — 1/32 unit — short of the surface, deliberately.**
+   `public/coordsize.h:35`. It is not a tolerance to tune: it is why a player does not
+   fuse to a wall, why `TryPlayerMove`'s clip-and-retry finds room to move, and why stair
+   stepping terminates. The same epsilon overlaps the two halves of a node split, so a
+   brush sitting on a node plane is reached from both sides rather than missed by both.
+   If a number here disagrees with the C++ by about 0.03, this is why.
+
+3. **`Trace::start` is not the ray's start when the trace began in solid.** It is where
+   the sweep *left* solid — `start + delta * fraction_left_solid`. For a sweep that never
+   left, `compute_trace_endpoints` forces `all_solid`, `fraction = 0` and `end == start`.
+
+4. **`fraction_left_solid` is meaningful for rays only.** Computing it for a box sweep
+   needs, in Valve's words, "*a lot* more computation", so a hull trace gets zero and its
+   `start` is the ray's origin (`CEngineTrace::TraceRay`, `engine/enginetrace.cpp:2958`).
+   Reading it after a hull sweep is reading a value nothing produced.
+
+5. **A leaf's `contents` is what its *volume* is made of, not the OR of its brush list.**
+   An empty leaf beside a wall references that wall in `leaf_brushes` while its own
+   contents stay 0. Conflating them makes every position test in open air report
+   `all_solid`, because the unswept path reads leaf contents to decide whether the box is
+   buried in the void outside the map. This cost a test failure while stage 1 was being
+   written, and it is why the test fixtures set leaf contents explicitly.
+
+6. **`surface_flags` is per *material*, not per side.** Valve ORs every texinfo's flags
+   into the one surface entry its texdata shares, under a comment reading `HACKHACK: Copy
+   this over for the whole material!!!` (`engine/cmodel_bsp.cpp:381`). Ported as written:
+   a surface can therefore report a flag set by a different face using the same material.
+
+7. **Bevel planes are skipped by rays and used by hulls.** VBSP emits redundant planes so
+   that "push the plane out by `|normal · extents|`" is *exact* for an AABB. A brush's
+   plane set is therefore not its hull — it is its hull plus the planes that make box
+   sweeps correct. Clipping a ray against them reports impacts on planes that are not
+   surfaces.
+
+8. **`point_contents` returns a solid leaf's own contents without testing brushes**, on
+   `cluster < 0` — not on the leaf having no brushes. The two look equivalent and are not:
+   an *empty* leaf with an empty brush list would then report the leaf's contents rather
+   than nothing.
+
+9. **The box-brush and plane-brush paths differ in one place Valve did not make
+   symmetric.** In the all-solid case the plane path sets `fraction_left_solid = 1` and
+   the box path does not, which changes what `compute_trace_endpoints` reports as `start`
+   for a sweep that begins inside an axial brush. Ported as written; inventing symmetry
+   would be a silent divergence rather than a fix.
+
+10. **Most brushes in a Source map are box brushes** — 1,010 of `sp_a1_intro1`'s 1,681 —
+    so the slab test is the path most traces take, not a rarely-hit optimization. The two
+    paths are asserted to agree in
+    `a_box_brush_answers_the_same_as_its_six_planes`.
+
+### One place this is stricter than Valve
+
+`IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
+have axial *types*, then asserts in `ExtractBoxBrush` that each normal component is
+exactly ±1 — an assert compiled out of release builds, leaving a box brush with
+uninitialised bounds. `extract_box` checks the normals and that all six faces are
+distinct, and keeps the brush on the plane path if either fails. Valid maps take the same
+path either way.
+
+### Not implemented, and what each waits on
+
+| Missing | Waits on |
+|---|---|
+| Brush models (`CM_TransformedBoxTrace`) — doors, platforms | stage 2; `Model::head_node` is already parsed |
+| Displacements — terrain, and the "stab" | stage 3, jointly with `world/disp/` |
+| Entities, trace filters, `ClipTraceToTrace` | stage 4, and `server/` |
+| Static props and `.phy`/vcollide | stage 5, where `parry` enters |
+| PVS, areas, areaportals | `world/`'s visibility work, not this module's |
+| `surfaceProps`, hitboxes, occlusion queries | `vphysics/`, `.mdl`, and never |
+
+### The `trace` command
+
+`trace` fires a ray from the player's eye along the view; `trace hull` sweeps the player
+hull from the feet. Both print the fraction, distance, endpoint, normal, surface, contents
+and solid flags, then the contents and leaf at the eye and a ground probe with
+`CategorizePosition`'s 0.7 standable test.
+
+**This port's own, not Valve's** — the C++ equivalents (`debugrayenable`, the trace
+counter) exist to work around a DLL boundary this build does not have. It is stage 1's
+acceptance test: it asks the one question the module exists to answer using only a
+console, a player and a view, all of which already existed.
+
+On `sp_a1_intro1` it reports the spawn standing 8.97 units above `MOTEL/HOTEL_CARPET001`
+with a `(0, 0, 1)` normal, and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with
+contents `0x8010000` (`PLAYERCLIP | DETAIL`) and surface flags `0x480`
+(`NODRAW | NOLIGHT`).
+
+### Test coverage (trace)
+
+15 tests, none of which need a map, a GPU or a window — the fixtures build a
+`CollisionBsp` through `CollisionBsp::build` from a hand-written `Bsp`, so the box
+extraction and surface table are under test too.
+
+| Test | Guards |
+|---|---|
+| `a_ray_stops_dist_epsilon_short_of_the_surface` | gotcha 2, and the normal and contents |
+| `a_box_brush_answers_the_same_as_its_six_planes` | gotcha 10 — three rays including a diagonal |
+| `a_hull_sweep_stops_a_half_width_early` | the plane offset, and gotcha 1 |
+| `a_hull_reports_no_fraction_left_solid` | gotcha 4 |
+| `a_ray_starting_inside_reports_where_it_left` | gotcha 3 |
+| `a_ray_that_never_leaves_a_brush_is_all_solid` | the `all_solid` branch |
+| `a_mask_that_excludes_the_brush_hits_nothing` | contents filtering |
+| `playerclip_stops_a_player_and_not_a_shot` | `MASK_PLAYERSOLID` vs `MASK_SOLID` |
+| `a_zero_length_sweep_is_a_position_test` | the unswept path, and gotcha 5 |
+| `the_tree_descent_keeps_the_nearer_hit` | the descent and the split, both directions |
+| `a_downward_hull_sweep_finds_the_floor_normal` | `CategorizePosition`'s question |
+| `bevel_planes_bind_a_hull_and_are_invisible_to_a_ray` | gotcha 7 |
+| `point_contents_and_leaf_lookup` | gotcha 8 |
+| `a_map_with_no_brushes_traces_as_a_clean_miss` | the empty-model early-out |
+| `a_tracer_gives_the_same_answer_twice` | the visit stamps not leaking between traces |
+
+Plus `collision_lump_strides_match_the_file` and `leaf_area_and_flags_unpack` in
+`world::bsp`.
+
 ## `src/engine/input/`
 
 Buttons, the event queue, and where the view points. Replaces `inputsystem/` (10,649

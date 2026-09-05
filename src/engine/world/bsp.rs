@@ -41,14 +41,25 @@ const HEADER_SIZE: usize = 4 + 4 + HEADER_LUMPS * LUMP_ENTRY + 4;
 // The lumps this reader consumes, from the `enum` at `public/bspfile.h:282`.
 // The other 50 are listed there; each arrives with the subsystem that needs it.
 const LUMP_ENTITIES: usize = 0;
+/// The collision lumps. `trace/` is their only consumer; they are read here
+/// because this is the `.bsp` reader and Valve's second one
+/// (`engine/cmodel_bsp.cpp`) existed only because collision lived in code that
+/// could not see `modelloader.cpp`'s allocations. See
+/// `portdocs/ENGINE_TRACE.md` §7.4.
+const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;
 const LUMP_VERTEXES: usize = 3;
+const LUMP_NODES: usize = 5;
 const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
 const LUMP_LIGHTING: usize = 8;
+const LUMP_LEAFS: usize = 10;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
+const LUMP_LEAFBRUSHES: usize = 17;
+const LUMP_BRUSHES: usize = 18;
+const LUMP_BRUSHSIDES: usize = 19;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
 const LUMP_LIGHTING_HDR: usize = 53;
@@ -68,6 +79,14 @@ const LUMP_MAP_FLAGS: usize = 59;
 const LVLFLAGS_LIGHTMAP_ALPHA: u32 = 0x0000_0004;
 /// `LVLFLAGS_LIGHTMAP_ALPHA_3` — three sets of the above.
 const LVLFLAGS_LIGHTMAP_ALPHA_3: u32 = 0x0000_0010;
+
+/// `LUMP_LEAFS_VERSION` (`public/bspfile.h:370`). Version 0 carries a
+/// `CompressedLightCube` inline and is 56 bytes a leaf; version 1 moved that to
+/// `LUMP_LEAF_AMBIENT_LIGHTING` and is 32. Portal 2 ships version 1, and the two
+/// are indistinguishable except by this field — so a version 0 map is refused
+/// rather than read at the wrong stride, which would produce a plausible tree
+/// of nonsense rather than an error. See [`BspError::UnsupportedLeafVersion`].
+const LEAFS_VERSION: i32 = 1;
 
 /// `MAXLIGHTMAPS` (`public/bspfile.h:773`): how many lightstyles one face can
 /// carry. A style of 255 means "no more".
@@ -216,6 +235,136 @@ pub struct Model {
     pub num_faces: i32,
 }
 
+/// `dplane_t` (`public/bspfile.h:550`), 20 bytes.
+///
+/// A brush side and a BSP node both name one of these. `dist` is measured along
+/// `normal` from the origin, so a point is in front when
+/// `normal.dot(point) - dist > 0`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Plane {
+    pub normal: [f32; 3],
+    pub dist: f32,
+    /// `PLANE_X`/`Y`/`Z` (0-2) when the normal is axial, `PLANE_ANYX`/`Y`/`Z`
+    /// (3-5) otherwise.
+    ///
+    /// Valve's comment calls this "trivial to regenerate" and it is, but the
+    /// trace reads it on every node it descends: an axial plane needs one
+    /// subtraction where a general one needs a dot product, and the box's
+    /// extent along an axial normal is one component rather than three
+    /// `fabsf`s (`engine/cmodel.cpp:2578`).
+    pub plane_type: i32,
+}
+
+impl Plane {
+    /// Whether [`plane_type`](Plane::plane_type) names an axis, in which case
+    /// it is also the index of that axis.
+    pub fn is_axial(&self) -> bool {
+        (0..3).contains(&self.plane_type)
+    }
+}
+
+/// `dnode_t` (`public/bspfile.h:562`), 32 bytes.
+///
+/// `children` is the whole BSP: a non-negative entry is another node, and a
+/// negative one is the leaf at `-1 - child`. Child 0 is in front of the plane.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Node {
+    pub plane_num: i32,
+    /// Front, then back. Negative means `-1 - child` indexes [`Bsp::leaves`].
+    pub children: [i32; 2],
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub first_face: u16,
+    pub num_faces: u16,
+    /// The area every leaf below this node is in, or -1 when they differ.
+    pub area: i16,
+    /// `dnode_t` is 30 bytes of fields with 4-byte alignment, so the compiler
+    /// that wrote the file put two bytes here. Named because `bytemuck::Pod`
+    /// refuses a type with implicit padding — reading it is what proves the
+    /// stride is 32.
+    pub _pad: u16,
+}
+
+/// `dleaf_t` version 1 (`public/bspfile.h:930`), 32 bytes.
+///
+/// The trace reads `contents` — to reject a whole leaf before looking at a
+/// brush — and the leaf-brush range. The rest is visibility's
+/// (`portdocs/ENGINE_TRACE.md` §1).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Leaf {
+    /// The OR of every brush in the leaf (`CONTENTS_*`).
+    pub contents: i32,
+    /// The PVS cluster, or -1 for a leaf that sees nothing.
+    pub cluster: i16,
+    /// Valve's `short area:9; short flags:7;` bitfield in one field.
+    ///
+    /// Kept packed rather than split: bit order in a C bitfield is
+    /// implementation-defined, the two halves are visibility's and not this
+    /// module's, and unpacking them here would be inventing a guarantee the
+    /// format does not make. `area()` and `flags()` decode the layout every
+    /// compiler that has ever built this actually used — LSB first.
+    pub area_flags: u16,
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub first_leaf_face: u16,
+    pub num_leaf_faces: u16,
+    pub first_leaf_brush: u16,
+    pub num_leaf_brushes: u16,
+    /// -1 when the leaf is not in water.
+    pub leaf_water_data_id: i16,
+    /// Trailing padding to the 32-byte stride — see [`Node::_pad`].
+    pub _pad: u16,
+}
+
+impl Leaf {
+    // Visibility's, not the trace's: `world/`'s PVS work is the first caller
+    // (`portdocs/ENGINE_TRACE.md` §1). Kept here because this is where the
+    // packing is documented.
+    #[allow(dead_code)]
+    /// The `area:9` half of [`area_flags`](Leaf::area_flags).
+    pub fn area(&self) -> u16 {
+        self.area_flags & 0x01FF
+    }
+
+    #[allow(dead_code)]
+    /// The `flags:7` half.
+    pub fn flags(&self) -> u16 {
+        self.area_flags >> 9
+    }
+}
+
+/// `dbrush_t` (`public/bspfile.h:995`), 12 bytes.
+///
+/// A convex volume: the intersection of the half-spaces named by its sides.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Brush {
+    pub first_side: i32,
+    pub num_sides: i32,
+    /// `CONTENTS_*` (`public/bspflags.h`) — what this volume is made of.
+    pub contents: i32,
+}
+
+/// `dbrushside_t` (`public/bspfile.h:985`), 8 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BrushSide {
+    /// Index into [`Bsp::planes`], facing *out* of the brush.
+    pub plane_num: u16,
+    pub tex_info: i16,
+    /// Index into the displacement lumps, or negative.
+    pub disp_info: i16,
+    /// Non-zero for a plane `vbsp` added so that a swept *box* clips exactly.
+    /// Point traces must skip these; box traces must not
+    /// (`portdocs/ENGINE_TRACE.md` §4.4).
+    pub bevel: u8,
+    /// A CS:GO-era addition; see `portdocs/ENGINE_TRACE.md` §9.1.
+    pub thin: u8,
+}
+
 /// Anything that stops a `.bsp` from being read.
 #[derive(Debug, thiserror::Error)]
 pub enum BspError {
@@ -279,6 +428,12 @@ pub enum BspError {
     #[error("{path} has no {what} lump, so it has no geometry to draw")]
     MissingLump { path: String, what: &'static str },
 
+    #[error(
+        "{path} has version {version} leaves; this engine reads version {}",
+        LEAFS_VERSION
+    )]
+    UnsupportedLeafVersion { path: String, version: i32 },
+
     #[error("{path} is internally inconsistent: {what}")]
     Corrupt { path: String, what: String },
 }
@@ -288,7 +443,8 @@ pub enum BspError {
 struct LumpEntry {
     offset: usize,
     length: usize,
-    #[allow(dead_code)] // read by lumps whose layout changed between versions
+    /// Read by lumps whose layout changed between versions — `LUMP_LEAFS` is
+    /// the one this reader acts on.
     version: i32,
     /// Non-zero means LZMA-compressed; the value is the uncompressed size.
     four_cc: u32,
@@ -322,6 +478,21 @@ pub struct Bsp {
     /// `.vmt` extension.
     pub texdata_string_table: Vec<String>,
     pub models: Vec<Model>,
+    /// The collision lumps. Read here, given meaning by
+    /// [`trace`](crate::engine::trace) — see `portdocs/ENGINE_TRACE.md` §7.4.
+    ///
+    /// **All six may legitimately be empty.** A `.bsp` with no brushes is not
+    /// corrupt, it is a map nothing can collide with, and `CM_BoxTrace`'s own
+    /// first act is to return the cleared trace when `numnodes` is 0
+    /// (`engine/cmodel.cpp:3208`). So these are not checked by
+    /// [`validate`](Bsp::validate) for presence, only for consistency.
+    pub planes: Vec<Plane>,
+    pub nodes: Vec<Node>,
+    pub leaves: Vec<Leaf>,
+    /// `LUMP_LEAFBRUSHES` — the brush indices each leaf's range points into.
+    pub leaf_brushes: Vec<u16>,
+    pub brushes: Vec<Brush>,
+    pub brush_sides: Vec<BrushSide>,
     /// `LUMP_LIGHTING_HDR` if the map has one, else `LUMP_LIGHTING`: the baked
     /// light samples every lit face indexes with its `light_ofs`.
     ///
@@ -446,6 +617,17 @@ impl Bsp {
             LUMP_LIGHTING
         };
 
+        // The leaf lump is the one collision lump whose *stride* changed
+        // between versions, and the directory is the only place that says
+        // which. Refuse before `records` reads 56-byte leaves as 32-byte ones.
+        let leafs_version = reader.version(LUMP_LEAFS);
+        if !reader.is_empty(LUMP_LEAFS) && leafs_version != LEAFS_VERSION {
+            return Err(BspError::UnsupportedLeafVersion {
+                path,
+                version: leafs_version,
+            });
+        }
+
         let bsp = Bsp {
             entity_lump: reader.text(LUMP_ENTITIES)?,
             lighting: reader.records(lighting_lump)?,
@@ -459,6 +641,12 @@ impl Bsp {
             texdata: reader.records(LUMP_TEXDATA)?,
             texdata_string_table: reader.texdata_strings()?,
             models: reader.records(LUMP_MODELS)?,
+            planes: reader.records(LUMP_PLANES)?,
+            nodes: reader.records(LUMP_NODES)?,
+            leaves: reader.records(LUMP_LEAFS)?,
+            leaf_brushes: reader.records(LUMP_LEAFBRUSHES)?,
+            brushes: reader.records(LUMP_BRUSHES)?,
+            brush_sides: reader.records(LUMP_BRUSHSIDES)?,
             path: path.clone(),
             version,
             revision,
@@ -551,6 +739,90 @@ impl Bsp {
                     "model {i} names faces {first}..{} of {}",
                     first + count,
                     self.faces.len()
+                )));
+            }
+            if model.head_node < 0 && !self.nodes.is_empty() {
+                return Err(corrupt(format!(
+                    "model {i} has head node {}, which is not a node",
+                    model.head_node
+                )));
+            }
+        }
+
+        // The collision lumps. Checked here for the same reason the render
+        // lumps are: the trace descends this tree per frame per player and
+        // indexes it directly, so one pass at load buys the right to do that
+        // without a bounds check in the inner loop.
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.plane_num < 0 || node.plane_num as usize >= self.planes.len() {
+                return Err(corrupt(format!(
+                    "node {i} names plane {} of {}",
+                    node.plane_num,
+                    self.planes.len()
+                )));
+            }
+            for child in node.children {
+                let ok = if child < 0 {
+                    // `-1 - child`, so -1 is leaf 0.
+                    ((-1 - child) as usize) < self.leaves.len()
+                } else {
+                    (child as usize) < self.nodes.len()
+                };
+                if !ok {
+                    return Err(corrupt(format!(
+                        "node {i} names child {child}, which is neither a node of {} \
+                         nor a leaf of {}",
+                        self.nodes.len(),
+                        self.leaves.len()
+                    )));
+                }
+            }
+        }
+
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            let first = leaf.first_leaf_brush as usize;
+            let end = first + leaf.num_leaf_brushes as usize;
+            if end > self.leaf_brushes.len() {
+                return Err(corrupt(format!(
+                    "leaf {i} names leafbrushes {first}..{end} of {}",
+                    self.leaf_brushes.len()
+                )));
+            }
+        }
+
+        for (i, &brush) in self.leaf_brushes.iter().enumerate() {
+            if brush as usize >= self.brushes.len() {
+                return Err(corrupt(format!(
+                    "leafbrush {i} names brush {brush} of {}",
+                    self.brushes.len()
+                )));
+            }
+        }
+
+        for (i, brush) in self.brushes.iter().enumerate() {
+            let first = brush.first_side.max(0) as usize;
+            let end = first + brush.num_sides.max(0) as usize;
+            if brush.first_side < 0 || brush.num_sides < 0 || end > self.brush_sides.len() {
+                return Err(corrupt(format!(
+                    "brush {i} names sides {first}..{end} of {}",
+                    self.brush_sides.len()
+                )));
+            }
+        }
+
+        for (i, side) in self.brush_sides.iter().enumerate() {
+            if side.plane_num as usize >= self.planes.len() {
+                return Err(corrupt(format!(
+                    "brush side {i} names plane {} of {}",
+                    side.plane_num,
+                    self.planes.len()
+                )));
+            }
+            if side.tex_info >= 0 && side.tex_info as usize >= self.texinfo.len() {
+                return Err(corrupt(format!(
+                    "brush side {i} names texinfo {} of {}",
+                    side.tex_info,
+                    self.texinfo.len()
                 )));
             }
         }
@@ -765,6 +1037,11 @@ impl LumpReader<'_> {
     /// distinguish and neither does anything that asks.
     fn is_empty(&self, lump: usize) -> bool {
         self.lumps[lump].length == 0
+    }
+
+    /// The directory's per-lump version field.
+    fn version(&self, lump: usize) -> i32 {
+        self.lumps[lump].version
     }
 
     fn raw(&self, lump: usize) -> Result<&[u8], BspError> {
@@ -1114,6 +1391,44 @@ fn face_bsp(lit: Option<bool>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The collision lumps' strides, which nothing else checks.
+    ///
+    /// Two of these carry an explicit `_pad` field because `bytemuck::Pod`
+    /// refuses a type with implicit padding — and because the padding is real:
+    /// the compiler that wrote the file put it there. A wrong stride reads a
+    /// whole lump shifted, which produces a plausible tree of nonsense rather
+    /// than an error.
+    #[test]
+    fn collision_lump_strides_match_the_file() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<Plane>(), 20, "dplane_t");
+        assert_eq!(size_of::<Node>(), 32, "dnode_t");
+        assert_eq!(size_of::<Leaf>(), 32, "dleaf_t version 1");
+        assert_eq!(size_of::<Brush>(), 12, "dbrush_t");
+        assert_eq!(size_of::<BrushSide>(), 8, "dbrushside_t");
+    }
+
+    /// The `area:9`/`flags:7` bitfield, LSB first.
+    #[test]
+    fn leaf_area_and_flags_unpack() {
+        let leaf = Leaf {
+            contents: 0,
+            cluster: 0,
+            // flags = 3, area = 5
+            area_flags: (3 << 9) | 5,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_face: 0,
+            num_leaf_faces: 0,
+            first_leaf_brush: 0,
+            num_leaf_brushes: 0,
+            leaf_water_data_id: -1,
+            _pad: 0,
+        };
+        assert_eq!(leaf.area(), 5);
+        assert_eq!(leaf.flags(), 3);
+    }
     use super::*;
 
     /// The layouts are transcribed from `public/bspfile.h` and every one of

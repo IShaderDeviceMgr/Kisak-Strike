@@ -37,8 +37,8 @@ built for; `rustdocs/ENGINE.md` is the API doc for the module it lands beside.
    the replacement — enumeration order is not observable, because every consumer keeps
    the *minimum* fraction (`ClipTraceToTrace`, `enginetrace.cpp:1524`). §6.
 
-4. **`portdocs/ENGINE.md` §7.14 and §7.17 need correcting, and this doc is the
-   correction.** §7.17 sizes `trace/` at ~6,400 lines counting only `spatialpartition.cpp`
+4. **`portdocs/ENGINE.md` §7.14 and §7.17 needed correcting, and this doc is the
+   correction** — applied to `ENGINE.md` when stage 1 landed. §7.17 sizes `trace/` at ~6,400 lines counting only `spatialpartition.cpp`
    + `enginetrace.cpp` + `gametrace_engine.cpp`, while §7.14 counts `cmodel.cpp` (4,067),
    `cmodel_bsp.cpp` (1,297) and `cmodel_disp.cpp` (603) under `world/`. **The BSP
    collision core is this module's, not `world/`'s** — `world/` reads lumps and draws
@@ -768,7 +768,7 @@ misreading it, the way `bsp.rs` already refuses `LVLFLAGS_LIGHTMAP_ALPHA`.
 Five stages. **Stage 1 is the one that unblocks `client/` stage 4**, and it depends on
 nothing that is not already built.
 
-### Stage 1 — the world brush trace (unblocked, ~1,200-1,500 lines)
+### Stage 1 — the world brush trace — **DONE** (2,093 lines, 15 tests)
 
 The collision lumps in `bsp.rs`; `CollisionBsp::build` with box-brush extraction; `Ray`,
 `Trace`, `Contents`, `Surface`; `recursive_hull_check`, `trace_to_leaf`,
@@ -797,6 +797,34 @@ port can otherwise ship:
 
 **Done when** `trace` printed from the console in `sp_a1_intro1` reports plausible
 distances and real material names for the floor, and the nine cases above pass.
+
+**Done.** `src/engine/trace/` (2,093 lines) plus six lumps and their validation in
+`src/engine/world/bsp.rs`. `sp_a1_intro1` loads 1,681 brushes (1,010 of them box
+brushes), 7,058 sides, 1,958 nodes, 2,038 leaves and 11,324 planes; `trace` at the spawn
+reports the floor as `MOTEL/HOTEL_CARPET001` 8.97 units below the feet with a `(0, 0, 1)`
+normal, and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x8010000`
+(`PLAYERCLIP | DETAIL`). All fifteen cases pass, plus two lump-stride tests. **API:
+`rustdocs/ENGINE.md`, `src/engine/trace/`** — read that before calling in.
+
+#### Corrections to this plan, found while implementing
+
+- **§7.2's `Tracer::point_contents`/`leaf` are on `CollisionBsp`.** Neither needs the
+  per-trace scratch — a point is in exactly one leaf, so there is nothing to
+  deduplicate — and `&self` is the honest signature. `Tracer` is only for `trace`.
+- **`CollisionBsp::build` is infallible, so there is no `TraceError`.** Every cross-lump
+  reference the trace walks is checked by `Bsp::parse`'s `validate`, which is what buys
+  the right to index without bounds tests in the inner loop. Putting a second set of
+  checks here would have been checking the same thing twice.
+- **`brush_planes`/`brushes_in_aabb` are not built.** They are Portal's (§4.10) and have
+  no caller until portals exist; building them now would be guessing at a shape. The
+  *data model* keeps the ability, which is the part that mattered.
+- **`CLeaf` had to carry `cluster`.** `CM_PointContents` branches on `cluster < 0`, not
+  on the brush count, and the two are not equivalent — see `rustdocs/ENGINE.md`'s gotcha
+  8.
+- **The stage-1 test list was nine cases and shipped as fifteen.** The additions worth
+  naming: bevel planes binding a hull and not a ray (§4.4, which nothing in the nine
+  covered), and a `Tracer` reused across traces, which is the only way the visit stamps
+  can be observed at all.
 
 ### Stage 2 — brush models (small)
 

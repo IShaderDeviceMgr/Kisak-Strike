@@ -427,10 +427,14 @@ Spectator relay for competitive multiplayer. Not a Portal 2 concern.
 `replayserver.cpp` (1,583), `replayhistorymanager.cpp` (532), `replayclient.cpp` (509),
 `replaydemo.cpp` (446), `replay.cpp` (211).
 
-### 7.14 World / BSP / model loading — ~16,300 → `world/`
-`modelloader.cpp` (7,587 — **largest non-audio file in the module**), `cmodel.cpp` (4,067 —
-BSP collision), `ModelInfo.cpp` (1,454), `cmodel_bsp.cpp` (1,297), `cmodel_disp.cpp` (603),
-`world.cpp` (589 — entity/trigger spatial linking), `mod_vis.cpp` (467), `zone.cpp` (277),
+### 7.14 World / BSP / model loading — ~10,300 → `world/`
+**Corrected:** this section used to count `cmodel.cpp` (4,067), `cmodel_bsp.cpp` (1,297)
+and `cmodel_disp.cpp` (603) here. **They are `trace/`'s** — `world/` reads lumps and draws
+faces and never wants a brush — and they are why §7.17's figure was low by the same 5,967.
+See `portdocs/ENGINE_TRACE.md` §0.4 and §2.
+`modelloader.cpp` (7,587 — **largest non-audio file in the module**), `ModelInfo.cpp`
+(1,454), `world.cpp` (589 — entity/trigger spatial linking), `mod_vis.cpp` (467),
+`zone.cpp` (277),
 `precache.cpp` (260), `bsplog.cpp` (181), `mem_fgets.cpp` (65), `mem.cpp` (52).
 Largest graph cluster (433 members, cohesion 0.87). **`.bsp`/`.mdl` formats are fixed** —
 parse with `binrw`/`nom`. `zone.cpp`/`mem.cpp`/`mem_fgets.cpp` are the hunk/zone
@@ -458,10 +462,16 @@ survives into `render/`; *how to draw it* (everything calling `IMatRenderContext
 `IShaderAPI`) goes to `src/materials/`. Note `imagepacker.cpp` here is a **duplicate** of
 the material system's — port one.
 
-### 7.17 Collision, tracing & spatial queries — ~6,400 → `trace/`
-`spatialpartition.cpp` (3,219), `enginetrace.cpp` (3,177), `gametrace_engine.cpp` (24).
+### 7.17 Collision, tracing & spatial queries — ~12,400 → `trace/`
+**Stage 1 ported — see `src/engine/trace/` and `portdocs/ENGINE_TRACE.md`.**
+`cmodel.cpp` (4,067 — the BSP brush trace), `spatialpartition.cpp` (3,219),
+`enginetrace.cpp` (3,177), `cmodel_bsp.cpp` (1,297), `cmodel_disp.cpp` (603),
+`gametrace_engine.cpp` (24). The first, fourth and fifth were counted under §7.14 until
+`ENGINE_TRACE.md` was written; they are the core of this subsystem, not `world/`'s.
 Port faithfully — gameplay-visible behavior, and Portal 2's portal placement depends on
-exact trace semantics.
+exact trace semantics. `spatialpartition.cpp` is **not** ported (an entity broadphase with
+no entities); `parry`'s `Qbvh` replaces it when entities land, and `rapier` replaces
+`vphysics/` — see `ENGINE_TRACE.md` §5 for the full evaluation.
 
 ### 7.18 Sound — ~97,200 → `audio/`
 **The largest subsystem in the module by a wide margin**, and larger than this doc
@@ -544,7 +554,7 @@ console files: `engine_helper_ps3.cpp` (378), `buildworldlists_PS3.cpp` (173),
 | 16 | Renderer front-end | 40,000 | `render/` + `paint/` | Split; most folds into `src/materials/` |
 | 6 | Server & game boundary | 22,500 | `server/` | ~5.5k droppable (RCON, plugins, pure) |
 | 19 | VGui host & debug panels | 19,000 | — | **Delete** (`egui`) |
-| 14 | World / BSP / model loading | 16,300 | `world/` | Port faithfully (format fixed) |
+| 14 | World / BSP / model loading | 10,300 | `world/` | Port faithfully (format fixed) |
 | 2 | Host / frame orchestration | 15,000 | `host/` | The `winit` work |
 | 11 | Demo record & playback | 14,700 | `demo/` | ~8.9k after deleting editor panels |
 | 7 | Network transport | 13,700 | `net/` | Port faithfully |
@@ -552,7 +562,7 @@ console files: `engine_helper_ps3.cpp` (378), `buildworldlists_PS3.cpp` (173),
 | 20 | Profiling & dev tooling | 8,300 | — | **Mostly delete** (`tracing`) |
 | 8 | Entity serialization | 8,200 | `net/datatable/` | Format fixed until game DLLs land |
 | 12 | HLTV / SourceTV | 7,300 | — | **Delete** |
-| 17 | Collision / tracing | 6,400 | `trace/` | Port faithfully |
+| 17 | Collision / tracing | 12,400 | `trace/` | **Stage 1 done**; port faithfully, less `spatialpartition` |
 | 3 | Windowing & video mode | 5,700 | `window/` | The `winit` work; shrinks a lot |
 | 1 | Bootstrap & module hosting | 5,700 | — | **Dissolves** into `mod.rs` |
 | 4 | Console, cvars & commands | 5,600 | `console/` | Port early |

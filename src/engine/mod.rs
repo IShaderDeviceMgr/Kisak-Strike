@@ -43,12 +43,14 @@
 pub mod console;
 pub mod host;
 pub mod input;
+pub mod trace;
 pub mod window;
 pub mod world;
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::client::player::{VEC_HULL_MAX, VEC_HULL_MIN};
 use crate::client::{Client, MoveType, BUTTONS};
 use crate::cmdline::CommandLine;
 use crate::filesystem::{PathId, Vfs};
@@ -64,6 +66,7 @@ use host::{Host, Level, Outcome};
 use input::Bindings;
 use input::{Button, CommandSink, Consumer, Input, Key, MouseButton};
 use world::World;
+use self::trace::{Contents, Ray};
 
 /// The engine.
 ///
@@ -205,6 +208,16 @@ impl<'a> Engine<'a> {
             // and moves when there is one (`portdocs/CLIENT.md` §9.2).
             CommandSpec::new("noclip", "Toggle. Player becomes non-solid and flies."),
             CommandSpec::new("impulse", "Issue an impulse command."),
+            // **This port's, not Valve's.** The C++ has no `trace` command:
+            // its equivalents are `debugrayenable` and the trace counter,
+            // which exist to work around a DLL boundary this build does not
+            // have (`portdocs/ENGINE_TRACE.md` §6). This is stage 1's
+            // acceptance test — the only way to ask the collision model a
+            // question before `client/` stage 4 can walk on it.
+            CommandSpec::new(
+                "trace",
+                "Trace from the eye along the view. `trace hull` sweeps the player hull.",
+            ),
         ] {
             console
                 .register_command(spec)
@@ -487,6 +500,7 @@ impl<'a> Engine<'a> {
             host,
             input,
             ui: console_ui,
+            world: scene.world.as_ref(),
             client: &mut scene.client,
         });
 
@@ -806,6 +820,11 @@ struct EngineCommands<'e> {
     /// `toggleconsole`/`showconsole`/`hideconsole`. The dialog is the engine's
     /// state, not the console's — see [`Engine::console_ui`].
     ui: &'e mut ConsoleUi,
+    /// The loaded map, for `trace`. A shared borrow of `scene.world`
+    /// alongside the exclusive one of `scene.client`, which is disjoint
+    /// because they are separate fields — the same move the destructuring at
+    /// the call site already makes.
+    world: Option<&'e World>,
 }
 
 /// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
@@ -816,6 +835,147 @@ impl CommandSink for Console<'_> {
         // `kCommandSrcUserInput`: this came from a key the user pressed, which
         // is the distinction `ENGINE_CONSOLE.md` §4.7 exists to preserve.
         Console::enqueue(self, command, Source::UserInput);
+    }
+}
+
+/// `MAX_TRACE_LENGTH` (`public/worldsize.h:32`) — `sqrt(3) * COORD_EXTENT`,
+/// the diagonal of the largest legal map, and so the longest a trace can
+/// usefully be.
+const MAX_TRACE_LENGTH: f32 = 1.732_050_8 * 2.0 * 16384.0;
+
+/// The `trace` command: fire a ray from the player's eye, or sweep the player
+/// hull from their feet, and report what the collision model says.
+///
+/// This port's own, and the acceptance test for `portdocs/ENGINE_TRACE.md`
+/// stage 1 — it asks the one question the module exists to answer, using only
+/// what already existed (a console, a player, a view). `client/` stage 4 is
+/// what turns the answer into movement.
+fn trace_command(
+    world: Option<&World>,
+    client: &Client,
+    cmd: &Command,
+    cx: &mut ExecContext<'_>,
+) {
+    let Some(world) = world else {
+        cx.print("trace: no map is loaded");
+        return;
+    };
+    let collision = &world.collision;
+    if collision.is_empty() {
+        cx.print(&format!("trace: {} has no collision tree", world.name));
+        return;
+    }
+
+    let hull = matches!(cmd.arg(1), Some(arg) if arg.trim().eq_ignore_ascii_case("hull"));
+    let player = client.player();
+    let (forward, _, _) = player.angles.vectors();
+
+    // The hull sweeps from the feet, because that is what `origin` is and what
+    // stage 4 will sweep; the ray goes from the eye, because that is where a
+    // player is pointing from.
+    let (from, ray) = match hull {
+        true => (
+            player.origin,
+            Ray::hull(
+                player.origin,
+                player.origin + forward * MAX_TRACE_LENGTH,
+                VEC_HULL_MIN,
+                VEC_HULL_MAX,
+            ),
+        ),
+        false => {
+            let eye = player.eye();
+            (eye, Ray::line(eye, eye + forward * MAX_TRACE_LENGTH))
+        }
+    };
+
+    let hit = collision.tracer().trace(&ray, Contents::MASK_PLAYERSOLID);
+    let v = |v: glam::Vec3| format!("({:.1} {:.1} {:.1})", v.x, v.y, v.z);
+
+    cx.print(&format!(
+        "trace: {} from {} along {} (mask {})",
+        if hull { "hull" } else { "ray" },
+        v(from),
+        v(forward),
+        Contents::MASK_PLAYERSOLID,
+    ));
+    if !hit.did_hit() {
+        cx.print(&format!("  nothing hit; end {}", v(hit.end)));
+    } else {
+        cx.print(&format!(
+            "  fraction {:.6}  distance {:.2}  end {}",
+            hit.fraction,
+            (hit.end - from).length(),
+            v(hit.end),
+        ));
+        cx.print(&format!(
+            "  normal {}  plane dist {:.2}",
+            v(hit.normal),
+            hit.plane_dist
+        ));
+        cx.print(&format!(
+            "  surface \"{}\"  surface flags {:#x}  contents {}",
+            collision.surface_name(hit.surface),
+            hit.surface_flags,
+            hit.contents,
+        ));
+    }
+    if hit.start_solid || hit.all_solid {
+        cx.print(&format!(
+            "  startsolid {}  allsolid {}  fractionleftsolid {:.6}  start {}",
+            hit.start_solid,
+            hit.all_solid,
+            hit.fraction_left_solid,
+            v(hit.start),
+        ));
+    }
+    cx.print(&format!(
+        "  at the eye: contents {}, leaf {}",
+        collision.point_contents(player.eye()),
+        collision.leaf(player.eye()),
+    ));
+
+    // The ground probe, which is the question stage 4 asks more than any
+    // other. `CategorizePosition` (`gamemovement.cpp:1714`) sweeps the hull
+    // exactly two units down and calls what it finds the ground; this reports
+    // a longer sweep and the two-unit verdict separately, because "no ground"
+    // and "ground, 8 units down" are the same answer to Valve's question and
+    // very different answers to "is this module working".
+    const GROUND_PROBE: f32 = 128.0;
+    let ground = collision.tracer().trace(
+        &Ray::hull(
+            player.origin,
+            player.origin - glam::Vec3::Z * GROUND_PROBE,
+            VEC_HULL_MIN,
+            VEC_HULL_MAX,
+        ),
+        Contents::MASK_PLAYERSOLID,
+    );
+    match ground.did_hit() {
+        true => {
+            let drop = player.origin.z - ground.end.z;
+            cx.print(&format!(
+                "  ground: \"{}\" {:.2} below the feet, normal {} — {}, {}",
+                collision.surface_name(ground.surface),
+                drop,
+                v(ground.normal),
+                // 0.7 is Valve's, and it is a cosine: anything steeper than
+                // ~45.6 degrees is a wall you slide down, not a floor.
+                if ground.normal.z > 0.7 {
+                    "standable"
+                } else {
+                    "too steep to stand on"
+                },
+                if drop <= 2.0 {
+                    "on the ground"
+                } else {
+                    "in the air (CategorizePosition only looks 2 units down)"
+                },
+            ));
+        }
+        false => cx.print(&format!(
+            "  ground: nothing within {GROUND_PROBE} units below the feet"
+        )),
     }
 }
 
@@ -862,6 +1022,7 @@ impl CommandTarget for EngineCommands<'_> {
                 Some(impulse) => self.client.set_impulse(impulse),
                 None => cx.print("impulse <number>"),
             },
+            "trace" => trace_command(self.world, self.client, cmd, cx),
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
 
@@ -1140,6 +1301,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -1157,6 +1319,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert!(
@@ -1172,6 +1335,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert_eq!(client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove, 0.0);
@@ -1203,6 +1367,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1215,6 +1380,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert!(ui.is_open(), "the console key opened the console");
@@ -1229,6 +1395,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1275,6 +1442,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
 
@@ -1365,6 +1533,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         sensitivity.set_string("6");
@@ -1373,6 +1542,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
 
@@ -1398,6 +1568,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
 
@@ -1435,6 +1606,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
 
@@ -1461,6 +1633,7 @@ mod tests {
             host: &mut host,
             input: &mut input,
             ui: &mut ui,
+            world: None,
             client: &mut client,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());

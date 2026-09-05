@@ -58,7 +58,8 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   angles. Five stages; stages 1-3 are unblocked and delete `src/engine/input/view.rs`
   along with `CLAUDE.md`'s view-angles wart.
 
-- [`ENGINE_TRACE.md`](ENGINE_TRACE.md) — collision and tracing: `engine/cmodel*.cpp` (the
+- [`ENGINE_TRACE.md`](ENGINE_TRACE.md) — collision and tracing. **Stage 1 of 5 done; see
+  `rustdocs/ENGINE.md` for the API.** `engine/cmodel*.cpp` (the
   BSP brush trace), `enginetrace.cpp` (the dispatch over collideables),
   `spatialpartition.cpp` (the entity broadphase) and `public/dispcoll_common.*`. Inventory
   across all four, `Ray_t`'s centered box and the offset that comes with it, the
@@ -68,7 +69,7 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   collision core under `world/`. Contains a full evaluation of **Rapier/parry**:
   adopted for `vphysics/`, the `.phy` sweep and the broadphase; **not** for the world
   brush trace, with the six reasons and the conditions that would reverse it. Five
-  stages; stage 1 is unblocked and is what `portdocs/CLIENT.md` stage 4 waits on.
+  stages; stage 1 has landed and is what `portdocs/CLIENT.md` stage 4 was waiting on.
 
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.

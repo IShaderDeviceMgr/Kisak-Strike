@@ -434,6 +434,16 @@ impl Client {
     /// interpolation through a portal needs portals. They attach at
     /// [`Player::eye`], which is why this asks the player for its eye rather
     /// than adding `VEC_VIEW` itself.
+    /// The local player — where they are, where they are looking, and what
+    /// move type they are in.
+    ///
+    /// Read-only: the player is moved by [`run_move`](Client::run_move) and by
+    /// nothing else, which is what keeps a command the only thing that can
+    /// change the world.
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+
     pub fn view(&self, width: u32, height: u32) -> ViewSetup {
         let aspect = view::screen_aspect(width, height);
         ViewSetup {

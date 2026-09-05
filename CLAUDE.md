@@ -18,7 +18,7 @@ is not compiled, not linked, and not edited.
   src/launcher/    process bootstrap
   src/filesystem/  search paths, gameinfo.txt, VPK reading
   src/materials/   the GPU device and frame boundary (wgpu), textures, materials
-  src/engine/      the engine; window/ (winit), host/, world/, input/, console/ (egui)
+  src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
   src/client/      the game client — the player, CUserCmd, movement, the view
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
@@ -51,7 +51,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 456 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 517 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -60,8 +60,11 @@ draws its world geometry **lit**, moves the view with WASD and the mouse, and dr
 `egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
 list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), and
 every cvar and command the port has registered. **There is now a player** — a real one, in
-`MOVETYPE_NOCLIP`, built from a `CUserCmd` and moved by `FullNoClipMove` — but it is
-**still not a runnable game**: no collision, no simulation, no sound, no netcode. The boot
+`MOVETYPE_NOCLIP`, built from a `CUserCmd` and moved by `FullNoClipMove` — and **the world
+can now be traced against**: `trace` in the console fires a ray or sweeps the player hull
+and reports what it hit, which is what `client/` stage 4 needs to make the player walk. It
+is **still not a runnable game**: nothing consumes the traces yet, and there is no
+simulation, no sound and no netcode. The boot
 path is continuous from `main` to a rendered, lit level you can fly around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
@@ -191,8 +194,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   expressed" question is still open and still unforced. **`LightmappedGeneric` was
   expected to force it and did not**: bumped and unbumped share one vertex layout, because
   the bumped diffuse path never leaves tangent space.
-- **`src/engine/` — 5 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `input/` (stages 1-4 of 5), and `console/` (all five stages, complete)**
+- **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
+  lightmaps, `trace/` (stage 1 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
+  stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -233,7 +237,24 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `FCVAR_NEVER_AS_STRING` cvar**, so anything comparing or displaying a value goes through
   `describe::value`/`describe::is_at_default` — otherwise `differences` reports every such
   cvar as unchanged for ever.
-  Not implemented: simulation, visibility, collision, displacements, brush
+  `trace/` is stage 1 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
+  it — the recursive hull check, the brush clip, box brushes, the position test,
+  `point_contents` and the leaf lookup — over six new collision lumps read by the
+  *existing* `bsp.rs` rather than by a second reader, which is a duplication Valve only had
+  because collision could not see `modelloader.cpp`'s allocations. **The world's brushes
+  only**; brush models, displacements, entities and props are stages 2-5.
+  `spatialpartition.cpp` is not ported and will not be — `parry`'s `Qbvh` replaces it when
+  entities land, and `rapier` replaces `vphysics/`; `ENGINE_TRACE.md` §5 is the full
+  evaluation of where those two crates do and do not fit, and the world brush trace is one
+  of the places they do not. Three rules there produce a plausible wrong answer rather than
+  an error: **`Ray`'s start is the centre of the box and `Trace`'s is not** — 36 units
+  apart for a player, so conflating them floats them a hull-height up; **`fraction` stops
+  `DIST_EPSILON`, 1/32 unit, short of the surface on purpose**, and stair stepping, ground
+  probes and `TryPlayerMove`'s clip-and-retry are all written around that gap; and **a
+  leaf's `contents` describes its own volume, not the OR of its brush list**, so an empty
+  leaf beside a wall has contents 0 — reading it the other way makes every position test in
+  open air report `all_solid`.
+  Not implemented: simulation, visibility, displacements, brush
   entities, static props, the skybox, dynamic lights and lightstyle animation.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
@@ -287,14 +308,20 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   frame time and a one-second step removes more speed than a second of acceleration adds.
 - **Everything else is unported** and lives in `legacy/`.
 
-Next: **`client/` stages 1-3 have landed — everything in it that is not blocked on
-another module.** The candidates, in the order they are worth doing:
+Next: **`client/` stage 4 — walking.** `trace/` stage 1 was what it was blocked on and
+it has landed, so `FullWalkMove`, gravity, friction, `CategorizePosition`, ducking,
+jumping and the hulls are all now unblocked. That is what turns the noclip player into a
+player, it kills the `+jump`/`+duck`-as-up/down placeholder wart, and it is the only thing
+left on the boot path proper. See `portdocs/CLIENT.md` §8 stage 4.
+
+After it, in the order they are worth doing:
 
 - **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
   breadth move: unblocked, needed by every model, not on the boot path.
-- **`trace/`** (`ENGINE.md` §7.17) is what `client/` stage 4 needs, and stage 4 —
-  `FullWalkMove`, gravity, collision, ducking — is what turns the noclip player into a
-  player. It is the only thing left on the boot path proper.
+- **`trace/` stage 2** (brush models — `CM_TransformedBoxTrace`). Small, and it is what
+  makes doors and platforms solid. `Model::head_node` is already parsed.
+- **`trace/` stage 3** (displacements), jointly with `world/disp/` — one lump read, two
+  consumers.
 
 ### Known warts, and what triggers fixing them
 
