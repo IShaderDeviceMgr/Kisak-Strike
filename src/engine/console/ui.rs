@@ -671,7 +671,8 @@ mod tests {
             vec![key(egui::Key::ArrowUp, egui::Modifiers::NONE)],
         );
         assert_eq!(
-            ui.input(), "map b",
+            ui.input(),
+            "map b",
             "Up lands on the newest, and a completion that already has a \
              space does not get another"
         );

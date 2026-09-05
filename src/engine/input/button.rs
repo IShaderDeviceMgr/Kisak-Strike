@@ -507,7 +507,11 @@ mod tests {
 
     #[test]
     fn the_space_is_the_size_valve_shipped_minus_the_pseudo_keys() {
-        assert_eq!(Key::COUNT, 103, "107 key codes, less KEY_NONE and the 3 toggles");
+        assert_eq!(
+            Key::COUNT,
+            103,
+            "107 key codes, less KEY_NONE and the 3 toggles"
+        );
         assert_eq!(MouseButton::COUNT, 7, "MOUSE_COUNT, wheel buttons included");
         assert_eq!(Button::COUNT, 110);
     }

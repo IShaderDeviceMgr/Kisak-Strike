@@ -497,7 +497,16 @@ fn build_meshes(
         }
 
         for (page, faces) in placed {
-            build_page_meshes(bsp, lightmaps, material, info, page, &faces, stats, &mut meshes);
+            build_page_meshes(
+                bsp,
+                lightmaps,
+                material,
+                info,
+                page,
+                &faces,
+                stats,
+                &mut meshes,
+            );
         }
     }
 
@@ -562,19 +571,20 @@ fn build_page_meshes(
     let mut vertices = MeshVertices::empty(info.layout);
     let mut indices: Vec<u16> = Vec::new();
 
-    let mut flush = |vertices: &mut MeshVertices, indices: &mut Vec<u16>, stats: &mut WorldStats| {
-        if vertices.is_empty() {
-            return;
-        }
-        stats.vertices += vertices.len();
-        stats.triangles += indices.len() / 3;
-        meshes.push(Mesh {
-            material: material.to_owned(),
-            vertices: vertices.take(),
-            indices: std::mem::take(indices),
-            lightmap_page: page,
-        });
-    };
+    let mut flush =
+        |vertices: &mut MeshVertices, indices: &mut Vec<u16>, stats: &mut WorldStats| {
+            if vertices.is_empty() {
+                return;
+            }
+            stats.vertices += vertices.len();
+            stats.triangles += indices.len() / 3;
+            meshes.push(Mesh {
+                material: material.to_owned(),
+                vertices: vertices.take(),
+                indices: std::mem::take(indices),
+                lightmap_page: page,
+            });
+        };
 
     for &(face, allocation) in faces {
         let count = face.num_edges as usize;
@@ -589,10 +599,8 @@ fn build_page_meshes(
         let base = vertices.len() as u16;
         let lightmap_offset = lightmap_block_offset(face, info.lighting, page_size);
         for position in bsp.face_vertices(face) {
-            let mut vertex = WorldVertex::new(
-                position.to_array(),
-                bsp.texture_coordinate(face, position),
-            );
+            let mut vertex =
+                WorldVertex::new(position.to_array(), bsp.texture_coordinate(face, position));
             vertex.lightmap_texcoord =
                 lightmap_texcoord(bsp, face, position, allocation, page_size);
             vertex.lightmap_offset = lightmap_offset;
@@ -672,10 +680,7 @@ fn lightmap_texcoord(
         return [0.5, 0.5];
     };
     let scale = (1.0 / page_size.0 as f32, 1.0 / page_size.1 as f32);
-    let offset = (
-        allocation.x as f32 * scale.0,
-        allocation.y as f32 * scale.1,
-    );
+    let offset = (allocation.x as f32 * scale.0, allocation.y as f32 * scale.1);
 
     // `else if ( MSurf_LightmapExtents( surfID )[0] == 0 )` — Valve tests the
     // s extent only, and takes the luxel centre on both axes when it is zero.

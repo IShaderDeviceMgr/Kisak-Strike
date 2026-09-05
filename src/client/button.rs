@@ -408,7 +408,12 @@ mod tests {
     #[test]
     fn the_table_is_indexed_by_its_own_enum() {
         for (index, spec) in BUTTONS.iter().enumerate() {
-            assert_eq!(spec.button.index(), index, "`{}` is out of order", spec.name);
+            assert_eq!(
+                spec.button.index(),
+                index,
+                "`{}` is out of order",
+                spec.name
+            );
             assert_eq!(spec.down, format!("+{}", spec.name));
             assert_eq!(spec.up, format!("-{}", spec.name));
         }
@@ -451,7 +456,10 @@ mod tests {
         buttons.apply("forward", true, Some(10));
         buttons.apply("forward", true, Some(10));
         buttons.apply("forward", false, Some(10));
-        assert!(!buttons.is_down(MoveButton::Forward), "one press, one release");
+        assert!(
+            !buttons.is_down(MoveButton::Forward),
+            "one press, one release"
+        );
     }
 
     /// Valve's `if ( !c || !c[0] )` branch: typing `-forward` at the console
@@ -536,7 +544,9 @@ mod tests {
     #[test]
     fn the_axis_only_buttons_contribute_no_bits() {
         let mut buttons = Buttons::default();
-        for name in ["moveup", "movedown", "lookup", "lookdown", "strafe", "klook"] {
+        for name in [
+            "moveup", "movedown", "lookup", "lookdown", "strafe", "klook",
+        ] {
             assert!(buttons.apply(name, true, Some(1)), "`{name}` is not bound");
         }
         assert_eq!(buttons.bits(true), ButtonBits::NONE);

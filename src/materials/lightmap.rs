@@ -249,7 +249,9 @@ impl ImagePacker {
     /// `CImagePacker::GetEfficiency`, reported by `mat_info`.
     #[allow(dead_code)]
     pub fn efficiency(&self) -> f32 {
-        let used_height = (self.minimum_height.max(0) as u32).next_power_of_two().max(1);
+        let used_height = (self.minimum_height.max(0) as u32)
+            .next_power_of_two()
+            .max(1);
         self.area_used as f32 / (self.width * used_height) as f32
     }
 }

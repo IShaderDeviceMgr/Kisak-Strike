@@ -150,9 +150,9 @@ impl UiRenderer {
             return;
         }
 
-        let user = self
-            .renderer
-            .update_buffers(&self.device, &self.queue, encoder, primitives, &screen);
+        let user =
+            self.renderer
+                .update_buffers(&self.device, &self.queue, encoder, primitives, &screen);
         // Work from `egui` paint callbacks, which this port has none of. Kept
         // because submitting it is the contract, and because an empty submit
         // is not free: only pay for it if there is something to submit.

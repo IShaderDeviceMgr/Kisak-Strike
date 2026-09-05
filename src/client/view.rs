@@ -421,12 +421,7 @@ mod tests {
     fn the_vertical_field_of_view_is_the_same_at_every_aspect_ratio() {
         let scaled: Vec<f32> = [4.0 / 3.0, 16.0 / 10.0, 16.0 / 9.0, 21.0 / 9.0]
             .into_iter()
-            .map(|aspect| {
-                vertical_fov(
-                    scale_fov_by_width_ratio(75.0, aspect / FOV_ASPECT),
-                    aspect,
-                )
-            })
+            .map(|aspect| vertical_fov(scale_fov_by_width_ratio(75.0, aspect / FOV_ASPECT), aspect))
             .collect();
 
         for fov_y in &scaled {

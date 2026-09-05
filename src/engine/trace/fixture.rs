@@ -47,7 +47,13 @@ impl Fixture {
     }
 
     /// An axis-aligned box brush. `axial` false forces the plane path.
-    pub(crate) fn add_box(&mut self, mins: Vec3, maxs: Vec3, contents: Contents, axial: bool) -> u16 {
+    pub(crate) fn add_box(
+        &mut self,
+        mins: Vec3,
+        maxs: Vec3,
+        contents: Contents,
+        axial: bool,
+    ) -> u16 {
         let first_side = self.brush_sides.len() as i32;
         for axis in 0..3 {
             for (sign, dist) in [(-1.0f32, -mins[axis]), (1.0, maxs[axis])] {

@@ -70,7 +70,10 @@ pub(super) struct CLeaf {
 /// same thing and cannot be read the wrong way.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BrushSides {
-    Planes { first: u32, count: u32 },
+    Planes {
+        first: u32,
+        count: u32,
+    },
     /// An index into [`CollisionBsp::box_brushes`].
     Box(u32),
 }

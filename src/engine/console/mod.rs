@@ -1573,10 +1573,12 @@ fn matches_text(command: &str, text: &str, check_substrings: bool) -> bool {
         return has_prefix(command, text);
     }
 
-    text.split(' ').filter(|piece| !piece.is_empty()).all(|piece| {
-        let piece = piece.to_ascii_lowercase();
-        command.to_ascii_lowercase().contains(&piece)
-    })
+    text.split(' ')
+        .filter(|piece| !piece.is_empty())
+        .all(|piece| {
+            let piece = piece.to_ascii_lowercase();
+            command.to_ascii_lowercase().contains(&piece)
+        })
 }
 
 /// Case-insensitive prefix test over bytes, which is what `Q_strnicmp` is.

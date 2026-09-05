@@ -356,12 +356,7 @@ mod tests {
     #[test]
     fn a_hull_sweep_stops_a_half_width_early() {
         let world = wall(true);
-        let ray = Ray::hull(
-            Vec3::ZERO,
-            Vec3::new(200.0, 0.0, 0.0),
-            HULL_MIN,
-            HULL_MAX,
-        );
+        let ray = Ray::hull(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0), HULL_MIN, HULL_MAX);
         let hit = world.tracer().trace(&ray, Contents::MASK_SOLID);
 
         assert!(hit.did_hit());
@@ -500,7 +495,10 @@ mod tests {
         // Left to right: the x = -100 face is the first thing in the way.
         let ray = Ray::line(Vec3::new(-400.0, 0.0, 0.0), Vec3::new(400.0, 0.0, 0.0));
         let hit = world.tracer().trace(&ray, Contents::MASK_SOLID);
-        assert!((hit.end.x - (-200.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+        assert!(
+            (hit.end.x - (-200.0 - DIST_EPSILON)).abs() < 1e-3,
+            "{hit:?}"
+        );
         assert_eq!(hit.normal, Vec3::new(-1.0, 0.0, 0.0));
 
         // ...and right to left it is the other brush's far face.

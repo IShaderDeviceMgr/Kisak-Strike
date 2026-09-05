@@ -1063,7 +1063,9 @@ fn set_ducked_eye_offset(mv: &mut MoveData, duck_fraction: f32) {
 fn duck_origin_shift(on_ground: bool) -> Vec3 {
     match on_ground {
         true => player_mins(true) - player_mins(false),
-        false => (player_maxs(false) - player_mins(false)) - (player_maxs(true) - player_mins(true)),
+        false => {
+            (player_maxs(false) - player_mins(false)) - (player_maxs(true) - player_mins(true))
+        }
     }
 }
 
@@ -1214,9 +1216,8 @@ fn fraction_unducked(msecs: i32) -> f32 {
 /// which is the first reason noclip was a clean stage 1.
 pub fn check_parameters(mv: &mut MoveData) {
     if mv.move_type != MoveType::Noclip {
-        let spd = mv.forwardmove * mv.forwardmove
-            + mv.sidemove * mv.sidemove
-            + mv.upmove * mv.upmove;
+        let spd =
+            mv.forwardmove * mv.forwardmove + mv.sidemove * mv.sidemove + mv.upmove * mv.upmove;
         if spd != 0.0 && spd > mv.max_speed * mv.max_speed {
             let ratio = mv.max_speed / spd.sqrt();
             mv.forwardmove *= ratio;
@@ -1537,7 +1538,11 @@ mod tests {
             (speed - SV_SPEED_NORMAL).abs() < 1.0,
             "walks at sv_speed_normal, not sv_maxspeed: {speed}"
         );
-        assert!(mv.origin.x > 100.0, "and actually travelled: {}", mv.origin.x);
+        assert!(
+            mv.origin.x > 100.0,
+            "and actually travelled: {}",
+            mv.origin.x
+        );
     }
 
     /// Friction stops a walk rather than letting it coast for ever, and the
@@ -1659,7 +1664,9 @@ mod tests {
         assert!(mv.velocity.z > 200.0, "jumped once");
 
         // Land, still holding.
-        run(&mut mv, &world, 240, TICK, |mv| mv.buttons = ButtonBits::JUMP);
+        run(&mut mv, &world, 240, TICK, |mv| {
+            mv.buttons = ButtonBits::JUMP
+        });
         assert!(mv.ground.is_some(), "landed");
         assert_eq!(mv.velocity.z, 0.0, "and stayed down");
 
@@ -1675,7 +1682,9 @@ mod tests {
         let mut mv = settled(&world);
         assert_eq!(mv.view_offset, VEC_VIEW);
 
-        run(&mut mv, &world, 60, TICK, |mv| mv.buttons = ButtonBits::DUCK);
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.buttons = ButtonBits::DUCK
+        });
 
         assert!(mv.ducked, "{mv:?}");
         assert_eq!(mv.view_offset, VEC_DUCK_VIEW);
@@ -1685,7 +1694,9 @@ mod tests {
             mv.origin.z
         );
 
-        run(&mut mv, &world, 60, TICK, |mv| mv.buttons = ButtonBits::NONE);
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.buttons = ButtonBits::NONE
+        });
         assert!(!mv.ducked, "stood back up");
         assert_eq!(mv.view_offset, VEC_VIEW);
     }
@@ -1711,7 +1722,9 @@ mod tests {
     fn a_ducked_player_cannot_stand_up_under_a_low_ceiling() {
         let world = room();
         let mut mv = settled(&world);
-        run(&mut mv, &world, 60, TICK, |mv| mv.buttons = ButtonBits::DUCK);
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.buttons = ButtonBits::DUCK
+        });
         assert!(mv.ducked);
 
         // Walk under the ceiling, still crouched. A ducked player moves at a
@@ -1741,7 +1754,9 @@ mod tests {
         });
 
         let mut ducked = settled(&world);
-        run(&mut ducked, &world, 60, TICK, |mv| mv.buttons = ButtonBits::DUCK);
+        run(&mut ducked, &world, 60, TICK, |mv| {
+            mv.buttons = ButtonBits::DUCK
+        });
         assert!(ducked.ducked);
         run(&mut ducked, &world, 120, TICK, |mv| {
             mv.buttons = ButtonBits::DUCK;
@@ -1762,7 +1777,9 @@ mod tests {
     fn a_ducked_player_cannot_jump() {
         let world = room();
         let mut mv = settled(&world);
-        run(&mut mv, &world, 60, TICK, |mv| mv.buttons = ButtonBits::DUCK);
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.buttons = ButtonBits::DUCK
+        });
         assert!(mv.ducked);
 
         run(&mut mv, &world, 1, TICK, |mv| {
@@ -1870,11 +1887,7 @@ mod tests {
                 player_move(&mut mv, Some(&mut tracer), &MoveVars::PORTAL2, TICK);
 
                 let stuck = trace_player_bbox(&mv, &mut tracer, mv.origin, mv.origin);
-                assert!(
-                    !stuck.start_solid,
-                    "stuck at {:?} facing {yaw}",
-                    mv.origin
-                );
+                assert!(!stuck.start_solid, "stuck at {:?} facing {yaw}", mv.origin);
             }
         }
     }

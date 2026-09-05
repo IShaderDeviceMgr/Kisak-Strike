@@ -265,7 +265,11 @@ impl Vtf {
         let major = u32(&data, 4);
         let minor = u32(&data, 8);
         match major {
-            X360_MAJOR_VERSION => return Err(VtfError::ConsoleFormat { platform: "Xbox 360" }),
+            X360_MAJOR_VERSION => {
+                return Err(VtfError::ConsoleFormat {
+                    platform: "Xbox 360",
+                })
+            }
             PS3_MAJOR_VERSION => return Err(VtfError::ConsoleFormat { platform: "PS3" }),
             MAJOR_VERSION => {}
             _ => return Err(VtfError::UnsupportedVersion { major, minor }),
@@ -690,15 +694,12 @@ mod tests {
             if self.minor >= 3 {
                 // Two entries, sorted ascending by type as the writer does.
                 let mut entries: Vec<(u32, u32)> = Vec::new();
-                let dictionary_end = HEADER_SIZE_7_2
-                    + RESOURCE_ENTRY_SIZE * if low_res_bytes > 0 { 2 } else { 1 };
+                let dictionary_end =
+                    HEADER_SIZE_7_2 + RESOURCE_ENTRY_SIZE * if low_res_bytes > 0 { 2 } else { 1 };
                 if low_res_bytes > 0 {
                     entries.push((RSRC_LOW_RES_IMAGE, dictionary_end as u32));
                 }
-                entries.push((
-                    RSRC_IMAGE,
-                    (dictionary_end + low_res_bytes) as u32,
-                ));
+                entries.push((RSRC_IMAGE, (dictionary_end + low_res_bytes) as u32));
                 file[68..72].copy_from_slice(&(entries.len() as u32).to_le_bytes());
                 for (kind, offset) in entries {
                     file.extend_from_slice(&kind.to_le_bytes());
@@ -711,8 +712,7 @@ mod tests {
             // Image data: smallest mip first, then frame, then face.
             let depth = self.depth as u32;
             for level in (0..self.mips as u32).rev() {
-                let (w, h, d) =
-                    mip_dimensions(self.width as u32, self.height as u32, depth, level);
+                let (w, h, d) = mip_dimensions(self.width as u32, self.height as u32, depth, level);
                 let size = self.format.mem_required(w, h, d);
                 for frame in 0..self.frames as u32 {
                     for face in 0..faces {
@@ -848,7 +848,10 @@ mod tests {
     fn a_7_0_cubemap_has_only_six_faces() {
         let vtf = VtfBuilder::new(0).size(4, 4).cubemap().parse().unwrap();
         for face in 0..6 {
-            assert_eq!(vtf.mip_data(0, face, 0).unwrap()[0], VtfBuilder::marker(0, face, 0));
+            assert_eq!(
+                vtf.mip_data(0, face, 0).unwrap()[0],
+                VtfBuilder::marker(0, face, 0)
+            );
         }
     }
 
@@ -896,7 +899,10 @@ mod tests {
             assert_eq!(low_res.format, ImageFormat::Dxt1);
             assert_eq!(vtf.low_res_data().unwrap(), &[0xEE; 8]);
             // ...and the image data still lands correctly behind it.
-            assert_eq!(vtf.mip_data(0, 0, 0).unwrap()[0], VtfBuilder::marker(0, 0, 0));
+            assert_eq!(
+                vtf.mip_data(0, 0, 0).unwrap()[0],
+                VtfBuilder::marker(0, 0, 0)
+            );
         }
     }
 
@@ -993,10 +999,7 @@ mod tests {
             .mips(5)
             .truncate_to(full.len() - 1)
             .build();
-        assert!(matches!(
-            Vtf::parse(short),
-            Err(VtfError::Truncated { .. })
-        ));
+        assert!(matches!(Vtf::parse(short), Err(VtfError::Truncated { .. })));
     }
 
     #[test]
@@ -1024,7 +1027,10 @@ mod tests {
         // 8x8 is a 4-level chain; claiming 9 means the file is lying.
         file = VtfBuilder::new(5).size(8, 8).build();
         file[56] = 9;
-        assert!(matches!(Vtf::parse(file.clone()), Err(VtfError::Invalid(_))));
+        assert!(matches!(
+            Vtf::parse(file.clone()),
+            Err(VtfError::Invalid(_))
+        ));
         file[56] = 0;
         assert!(matches!(Vtf::parse(file), Err(VtfError::Invalid(_))));
     }

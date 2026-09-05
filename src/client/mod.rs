@@ -277,12 +277,7 @@ impl Client {
                 CvarFlags::CHEAT,
                 "",
             ),
-            cl_upspeed: console.cvar(
-                "cl_upspeed",
-                &CL_UPSPEED.to_string(),
-                CvarFlags::CHEAT,
-                "",
-            ),
+            cl_upspeed: console.cvar("cl_upspeed", &CL_UPSPEED.to_string(), CvarFlags::CHEAT, ""),
             default_fov: console.cvar(
                 "default_fov",
                 &DEFAULT_FOV.to_string(),
@@ -1224,11 +1219,19 @@ mod tests {
 
         // Pressed during this frame, so half of it: 210 / 60 / 2.
         frame(&mut client, (0.0, 0.0));
-        assert!((client.player.angles.yaw - 1.75).abs() < 1e-4, "{}", client.player.angles.yaw);
+        assert!(
+            (client.player.angles.yaw - 1.75).abs() < 1e-4,
+            "{}",
+            client.player.angles.yaw
+        );
 
         // Held throughout the next.
         frame(&mut client, (0.0, 0.0));
-        assert!((client.player.angles.yaw - 5.25).abs() < 1e-4, "{}", client.player.angles.yaw);
+        assert!(
+            (client.player.angles.yaw - 5.25).abs() < 1e-4,
+            "{}",
+            client.player.angles.yaw
+        );
     }
 
     /// `+strafe` suppresses `AdjustYaw` and hands `+left`/`+right` to

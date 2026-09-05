@@ -1004,8 +1004,7 @@ impl Bsp {
         };
         let luxel = |axis: usize| {
             let v = info.lightmap_vecs[axis];
-            position.dot(Vec3::new(v[0], v[1], v[2]) ) + v[3] - face.lightmap_mins[axis] as f32
-                + 0.5
+            position.dot(Vec3::new(v[0], v[1], v[2])) + v[3] - face.lightmap_mins[axis] as f32 + 0.5
         };
         [luxel(0), luxel(1)]
     }
@@ -1280,10 +1279,7 @@ fn face_bsp(lit: Option<bool>) -> Vec<u8> {
             texture_vecs: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
             // One luxel per 32 units, so the 64-unit square spans 0..2 luxels
             // and its `lightmap_size` extent of 1 is right.
-            lightmap_vecs: [
-                [1.0 / 32.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0 / 32.0, 0.0, 0.0],
-            ],
+            lightmap_vecs: [[1.0 / 32.0, 0.0, 0.0, 0.0], [0.0, 1.0 / 32.0, 0.0, 0.0]],
             flags: if bumped { surf::BUMPLIGHT } else { 0 },
             tex_data: 0,
         })
@@ -1342,17 +1338,16 @@ fn face_bsp(lit: Option<bool>) -> Vec<u8> {
         }];
         for block in 0..blocks {
             let value = (block + 1) as u8;
-            lighting.extend([ColorRgbExp32 {
-                r: value,
-                g: value,
-                b: value,
-                exponent: 0,
-            }; 4]);
+            lighting.extend(
+                [ColorRgbExp32 {
+                    r: value,
+                    g: value,
+                    b: value,
+                    exponent: 0,
+                }; 4],
+            );
         }
-        lumps.push((
-            LUMP_LIGHTING_HDR,
-            bytemuck::cast_slice(&lighting).to_vec(),
-        ));
+        lumps.push((LUMP_LIGHTING_HDR, bytemuck::cast_slice(&lighting).to_vec()));
     }
 
     lumps.push((

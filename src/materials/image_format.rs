@@ -209,10 +209,7 @@ impl ImageFormat {
     /// `ImageFormatInfo_t::m_bIsCompressed`.
     pub fn is_compressed(self) -> bool {
         use ImageFormat::*;
-        matches!(
-            self,
-            Dxt1 | Dxt3 | Dxt5 | Dxt1OneBitAlpha | Ati1n | Ati2n
-        )
+        matches!(self, Dxt1 | Dxt3 | Dxt5 | Dxt1OneBitAlpha | Ati1n | Ati2n)
     }
 
     /// Bytes per 4x4 block for a compressed format, bytes per texel otherwise.
@@ -698,7 +695,11 @@ mod tests {
         assert_eq!(full_mip_count(8, 8, 8), 4);
         assert_eq!(mip_dimensions(256, 4, 1, 3), (32, 1, 1));
         assert_eq!(mip_dimensions(256, 4, 1, 8), (1, 1, 1));
-        assert_eq!(mip_dimensions(256, 4, 1, 31), (1, 1, 1), "no shift overflow");
+        assert_eq!(
+            mip_dimensions(256, 4, 1, 31),
+            (1, 1, 1),
+            "no shift overflow"
+        );
     }
 
     #[test]
@@ -720,7 +721,10 @@ mod tests {
     fn srgb_only_applies_where_a_variant_exists() {
         use wgpu::TextureFormat as Tf;
         let (lin, srgb) = (ColorSpace::Linear, ColorSpace::Srgb);
-        assert_eq!(ImageFormat::Dxt5.gpu_format(srgb), Some(Tf::Bc3RgbaUnormSrgb));
+        assert_eq!(
+            ImageFormat::Dxt5.gpu_format(srgb),
+            Some(Tf::Bc3RgbaUnormSrgb)
+        );
         assert_eq!(ImageFormat::Dxt5.gpu_format(lin), Some(Tf::Bc3RgbaUnorm));
         assert_eq!(
             ImageFormat::Bgr888.gpu_format(srgb),

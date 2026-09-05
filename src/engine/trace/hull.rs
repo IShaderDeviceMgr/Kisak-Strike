@@ -172,7 +172,10 @@ pub(super) fn unswept_box_trace(work: &mut Work<'_>, head_node: i32) {
 
     let mut found_non_solid = false;
     for leaf_index in leaves {
-        if !work.bsp.leaves[leaf_index].contents.intersects(Contents::SOLID) {
+        if !work.bsp.leaves[leaf_index]
+            .contents
+            .intersects(Contents::SOLID)
+        {
             found_non_solid = true;
         }
         test_in_leaf(work, leaf_index);

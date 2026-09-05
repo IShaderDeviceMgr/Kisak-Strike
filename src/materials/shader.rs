@@ -670,8 +670,8 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
                 .var("$bumpmap")
                 .and_then(|var| var.as_str())
                 .is_some_and(|name| !name.is_empty());
-            let no_diffuse_bump = param_value(kind, vmt, "$nodiffusebumplighting")
-                .is_some_and(|var| var.as_bool());
+            let no_diffuse_bump =
+                param_value(kind, vmt, "$nodiffusebumplighting").is_some_and(|var| var.as_bool());
             if has_bump && !no_diffuse_bump {
                 Lighting::BumpedLightmap
             } else {

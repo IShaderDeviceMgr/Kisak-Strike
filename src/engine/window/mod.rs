@@ -491,7 +491,11 @@ impl<'a> GameWindow<'a> {
             window.theme(),
             Some(renderer.device().limits().max_texture_dimension_2d as usize),
         );
-        let ui = UiRenderer::new(renderer.device(), renderer.queue(), renderer.target_format());
+        let ui = UiRenderer::new(
+            renderer.device(),
+            renderer.queue(),
+            renderer.target_format(),
+        );
 
         self.focused = window.has_focus();
         self.engine = Some(engine);

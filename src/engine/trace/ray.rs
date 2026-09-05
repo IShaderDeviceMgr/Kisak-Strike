@@ -144,14 +144,11 @@ impl Contents {
             | Self::GRATE.0,
     );
     /// Everything normally solid, minus entities — world and brush models only.
-    pub const MASK_SOLID_BRUSHONLY: Contents = Contents(
-        Self::SOLID.0 | Self::MOVEABLE.0 | Self::WINDOW.0 | Self::GRATE.0,
-    );
-    pub const MASK_WATER: Contents =
-        Contents(Self::WATER.0 | Self::MOVEABLE.0 | Self::SLIME.0);
+    pub const MASK_SOLID_BRUSHONLY: Contents =
+        Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::WINDOW.0 | Self::GRATE.0);
+    pub const MASK_WATER: Contents = Contents(Self::WATER.0 | Self::MOVEABLE.0 | Self::SLIME.0);
     /// Everything that blocks lighting.
-    pub const MASK_OPAQUE: Contents =
-        Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::OPAQUE.0);
+    pub const MASK_OPAQUE: Contents = Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::OPAQUE.0);
 
     /// Whether the two sets share a bit — the test the whole traversal is
     /// built on.

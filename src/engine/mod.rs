@@ -58,6 +58,7 @@ use crate::materials::context::{Camera, Load};
 use crate::materials::renderer::Frame;
 use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
 
+use self::trace::{Contents, Ray};
 use console::{
     Command, CommandSpec, CommandTarget, ConfigFiles, Console, ConsoleUi, Cvar, CvarFlags,
     CvarRegistry, Dispatch, ExecContext, Source,
@@ -66,7 +67,6 @@ use host::{Host, Level, Outcome};
 use input::Bindings;
 use input::{Button, CommandSink, Consumer, Input, Key, MouseButton};
 use world::World;
-use self::trace::{Contents, Ray};
 
 /// The engine.
 ///
@@ -860,12 +860,7 @@ const MAX_TRACE_LENGTH: f32 = 1.732_050_8 * 2.0 * 16384.0;
 /// stage 1 — it asks the one question the module exists to answer, using only
 /// what already existed (a console, a player, a view). `client/` stage 4 is
 /// what turns the answer into movement.
-fn trace_command(
-    world: Option<&World>,
-    client: &Client,
-    cmd: &Command,
-    cx: &mut ExecContext<'_>,
-) {
+fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut ExecContext<'_>) {
     let Some(world) = world else {
         cx.print("trace: no map is loaded");
         return;
@@ -1494,9 +1489,7 @@ mod tests {
     ///
     /// The cvars are the client's real ones rather than a stand-in, so this
     /// exercises what a session actually persists.
-    fn config_console(
-        store: &std::sync::Arc<MemoryConfigs>,
-    ) -> (Console<'static>, Client, Cvar) {
+    fn config_console(store: &std::sync::Arc<MemoryConfigs>) -> (Console<'static>, Client, Cvar) {
         let mut console = Console::new(Box::new(store.clone()), Vec::new());
         console.log_mut().set_echo_to_stderr(false);
         for spec in [

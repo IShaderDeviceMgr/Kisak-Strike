@@ -724,7 +724,10 @@ mod tests {
         let w = Button::Key(Key::W);
         input.push_from(pressed(w), Consumer::Ui);
         input.frame();
-        assert!(input.is_down(w), "the key is down; the game just was not told");
+        assert!(
+            input.is_down(w),
+            "the key is down; the game just was not told"
+        );
         assert!(input.events().is_empty());
     }
 
