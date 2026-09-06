@@ -8,6 +8,7 @@
 //! [`Vfs`]: super::Vfs
 
 pub mod dir;
+pub mod pak;
 pub mod vpk;
 
 use crate::filesystem::error::Result;

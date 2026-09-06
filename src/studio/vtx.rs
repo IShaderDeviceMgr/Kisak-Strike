@@ -94,6 +94,19 @@ const STRIP_IS_QUADLIST: u8 = 0x02 | 0x04;
 pub struct Mesh {
     /// Triangle list, three indices per triangle, in the file's winding.
     pub indices: Vec<u32>,
+    /// The mesh's **hardware vertex order**: every strip group's `Vertex_t`
+    /// table, concatenated, as mesh-relative vertex ids.
+    ///
+    /// This is the order the original's GPU vertex buffer would be in, because
+    /// `studiomeshgroup_t` is built by walking exactly this table — and it is
+    /// therefore the order a `.vhv` writes its colours in. It is **not** the
+    /// `.vvd` pool order and is not a prefix of it: a model whose lower LODs
+    /// use a subset of the pool has more pool vertices than LOD 0 has hardware
+    /// vertices, and the ids are a permutation rather than a run.
+    ///
+    /// Kept because [`vhv`](crate::studio::vhv) is the only way to read a
+    /// prop's baked lighting and this is the only record of that order.
+    pub hardware: Vec<u32>,
 }
 
 /// One LOD of one model.
@@ -212,10 +225,17 @@ impl Vtx {
         let base = r.relative_offset(at + 4, at, "MeshHeader_t::stripGroupHeaderOffset")?;
 
         let mut indices = Vec::new();
+        let mut hardware = Vec::new();
         for i in 0..count {
-            Self::strip_group(r, base + i * STRIP_GROUP_STRIDE, i, &mut indices)?;
+            Self::strip_group(
+                r,
+                base + i * STRIP_GROUP_STRIDE,
+                i,
+                &mut indices,
+                &mut hardware,
+            )?;
         }
-        Ok(Mesh { indices })
+        Ok(Mesh { indices, hardware })
     }
 
     /// Appends one strip group's triangles, resolved through its vertex table.
@@ -229,6 +249,7 @@ impl Vtx {
         at: usize,
         which: usize,
         out: &mut Vec<u32>,
+        hardware: &mut Vec<u32>,
     ) -> Result<(), StudioError> {
         let vertex_count = r.count(at, "strip group vertices")?;
         let vertex_base = r.relative_offset(at + 4, at, "StripGroupHeader_t::vertOffset")?;
@@ -259,6 +280,10 @@ impl Vtx {
         for i in 0..vertex_count {
             mesh_vert.push(r.u16(vertex_base + i * VERTEX_STRIDE + ORIG_MESH_VERT_ID)? as u32);
         }
+        // The table itself, kept in order — see [`Mesh::hardware`]. Groups
+        // concatenate, which is what makes a mesh's hardware vertex `j` the
+        // `j`th entry across all of its groups.
+        hardware.extend_from_slice(&mesh_vert);
 
         // Strips, not the group's whole index array, are what actually gets
         // drawn: a group's array can hold ranges no strip references. In every

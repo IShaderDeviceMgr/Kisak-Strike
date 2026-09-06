@@ -65,7 +65,7 @@ use gameinfo::{PlannedPath, GAMEINFO_FILENAME};
 use mount::{dir::DirMount, vpk::VpkMount, Mount};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Where a search path sits in the game's content layout.
 ///
@@ -126,6 +126,16 @@ pub struct Vfs {
     /// plus a six-figure entry map, and parsing it per search path would
     /// duplicate all of it.
     vpk_cache: HashMap<PathBuf, Arc<VpkMount>>,
+    /// The current map's `LUMP_PAKFILE`, searched **before** every other mount.
+    ///
+    /// A field of its own rather than an entry in `mounts` because its
+    /// lifetime is a map's rather than the process's, and because it is set
+    /// while the rest of the engine holds the `Vfs` by shared reference: the
+    /// map loader has a `&Vfs`, not a `&mut Vfs`, and threading mutability
+    /// through every subsystem that reads a file to accommodate the one mount
+    /// that comes and goes would be the tail wagging the dog. See
+    /// [`set_map_pak`](Vfs::set_map_pak).
+    map_pak: RwLock<Option<MountEntry>>,
 }
 
 impl std::fmt::Debug for Vfs {
@@ -194,6 +204,7 @@ impl Vfs {
             write_root,
             warnings: plan.warnings,
             vpk_cache: HashMap::new(),
+            map_pak: RwLock::new(None),
         };
 
         for PlannedPath { path_id, dir } in plan.paths {
@@ -264,10 +275,32 @@ impl Vfs {
     }
 
     /// Mounts an already-opened source under `path_id`, at the end of the list.
-    ///
-    /// The seam for `.bsp` pak lumps at map load.
     pub fn push_mount(&mut self, path_id: PathId, mount: Arc<dyn Mount>) {
         self.mounts.push(MountEntry { path_id, mount });
+    }
+
+    /// Sets — or with `None` clears — the map's embedded pak file.
+    ///
+    /// `AddSearchPath( <map>.bsp, "GAME", PATH_ADD_TO_HEAD )` and the matching
+    /// `RemoveSearchPath` (`engine/modelloader.cpp:4229` and `:6269`), which is
+    /// how the engine makes a map's own generated content visible for exactly
+    /// as long as the map is loaded.
+    ///
+    /// **At the head**, so a mapper's embedded copy of an asset wins over the
+    /// shipped one, which is what embedding it means. There is only ever one,
+    /// so setting replaces.
+    ///
+    /// Takes `&self`: see [`map_pak`](Vfs::map_pak). A caller that already has
+    /// `&mut Vfs` may still call it.
+    pub fn set_map_pak(&self, pak: Option<(PathId, Arc<dyn Mount>)>) {
+        let entry = pak.map(|(path_id, mount)| MountEntry { path_id, mount });
+        match self.map_pak.write() {
+            Ok(mut slot) => *slot = entry,
+            // A poisoned lock means a panic while a *different* thread held it,
+            // which cannot lose data here: the value is one `Option` replaced
+            // wholesale, never mutated in place.
+            Err(poisoned) => *poisoned.into_inner() = entry,
+        }
     }
 
     /// Non-fatal problems encountered while mounting.
@@ -292,7 +325,13 @@ impl Vfs {
     /// comparing this against a stock build "the highest-value verification
     /// opportunity in the whole module".
     pub fn search_paths(&self) -> impl Iterator<Item = (PathId, String)> + '_ {
-        self.mounts.iter().map(|m| (m.path_id, m.mount.describe()))
+        let pak = self
+            .map_pak
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|e| (e.path_id, e.mount.describe())));
+        pak.into_iter()
+            .chain(self.mounts.iter().map(|m| (m.path_id, m.mount.describe())))
     }
 
     /// Restricts lookups to one role — replaces the path-ID argument threaded
@@ -353,8 +392,26 @@ impl ScopedVfs<'_> {
         self.vfs.mounts.iter().filter(|m| self.accepts(m))
     }
 
+    /// The map's pak lump, if there is one and this scope may see it.
+    ///
+    /// Returned by value rather than by reference because it lives behind a
+    /// lock; the `Arc` clone is one atomic and the guard is released before
+    /// anything reads a file.
+    fn map_pak(&self) -> Option<Arc<dyn Mount>> {
+        let slot = self
+            .vfs
+            .map_pak
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = slot.as_ref()?;
+        self.accepts(entry).then(|| Arc::clone(&entry.mount))
+    }
+
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
         let rel = RelPath::new(path)?;
+        if let Some(result) = self.map_pak().and_then(|pak| pak.read(&rel)) {
+            return result;
+        }
         for entry in self.mounts() {
             if let Some(result) = entry.mount.read(&rel) {
                 return result;
@@ -367,6 +424,9 @@ impl ScopedVfs<'_> {
 
     pub fn open(&self, path: &str) -> Result<Box<dyn ReadSeek>> {
         let rel = RelPath::new(path)?;
+        if let Some(result) = self.map_pak().and_then(|pak| pak.open(&rel)) {
+            return result;
+        }
         for entry in self.mounts() {
             if let Some(result) = entry.mount.open(&rel) {
                 return result;
@@ -381,6 +441,9 @@ impl ScopedVfs<'_> {
         let Ok(rel) = RelPath::new(path) else {
             return false;
         };
+        if self.map_pak().is_some_and(|pak| pak.contains(&rel)) {
+            return true;
+        }
         self.mounts().any(|e| e.mount.contains(&rel))
     }
 
@@ -398,9 +461,15 @@ impl ScopedVfs<'_> {
 
         let mut seen = std::collections::HashSet::new();
         let mut merged = Vec::new();
-        for entry in self.mounts() {
+        let pak = self.map_pak();
+        for mount in pak.iter().map(Arc::as_ref).chain(
+            self.mounts()
+                .map(|e| e.mount.as_ref())
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ) {
             let mut batch = Vec::new();
-            entry.mount.list(rel.as_ref(), &mut batch);
+            mount.list(rel.as_ref(), &mut batch);
             for item in batch {
                 if seen.insert(item.name.to_ascii_lowercase()) {
                     merged.push(item);

@@ -142,6 +142,27 @@ Absent on purpose: `CONTENT` (authoring-only, and broken on POSIX in the origina
 `BSP` (never a path ID; it was a lookup-time filter, and becomes a real mount at map
 load).
 
+#### The map pak
+
+```rust
+pub fn set_map_pak(&self, pak: Option<(PathId, Arc<dyn Mount>)>);
+```
+
+`AddSearchPath( <map>.bsp, "GAME", PATH_ADD_TO_HEAD )` and the matching
+`RemoveSearchPath` (`engine/modelloader.cpp:4229` and `:6269`) — the one mount whose
+lifetime is a map's rather than the process's. `World::load` clears it, then sets it from
+the `.bsp` it just read.
+
+Two things about it are deliberate and both would be wrong the other way:
+
+- **It is searched *before* every other mount**, so a mapper's embedded copy of an asset
+  beats the shipped one — which is what embedding it means. At the tail, the `.vhv` files
+  would still be reachable and every override would be silently ignored.
+- **It takes `&self`.** Everything that reads a file holds the `Vfs` by shared reference,
+  including the map loader; threading `&mut` through every subsystem to accommodate the
+  one mount that comes and goes would be the tail wagging the dog. The value is a single
+  `Option` behind an `RwLock`, replaced wholesale.
+
 ### `ScopedVfs<'a>`
 
 A `Copy` view restricted to one `PathId`. Same four read methods as `Vfs`.
@@ -212,6 +233,7 @@ closes on drop. Streams are `Send` but not `Sync`.
 `SearchPaths` are `|gameinfo_path|.`, `portal2_dlc1`, `portal2`:
 
 ```
+Game            <map>.bsp/pak            <- only while a map is loaded
 Mod             <base>/portal2
 Mod             <base>/portal2/pak01_dir.vpk
 GameBin         <base>/portal2/bin
@@ -223,7 +245,9 @@ Game            <base>/platform
 ExecutablePath  <exe dir>
 ```
 
-Rules, from `FileSystem_AddLoadedSearchPath`:
+The first line is [`set_map_pak`](#the-map-pak) and is not part of `mount_game`'s output;
+everything below it is. The rest of the rules come from
+`FileSystem_AddLoadedSearchPath`:
 
 1. Location prefixes: `|gameinfo_path|` is relative to the `gameinfo.txt` directory,
    `|all_source_engine_paths|` and bare locations to the base directory. Prefix matching
@@ -377,43 +401,60 @@ not just the filename, because Valve content miscases directories too.
 Handles v1, v2 and headerless directories, files spanning numbered archives, and data
 embedded in the dir file (`archive == 0x7fff`).
 
+**`PakMount`** — `PakMount::new(map: &str, bytes: Arc<[u8]>) -> Result<Self>`, `len()`,
+`is_empty()`. The ZIP archive in a `.bsp`'s `LUMP_PAKFILE`: the cubemap material patches
+`vbsp` generates, the per-prop `.vhv` lighting `vrad` bakes, and anything a mapper
+embedded. **Stored entries only** — every one of the 64,428 entries in Portal 2's 106
+maps is method 0, and a compressed one is refused by name rather than misread, which is
+why this needs no decompressor and no new dependency. Reads each entry's offset from its
+**local** header, not the central directory's copy, because the two are permitted to
+disagree about the extra-field length and do.
+
+Mounted with [`Vfs::set_map_pak`](#vfs), not `push_mount`.
+
 ---
 
 ## Invariants and gotchas
 
 Ordered by how likely each is to bite.
 
-1. **Unscoped lookups skip `Mod`, `GameBin` and `ExecutablePath`.** `vfs.read("libtier0.so")`
+1. **The map pak is searched first and outlives nothing.** While a map is loaded,
+   `set_map_pak` puts its `LUMP_PAKFILE` ahead of every other mount, so a name that
+   resolved to a shipped asset a moment ago can resolve to the map's copy now — that is
+   the point, and it is how `materials/maps/<map>/…` cubemap patches work. It is cleared
+   at the start of the next `World::load`, so anything read out of it must be *read*, not
+   held as a path to re-read later.
+2. **Unscoped lookups skip `Mod`, `GameBin` and `ExecutablePath`.** `vfs.read("libtier0.so")`
    will *not* find `<mod>/bin/libtier0.so`; use `vfs.scoped(PathId::GameBin)`. This is
    intentional and matches `MarkPathIDByRequestOnly`. (The file is still reachable
    unscoped as `bin/libtier0.so`, because the mod directory is itself a `Game` path.)
-2. **`..` that escapes the root is an error, not a clamp.** `read("../secret")` returns
+3. **`..` that escapes the root is an error, not a clamp.** `read("../secret")` returns
    `InvalidPath`. Do not "fix" this by clamping.
-3. **`$WIN32` does not mean Windows.** Valve's `DefaultConditionalSymbolProc` resolves it
+4. **`$WIN32` does not mean Windows.** Valve's `DefaultConditionalSymbolProc` resolves it
    to `IsPC()` — "not a game console" — so `[$WIN32]` in `gameinfo.txt` is **true on
    Linux and macOS**. `$WINDOWS` is the one that means Windows, and it is false. Getting
    this backwards silently drops search paths, and the failure surfaces much later as
    missing content. See `ConditionalSymbols`.
-4. **KeyValues escape sequences are off.** Valve only enables them via
+5. **KeyValues escape sequences are off.** Valve only enables them via
    `UsesEscapeSequences(true)`, which nothing calls for `gameinfo.txt`. A `\` is a
    literal character; Valve content is full of Windows-authored paths that depend on it.
-5. **VPKs are ordered mounts, placed *after* the directory they were found in.** This is
+6. **VPKs are ordered mounts, placed *after* the directory they were found in.** This is
    a deliberate divergence: the original keeps VPKs in a separate global list consulted
    before every search path, so VPK content wins over loose files unconditionally. Here a
    loose file overrides the VPK beside it. **Unverified against a real install.**
    `VPKS_AFTER_LOOSE_FILES` in `mod.rs` is the single switch to revert it.
-6. **`Block::values()` skips nested blocks**, and `Block::find*` is case-insensitive and
+7. **`Block::values()` skips nested blocks**, and `Block::find*` is case-insensitive and
    returns the *first* match while duplicates are preserved in order. `SearchPaths`
    depends on both halves of that.
-7. **VPK entries are stored fully lowercased** by Valve's writer — directory, basename
+8. **VPK entries are stored fully lowercased** by Valve's writer — directory, basename
    *and* extension — with the directory's trailing slash stripped, and `" "` (a single
    space) standing in for an empty directory or absent extension.
-8. **A VPK file's contents are its metadata blob followed by its archive parts.** The
+9. **A VPK file's contents are its metadata blob followed by its archive parts.** The
    metadata is a preload prefix, not a sidecar; a file's logical length is
    `metadata_size + part lengths`.
-9. **Missing directories are normal**, not errors. Only `gameinfo.txt` itself is
+10. **Missing directories are normal**, not errors. Only `gameinfo.txt` itself is
    required.
-10. **`Vfs` is not `Clone`.** Share `&Vfs`. Don't reintroduce a global.
+11. **`Vfs` is not `Clone`.** Share `&Vfs`. Don't reintroduce a global.
 
 ---
 
@@ -424,14 +465,14 @@ Deferred deliberately, with the reasoning in `portdocs/FILESYSTEM.md`:
 - **Async I/O.** `basefilesystemasync.cpp`'s callback API with manual buffer ownership
   should not survive contact with Rust, and nothing on the boot path needs it. Picking a
   concurrency model before there is a consumer to measure is the wrong order.
-- **`.bsp` embedded pak lump mounts.** Needed at map load, not before. `Mount` +
-  `push_mount` is the seam; a `BspPakMount` implementing the trait is the whole job.
 - **`sv_pure` file tracking.** Dropped for single-player Portal 2. If multiplayer returns:
   the original computes hashes *during* reads (`CPackedStore::RegisterFileTracker`), so
   the tee point is inside `VpkMount`'s read path, not after it.
 - **`QueuedLoader`.** A map-load prefetch optimization with no correctness role.
 - **VPK writing.** Tooling, not runtime.
-- **Plain-zip mounts.** Whether anything still needs them at runtime is an open question.
+- **Plain-zip mounts** of loose `.zip` files. The reader for them exists — `PakMount`
+  takes bytes, not a `.bsp` — but nothing asks for one.
+- **Deflate.** See `PakMount` above: it is a measurement, not an omission.
 
 `#![allow(dead_code)]` sits at the top of `mod.rs` because the read API has no consumer
 until `src/engine/` exists. **Remove it when it does.**

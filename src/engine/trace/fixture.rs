@@ -172,6 +172,7 @@ impl Fixture {
             game_lumps: Vec::new(),
             leaf_ambient: Vec::new(),
             leaf_ambient_index: Vec::new(),
+            pak: std::sync::Arc::from(&[][..]),
             path: "test".to_owned(),
             version: 21,
             revision: 0,

@@ -40,6 +40,10 @@ pub enum VfsError {
     #[error("{}: malformed VPK: {reason}", .path.display())]
     Vpk { path: PathBuf, reason: String },
 
+    /// A `.bsp`'s embedded pak file could not be read.
+    #[error("{map}.bsp: malformed pak lump: {reason}")]
+    Pak { map: String, reason: String },
+
     /// A KeyValues document could not be parsed.
     #[error("{source_name}:{line}: {reason}")]
     KeyValues {

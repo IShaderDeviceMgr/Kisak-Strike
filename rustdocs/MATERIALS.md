@@ -980,10 +980,12 @@ struct, its GPU layout is derived from the struct, and filling a buffer is
 ### Vertices and layouts
 
 ```rust
-pub enum VertexLayout { Simple, World, Model }
+pub enum VertexLayout { Simple, World, Model, StaticLight }
 impl VertexLayout {
-    pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static>;
+    /// Every buffer a pipeline in this layout binds, in slot order.
+    pub fn buffer_layouts(self) -> &'static [wgpu::VertexBufferLayout<'static>];
     pub fn stride(self) -> u64;
+    pub fn takes_static_light(self) -> bool;   // true only for Model
 }
 
 pub trait Vertex: Pod { const LAYOUT: VertexLayout; }
@@ -1008,12 +1010,33 @@ pub struct ModelVertex {
     pub normal: [f32; 3],
     pub texcoord: [f32; 2],
     pub tangent: [f32; 4],            // xyz tangent S, w the binormal's sign
-    pub color: [f32; 4],              // COLOR1, vrad's baked per-vertex light
 }
 impl ModelVertex {
     pub const fn new(position: [f32; 3], normal: [f32; 3], texcoord: [f32; 2]) -> ModelVertex;
 }
+
+/// Slot **1** of `VertexLayout::Model`. COLOR1 / vStaticLight.
+#[repr(C)]
+pub struct StaticLightVertex { pub color: [u8; 4] }   // Unorm8x4
+impl StaticLightVertex {
+    pub const UNLIT: StaticLightVertex;
+    pub const fn new(color: [u8; 4]) -> StaticLightVertex;
+}
 ```
+
+**`VertexLayout::Model` is two buffers, and the baked light is the second.** It is not a
+field of `ModelVertex` because it is per *placement* and the geometry is per *model*:
+`vrad` bakes a colour per vertex per placed prop and writes a `.vhv` beside the map —
+56,955 of them across Portal 2 — so a thousand copies of one crate share a vertex buffer
+and have a thousand lighting streams. Folding it back in would mean uploading the model
+once per placement, which for `sp_a1_intro1` alone is 2.3 million vertices instead of
+284 thousand. Valve splits it for the same reason: `m_pColorMeshData` is a separate
+`IMesh` bound alongside the model's (`engine/l_studio.cpp:4290`), which is what
+`VERTEX_COLOR_STREAM_1` names. It is eight bits because that is what a `.vhv` holds.
+
+**Every model draw must bind one** — `Pass::bind_static_light`, including a model with no
+baked lighting, which binds a black stream and clears `ModelLighting::static_light` so the
+shader ignores it. A missing one panics rather than reaching `wgpu`.
 
 `WorldVertex` is what `BuildMSurfaceVertexArrays` writes for a brush surface, minus the
 attributes nothing in scope reads. `new` gives white, unlit, at the origin — a base to
@@ -1202,6 +1225,39 @@ are padded to `min_uniform_buffer_offset_alignment` (256 on the portable floor),
 one buffer per draw.
 
 `each_draw_gets_its_own_model_matrix` in `preview.rs` is the regression test.
+
+**Writes are staged, not queued per slot.** `push` copies into a CPU-side mirror and the
+whole range reaches the GPU in one `write_buffer` when the pass drops. This is a frame
+rate decision, not a tidiness one: `write_buffer` is not a memcpy — every call takes a
+staging-belt chunk, maps it and records a copy — and at one call per draw a map with 1,080
+static props made about 3,300 of them a frame. `Pass::drop` is where the flush happens,
+which is before the encoder is finished, let alone submitted.
+
+**Slots survive a growth of the arena.** `grow` hands the old buffer everything staged so
+far, then keeps the staged bytes and the slot counter, so an offset handed out earlier
+still names the same block — which is what lets `push_model_lighting` take a batch of
+slots up front and draw with them later.
+
+### Redundant state is elided
+
+`Pass` remembers the pipeline, bind groups 0, 1 and 3, and both vertex buffers and the
+index buffer, and only touches the encoder when one of them would change. `wgpu`'s
+resource handles compare by identity, so this is a pointer comparison.
+
+**This is worth roughly as much as batching the uniform writes.** A scene of static props
+issues the same pipeline, material and geometry for every instance of a model — 1,080
+times over on `sp_a1_intro1` — and each redundant `set_*` is a validation pass and an
+encoder command. Together the two changes took that map from a 78 fps CPU ceiling to a
+four-figure one; `engine::world::bench::tests::frame_cost` is the stopwatch.
+
+Group 2 is deliberately not elided: its dynamic offset differs for every draw by
+construction.
+
+**The correctness hazard is A/B/A**, not A/B: a draw that returns to a material used
+earlier in the pass must get that material back.
+`a_draw_returning_to_an_earlier_material_gets_it_back` and
+`one_model_can_be_drawn_under_two_static_light_streams` in `preview.rs` are the
+regression tests, and neither passes if the bookkeeping is wrong in the obvious way.
 
 ### `Camera`
 
@@ -1526,6 +1582,12 @@ Ordered by how likely each is to bite.
    The two differ by a factor of 255 and the wrong one is the one that looks right in the
    source. See [`ColorRgbExp32`](#colorrgbexp32--and-the-decode-that-is-255x-wrong); the
    symptom is a uniformly white screen rather than anything that reads as a bad decode.
+
+   **The opposite is true of an ambient cube**, which is Valve's asymmetry and not a
+   mistake: `Mod_LeafAmbientColorAtPos` uses `ColorRGBExp32ToVector`
+   (`modelloader.cpp:7338`) and `ColorRgbExp32::to_vector` is it. Measured, not assumed —
+   `rustdocs/STUDIO.md` gotcha 2 has the numbers. Use `to_linear` for a lightmap luxel and
+   `to_vector` for a light cube, and nothing else.
 3. **`ColorSpace` is decided by the shader, and nothing checks it.** Getting it wrong
    produces a picture that looks *plausible* — a washed-out albedo, or a normal map that
    lights slightly wrong — rather than anything that errors.

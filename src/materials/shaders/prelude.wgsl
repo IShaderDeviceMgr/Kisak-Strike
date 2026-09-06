@@ -213,6 +213,10 @@ struct ModelVertexInput {
     @location(2) texcoord: vec2<f32>,
     // xyz = tangent S, w = the sign of the binormal.
     @location(3) tangent: vec4<f32>,
+    // `vStaticLight`, from a **second vertex buffer** — `Unorm8x4`, so it
+    // arrives here as a `vec4<f32>` in `0..1` whatever the stream's width.
+    // It is per placement rather than per model, which is why it is its own
+    // stream; see `mesh::StaticLightVertex`.
     @location(4) color: vec4<f32>,
 }
 

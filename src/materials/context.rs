@@ -320,9 +320,9 @@ impl RenderContext {
     /// still holding a slice or a uniform slot from the previous frame will
     /// read whatever overwrites it.
     pub fn begin_frame(&mut self) {
-        self.frames.begin_frame(&self.device);
-        self.draws.begin_frame(&self.device);
-        self.lights.begin_frame(&self.device);
+        self.frames.begin_frame(&self.device, &self.queue);
+        self.draws.begin_frame(&self.device, &self.queue);
+        self.lights.begin_frame(&self.device, &self.queue);
         self.dynamic.begin_frame(&self.device);
     }
 
@@ -419,6 +419,9 @@ impl RenderContext {
             &self.queue,
             bytemuck::bytes_of(&frame_uniforms),
         );
+        // One slot per pass, so there is nothing to batch: flushed here rather
+        // than in `Pass::drop` because the pass does not hold this arena.
+        self.frames.flush(&self.queue);
 
         // Every pass starts with one fullbright lighting slot, so that a model
         // draw before `set_model_lighting` binds something well-defined rather
@@ -478,6 +481,8 @@ impl RenderContext {
             overrides: StateOverride::default(),
             white_lightmap: self.white_lightmap.bind_group.clone(),
             lightmap: None,
+            static_light: None,
+            bound: BoundState::default(),
         }
     }
 }
@@ -558,6 +563,50 @@ pub struct Pass<'a> {
     white_lightmap: wgpu::BindGroup,
     /// The page [`bind_lightmap_page`](Pass::bind_lightmap_page) last named.
     lightmap: Option<wgpu::BindGroup>,
+    /// The baked static light slot 1 binds. See
+    /// [`bind_static_light`](Pass::bind_static_light).
+    static_light: Option<VertexSlice>,
+    /// What is already set on the encoder, so a draw only changes what
+    /// differs. See [`BoundState`].
+    bound: BoundState,
+}
+
+/// A reserved slot in the pass's model-lighting arena.
+///
+/// Opaque because it is a dynamic-offset into a buffer that may be replaced
+/// mid-pass; only [`Pass`] knows when that stays valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightingSlot(u32);
+
+/// The render state the pass has already recorded.
+///
+/// **A redundant `set_*` is not free.** Each one is a validation pass and an
+/// encoder command, and a scene of static props issues the same pipeline, the
+/// same material bind group and the same vertex buffer for every instance of
+/// a model — 1,080 times over on `sp_a1_intro1`. Skipping the ones that do not
+/// change is worth roughly as much as batching the uniform writes was, and the
+/// two together are what took that map from a 78 fps CPU ceiling to a
+/// four-figure one (`world::bench`).
+///
+/// `wgpu`'s resource handles compare by identity, so this is a pointer
+/// comparison and not a deep one. Group 2 is deliberately absent: its dynamic
+/// offset is different for every draw by construction, so it is bound every
+/// time and there is nothing to remember.
+#[derive(Default)]
+struct BoundState {
+    /// The key as well as the pipeline, so that a repeat draw skips the
+    /// cache's hash lookup and not just the `set_pipeline`.
+    pipeline: Option<(PipelineKey, std::sync::Arc<wgpu::RenderPipeline>)>,
+    /// Group 0. Constant for the whole pass, so this is set exactly once.
+    frame: Option<(wgpu::BindGroup, u32)>,
+    /// Group 1 — the material's textures and constants.
+    material: Option<wgpu::BindGroup>,
+    /// Group 3 — a lightmap page or a model's lighting block, with its offset.
+    lighting: Option<(wgpu::BindGroup, u32)>,
+    vertices: Option<(wgpu::Buffer, u64, u32)>,
+    /// Slot 1, the static-light stream.
+    static_light: Option<(wgpu::Buffer, u64, u32)>,
+    indices: Option<(wgpu::Buffer, u64, u32)>,
 }
 
 // Viewport, scissor and depth range are per-pass state the engine sets and
@@ -610,6 +659,36 @@ impl Pass<'_> {
         self.lightmap = Some(page.bind_group().clone());
     }
 
+    /// Sets the per-vertex baked static light every subsequent model draw
+    /// reads — vertex buffer slot 1.
+    ///
+    /// `CStaticProp`'s colour mesh (`engine/l_studio.cpp:4290`), which the
+    /// original binds beside the model's own geometry for exactly this reason:
+    /// `vrad` bakes one colour per vertex **per placement**, so a thousand
+    /// copies of one crate share a vertex buffer and have a thousand lighting
+    /// streams. See [`StaticLightVertex`](super::mesh::StaticLightVertex).
+    ///
+    /// Applies from here to the end of the pass or the next call, like
+    /// [`bind_lightmap_page`](Pass::bind_lightmap_page). Every draw of a
+    /// [`VertexLayout::Model`] material needs one bound — including a model
+    /// with no baked lighting, which binds a black stream and clears
+    /// [`ModelLighting::static_light`] so the shader ignores it.
+    ///
+    /// # Panics
+    ///
+    /// If `vertices` is not a [`VertexLayout::StaticLight`] buffer. Binding a
+    /// model's *geometry* here would otherwise reinterpret 48-byte vertices as
+    /// 4-byte colours and light every prop from its own positions.
+    pub fn bind_static_light(&mut self, vertices: &VertexSlice) {
+        assert_eq!(
+            vertices.layout(),
+            super::mesh::VertexLayout::StaticLight,
+            "the static light stream must be a StaticLightVertex buffer, got {:?}",
+            vertices.layout()
+        );
+        self.static_light = Some(vertices.clone());
+    }
+
     /// Sets the ambient cube and local lights every subsequent model draw is
     /// lit by.
     ///
@@ -628,9 +707,34 @@ impl Pass<'_> {
     /// again and draw again within one pass — which is exactly what a scene of
     /// props does.
     pub fn set_model_lighting(&mut self, lighting: &ModelLighting) {
-        self.lighting_offset =
+        let slot = self.push_model_lighting(lighting);
+        self.set_model_lighting_slot(slot);
+    }
+
+    /// Reserves a lighting slot without binding it, for a caller that wants
+    /// many and will draw with them in a different order.
+    ///
+    /// A scene of static props wants exactly this: one lighting state per
+    /// instance, but drawn **batch-major** so that a model's pipeline, material
+    /// and buffers are bound once rather than once per instance. Pushing as it
+    /// draws would cost one slot per (batch, instance) instead of one per
+    /// instance. See [`PropModels::draw`].
+    ///
+    /// Slots stay valid for the rest of the pass, including across a growth of
+    /// the arena — see [`UniformArena::grow`].
+    ///
+    /// [`PropModels::draw`]: crate::engine::world::props::PropModels::draw
+    pub fn push_model_lighting(&mut self, lighting: &ModelLighting) -> LightingSlot {
+        LightingSlot(
             self.lights
-                .push(self.device, self.queue, bytemuck::bytes_of(lighting));
+                .push(self.device, self.queue, bytemuck::bytes_of(lighting)),
+        )
+    }
+
+    /// Binds a slot taken by [`push_model_lighting`](Pass::push_model_lighting)
+    /// for every subsequent model draw.
+    pub fn set_model_lighting_slot(&mut self, slot: LightingSlot) {
+        self.lighting_offset = slot.0;
     }
 
     /// Overrides part of every subsequent draw's pipeline state.
@@ -731,7 +835,20 @@ impl Pass<'_> {
             state: self.overrides.apply(material.state),
             target: self.target,
         };
-        let pipeline = self.pipelines.get(&key);
+        // The cache lookup is a hash of the whole key; consecutive draws of one
+        // material's instances all want the same pipeline, so the last answer
+        // is remembered and the hash skipped.
+        let pipeline = match &self.bound.pipeline {
+            Some((last_key, pipeline)) if *last_key == key => pipeline.clone(),
+            _ => {
+                let pipeline = self.pipelines.get(&key);
+                self.pass.set_pipeline(&pipeline);
+                self.bound.pipeline = Some((key, pipeline.clone()));
+                pipeline
+            }
+        };
+        // Bound above when it changed; nothing to do with it here.
+        drop(pipeline);
 
         let draw = DrawUniforms {
             model: uniforms::from_mat4(model),
@@ -746,32 +863,100 @@ impl Pass<'_> {
             .draws
             .push(self.device, self.queue, bytemuck::bytes_of(&draw));
 
-        self.pass.set_pipeline(&pipeline);
-        self.pass
-            .set_bind_group(0, &self.frame_bind_group, &[self.frame_offset]);
-        self.pass.set_bind_group(1, material.bind_group(), &[]);
-        self.pass
-            .set_bind_group(2, self.draws.bind_group(), &[offset]);
+        // Everything below only touches the encoder when it would actually
+        // change something — see [`BoundState`]. The one exception is group 2,
+        // whose dynamic offset is different for every draw by construction.
+        let frame = (self.frame_bind_group.clone(), self.frame_offset);
+        if self.bound.frame.as_ref() != Some(&frame) {
+            self.pass.set_bind_group(0, &frame.0, &[frame.1]);
+            self.bound.frame = Some(frame);
+        }
+
+        if self.bound.material.as_ref() != Some(material.bind_group()) {
+            self.pass.set_bind_group(1, material.bind_group(), &[]);
+            self.bound.material = Some(material.bind_group().clone());
+        }
+
+        // Always set: the offset below is different for every draw by
+        // construction, so there is nothing here to elide.
+        self.pass.set_bind_group(2, self.draws.bind_group(), &[offset]);
+
         match material.shader.lighting_binding() {
             None => {}
             Some(LightingBinding::LightmapPage) => {
-                self.pass.set_bind_group(
-                    3,
-                    self.lightmap.as_ref().unwrap_or(&self.white_lightmap),
-                    &[],
-                );
+                let page = self.lightmap.as_ref().unwrap_or(&self.white_lightmap);
+                if self.bound.lighting.as_ref().map(|(g, _)| g) != Some(page) {
+                    self.pass.set_bind_group(3, page, &[]);
+                    self.bound.lighting = Some((page.clone(), 0));
+                }
             }
             // Read after any `set_model_lighting` in this pass, because a push
             // that grew the arena replaced the bind group this names.
             Some(LightingBinding::ModelLighting) => {
-                self.pass
-                    .set_bind_group(3, self.lights.bind_group(), &[self.lighting_offset]);
+                let group = self.lights.bind_group();
+                let wanted = (group, self.lighting_offset);
+                if self.bound.lighting.as_ref().map(|(g, o)| (g, *o)) != Some(wanted) {
+                    self.pass.set_bind_group(3, group, &[self.lighting_offset]);
+                    self.bound.lighting = Some((group.clone(), self.lighting_offset));
+                }
             }
         }
-        self.pass.set_vertex_buffer(0, vertices.buffer_slice());
-        self.pass
-            .set_index_buffer(indices.buffer_slice(), indices.format());
+
+        let (buffer, offset, count) = vertices.identity();
+        if self.bound.vertices.as_ref().map(|(b, o, c)| (b, *o, *c)) != Some((buffer, offset, count))
+        {
+            self.pass.set_vertex_buffer(0, vertices.buffer_slice());
+            self.bound.vertices = Some((buffer.clone(), offset, count));
+        }
+        if expected.takes_static_light() {
+            // A missing stream is a programming error the same way a wrong
+            // vertex layout is, and it fails here rather than as a `wgpu`
+            // validation message naming a slot number.
+            let light = self.static_light.clone().unwrap_or_else(|| {
+                panic!(
+                    "material {:?} takes model vertices, so a static light stream must be \
+                     bound before drawing it — see Pass::bind_static_light",
+                    material.name
+                )
+            });
+            assert!(
+                light.len() >= vertices.len(),
+                "material {:?}: the static light stream has {} vertices for {} of geometry",
+                material.name,
+                light.len(),
+                vertices.len()
+            );
+            let (buffer, offset, count) = light.identity();
+            if self.bound.static_light.as_ref().map(|(b, o, c)| (b, *o, *c))
+                != Some((buffer, offset, count))
+            {
+                self.pass.set_vertex_buffer(1, light.buffer_slice());
+                self.bound.static_light = Some((buffer.clone(), offset, count));
+            }
+        }
+
+        let (buffer, offset, count) = indices.identity();
+        if self.bound.indices.as_ref().map(|(b, o, c)| (b, *o, *c)) != Some((buffer, offset, count))
+        {
+            self.pass
+                .set_index_buffer(indices.buffer_slice(), indices.format());
+            self.bound.indices = Some((buffer.clone(), offset, count));
+        }
         self.pass.draw_indexed(0..indices.len(), 0, 0..1);
+    }
+}
+
+impl Drop for Pass<'_> {
+    /// Hands the pass's staged uniform slots to the queue.
+    ///
+    /// Correct here rather than at submit time because `write_buffer` orders
+    /// its copy ahead of every command buffer submitted afterwards, and this
+    /// runs before the encoder is finished, let alone submitted. Doing it per
+    /// pass rather than per frame keeps a context that never opens another
+    /// pass from holding a frame's writes indefinitely.
+    fn drop(&mut self) {
+        self.draws.flush(self.queue);
+        self.lights.flush(self.queue);
     }
 }
 
@@ -801,6 +986,21 @@ struct UniformArena {
     slots: u64,
     used: u64,
     demand: u64,
+    /// A CPU-side mirror of the slots written this frame, flushed to the GPU
+    /// in one `write_buffer` rather than one per slot.
+    ///
+    /// **This is a frame-rate decision, not a tidiness one.** `write_buffer`
+    /// is not a memcpy: every call takes a staging-belt chunk, maps it and
+    /// records a buffer-to-buffer copy, and at one call per draw a map with
+    /// 1,080 static props made ~3,300 of them a frame. Measured on
+    /// `sp_a1_intro1` (`world::bench`), collapsing them to one call per pass
+    /// per arena is most of the difference between a 78 fps and a 500 fps
+    /// ceiling from CPU alone.
+    staged: Vec<u8>,
+    /// Slots already handed to the queue. A pass flushes what it added rather
+    /// than the whole frame's worth, so several passes cost several small
+    /// writes rather than one growing quadratically.
+    flushed: u64,
 }
 
 impl UniformArena {
@@ -829,6 +1029,8 @@ impl UniformArena {
             slots,
             used: 0,
             demand: 0,
+            staged: vec![0; (slot * slots) as usize],
+            flushed: 0,
         }
     }
 
@@ -864,15 +1066,20 @@ impl UniformArena {
         (buffer, bind_group)
     }
 
-    fn begin_frame(&mut self, device: &wgpu::Device) {
+    fn begin_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.demand > self.slots {
-            self.grow(device, self.demand);
+            self.grow(device, queue, self.demand);
         }
         self.used = 0;
         self.demand = 0;
+        self.flushed = 0;
     }
 
-    fn grow(&mut self, device: &wgpu::Device, wanted: u64) {
+    fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, wanted: u64) {
+        // Whatever is staged belongs to the buffer being replaced: draws
+        // already recorded name its bind group, and it stays alive for them.
+        // So it has to be handed over before the swap, not after.
+        self.flush(queue);
         self.slots = wanted.next_power_of_two();
         let (buffer, bind_group) = Self::allocate(
             device,
@@ -884,6 +1091,31 @@ impl UniformArena {
         );
         self.buffer = buffer;
         self.bind_group = bind_group;
+        // **The staged bytes are kept and `used` is not reset**, so every
+        // offset handed out before the growth still names the same block. That
+        // is what lets a caller take a batch of slots and draw with them later
+        // (`push_model_lighting`): the draws recorded before the growth name
+        // the old bind group, which was just flushed with the right contents,
+        // and the ones after name the new one, which is about to be flushed
+        // with all of it.
+        self.staged.resize((self.slot * self.slots) as usize, 0);
+        self.flushed = 0;
+    }
+
+    /// Hands every slot staged since the last flush to the queue.
+    ///
+    /// Correct to call at any point before `submit`, because `write_buffer`
+    /// stages its copy ahead of the whole command buffer — which is the same
+    /// property that makes a *rewritten* slot reach every draw in the frame,
+    /// and so the reason each draw gets its own slot in the first place.
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        if self.used <= self.flushed {
+            return;
+        }
+        let from = (self.flushed * self.slot) as usize;
+        let to = (self.used * self.slot) as usize;
+        queue.write_buffer(&self.buffer, from as u64, &self.staged[from..to]);
+        self.flushed = self.used;
     }
 
     fn bind_group(&self) -> &wgpu::BindGroup {
@@ -894,14 +1126,11 @@ impl UniformArena {
     fn push(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> u32 {
         self.demand += 1;
         if self.used >= self.slots {
-            // The replaced buffer stays alive for as long as the draws already
-            // recorded against it, so restarting at slot zero writes into
-            // genuinely fresh memory.
-            self.grow(device, self.demand);
-            self.used = 0;
+            self.grow(device, queue, self.demand.max(self.used + 1));
         }
         let offset = self.used * self.slot;
-        queue.write_buffer(&self.buffer, offset, bytes);
+        let at = offset as usize;
+        self.staged[at..at + bytes.len()].copy_from_slice(bytes);
         self.used += 1;
         offset as u32
     }

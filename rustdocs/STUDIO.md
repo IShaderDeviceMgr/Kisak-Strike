@@ -1,6 +1,7 @@
 # `src/studio/` and `src/engine/world/props/` — API reference
 
-Studio models (`.mdl` / `.vvd` / `.dx90.vtx`) and the static props a map places.
+Studio models (`.mdl` / `.vvd` / `.dx90.vtx` / `.vhv`) and the static props a map
+places.
 Two modules, because the *asset* and the *instance* have different lifetimes:
 `studio/` reads files and needs no map; `world/props/` places them and dies with
 one. Design and the measurements behind the scoping: `portdocs/STUDIO.md`.
@@ -10,7 +11,7 @@ one. Design and the measurements behind the scoping: `portdocs/STUDIO.md`.
 | 1 | the three readers and the join | **done**, verified against all 2,041 shipped models |
 | 2 | the `sprp` game lump | **done**, verified against all 106 shipped maps |
 | 3 | draw them | **done** — 1,080 props draw in `sp_a1_intro1` |
-| 4 | the `.bsp` pak lump and `.vhv` per-vertex light | **not started** |
+| 4 | the `.bsp` pak lump and `.vhv` per-vertex light | **done** |
 | 5 | the leaf ambient cube | **done** |
 | 6 | LOD selection and fade | **not started** (optional) |
 
@@ -143,15 +144,32 @@ once per model, and the count is in `stats`.
 
 ### Lighting
 
+A prop is lit by two things, and both are baked:
+
 ```rust
+// The leaf ambient cube — `Mod_LeafAmbientColorAtPos`, inverse-squared-distance
+// weighted over the leaf's samples.
 pub fn ambient_at(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> AmbientCube;
 pub fn lighting_for(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> ModelLighting;
+
+// The per-vertex bake — one `.vhv` per placement, out of the map's pak lump.
+pub struct Vhv { pub checksum: u32, pub vertex_count: u32, pub meshes: Vec<VhvMesh> }
+impl Vhv {
+    pub fn parse(path: String, bytes: &[u8]) -> Result<Vhv, StudioError>;
+    pub fn lod_meshes(&self, lod: u32) -> impl Iterator<Item = &VhvMesh>;
+    pub fn colors(&self, bytes: &[u8], lod: u32, meshes: &[HardwareMesh], vertex_count: usize)
+        -> Option<Vec<StaticLightVertex>>;
+}
+pub fn prop_lighting_path(index: usize, hdr: bool) -> String;  // sp_hdr_<i>.vhv
 ```
 
-`Mod_LeafAmbientColorAtPos`: inverse-squared-distance-weighted interpolation of
-the leaf's baked cubes. Local lights are **not** ported — that needs
-`LUMP_WORLDLIGHTS` and the attenuation model — so a prop is lit by the ambient
-cube alone.
+`PropModels::load` reads every instance's `.vhv` into **one** `VertexBuffer` for
+the whole map and slices it per prop; `ModelLighting::static_light` is set per
+instance, because whether a prop got a file is per instance.
+
+Local lights are **not** ported — that needs `LUMP_WORLDLIGHTS` and the
+attenuation model — so beyond the ambient cube and the vertex bake a prop has no
+lighting.
 
 ---
 
@@ -197,7 +215,30 @@ Ordered by how likely each is to bite.
    cubes. Use `ColorRgbExp32::to_vector` here and `to_linear` there; getting it
    backwards makes every prop black.
 
-3. **A `QAngle` is pitch, yaw, roll — not x, y, z** — and the composition is
+3. **A `.vhv` is in *hardware* vertex order, not `.vvd` pool order.** Valve's
+   runtime compacts a model's vertices per LOD — `studiomeshgroup_t` holds
+   exactly the vertices that LOD's strips reference, in the order the `.vtx`
+   strip-group tables list them — and `vrad` writes against that numbering.
+   This port does not compact, so the two differ whenever a lower LOD uses a
+   subset of the pool: `models/props_destruction/framework_dest_01` has 9,434
+   pool vertices and 6,703 hardware vertices at LOD 0. `HardwareMesh` carries
+   the mapping and `Vhv::colors` scatters through it. Reading the block as a
+   run mislights 125 of `sp_a1_intro1`'s 1,080 props **and appears to work for
+   the other 955**, because a single-LOD model's table is usually the identity.
+
+4. **`vrad` writes no `.vhv` block for an empty mesh**, so a model's empty
+   meshes have to be dropped before the two lists are matched — eight meshes
+   and five blocks on `models/npcs/turret/turret_debris_lrg`. Matching them
+   without dropping shifts every later block onto the wrong mesh.
+
+5. **The `.vhv` checksum is counted, not enforced.** `r_ignoreStaticColorChecksum`
+   defaults to 1 (`l_studio.cpp:117`) and the shipped data needs it to: 24 of
+   the game's 56,801 `.vhv` files carry a checksum that is not their model's,
+   and Portal 2 draws those props lit. The per-mesh vertex count is the check
+   that actually protects against another model's colours, and that one is
+   enforced.
+
+6. **A `QAngle` is pitch, yaw, roll — not x, y, z** — and the composition is
    `Rz(yaw) · Ry(pitch) · Rx(roll)` (`mathlib_base.cpp:1329`'s own comment is
    `matrix = (YAW * PITCH) * ROLL`). `StaticProp::rotation` builds it from three
    explicit axis rotations rather than `Mat3::from_euler`, because every
@@ -206,29 +247,29 @@ Ordered by how likely each is to bite.
    look correct and every tilted one does not. Pitch rotates `+X` towards
    `-Z`, not `+Z`.
 
-4. **A leaf with zero ambient samples and a non-zero `first_sample` is a *solid*
+7. **A leaf with zero ambient samples and a non-zero `first_sample` is a *solid*
    leaf, and `first_sample` is a leaf index** — not a sample index. `vrad`
    writes it so a prop embedded in geometry borrows a neighbour's lighting.
    The field means two different things depending on the count beside it and
    nothing in the lump says so. Read it the other way and every such prop is
    black.
 
-5. **`m_LightingOrigin` is meaningless without
+8. **`m_LightingOrigin` is meaningless without
    `STATIC_PROP_USE_LIGHTING_ORIGIN`.** Without the flag it holds whatever the
    compiler left there. `Props::from_lump` falls back to the prop's origin.
 
-6. **`.vtx` triangles are emitted with their winding reversed**, exactly as
+9. **`.vtx` triangles are emitted with their winding reversed**, exactly as
    `world/`'s fans are, and for the same reason: Valve's `D3DCULL_CCW` under a
    Y-up framebuffer and this port's `front_face: Ccw` under `wgpu`'s Y-down one
    name opposite sets of triangles. The fix, if ever made, is one `front_face`
    in `PipelineCache` **and the deletion of both reversals**.
    `rustdocs/ENGINE.md` gotcha #1.
 
-7. **A prop's index buffer is 32-bit.** `models/stars/allstars.mdl` is a static
+10. **A prop's index buffer is 32-bit.** `models/stars/allstars.mdl` is a static
    prop with 187,676 vertices, so `IndexBuffer::new_u32` exists and `IndexSlice`
    carries its format. The world path stays 16-bit.
 
-8. **`OptimizedModel::Vertex_t::origMeshVertID` is at byte 4, not 5**, and
+11. **`OptimizedModel::Vertex_t::origMeshVertID` is at byte 4, not 5**, and
    `FileHeader_t`'s fields are not evenly spaced (`maxBonesPerStrip` and
    `maxBonesPerFace` are `unsigned short`, so `checkSum` lands at 16). Both were
    wrong in the first draft of this reader and **both passed every synthetic
@@ -236,16 +277,16 @@ Ordered by how likely each is to bite.
    were caught only by parsing the real depot. Write a format fixture from the
    header, never from the reader.
 
-9. **A material naming a brush shader cannot draw a prop**, and vice versa. A
+12. **A material naming a brush shader cannot draw a prop**, and vice versa. A
    prop's geometry is `ModelVertex` and nothing else, so `PropModels::load`
    substitutes `MaterialCache::error_model_material()` — a second checkerboard
    under `VertexLitGeneric`, because this port picks the vertex layout per
    shader where Valve picked it per `$model` flag.
 
-10. **`Prop::leaves` is a PVS structure and is not used yet.** Every prop is
+13. **`Prop::leaves` is a PVS structure and is not used yet.** Every prop is
     drawn every frame.
 
-11. **`TRANSLUCENT_TWOPASS` models draw unsorted.** 38 of Portal 2's models set
+14. **`TRANSLUCENT_TWOPASS` models draw unsorted.** 38 of Portal 2's models set
     it and this port has no sorted translucent pass.
 
 ---
@@ -264,9 +305,11 @@ Ordered by how likely each is to bite.
   fit models into a 2007 console; a `StudioModel` is an owned value and dropping
   it frees it.
 - **The local lights** on a prop (`LightcacheGetStatic`'s `dworldlight_t` walk).
-- **`.vhv` per-vertex baked light** — stage 4, blocked on mounting the `.bsp`'s
-  pak lump. Until then `ModelLighting::static_light` is 0, which is what stops
-  the shader reading an all-black colour stream as real darkness.
+- **The 3-stream `.vhv`** (`r_staticlight_streams` 3, the cascaded-shadow
+  path). Every shipped file is `m_nVertexSize` 4, so a wider one is refused
+  rather than misread.
+- **LZMA-compressed `.vhv`** and compressed pak entries. Both are X360-only;
+  all 64,428 pak entries in the shipped game are stored.
 
 ---
 
@@ -303,6 +346,11 @@ Ordered by how likely each is to bite.
 | `props::light::tests::a_solid_leaf_borrows_its_neighbours_samples` | gotcha 4 |
 | `props::light::tests::the_cube_decodes_the_ambient_way_and_not_the_lightmap_way` | gotcha 2 |
 | `props::light::tests::the_nearer_sample_dominates` | inverse-*squared* weighting |
+| `studio::vhv::tests::colours_follow_the_hardware_vertex_order` | gotcha 3 — the one that fails silently |
+| `studio::vhv::tests::empty_meshes_are_not_written_and_must_not_be_matched` | gotcha 4 |
+| `studio::vhv::tests::a_file_that_does_not_describe_the_model_is_refused` | the shape check gotcha 5 relies on |
+| `materials::preview::tests::one_model_can_be_drawn_under_two_static_light_streams` | the per-placement stream, on real pixels |
+| `filesystem::mount::pak::tests::*` | the ZIP reader, against a spec-derived fixture |
 
 Two tests are `#[ignore]`d and gated on `KISAK_GAME_DIR`, because the depot is
 not in this repository and the rest of the suite deliberately needs no game
@@ -318,4 +366,9 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release -- --ignored --nocapture
   found gotcha 8.**
 - `props::tests::every_shipped_map_places_its_props` — 106 maps, 104 with props,
   56,955 props placed; asserts `sp_a1_intro1`'s measured 1,080 props from 136
-  models, and prints the luminance comparison behind gotcha 2.
+  models, prints the luminance comparison behind gotcha 2, and checks that
+  **all 56,801 `.vhv` files in the game describe the model they are for**.
+  That last one is what found gotchas 3 and 4.
+- `engine::world::bench::tests::frame_cost` is not a test but a stopwatch: it
+  loads a real map and times the CPU cost of recording a frame, with no window
+  in the way. Use it before and after any change to the draw path.

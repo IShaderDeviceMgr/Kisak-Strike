@@ -176,7 +176,11 @@ pub struct Prop {
     pub skin: i32,
     /// Kept so stage 6 can fade without re-reading the lump.
     pub fade: (f32, f32, f32),
-    pub diffuse_modulation: [u8; 4],
+    /// `m_DiffuseModulation` as the draw wants it — `0..1` per channel.
+    ///
+    /// Converted at load rather than per draw: it is the same four divisions
+    /// for the same prop every frame, and there are 1,080 of them.
+    pub modulation: [f32; 4],
     /// The prop's slice of [`Props::leaves`]. Unused until visibility lands.
     pub leaves: std::ops::Range<usize>,
 }
@@ -234,7 +238,7 @@ impl Props {
                 flags: prop.flags,
                 skin: prop.skin,
                 fade: (prop.fade_min, prop.fade_max, prop.forced_fade_scale),
-                diffuse_modulation: prop.diffuse_modulation,
+                modulation: prop.diffuse_modulation.map(|c| f32::from(c) / 255.0),
                 leaves: prop.first_leaf as usize
                     ..prop.first_leaf as usize + prop.leaf_count as usize,
             })
@@ -524,6 +528,7 @@ mod tests {
         assert!(names.len() > 50, "only {} maps found", names.len());
 
         let (mut maps, mut total, mut with_props) = (0, 0usize, 0);
+        let (mut vhv_total, mut vhv_matched, mut vhv_stale) = (0usize, 0usize, 0usize);
         for name in &names {
             let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
             let props = Props::load(name, &bsp).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -540,13 +545,66 @@ mod tests {
                 assert!(prop.leaves.end <= props.leaves.len());
                 assert!(prop.model.ends_with(".mdl"), "{}", prop.model);
             }
+            // Stage 4: every prop's `.vhv` must match the model it names, in
+            // the hardware vertex order `HardwareMesh` documents. A count that
+            // disagrees is the reader being wrong about that order rather than
+            // the data being odd — `vrad` writes one file per prop and it is
+            // generated from the same `.mdl` this loads.
+            let pak = crate::filesystem::mount::pak::PakMount::new(
+                name,
+                std::sync::Arc::clone(&bsp.pak),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            vfs.set_map_pak(Some((
+                crate::filesystem::PathId::Game,
+                std::sync::Arc::new(pak),
+            )));
+            let mut cache: std::collections::HashMap<usize, Option<crate::studio::StudioModel>> =
+                std::collections::HashMap::new();
+            for (i, prop) in props.instances.iter().enumerate() {
+                if prop.flags.contains(PropFlags::NO_PER_VERTEX_LIGHTING) {
+                    continue;
+                }
+                let path = crate::studio::vhv::prop_lighting_path(i, bsp.lighting_is_hdr);
+                let Ok(bytes) = vfs.read(&path) else { continue };
+                let vhv = crate::studio::Vhv::parse(path.clone(), &bytes)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let model = cache.entry(prop.model_index).or_insert_with(|| {
+                    crate::studio::StudioModel::load(&vfs, &prop.model).ok()
+                });
+                let Some(model) = model else { continue };
+                vhv_total += 1;
+                // Not asserted: `r_ignoreStaticColorChecksum` defaults to 1 and
+                // the shipped data needs it to — `mp_coop_paint_longjump_intro`
+                // prop 26's `.vhv` carries a checksum that is not its model's,
+                // and the real game draws it lit. The *shape* is what has to
+                // agree, and that is what is checked below.
+                if vhv.checksum != model.checksum {
+                    vhv_stale += 1;
+                }
+                assert!(
+                    vhv.colors(&bytes, 0, &model.meshes, model.vertices.len())
+                        .is_some(),
+                    "{name}: {path} does not describe {} — .vhv lod 0 {:?}, model {:?}",
+                    prop.model,
+                    vhv.lod_meshes(0).map(|m| m.vertex_count).collect::<Vec<_>>(),
+                    model.meshes.iter().map(|m| m.vertices.len()).collect::<Vec<_>>(),
+                );
+                vhv_matched += 1;
+            }
+            vfs.set_map_pak(None);
+
             if name == "sp_a1_intro1" {
                 // `portdocs/STUDIO.md` §8 stage 2's acceptance measurement.
                 assert_eq!(props.instances.len(), 1080, "sp_a1_intro1 prop count");
                 assert_eq!(props.models.len(), 136, "sp_a1_intro1 distinct models");
             }
         }
-        println!("{maps} maps, {with_props} with props, {total} props placed");
+        println!(
+            "{maps} maps, {with_props} with props, {total} props placed; \
+             {vhv_matched}/{vhv_total} .vhv files match their model \
+             ({vhv_stale} with a stale checksum, used anyway)"
+        );
 
         // The decode question `light::decode` documents, measured rather than
         // argued: a lightmap luxel and an ambient cube sample are both

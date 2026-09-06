@@ -45,14 +45,17 @@ cargo test
 That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and nine
 direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam`, and
 `egui`/`egui-winit`/`egui-wgpu` (each justified in a comment in `Cargo.toml`). Release
-builds use full LTO and one codegen unit.
+builds use full LTO and one codegen unit; **debug builds optimise the dependencies**
+(`[profile.dev.package."*"] opt-level = 3`) while leaving this crate untouched, because
+almost all of a frame's CPU time is inside `wgpu` and a debug build has to be playable —
+it takes `sp_a1_intro1` from 37 ms a frame to 6.6 ms and costs nothing at the debugger.
 
 The CMake tree under `legacy/` is not part of this build and is not maintained — don't
 invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml` still
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 552 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 600 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -81,10 +84,11 @@ layout the `.vmt`'s shader declared — a model material is drawn under a synthe
 cube and one point light, which is not a real lighting environment and does not pretend to
 be.
 
-**`sp_a1_intro1` draws lit**: 5,512 of 5,638 faces, 58 of its 66 materials resolving,
-4,828 surfaces with real baked lighting over 12 atlas pages. The 8 materials that still
-draw as the magenta error checkerboard are `maps/<map>/…` cubemap patches living in the
-`.bsp`'s embedded pak lump, which the `Vfs` does not mount yet. The scene is **dimmer than
+**`sp_a1_intro1` draws lit**: 5,512 of 5,638 faces, 64 of its 66 materials resolving,
+4,846 surfaces with real baked lighting over 13 atlas pages, and **1,080 static props
+from 136 models** on top of that. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
+now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO.md`
+stage 4); 2 materials still do not, and they name shaders this port has not ported. The scene is **dimmer than
 the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
 unexposed. The view is the **player's eye**: WASD to walk, space to jump, left control to
 crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
@@ -149,9 +153,12 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   reporting, startup sequence. Mounts the filesystem, then hands off to
   `engine::window::run`.
 - **`src/filesystem/` — ported.** `Vfs` over an ordered mount list: `gameinfo.txt` ->
-  search paths, KeyValues reader, case-folded directory mounts, and VPK reading
-  (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
-  `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
+  search paths, KeyValues reader, case-folded directory mounts, VPK reading
+  (v1/v2/headerless, multi-archive, embedded chunks), and the `.bsp`'s embedded pak lump
+  (`PakMount`, a stored-entry ZIP reader) mounted **at the head** for a map's lifetime by
+  `Vfs::set_map_pak` — `AddSearchPath( <map>.bsp, "GAME", PATH_ADD_TO_HEAD )`. Deflate is
+  not implemented and that is a measurement: all 64,428 pak entries in Portal 2's 106 maps
+  are stored. Async and `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
 - **`src/materials/` — stages 1-6 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
@@ -216,8 +223,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   original and unifying them would silently reshade every prop; **a bumped model gets no
   baked vertex light at all**, which is Valve's asymmetry and not an omission; and
   **`$envmap "env_cubemap"` names no file** — it is a request for the render instance's
-  local cubemap, so those 78 materials reflect a black cube until the `.bsp`'s pak lump is
-  mounted. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
+  local cubemap, so those 78 materials reflect a black cube; the pak lump is mounted now,
+  but the per-instance cubemap lookup that would resolve them is not written. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
   hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
   `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
   Portal 2 has neither.
@@ -365,15 +372,18 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
   before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
   test is only ever reachable from the air.
-- **`src/studio/` — stages 1-3 and 5 of `portdocs/STUDIO.md`'s six ported**, and with them
-  **static props draw**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
+- **`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported**, and with them
+  **static props draw, lit the way the shipped game lights them**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
   buffer, one index buffer, per-material `Batch`es. The instances are
   `src/engine/world/props/` — the `sprp` game lump, `AngleMatrix` transforms, one upload
   per distinct model and one draw per instance, lit by the map's baked leaf ambient cubes.
   `sp_a1_intro1` now draws **1,080 props from 136 models, 224,924 triangles** on top of
-  the world's 14,546. Not done: the `.bsp` pak lump and the `.vhv` per-vertex bake
-  (stage 4), LOD selection (stage 6), `.phy` collision (that is `ENGINE_TRACE.md`'s), and
-  the local lights on a prop. `CMDLCache`'s eviction, budgets and async queues are
+  the world's 14,546, **1,062 of them wearing `vrad`'s per-vertex bake**. Stage 4 also
+  mounted the `.bsp`'s `LUMP_PAKFILE` as a search path, which is what the `.vhv` files
+  live in and **which also fixed the 8 `maps/<map>/…` cubemap materials** that used to
+  draw as checkerboards — one change, two subsystems, as predicted. Not done: LOD
+  selection (stage 6), `.phy` collision (that is `ENGINE_TRACE.md`'s), and the local
+  lights on a prop. `CMDLCache`'s eviction, budgets and async queues are
   **deleted rather than deferred**, and so are skinning, flexes and sub-d — which are
   absent from the *data*: all 968 models Portal 2 places as static props have one bone,
   trilist strips and no flex deltas. **API: `rustdocs/STUDIO.md`** — read it before
@@ -387,13 +397,37 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   only a yaw look right under any other reading and tilted ones do not; and **a leaf with
   zero ambient samples and a non-zero `first_sample` is a solid leaf whose `first_sample`
   is a *leaf* index**, which is what keeps a prop embedded in geometry lit.
+  Two more gotchas arrived with stage 4, and the first is the worst in the module:
+  **a `.vhv` is in *hardware* vertex order, not `.vvd` pool order** — Valve's runtime
+  compacts a model's vertices per LOD and bakes against that numbering, this port does
+  not compact, and reading the block as a run over the pool mislights 125 of
+  `sp_a1_intro1`'s 1,080 props **while appearing to work for the other 955**
+  (`HardwareMesh` carries the mapping); and **`vrad` writes no block for an empty mesh**,
+  so a model's empty meshes must be dropped before the lists are matched. The `.vhv`
+  checksum is **counted, not enforced**, because `r_ignoreStaticColorChecksum` defaults to
+  1 and 24 of the game's 56,801 files need it to.
   Two verifications run against the real depot behind `KISAK_GAME_DIR` and `--ignored`:
   **2,017 of the 2,041 shipped models parse** (all 1,444 flagged `STATIC_PROP`; the 16
   refusals are animated flex-delta models and are correct), and **all 106 shipped maps
-  place their props — 56,955 of them**. The first of those found two wrong `.vtx` field
-  offsets that **every synthetic test had passed**, because the fixture had been written
-  from the reader instead of from `optimize.h`; `portdocs/STUDIO.md` §11.1 has it.
+  place their props — 56,955 of them — with all 56,801 `.vhv` files describing the model
+  they are for**. The first of those found two wrong `.vtx` field offsets that **every
+  synthetic test had passed**, because the fixture had been written from the reader
+  instead of from `optimize.h`; the second found the hardware-order rule.
+  `portdocs/STUDIO.md` §11 has both.
 - **Everything else is unported** and lives in `legacy/`.
+
+**Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
+`--ignored`) loads a real map, records real passes against a real device with no window in
+the way, and times the CPU. Reach for it before and after any change to the draw path —
+the running game cannot be profiled from outside, because macOS stops delivering redraws
+to an occluded window and `sample` only ever shows a main thread parked in `mach_msg`.
+`sp_a1_intro1` records a whole frame in **about 1 ms** (release) / 6.6 ms (debug); it was
+12.7 ms when static props first drew, and `portdocs/STUDIO.md` §11.8 has what the three
+causes were. Run the three sub-benchmarks on their own — back to back they share thermal
+state and read 2x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
+**uniform writes are staged and flushed once per pass, not queued per draw**, and
+**redundant pipeline and bind-group state is elided** — the correctness hazard for the
+second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it.** `client/` stage 5
 and everything below it needs `net/` and `server/`, which is the last of the core path and
@@ -406,9 +440,8 @@ a long way from here. The candidates, in the order they are worth doing:
 - **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
   read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
   neither drawn nor collided with.
-- **`filesystem/`'s zip mount over `LUMP_PAKFILE`** (`portdocs/STUDIO.md` stage 4). One
-  change, two subsystems: it is what the `.vhv` per-prop vertex bake needs *and* what the
-  8 `maps/<map>/…` cubemap materials that draw as checkerboards are waiting for.
+- **`world/`'s 3D skybox and the displacement rendering** — the two remaining reasons
+  `sp_a1_intro1` does not look like the shipped game, now that props are lit.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.
 

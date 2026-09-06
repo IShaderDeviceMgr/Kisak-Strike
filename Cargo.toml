@@ -125,3 +125,15 @@ egui-wgpu = { version = "0.36.1", default-features = false, features = [
 [profile.release]
 lto = true
 codegen-units = 1
+
+# A debug build has to be *playable*, not just correct: it is what a porting
+# session runs to see whether a change did what it meant to.
+#
+# Almost all of a frame's CPU time is spent inside `wgpu` — validating and
+# encoding one draw call at a time — and none of it is code this port is ever
+# going to step through. Optimising the dependencies while leaving this crate
+# unoptimised and fully debuggable takes `sp_a1_intro1` from 37 ms a frame to
+# something playable (`engine::world::bench`), costs nothing at the debugger,
+# and only lengthens the first build after a `cargo clean`.
+[profile.dev.package."*"]
+opt-level = 3

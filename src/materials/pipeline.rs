@@ -522,7 +522,13 @@ impl PipelineCache {
                     // `IShaderShadow::VertexShaderVertexFormat`: the layout is
                     // the shader's declaration, not the mesh's. See
                     // `ShaderKind::vertex_layout`.
-                    buffers: &[Some(key.shader.vertex_layout().buffer_layout())],
+                    buffers: &key
+                        .shader
+                        .vertex_layout()
+                        .buffer_layouts()
+                        .iter()
+                        .map(|l| Some(l.clone()))
+                        .collect::<Vec<_>>(),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

@@ -21,6 +21,8 @@
 //!   (`gl_rsurf.cpp`). Grouping happens once, here, at load.
 
 pub mod bsp;
+#[cfg(test)]
+mod bench;
 pub mod props;
 
 use std::collections::BTreeMap;
@@ -29,7 +31,8 @@ use std::sync::Arc;
 use glam::Vec3;
 
 use crate::engine::trace::CollisionBsp;
-use crate::filesystem::Vfs;
+use crate::filesystem::mount::pak::PakMount;
+use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
 use crate::materials::lightmap::{Allocation, LightmapAtlas, LightmapPages, WHITE_PAGE};
 use crate::materials::mesh::{IndexBuffer, SimpleVertex, VertexBuffer, VertexLayout, WorldVertex};
@@ -141,6 +144,8 @@ pub struct WorldStats {
     /// Distinct models those instances name — the number of models that
     /// actually have to be loaded, which is far smaller.
     pub prop_models: usize,
+    /// Files in the map's embedded pak lump, mounted for its lifetime.
+    pub pak_files: usize,
 }
 
 /// A loaded map.
@@ -199,7 +204,28 @@ impl World {
         device: &wgpu::Device,
         name: &str,
     ) -> Result<World, WorldError> {
+        // Cleared first, so that a map that fails to load never leaves the
+        // *previous* map's embedded content mounted over the game's.
+        vfs.set_map_pak(None);
         let bsp = Bsp::load(vfs, name)?;
+
+        // Mounted before anything reads a file, because almost everything below
+        // this line can want something out of it: the `materials/maps/<map>/...`
+        // cubemap patches `vbsp` generated, a model the mapper embedded, and
+        // the per-prop `.vhv` lighting. `AddSearchPath( ..., PATH_ADD_TO_HEAD )`
+        // (`modelloader.cpp:4229`).
+        //
+        // A pak that will not parse costs the map its embedded content and
+        // nothing else - the same call in the original is not checked at all -
+        // so it is reported and stepped over rather than failing the load.
+        let mut pak_files = 0;
+        match PakMount::new(name, Arc::clone(&bsp.pak)) {
+            Ok(pak) => {
+                pak_files = pak.len();
+                vfs.set_map_pak(Some((PathId::Game, Arc::new(pak))));
+            }
+            Err(e) => eprintln!("source-engine: world: {e}"),
+        }
 
         // Materials are resolved *before* the geometry, which is a change from
         // stage 4 and is forced: how wide a lightmap block a surface reserves
@@ -293,9 +319,10 @@ impl World {
         // leaf that point is in is a walk of this tree.
         let collision = CollisionBsp::build(&bsp);
         props.light(&bsp, &collision);
+        stats.pak_files = pak_files;
         stats.props = props.instances.len();
         stats.prop_models = props.models.len();
-        let prop_models = PropModels::load(vfs, materials, device, &props);
+        let prop_models = PropModels::load(vfs, materials, device, &props, bsp.lighting_is_hdr);
 
         Ok(World {
             name: name.to_owned(),
@@ -332,7 +359,7 @@ impl World {
         self.prop_models.draw(pass, &self.props);
     }
 
-    fn draw_brushes(&self, pass: &mut Pass<'_>) {
+    pub(crate) fn draw_brushes(&self, pass: &mut Pass<'_>) {
         for batch in &self.batches {
             // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
             // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
@@ -370,6 +397,7 @@ impl World {
              {} materials ({} missing), \
              {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
              {} static props from {} models ({}); \
+             {} files in the map pak; \
              collision: {}",
             self.name,
             self.bsp_version,
@@ -392,6 +420,7 @@ impl World {
             s.props,
             s.prop_models,
             self.prop_models.summary(),
+            s.pak_files,
             self.collision.summary(),
         )
     }
@@ -444,7 +473,9 @@ impl MeshVertices {
         match layout {
             VertexLayout::Simple => MeshVertices::Simple(Vec::new()),
             VertexLayout::World => MeshVertices::World(Vec::new()),
-            VertexLayout::Model => unreachable!("model geometry is not built from a .bsp face"),
+            VertexLayout::Model | VertexLayout::StaticLight => {
+                unreachable!("model geometry is not built from a .bsp face")
+            }
         }
     }
 

@@ -91,21 +91,40 @@ pub enum VertexLayout {
     /// `VERTEX_POSITION | VERTEX_NORMAL | VERTEX_COLOR_STREAM_1` and
     /// `userDataSize` is 4 — the tangent — when the material has a `$bumpmap`.
     Model,
+
+    /// Slot 1 of [`Model`](VertexLayout::Model): the per-instance baked static
+    /// light, on its own. [`StaticLightVertex`].
+    ///
+    /// Not a layout a pipeline is ever built for — it names the *second* stream
+    /// a model pipeline takes — but a [`VertexBuffer`] records which of these
+    /// it holds, and that is what stops a geometry buffer being bound as a
+    /// lighting stream or the reverse.
+    StaticLight,
 }
 
 impl VertexLayout {
-    /// The `wgpu` description of this layout.
+    /// Every buffer a pipeline in this layout binds, in slot order.
     ///
     /// `@location` numbers match `shaders/prelude.wgsl`'s `VertexInput`; the
     /// two are one ABI and drift between them is a pipeline-creation error
     /// rather than a wrong picture, because `naga` checks that every location a
     /// shader declares is supplied.
-    pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static> {
+    ///
+    /// One buffer for every layout but [`Model`](VertexLayout::Model), which
+    /// takes a **second stream carrying only the baked static light** — see
+    /// [`StaticLightVertex`].
+    pub fn buffer_layouts(self) -> &'static [wgpu::VertexBufferLayout<'static>] {
         match self {
-            VertexLayout::Simple => SimpleVertex::LAYOUT,
-            VertexLayout::World => WorldVertex::LAYOUT,
-            VertexLayout::Model => ModelVertex::LAYOUT,
+            VertexLayout::Simple => &[SimpleVertex::LAYOUT],
+            VertexLayout::World => &[WorldVertex::LAYOUT],
+            VertexLayout::Model => &[ModelVertex::LAYOUT, StaticLightVertex::LAYOUT],
+            VertexLayout::StaticLight => &[StaticLightVertex::LAYOUT],
         }
+    }
+
+    /// Whether this layout takes a [`StaticLightVertex`] stream in slot 1.
+    pub fn takes_static_light(self) -> bool {
+        matches!(self, VertexLayout::Model)
     }
 
     /// Bytes per vertex.
@@ -114,6 +133,7 @@ impl VertexLayout {
             VertexLayout::Simple => size_of::<SimpleVertex>() as u64,
             VertexLayout::World => size_of::<WorldVertex>() as u64,
             VertexLayout::Model => size_of::<ModelVertex>() as u64,
+            VertexLayout::StaticLight => size_of::<StaticLightVertex>() as u64,
         }
     }
 }
@@ -317,26 +337,14 @@ pub struct ModelVertex {
     /// zero mirrors every bumped surface's lighting along the V axis; the
     /// `.vvd` stores ±1 and nothing else should be written here.
     pub tangent: [f32; 4],
-    /// `COLOR1`, `vStaticLight`: the light `vrad` baked for this vertex, in
-    /// **gamma space and pre-multiplied by 1/2** — the shader's first act is
-    /// `GammaToLinear( staticLightColor * cOverbright )` with `cOverbright` 2
-    /// (`common_vs_fxc.h:852`). `w` carries the fraction of that light which
-    /// came from the sun, which only the cascaded-shadow path reads.
-    ///
-    /// White is *not* the neutral value: an unlit-by-`vrad` vertex is black,
-    /// and a model with no baked lighting takes its light from the ambient cube
-    /// instead — see
-    /// [`ModelLighting`](super::uniforms::ModelLighting).
-    pub color: [f32; 4],
 }
 
 impl ModelVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x2,
         3 => Float32x4,
-        4 => Float32x4,
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -345,27 +353,85 @@ impl ModelVertex {
         attributes: &ModelVertex::ATTRIBUTES,
     };
 
-    /// A vertex with an unbaked (black) static light, a `+z` normal and a `+x`
-    /// tangent — a base to override fields of, so that adding an attribute does
-    /// not have to be echoed at every literal.
-    ///
-    /// The static light is black rather than white because that is what "no
-    /// baked lighting" means to this shader: white would be double the
-    /// brightest value `vrad` can bake, since the stream is pre-multiplied by
-    /// a half.
+    /// A vertex with a `+z` normal and a `+x` tangent — a base to override
+    /// fields of, so that adding an attribute does not have to be echoed at
+    /// every literal.
     pub const fn new(position: [f32; 3], normal: [f32; 3], texcoord: [f32; 2]) -> ModelVertex {
         ModelVertex {
             position,
             normal,
             texcoord,
             tangent: [1.0, 0.0, 0.0, 1.0],
-            color: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
 
 impl Vertex for ModelVertex {
     const LAYOUT: VertexLayout = VertexLayout::Model;
+}
+
+/// The baked static light for one vertex — slot 1 of [`VertexLayout::Model`].
+///
+/// `COLOR1` / `vStaticLight`: the light `vrad` baked for this vertex, in
+/// **gamma space and pre-multiplied by 1/2** — the shader's first act is
+/// `GammaToLinear( staticLightColor * cOverbright )` with `cOverbright` 2
+/// (`common_vs_fxc.h:852`). `w` carries the fraction of that light which came
+/// from the sun, which only the cascaded-shadow path reads.
+///
+/// White is *not* the neutral value: an unlit-by-`vrad` vertex is black, and a
+/// model with no baked lighting takes its light from the ambient cube instead —
+/// see [`ModelLighting`](super::uniforms::ModelLighting), whose `static_light`
+/// flag is what distinguishes "black because unlit" from "black because
+/// absent".
+///
+/// # Why it is a stream of its own
+///
+/// **Because it is per *instance* and the geometry is per *model*.** `vrad`
+/// bakes one colour per vertex per placed prop and writes it to a `.vhv` beside
+/// the map — 56,955 of them across Portal 2 — so a thousand copies of one
+/// crate share one vertex buffer and have a thousand different lighting
+/// streams. Folding the colour back into [`ModelVertex`] would mean uploading
+/// the whole model once per placement, which for `sp_a1_intro1` alone is 2.3
+/// million vertices instead of 284 thousand.
+///
+/// This is Valve's design too and for the same reason: `m_pColorMeshData` is a
+/// separate `IMesh` bound alongside the model's (`engine/l_studio.cpp:4290`),
+/// which is what `VERTEX_COLOR_STREAM_1` names.
+///
+/// # Why eight bits
+///
+/// Because that is what a `.vhv` holds — `m_nVertexSize` is 4 on every one of
+/// the 56,955 files in the shipped game, RGBA8 — so `Unorm8x4` is the format
+/// the data is already in, and a wider one would only pad it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct StaticLightVertex {
+    pub color: [u8; 4],
+}
+
+impl StaticLightVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![4 => Unorm8x4];
+
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: size_of::<StaticLightVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &StaticLightVertex::ATTRIBUTES,
+    };
+
+    /// No baked light — what a vertex gets when the map has no `.vhv` for its
+    /// prop.
+    pub const UNLIT: StaticLightVertex = StaticLightVertex { color: [0; 4] };
+
+    pub const fn new(color: [u8; 4]) -> StaticLightVertex {
+        StaticLightVertex { color }
+    }
+}
+
+impl Vertex for StaticLightVertex {
+    // Slot 1 of the model layout rather than a layout of its own: a
+    // `VertexBuffer` records what it is so that `Pass` can refuse a stream
+    // bound to the wrong slot, and there is no pipeline that takes this alone.
+    const LAYOUT: VertexLayout = VertexLayout::StaticLight;
 }
 
 /// Vertices that live on the GPU for longer than a frame.
@@ -417,11 +483,27 @@ impl VertexBuffer {
 
     /// The whole buffer, as something a draw can take.
     pub fn slice(&self) -> VertexSlice {
+        self.range(0, self.count)
+    }
+
+    /// A sub-range, in vertices.
+    ///
+    /// One buffer holding many models' or many instances' vertices, sliced per
+    /// draw — the same trade [`IndexBuffer::range`] makes, and what lets a
+    /// map's whole per-prop lighting live in one allocation instead of one per
+    /// prop.
+    pub fn range(&self, first: u32, count: u32) -> VertexSlice {
+        assert!(
+            first.saturating_add(count) <= self.count,
+            "vertex range {first}..{} is outside a buffer of {}",
+            first + count,
+            self.count
+        );
         VertexSlice {
             buffer: self.buffer.clone(),
             layout: self.layout,
-            offset: 0,
-            count: self.count,
+            offset: u64::from(first) * self.layout.stride(),
+            count,
         }
     }
 }
@@ -564,6 +646,11 @@ impl VertexSlice {
         let bytes = u64::from(self.count) * self.layout.stride();
         self.buffer.slice(self.offset..self.offset + bytes)
     }
+
+    /// See [`IndexSlice::identity`].
+    pub(super) fn identity(&self) -> (&wgpu::Buffer, u64, u32) {
+        (&self.buffer, self.offset, self.count)
+    }
 }
 
 /// A range of indices to draw.
@@ -593,6 +680,16 @@ impl IndexSlice {
         };
         let bytes = u64::from(self.count) * stride;
         self.buffer.slice(self.offset..self.offset + bytes)
+    }
+
+    /// What makes two slices the same binding, for the render pass's
+    /// redundant-state check. `wgpu::Buffer` compares by identity.
+    ///
+    /// Borrowed rather than cloned: this runs twice per draw, and a
+    /// `wgpu::Buffer` clone is a pair of atomics that a comparison does not
+    /// need.
+    pub(super) fn identity(&self) -> (&wgpu::Buffer, u64, u32) {
+        (&self.buffer, self.offset, self.count)
     }
 
     pub(super) fn format(&self) -> wgpu::IndexFormat {
@@ -892,7 +989,7 @@ mod tests {
     fn the_world_layout_offsets_match_the_struct() {
         let vertex = WorldVertex::new([1.0, 2.0, 3.0], [4.0, 5.0]);
         let bytes: &[u8] = bytemuck::bytes_of(&vertex);
-        let layout = VertexLayout::World.buffer_layout();
+        let layout = VertexLayout::World.buffer_layouts()[0].clone();
         let offset = |location: u32| {
             layout
                 .attributes
@@ -919,7 +1016,7 @@ mod tests {
     fn the_declared_layout_covers_the_whole_vertex() {
         // A layout whose attributes do not reach the end of the struct is not
         // an error anywhere -- it just quietly stops feeding the shader.
-        let layout = VertexLayout::Simple.buffer_layout();
+        let layout = VertexLayout::Simple.buffer_layouts()[0].clone();
         let last = layout
             .attributes
             .last()

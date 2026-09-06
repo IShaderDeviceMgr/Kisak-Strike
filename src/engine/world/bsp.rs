@@ -20,6 +20,8 @@
 //! uniform blocks) reads without a derive macro or a parser DSL. Revisit for
 //! `.mdl`, which has real internal pointers.
 
+use std::sync::Arc;
+
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
@@ -61,6 +63,7 @@ const LUMP_LEAFBRUSHES: usize = 17;
 const LUMP_BRUSHES: usize = 18;
 const LUMP_BRUSHSIDES: usize = 19;
 const LUMP_GAME_LUMP: usize = 35;
+const LUMP_PAKFILE: usize = 40;
 const LUMP_LEAF_AMBIENT_INDEX_HDR: usize = 51;
 const LUMP_LEAF_AMBIENT_INDEX: usize = 52;
 const LUMP_LEAF_AMBIENT_LIGHTING_HDR: usize = 55;
@@ -535,6 +538,15 @@ pub struct Bsp {
     pub leaf_ambient: Vec<LeafAmbientSample>,
     /// `LUMP_LEAF_AMBIENT_INDEX*` — parallel to [`leaves`](Bsp::leaves).
     pub leaf_ambient_index: Vec<LeafAmbientIndex>,
+    /// `LUMP_PAKFILE` — a whole ZIP archive of the content `vbsp` generated
+    /// for this map, still in its on-disk form.
+    ///
+    /// Read as bytes rather than parsed here because it is a *filesystem*, not
+    /// a lump: [`PakMount`](crate::filesystem::mount::pak::PakMount) turns it
+    /// into a search path and `World::load` mounts it. Shared rather than
+    /// copied, because it is the largest thing in the file — up to 54 MB on
+    /// Portal 2's biggest map — and the mount outlives this `Bsp`.
+    pub pak: Arc<[u8]>,
 }
 
 impl Bsp {
@@ -662,6 +674,7 @@ impl Bsp {
             } else {
                 LUMP_LEAF_AMBIENT_INDEX
             })?,
+            pak: Arc::from(reader.raw(LUMP_PAKFILE).unwrap_or(&[])),
             vertices: reader.records(LUMP_VERTEXES)?,
             edges: reader.records(LUMP_EDGES)?,
             surfedges: reader.records(LUMP_SURFEDGES)?,

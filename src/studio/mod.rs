@@ -64,10 +64,12 @@ mod build;
 #[cfg(test)]
 mod fixture;
 mod mdl;
+pub mod vhv;
 mod vtx;
 mod vvd;
 
 pub use mdl::{Mdl, StudioFlags};
+pub use vhv::Vhv;
 pub use vtx::Vtx;
 pub use vvd::Vvd;
 
@@ -197,6 +199,36 @@ pub struct StudioModel {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
+    /// The studio meshes of LOD 0, in file order — what a [`Vhv`]'s meshes are
+    /// matched against.
+    pub meshes: Vec<HardwareMesh>,
+}
+
+/// One studio mesh, as the *hardware* would hold it.
+///
+/// Kept beside the [`Batch`]es rather than folded into them because they answer
+/// different questions: a batch is "what to draw with which material", and this
+/// is "which vertex of the buffer is this mesh's `n`th" — the only thing that
+/// can line a `.vhv`'s per-mesh colour blocks up with the vertex buffer.
+/// Batches merge meshes that share a material and skip empty ones, so they
+/// cannot do it.
+///
+/// **This is not a range.** Valve's runtime compacts a model's vertices per LOD
+/// — `studiomeshgroup_t`'s buffer holds exactly the vertices that LOD's strips
+/// reference, in the order the `.vtx` strip-group tables list them — and a
+/// `.vhv` is written against *that* numbering, which is what "hardware verts"
+/// means. This port does not compact (it uploads the whole `.vvd` pool and
+/// indexes into it), so the two numberings differ whenever a lower LOD uses a
+/// subset of the pool: `models/props_destruction/framework_dest_01` has 9,434
+/// pool vertices and 6,703 hardware vertices at LOD 0. Treating the `.vhv` as a
+/// prefix of the pool lights 125 of `sp_a1_intro1`'s 1,080 props from the wrong
+/// vertices — and, worse, silently *appears* to work for the other 955,
+/// because a single-LOD model's table is usually the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareMesh {
+    /// Where each hardware vertex lives in [`StudioModel::vertices`], in the
+    /// order a `.vhv` block is written.
+    pub vertices: Vec<u32>,
 }
 
 impl StudioModel {
@@ -674,13 +706,23 @@ mod tests {
         assert_eq!(model.vertices[0].tangent, [1.0, 0.0, 0.0, 1.0]);
     }
 
-    /// The baked static light is black until a `.vhv` supplies it — white would
-    /// be twice the brightest value `vrad` can bake, since the stream is
-    /// pre-multiplied by a half.
+    /// A model's geometry carries no baked light at all.
+    ///
+    /// It cannot: `vrad` bakes one colour per vertex **per placement**, and a
+    /// `StudioModel` is the asset every placement shares. The light arrives as
+    /// a second vertex stream that `engine::world::props` fills per instance —
+    /// see `materials::mesh::StaticLightVertex`. This test exists so that
+    /// putting it back here fails rather than quietly lighting a thousand props
+    /// identically.
     #[test]
-    fn vertices_start_with_no_baked_light() {
+    fn a_model_carries_no_baked_light_because_it_is_per_placement() {
         let model = assemble_spec(&Spec::default()).expect("a well-formed trio");
-        assert!(model.vertices.iter().all(|v| v.color == [0.0; 4]));
+        assert_eq!(
+            size_of::<ModelVertex>(),
+            48,
+            "position, normal, texcoord and tangent — and no colour"
+        );
+        assert_eq!(model.vertices.len(), 3);
     }
 
     /// Every studio model the shipped game holds, parsed for real.

@@ -35,7 +35,7 @@
 use super::mdl::Mdl;
 use super::vtx::Vtx;
 use super::vvd::Vvd;
-use super::{Batch, StudioError, StudioModel};
+use super::{Batch, HardwareMesh, StudioError, StudioModel};
 use crate::materials::mesh::ModelVertex;
 
 pub(super) fn build(
@@ -62,12 +62,10 @@ pub(super) fn build(
                 normal: v.normal.to_array(),
                 texcoord: v.texcoord.to_array(),
                 tangent: tangent.to_array(),
-                // Black until a `.vhv` supplies the baked light, which is
-                // `ModelLighting::static_light`'s whole purpose — see
-                // `portdocs/STUDIO.md` §5.2. Black rather than white because
-                // the stream is pre-multiplied by a half, so white would be
-                // twice the brightest value `vrad` can bake.
-                color: [0.0, 0.0, 0.0, 0.0],
+                // No colour here: the baked static light is per *placement*,
+                // not per model, and lives in the second vertex stream that
+                // `engine::world::props` fills from the map's `.vhv` files.
+                // See `materials::mesh::StaticLightVertex`.
             }
         })
         .collect();
@@ -86,6 +84,7 @@ pub(super) fn build(
 
     let mut indices: Vec<u32> = Vec::new();
     let mut batches: Vec<Batch> = Vec::new();
+    let mut meshes: Vec<HardwareMesh> = Vec::new();
 
     for (bp_index, (mdl_part, vtx_part)) in
         mdl.body_parts.iter().zip(&vtx.body_parts).enumerate()
@@ -106,10 +105,21 @@ pub(super) fn build(
             for (mesh_index, (mdl_mesh, vtx_mesh)) in
                 mdl_model.meshes.iter().zip(&lod.meshes).enumerate()
             {
+                let base = mdl_model.vertex_index + mdl_mesh.vertex_offset;
+                // Recorded for **every** mesh, drawn or not, because a `.vhv`
+                // has one entry per studio mesh at this LOD and the two lists
+                // are matched positionally. Skipping the empty ones here would
+                // shift every later mesh's colours onto the wrong vertices.
+                //
+                // The `.vtx`'s strip-group vertex tables, rebased onto the
+                // pool: hardware vertex `j` of this mesh is pool vertex
+                // `base + hardware[j]`. See `HardwareMesh`.
+                meshes.push(HardwareMesh {
+                    vertices: vtx_mesh.hardware.iter().map(|&v| base + v).collect(),
+                });
                 if vtx_mesh.indices.is_empty() {
                     continue;
                 }
-                let base = mdl_model.vertex_index + mdl_mesh.vertex_offset;
                 let slot = match by_material.iter().position(|(m, _)| *m == mdl_mesh.material) {
                     Some(slot) => slot,
                     None => {
@@ -165,6 +175,7 @@ pub(super) fn build(
         vertices,
         indices,
         batches,
+        meshes,
     })
 }
 

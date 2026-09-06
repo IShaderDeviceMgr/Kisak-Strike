@@ -56,6 +56,14 @@ pub struct MaterialPreview {
     /// Which one a `-vmt` uses is decided by the `.vmt`, so the preview cannot
     /// pick at construction time and builds both — 24 vertices each.
     model_vertices: VertexBuffer,
+    /// A black static-light stream, long enough for the cube and the ground.
+    ///
+    /// Slot 1 of [`VertexLayout::Model`] has to be bound for every model draw,
+    /// and a preview cube has no `vrad` bake to put there — `preview_lighting`
+    /// leaves `static_light` off, so the shader never reads this. It exists to
+    /// satisfy the vertex layout, which is exactly the situation a static prop
+    /// with no `.vhv` is in.
+    unlit: VertexBuffer,
     indices: IndexBuffer,
     /// The ground quad's indices, uploaded once even though its vertices are
     /// rebuilt every frame — see [`MaterialPreview::draw`].
@@ -68,6 +76,11 @@ impl MaterialPreview {
         let model_vertices = model_cube();
         MaterialPreview {
             vertices: VertexBuffer::new(device, "preview cube", &vertices),
+            unlit: VertexBuffer::new(
+                device,
+                "preview static light",
+                &vec![super::mesh::StaticLightVertex::UNLIT; model_vertices.len()],
+            ),
             model_vertices: VertexBuffer::new(device, "preview model cube", &model_vertices),
             indices: IndexBuffer::new(device, "preview cube", &indices),
             ground_indices: IndexBuffer::new(device, "preview ground", &QUAD_INDICES),
@@ -115,6 +128,9 @@ impl MaterialPreview {
             // the shading visible and the cube's *ordering* checkable. See
             // `preview_lighting`.
             pass.set_model_lighting(&preview_lighting());
+            // 24 vertices, which covers the cube exactly and the four-vertex
+            // ground with room to spare.
+            pass.bind_static_light(&self.unlit.slice());
         }
         let vertices = if model_layout {
             self.model_vertices.slice()
@@ -340,6 +356,7 @@ impl RenderContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::materials::mesh::StaticLightVertex;
     use crate::filesystem::keyvalues;
     use crate::materials::context::{Load, RenderContext, StateOverride};
     use crate::materials::image_format::{ColorSpace, ImageFormat};
@@ -1274,6 +1291,31 @@ mod tests {
     }
 
     #[test]
+    fn the_preview_scene_draws_a_model_material() {
+        // `-vmt` on a `VertexLitGeneric` takes the other half of
+        // `MaterialPreview::draw` — model vertices, group 3, and slot 1's
+        // static-light stream. Nothing else here drives it, and it is a path a
+        // person runs by hand rather than one a test covers by accident, so it
+        // rots quietly: when the baked light became a second vertex buffer,
+        // this scene stopped having one to bind and `-vmt <a model material>`
+        // began panicking. The GPU is what proves it draws.
+        let mut h = harness!(true);
+        let material = h.model_material("");
+        let preview = MaterialPreview::new(&h.device);
+        let camera = preview.camera((TARGET, TARGET), 1.0);
+
+        let pixels = h.render_with(&camera, |pass| preview.draw(pass, &material));
+        let covered = (0..TARGET * TARGET)
+            .filter(|i| pixels[(*i as usize) * 4 + 3] != 0)
+            .count();
+        assert!(
+            covered > (TARGET * TARGET / 8) as usize,
+            "the model preview drew almost nothing: {covered} of {} pixels",
+            TARGET * TARGET
+        );
+    }
+
+    #[test]
     fn the_preview_scene_draws_its_ground() {
         // The cubes are checked by the winding test above; the ground quad is
         // the piece nothing else covers, and a quad wound the wrong way round
@@ -1362,12 +1404,20 @@ mod tests {
     /// Same corners and same winding as [`quad`] — the difference is only the
     /// two attributes a model vertex has. The normal is a parameter because
     /// every lighting test below is a question about it.
-    fn model_quad(normal: [f32; 3], static_light: [f32; 4]) -> ([ModelVertex; 4], [u16; 6]) {
-        let corner = |x: f32, y: f32, u: f32, v: f32| {
-            let mut vertex = ModelVertex::new([x, y, 0.0], normal, [u, v]);
-            vertex.color = static_light;
-            vertex
-        };
+    /// A model-layout quad and the **separate** baked-light stream that goes
+    /// with it.
+    ///
+    /// Two buffers rather than one because that is what the layout is: the
+    /// static light is per placement, not per model, so it lives in vertex slot
+    /// 1 (`mesh::StaticLightVertex`). `static_light` is given as floats and
+    /// quantised here, which is what the 8-bit stream does to a `.vhv` too.
+    fn model_quad(
+        normal: [f32; 3],
+        static_light: [f32; 4],
+    ) -> ([ModelVertex; 4], [StaticLightVertex; 4], [u16; 6]) {
+        let corner =
+            |x: f32, y: f32, u: f32, v: f32| ModelVertex::new([x, y, 0.0], normal, [u, v]);
+        let light = StaticLightVertex::new(static_light.map(|c| (c * 255.0).round() as u8));
         (
             [
                 corner(0.0, 0.0, 0.0, 0.0),
@@ -1375,6 +1425,7 @@ mod tests {
                 corner(1.0, 1.0, 1.0, 1.0),
                 corner(0.0, 1.0, 0.0, 1.0),
             ],
+            [light; 4],
             [0, 2, 1, 0, 3, 2],
         )
     }
@@ -1418,10 +1469,12 @@ mod tests {
             ("-z", [0.0, 0.0, -1.0]),
         ];
         for (face, (name, normal)) in axes.iter().enumerate() {
-            let (vertices, indices) = model_quad(*normal, [0.0; 4]);
+            let (vertices, light, indices) = model_quad(*normal, [0.0; 4]);
             let pixels = h.render(|pass| {
                 pass.set_model_lighting(&lighting);
-                let v = pass.vertices(&vertices);
+                let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            let v = pass.vertices(&vertices);
                 let i = pass.indices(&indices);
                 pass.draw(&material, &v, &i, Mat4::IDENTITY);
             });
@@ -1444,9 +1497,11 @@ mod tests {
         lighting.ambient_cube = [[1.0, 1.0, 1.0, 0.0]; AMBIENT_CUBE_FACES];
         lighting.ambient_light = 0;
 
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1466,9 +1521,11 @@ mod tests {
         let mut lighting = dark_lighting();
         lighting.static_light = 1;
 
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1476,9 +1533,11 @@ mod tests {
         assert_eq!(centre(&pixels), [255, 255, 255, 255]);
 
         // A quarter is `GammaToLinear( 0.5 )` = 0.5^2.2 = 0.2176.
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.25, 0.25, 0.25, 1.0]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.25, 0.25, 0.25, 1.0]);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1499,9 +1558,11 @@ mod tests {
         let material = h.model_material("");
         let lighting = dark_lighting();
 
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1517,7 +1578,7 @@ mod tests {
         // round and every point light in the game becomes unattenuated.
         let mut h = harness!(false);
         let material = h.model_material("");
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
 
         // A directional light shining along -z onto a +z-facing quad: N.L = 1,
         // no attenuation, so a half-grey light reads back as half grey.
@@ -1526,6 +1587,8 @@ mod tests {
         lighting.count = 1;
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1554,6 +1617,8 @@ mod tests {
         lighting.count = 1;
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1583,11 +1648,13 @@ mod tests {
         lighting.lights[0] = Light::directional([1.0, 1.0, 1.0], [0.0, -1.0, 0.0]);
         lighting.count = 1;
         // Normal +z, light shining along -y: perpendicular.
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
 
         let lambert = h.model_material("");
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&lambert, &v, &i, Mat4::IDENTITY);
@@ -1597,6 +1664,8 @@ mod tests {
         let half = h.model_material(r#""$halflambert" "1""#);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&half, &v, &i, Mat4::IDENTITY);
@@ -1616,7 +1685,7 @@ mod tests {
         // difference between a black model and a lit-looking one.
         let mut h = harness!(false);
         let lighting = dark_lighting();
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
 
         let material = shader_material(
             &h.device,
@@ -1629,6 +1698,8 @@ mod tests {
         );
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&material, &v, &i, Mat4::IDENTITY);
@@ -1650,11 +1721,13 @@ mod tests {
         let mut h = harness!(false);
         let mut lighting = dark_lighting();
         lighting.static_light = 1;
-        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
 
         let unbumped = h.model_material("");
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&unbumped, &v, &i, Mat4::IDENTITY);
@@ -1664,6 +1737,8 @@ mod tests {
         let bumped = h.model_material(r#""$bumpmap" "test""#);
         let pixels = h.render(|pass| {
             pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
             let v = pass.vertices(&vertices);
             let i = pass.indices(&indices);
             pass.draw(&bumped, &v, &i, Mat4::IDENTITY);
@@ -1685,7 +1760,7 @@ mod tests {
         bright.static_light = 1;
         let dark = dark_lighting();
 
-        let (left, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let (left, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
         let mut right = left;
         for vertex in &mut right {
             vertex.position[0] = vertex.position[0] * 0.5 + 0.5;
@@ -1697,6 +1772,8 @@ mod tests {
 
         let pixels = h.render(|pass| {
             let i = pass.indices(&indices);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
 
             pass.set_model_lighting(&bright);
             let v = pass.vertices(&left);
@@ -1709,5 +1786,96 @@ mod tests {
 
         assert_eq!(pixel(&pixels, TARGET / 4, TARGET / 2)[0], 255);
         assert_eq!(pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0], 0);
+    }
+
+    /// Two draws of the *same* geometry, lit by different static-light streams.
+    ///
+    /// This is the whole mechanism static props are built on: `vrad` bakes a
+    /// colour per vertex **per placement**, so a thousand copies of one model
+    /// share a vertex buffer and differ only in slot 1. If the stream were
+    /// folded back into [`ModelVertex`] this could not be expressed without a
+    /// copy of the geometry per placement, and if `Pass` failed to rebind slot
+    /// 1 between draws every prop would wear the first one's lighting.
+    #[test]
+    fn one_model_can_be_drawn_under_two_static_light_streams() {
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+
+        // One quad's geometry, drawn twice at different x, with two streams.
+        let (left, bright, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let (_, dark, _) = model_quad([0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]);
+        let mut right = left;
+        for vertex in &mut right {
+            vertex.position[0] = vertex.position[0] * 0.5 + 0.5;
+        }
+        let mut left = left;
+        for vertex in &mut left {
+            vertex.position[0] *= 0.5;
+        }
+
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let i = pass.indices(&indices);
+
+            let l = pass.vertices(&bright);
+            pass.bind_static_light(&l);
+            let v = pass.vertices(&left);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+
+            let l = pass.vertices(&dark);
+            pass.bind_static_light(&l);
+            let v = pass.vertices(&right);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(
+            pixel(&pixels, TARGET / 4, TARGET / 2)[0],
+            255,
+            "the first stream lights its quad"
+        );
+        assert_eq!(
+            pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0],
+            0,
+            "the second stream is black and the first did not leak into it"
+        );
+    }
+
+    /// A draw that returns to a material used earlier in the pass gets that
+    /// material back.
+    ///
+    /// [`Pass::draw`] skips a `set_bind_group` whose argument is already bound,
+    /// which is worth a large fraction of the frame on a map full of static
+    /// props — and which would, if the bookkeeping were wrong in the obvious
+    /// way, silently draw the third quad in the *second* material. A/B/A is the
+    /// pattern that catches it; A/B alone does not, and neither does anything
+    /// the rest of this file draws.
+    ///
+    /// The same shape covers the vertex buffer and the pipeline, because all
+    /// three change together here.
+    #[test]
+    fn a_draw_returning_to_an_earlier_material_gets_it_back() {
+        let mut h = harness!(false);
+        let red = h.material("", h.texture([255, 0, 0, 255]));
+        let green = h.material("", h.texture([0, 255, 0, 255]));
+
+        let pixels = h.render(|pass| {
+            // Three columns of the target, drawn red, green, red.
+            for (i, material) in [&red, &green, &red].into_iter().enumerate() {
+                let i = i as f32;
+                let (vertices, indices) = quad([i / 3.0, 0.0, (i + 1.0) / 3.0, 1.0], 0.0);
+                let v = pass.vertices(&vertices);
+                let idx = pass.indices(&indices);
+                pass.draw(material, &v, &idx, Mat4::IDENTITY);
+            }
+        });
+
+        let at = |i: u32| pixel(&pixels, TARGET / 6 + i * TARGET / 3, TARGET / 2);
+        assert_eq!(at(0)[0], 255, "first column is red");
+        assert_eq!(at(1)[1], 255, "second column is green");
+        assert_eq!(at(1)[0], 0, "second column is not red");
+        assert_eq!(at(2)[0], 255, "third column is red again");
+        assert_eq!(at(2)[1], 0, "third column is not green");
     }
 }

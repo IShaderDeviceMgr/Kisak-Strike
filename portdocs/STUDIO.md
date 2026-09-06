@@ -588,7 +588,7 @@ wrong, and the point is that 1,080 props appear in the right places with the rig
 materials. This is where the winding question (`rustdocs/ENGINE.md` gotcha #1) has to be
 answered a second time; `.vtx` indices are D3D-wound like the world's.
 
-### Stage 4 — the pak lump, and real per-vertex lighting — **not started**
+### Stage 4 — the pak lump, and real per-vertex lighting — **DONE**
 `filesystem/` gains a zip `Mount` over `LUMP_PAKFILE`; `vhv.rs` reads
 `sp_hdr_<i>.vhv` into the colour stream and sets `ModelLighting::static_light`. **Also
 fixes the 8 cubemap materials** that draw as checkerboards today, which is a second
@@ -721,3 +721,76 @@ flag on one material. So the checkerboard had to become two materials —
 `error_model_material` (`VertexLitGeneric`, model vertices) — from the same
 three keys, so a broken prop shows the same checkerboard a broken brush face
 does.
+
+
+### 11.6 Stage 4's real difficulty was not the ZIP
+
+The pak lump is a plain ZIP and **every one of the 64,428 entries in the shipped
+game is stored uncompressed**, so it needed no decompressor and no new
+dependency — 260 lines and done. The `.vhv` header is equally simple.
+
+What was hard is a thing neither `hardwareverts.h` nor `l_studio.cpp` says out
+loud: **a `.vhv` is written in *hardware* vertex order.** Valve's runtime
+compacts a model's vertices per LOD — `studiomeshgroup_t` holds exactly the
+vertices that LOD's strips reference, in the order the `.vtx` strip-group
+`Vertex_t` tables list them — and `vrad` bakes against that numbering. This port
+does not compact: it uploads the whole `.vvd` pool and indexes into it. The two
+numberings coincide for a single-LOD model and diverge for everything else.
+
+Read as a run over the pool, that lights **125 of `sp_a1_intro1`'s 1,080 props
+from the wrong vertices — and silently appears to work for the other 955.** It
+was caught only by checking the per-mesh vertex counts against the whole depot,
+where 125 refused to line up at all. Two smaller rules came out of the same
+check: `vrad` writes **no block for an empty mesh** (eight meshes, five blocks on
+`models/npcs/turret/turret_debris_lrg`), and **the checksum cannot be enforced**
+— `r_ignoreStaticColorChecksum` defaults to 1 and 24 of the game's 56,801 files
+need it to.
+
+`StudioModel::meshes` (`HardwareMesh`) exists for exactly this and nothing else.
+
+### 11.7 The per-placement stream forced a second vertex buffer
+
+`ModelVertex` lost its `color`, and `VertexLayout::Model` became two buffers with
+`StaticLightVertex` (`Unorm8x4`) in slot 1. That is Valve's design —
+`m_pColorMeshData` is a separate `IMesh` and `VERTEX_COLOR_STREAM_1` is what
+names it — and it is forced by arithmetic rather than by fidelity: folding the
+colour into the geometry means uploading a model once per placement, which is
+2.3 million vertices instead of 284 thousand on `sp_a1_intro1` and 59× across
+the game.
+
+`Pass::bind_static_light` is the binding, and every model draw needs one — a
+prop with no `.vhv` binds a shared black stream and clears
+`ModelLighting::static_light`.
+
+### 11.8 The frame cost, and what it cost to find
+
+Drawing 1,080 props cost **12.3 ms of CPU a frame** in a release build when
+stage 3 landed — a 78 fps ceiling before the GPU does anything, and unplayable
+in a debug build. None of it was visible from outside the process: macOS stops
+delivering redraws to an occluded window, so `sample` shows a main thread parked
+in `mach_msg`. `engine::world::bench` exists to make it measurable — a real map,
+a real device, no window — and it is the thing to reach for before and after any
+change to the draw path.
+
+Three causes, in order of size:
+
+1. **One `Queue::write_buffer` per draw.** It is not a memcpy: each call takes a
+   staging-belt chunk, maps it, and records a copy. At one per draw plus one per
+   instance for lighting, that was ~3,300 calls a frame. Now staged into a CPU
+   mirror and flushed once per arena per pass.
+2. **Redundant pipeline and bind-group state.** Every instance of a model re-set
+   the same pipeline, material and buffers. `Pass` now elides what has not
+   changed, and props draw **batch-major** so a model's state is set once per
+   batch rather than once per instance.
+3. **An O(models x instances) scan** to find each model's instances, redone every
+   frame. Precomputed at load.
+
+Result on `sp_a1_intro1`: **12.74 ms -> 0.86 ms** for the whole scene, and the
+brush path got 2.8x faster with it. Stage 4's per-instance stream brought it back
+to **1.00 ms**, which is the cost of the feature and is paid for. (Run the three
+sub-benchmarks separately: back to back they share thermal state and read about
+twice as high.)
+
+A fourth cause was not in this port's code at all: a debug build leaves `wgpu`
+unoptimised, and almost all of a frame's CPU time is inside it. `[profile.dev.package."*"] opt-level = 3`
+takes the debug frame from 37 ms to 6.6 ms and costs nothing at the debugger.
