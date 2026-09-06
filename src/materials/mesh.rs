@@ -82,6 +82,15 @@ pub enum VertexLayout {
     /// numTexCoords, 0, 0 )` (`lightmappedgeneric_dx9_helper.cpp:681`), where
     /// `numTexCoords` is 2 or, when the material has a `$bumpmap`, 3.
     World,
+
+    /// Model geometry: position, normal, one texture coordinate, a tangent,
+    /// and the baked static-lighting colour. [`ModelVertex`].
+    ///
+    /// `VertexLitGeneric`'s `VertexShaderVertexFormat( flags, 1, pDims, userDataSize )`
+    /// (`vertexlitgeneric_dx9_helper.cpp:895`), where `flags` is
+    /// `VERTEX_POSITION | VERTEX_NORMAL | VERTEX_COLOR_STREAM_1` and
+    /// `userDataSize` is 4 — the tangent — when the material has a `$bumpmap`.
+    Model,
 }
 
 impl VertexLayout {
@@ -95,6 +104,7 @@ impl VertexLayout {
         match self {
             VertexLayout::Simple => SimpleVertex::LAYOUT,
             VertexLayout::World => WorldVertex::LAYOUT,
+            VertexLayout::Model => ModelVertex::LAYOUT,
         }
     }
 
@@ -103,6 +113,7 @@ impl VertexLayout {
         match self {
             VertexLayout::Simple => size_of::<SimpleVertex>() as u64,
             VertexLayout::World => size_of::<WorldVertex>() as u64,
+            VertexLayout::Model => size_of::<ModelVertex>() as u64,
         }
     }
 }
@@ -244,6 +255,117 @@ impl WorldVertex {
 
 impl Vertex for WorldVertex {
     const LAYOUT: VertexLayout = VertexLayout::World;
+}
+
+/// Position, normal, texture coordinate, tangent, baked static light.
+/// [`VertexLayout::Model`].
+///
+/// `mstudiovertex_t` (`public/studio.h:1447`) plus the `.vvd`'s parallel
+/// tangent array — the two halves of a model vertex, which Valve stores in two
+/// arrays because `vertexFileHeader_t` has a `vertexDataStart` and a separate
+/// `tangentDataStart`.
+///
+/// # The tangent is always here, and Valve's was not
+///
+/// `VertexLitGeneric`'s shadow phase asks for `userDataSize = 4` — the tangent
+/// — **only** when the material has a `$bumpmap` or a lightwarp
+/// (`vertexlitgeneric_dx9_helper.cpp:824`), so bumped and unbumped are two
+/// vertex formats there. That is the second layout
+/// `portdocs/MATERIALSYSTEM.md` §10 predicted `LightmappedGeneric`'s envmap
+/// would force; it arrives here instead, and **this port declines it**:
+///
+/// - The data is present either way. A `.vvd`'s tangent array is not optional,
+///   so an unbumped model has a tangent on disk whether or not its shader reads
+///   one; leaving it out saves upload bandwidth and nothing else.
+/// - It is 8.9% of the materials. Of Portal 2's 801 non-phong
+///   `VertexLitGeneric` materials, 71 set a `$bumpmap`. Two layouts to save 16
+///   bytes on a vertex for the other 730 is the wrong trade when the same
+///   model can wear both.
+/// - It would cost the invariant that a layout is a function of the *shader*.
+///   [`ShaderKind::vertex_layout`](super::shader::ShaderKind::vertex_layout)
+///   takes only `self`; making it depend on a `.vmt` means
+///   [`PipelineKey`](super::pipeline::PipelineKey) grows a layout field and
+///   every caller that reasons about layouts has to carry a material.
+///
+/// The condition to revisit: a shader whose two layouts differ by more than one
+/// attribute, or a measurement showing model vertex bandwidth matters. Then the
+/// key grows the field and this splits in two.
+///
+/// # The colour is static lighting, not `$vertexcolor`
+///
+/// The shadow phase picks `VERTEX_COLOR` **or** `VERTEX_COLOR_STREAM_1`, never
+/// both (`vertexlitgeneric_dx9_helper.cpp:830`), so one colour attribute covers
+/// both — and for `VertexLitGeneric` proper the choice is already made:
+/// `bHasVertexColor` is `bVertexLitGeneric ? false : IS_FLAG_SET( MATERIAL_VAR_VERTEXCOLOR )`
+/// (`:594`), which is *unconditionally false* for this shader. `$vertexcolor`
+/// is `UnlitGeneric`'s half of the shared helper, and `UnlitGeneric` reads
+/// [`SimpleVertex`]. So this attribute always means baked static light, and the
+/// four Portal 2 materials that set `$vertexcolor` on a `VertexLitGeneric` are
+/// ignored by the shipped engine too.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct ModelVertex {
+    pub position: [f32; 3],
+    /// `NORMAL`, object space. Normalized by the vertex shader after the model
+    /// transform, as `SkinPositionAndNormal` leaves it.
+    pub normal: [f32; 3],
+    /// `TEXCOORD0`.
+    pub texcoord: [f32; 2],
+    /// `TANGENT` / `vUserData`: tangent S in `xyz`, and in `w` the **sign of
+    /// the binormal**, which the shader multiplies into `cross( normal,
+    /// tangent )` (`vertexlit_and_unlit_generic_bump_ps2x.fxc:347`). A `w` of
+    /// zero mirrors every bumped surface's lighting along the V axis; the
+    /// `.vvd` stores ±1 and nothing else should be written here.
+    pub tangent: [f32; 4],
+    /// `COLOR1`, `vStaticLight`: the light `vrad` baked for this vertex, in
+    /// **gamma space and pre-multiplied by 1/2** — the shader's first act is
+    /// `GammaToLinear( staticLightColor * cOverbright )` with `cOverbright` 2
+    /// (`common_vs_fxc.h:852`). `w` carries the fraction of that light which
+    /// came from the sun, which only the cascaded-shadow path reads.
+    ///
+    /// White is *not* the neutral value: an unlit-by-`vrad` vertex is black,
+    /// and a model with no baked lighting takes its light from the ambient cube
+    /// instead — see
+    /// [`ModelLighting`](super::uniforms::ModelLighting).
+    pub color: [f32; 4],
+}
+
+impl ModelVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x2,
+        3 => Float32x4,
+        4 => Float32x4,
+    ];
+
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: size_of::<ModelVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ModelVertex::ATTRIBUTES,
+    };
+
+    /// A vertex with an unbaked (black) static light, a `+z` normal and a `+x`
+    /// tangent — a base to override fields of, so that adding an attribute does
+    /// not have to be echoed at every literal.
+    ///
+    /// The static light is black rather than white because that is what "no
+    /// baked lighting" means to this shader: white would be double the
+    /// brightest value `vrad` can bake, since the stream is pre-multiplied by
+    /// a half.
+    pub const fn new(position: [f32; 3], normal: [f32; 3], texcoord: [f32; 2]) -> ModelVertex {
+        ModelVertex {
+            position,
+            normal,
+            texcoord,
+            tangent: [1.0, 0.0, 0.0, 1.0],
+            color: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+impl Vertex for ModelVertex {
+    const LAYOUT: VertexLayout = VertexLayout::Model;
 }
 
 /// Vertices that live on the GPU for longer than a frame.

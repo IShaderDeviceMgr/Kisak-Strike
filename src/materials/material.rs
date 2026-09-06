@@ -33,7 +33,7 @@ use crate::filesystem::{keyvalues, Vfs};
 
 use super::error::VmtError;
 use super::pipeline::{BindLayouts, PipelineCache, RenderState};
-use super::shader::{self, Lighting, ShaderKind};
+use super::shader::{self, Lighting, ShaderKind, TextureDimension};
 use super::texture::{Texture, TextureCache};
 use super::var::MaterialFlags;
 use super::vmt::Vmt;
@@ -103,36 +103,39 @@ impl Material {
         name: &str,
         vmt: &Vmt,
         fallback: &TextureFallbacks,
-        mut resolve: impl FnMut(&str, super::ColorSpace) -> Arc<Texture>,
+        mut resolve: impl FnMut(&str, super::ColorSpace, TextureDimension) -> Arc<Texture>,
     ) -> Option<Material> {
         let shader = ShaderKind::from_name(&vmt.shader)?;
 
         let mut textures = Vec::new();
         let mut entries = Vec::new();
         for request in shader::texture_requests(shader, vmt) {
-            let texture = match vmt.var(request.param).and_then(|var| var.as_str()) {
-                Some(texture_name) => resolve(texture_name, request.color_space),
+            let texture = match texture_name(vmt, request.param) {
+                Some(texture_name) => resolve(texture_name, request.color_space, request.dimension),
                 // An *undefined* texture parameter is not a failure and must
                 // not draw as one: a `.vmt` with no `$basetexture` is a legal
                 // material whose colour comes from `$color` and the vertex
                 // stream, and every shader binds the standard white texture for
                 // it (`vertexlitgeneric_dx9_helper.cpp:1255`). Valve's own
                 // `___flat.vmt` is one.
-                None => Arc::clone(&fallback.white),
+                None => Arc::clone(fallback.unset(request.dimension)),
             };
-            // The bind group layout declares a 2D texture. A cubemap bound
-            // there is a validation error rather than a wrong picture, so it
-            // gets the same treatment a broken one does.
-            let texture = if texture.view_dimension == wgpu::TextureViewDimension::D2 {
+            // A bind group layout names a view dimension, so binding a cubemap
+            // where the shader declared a 2D texture — or the reverse — is a
+            // `wgpu` validation error rather than a wrong picture. It gets the
+            // same treatment a broken texture does, in the shape the layout
+            // wants.
+            let texture = if texture.view_dimension == request.dimension.view_dimension() {
                 texture
             } else {
                 eprintln!(
-                    "source-engine: materials: {name}: {} is a {:?} texture, which {} cannot sample",
+                    "source-engine: materials: {name}: {} is a {:?} texture, which {} samples as {:?}",
                     request.param,
                     texture.view_dimension,
-                    shader.name()
+                    shader.name(),
+                    request.dimension.view_dimension(),
                 );
-                Arc::clone(&fallback.error)
+                Arc::clone(fallback.broken(request.dimension))
             };
             textures.push((request, texture));
         }
@@ -144,6 +147,10 @@ impl Material {
             }
             ShaderKind::LightmappedGeneric => {
                 let block = shader::lightmapped_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
+            ShaderKind::VertexLitGeneric => {
+                let block = shader::vertex_lit_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
         };
@@ -195,6 +202,49 @@ impl Material {
 pub struct TextureFallbacks {
     pub white: Arc<Texture>,
     pub error: Arc<Texture>,
+    /// The cube-shaped substitute for both cases. There is no "error cubemap"
+    /// in the original and there is no useful one to invent: a checkerboard
+    /// reflection reads as a broken *world*, not a broken material, so an
+    /// unresolvable `$envmap` gets the same black cube an unset one does and
+    /// the failure is reported on stderr instead. See
+    /// [`Texture::black_cube`](super::texture::Texture::black_cube).
+    pub black_cube: Arc<Texture>,
+}
+
+impl TextureFallbacks {
+    /// What a parameter nobody set binds, in the shape the layout wants.
+    fn unset(&self, dimension: TextureDimension) -> &Arc<Texture> {
+        match dimension {
+            TextureDimension::D2 => &self.white,
+            TextureDimension::Cube => &self.black_cube,
+        }
+    }
+
+    /// What a parameter that was set and could not be honoured binds.
+    fn broken(&self, dimension: TextureDimension) -> &Arc<Texture> {
+        match dimension {
+            TextureDimension::D2 => &self.error,
+            TextureDimension::Cube => &self.black_cube,
+        }
+    }
+}
+
+/// The texture name a parameter resolves to, if it names one that can be
+/// loaded.
+///
+/// One special case, and it is not a quirk of this port:
+/// **`$envmap "env_cubemap"` names no file.** `CShaderSystem::LoadCubeMap`
+/// (`shadersystem.cpp:1840`) sets the var to `(ITexture *)-1` and flags the
+/// material `MATERIAL_VAR2_USES_ENV_CUBEMAP`; the cubemap then arrives per
+/// draw from the render instance, because which one a model reflects depends
+/// on where it is standing. See
+/// [`envmap_name`](super::shader::envmap_name) for the full note and the
+/// condition that makes it real render-context state.
+fn texture_name<'a>(vmt: &'a Vmt, param: &str) -> Option<&'a str> {
+    if param.eq_ignore_ascii_case("$envmap") {
+        return shader::envmap_name(vmt);
+    }
+    vmt.var(param).and_then(|var| var.as_str())
 }
 
 fn create_uniform_buffer(
@@ -241,6 +291,7 @@ impl MaterialCache {
         let fallback = TextureFallbacks {
             white: textures.white_texture(),
             error: textures.error_texture(),
+            black_cube: textures.black_cube_texture(),
         };
         let document = keyvalues::parse(ERROR_MATERIAL_NAME, ERROR_MATERIAL)
             .expect("the error material is a literal in this file");
@@ -256,7 +307,7 @@ impl MaterialCache {
             ERROR_MATERIAL_NAME,
             &vmt,
             &fallback,
-            |_, _| Arc::clone(&fallback.error),
+            |_, _, _| Arc::clone(&fallback.error),
         )
         .expect("the error material's shader is ported");
 
@@ -344,7 +395,20 @@ impl MaterialCache {
         let fallback = TextureFallbacks {
             white: textures.white_texture(),
             error: textures.error_texture(),
+            black_cube: textures.black_cube_texture(),
         };
+
+        // Said once, at load, because it is otherwise invisible: a fifth of
+        // Portal 2's models name a shader that this port draws with the wrong
+        // one. See `shader::wants_phong`.
+        if ShaderKind::from_name(&vmt.shader) == Some(ShaderKind::VertexLitGeneric)
+            && shader::wants_phong(&vmt)
+        {
+            eprintln!(
+                "source-engine: materials: {name}: $phong asks for the Phong shader, \
+                 which is not ported; drawing as VertexLitGeneric without specular"
+            );
+        }
 
         Material::new(
             device,
@@ -353,7 +417,12 @@ impl MaterialCache {
             name,
             &vmt,
             &fallback,
-            |texture_name, color_space| textures.load(vfs, texture_name, color_space),
+            |texture_name, color_space, dimension| match dimension {
+                // A cubemap goes through the HDR-name rule; a 2D texture has
+                // none. See `TextureCache::load_cubemap`.
+                TextureDimension::Cube => textures.load_cubemap(vfs, texture_name, color_space),
+                TextureDimension::D2 => textures.load(vfs, texture_name, color_space),
+            },
         )
         .ok_or_else(|| VmtError::UnknownShader {
             name: name.to_owned(),

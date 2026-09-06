@@ -51,7 +51,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 529 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 552 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -72,7 +72,13 @@ To see it work you need a directory containing a mod directory with a `gameinfo.
 ```
 cargo run --release -- -basedir /path/to/game -game portal2 -window +map sp_a1_intro1
 cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
+cargo run -- -basedir /path/to/game -game portal2 -window -vmt models/props/box_dropper
 ```
+
+`-vmt` previews any of the three ported shaders on a pair of cubes, in whichever vertex
+layout the `.vmt`'s shader declared — a model material is drawn under a synthetic ambient
+cube and one point light, which is not a real lighting environment and does not pretend to
+be.
 
 **`sp_a1_intro1` draws lit**: 5,512 of 5,638 faces, 58 of its 66 materials resolving,
 4,828 surfaces with real baked lighting over 12 atlas pages. The 8 materials that still
@@ -146,7 +152,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (v1/v2/headerless, multi-archive, embedded chunks). Async, `.bsp` pak lumps and
   `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-5 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-6 of 8 ported.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
@@ -187,13 +193,40 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   system**: `egui` owns its own pipeline, font atlas and vertex format, and it lives in
   `materials/` only because `Frame::parts` is `pub(super)` and opening a pass belongs on
   this side of that boundary.
-  Stages 6-8 (the rest of the shader set, paint maps, GPU morph) are not started. Still
-  settled for those: the shaders are **rewritten in WGSL** from the `.fxc` HLSL in
-  `stdshaders/`, and Valve's static/dynamic shader-combo system is deleted with them —
-  two shaders in, neither needed a source-text variant, so §10's "how are variants
-  expressed" question is still open and still unforced. **`LightmappedGeneric` was
-  expected to force it and did not**: bumped and unbumped share one vertex layout, because
-  the bumped diffuse path never leaves tangent space.
+  **Stage 6 is `VertexLitGeneric`, and it is done** — the shader every model wears, and
+  the largest in the shipped game: 1,108 of Portal 2's 3,431 materials name it, 1,012 of
+  them under `materials/models/`. Landed as `ShaderKind::VertexLitGeneric` with
+  `shaders/vertexlitgeneric.wgsl`, `mesh::ModelVertex`, `uniforms::{Light, ModelLighting}`
+  — the ambient cube and up to four local lights that `R_StudioSetupLighting` fills — a
+  second shape for bind group 3, and the cubemap half of the texture path. **All 1,108 of
+  those materials load and build a pipeline against the real game**; the whole set needs
+  15 pipelines, which answers §10's "how many variants survive" with a measurement. The
+  rest of §7.8's shader set and stages 7-8 (paint maps, GPU morph) are not started.
+
+  Five things about it that a reader will otherwise rediscover the hard way:
+  **a `.vmt` naming `VertexLitGeneric` does not always reach it** — `WantsPhongShader`
+  sends 317 of the 1,108 to `DrawPhong_DX9`, a separate §7.8 shader that is not ported, so
+  they draw without specular and say so once at load; **group 3 is now "where this
+  shader's lighting comes from"**, a lightmap page for brushes or a `ModelLighting` block
+  for models, so `reads_lightmap()` became `lighting_binding()`; **the unbumped path
+  lights per vertex and the bumped path per pixel**, because they are two files in the
+  original and unifying them would silently reshade every prop; **a bumped model gets no
+  baked vertex light at all**, which is Valve's asymmetry and not an omission; and
+  **`$envmap "env_cubemap"` names no file** — it is a request for the render instance's
+  local cubemap, so those 78 materials reflect a black cube until the `.bsp`'s pak lump is
+  mounted. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
+  hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
+  `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
+  Portal 2 has neither.
+
+  §10's "how are variants expressed" question is **closed**: three shaders in, none needed
+  a source-text variant — `VertexLitGeneric` merges two Valve *files* into one module with
+  a uniform branch — so the prelude is prepended by string concatenation and `naga_oil`,
+  `override` constants and a build-time preprocessor are all declined on evidence.
+  **`LightmappedGeneric` was expected to force the second vertex layout and did not**
+  (bumped and unbumped share one, because the bumped diffuse path never leaves tangent
+  space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
+  one, because the tangent is in the `.vvd` either way.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
   lightmaps, `trace/` (stage 1 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
   stages, complete)**
@@ -342,8 +375,11 @@ a long way from here. The candidates, in the order they are worth doing:
 - **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
   read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
   neither drawn nor collided with.
-- **`materialsystem` stage 6** (`VertexLitGeneric` and the rest of the shader set). A
-  breadth move: unblocked, needed by every model, not on the boot path.
+- **`studiorender` / `src/engine/`'s static props.** `materialsystem` stage 6 has landed,
+  so the material-system half of a static prop is built and waiting: `VertexLitGeneric`,
+  `ModelVertex` and the `ModelLighting` block. What is missing is a `.mdl`/`.vvd`/`.vtx`
+  reader, the `.bsp`'s `sprp` game lump, and `R_StudioSetupLighting` to fill that block —
+  none of which is in `materials/`.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.
 

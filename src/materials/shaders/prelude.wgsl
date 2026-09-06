@@ -8,8 +8,13 @@
 //
 //   skinning + morph (`SkinPosition`, `ApplyMorph`)  -> with studiorender
 //   flashlight + shadow filtering                    -> with the flashlight
-//   parallax, lightwarp, phong                       -> with VertexLitGeneric
-//   the bumped-lightmap basis                        -> with LightmappedGeneric
+//   parallax, lightwarp, phong, rim lighting         -> with the Phong shader
+//
+// Two things that could live here and deliberately do not: the bumped-lightmap
+// basis is here (`BUMP_BASIS`) but its *sampling* is `LightmappedGeneric`'s,
+// and the ambient cube and local lights are `VertexLitGeneric`'s outright.
+// Anything that reads a bind group belongs to the shader that declares it,
+// and group 3 is declared per shader -- see `shader::LightingBinding`.
 //
 // Two conventions are set here and inherited by everything later, and both
 // produce a plausible-looking wrong picture rather than an error when broken:
@@ -191,4 +196,171 @@ fn clip_position(world: vec3<f32>) -> vec4<f32> {
 fn transform_texcoord(uv: vec2<f32>, row0: vec4<f32>, row1: vec4<f32>) -> vec2<f32> {
     let expanded = vec4<f32>(uv, 0.0, 1.0);
     return vec2<f32>(dot(expanded, row0), dot(expanded, row1));
+}
+
+// `mesh::ModelVertex` / `VertexLayout::Model`: what a `.vvd`'s vertex and
+// tangent arrays hold, minus the bone weights that skinning will add.
+//
+// `color` is COLOR1, `vStaticLight` — the light `vrad` baked per vertex, in
+// gamma space and pre-multiplied by 1/2. It is *not* a vertex colour: the
+// shadow phase picks `VERTEX_COLOR` or `VERTEX_COLOR_STREAM_1` and never both,
+// and for this shader the choice is always the second
+// (`vertexlitgeneric_dx9_helper.cpp:594`).
+
+struct ModelVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) texcoord: vec2<f32>,
+    // xyz = tangent S, w = the sign of the binormal.
+    @location(3) tangent: vec4<f32>,
+    @location(4) color: vec4<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// Colour space and shading maths
+// ---------------------------------------------------------------------------
+// `common_fxc.h`'s helpers, ported as the shaders that call them arrive.
+
+// `cOverbright` (`common_vs_fxc.h:63`). Source stores baked lighting divided by
+// two so that a light brighter than white survives an 8-bit channel; every
+// reader multiplies it back before using it.
+const OVERBRIGHT: f32 = 2.0;
+
+// `GammaToLinear` (`common_fxc.h:266`). Note this is a plain 2.2 power, *not*
+// the sRGB piecewise curve `SrgbGammaToLinear` next to it: Valve uses the
+// simple one for vertex-stream colours and the piecewise one for texture reads,
+// and the two disagree by up to 5% in the darks. Which one a value wants is
+// decided by which one it was authored against, so this is not a place to
+// "improve" on the reference.
+fn gamma_to_linear(gamma: vec3<f32>) -> vec3<f32> {
+    return pow(max(gamma, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
+// `Luminance` (NTSC weights, as every `.fxc` in the tree spells it inline).
+fn luminance(color: vec3<f32>) -> f32 {
+    return dot(color, vec3<f32>(0.2125, 0.7154, 0.0721));
+}
+
+// `Vec3TangentToWorld` (`common_fxc.h:520`). Deliberately not normalized, as
+// the name in the original says: callers that need a unit vector say so.
+fn vec3_tangent_to_world(
+    tangent_vector: vec3<f32>,
+    world_normal: vec3<f32>,
+    world_tangent: vec3<f32>,
+    world_binormal: vec3<f32>,
+) -> vec3<f32> {
+    return tangent_vector.x * world_tangent
+        + tangent_vector.y * world_binormal
+        + tangent_vector.z * world_normal;
+}
+
+// `CalcReflectionVectorUnnormalized` (`common_fxc.h:127`).
+//
+// `2 * (N·V) * N - (N·N) * V`, which is the ordinary reflection formula scaled
+// through by `N·N`. The scale is deliberate and free: the result only ever
+// indexes a cubemap, and a cubemap lookup does not care about magnitude — so
+// this saves the normalize that the textbook form would need.
+fn calc_reflection_vector_unnormalized(normal: vec3<f32>, eye_vector: vec3<f32>) -> vec3<f32> {
+    return 2.0 * dot(normal, eye_vector) * normal - dot(normal, normal) * eye_vector;
+}
+
+// `Fresnel` (`common_vertexlitgeneric_dx9.h:180`): `(1 - N·V)²`.
+fn fresnel(normal: vec3<f32>, eye_dir: vec3<f32>) -> f32 {
+    let f = 1.0 - saturate(dot(normal, eye_dir));
+    return f * f;
+}
+
+// ---------------------------------------------------------------------------
+// Detail texturing
+// ---------------------------------------------------------------------------
+// `TextureCombine` / `TextureCombinePostLighting` (`common_ps_fxc.h:770,818`).
+// Valve's `combine_mode` is a compile-time `int` from a static combo and a
+// chain of thirteen `if`s that the compiler folds to one; here it is a uniform
+// and the chain is a `switch`, which is §7.3's bucket 2 for an axis with more
+// than two values.
+//
+// `shader::detail_blend`'s constants, which are what a `.vmt` writes in
+// `$detailblendmode`.
+
+const TCOMBINE_MOD2X: i32 = 0;
+const TCOMBINE_RGB_ADDITIVE: i32 = 1;
+const TCOMBINE_DETAIL_OVER_BASE: i32 = 2;
+const TCOMBINE_FADE: i32 = 3;
+const TCOMBINE_BASE_OVER_DETAIL: i32 = 4;
+const TCOMBINE_RGB_ADDITIVE_SELFILLUM: i32 = 5;
+const TCOMBINE_RGB_ADDITIVE_SELFILLUM_THRESHOLD_FADE: i32 = 6;
+const TCOMBINE_MOD2X_SELECT_TWO_PATTERNS: i32 = 7;
+const TCOMBINE_MULTIPLY: i32 = 8;
+const TCOMBINE_MASK_BASE_BY_DETAIL_ALPHA: i32 = 9;
+const TCOMBINE_SSBUMP_BUMP: i32 = 10;
+const TCOMBINE_SSBUMP_NOBUMP: i32 = 11;
+const TCOMBINE_NONE: i32 = 12;
+
+fn texture_combine(
+    base: vec4<f32>,
+    detail: vec4<f32>,
+    mode: i32,
+    blend: f32,
+) -> vec4<f32> {
+    var result = base;
+    switch mode {
+        case 7: {
+            // Base alpha selects between the detail's red and alpha channels,
+            // which is how one texture holds two mod2x patterns.
+            let dc = vec3<f32>(mix(detail.r, detail.a, base.a));
+            result = vec4<f32>(base.rgb * mix(vec3<f32>(1.0), 2.0 * dc, blend), base.a);
+        }
+        case 0: {
+            result = vec4<f32>(base.rgb * mix(vec3<f32>(1.0), 2.0 * detail.rgb, blend), base.a);
+        }
+        case 1: {
+            result = vec4<f32>(base.rgb + blend * detail.rgb, base.a);
+        }
+        case 2: {
+            result = vec4<f32>(mix(base.rgb, detail.rgb, blend * detail.a), base.a);
+        }
+        case 3: {
+            result = mix(base, detail, blend);
+        }
+        case 4: {
+            result = vec4<f32>(mix(base.rgb, detail.rgb, blend * (1.0 - base.a)), detail.a);
+        }
+        case 8: {
+            result = mix(base, base * detail, blend);
+        }
+        case 9: {
+            result = vec4<f32>(base.rgb, mix(base.a, base.a * detail.a, blend));
+        }
+        case 11: {
+            // `dot( detail.rgb, 2/3 )` in the original, which is a dot against
+            // a scalar broadcast to a float3 — the sum of the channels times
+            // two thirds.
+            result = vec4<f32>(base.rgb * dot(detail.rgb, vec3<f32>(2.0 / 3.0)), base.a);
+        }
+        // 5 and 6 are applied after lighting, 10 needs a self-shadowing bump
+        // map, and 12 is "no detail texture at all".
+        default: {}
+    }
+    return result;
+}
+
+fn texture_combine_post_lighting(
+    lit_base: vec3<f32>,
+    detail: vec4<f32>,
+    mode: i32,
+    blend: f32,
+) -> vec3<f32> {
+    if mode == TCOMBINE_RGB_ADDITIVE_SELFILLUM {
+        return lit_base + blend * detail.rgb;
+    }
+    if mode == TCOMBINE_RGB_ADDITIVE_SELFILLUM_THRESHOLD_FADE {
+        // "fade in an unusual way - instead of fading out color, remap an
+        // increasing band of it from 0..1".
+        if blend > 0.5 {
+            return lit_base
+                + min(vec3<f32>(1.0), (1.0 / blend) * max(vec3<f32>(0.0), detail.rgb - (1.0 - blend)));
+        }
+        return lit_base + 2.0 * blend * 2.0 * max(vec3<f32>(0.0), detail.rgb - 0.5);
+    }
+    return lit_base;
 }

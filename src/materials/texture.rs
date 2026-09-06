@@ -325,6 +325,71 @@ impl Texture {
         Texture::procedural(device, queue, "white", 1, &[255, 255, 255, 255], sampler)
     }
 
+    /// The 1x1x6 black cubemap an undefined `$envmap` binds.
+    ///
+    /// `TEXTURE_BLACK`'s role for the cube samplers: a bind group layout that
+    /// declares a cube view has to have *something* in it, and black is the
+    /// value that makes the reflection term contribute nothing — so a material
+    /// whose `$envmap` could not be resolved draws exactly as one with no
+    /// `$envmap`, rather than as one reflecting a checkerboard.
+    ///
+    /// This is also what `env_cubemap` resolves to until the `.bsp`'s embedded
+    /// cubemaps are readable; see
+    /// [`envmap_name`](super::shader::envmap_name).
+    pub fn black_cube(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sampler: wgpu::Sampler,
+    ) -> Texture {
+        const FACES: u32 = 6;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("black cube"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: FACES,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &[0u8; (4 * FACES) as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: FACES,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..wgpu::TextureViewDescriptor::default()
+        });
+        Texture {
+            name: "black cube".to_string(),
+            width: 1,
+            height: 1,
+            depth: 1,
+            mip_count: 1,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            view_dimension: wgpu::TextureViewDimension::Cube,
+            frame: 0,
+            translucent: false,
+            texture,
+            view,
+            sampler,
+        }
+    }
+
     /// A texture the GPU writes by drawing into it.
     ///
     /// `CTexture::InitRenderTarget` (`ctexture.cpp:1130`), reduced to what it
@@ -652,6 +717,7 @@ pub struct TextureCache {
     samplers: HashMap<SamplerKey, wgpu::Sampler>,
     error: Arc<Texture>,
     white: Arc<Texture>,
+    black_cube: Arc<Texture>,
 }
 
 impl TextureCache {
@@ -660,7 +726,8 @@ impl TextureCache {
         let mut samplers = HashMap::new();
         let sampler = sampler_for(device, &mut samplers, SamplerKey::simple());
         let error = Arc::new(Texture::error(device, queue, sampler.clone()));
-        let white = Arc::new(Texture::white(device, queue, sampler));
+        let white = Arc::new(Texture::white(device, queue, sampler.clone()));
+        let black_cube = Arc::new(Texture::black_cube(device, queue, sampler));
 
         TextureCache {
             device: device.clone(),
@@ -669,6 +736,7 @@ impl TextureCache {
             samplers,
             error,
             white,
+            black_cube,
         }
     }
 
@@ -683,6 +751,39 @@ impl TextureCache {
     /// a failed one. See [`Texture::white`].
     pub fn white_texture(&self) -> Arc<Texture> {
         Arc::clone(&self.white)
+    }
+
+    /// The 1x1x6 black cubemap. What an undefined or unresolvable `$envmap`
+    /// binds — see [`Texture::black_cube`].
+    pub fn black_cube_texture(&self) -> Arc<Texture> {
+        Arc::clone(&self.black_cube)
+    }
+
+    /// Loads a cubemap, trying the HDR name first.
+    ///
+    /// `CShaderSystem::LoadCubeMap` (`shadersystem.cpp:1855`) appends `.hdr`
+    /// to the name whenever `GetHDRType() != HDR_TYPE_NONE`, and
+    /// `CTexture::LoadTextureBitsFromFile` (`ctexture.cpp:3882`) strips it
+    /// again when that file is not on disk — so `$envmap "metal/foo"` means
+    /// `materials/metal/foo.hdr.vtf` **or** `materials/metal/foo.vtf`, in that
+    /// order, and never a failure of the first.
+    ///
+    /// Portal 2 ships exactly one `.hdr.vtf`, so this rule is invisible on
+    /// 3,430 of its 3,431 materials and loads the wrong file for the last one
+    /// if dropped. That asymmetry is why it lives here rather than at a call
+    /// site: an ordinary `load` for a cubemap is a silent, rare bug.
+    ///
+    /// The HDR name is *probed*, not attempted-and-recovered, because
+    /// [`load`](TextureCache::load) cannot report failure — it answers a
+    /// missing texture with the checkerboard, which is the right answer for a
+    /// caller and the wrong one for a fallback chain.
+    pub fn load_cubemap(&mut self, vfs: &Vfs, name: &str, color_space: ColorSpace) -> Arc<Texture> {
+        let hdr = format!("{name}.hdr");
+        let path = format!("{TEXTURE_DIR}{}{TEXTURE_EXT}", normalize_name(&hdr));
+        if vfs.exists(&path) {
+            return self.load(vfs, &hdr, color_space);
+        }
+        self.load(vfs, name, color_space)
     }
 
     /// Loads `materials/<name>.vtf`, or returns the error checkerboard.
@@ -758,18 +859,43 @@ fn sampler_for(
 
 /// The dictionary key for a texture name.
 ///
+/// **Content leaves extensions on, and Valve strips them.**
+/// `NormalizeTextureName` (`materialsystem/itextureinternal.h:155`) lowercases,
+/// forward-slashes and drops any extension that is not `.hdr` — so a `.vmt`
+/// that says `$basetexture "models/props/tripwire_turret.vtf"` finds
+/// `materials/models/props/tripwire_turret.vtf` rather than looking for
+/// `...vtf.vtf` and failing. Four Portal 2 materials depend on it, two with a
+/// stray `.vtf` and two with a stray `.tga`; without it they draw as the error
+/// checkerboard while the shipped game draws them correctly.
+///
 /// `CTexture::Init` lowercases and forward-slashes the name before storing it,
 /// so `Metal\Wall` and `metal/wall` are one texture rather than two. The
 /// filesystem is case-insensitive on its own (see `rustdocs/FILESYSTEM.md`), so
 /// this exists for the *cache*, not for the lookup.
 fn normalize_name(name: &str) -> String {
-    name.trim_matches(['/', '\\'])
+    let name: String = name
+        .trim_matches(['/', '\\'])
         .chars()
         .map(|c| match c {
             '\\' => '/',
             c => c.to_ascii_lowercase(),
         })
-        .collect()
+        .collect();
+
+    // `.hdr` survives, everything else goes. Both halves are load-bearing:
+    // `LoadCubeMap` builds an HDR name by *appending* `.hdr`
+    // (`shadersystem.cpp:1855`), so stripping it would undo the lookup this
+    // module's `load_cubemap` depends on.
+    if name.ends_with(".hdr") {
+        return name;
+    }
+    // `Q_StripExtension` (`tier1/strtools.cpp:1772`) scans back for a `.` *or*
+    // a path separator and gives up on the separator, so only the last
+    // component's extension is stripped: `props/pipe.001/base` keeps its name.
+    match (name.rfind('.'), name.rfind('/')) {
+        (Some(dot), slash) if slash.is_none_or(|slash| dot > slash) => name[..dot].to_owned(),
+        _ => name,
+    }
 }
 
 #[cfg(test)]
@@ -788,6 +914,21 @@ mod tests {
         assert_eq!(normalize_name("Metal\\Wall01"), "metal/wall01");
         assert_eq!(normalize_name("/metal/wall01"), "metal/wall01");
         assert_eq!(normalize_name("metal/wall01"), "metal/wall01");
+
+        // `NormalizeTextureName` strips an extension content left on, which
+        // four Portal 2 materials rely on.
+        assert_eq!(
+            normalize_name("models/props/tripwire_turret.vtf"),
+            "models/props/tripwire_turret"
+        );
+        assert_eq!(normalize_name("props/thing.tga"), "props/thing");
+        // ... except `.hdr`, which is a name a cubemap lookup *builds*.
+        assert_eq!(
+            normalize_name("cubemaps/cubemap_cave01.hdr"),
+            "cubemaps/cubemap_cave01.hdr"
+        );
+        // And only in the last component, as `Q_StripExtension` does.
+        assert_eq!(normalize_name("props/pipe.001/base"), "props/pipe.001/base");
     }
 
     #[test]

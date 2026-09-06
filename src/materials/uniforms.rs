@@ -226,6 +226,225 @@ impl DrawUniforms {
     }
 }
 
+/// How many local lights a draw can carry. `MaxNumLights()` on the PC path.
+///
+/// Valve's registers hold four (`LightInfo cLightInfo[4] : register(c27)`,
+/// `common_vs_fxc.h:126`) and `CompilePixelShaderLocalLights` packs a fourth
+/// into the `w` components of the first three because SM3 pixel shaders ran out
+/// of registers. There is no register pressure here, so the fourth light is an
+/// ordinary array element and that packing is deleted.
+pub const MAX_LIGHTS: usize = 4;
+
+/// The six directions an ambient cube samples: `+x, -x, +y, -y, +z, -z`.
+pub const AMBIENT_CUBE_FACES: usize = 6;
+
+/// One local light, as the shader reads it.
+///
+/// `LightInfo` (`common_vs_fxc.h:113`), five `float4`s, filled by
+/// `CShaderAPIDx8::CompileVertexShaderLocalLights` (`shaderapidx8.cpp:14020`).
+/// The layout is transcribed from there rather than from the struct, because
+/// two of the fields are *type tags smuggled into `w` components* and the
+/// struct does not say so.
+///
+/// # The light type lives in two `w` components
+///
+/// Valve's own note (`common_vs_fxc.h:119`): "1x - directional, 01 - spot,
+/// 00 - point". There is no type enum in the constant block — the shader
+/// selects behaviour with two `lerp`s on [`color`](Light::color)`.w` and
+/// [`direction`](Light::direction)`.w`, which is what a shader model with no
+/// branches had instead of an `if`. Build one with [`Light::point`],
+/// [`Light::spot`] or [`Light::directional`] rather than filling the fields.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct Light {
+    /// Linear RGB, and in `w` **1 for a directional light**, 0 otherwise.
+    /// A directional light skips attenuation entirely.
+    pub color: [f32; 4],
+    /// The direction the light points, and in `w` **1 for a spot light**,
+    /// 0 otherwise. A point light's direction is written as zero, exactly as
+    /// `CompileVertexShaderLocalLights` writes it.
+    pub direction: [f32; 4],
+    /// World-space position, `w` 1. Unused by a directional light.
+    pub position: [f32; 4],
+    /// `(falloff, thetaDot, phiDot, 1/(thetaDot - phiDot))` for a spot light,
+    /// and `(0, 1, 1, 1)` for anything else — which is not "unused" but the
+    /// value that makes the spot term fold to 1.
+    pub spot: [f32; 4],
+    /// `(constant, linear, quadratic, 0)`. The attenuation denominator is
+    /// `constant + linear * d + quadratic * d²`, so all-zero is a division by
+    /// zero rather than "no attenuation": [`Light::NONE`] uses a constant of 1.
+    pub attenuation: [f32; 4],
+}
+
+impl Light {
+    /// A light contributing nothing, for the array slots past
+    /// [`ModelLighting::count`].
+    ///
+    /// `s_pTwoEmptyLights` (`shaderapidx8.cpp:14146`) is this: a black colour,
+    /// a spot-shaped falloff that folds to 1, and a constant attenuation of 1
+    /// so that nothing divides by zero. The colour is what makes it dark; the
+    /// rest is what makes it *finite*, and the shader still evaluates it.
+    pub const NONE: Light = Light {
+        color: [0.0, 0.0, 0.0, 0.0],
+        direction: [1.0, 0.0, 0.0, 0.0],
+        position: [0.0, 0.0, 0.0, 0.0],
+        spot: [1.0, 1.0, 1.0, 1.0],
+        attenuation: [1.0, 1.0, 1.0, 1.0],
+    };
+
+    /// A point light: attenuated by distance, lighting in every direction.
+    pub fn point(color: [f32; 3], position: [f32; 3], attenuation: [f32; 3]) -> Light {
+        Light {
+            color: [color[0], color[1], color[2], 0.0],
+            direction: [0.0, 0.0, 0.0, 0.0],
+            position: [position[0], position[1], position[2], 1.0],
+            spot: [0.0, 1.0, 1.0, 1.0],
+            attenuation: [attenuation[0], attenuation[1], attenuation[2], 0.0],
+        }
+    }
+
+    /// A spot light. `falloff` is `LightDesc_t::m_Falloff`, and the two dots
+    /// are the cosines of the inner and outer cone half-angles.
+    // No caller in the binary yet: the thing that builds these is
+    // `R_StudioSetupLighting`, which arrives with static props. Kept, and
+    // tested, because the `w`-component type encoding they exist to hide is
+    // the part of this ABI that is silent when it is wrong.
+    #[allow(dead_code)]
+    pub fn spot(
+        color: [f32; 3],
+        position: [f32; 3],
+        direction: [f32; 3],
+        attenuation: [f32; 3],
+        falloff: f32,
+        theta_dot: f32,
+        phi_dot: f32,
+    ) -> Light {
+        // `LightDesc_t::OneOverThetaDotMinusPhiDot`. A cone whose two angles
+        // are equal is a hard edge, not a division by zero.
+        let ood = if (theta_dot - phi_dot).abs() > f32::EPSILON {
+            1.0 / (theta_dot - phi_dot)
+        } else {
+            0.0
+        };
+        Light {
+            color: [color[0], color[1], color[2], 0.0],
+            direction: [direction[0], direction[1], direction[2], 1.0],
+            position: [position[0], position[1], position[2], 1.0],
+            spot: [falloff, theta_dot, phi_dot, ood],
+            attenuation: [attenuation[0], attenuation[1], attenuation[2], 0.0],
+        }
+    }
+
+    /// A directional light. No position, no attenuation.
+    #[allow(dead_code)]
+    pub fn directional(color: [f32; 3], direction: [f32; 3]) -> Light {
+        Light {
+            color: [color[0], color[1], color[2], 1.0],
+            direction: [direction[0], direction[1], direction[2], 0.0],
+            position: [0.0, 0.0, 0.0, 1.0],
+            spot: [0.0, 1.0, 1.0, 1.0],
+            attenuation: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// The lighting one model instance is drawn under — group 3, binding 0, for
+/// the shaders that read it.
+///
+/// `MaterialLightingState_t` (`public/materialsystem/imaterialsystem.h`) as it
+/// reaches the GPU: `PI_SetVertexShaderAmbientLightCube` and
+/// `PI_SetPixelShaderLocalLighting`, the two per-instance commands
+/// `vertexlitgeneric_dx9_helper.cpp:634` emits, plus the light array
+/// `CommitVertexShaderLighting` uploads.
+///
+/// # Why this is group 3 and not part of [`DrawUniforms`]
+///
+/// It is per-draw data, so group 2 would be the obvious home — and it is 432
+/// bytes that no world surface and no sprite would ever read. Group 3 is
+/// already "whatever this shader's lighting comes from": a lightmap atlas page
+/// for `LightmappedGeneric`, this for `VertexLitGeneric`. A pipeline layout is
+/// per shader, so a shader that reads neither declares no group 3 at all —
+/// which is what keeps the cost off the shaders that do not want it. See
+/// [`ShaderKind::lighting_binding`](super::shader::ShaderKind::lighting_binding).
+///
+/// # Set once per model, not once per draw
+///
+/// `R_StudioSetupLighting` runs once for a model and every mesh of that model
+/// is then drawn under it, which is why
+/// [`Pass::set_model_lighting`](super::context::Pass::set_model_lighting) is
+/// pass state rather than an argument to a draw — the same shape
+/// `bind_lightmap_page` has, for the same reason.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct ModelLighting {
+    /// The ambient cube: light arriving from `+x, -x, +y, -y, +z, -z`, in
+    /// **that order**, in linear space.
+    ///
+    /// VS `c21..c26` as three `float3[2]` pairs (`cAmbientCubeX`, `Y`, `Z`),
+    /// which is where the axis-major ordering comes from — `AmbientLight`
+    /// indexes `cAmbientCubeX[isNegative.x]`, so positive is always the even
+    /// slot. Getting the pairing wrong swaps a model's lighting front-to-back
+    /// or top-to-bottom and reads as a level lit from the wrong side.
+    ///
+    /// `w` is padding: a `vec3` in a uniform array still occupies 16 bytes.
+    pub ambient_cube: [[f32; 4]; AMBIENT_CUBE_FACES],
+    /// Up to four local lights. Slots past [`count`](ModelLighting::count)
+    /// must be [`Light::NONE`] rather than zeroed, because the shader
+    /// evaluates every slot.
+    pub lights: [Light; MAX_LIGHTS],
+    /// How many of [`lights`](ModelLighting::lights) are real.
+    ///
+    /// `MaterialLightingState_t::m_nLocalLightCount`, which reaches the shader
+    /// as `g_nLightCount`. It is a count rather than the four
+    /// `g_bLightEnabled` booleans because those were a static-control-flow
+    /// mechanism and the loop is unrolled here anyway.
+    pub count: u32,
+    /// Whether the vertex stream's baked static light is meaningful.
+    ///
+    /// `ShaderStateLighting_t::m_bStaticLight`, which reaches the vertex shader
+    /// as `g_flStaticLightEnabled` (`vertexlitgeneric_dx9_helper.cpp:1800`).
+    /// A model with no baked lighting has a black colour stream, and the
+    /// difference between "black because unlit" and "black because absent" is
+    /// exactly this flag.
+    pub static_light: u32,
+    /// Whether [`ambient_cube`](ModelLighting::ambient_cube) is meaningful.
+    ///
+    /// `ShaderStateLighting_t::m_bAmbientLight`. Separate from
+    /// [`count`](ModelLighting::count) because Valve's two shaders gate the
+    /// cube differently and the difference is worth keeping in one place:
+    /// the unbumped vertex path adds it under `bDynamicLight`, which is
+    /// `m_bAmbientLight || m_nNumLights > 0` (`ishaderdynamic.h:43`), while the
+    /// bumped pixel path has its own `AMBIENT_LIGHT` combo
+    /// (`vertexlitgeneric_dx9_helper.cpp:1880`). The two agree whenever the
+    /// cube is zeroed while disabled, which is what `SetAmbientLightCube` does,
+    /// so this flag is the honest form of both.
+    pub ambient_light: u32,
+    /// One word, not two: WGSL rounds the struct up to 432 bytes and Rust's
+    /// `#[repr(C)]` alignment here is 4, so the padding has to be spelled out
+    /// exactly rather than left to either language's rules.
+    pub _padding: u32,
+}
+
+impl ModelLighting {
+    /// A neutral flat-lit state: a white ambient cube, no local lights, no
+    /// baked static light.
+    ///
+    /// Not a *correct* lighting state for anything — it is what a caller who
+    /// has not set one gets, so that a model drawn before the lighting path
+    /// exists is visible rather than black. `R_StudioSetupLighting`'s job is
+    /// to replace it.
+    pub fn fullbright() -> ModelLighting {
+        ModelLighting {
+            ambient_cube: [[1.0, 1.0, 1.0, 0.0]; AMBIENT_CUBE_FACES],
+            lights: [Light::NONE; MAX_LIGHTS],
+            count: 0,
+            static_light: 0,
+            ambient_light: 1,
+            _padding: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +458,87 @@ mod tests {
         assert_eq!(size_of::<DrawUniforms>(), 64 + 16);
         assert_eq!(size_of::<FrameUniforms>() % 16, 0);
         assert_eq!(size_of::<DrawUniforms>() % 16, 0);
+
+        // `Light` is Valve's five constant registers, and `ModelLighting` is
+        // six ambient vectors, four of those, and one word of switches — which
+        // has to be padded by hand, because Rust's alignment for an array of
+        // `[f32; 4]` is 4 and WGSL's is 16, so the two disagree about the tail
+        // unless it is spelled out.
+        assert_eq!(size_of::<Light>(), 5 * 16);
+        assert_eq!(
+            size_of::<ModelLighting>(),
+            AMBIENT_CUBE_FACES * 16 + MAX_LIGHTS * 5 * 16 + 16
+        );
+        assert_eq!(size_of::<ModelLighting>() % 16, 0);
+    }
+
+    #[test]
+    fn a_lights_type_lives_in_two_w_components() {
+        // "1x - directional, 01 - spot, 00 - point" (`common_vs_fxc.h:119`).
+        // There is no type enum in the constant block — the shader selects
+        // behaviour with two `lerp`s on these two `w`s, which is what a shader
+        // model with no branches had instead of an `if`. Swap them and every
+        // point light in the game stops attenuating.
+        let point = Light::point([1.0; 3], [1.0, 2.0, 3.0], [0.0, 0.0, 1.0]);
+        assert_eq!(point.color[3], 0.0, "not directional");
+        assert_eq!(point.direction[3], 0.0, "not a spot");
+        // `CompileVertexShaderLocalLights` writes a point light's direction as
+        // zero rather than leaving it: `pDest[1].Init( 0, 0, 0, w )`.
+        assert_eq!(point.direction[..3], [0.0, 0.0, 0.0]);
+
+        let spot = Light::spot(
+            [1.0; 3],
+            [0.0; 3],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0],
+            5.0,
+            0.9,
+            0.4,
+        );
+        assert_eq!(spot.color[3], 0.0);
+        assert_eq!(spot.direction[3], 1.0, "a spot");
+        // exponent, thetaDot, phiDot, 1/(thetaDot - phiDot).
+        assert_eq!(spot.spot[0], 5.0);
+        assert_eq!(spot.spot[1], 0.9);
+        assert_eq!(spot.spot[2], 0.4);
+        assert!((spot.spot[3] - 1.0 / 0.5).abs() < 1e-6);
+
+        let directional = Light::directional([1.0; 3], [0.0, 0.0, -1.0]);
+        assert_eq!(directional.color[3], 1.0, "directional");
+        assert_eq!(directional.direction[3], 0.0, "not a spot");
+    }
+
+    #[test]
+    fn a_cone_with_no_width_does_not_divide_by_zero() {
+        // `OneOverThetaDotMinusPhiDot` with equal angles. A hard-edged cone is
+        // a thing content can ask for; an infinity in a uniform is not.
+        let spot = Light::spot(
+            [1.0; 3],
+            [0.0; 3],
+            [0.0, 0.0, -1.0],
+            [1.0, 0.0, 0.0],
+            1.0,
+            0.5,
+            0.5,
+        );
+        assert!(spot.spot[3].is_finite());
+    }
+
+    #[test]
+    fn an_unused_light_slot_is_dark_but_finite() {
+        // `s_pTwoEmptyLights` (`shaderapidx8.cpp:14146`). The shader evaluates
+        // every slot, so a zeroed one is a division by zero in the attenuation
+        // denominator — the colour is what makes this contribute nothing, and
+        // the constant attenuation of 1 is what keeps it finite.
+        assert_eq!(Light::NONE.color[..3], [0.0, 0.0, 0.0]);
+        // The denominator the shader divides by is
+        // `constant + linear * d + quadratic * d²`, so a zeroed slot is an
+        // infinity rather than a dark light.
+        const _: () = assert!(Light::NONE.attenuation[0] > 0.0);
+        // And `fullbright` fills every slot with it rather than zeroing them.
+        let lighting = ModelLighting::fullbright();
+        assert_eq!(lighting.count, 0);
+        assert!(lighting.lights.iter().all(|light| *light == Light::NONE));
     }
 
     #[test]

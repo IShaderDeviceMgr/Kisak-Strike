@@ -13,10 +13,10 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~12,300 Rust including tests, plus ~500 of WGSL |
-| Tests | 145 (`cargo test materials`) — 21 of them run on a real GPU |
+| Lines | ~14,900 Rust including tests, plus ~1,200 of WGSL |
+| Tests | 168 (`cargo test materials`) — 28 of them run on a real GPU |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-5 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, and lightmaps. Stages 6+ not started |
+| Status | **Stages 1-6 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, and `VertexLitGeneric`. Stage 6's remaining shaders and stages 7-8 not started |
 
 ```
 src/materials/
@@ -27,11 +27,11 @@ src/materials/
   var.rs           MaterialVar, MaterialFlags — what a .vmt says, and the coercions
   vmt.rs           Vmt — reading a .vmt: patches, conditionals, flags, vars
   shader.rs        ShaderKind, ShaderParam, render_state, vertex_layout — the shader set and its shadow phase
-  uniforms.rs      FrameUniforms, DrawUniforms, from_mat4, from_row_major — the constant ABI (§7.4)
+  uniforms.rs      FrameUniforms, DrawUniforms, ModelLighting, Light, from_mat4 — the constant ABI (§7.4)
   pipeline.rs      RenderState, PipelineKey, TargetFormat, PipelineCache, BindLayouts
   material.rs      Material, MaterialCache — a .vmt bound to a shader and its textures
   lightmap.rs      ImagePacker, LightmapAtlas, LightmapPages, ColorRgbExp32 — the lightmap atlas
-  mesh.rs          SimpleVertex, WorldVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers, slices
+  mesh.rs          SimpleVertex, WorldVertex, ModelVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers
   target.rs        DepthBuffer, RenderTarget, DEPTH_FORMAT — what a pass draws into
   context.rs       RenderContext, Pass, Camera, Load, StateOverride — passes and the constants under them
   preview.rs       MaterialPreview — the stage-4 verification draw. Temporary
@@ -39,6 +39,7 @@ src/materials/
   shaders/prelude.wgsl             the shared prelude (§7.5)
   shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
+  shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
   error.rs         RendererError, VtfError, VmtError, TextureError
 ```
 
@@ -531,10 +532,22 @@ pub fn new(
     layouts: &BindLayouts,
     name: &str,
     vmt: &Vmt,
-    fallback: &TextureFallbacks,   // { white, error }
-    resolve: impl FnMut(&str, ColorSpace) -> Arc<Texture>,
+    fallback: &TextureFallbacks,   // { white, error, black_cube }
+    resolve: impl FnMut(&str, ColorSpace, TextureDimension) -> Arc<Texture>,
 ) -> Option<Material>;   // None if the .vmt names a shader we do not have
 ```
+
+`resolve` is told the **view dimension** the shader declared, because a bind group layout
+names one and binding the wrong shape is a `wgpu` validation error rather than a wrong
+picture. `MaterialCache` uses it to send cubemaps through
+[`load_cubemap`](#envmap_name)'s `.hdr` rule and everything else through `load`; a texture
+that comes back the wrong shape is replaced with the fallback of the right one and logged.
+
+`TextureFallbacks` has three entries and the split is by *situation*, not by failure — the
+same distinction `CTextureManager`'s family of standard textures draws. A parameter nobody
+set gets `white` (or `black_cube`); one that was set and could not be honoured gets
+`error` (or, again, `black_cube` — there is no error cubemap to invent, and a checkerboard
+reflection reads as a broken world rather than a broken material).
 
 `resolve` is a callback rather than a `&mut TextureCache` because the two callers differ
 in what they can do: an ordinary material reads through the `Vfs`, and the error material
@@ -662,21 +675,31 @@ all).
 ### `ShaderKind`
 
 ```rust
-pub enum ShaderKind { UnlitGeneric, LightmappedGeneric }
+pub enum ShaderKind { UnlitGeneric, LightmappedGeneric, VertexLitGeneric }
 
 pub fn from_name(name: &str) -> Option<ShaderKind>;
 pub fn name(self) -> &'static str;
 pub fn vertex_layout(self) -> VertexLayout;
-pub fn reads_lightmap(self) -> bool;          // does this shader want bind group 3
+pub fn lighting_binding(self) -> Option<LightingBinding>;   // what group 3 holds
 pub fn params(self) -> impl Iterator<Item = &'static ShaderParam>;
 pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Two deep. `UnlitGeneric` is sprites, tool textures and anything whose colour is entirely
+Three deep. `UnlitGeneric` is sprites, tool textures and anything whose colour is entirely
 in its texture; `LightmappedGeneric` is world brush surfaces — 62 of `sp_a1_intro1`'s 66
 world materials — and multiplies a base texture by a baked lightmap, flat or
-radiosity-normal-mapped.
+radiosity-normal-mapped; `VertexLitGeneric` is models, and is the largest shader in the
+shipped game — 1,108 of Portal 2's 3,431 materials name it, including 1,012 of the 1,096
+under `materials/models/`.
+
+**A `.vmt` naming `VertexLitGeneric` does not always reach `VertexLitGeneric`.**
+`DrawVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:2346`) opens by handing the
+material to `DrawPhong_DX9` when `WantsPhongShader` says so — `$phong 1` plus any of a
+`$bumpmap`, a `$lightwarptexture` or `$basemapalphaphongmask 1`. Measured against the real
+game that is **317 of the 1,108**, and `Phong` is a separate §7.8 entry that is not
+ported: they draw here, without their specular, and say so once on stderr at load. See
+[`wants_phong`](#wants_phong).
 
 Replaces `CShaderSystem::FindShader`'s `CUtlDict`, filled by whichever `shaderapi.so` had
 been `dlopen`ed. There is no registration step and no way to fail to be registered.
@@ -697,6 +720,14 @@ pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4];
 pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting;
 pub fn unlit_uniforms(vmt: &Vmt) -> UnlitUniforms;
 pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms;
+pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms;
+```
+
+<a id="wants_phong"></a>
+
+```rust
+pub fn wants_phong(vmt: &Vmt) -> bool;        // is this really a Phong material?
+pub fn envmap_name(vmt: &Vmt) -> Option<&str>;
 ```
 
 `param_value` is `InitShaderParameters` (`shadersystem.cpp:838`): the var if the file set
@@ -734,6 +765,44 @@ original tree `m_pDefaultValue` is read by one file, `tools/vmt/vmtdoc.cpp`, the
 editor. At runtime the default comes from the type or from the shader's own
 `SHADER_INIT_PARAMS` block.
 
+<a id="two-defaults"></a>
+
+**There are two default mechanisms and `param_value` is only the second one.** They run
+in order, and the difference is a silent zero:
+
+1. `SHADER_INIT_PARAMS` — the shader's own `InitParams*` function, which *writes* a real
+   value into the var array for a parameter the `.vmt` left out. `$detailscale` becomes 4,
+   `$envmapsaturation` becomes 1, `$selfillummaskscale` becomes 1.
+2. `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:865`), which fills anything
+   still undefined from its declared *type* — 0 for a float, black for a colour.
+
+`param_value` is (2). Calling it and appending `.unwrap_or( 4.0 )` looks right and is dead
+code: the type default arrives first, so the fallback never fires and `$detailscale`
+silently becomes 0 — which collapses every detail texture to a single texel. Anything with
+a non-type default goes through `init_float`/`init_vec` instead, which read `Vmt::var`
+directly. This cost a debugging session and is pinned by
+`shader_supplied_defaults_beat_type_defaults`.
+
+<a id="envmap_name"></a>
+
+**`$envmap "env_cubemap"` is not a texture name.** `CShaderSystem::LoadCubeMap`
+(`shadersystem.cpp:1840`) special-cases the literal string: it sets the var to
+`(ITexture *)-1`, sets `MATERIAL_VAR2_USES_ENV_CUBEMAP`, and loads nothing. The cubemap
+then arrives *per draw* from the render instance — `instance.m_pEnvCubemap`, falling back
+to `m_StdTextureHandles[TEXTURE_LOCAL_ENV_CUBEMAP]` (`shaderapidx8.cpp:8370`) — because
+which cubemap a model reflects depends on where the model is standing, not on its
+material. 78 of Portal 2's non-phong `VertexLitGeneric` materials say it. `envmap_name`
+answers `None` for it, which binds the black cube and turns the envmap branch off; when
+the `.bsp`'s embedded cubemaps become readable this becomes render-context state alongside
+the lightmap page, and *that* is the trigger to revisit it.
+
+The other half of the same rule: **a cubemap name gains `.hdr` before it gains `.vtf`.**
+`LoadCubeMap` appends the suffix whenever HDR is on and `CTexture` falls back to the
+unsuffixed name when the suffixed file is missing (`ctexture.cpp:3882`), so
+`$envmap "metal/foo"` means `materials/metal/foo.hdr.vtf` **or** `materials/metal/foo.vtf`,
+in that order. `TextureCache::load_cubemap` is that, and it is the reason
+`texture::normalize_name` strips every extension *except* `.hdr`.
+
 ### The constant ABI
 
 `uniforms.rs` replaces `common_hlsl_cpp_consts.h` and the register maps at the top of
@@ -747,14 +816,29 @@ Valve's register map is really a *frequency* map, and that frequency is the bind
 | 0 | `FrameUniforms` | once a frame | VS `c2`, `c8..c11`, `c16`; PS `c29`, `c30`, `c32` |
 | 1 | the shader's own block, plus its textures and samplers | once a material | the shader-specific block |
 | 2 | `DrawUniforms` | once a draw | VS `c4..c7`, `c47` |
-| 3 | the lightmap atlas page, for the shaders that read one | once a batch | PS `s1` (`TEXTURE_LIGHTMAP`) |
+| 3 | *where this shader's lighting comes from* — see below | once a batch, or once a model | PS `s1` (`TEXTURE_LIGHTMAP`); VS `c21..c26` + `c27..c46` |
 
-**Group 3 is the lightmap page**, not skinning as stage 4 reserved it for. It is declared
-only by shaders whose `reads_lightmap()` is true, because a pipeline layout is per shader
-and declaring it everywhere would oblige every draw of every shader to bind something
-there. Skinning takes the next free group when `studiorender` lands. Group 1's
-*layout* is the shader's, which is the one thing that genuinely differs between shaders;
-groups 0 and 2 are shared, which is what makes them worth being groups.
+**Group 3 is the shader's lighting**, not skinning as stage 4 reserved it for, and it has
+two shapes:
+
+```rust
+pub enum LightingBinding { LightmapPage, ModelLighting }
+```
+
+| Shader | Group 3 | Set by | Rate |
+|---|---|---|---|
+| `UnlitGeneric` | nothing — no group 3 is declared | — | — |
+| `LightmappedGeneric` | a lightmap atlas page: texture + sampler | `Pass::bind_lightmap_page` | per batch |
+| `VertexLitGeneric` | `ModelLighting`: ambient cube + 4 lights, dynamic offset | `Pass::set_model_lighting` | per model instance |
+
+Both are things Valve also kept out of the material: `BindLightmapPage` and
+`PI_SetVertexShaderAmbientLightCube` are render-context state that neither the material nor
+the draw call owns. A pipeline layout is per shader, so declaring group 3 everywhere would
+oblige every draw of every shader to bind something there; a shader that reads neither
+declares no group 3 at all. Skinning takes the next free group when `studiorender` lands.
+
+Group 1's *layout* is the shader's, which is the one thing that genuinely differs between
+shaders; groups 0 and 2 are shared, which is what makes them worth being groups.
 
 ```rust
 pub struct FrameUniforms {
@@ -769,7 +853,47 @@ pub struct DrawUniforms {
     pub model: ColumnMajor,
     pub modulation: [f32; 4],               // cModulationColor
 }
+
+pub const MAX_LIGHTS: usize = 4;            // MATERIAL_MAX_LIGHT_COUNT
+pub const AMBIENT_CUBE_FACES: usize = 6;
+
+pub struct Light {                          // LightInfo, VS c27..c46
+    pub color: [f32; 4],                    // rgb; w = 1 for a directional light
+    pub direction: [f32; 4],                // xyz; w = 1 for a spot light
+    pub position: [f32; 4],
+    pub spot: [f32; 4],                     // falloff, thetaDot, phiDot, 1/(theta-phi)
+    pub attenuation: [f32; 4],              // constant, linear, quadratic
+}
+impl Light {
+    pub const NONE: Light;                  // s_pTwoEmptyLights: dark, but finite
+    pub fn point(color: [f32; 3], position: [f32; 3], attenuation: [f32; 3]) -> Light;
+    pub fn spot(color: [f32; 3], position: [f32; 3], direction: [f32; 3],
+                attenuation: [f32; 3], falloff: f32, theta_dot: f32, phi_dot: f32) -> Light;
+    pub fn directional(color: [f32; 3], direction: [f32; 3]) -> Light;
+}
+
+pub struct ModelLighting {                  // group 3, for VertexLitGeneric
+    pub ambient_cube: [[f32; 4]; AMBIENT_CUBE_FACES],  // +x -x +y -y +z -z, linear
+    pub lights: [Light; MAX_LIGHTS],
+    pub count: u32,                         // how many of `lights` are real
+    pub static_light: u32,                  // is the vertex stream's baked light meaningful
+    pub ambient_light: u32,                 // is the ambient cube meaningful
+    pub _padding: u32,
+}
+impl ModelLighting { pub fn fullbright() -> ModelLighting; }
 ```
+
+`ModelLighting` is `MaterialLightingState_t` as it reaches the GPU — what
+`R_StudioSetupLighting` computes once per model instance. Three switches rather than two,
+because Valve has three: `m_bStaticLight`, `m_bAmbientLight` and `m_nLocalLightCount`, and
+`HasDynamicLight()` is the second or the third (`ishaderdynamic.h:43`). Slots past `count`
+must hold `Light::NONE` rather than zeroes — the shader evaluates every slot, and a zeroed
+attenuation is a division by zero rather than a dark light.
+
+**Its tail padding is written out by hand**, and that is not tidiness: Rust's alignment for
+a `[[f32; 4]; 6]` is 4 while WGSL rounds the struct up to 16, so the two languages disagree
+about the size unless it is spelled. `uniform_blocks_are_the_size_wgsl_expects` is the
+guard.
 
 **Matrices are column-major and multiply on the left** — `m * vec4(pos, 1.0)`, with `m[3]`
 the translation. Valve's is the opposite on both counts (row-major `VMatrix`, applied as
@@ -805,7 +929,8 @@ pub fn layouts(&self) -> &BindLayouts;
 pub fn frame(&self) -> &wgpu::BindGroupLayout;                    // group 0
 pub fn material(&self, shader: ShaderKind) -> &wgpu::BindGroupLayout;  // group 1
 pub fn draw(&self) -> &wgpu::BindGroupLayout;                     // group 2
-pub fn lightmap(&self) -> &wgpu::BindGroupLayout;                 // group 3
+pub fn lightmap(&self) -> &wgpu::BindGroupLayout;                 // group 3, brushes
+pub fn model_lighting(&self) -> &wgpu::BindGroupLayout;           // group 3, models
 ```
 
 `RenderState` is `StateSnapshot_t`, and `PipelineCache` is the deduplication half of
@@ -826,9 +951,22 @@ pass borrows the frame, so the pipeline has to outlive the lookup.
 
 Note what is *not* a field of `PipelineKey`: the vertex layout. It comes from
 `ShaderKind::vertex_layout()`, because that is where `IShaderShadow::VertexShaderVertexFormat`
-put it — the shader declares the layout it reads, in its shadow phase. The key grows a
-field the day one shader has two layouts, which will be `LightmappedGeneric`'s bumped
-variant.
+put it — the shader declares the layout it reads, in its shadow phase.
+
+The key grows a layout field the day one shader genuinely has two layouts, and **that day
+has now come close twice and been declined twice**, for different reasons each time.
+`LightmappedGeneric`'s bumped variant does not need one: the bumped diffuse path dots a
+tangent-space normal against a constant basis and never leaves tangent space, so bumped
+and unbumped read the same vertices. `VertexLitGeneric`'s bumped variant *is* a second
+layout in Valve's engine — the tangent is `userDataSize = 4` only when the material is
+bumped — and this port declines it because the tangent is in the `.vvd` either way; the
+reasoning and the trigger to revisit are on `ModelVertex`. The envmap variant of
+`LightmappedGeneric` is still the one most likely to force it.
+
+**How many pipelines actually survive the combo cull**, which `portdocs/MATERIALSYSTEM.md`
+§10 asks: loading all 1,108 of Portal 2's `VertexLitGeneric` materials and asking the cache
+for one pipeline each produces **15**. Single digits per shader was the prediction; a
+low double digit against the whole game's material set is the measurement.
 
 ---
 
@@ -842,7 +980,7 @@ struct, its GPU layout is derived from the struct, and filling a buffer is
 ### Vertices and layouts
 
 ```rust
-pub enum VertexLayout { Simple, World }
+pub enum VertexLayout { Simple, World, Model }
 impl VertexLayout {
     pub fn buffer_layout(self) -> wgpu::VertexBufferLayout<'static>;
     pub fn stride(self) -> u64;
@@ -863,6 +1001,18 @@ pub struct WorldVertex {
     pub color: [f32; 4],
 }
 impl WorldVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> WorldVertex; }
+
+#[repr(C)]
+pub struct ModelVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub texcoord: [f32; 2],
+    pub tangent: [f32; 4],            // xyz tangent S, w the binormal's sign
+    pub color: [f32; 4],              // COLOR1, vrad's baked per-vertex light
+}
+impl ModelVertex {
+    pub const fn new(position: [f32; 3], normal: [f32; 3], texcoord: [f32; 2]) -> ModelVertex;
+}
 ```
 
 `WorldVertex` is what `BuildMSurfaceVertexArrays` writes for a brush surface, minus the
@@ -882,6 +1032,27 @@ phase adds `VERTEX_TANGENT_S | VERTEX_TANGENT_T | VERTEX_NORMAL` only for an `$e
 (`lightmappedgeneric_dx9_helper.cpp:670`). Bumped lighting is therefore a flag in a
 uniform — §7.3's bucket 2 — and the envmap variant is what will force the second layout.
 
+`ModelVertex` is `mstudiovertex_t` (`public/studio.h:1447`) plus the `.vvd`'s parallel
+tangent array — the two arrays Valve stores a model vertex in. Three things about it are
+worth knowing before writing one:
+
+- **The tangent is always present, and Valve's was not.** `VertexLitGeneric`'s shadow
+  phase asks for `userDataSize = 4` only when the material has a `$bumpmap`
+  (`vertexlitgeneric_dx9_helper.cpp:824`), so bumped and unbumped are two vertex formats
+  there. This port keeps one, because the data is in the `.vvd` either way, because only
+  71 of the game's 801 non-phong `VertexLitGeneric` materials are bumped, and because a
+  layout that depends on a `.vmt` rather than on a `ShaderKind` costs `PipelineKey` a
+  field. The condition to revisit is on the type.
+- **`color` is baked static light, never `$vertexcolor`.** The shadow phase picks
+  `VERTEX_COLOR` *or* `VERTEX_COLOR_STREAM_1` and never both, and for this shader the
+  choice is already made: `bHasVertexColor` is unconditionally false when
+  `bVertexLitGeneric` (`:594`). `$vertexcolor` belongs to `UnlitGeneric`, which reads
+  `SimpleVertex`.
+- **It is gamma space and pre-multiplied by a half.** The shader's first act is
+  `GammaToLinear( color * 2 )`, so a baked 0.5 is a linear 1.0 and *white is not the
+  neutral value* — an unlit-by-`vrad` vertex is black. `ModelVertex::new` gives black for
+  exactly that reason.
+
 `VertexLayout` is `VertexFormat_t` (a `uint64` of flags plus per-texcoord sizes) reduced
 to what it was used for. It is an enum, not a bitfield, because the set is not open: a
 layout exists only if some shader reads it.
@@ -894,7 +1065,7 @@ version, since it is the expensive half of stage 4's reading:
 |---|---|
 | `UnlitGeneric` | position, one texcoord, colour — `Simple` |
 | `LightmappedGeneric` | position, base uv, lightmap uv, lightmap-offset uv, normal, tangent s/t, colour; the last three only when bumped |
-| `VertexLitGeneric` | bone weights, position, normal, uv, plus a tangent from the `.vvd` when bumped |
+| `VertexLitGeneric` | position, normal, uv, tangent, baked static light — `Model` |
 
 Those structs arrive **with the shaders that read them**, not before.
 
@@ -1081,14 +1252,27 @@ pub fn set_depth_range(&mut self, x: f32, y: f32, width: f32, height: f32,
 pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 pub fn set_state_override(&mut self, overrides: StateOverride);
 pub fn bind_lightmap_page(&mut self, page: &LightmapPage);
+pub fn set_model_lighting(&mut self, lighting: &ModelLighting);
 pub fn target_format(&self) -> TargetFormat;
 ```
 
-`bind_lightmap_page` is `IMatRenderContext::BindLightmapPage( lightmapPageID )`. It is
-pass state, like `set_state_override`, and applies from the call to the end of the pass;
-draws of a shader whose `reads_lightmap()` is false ignore it. A lit draw with no page
-bound gets the 1x1 white page rather than a validation error, which is what
-`AllocateWhiteLightmap` hands unlit surfaces anyway.
+`bind_lightmap_page` is `IMatRenderContext::BindLightmapPage( lightmapPageID )` and
+`set_model_lighting` is `R_StudioSetupLighting` plus the two per-instance commands it
+feeds. Both are the two halves of group 3, both are pass state like `set_state_override`,
+both apply from the call to the end of the pass, and a draw of a shader that does not read
+that half ignores it.
+
+Neither has to be called. A lit brush draw with no page bound gets the 1x1 white page,
+which is what `AllocateWhiteLightmap` hands unlit surfaces anyway; a model draw with no
+lighting set gets `ModelLighting::fullbright` — a white ambient cube and no lights — which
+every pass allocates for itself when it opens. Both are visible-and-wrong rather than a
+validation error or a read of whatever the previous instance left behind.
+
+**`set_model_lighting` takes an arena slot per call**, so setting it, drawing, setting it
+again and drawing again within one pass is the intended shape — which is what a scene of
+props is. It is per *instance* rather than per draw because `R_StudioSetupLighting` runs
+once for a model and every mesh of that model is then drawn under it; binding it per draw
+would re-upload the same 432 bytes once per material the model wears.
 
 The pass ends when it drops. `model` is object space to world space — the
 `MATERIAL_MODEL` matrix, as a parameter rather than a stack, because unlike view and
@@ -1420,6 +1604,39 @@ Ordered by how likely each is to bite.
     no tone mapper, so a map is as bright as `vrad` left it — dimmer than the shipped
     game, which auto-exposes. It is one uniform field, not a redesign; see the divergence
     table.
+23. **A parameter with a non-type default must be read with `init_float`/`init_vec`, not
+    `param_value`.** There are two default mechanisms and `param_value` is the second one,
+    so `param_value(..., "$detailscale").unwrap_or( 4.0 )` compiles, reads correctly and
+    silently yields 0. See [the two defaults](#two-defaults) — this cost a debugging
+    session on the shader it was introduced with.
+24. **A model's baked vertex light is gamma space times a half, and white is not
+    neutral.** `GammaToLinear( color * cOverbright )` with `cOverbright` 2
+    (`common_vs_fxc.h:852`): a baked 0.5 is a linear 1.0, and an unlit vertex is *black*.
+    Filling `ModelVertex::color` with white is twice the brightest value `vrad` can bake.
+    `ModelLighting::static_light` is the switch that says whether the stream means
+    anything at all.
+25. **The ambient cube is ordered `+x, -x, +y, -y, +z, -z`.** It comes from three
+    `float3[2]` register pairs (`cAmbientCubeX` at VS `c21`, `Y` at `c23`, `Z` at `c25`),
+    so positive is always the even slot. A swapped pair lights every model in the level
+    from the wrong side and looks entirely plausible;
+    `the_ambient_cube_lights_each_axis_from_its_own_entry` pins all six.
+26. **A local light's *type* lives in the `w` of two of its vectors**, not in an enum:
+    `color.w` is 1 for a directional light and `direction.w` is 1 for a spot
+    (`common_vs_fxc.h:119`). The shader selects with two `lerp`s, which is what a shader
+    model with no branches had instead of an `if`. Build lights with `Light::point`,
+    `Light::spot` and `Light::directional` rather than filling the fields, and fill unused
+    slots with `Light::NONE` — a *zeroed* slot divides by zero in the attenuation
+    denominator, which is why `s_pTwoEmptyLights` has a constant attenuation of 1.
+27. **A bumped model gets no baked vertex light at all, and an unbumped one does.** That
+    asymmetry is Valve's: `vertexlit_and_unlit_generic_bump_ps2x.fxc:452` calls
+    `PixelShaderDoLighting` with `bStaticLight = false`, because the per-vertex stream
+    cannot be re-evaluated against a per-pixel normal. The same model with and without a
+    `$bumpmap` is therefore lit by different things, not by the same thing more precisely.
+28. **Unbumped `VertexLitGeneric` is Gouraud-shaded** — `DoLighting` runs in the *vertex*
+    shader (`vertexlit_and_unlit_generic_vs20.fxc:437`) and the fragment shader reads the
+    interpolated result. Lighting it per pixel instead is prettier and wrong: content was
+    authored against the flatter shading, and a lighting number measured at the middle of
+    a surface will not match what the middle pixel shows.
 
 ## Deliberate divergences from Valve's behavior
 
@@ -1449,12 +1666,21 @@ Each of these changes what the engine does, and each names the thing that revers
 | A map with interleaved lightmap alpha is refused | `LVLFLAGS_LIGHTMAP_ALPHA` puts a CS:GO-era cascaded-shadow term between every face's samples, so the stride changes for the whole lump. Portal 2 does not set it; misreading it would draw noise | `BspError::UnsupportedLightmapAlpha` |
 | No tone mapping: `cLightScale` is all ones | HDR lightmaps arrive in `[0..16]` and `SetToneMappingScaleLinear` normally carries the exposure the tone-map controller chose. There is no controller, so a map is as bright as `vrad` left it | `FrameUniforms::light_scale` |
 | The dynamic geometry arena grows instead of overflowing | `CDynamicVB` was a fixed allocation and callers split batches to fit. The `*_remaining` queries are still there for callers that want to | `mesh::ARENA_BYTES` |
+| **Half-lambert is read from `$halflambert` again** | the tree this port is derived from hard-codes `bHalfLambert = false` over a commented-out read of the flag, with the comment *"Disabling half-lambert for CSGO (not compatible with CSM's, causes bad shadow aliasing)"* (`vertexlitgeneric_dx9_helper.cpp:679`). Portal 2 has no cascaded shadow maps and neither does this port, so the commented-out line is the behaviour and the constant is the divergence | `shader::vertex_lit_uniforms` |
+| **`SoftenCosineTerm` is not applied to the diffuse term** | `(d + d²)/2` (`common_fxc.h:112`), tagged `// For CS:GO` at both of its call sites (`common_vs_fxc.h:796`, `common_vertexlitgeneric_dx9.h:99`). It changes the falloff of every lit surface in the game and postdates Portal 2 | `cosine_term` in `vertexlitgeneric.wgsl` |
+| `VertexLitGeneric` carries a tangent even when unbumped | Valve's `userDataSize` is 4 only for a bumped material, so bumped and unbumped are two vertex formats there. The `.vvd` stores the tangent either way, 71 of 801 materials are bumped, and one layout per shader is what keeps it out of `PipelineKey` | `mesh::ModelVertex`, and a layout field on the key |
+| `$phong` materials draw without specular | `WantsPhongShader` sends them to `DrawPhong_DX9`, a separate §7.8 shader that is not ported. 317 of Portal 2's 1,108 `VertexLitGeneric` materials; each says so once on stderr at load | port `Phong` |
+| `$envmap "env_cubemap"` reflects nothing | it names no file — it is a request for the render instance's local cubemap, which needs the `.bsp`'s pak lump mounted. 78 materials; they bind the 1x1 black cube, so the reflection term contributes zero rather than a checkerboard | `shader::envmap_name` |
+| An **opaque** material writes its base texture's alpha to the frame, where Valve writes 1 | `g_EyePos_BaseTextureTranslucency.w` is `TextureIsTranslucent( BASETEXTURE, true )` — 1 for a `$translucent` or `$alphatest` material, 0 for an opaque one — and the shader lerps the base alpha in by it. Blending and the alpha-test `discard` are unaffected, because both cases have `w` of 1; only the frame's alpha channel differs, and the underwater fog pass that reads it is not ported. Shared with `UnlitGeneric`, which reaches the same Valve source file | thread the resolved base texture into `*_uniforms` and add a flag |
+| `$lightwarptexture`, `$rimlight` and self-illum fresnel are ignored | each belongs to the `Phong` path or needs a texture kind not yet loaded; all three are declared-and-unread rather than silently accepted, since the params table omits what it does not honour | — |
 
 ## Not implemented
 
-Stages 6-8: the rest of the shader set, paint maps, GPU morph. The shader set is two
-shaders deep, so a `.vmt` naming any of the other 160-odd still resolves to the error
-material. Also deliberately absent, and listed so nobody looks for them:
+Stage 6 is `VertexLitGeneric` and is done; the rest of §7.8's shader set, paint maps and
+GPU morph (stages 7-8) are not. The shader set is three shaders deep, so a `.vmt` naming
+any of the other 160-odd still resolves to the error material — measured against Portal 2,
+those three cover 2,836 of its 3,431 materials. Also deliberately absent, and listed so
+nobody looks for them:
 
 - **Everything `LightmappedGeneric` can do past a base texture, a bump map and a
   lightmap.** `$basetexture2`/`$bumpmap2` two-layer blending and `$blendmodulatetexture`,
@@ -1467,9 +1693,17 @@ material. Also deliberately absent, and listed so nobody looks for them:
   frame from `LightStyleValue( style )` and the visible `dlight_t`s; a page here is
   written once at load. `LockLightmap`/`UpdateLightmap` and the ring of dynamic pages go
   with it.
-- **`ModelVertex`.** The layout is enumerated on `VertexLayout` — the reading is done —
-  but the struct arrives with `VertexLitGeneric`, because a vertex struct with no shader
-  to read it cannot be checked against anything.
+- **Everything `VertexLitGeneric` can do past the features listed on `ShaderKind`.**
+  `$phong` and its whole family (a separate shader — see [`wants_phong`](#wants_phong)),
+  `$lightwarptexture`, `$rimlight`, self-illum fresnel, wrinkle maps, tree sway,
+  `$decaltexture`, `$tintmask`, `$displacementmap`, seamless mapping, distance alpha, and
+  the emissive-scroll, cloak and flesh-interior blended passes — which are three whole
+  extra shaders drawn over the top of this one, and are HL2/Alien Swarm content rather
+  than Portal 2's.
+- **Skinning and morphing.** `ModelVertex` has no bone weights or indices, and
+  `SkinPositionAndNormal` is replaced by the per-draw model matrix — which is what an
+  unskinned draw did anyway, through `cModel[0]`. This is what makes group 3's "skinning"
+  reservation from stage 4 land somewhere else.
 - **Vertex compression** (`VERTEX_FORMAT_COMPRESSED`, packed normals and bone weights).
   Still open, and answered *with* skinning: the shaders unpack what the vertex format
   packs, so the two halves are one decision.
@@ -1533,23 +1767,35 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 ```
 
 A missing or broken name draws the error material — magenta checkerboard — which is
-itself worth seeing. `-vmt` draws through `UnlitGeneric` only: it has no lightmap page and
-no world geometry, so a `LightmappedGeneric` material previewed this way is lit by the
-white page and comes out fullbright.
+itself worth seeing.
 
-Two things it pins down that are worth reading before writing the real one:
+**Every shader can be previewed, and each is lit by whatever `-vmt` can honestly supply.**
+The cube is built in both `SimpleVertex` and `ModelVertex`, and the draw picks whichever
+layout the `.vmt`'s shader declared. A `LightmappedGeneric` material has no lightmap page
+here — there is no world geometry — so it binds the white page and comes out fullbright. A
+`VertexLitGeneric` one is drawn under `preview_lighting()`: an ambient cube deliberately
+*unequal per axis*, so that a swapped cube entry shows as a face with the wrong tint
+rather than as nothing, plus one point light offset from the centre so the falloff is
+visible across the ground quad. Neither is a real lighting environment, and neither
+pretends to be.
+
+Three things it pins down that are worth reading before writing the real one:
 
 - **The cube is built rather than written out**, from a per-face `(normal, u, v)` triple
   chosen so that `u × v == n`. That is what makes each face wind counter-clockwise as
   seen from outside without anyone having to check twenty-four literals. Getting one face
   backwards does not draw it mirrored — it draws a hole, silently, invisible from most
   angles.
+- **The model cube's binormal sign is -1**, and it is not arbitrary: the cube's texture
+  `v` runs opposite its in-plane `v` axis, and Valve's shader builds the binormal as
+  `cross( normal, tangent ) * tangent.w`. With `+1` a normal map previews lit from the
+  wrong side along one axis only — the kind of half-wrong that survives a glance.
 - **The ground quad is dynamic on purpose**, not because it changes. The dynamic vertex
   path is what every immediate-mode draw in the engine uses, and a path only the tests
   exercise is a path that rots.
 
 **Do not grow this.** Map loading has landed, so the deletion this asked for is now
-possible and is deliberately *not* part of stage 5: the nineteen GPU tests at the bottom
+possible and is deliberately *not* part of stage 5: the twenty-eight GPU tests at the bottom
 of `preview.rs` are the only place the whole path is checked against real pixels, and
 moving them onto the world draw means giving them a `.bsp` — which means shipping content
 into the test suite or making them skip without it. Delete `preview.rs` and `-vmt`
@@ -1618,13 +1864,13 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 | `vtf` (18) | every version 7.0-7.5, the seventh cubemap face, partial mip chains, the thumbnail, flag masking, and each way a file can be malformed |
 | `vmt` (17) | the type sniffing, conditional keys, flags-are-not-vars, fallback blocks, and patch expansion against a real temp-directory `Vfs` |
 | `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
-| `shader` (13) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule |
+| `shader` (24) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule — plus `VertexLitGeneric`'s parameter resolution: `WantsPhongShader`'s truth table, `env_cubemap`, the shader-supplied defaults that `param_value` does not give, the three envmap masks resolving against each other, and the alpha-test suppression when base alpha is spoken for |
 | `var` (12) | the value grammar and every coercion between the arms, plus the flag-name table against the bit constants |
-| `texture` (7) | the `.vtf` flags -> sampler policy, and name normalization |
-| `uniforms` (7) | the uniform block sizes WGSL expects, the no-fog packing, and the row-major/column-major conversion in both directions |
+| `texture` (7) | the `.vtf` flags -> sampler policy, and `NormalizeTextureName` — extensions stripped except `.hdr`, and only in the last path component |
+| `uniforms` (10) | the uniform block sizes WGSL expects — including `ModelLighting`'s hand-written tail padding, where Rust's alignment for an array of `[f32; 4]` is 4 and WGSL's is 16 — the no-fog packing, the row-major/column-major conversion in both directions, and the light type's two-`w`-component encoding |
 | `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout |
 | `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
-| `mesh` (6) | both vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
+| `mesh` (6) | the vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
 
 The `vtf` tests build files with an in-memory writer that can produce *archaic* and
@@ -1640,7 +1886,7 @@ module path apart, and its `near`/`far` are distances along `-z` rather than `z`
 first time round — the GPU depth test is what caught it, and this is the cheap check that
 keeps it caught.
 
-**End to end, on a real GPU** (19, in `preview.rs`) — a `.vmt` and a `.vtf`, through the
+**End to end, on a real GPU** (28, in `preview.rs`) — a `.vmt` and a `.vtf`, through the
 material system, onto the GPU, through real WGSL, and back to the CPU by rendering to an
 offscreen `RenderTarget` and reading the pixels back:
 
@@ -1665,6 +1911,15 @@ offscreen `RenderTarget` and reading the pixels back:
 | `an_alpha_tested_material_discards_below_its_reference` | the `discard` that replaces D3D9's fixed-function alpha test |
 | `a_material_with_no_base_texture_draws_white_not_the_checkerboard` | the difference between an *undefined* texture parameter and a *failed* one |
 | `identical_states_share_one_pipeline` | the dedup that replaces `TransitionTable` |
+| `the_ambient_cube_lights_each_axis_from_its_own_entry` | all six ambient-cube entries, in order. A swapped pair lights every model in a level from the wrong side and looks plausible |
+| `the_ambient_cube_is_ignored_when_it_is_disabled` | `m_bAmbientLight` — a model with no lighting environment lit by whatever the previous instance left behind |
+| `baked_vertex_light_is_gamma_decoded_and_doubled` | `GammaToLinear( c * cOverbright )`: dropping the doubling halves every prop in the game, dropping the decode brightens the darks |
+| `baked_vertex_light_is_ignored_when_it_is_disabled` | `g_flStaticLightEnabled`, the only thing that says whether the colour stream means anything |
+| `a_directional_light_ignores_distance_and_a_point_light_does_not` | the two `lerp`s that encode the light type in `color.w` and `direction.w`, and the `1/(a0 + a1·d + a2·d²)` denominator |
+| `half_lambert_lights_a_surface_that_lambert_leaves_black` | `$halflambert` restored from the flag against the CS:GO tree's hard-coded `false` |
+| `self_illumination_emits_where_the_lighting_is_black` | `$selfillum`, and with it the whole shader-supplied-defaults path — `$selfillummaskscale` reading 0 makes this test's quad black |
+| `a_bumped_model_takes_no_baked_vertex_light` | Valve's asymmetry between its two files: `bStaticLight = false` on the bumped path only |
+| `model_lighting_is_per_instance_and_two_draws_can_differ` | the group-3 arena — one lighting buffer rewritten between draws would give every draw in the frame the last values written |
 
 They earn the GPU: row pitch, block layout, channel order, winding, matrix convention,
 depth direction and bind group layout are all invisible to a unit test, and each produces

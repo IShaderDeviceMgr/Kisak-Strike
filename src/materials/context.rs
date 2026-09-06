@@ -74,8 +74,9 @@ use super::material::Material;
 use super::mesh::{DynamicBuffers, IndexSlice, VertexSlice};
 use super::pipeline::{PipelineCache, PipelineKey, RenderState, TargetFormat};
 use super::renderer::Frame;
+use super::shader::LightingBinding;
 use super::target::{RenderTarget, CLEAR_DEPTH};
-use super::uniforms::{self, DrawUniforms, FrameUniforms};
+use super::uniforms::{self, DrawUniforms, FrameUniforms, ModelLighting};
 
 /// Where a camera is and what it sees.
 ///
@@ -250,6 +251,9 @@ pub struct RenderContext {
     frames: UniformArena,
     /// One slot per draw.
     draws: UniformArena,
+    /// One slot per `set_model_lighting`. Group 3 for the shaders that light a
+    /// model rather than sample a lightmap page.
+    lights: UniformArena,
     dynamic: DynamicBuffers,
     /// Group 3 for a pass that has not bound a real lightmap page.
     ///
@@ -296,6 +300,13 @@ impl RenderContext {
                 size_of::<DrawUniforms>() as u64,
                 INITIAL_DRAWS,
             ),
+            lights: UniformArena::new(
+                device,
+                "model lighting",
+                layouts.model_lighting(),
+                size_of::<ModelLighting>() as u64,
+                INITIAL_LIGHTING,
+            ),
             dynamic: DynamicBuffers::new(device),
             device: device.clone(),
             queue: queue.clone(),
@@ -311,6 +322,7 @@ impl RenderContext {
     pub fn begin_frame(&mut self) {
         self.frames.begin_frame(&self.device);
         self.draws.begin_frame(&self.device);
+        self.lights.begin_frame(&self.device);
         self.dynamic.begin_frame(&self.device);
     }
 
@@ -408,6 +420,16 @@ impl RenderContext {
             bytemuck::bytes_of(&frame_uniforms),
         );
 
+        // Every pass starts with one fullbright lighting slot, so that a model
+        // draw before `set_model_lighting` binds something well-defined rather
+        // than reading whichever instance's lights were last in the arena. One
+        // slot per pass, which is the same cost as the frame block above.
+        let lighting_offset = self.lights.push(
+            &self.device,
+            &self.queue,
+            bytemuck::bytes_of(&ModelLighting::fullbright()),
+        );
+
         let (color_load, depth_load) = match load {
             Load::Clear(color) => (wgpu::LoadOp::Clear(color), wgpu::LoadOp::Clear(CLEAR_DEPTH)),
             Load::Keep => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
@@ -446,6 +468,8 @@ impl RenderContext {
             device: &self.device,
             queue: &self.queue,
             draws: &mut self.draws,
+            lights: &mut self.lights,
+            lighting_offset,
             dynamic: &mut self.dynamic,
             frame_bind_group: self.frames.bind_group().clone(),
             frame_offset,
@@ -514,6 +538,12 @@ pub struct Pass<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     draws: &'a mut UniformArena,
+    /// The model-lighting arena, group 3 for the shaders that read one.
+    lights: &'a mut UniformArena,
+    /// The slot in it that subsequent model draws bind. Set by
+    /// [`set_model_lighting`](Pass::set_model_lighting); starts at the
+    /// fullbright block this pass allocated when it opened.
+    lighting_offset: u32,
     /// Cloned rather than borrowed because the arena it belongs to may be
     /// replaced by a growing draw allocation, and `set_bind_group` needs
     /// something that outlives that. `wgpu::BindGroup` is a refcounted handle.
@@ -578,6 +608,29 @@ impl Pass<'_> {
     /// does not read a lightmap ignore it.
     pub fn bind_lightmap_page(&mut self, page: &super::lightmap::LightmapPage) {
         self.lightmap = Some(page.bind_group().clone());
+    }
+
+    /// Sets the ambient cube and local lights every subsequent model draw is
+    /// lit by.
+    ///
+    /// `R_StudioSetupLighting` plus the two per-instance commands it feeds —
+    /// `PI_SetVertexShaderAmbientLightCube` and `PI_SetPixelShaderLocalLighting`
+    /// (`vertexlitgeneric_dx9_helper.cpp:634`). It is pass state rather than an
+    /// argument to a draw for the reason those are per-*instance* commands: a
+    /// model is one lighting state and many meshes, so binding it per draw
+    /// would re-upload the same 432 bytes once per material the model wears.
+    ///
+    /// Applies from here to the end of the pass or the next call, like
+    /// [`bind_lightmap_page`](Pass::bind_lightmap_page). Draws of a shader that
+    /// does not light a model ignore it.
+    ///
+    /// Each call takes its own arena slot, so a caller may set it, draw, set it
+    /// again and draw again within one pass — which is exactly what a scene of
+    /// props does.
+    pub fn set_model_lighting(&mut self, lighting: &ModelLighting) {
+        self.lighting_offset =
+            self.lights
+                .push(self.device, self.queue, bytemuck::bytes_of(lighting));
     }
 
     /// Overrides part of every subsequent draw's pipeline state.
@@ -699,12 +752,21 @@ impl Pass<'_> {
         self.pass.set_bind_group(1, material.bind_group(), &[]);
         self.pass
             .set_bind_group(2, self.draws.bind_group(), &[offset]);
-        if material.shader.reads_lightmap() {
-            self.pass.set_bind_group(
-                3,
-                self.lightmap.as_ref().unwrap_or(&self.white_lightmap),
-                &[],
-            );
+        match material.shader.lighting_binding() {
+            None => {}
+            Some(LightingBinding::LightmapPage) => {
+                self.pass.set_bind_group(
+                    3,
+                    self.lightmap.as_ref().unwrap_or(&self.white_lightmap),
+                    &[],
+                );
+            }
+            // Read after any `set_model_lighting` in this pass, because a push
+            // that grew the arena replaced the bind group this names.
+            Some(LightingBinding::ModelLighting) => {
+                self.pass
+                    .set_bind_group(3, self.lights.bind_group(), &[self.lighting_offset]);
+            }
         }
         self.pass.set_vertex_buffer(0, vertices.buffer_slice());
         self.pass
@@ -717,6 +779,9 @@ impl Pass<'_> {
 /// an ordinary frame needs no growth.
 const INITIAL_PASSES: u64 = 64;
 const INITIAL_DRAWS: u64 = 4096;
+/// One per model instance rather than per draw — `R_StudioSetupLighting` runs
+/// once and every mesh of that model is drawn under it.
+const INITIAL_LIGHTING: u64 = 1024;
 
 /// A uniform buffer sub-allocated a slot at a time, bound with a dynamic
 /// offset.

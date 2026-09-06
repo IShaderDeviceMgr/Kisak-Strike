@@ -6,11 +6,13 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stages 1-4 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
+**Status: stages 1-6 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
 texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), the material path
-(`.vmt` → `Material` → `UnlitGeneric` in WGSL), and meshes plus the render context (typed
-vertex buffers, static and dynamic geometry, render targets, and a depth buffer). Stages
-5-8 not started. The implemented API is documented in
+(`.vmt` → `Material` → `UnlitGeneric` in WGSL), meshes plus the render context (typed
+vertex buffers, static and dynamic geometry, render targets, and a depth buffer),
+lightmaps with `LightmappedGeneric`, and `VertexLitGeneric` with the model lighting
+constants under it. Stage 6's remaining shaders and stages 7-8 are not started. The
+implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
 
@@ -809,14 +811,90 @@ milestone the project has.
    `GetMinimumDimensions` shrink, and everything `LightmappedGeneric` can do past a base
    texture, a bump map and a lightmap (`$basetexture2` blending, detail, envmap,
    selfillum, phong, seamless, flashlight, CSM, paint).
-6. **`VertexLitGeneric` + the remaining core shader set** (§7). This is where the vertex
-   layout question §10 expected `LightmappedGeneric` to force actually lands — see below.
+6. **`VertexLitGeneric`** (§7). **Done**; the rest of §7.8's shader set is not. Landed as
+   `ShaderKind::VertexLitGeneric`, `shaders/vertexlitgeneric.wgsl`, `mesh::ModelVertex`,
+   `uniforms::{Light, ModelLighting}`, a second shape for bind group 3, and the cubemap
+   half of the texture path. **Deliverable met:** all **1,108** of Portal 2's
+   `VertexLitGeneric` materials load and build a pipeline — none falls back to the error
+   material, and the whole set needs **15** pipelines. **API:
+   [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md).**
+
+   Decisions made here that the later stages inherit:
+
+   - **§7.8's list was verified against shipped content before anything was written, as
+     §7.8 asks, and the answer reshaped the stage.** Of Portal 2's 3,431 `.vmt` files,
+     `VertexLitGeneric` is 1,108 and `materials/models/` is 1,012 of its 1,096 — models
+     are this shader and essentially nothing else, so "unblock static props" and "port
+     `VertexLitGeneric`" are the same task. The rest of the model set is `Refract` (21),
+     `UnlitTwoTexture` (12), `Portal`/`PortalRefract` (12) and `EyeRefract` (4); none is
+     needed by a static prop.
+   - **A `.vmt` naming `VertexLitGeneric` reaches one of *two* shaders, and this document
+     did not say so.** `DrawVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:2346`)
+     hands the material to `DrawPhong_DX9` when `WantsPhongShader` is true — `$phong 1`
+     plus a `$bumpmap`, a `$lightwarptexture` or `$basemapalphaphongmask 1`. That is
+     **317 of the 1,108**, measured. §7.8 lists `Phong` separately and it is not ported,
+     so those materials draw here without their specular and say so once at load.
+   - **The vertex layout question landed here rather than on `LightmappedGeneric`, and was
+     declined anyway.** `VertexLitGeneric`'s shadow phase asks for a tangent
+     (`userDataSize = 4`) only when the material is bumped, so Valve genuinely has two
+     vertex formats for one shader. This port keeps one: the tangent is in the `.vvd`
+     either way, only 71 of the 801 non-phong materials are bumped, and a layout that
+     depends on a `.vmt` rather than on a `ShaderKind` costs `PipelineKey` a field. §10's
+     prediction is therefore still open, and its likeliest trigger is still
+     `LightmappedGeneric`'s `$envmap`.
+   - **Group 3 is "where this shader's lighting comes from", not "the lightmap page".**
+     Stage 5 reserved it for the atlas; a model's lighting is an ambient cube plus up to
+     four local lights, which is the same *kind* of thing — per-batch or per-instance
+     state that belongs to neither the material nor the draw. `ShaderKind::reads_lightmap`
+     became `lighting_binding() -> Option<LightingBinding>` and the pipeline layout picks
+     between two group-3 layouts. Skinning takes the next free group.
+   - **The unbumped path is Gouraud and the bumped path is Phong, and that split is
+     preserved.** They are two files in the original, not two variants of one, and they
+     differ in *where the lighting happens*. Unifying them on the per-pixel path would be
+     prettier and would silently change how every unbumped prop in the game is shaded.
+     A consequence that reads as a bug until checked: **a bumped model gets no baked
+     vertex light at all** — `..._bump_ps2x.fxc:452` passes `bStaticLight = false`,
+     because a per-vertex stream cannot be re-evaluated against a per-pixel normal.
+   - **`$envmap "env_cubemap"` is not a texture name.** `LoadCubeMap`
+     (`shadersystem.cpp:1840`) sets the var to `(ITexture *)-1` and flags the material;
+     the cubemap arrives *per draw* from the render instance, because which one a model
+     reflects depends on where it is standing. 78 materials say it. They bind a 1x1 black
+     cube until the `.bsp`'s pak lump is mounted, at which point this becomes
+     render-context state alongside the lightmap page.
+   - **Two CS:GO-shaped defaults were found in this shader and both are reversed**, which
+     is `PORTING.md`'s standing warning arriving in a specific place. `bHalfLambert` is
+     hard-coded `false` over a commented-out read of the material flag, "not compatible
+     with CSM's" (`:679`); and `SoftenCosineTerm` — `(d + d²)/2`, tagged `// For CS:GO` at
+     both call sites — changes the diffuse falloff of every lit surface. Portal 2 has
+     neither, so the flag is read and the softening is dropped.
+
+   **A finding that corrects §7.2 further.** §7.2 was already corrected in stage 3 to say
+   that `SHADER_PARAM`'s declared default is documentation. The other half is that there
+   are **two** live default mechanisms, not one: `SHADER_INIT_PARAMS` *writes* real
+   defaults into the var array before `InitShaderParameters` fills the rest from the
+   declared type. `param_value` is only the second, so reading `$detailscale` through it
+   and appending `.unwrap_or( 4.0 )` compiles, reads correctly and yields 0. This cost a
+   debugging session; `init_float`/`init_vec` are the first mechanism.
+
+   **A pre-existing defect this stage's content sweep found and fixed**, in stage 2's
+   code: `texture::normalize_name` did not implement `NormalizeTextureName`
+   (`itextureinternal.h:155`), which strips any extension except `.hdr`. Four Portal 2
+   materials name a texture with a stray `.vtf` or `.tga` on it and drew as checkerboards.
+   The `.hdr` exception is not decoration — it is what `LoadCubeMap`'s HDR-name lookup
+   depends on.
+
+   Still owed from this stage: `$phong` and the whole `Phong` shader, the flashlight,
+   cascaded shadow maps, `$lightwarptexture`, `$rimlight`, self-illum fresnel, wrinkle
+   maps, tree sway, `$decaltexture`, `$tintmask`, seamless mapping, distance alpha, and
+   skinning and morphing — plus the rest of §7.8's shader set.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–5 are done. `PORTING.md`'s ordering rule — follow the boot path depth-first —
-puts **input** next, then `console/`; stage 6 is a breadth move and is not gated on
-either.
+Stages 1–6 are done, `VertexLitGeneric` being the whole of stage 6 so far. The rest of
+§7.8's shader set is a breadth move gated on nothing; the next thing *models* need is not
+in this module at all, but in `studiorender` — a `.mdl`/`.vvd`/`.vtx` reader — and in the
+engine's `sprp` game lump and `R_StudioSetupLighting`, which is what fills the
+`ModelLighting` block this stage built.
 
 ## 10. Open questions and risks
 
@@ -832,15 +910,35 @@ either.
   likely to force the question is `LightmappedGeneric`, whose bumped/unbumped split
   changes the vertex layout — a real bucket-3 axis, and therefore a pipeline variant
   before it is a source-text one.
-- **How many pipeline variants actually survive?** §7.3 predicts single digits per
-  shader. If a shader genuinely needs dozens, the pipeline cache needs an on-disk warm
-  cache and the plan needs a stage for it. *Stage 3 update:* `UnlitGeneric`'s
-  `RenderState` has 2 × 2 × 2 × 2 × 5 × 2 × 2 reachable combinations on paper, but the
-  ones content actually asks for are far fewer — `PipelineCache::len()` is the
-  measurement, and the honest answer needs a real map's material list. *Stage 4 update:*
-  the target format is now part of the key and has one more field that varies (a depth
-  attachment, present for the back buffer and optional for render targets), so the count
-  is per-shader-per-target rather than per-shader. Still single digits.
+
+  **Stage 6 update — the condition this bullet set has been met, and the answer is
+  "none of the three".** Three shaders now exist, and not one has needed a textual
+  variant. The strongest evidence is `VertexLitGeneric`, which is the case designed to
+  break it: Valve ships it as *two source files* — `vertexlit_and_unlit_generic_*.fxc`
+  and the `_bump_` pair — that differ in which shader stage the lighting runs in, which
+  is as close to a genuine source-text variant as this shader set gets. It is one WGSL
+  module with a uniform branch on a flag bit, and the branch is uniform across a draw so
+  the cost is a predicted jump. Every other axis of both files sorted into bucket 1
+  (pinned: consoles, `ps20`, tools, CSM, skinning, morph, `STATICLIGHT3`) or bucket 2 (a
+  flag word, or an `i32` the shader `switch`es on for `$detailblendmode`'s thirteen
+  values).
+
+  **So the mechanism is string concatenation, and this question is closed** — `naga_oil`,
+  `override` constants and a build-time preprocessor are all *not* chosen, on evidence
+  rather than on deferral. The condition to reopen it: a shader whose variants differ in
+  something a uniform cannot express — a different *binding* set, a different entry
+  point, or a loop whose trip count must be a compile-time constant. The flashlight's
+  shadow-filter modes (`FLASHLIGHTDEPTHFILTERMODE`, four filter kernels) are the first
+  plausible candidate in §7.8's remaining set.
+- ~~**How many pipeline variants actually survive?**~~ **Answered, by measurement.**
+  §7.3 predicted single digits per shader. Loading **all 1,108** of Portal 2's
+  `VertexLitGeneric` materials through the real `MaterialCache` and asking for one
+  pipeline each produces **15** — a low double digit against the whole game's model
+  material set, for one target format. No on-disk warm cache is needed and the plan needs
+  no stage for one. (Earlier updates, kept because they say what the count is *of*:
+  `UnlitGeneric`'s `RenderState` has 2 × 2 × 2 × 2 × 5 × 2 × 2 reachable combinations on
+  paper and content asks for far fewer; stage 4 put the target format in the key, so the
+  count is per-shader-per-target.)
 - **Vertex-texture-fetch morph** (`ApplyMorph`/`SampleMorphDelta` in `common_vs_fxc.h`)
   is tied to `morph.cpp`, which §2 defers. Make sure deferring it doesn't silently break
   the shaders that call it — the prelude needs a no-op path.
@@ -852,6 +950,11 @@ either.
   `DecompressBoneWeights` is the other half of the same decision, so **answer it with
   skinning, not before it**. *Stage 5 update: still open.* `LightmappedGeneric`'s
   `WorldVertex` is uncompressed and so is Valve's — brush geometry never declared the flag.
+  *Stage 6 update: still open, and now deliberately deferred rather than merely
+  untouched.* `VertexLitGeneric` does declare the flag, and `ModelVertex` is uncompressed
+  anyway: there is no `.vvd` reader yet, so there is nothing packed to unpack, and the
+  decision still belongs with skinning. The three combos it would have brought —
+  `COMPRESSED_VERTS`, `SKINNING`, `MORPHING` — are all bucket 1 for now.
 - ~~**Render-target stack semantics.**~~ **Resolved in stage 4, and the answer was
   simpler than the question.** `wgpu` render passes are not nestable, so the stack was
   deleted rather than restructured: a target, a viewport and a camera are the arguments

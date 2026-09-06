@@ -194,9 +194,29 @@ impl World {
         let error_material = materials.error_material();
         let mut resolved: BTreeMap<&str, (Arc<Material>, MaterialInfo)> = BTreeMap::new();
         for name in groups.keys() {
-            let material = materials.load(vfs, name);
+            let mut material = materials.load(vfs, name);
             stats.materials += 1;
             if Arc::ptr_eq(&material, &error_material) {
+                stats.materials_missing += 1;
+            }
+            // A brush face is not a model, and this builder can only write the
+            // two layouts a `.bsp` has the data for: it has no per-vertex
+            // normal, no tangent and no baked static-light stream, which is
+            // what [`VertexLayout::Model`] is made of. A mapper *can* put a
+            // model shader on a world surface, so this is reachable — and
+            // there is no honest geometry to emit for it, only a guess. The
+            // error material is the same answer the cache gives an unknown
+            // shader, one step later: visibly wrong beats plausibly wrong.
+            if !matches!(
+                material.shader.vertex_layout(),
+                VertexLayout::Simple | VertexLayout::World
+            ) {
+                eprintln!(
+                    "source-engine: world: {name}: {} needs model geometry, \
+                     which a brush face does not have",
+                    material.shader.name()
+                );
+                material = Arc::clone(&error_material);
                 stats.materials_missing += 1;
             }
             let info = MaterialInfo {
@@ -362,10 +382,16 @@ enum MeshVertices {
 }
 
 impl MeshVertices {
+    /// # Panics
+    ///
+    /// On [`VertexLayout::Model`], which [`World::load`] substitutes the error
+    /// material for before any geometry is built — a brush face has no normal,
+    /// tangent or static-light stream to fill one with.
     fn empty(layout: VertexLayout) -> MeshVertices {
         match layout {
             VertexLayout::Simple => MeshVertices::Simple(Vec::new()),
             VertexLayout::World => MeshVertices::World(Vec::new()),
+            VertexLayout::Model => unreachable!("model geometry is not built from a .bsp face"),
         }
     }
 

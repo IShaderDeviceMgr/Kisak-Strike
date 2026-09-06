@@ -24,7 +24,8 @@ use glam::{Mat4, Vec3};
 
 use super::context::{Camera, Load, Pass, RenderContext};
 use super::material::Material;
-use super::mesh::{IndexBuffer, SimpleVertex, VertexBuffer};
+use super::mesh::{IndexBuffer, ModelVertex, SimpleVertex, VertexBuffer, VertexLayout};
+use super::uniforms::{Light, ModelLighting, AMBIENT_CUBE_FACES, MAX_LIGHTS};
 
 // The non-deprecated spelling of `Mat4::look_at_rh`. Right-handed, Y-up.
 use glam::camera::rh::view::look_at_mat4 as look_at;
@@ -48,6 +49,13 @@ const CUBE_OFFSETS: [Vec3; 2] = [Vec3::new(-0.45, 0.0, 0.45), Vec3::new(0.45, 0.
 /// this file no longer mentions them is the measure of stage 4.
 pub struct MaterialPreview {
     vertices: VertexBuffer,
+    /// The same cube in [`VertexLayout::Model`], for the shaders that read one.
+    ///
+    /// Two buffers rather than one, because a draw's vertices must be the
+    /// layout its material's shader declared and `Pass::draw` panics otherwise.
+    /// Which one a `-vmt` uses is decided by the `.vmt`, so the preview cannot
+    /// pick at construction time and builds both — 24 vertices each.
+    model_vertices: VertexBuffer,
     indices: IndexBuffer,
     /// The ground quad's indices, uploaded once even though its vertices are
     /// rebuilt every frame — see [`MaterialPreview::draw`].
@@ -57,8 +65,10 @@ pub struct MaterialPreview {
 impl MaterialPreview {
     pub fn new(device: &wgpu::Device) -> MaterialPreview {
         let (vertices, indices) = cube();
+        let model_vertices = model_cube();
         MaterialPreview {
             vertices: VertexBuffer::new(device, "preview cube", &vertices),
+            model_vertices: VertexBuffer::new(device, "preview model cube", &model_vertices),
             indices: IndexBuffer::new(device, "preview cube", &indices),
             ground_indices: IndexBuffer::new(device, "preview ground", &QUAD_INDICES),
         }
@@ -98,10 +108,24 @@ impl MaterialPreview {
     /// indices, are both shapes the API has to allow (see
     /// [`mesh`](super::mesh)).
     pub fn draw(&self, pass: &mut Pass<'_>, material: &Material) {
+        let model_layout = material.shader.vertex_layout() == VertexLayout::Model;
+        if model_layout {
+            // A model shader reads group 3, and nothing here is a real
+            // lighting environment — so the preview supplies one that makes
+            // the shading visible and the cube's *ordering* checkable. See
+            // `preview_lighting`.
+            pass.set_model_lighting(&preview_lighting());
+        }
+        let vertices = if model_layout {
+            self.model_vertices.slice()
+        } else {
+            self.vertices.slice()
+        };
+
         for offset in CUBE_OFFSETS {
             pass.draw(
                 material,
-                &self.vertices.slice(),
+                &vertices,
                 &self.indices.slice(),
                 Mat4::from_translation(offset),
             );
@@ -115,12 +139,31 @@ impl MaterialPreview {
         // the other way round the ground is back-face culled and simply
         // absent — which is what happened first time round, and is why
         // `the_preview_scene_draws_its_ground` exists.
-        let ground = pass.vertices(&[
-            SimpleVertex::new([-R, Y, R], [0.0, 4.0]),
-            SimpleVertex::new([R, Y, R], [4.0, 4.0]),
-            SimpleVertex::new([R, Y, -R], [4.0, 0.0]),
-            SimpleVertex::new([-R, Y, -R], [0.0, 0.0]),
-        ]);
+        const CORNERS: [([f32; 3], [f32; 2]); 4] = [
+            ([-R, Y, R], [0.0, 4.0]),
+            ([R, Y, R], [4.0, 4.0]),
+            ([R, Y, -R], [4.0, 0.0]),
+            ([-R, Y, -R], [0.0, 0.0]),
+        ];
+        let ground = if model_layout {
+            let vertices: Vec<ModelVertex> = CORNERS
+                .iter()
+                .map(|&(position, texcoord)| {
+                    let mut vertex = ModelVertex::new(position, [0.0, 1.0, 0.0], texcoord);
+                    // +x is the texture's u; the binormal sign is -1 for the
+                    // same reason it is on the cube's faces.
+                    vertex.tangent = [1.0, 0.0, 0.0, -1.0];
+                    vertex
+                })
+                .collect();
+            pass.vertices(&vertices)
+        } else {
+            let vertices: Vec<SimpleVertex> = CORNERS
+                .iter()
+                .map(|&(position, texcoord)| SimpleVertex::new(position, texcoord))
+                .collect();
+            pass.vertices(&vertices)
+        };
         pass.draw(
             material,
             &ground,
@@ -139,6 +182,23 @@ impl MaterialPreview {
 /// Two triangles over four corners, wound counter-clockwise as seen from `+n`.
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
+/// For each cube face: the outward normal, and two in-plane axes chosen so that
+/// `u cross v == n`. That is exactly the condition that makes
+/// `c0 -> c1 -> c2 -> c3` run counter-clockwise seen from `+n`.
+///
+/// Shared by [`cube`] and [`model_cube`], which is the whole reason it is not
+/// a local: a model vertex needs the normal and the tangent that these axes
+/// *are*, and re-deriving them from the positions would be a second chance to
+/// get the winding wrong.
+const CUBE_FACES: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+    ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+    ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+    ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+    ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+    ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+];
+
 /// A unit cube centred on the origin, one quad per face.
 ///
 /// Twenty-four vertices rather than eight, because each face needs the whole
@@ -151,21 +211,9 @@ const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 /// counter-clockwise *as seen from outside*, and getting one face backwards
 /// does not draw it mirrored — it draws a hole, silently.
 fn cube() -> (Vec<SimpleVertex>, Vec<u16>) {
-    // For each face: the outward normal, and two in-plane axes chosen so that
-    // `u cross v == n`. That is exactly the condition that makes
-    // `c0 -> c1 -> c2 -> c3` run counter-clockwise seen from `+n`.
-    const FACES: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
-        ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
-        ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
-        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
-        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
-        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-    ];
-
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
-    for (normal, u, v) in FACES {
+    for (normal, u, v) in CUBE_FACES {
         let base = vertices.len() as u16;
         // (-u, -v), (+u, -v), (+u, +v), (-u, +v), each at half extent from the
         // face's centre, which is the normal scaled to the half extent too.
@@ -181,6 +229,73 @@ fn cube() -> (Vec<SimpleVertex>, Vec<u16>) {
         indices.extend(QUAD_INDICES.iter().map(|i| base + i));
     }
     (vertices, indices)
+}
+
+/// The same cube as [`cube`], in [`VertexLayout::Model`].
+///
+/// Shares that function's face table, and gains the two attributes a model
+/// vertex has and a simple one does not: the face normal, and a tangent frame.
+///
+/// **The binormal sign is -1, and it is not arbitrary.** `cube`'s texture
+/// coordinates run `u` along `+u` and `v` along `-v` (the corner table's `v`
+/// goes from 1 to 0 as `sv` goes from -0.5 to 0.5). Valve's shader builds the
+/// binormal as `cross( normal, tangent ) * tangent.w`, and `cross( n, u )` is
+/// `+v` by the table's own `u × v == n` invariant — so reaching the texture's
+/// increasing-`v` direction needs the sign flipped. With `+1` a normal map
+/// previews lit from the wrong side along one axis only, which is exactly the
+/// kind of half-wrong that survives a glance.
+fn model_cube() -> Vec<ModelVertex> {
+    let (simple, _) = cube();
+    let mut vertices = Vec::with_capacity(simple.len());
+    for (face, chunk) in simple.chunks(4).enumerate() {
+        let (normal, u, _) = CUBE_FACES[face];
+        for vertex in chunk {
+            let mut model = ModelVertex::new(vertex.position, normal, vertex.texcoord);
+            model.tangent = [u[0], u[1], u[2], -1.0];
+            vertices.push(model);
+        }
+    }
+    vertices
+}
+
+/// The lighting a `-vmt` preview of a model material is drawn under.
+///
+/// There is no lighting environment here to be faithful to — `-vmt` is a
+/// verification path, not a scene — so this is chosen to make the two things
+/// that are easy to get wrong *visible*:
+///
+///   - **The ambient cube's axis order.** The six entries are deliberately
+///     unequal and unequal per axis, so a swapped pair shows as a cube face
+///     with the wrong tint rather than as nothing. Up (`+y` in the preview's
+///     Y-up world, which is index 2) is the brightest, as a sky is.
+///   - **The local light path.** One white point light, offset so that its
+///     falloff is visible across the ground quad and the two cubes shade
+///     differently from each other.
+///
+/// `static_light` is off: a preview cube has no `vrad` bake, and its colour
+/// stream is [`ModelVertex::new`]'s black. Leaving it on would be dishonest
+/// in the other direction — the model would be lit by a stream that means
+/// nothing.
+fn preview_lighting() -> ModelLighting {
+    let mut lighting = ModelLighting::fullbright();
+    // +x, -x, +y, -y, +z, -z.
+    let cube: [[f32; 4]; AMBIENT_CUBE_FACES] = [
+        [0.16, 0.15, 0.14, 0.0],
+        [0.10, 0.11, 0.14, 0.0],
+        [0.34, 0.36, 0.40, 0.0],
+        [0.05, 0.05, 0.06, 0.0],
+        [0.14, 0.15, 0.16, 0.0],
+        [0.11, 0.10, 0.10, 0.0],
+    ];
+    lighting.ambient_cube = cube;
+    lighting.ambient_light = 1;
+    lighting.static_light = 0;
+    lighting.lights = [Light::NONE; MAX_LIGHTS];
+    // Constant 0, linear 0, quadratic 1/r² at about 4 units: bright at the
+    // cubes, dim at the edge of the ground quad.
+    lighting.lights[0] = Light::point([1.0, 0.95, 0.9], [1.6, 2.4, 1.6], [0.0, 0.0, 0.06]);
+    lighting.count = 1;
+    lighting
 }
 
 impl RenderContext {
@@ -230,6 +345,7 @@ mod tests {
     use crate::materials::image_format::{ColorSpace, ImageFormat};
     use crate::materials::material::{MaterialCache, TextureFallbacks};
     use crate::materials::pipeline::PipelineCache;
+    use crate::materials::shader::TextureDimension;
     use crate::materials::target::RenderTarget;
     use crate::materials::texture::{sampler_key, Texture, TextureCache};
     use crate::materials::vmt::Vmt;
@@ -320,7 +436,23 @@ mod tests {
         body: &str,
         base: Arc<Texture>,
     ) -> Material {
-        let text = format!("\"UnlitGeneric\" {{ \"$basetexture\" \"test\" {body} }}");
+        shader_material(device, queue, pipelines, "UnlitGeneric", body, base)
+    }
+
+    /// [`material`] for a shader other than `UnlitGeneric`.
+    ///
+    /// The cube fallback is the real black one rather than `base`, because a
+    /// `VertexLitGeneric` bind group has a cube entry that no test material
+    /// names and a 2D texture cannot fill.
+    fn shader_material(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &PipelineCache,
+        shader: &str,
+        body: &str,
+        base: Arc<Texture>,
+    ) -> Material {
+        let text = format!("\"{shader}\" {{ \"$basetexture\" \"test\" {body} }}");
         let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
         let vmt = Vmt::from_keyvalues("test.vmt", &document).expect("a shader block");
         // The fallbacks are `base` too: this material names its base texture,
@@ -329,6 +461,7 @@ mod tests {
         let fallback = TextureFallbacks {
             white: Arc::clone(&base),
             error: Arc::clone(&base),
+            black_cube: black_cube(device, queue),
         };
         Material::new(
             device,
@@ -337,9 +470,18 @@ mod tests {
             "test",
             &vmt,
             &fallback,
-            |_, _| Arc::clone(&base),
+            |_, _, dimension| match dimension {
+                TextureDimension::Cube => black_cube(device, queue),
+                TextureDimension::D2 => Arc::clone(&base),
+            },
         )
-        .expect("UnlitGeneric is ported")
+        .unwrap_or_else(|| panic!("{shader} is ported"))
+    }
+
+    /// The 1x1x6 black cubemap, for the fallback sets the tests build by hand.
+    fn black_cube(device: &wgpu::Device, queue: &wgpu::Queue) -> Arc<Texture> {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        Arc::new(Texture::black_cube(device, queue, sampler))
     }
 
     /// A flat-coloured 1x1 BGRA8 `.vtf`, which is the simplest thing a
@@ -431,6 +573,20 @@ mod tests {
 
         fn material(&self, body: &str, base: Arc<Texture>) -> Material {
             material(&self.device, &self.queue, &self.pipelines, body, base)
+        }
+
+        /// A `VertexLitGeneric` material. Its base texture is white unless the
+        /// caller wants otherwise, so that a lighting test reads the lighting
+        /// and nothing else.
+        fn model_material(&self, body: &str) -> Material {
+            shader_material(
+                &self.device,
+                &self.queue,
+                &self.pipelines,
+                "VertexLitGeneric",
+                body,
+                self.texture([255, 255, 255, 255]),
+            )
         }
 
         fn texture(&self, rgba: [u8; 4]) -> Arc<Texture> {
@@ -1092,6 +1248,7 @@ mod tests {
         let fallback = TextureFallbacks {
             white: textures.white_texture(),
             error: textures.error_texture(),
+            black_cube: textures.black_cube_texture(),
         };
         let flat = Material::new(
             &h.device,
@@ -1100,7 +1257,7 @@ mod tests {
             "flat",
             &vmt,
             &fallback,
-            |_, _| unreachable!("nothing to resolve: the material names no texture"),
+            |_, _, _| unreachable!("nothing to resolve: the material names no texture"),
         )
         .expect("UnlitGeneric is ported");
         let (vertices, indices) = quad([0.0, 0.0, 1.0, 1.0], 0.0);
@@ -1189,5 +1346,368 @@ mod tests {
                 "the {name} face was culled away"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // VertexLitGeneric
+    // ---------------------------------------------------------------------
+    // These are the only place the model shader's WGSL is compiled at all, so
+    // the first of them failing to *build a pipeline* is a syntax error and
+    // not a maths error. Every one after that pins a number that produces a
+    // plausible wrong picture rather than an error.
+
+    /// A screen-space quad in [`VertexLayout::Model`], with a chosen normal and
+    /// baked static-light colour.
+    ///
+    /// Same corners and same winding as [`quad`] — the difference is only the
+    /// two attributes a model vertex has. The normal is a parameter because
+    /// every lighting test below is a question about it.
+    fn model_quad(normal: [f32; 3], static_light: [f32; 4]) -> ([ModelVertex; 4], [u16; 6]) {
+        let corner = |x: f32, y: f32, u: f32, v: f32| {
+            let mut vertex = ModelVertex::new([x, y, 0.0], normal, [u, v]);
+            vertex.color = static_light;
+            vertex
+        };
+        (
+            [
+                corner(0.0, 0.0, 0.0, 0.0),
+                corner(1.0, 0.0, 1.0, 0.0),
+                corner(1.0, 1.0, 1.0, 1.0),
+                corner(0.0, 1.0, 0.0, 1.0),
+            ],
+            [0, 2, 1, 0, 3, 2],
+        )
+    }
+
+    /// Lighting with everything off: no ambient cube, no baked light, no local
+    /// lights. Whatever a test switches on is then the only source.
+    fn dark_lighting() -> ModelLighting {
+        ModelLighting {
+            ambient_cube: [[0.0; 4]; AMBIENT_CUBE_FACES],
+            lights: [Light::NONE; MAX_LIGHTS],
+            count: 0,
+            static_light: 0,
+            ambient_light: 0,
+            _padding: 0,
+        }
+    }
+
+    #[test]
+    fn the_ambient_cube_lights_each_axis_from_its_own_entry() {
+        // Gotcha #1 of the whole block: the cube is stored `+x, -x, +y, -y,
+        // +z, -z`, and a swapped pair lights every model in the game from the
+        // wrong side while looking entirely plausible. Six draws, six normals,
+        // six distinct answers.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+
+        let mut lighting = dark_lighting();
+        lighting.ambient_light = 1;
+        // Values chosen to land exactly on a byte: n/255 for n in 51..=204.
+        let levels = [51u8, 68, 85, 119, 153, 204];
+        for (face, level) in levels.iter().enumerate() {
+            lighting.ambient_cube[face] = [*level as f32 / 255.0, 0.0, 0.0, 0.0];
+        }
+
+        let axes = [
+            ("+x", [1.0, 0.0, 0.0]),
+            ("-x", [-1.0, 0.0, 0.0]),
+            ("+y", [0.0, 1.0, 0.0]),
+            ("-y", [0.0, -1.0, 0.0]),
+            ("+z", [0.0, 0.0, 1.0]),
+            ("-z", [0.0, 0.0, -1.0]),
+        ];
+        for (face, (name, normal)) in axes.iter().enumerate() {
+            let (vertices, indices) = model_quad(*normal, [0.0; 4]);
+            let pixels = h.render(|pass| {
+                pass.set_model_lighting(&lighting);
+                let v = pass.vertices(&vertices);
+                let i = pass.indices(&indices);
+                pass.draw(&material, &v, &i, Mat4::IDENTITY);
+            });
+            assert_eq!(
+                centre(&pixels)[0],
+                levels[face],
+                "a {name} normal read the wrong ambient cube entry"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ambient_cube_is_ignored_when_it_is_disabled() {
+        // `m_bAmbientLight`. A cube that is present but not enabled must
+        // contribute nothing, or a model with no lighting environment is lit
+        // by whatever the previous instance left behind.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.ambient_cube = [[1.0, 1.0, 1.0, 0.0]; AMBIENT_CUBE_FACES];
+        lighting.ambient_light = 0;
+
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels)[0], 0);
+    }
+
+    #[test]
+    fn baked_vertex_light_is_gamma_decoded_and_doubled() {
+        // `GammaToLinear( staticLightingColor * cOverbright )`
+        // (`common_vs_fxc.h:852`), and both halves matter: the stream is in
+        // gamma space *and* pre-multiplied by a half, so a baked 0.5 is a
+        // linear 1.0. Dropping the doubling halves every prop in the game;
+        // dropping the decode brightens the darks. Neither errors.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels), [255, 255, 255, 255]);
+
+        // A quarter is `GammaToLinear( 0.5 )` = 0.5^2.2 = 0.2176.
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.25, 0.25, 0.25, 1.0]);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        let expected = (0.5f32.powf(2.2) * 255.0).round() as i32;
+        assert!(
+            (centre(&pixels)[0] as i32 - expected).abs() <= 1,
+            "expected about {expected}, got {:?}",
+            centre(&pixels)
+        );
+    }
+
+    #[test]
+    fn baked_vertex_light_is_ignored_when_it_is_disabled() {
+        // `g_flStaticLightEnabled`. The stream is always in the vertex buffer;
+        // this flag is the only thing that says whether it means anything.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let lighting = dark_lighting();
+
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels)[0], 0);
+    }
+
+    #[test]
+    fn a_directional_light_ignores_distance_and_a_point_light_does_not() {
+        // The two `lerp`s at the end of `VertexAttenInternal`, which are how a
+        // shader with no branches encoded the light type. `color.w` selects
+        // directional and `direction.w` selects spot; get them the wrong way
+        // round and every point light in the game becomes unattenuated.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+
+        // A directional light shining along -z onto a +z-facing quad: N.L = 1,
+        // no attenuation, so a half-grey light reads back as half grey.
+        let mut lighting = dark_lighting();
+        lighting.lights[0] = Light::directional([0.5, 0.5, 0.5], [0.0, 0.0, -1.0]);
+        lighting.count = 1;
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(
+            centre(&pixels)[0],
+            128,
+            "a directional light is unattenuated"
+        );
+
+        // The same light as a point light above the quad's centre, with a
+        // purely quadratic falloff.
+        //
+        // **The expected value is computed at a corner, not at the centre**,
+        // and that is the second thing this test pins: the unbumped path lights
+        // in the *vertex* shader (`vertexlit_and_unlit_generic_vs20.fxc:437`),
+        // so what the middle pixel shows is the interpolation of four corner
+        // values, not the lighting of the middle. The four corners are
+        // equidistant from a light above the centre, so the interpolant is flat
+        // and the corner value is the answer — but it is emphatically not
+        // `1/2² * 0.5`, which is what the same light would give if this shader
+        // were Phong-shaded. Unify the two paths and this test is what fails.
+        let mut lighting = dark_lighting();
+        const HEIGHT: f32 = 2.0;
+        lighting.lights[0] = Light::point([0.5, 0.5, 0.5], [0.5, 0.5, HEIGHT], [0.0, 0.0, 1.0]);
+        lighting.count = 1;
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        // A corner is at (0, 0, 0) and the light at (0.5, 0.5, 2).
+        let distance_squared = 0.5 * 0.5 + 0.5 * 0.5 + HEIGHT * HEIGHT;
+        let cosine = HEIGHT / distance_squared.sqrt();
+        let expected = (0.5 * cosine / distance_squared * 255.0).round() as i32;
+        assert!(
+            (centre(&pixels)[0] as i32 - expected).abs() <= 1,
+            "expected about {expected} from 1/d^2 at a corner, got {:?}",
+            centre(&pixels)
+        );
+    }
+
+    #[test]
+    fn half_lambert_lights_a_surface_that_lambert_leaves_black() {
+        // `$halflambert`, and the reason it is here at all: the tree this port
+        // is derived from hard-codes `bHalfLambert = false` "for CSGO"
+        // (`vertexlitgeneric_dx9_helper.cpp:679`) over a commented-out read of
+        // the material flag. Portal 2 reads the flag, so this port does.
+        //
+        // A surface exactly edge-on to the light has N.L = 0: Lambert gives
+        // black, half-Lambert gives (0.5)^2 = a quarter.
+        let mut h = harness!(false);
+        let mut lighting = dark_lighting();
+        lighting.lights[0] = Light::directional([1.0, 1.0, 1.0], [0.0, -1.0, 0.0]);
+        lighting.count = 1;
+        // Normal +z, light shining along -y: perpendicular.
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+
+        let lambert = h.model_material("");
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&lambert, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels)[0], 0, "N.L is zero, so Lambert is black");
+
+        let half = h.model_material(r#""$halflambert" "1""#);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&half, &v, &i, Mat4::IDENTITY);
+        });
+        let expected = (0.25 * 255.0f32).round() as i32;
+        assert!(
+            (centre(&pixels)[0] as i32 - expected).abs() <= 1,
+            "expected about {expected}, got {:?}",
+            centre(&pixels)
+        );
+    }
+
+    #[test]
+    fn self_illumination_emits_where_the_lighting_is_black() {
+        // `$selfillum` lerps the lit colour toward `$selfillumtint * albedo` by
+        // base alpha. With no lighting at all, an alpha of 1 is the whole
+        // difference between a black model and a lit-looking one.
+        let mut h = harness!(false);
+        let lighting = dark_lighting();
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.0; 4]);
+
+        let material = shader_material(
+            &h.device,
+            &h.queue,
+            &h.pipelines,
+            "VertexLitGeneric",
+            r#""$selfillum" "1" "$selfillumtint" "[1 0 0]""#,
+            // Opaque white: base alpha is the self-illum mask.
+            h.texture([255, 255, 255, 255]),
+        );
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(
+            centre(&pixels)[0..3],
+            [255, 0, 0],
+            "a fully self-illuminating material emits its tint"
+        );
+    }
+
+    #[test]
+    fn a_bumped_model_takes_no_baked_vertex_light() {
+        // The asymmetry between Valve's two files, and the one most likely to
+        // read as a bug: `vertexlit_and_unlit_generic_bump_ps2x.fxc:452` calls
+        // `PixelShaderDoLighting` with `bStaticLight = false`, so a material
+        // with a `$bumpmap` is lit by the ambient cube and the local lights
+        // and by nothing else — the same model without the bump map is not.
+        let mut h = harness!(false);
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        let (vertices, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+
+        let unbumped = h.model_material("");
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&unbumped, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels)[0], 255, "unbumped reads the baked stream");
+
+        let bumped = h.model_material(r#""$bumpmap" "test""#);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&bumped, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(centre(&pixels)[0], 0, "bumped does not");
+    }
+
+    #[test]
+    fn model_lighting_is_per_instance_and_two_draws_can_differ() {
+        // The same hazard `DrawUniforms` has and for the same reason:
+        // `Queue::write_buffer` stages its copy ahead of the whole command
+        // buffer, so a single lighting buffer rewritten between draws would
+        // give every draw in the frame the last values written. Two quads,
+        // side by side, two lighting states.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+
+        let mut bright = dark_lighting();
+        bright.static_light = 1;
+        let dark = dark_lighting();
+
+        let (left, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let mut right = left;
+        for vertex in &mut right {
+            vertex.position[0] = vertex.position[0] * 0.5 + 0.5;
+        }
+        let mut left = left;
+        for vertex in &mut left {
+            vertex.position[0] *= 0.5;
+        }
+
+        let pixels = h.render(|pass| {
+            let i = pass.indices(&indices);
+
+            pass.set_model_lighting(&bright);
+            let v = pass.vertices(&left);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+
+            pass.set_model_lighting(&dark);
+            let v = pass.vertices(&right);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(pixel(&pixels, TARGET / 4, TARGET / 2)[0], 255);
+        assert_eq!(pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0], 0);
     }
 }

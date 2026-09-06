@@ -23,9 +23,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::shader::{
-    ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BUMP_SAMPLER,
-    BINDING_BUMP_TEXTURE, BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE,
-    BINDING_MATERIAL_UNIFORMS,
+    LightingBinding, ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BUMP_SAMPLER,
+    BINDING_BUMP_TEXTURE, BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE,
+    BINDING_ENVMAP_MASK_SAMPLER, BINDING_ENVMAP_MASK_TEXTURE, BINDING_ENVMAP_SAMPLER,
+    BINDING_ENVMAP_TEXTURE, BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE,
+    BINDING_MATERIAL_UNIFORMS, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
 };
 
 /// Fixed pipeline state, as a material asks for it.
@@ -220,7 +222,9 @@ pub struct BindLayouts {
     draw: wgpu::BindGroupLayout,
     unlit_material: wgpu::BindGroupLayout,
     lightmapped_material: wgpu::BindGroupLayout,
+    vertex_lit_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
+    model_lighting: wgpu::BindGroupLayout,
 }
 
 impl BindLayouts {
@@ -280,6 +284,39 @@ impl BindLayouts {
                     ],
                 },
             ),
+            vertex_lit_material: device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material: VertexLitGeneric"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: BINDING_MATERIAL_UNIFORMS,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        texture_entry(BINDING_BASE_TEXTURE),
+                        sampler_entry(BINDING_BASE_SAMPLER),
+                        texture_entry(BINDING_BUMP_TEXTURE),
+                        sampler_entry(BINDING_BUMP_SAMPLER),
+                        texture_entry(BINDING_DETAIL_TEXTURE),
+                        sampler_entry(BINDING_DETAIL_SAMPLER),
+                        texture_entry(BINDING_SELFILLUM_MASK_TEXTURE),
+                        sampler_entry(BINDING_SELFILLUM_MASK_SAMPLER),
+                        texture_entry(BINDING_ENVMAP_MASK_TEXTURE),
+                        sampler_entry(BINDING_ENVMAP_MASK_SAMPLER),
+                        // The one cube entry in the set. `EnvmapSampler` is
+                        // `samplerCUBE` in the HLSL; D3D9 typed the sampler in
+                        // the shader and WebGPU types it in the layout, which
+                        // is why `TextureRequest` has to carry a dimension.
+                        cube_texture_entry(BINDING_ENVMAP_TEXTURE),
+                        sampler_entry(BINDING_ENVMAP_SAMPLER),
+                    ],
+                },
+            ),
             lightmap: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("lightmap page"),
                 entries: &[
@@ -287,6 +324,7 @@ impl BindLayouts {
                     sampler_entry(BINDING_LIGHTMAP_SAMPLER),
                 ],
             }),
+            model_lighting: uniform_layout(device, "model lighting"),
         }
     }
 
@@ -305,6 +343,7 @@ impl BindLayouts {
         match shader {
             ShaderKind::UnlitGeneric => &self.unlit_material,
             ShaderKind::LightmappedGeneric => &self.lightmapped_material,
+            ShaderKind::VertexLitGeneric => &self.vertex_lit_material,
         }
     }
 
@@ -317,6 +356,24 @@ impl BindLayouts {
     pub fn lightmap(&self) -> &wgpu::BindGroupLayout {
         &self.lightmap
     }
+
+    /// Group 3, for the shaders that read
+    /// [`ModelLighting`](super::uniforms::ModelLighting).
+    ///
+    /// A dynamic-offset uniform, unlike the lightmap page: a page is per
+    /// *batch* and a model's lighting is per *instance*, so this is
+    /// bump-allocated out of an arena the same way group 2 is.
+    pub fn model_lighting(&self) -> &wgpu::BindGroupLayout {
+        &self.model_lighting
+    }
+
+    /// Group 3's layout for a shader, or `None` if it declares no group 3.
+    fn lighting(&self, shader: ShaderKind) -> Option<&wgpu::BindGroupLayout> {
+        match shader.lighting_binding()? {
+            LightingBinding::LightmapPage => Some(&self.lightmap),
+            LightingBinding::ModelLighting => Some(&self.model_lighting),
+        }
+    }
 }
 
 /// A filterable 2D texture at `binding`.
@@ -327,6 +384,20 @@ const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// A filterable cubemap at `binding`.
+const fn cube_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::Cube,
             multisampled: false,
         },
         count: None,
@@ -416,7 +487,8 @@ impl PipelineCache {
                 })
         });
 
-        // Group 3 exists only for the shaders that read a lightmap page. A
+        // Group 3 exists only for the shaders whose lighting comes from
+        // somewhere — a lightmap page, or a model's ambient cube and lights. A
         // pipeline layout is per shader, so declaring it unconditionally would
         // oblige every draw of every shader to bind something there.
         let mut groups = vec![
@@ -424,8 +496,8 @@ impl PipelineCache {
             Some(self.layouts.material(key.shader)),
             Some(&self.layouts.draw),
         ];
-        if key.shader.reads_lightmap() {
-            groups.push(Some(&self.layouts.lightmap));
+        if let Some(lighting) = self.layouts.lighting(key.shader) {
+            groups.push(Some(lighting));
         }
         let layout = self
             .device

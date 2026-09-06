@@ -71,6 +71,11 @@ use super::vmt::Vmt;
 /// (`shadersystem.cpp:1290`), which looked a name up in a `CUtlDict` populated
 /// by whichever `shaderapi.so` had been `dlopen`ed. There is no registration
 /// step here and no way to fail to be registered.
+// `clippy::enum_variant_names`: every variant ends in `Generic`, and all three
+// names are content surface area — a `.vmt`'s outermost key is matched against
+// them (`ShaderKind::from_name`), so renaming one to satisfy a lint would
+// break every material in the game.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShaderKind {
     /// Sprites, tool textures, UI in the world, and anything else whose colour
@@ -86,6 +91,50 @@ pub enum ShaderKind {
     /// `lightmappedgeneric_dx9_helper.cpp`, `lightmappedgeneric_vs20.fxc` and
     /// `lightmappedgeneric_ps2_3_x.h`.
     LightmappedGeneric,
+
+    /// Models: props, characters, gibs and debris. A base texture lit by an
+    /// ambient cube, up to four local lights, and whatever `vrad` baked into
+    /// the vertex stream — 1,012 of Portal 2's 1,096 `materials/models/`
+    /// materials, and the largest single shader in the shipped game.
+    ///
+    /// `stdshaders/vertexlitgeneric_dx9.cpp` through
+    /// `vertexlitgeneric_dx9_helper.cpp`, `vertexlit_and_unlit_generic_vs20.fxc`
+    /// and `vertexlit_and_unlit_generic_ps2x.fxc` — plus the `_bump_` pair of
+    /// the same names, which is the same shader with a normal map and is one
+    /// WGSL module here.
+    ///
+    /// **A `.vmt` naming `VertexLitGeneric` does not always reach this
+    /// shader.** `DrawVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:2346`)
+    /// opens by handing the material to `DrawPhong_DX9` when `WantsPhongShader`
+    /// says so — `$phong 1` plus any of a `$bumpmap`, a `$lightwarptexture` or
+    /// `$basemapalphaphongmask 1`. That is 307 of Portal 2's 1,108
+    /// `VertexLitGeneric` materials, and `Phong` is a separate entry in
+    /// `portdocs/MATERIALSYSTEM.md` §7.8 that is not ported: they draw here
+    /// without their specular. See [`wants_phong`].
+    VertexLitGeneric,
+}
+
+/// What a shader binds in group 3, if anything.
+///
+/// Group 3 is "where this shader's lighting comes from", and the two answers
+/// so far are the two ways Source lights a surface: a page of the baked
+/// lightmap atlas for brushes, an ambient cube plus local lights for models.
+/// A pipeline layout is per shader, so a shader that reads neither declares no
+/// group 3 at all and its draws bind nothing there.
+///
+/// Groups 0, 1 and 2 are frequency groups shared by every shader
+/// ([`uniforms`](super::uniforms)); this one is the exception, and it is an
+/// exception Valve had too — `BindLightmapPage` and
+/// `PI_SetVertexShaderAmbientLightCube` are both render-context state that
+/// neither the material nor the draw call owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LightingBinding {
+    /// A lightmap atlas page: a texture and its sampler.
+    /// [`Pass::bind_lightmap_page`](super::context::Pass::bind_lightmap_page).
+    LightmapPage,
+    /// [`ModelLighting`](super::uniforms::ModelLighting), bound with a dynamic
+    /// offset. [`Pass::set_model_lighting`](super::context::Pass::set_model_lighting).
+    ModelLighting,
 }
 
 impl ShaderKind {
@@ -107,6 +156,7 @@ impl ShaderKind {
             n if n.eq_ignore_ascii_case("LightmappedGeneric") => {
                 Some(ShaderKind::LightmappedGeneric)
             }
+            n if n.eq_ignore_ascii_case("VertexLitGeneric") => Some(ShaderKind::VertexLitGeneric),
             _ => None,
         }
     }
@@ -116,6 +166,7 @@ impl ShaderKind {
         match self {
             ShaderKind::UnlitGeneric => "UnlitGeneric",
             ShaderKind::LightmappedGeneric => "LightmappedGeneric",
+            ShaderKind::VertexLitGeneric => "VertexLitGeneric",
         }
     }
 
@@ -136,8 +187,14 @@ impl ShaderKind {
     /// VERTEX_TANGENT_T | VERTEX_NORMAL` only for an `$envmap`
     /// (`lightmappedgeneric_dx9_helper.cpp:670`). Bumped and unbumped read the
     /// same layout, and bumped lighting is a flag in a uniform — §7.3's bucket
-    /// 2 rather than bucket 3. The envmap variant is what will force the
-    /// question.
+    /// 2 rather than bucket 3.
+    ///
+    /// `VertexLitGeneric` *is* a shader with two of Valve's layouts — the
+    /// tangent is `userDataSize = 4` only when the material is bumped
+    /// (`vertexlitgeneric_dx9_helper.cpp:824`) — and this port still answers
+    /// with one, because the tangent is in the `.vvd` either way. The reasoning
+    /// and the condition to revisit are on
+    /// [`ModelVertex`](super::mesh::ModelVertex).
     pub fn vertex_layout(self) -> VertexLayout {
         match self {
             // `unlitgeneric_vs20.fxc`'s `VS_INPUT` also declares `vNormal`,
@@ -152,6 +209,10 @@ impl ShaderKind {
             // lightmapped coordinates in all cases"
             // (`matsys_interface.cpp:1502`).
             ShaderKind::LightmappedGeneric => VertexLayout::World,
+            // `VertexShaderVertexFormat( VERTEX_POSITION | VERTEX_NORMAL |
+            // VERTEX_COLOR_STREAM_1, 1, {2}, userDataSize )`
+            // (`vertexlitgeneric_dx9_helper.cpp:895`).
+            ShaderKind::VertexLitGeneric => VertexLayout::Model,
         }
     }
 
@@ -164,6 +225,7 @@ impl ShaderKind {
         let own = match self {
             ShaderKind::UnlitGeneric => UNLIT_GENERIC_PARAMS,
             ShaderKind::LightmappedGeneric => LIGHTMAPPED_GENERIC_PARAMS,
+            ShaderKind::VertexLitGeneric => VERTEX_LIT_GENERIC_PARAMS,
         };
         STANDARD_PARAMS.iter().chain(own)
     }
@@ -173,13 +235,18 @@ impl ShaderKind {
         self.params().find(|p| p.name.eq_ignore_ascii_case(name))
     }
 
-    /// Whether draws of this shader bind a lightmap page in group 3.
+    /// What draws of this shader bind in group 3.
     ///
-    /// `IMatRenderContext::BindLightmapPage` applied to every shader whether
-    /// it read one or not; here it decides a pipeline layout, so it has to be
-    /// answerable per shader.
-    pub fn reads_lightmap(self) -> bool {
-        matches!(self, ShaderKind::LightmappedGeneric)
+    /// `IMatRenderContext::BindLightmapPage` applied to every shader whether it
+    /// read one or not, and `PI_SetVertexShaderAmbientLightCube` was emitted
+    /// only by the shaders that wanted it; here both decide a pipeline layout,
+    /// so both have to be answerable per shader. See [`LightingBinding`].
+    pub fn lighting_binding(self) -> Option<LightingBinding> {
+        match self {
+            ShaderKind::UnlitGeneric => None,
+            ShaderKind::LightmappedGeneric => Some(LightingBinding::LightmapPage),
+            ShaderKind::VertexLitGeneric => Some(LightingBinding::ModelLighting),
+        }
     }
 
     /// The complete WGSL for this shader: the shared prelude, then the body.
@@ -195,6 +262,7 @@ impl ShaderKind {
         let body = match self {
             ShaderKind::UnlitGeneric => include_str!("shaders/unlitgeneric.wgsl"),
             ShaderKind::LightmappedGeneric => include_str!("shaders/lightmappedgeneric.wgsl"),
+            ShaderKind::VertexLitGeneric => include_str!("shaders/vertexlitgeneric.wgsl"),
         };
         format!("{}\n{}", include_str!("shaders/prelude.wgsl"), body)
     }
@@ -412,6 +480,204 @@ const LIGHTMAPPED_GENERIC_PARAMS: &[ShaderParam] = &[
     },
 ];
 
+/// `VertexLitGeneric`'s own parameters (`stdshaders/vertexlitgeneric_dx9.cpp:19`),
+/// restricted to the ones this port reads.
+///
+/// The declaration there has around 130 more, and they fall into three groups.
+/// **Other passes**: the emissive-scroll, cloak and flesh-interior blended
+/// passes, which are three whole extra shaders drawn over the top of this one
+/// (`emissive_scroll_blended_pass_helper.cpp` and friends) and are HL2/Alien
+/// Swarm content, not Portal 2's. **Other shaders**: everything `$phong` pulls
+/// in, which reaches `phong_dx9_helper.cpp` instead — see
+/// [`wants_phong`]. **Features not ported**: wrinkle maps, tree sway, decal
+/// textures, tint masks, displacement, distance alpha, seamless mapping,
+/// self-illum fresnel, the flashlight and cascaded shadow maps.
+///
+/// They are left out rather than declared-and-ignored, because a table that
+/// lists a parameter is a promise that setting it does something.
+const VERTEX_LIT_GENERIC_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$bumpmap",
+        kind: ParamKind::Texture,
+        declared_default: "models/shadertest/shader1_normal",
+        help: "bump map",
+    },
+    ShaderParam {
+        name: "$bumpframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $bumpmap",
+    },
+    ShaderParam {
+        name: "$bumptransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$bumpmap texcoord transform",
+    },
+    ShaderParam {
+        name: "$selfillumtint",
+        kind: ParamKind::Color,
+        declared_default: "[1 1 1]",
+        help: "Self-illumination tint",
+    },
+    ShaderParam {
+        name: "$selfillummask",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/BaseTexture",
+        help: "If we bind a texture here, it overrides base alpha (if any) for self illum",
+    },
+    ShaderParam {
+        name: "$selfillummaskscale",
+        kind: ParamKind::Float,
+        declared_default: "0",
+        help: "Scale self illum effect strength",
+    },
+    ShaderParam {
+        name: "$detail",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/detail",
+        help: "detail texture",
+    },
+    ShaderParam {
+        name: "$detailframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $detail",
+    },
+    ShaderParam {
+        name: "$detailscale",
+        kind: ParamKind::Float,
+        declared_default: "4",
+        help: "scale of the detail texture",
+    },
+    ShaderParam {
+        name: "$detailtint",
+        kind: ParamKind::Color,
+        declared_default: "[1 1 1]",
+        help: "detail texture tint",
+    },
+    ShaderParam {
+        name: "$detailblendmode",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "mode for combining detail texture with base",
+    },
+    ShaderParam {
+        name: "$detailblendfactor",
+        kind: ParamKind::Float,
+        declared_default: "1",
+        help: "blend amount for detail texture",
+    },
+    ShaderParam {
+        name: "$detailtexturetransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$detail texcoord transform",
+    },
+    ShaderParam {
+        name: "$envmap",
+        kind: ParamKind::Envmap,
+        declared_default: "shadertest/shadertest_env",
+        help: "envmap",
+    },
+    ShaderParam {
+        name: "$envmapframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "envmap frame number",
+    },
+    ShaderParam {
+        name: "$envmapmask",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/shadertest_envmask",
+        help: "envmap mask",
+    },
+    ShaderParam {
+        name: "$envmaptint",
+        kind: ParamKind::Color,
+        declared_default: "[1 1 1]",
+        help: "envmap tint",
+    },
+    ShaderParam {
+        name: "$envmapcontrast",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "contrast 0 == normal 1 == color*color",
+    },
+    ShaderParam {
+        name: "$envmapsaturation",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "saturation 0 == greyscale 1 == normal",
+    },
+    ShaderParam {
+        name: "$envmapfresnel",
+        kind: ParamKind::Float,
+        declared_default: "0",
+        help: "Degree to which Fresnel should be applied to env map",
+    },
+    ShaderParam {
+        name: "$envmapfresnelminmaxexp",
+        kind: ParamKind::Vec3,
+        declared_default: "[0.0 1.0 2.0]",
+        help: "Min/max fresnel range and exponent for vertexlitgeneric",
+    },
+    ShaderParam {
+        name: "$basealphaenvmapmaskminmaxexp",
+        kind: ParamKind::Vec3,
+        declared_default: "[1.0 0.0 1.0]",
+        help: "Min/max range and exponent for $basealphaenvmapmask",
+    },
+    ShaderParam {
+        name: "$blendtintbybasealpha",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "Use the base alpha to blend in the $color modulation",
+    },
+    ShaderParam {
+        name: "$notint",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "Disable tinting",
+    },
+    ShaderParam {
+        name: "$allowdiffusemodulation",
+        kind: ParamKind::Bool,
+        declared_default: "1",
+        help: "Allow per-instance color modulation",
+    },
+    ShaderParam {
+        name: "$phong",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "enables phong lighting",
+    },
+    ShaderParam {
+        name: "$basemapalphaphongmask",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "indicates that there is no normal map and that the phong mask is in base alpha",
+    },
+    ShaderParam {
+        name: "$lightwarptexture",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/BaseTexture",
+        help: "1D ramp texture for tinting scalar diffuse term",
+    },
+    ShaderParam {
+        name: "$alphatestreference",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "alpha below which $alphatest discards a pixel",
+    },
+    ShaderParam {
+        name: "$gammacolorread",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "disables sRGB conversion of the colour texture read",
+    },
+];
+
 /// The value of a parameter, or the default an undefined one takes.
 ///
 /// `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:838`) in one
@@ -437,6 +703,33 @@ pub fn param_value(kind: ShaderKind, vmt: &Vmt, name: &str) -> Option<MaterialVa
     kind.param(name)?.kind.default_value()
 }
 
+/// `InitFloatParam( index, params, default )` (`stdshaders/BaseVSShader.h`).
+///
+/// **[`param_value`] cannot express this, and the difference is a silent
+/// zero.** There are *two* default mechanisms in the original and they run in
+/// order:
+///
+/// 1. `SHADER_INIT_PARAMS` — the shader's own `InitParams*` function, which
+///    *writes* a real value into the var array for a parameter the `.vmt` left
+///    out. `$detailscale` becomes 4, `$envmapsaturation` becomes 1.
+/// 2. `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:865`), which
+///    fills anything still undefined from its declared *type* — 0 for a float,
+///    black for a colour.
+///
+/// [`param_value`] is the second. Reaching for it and then writing
+/// `.unwrap_or( 4.0 )` looks right and is dead code: the type default arrives
+/// first and the fallback never fires, so `$detailscale` silently becomes 0 and
+/// every detail texture collapses to a single texel. This function is the first
+/// mechanism, and anything with a non-type default must go through it.
+fn init_float(vmt: &Vmt, name: &str, default: f32) -> f32 {
+    vmt.var(name).map(|var| var.as_f32()).unwrap_or(default)
+}
+
+/// [`init_float`] for a `SetVecValue` default.
+fn init_vec(vmt: &Vmt, name: &str, default: [f32; 4]) -> [f32; 4] {
+    vmt.var(name).map(|var| var.as_vec4()).unwrap_or(default)
+}
+
 /// Where each texture is bound within group 1. A texture's sampler always
 /// goes in the binding after it, which is what lets
 /// [`Material::new`](super::material::Material::new) fill the group from
@@ -446,6 +739,16 @@ pub const BINDING_BASE_TEXTURE: u32 = 1;
 pub const BINDING_BASE_SAMPLER: u32 = 2;
 pub const BINDING_BUMP_TEXTURE: u32 = 3;
 pub const BINDING_BUMP_SAMPLER: u32 = 4;
+pub const BINDING_DETAIL_TEXTURE: u32 = 5;
+pub const BINDING_DETAIL_SAMPLER: u32 = 6;
+pub const BINDING_SELFILLUM_MASK_TEXTURE: u32 = 7;
+pub const BINDING_SELFILLUM_MASK_SAMPLER: u32 = 8;
+pub const BINDING_ENVMAP_MASK_TEXTURE: u32 = 9;
+pub const BINDING_ENVMAP_MASK_SAMPLER: u32 = 10;
+/// The environment cubemap. A **cube** view, not a 2D one — the only binding
+/// in the set that is, which is why [`TextureRequest`] has to say so.
+pub const BINDING_ENVMAP_TEXTURE: u32 = 11;
+pub const BINDING_ENVMAP_SAMPLER: u32 = 12;
 
 /// Where the lightmap page is bound, in group **3**.
 ///
@@ -470,6 +773,74 @@ pub struct TextureRequest {
     /// in the next binding.
     pub binding: u32,
     pub color_space: ColorSpace,
+    /// What shape of view the shader declares here.
+    ///
+    /// A bind group layout names a `view_dimension`, and binding the wrong
+    /// shape is a `wgpu` validation error rather than a wrong picture — so a
+    /// request has to carry it, and [`Material::new`](super::material::Material::new)
+    /// substitutes the fallback of the matching shape when the `.vmt` names
+    /// something else.
+    pub dimension: TextureDimension,
+}
+
+/// The two view shapes the shader set binds.
+///
+/// `IShaderShadow` had no equivalent: D3D9 samplers were typed by the *shader*
+/// (`sampler` versus `samplerCUBE` in the HLSL) and the runtime just bound
+/// whatever texture was in the var. WebGPU types the *layout*, so the shape has
+/// to be declared on this side too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureDimension {
+    D2,
+    Cube,
+}
+
+impl TextureDimension {
+    pub fn view_dimension(self) -> wgpu::TextureViewDimension {
+        match self {
+            TextureDimension::D2 => wgpu::TextureViewDimension::D2,
+            TextureDimension::Cube => wgpu::TextureViewDimension::Cube,
+        }
+    }
+}
+
+/// Whether a `VertexLitGeneric` `.vmt` is really drawn by the `Phong` shader.
+///
+/// `WantsPhongShaderInternal` (`vertexlitgeneric_dx9_helper.cpp:70`), which
+/// `DrawVertexLitGeneric_DX9` consults before doing anything else and which
+/// sends 307 of Portal 2's 1,108 `VertexLitGeneric` materials to
+/// `DrawPhong_DX9` instead. `mat_phong` defaults to 1 and there is no video
+/// options page here, so `WantsPhongShader`'s outer `mat_phong` test is taken
+/// as true and `$forcephong` is redundant.
+///
+/// **`Phong` is not ported**, so this does not change which code draws the
+/// material — it draws here, without specular. What it *is* for is saying so
+/// once, at load, instead of leaving a fifth of the game's models quietly
+/// wrong with nothing recording why.
+pub fn wants_phong(vmt: &Vmt) -> bool {
+    let kind = ShaderKind::VertexLitGeneric;
+    let defined = |name| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+
+    if !param_value(kind, vmt, "$phong").is_some_and(|var| var.as_bool()) {
+        return false;
+    }
+    // A lightwarp is enough on its own: "If there's Phong flag and diffuse
+    // warp do Phong".
+    if defined("$lightwarptexture") {
+        return true;
+    }
+    // Otherwise a bump map is required — unless the mask is in base alpha,
+    // which is the case that exists precisely because there is no normal map.
+    // Note the test is `!= 1`, not `== 0`: `$basemapalphaphongmask 2` also
+    // skips the bump-map requirement.
+    if param_value(kind, vmt, "$basemapalphaphongmask").map(|var| var.as_i32()) != Some(1) {
+        return defined("$bumpmap");
+    }
+    true
 }
 
 /// Which textures a material wants, and whether each is colour or data.
@@ -498,26 +869,94 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
                 param: "$basetexture",
                 binding: BINDING_BASE_TEXTURE,
                 color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
             },
             TextureRequest {
                 param: "$bumpmap",
                 binding: BINDING_BUMP_TEXTURE,
                 color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
             },
         ],
         ShaderKind::UnlitGeneric => {
-            let gamma_read =
-                param_value(kind, vmt, "$gammacolorread").is_some_and(|var| var.as_bool());
             vec![TextureRequest {
                 param: "$basetexture",
                 binding: BINDING_BASE_TEXTURE,
-                color_space: if gamma_read {
-                    ColorSpace::Linear
-                } else {
-                    ColorSpace::Srgb
-                },
+                color_space: base_texture_color_space(kind, vmt),
+                dimension: TextureDimension::D2,
             }]
         }
+        // `InitVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:369`),
+        // which is one `LoadTexture` per feature with its sRGB flag spelled
+        // out. Three of the six are *not* colour and the reasons differ:
+        // `$bumpmap` is `LoadBumpMap`, three signed directions stored as
+        // bytes; `$selfillummask` and `$envmapmask` are masks, and Valve
+        // passes them no flag at all (`:437`, `:463`).
+        ShaderKind::VertexLitGeneric => vec![
+            TextureRequest {
+                param: "$basetexture",
+                binding: BINDING_BASE_TEXTURE,
+                color_space: base_texture_color_space(kind, vmt),
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$bumpmap",
+                binding: BINDING_BUMP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            // `IsSRGBDetailTexture( nMode )` (`BaseVSShader.h:227`): only the
+            // three blend modes that put the detail texture *in the albedo*
+            // read it as colour. The other ten treat it as a mask or a
+            // modulation, where an sRGB decode would bend the curve.
+            TextureRequest {
+                param: "$detail",
+                binding: BINDING_DETAIL_TEXTURE,
+                color_space: if is_srgb_detail_texture(detail_blend_mode(vmt)) {
+                    ColorSpace::Srgb
+                } else {
+                    ColorSpace::Linear
+                },
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$selfillummask",
+                binding: BINDING_SELFILLUM_MASK_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$envmapmask",
+                binding: BINDING_ENVMAP_MASK_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            // `LoadCubeMap( info.m_nEnvmap, GetHDRType() == HDR_TYPE_NONE ?
+            // TEXTURE_FLAGS_SRGB : 0 )` (`:425`). Portal 2 ships HDR, so the
+            // cubemap is linear -- and its *name* gains a `.hdr` on the way to
+            // the filesystem, which is `MaterialCache`'s business rather than
+            // this table's.
+            TextureRequest {
+                param: "$envmap",
+                binding: BINDING_ENVMAP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::Cube,
+            },
+        ],
+    }
+}
+
+/// `$basetexture`'s colour space: sRGB unless `$gammacolorread` says otherwise.
+///
+/// `vertexlitgeneric_dx9_helper.cpp:784`, shared by both shaders that reach
+/// that helper. `$gammacolorread` is not obscure:
+/// `CMaterialSystem::CreateDebugMaterials` sets it on the error material itself
+/// (`cmaterialsystem.cpp:469`).
+fn base_texture_color_space(kind: ShaderKind, vmt: &Vmt) -> ColorSpace {
+    if param_value(kind, vmt, "$gammacolorread").is_some_and(|var| var.as_bool()) {
+        ColorSpace::Linear
+    } else {
+        ColorSpace::Srgb
     }
 }
 
@@ -605,6 +1044,54 @@ fn alpha_test_reference(kind: ShaderKind, vmt: &Vmt) -> f32 {
         .unwrap_or(DEFAULT_ALPHA_TEST_REFERENCE)
 }
 
+/// `DETAIL_BLEND_MODE_*` (`stdshaders/BaseVSShader.h:26`), which the shader
+/// reads as `TCOMBINE_*` (`common_ps_fxc.h:756`) — two names, one number, and
+/// the number is what a `.vmt` writes.
+///
+/// Declared whole rather than as the two modes Portal 2 uses, because the set
+/// is `$detailblendmode`'s content surface area and a number outside it should
+/// read as "not implemented" rather than as mode 0.
+#[allow(dead_code)]
+pub mod detail_blend {
+    /// `baseColor.rgb *= lerp( 1, 2 * detail.rgb, blend )`. The original mode.
+    pub const MOD2X: i32 = 0;
+    pub const ADDITIVE: i32 = 1;
+    pub const DETAIL_OVER_BASE: i32 = 2;
+    pub const FADE: i32 = 3;
+    pub const BASE_OVER_DETAIL: i32 = 4;
+    /// Added *after* lighting, in `TextureCombinePostLighting`.
+    pub const ADDITIVE_SELFILLUM: i32 = 5;
+    pub const ADDITIVE_SELFILLUM_THRESHOLD_FADE: i32 = 6;
+    /// Base alpha selects between the detail's `r` and `a` as a mod2x.
+    pub const MOD2X_SELECT_TWO_PATTERNS: i32 = 7;
+    pub const MULTIPLY: i32 = 8;
+    pub const MASK_BASE_BY_DETAIL_ALPHA: i32 = 9;
+    pub const SSBUMP_BUMP: i32 = 10;
+    pub const SSBUMP_NOBUMP: i32 = 11;
+    /// Not a mode a `.vmt` writes: what the shader is told when there is no
+    /// detail texture at all.
+    pub const NONE: i32 = 12;
+}
+
+/// `$detailblendmode`, defaulting to 0.
+fn detail_blend_mode(vmt: &Vmt) -> i32 {
+    param_value(ShaderKind::VertexLitGeneric, vmt, "$detailblendmode")
+        .map(|var| var.as_i32())
+        .unwrap_or(detail_blend::MOD2X)
+}
+
+/// `IsSRGBDetailTexture( nMode )` (`stdshaders/BaseVSShader.h:227`).
+///
+/// Only the three modes that composite the detail texture into the albedo read
+/// it as colour; the rest use it as a mask or a multiplier, where an sRGB
+/// decode would bend a curve that was authored linear.
+fn is_srgb_detail_texture(mode: i32) -> bool {
+    matches!(
+        mode,
+        detail_blend::DETAIL_OVER_BASE | detail_blend::FADE | detail_blend::BASE_OVER_DETAIL
+    )
+}
+
 /// How a material is lit, and therefore what the world builder has to allocate
 /// for the surfaces that wear it.
 ///
@@ -664,7 +1151,10 @@ impl Lighting {
 /// being derived where it is used.
 pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
     match kind {
-        ShaderKind::UnlitGeneric => Lighting::None,
+        // `MATERIAL_VAR2_LIGHTING_VERTEX_LIT` (`vertexlitgeneric_dx9_helper.cpp:202`),
+        // which `RegisterLightmappedSurface` treats as "no lightmap": a model
+        // carries its baked light in its vertices, not in the atlas.
+        ShaderKind::UnlitGeneric | ShaderKind::VertexLitGeneric => Lighting::None,
         ShaderKind::LightmappedGeneric => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -748,6 +1238,310 @@ pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms {
         flags,
         _padding: [0; 2],
     }
+}
+
+/// Flags in [`VertexLitUniforms::flags`]. Bucket 2 of the combo split: what
+/// used to be a static shader variant and is now an `if` on a uniform.
+#[allow(dead_code)]
+pub struct VertexLitFlags;
+
+impl VertexLitFlags {
+    /// Alpha testing, fixed-function state in D3D9.
+    pub const ALPHA_TEST: u32 = 1 << 0;
+    /// `SHADER_FOGMODE_DISABLED`. Set by `$nofog`.
+    pub const NO_FOG: u32 = 1 << 1;
+    /// `BUMPMAP`: the material has a `$bumpmap`, so lighting is per pixel
+    /// against a normal read from it rather than per vertex. This is the axis
+    /// that picked between `vertexlit_and_unlit_generic_ps2x.fxc` and the
+    /// `_bump_` file of the same name; here it is one branch.
+    pub const BUMPMAP: u32 = 1 << 2;
+    /// `CUBEMAP`: the material has a usable `$envmap`.
+    pub const ENVMAP: u32 = 1 << 3;
+    /// `ENVMAPMASK`: `$envmapmask` scales the reflection.
+    pub const ENVMAP_MASK: u32 = 1 << 4;
+    /// `BASEALPHAENVMAPMASK`: the base texture's alpha scales it instead.
+    pub const BASE_ALPHA_ENVMAP_MASK: u32 = 1 << 5;
+    /// `NORMALMAPALPHAENVMAPMASK`: the *normal map's* alpha does.
+    pub const NORMAL_ALPHA_ENVMAP_MASK: u32 = 1 << 6;
+    /// `ENVMAPFRESNEL`: the reflection is scaled by a fresnel term.
+    pub const ENVMAP_FRESNEL: u32 = 1 << 7;
+    /// `SELFILLUM`: part of the albedo is emitted rather than lit.
+    pub const SELFILLUM: u32 = 1 << 8;
+    /// `$selfillummask` is bound, so the mask comes from it rather than from
+    /// base alpha. `MATERIAL_VAR2_SELFILLUMMASK`.
+    pub const SELFILLUM_MASK: u32 = 1 << 9;
+    /// `DETAILTEXTURE`: a `$detail` texture is bound.
+    pub const DETAIL: u32 = 1 << 10;
+    /// `HALFLAMBERT`: the diffuse term is `(N·L * 0.5 + 0.5)²` rather than
+    /// `saturate( N·L )`. `$halflambert`.
+    pub const HALF_LAMBERT: u32 = 1 << 11;
+    /// `$blendtintbybasealpha`: base alpha decides how much of `$color`
+    /// reaches the lighting.
+    pub const BLEND_TINT_BY_BASE_ALPHA: u32 = 1 << 12;
+}
+
+/// `VertexLitGeneric`'s material block — group 1, binding 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VertexLitUniforms {
+    /// `$basetexturetransform`, two rows dotted against `(u, v, 0, 1)`.
+    pub base_texture_transform: [[f32; 4]; 2],
+    /// `$bumptransform`. Its own transform, unlike `LightmappedGeneric`'s,
+    /// because `vertexlit_and_unlit_generic_bump_vs20.fxc:255` gives the bump
+    /// coordinate a separate `cBumpTexCoordTransform`.
+    pub bump_transform: [[f32; 4]; 2],
+    /// `cDetailTexCoordTransform`, which is `$detailtexturetransform` scaled by
+    /// `$detailscale` — `SetVertexShaderTextureScaledTransform`
+    /// (`BaseVSShader.cpp:294`). The scale is folded in here rather than in the
+    /// shader, exactly as Valve folds it.
+    pub detail_transform: [[f32; 4]; 2],
+    /// `$selfillumtint` in `rgb`, `$selfillummaskscale` in `w`.
+    pub selfillum_tint: [f32; 4],
+    /// `$envmaptint` in `rgb`, `$envmapcontrast` in `w`.
+    pub envmap_tint: [f32; 4],
+    /// `$envmapsaturation` in `x`, `$envmapfresnel` in `y`, and
+    /// `$detailtint`'s luminance-neutral counterpart is elsewhere: `z` and `w`
+    /// are the fresnel range's scale and bias, derived from
+    /// `$envmapfresnelminmaxexp` by `SetupFresnelParams`.
+    pub envmap_params: [f32; 4],
+    /// `$envmapfresnelminmaxexp`'s exponent in `x`, and the
+    /// `$basealphaenvmapmask` scale, bias and exponent in `yzw` — the three
+    /// numbers `g_FresnelConstants` and `g_DistanceAlphaParams.zw` carry
+    /// between them (`vertexlit_and_unlit_generic_ps2x.fxc:152,179`).
+    pub fresnel_params: [f32; 4],
+    /// `g_DetailTint` in `rgb`, `$detailblendfactor` in `w`.
+    pub detail_tint: [f32; 4],
+    /// `$alphatestreference`, or the fixed-function default of 0.7.
+    pub alpha_test_reference: f32,
+    /// `$detailblendmode`. Not a flag bit because it is a *number* the shader
+    /// switches on — §7.3's bucket 2 with more than two values.
+    pub detail_blend_mode: i32,
+    /// [`VertexLitFlags`].
+    pub flags: u32,
+    pub _padding: u32,
+}
+
+/// Builds the material block for a `.vmt`.
+pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms {
+    let kind = ShaderKind::VertexLitGeneric;
+    let value = |name| param_value(kind, vmt, name);
+    let transform = |name| {
+        value(name)
+            .map(|var| var.as_matrix())
+            .unwrap_or(super::var::IDENTITY)
+    };
+    let defined = |name| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    let float = |name, default| init_float(vmt, name, default);
+
+    let base = transform("$basetexturetransform");
+    let bump = transform("$bumptransform");
+
+    // `SetVertexShaderTextureScaledTransform` (`BaseVSShader.cpp:294`)
+    // multiplies the whole transform — translation included — by
+    // `$detailscale`, which is why a detail texture tiles about its origin
+    // rather than about the surface's texture origin.
+    let detail_scale = float("$detailscale", 4.0);
+    let detail = transform("$detailtexturetransform");
+    let detail = [
+        [
+            detail[0][0] * detail_scale,
+            detail[0][1] * detail_scale,
+            detail[0][2] * detail_scale,
+            detail[0][3] * detail_scale,
+        ],
+        [
+            detail[1][0] * detail_scale,
+            detail[1][1] * detail_scale,
+            detail[1][2] * detail_scale,
+            detail[1][3] * detail_scale,
+        ],
+    ];
+
+    let has_bump = defined("$bumpmap");
+    let has_envmap = envmap_name(vmt).is_some();
+    let has_detail = defined("$detail");
+    // `InitVertexLitGeneric_DX9:394` clears `MATERIAL_VAR_SELFILLUM` when the
+    // base texture has no alpha channel to hold the mask, unless a
+    // `$selfillummask` supplies one. The texture is not available here, so the
+    // flag is taken at face value and a self-illuminating material with an
+    // opaque base texture reads its alpha as 1 — which is what the shipped
+    // engine would have drawn had the flag survived, and is fully emissive
+    // rather than subtly wrong.
+    let has_selfillum = vmt.flags.contains(MaterialFlags::SELFILLUM);
+    let has_selfillum_mask = has_selfillum && defined("$selfillummask");
+
+    let mut flags = 0;
+    if vmt.flags.contains(MaterialFlags::ALPHATEST) {
+        // "Don't alpha test if the alpha channel is used for other purposes"
+        // (`vertexlitgeneric_dx9_helper.cpp:417`): `$selfillum` without a mask
+        // texture, and `$basealphaenvmapmask`, both claim base alpha.
+        let alpha_is_spoken_for = (has_selfillum && !has_selfillum_mask)
+            || vmt.flags.contains(MaterialFlags::BASEALPHAENVMAPMASK);
+        if !alpha_is_spoken_for {
+            flags |= VertexLitFlags::ALPHA_TEST;
+        }
+    }
+    if vmt.flags.contains(MaterialFlags::NOFOG) {
+        flags |= VertexLitFlags::NO_FOG;
+    }
+    if has_bump {
+        flags |= VertexLitFlags::BUMPMAP;
+    }
+    if has_envmap {
+        flags |= VertexLitFlags::ENVMAP;
+
+        // `InitParamsVertexLitGeneric_DX9:255` resolves the three envmap masks
+        // against each other, in this order, because they all want the same
+        // scalar and two of them want the same alpha channel:
+        //
+        //   - `$normalmapalphaenvmapmask` wins and undefines `$envmapmask`.
+        //   - a `$bumpmap` plus `$basealphaenvmapmask` without it is a content
+        //     error Valve warns about and answers by dropping the *envmap*.
+        //   - a `$bumpmap` plus an `$envmapmask` likewise.
+        let normal_alpha = vmt.flags.contains(MaterialFlags::NORMALMAPALPHAENVMAPMASK);
+        if normal_alpha && has_bump {
+            flags |= VertexLitFlags::NORMAL_ALPHA_ENVMAP_MASK;
+        } else if defined("$envmapmask") && !has_bump {
+            flags |= VertexLitFlags::ENVMAP_MASK;
+        } else if vmt.flags.contains(MaterialFlags::BASEALPHAENVMAPMASK) && !has_bump {
+            flags |= VertexLitFlags::BASE_ALPHA_ENVMAP_MASK;
+        }
+
+        // `IsBoolSet` (`BaseVSShader.h:346`) is `GetIntValue() != 0`, which
+        // *truncates*: `$envmapfresnel 0.5` is off in Valve's engine even
+        // though the parameter is declared a float. `as_bool` is that
+        // truncation. Every one of the 30 Portal 2 materials that set this
+        // writes "1", so the two readings agree on shipped content and would
+        // not on a fractional value.
+        if value("$envmapfresnel").is_some_and(|var| var.as_bool()) {
+            flags |= VertexLitFlags::ENVMAP_FRESNEL;
+        }
+    }
+    if has_selfillum {
+        flags |= VertexLitFlags::SELFILLUM;
+    }
+    if has_selfillum_mask {
+        flags |= VertexLitFlags::SELFILLUM_MASK;
+    }
+    if has_detail {
+        flags |= VertexLitFlags::DETAIL;
+    }
+    // **Restored from the flag, against the CS:GO tree this port is derived
+    // from.** `vertexlitgeneric_dx9_helper.cpp:679` reads
+    //
+    //     //bool bHalfLambert = IS_FLAG_SET( MATERIAL_VAR_HALFLAMBERT );
+    //     // Disabling half-lambert for CSGO (not compatible with CSM's,
+    //     // causes bad shadow aliasing).
+    //     bool bHalfLambert = false;
+    //
+    // — the commented-out line is the Portal 2 behaviour and the constant below
+    // it is a CS:GO change made for cascaded shadow maps, which Portal 2 does
+    // not have and this port does not implement. `PORTING.md`'s standing
+    // warning about CS:GO-shaped defaults in shared systems is exactly this.
+    if vmt.flags.contains(MaterialFlags::HALFLAMBERT) {
+        flags |= VertexLitFlags::HALF_LAMBERT;
+    }
+    if value("$blendtintbybasealpha").is_some_and(|var| var.as_bool()) {
+        flags |= VertexLitFlags::BLEND_TINT_BY_BASE_ALPHA;
+    }
+
+    // All three are `SetVecValue( 1, 1, 1 )` in `InitParamsVertexLitGeneric_DX9`
+    // (`:139`, `:145`, `:158`), which is *not* what their declared `Color` type
+    // would give them.
+    let selfillum_tint = init_vec(vmt, "$selfillumtint", [1.0, 1.0, 1.0, 0.0]);
+    let envmap_tint = init_vec(vmt, "$envmaptint", [1.0, 1.0, 1.0, 0.0]);
+    let detail_tint = init_vec(vmt, "$detailtint", [1.0, 1.0, 1.0, 0.0]);
+
+    // `$envmapfresnelminmaxexp` and `$basealphaenvmapmaskminmaxexp` are both
+    // (min, max, exp) triples that the shader applies as
+    // `scale * pow( x, exp ) + bias` — so the scale is `max - min` and the bias
+    // is `min`. `$basealphaenvmapmask`'s default of `[1 0 1]` therefore means
+    // scale -1, bias 1, exponent 1, which is `1 - baseColor.a`: Valve's own
+    // comment calls that "the legacy behavior", and it is *inverted* relative
+    // to what the parameter's name suggests.
+    let fresnel = init_vec(vmt, "$envmapfresnelminmaxexp", [0.0, 1.0, 2.0, 0.0]);
+    let base_alpha_mask = init_vec(vmt, "$basealphaenvmapmaskminmaxexp", [1.0, 0.0, 1.0, 0.0]);
+
+    VertexLitUniforms {
+        base_texture_transform: [base[0], base[1]],
+        bump_transform: [bump[0], bump[1]],
+        detail_transform: detail,
+        selfillum_tint: [
+            selfillum_tint[0],
+            selfillum_tint[1],
+            selfillum_tint[2],
+            float("$selfillummaskscale", 1.0),
+        ],
+        envmap_tint: [
+            envmap_tint[0],
+            envmap_tint[1],
+            envmap_tint[2],
+            float("$envmapcontrast", 0.0),
+        ],
+        envmap_params: [
+            float("$envmapsaturation", 1.0),
+            float("$envmapfresnel", 0.0),
+            fresnel[1] - fresnel[0],
+            fresnel[0],
+        ],
+        fresnel_params: [
+            fresnel[2],
+            base_alpha_mask[1] - base_alpha_mask[0],
+            base_alpha_mask[0],
+            base_alpha_mask[2],
+        ],
+        detail_tint: [
+            detail_tint[0],
+            detail_tint[1],
+            detail_tint[2],
+            float("$detailblendfactor", 1.0),
+        ],
+        alpha_test_reference: alpha_test_reference(kind, vmt),
+        detail_blend_mode: if has_detail {
+            detail_blend_mode(vmt)
+        } else {
+            detail_blend::NONE
+        },
+        flags,
+        _padding: 0,
+    }
+}
+
+/// The `.vtf` a `$envmap` names, if it names one this port can load.
+///
+/// **`env_cubemap` is not a texture name**, and that is the finding this
+/// function exists to record. `CShaderSystem::LoadCubeMap`
+/// (`shadersystem.cpp:1840`) special-cases the literal string: it sets the var
+/// to `(ITexture *)-1`, sets `MATERIAL_VAR2_USES_ENV_CUBEMAP`, and loads
+/// nothing. The cubemap then arrives *per draw*, from the render instance —
+/// `instance.m_pEnvCubemap`, falling back to
+/// `m_StdTextureHandles[TEXTURE_LOCAL_ENV_CUBEMAP]`
+/// (`shaderapidx8.cpp:8370`) — because which cubemap a model reflects depends
+/// on where the model is standing, not on its material.
+///
+/// 78 of Portal 2's 801 non-phong `VertexLitGeneric` materials say
+/// `env_cubemap`. They get the fallback cubemap until the `.bsp`'s embedded
+/// cubemaps are readable, which needs the pak lump mounted; at that point this
+/// becomes render-context state alongside the lightmap page rather than a
+/// material texture, and *that* is the trigger to revisit.
+///
+/// The other half of this function is the `.hdr` suffix. `LoadCubeMap` appends
+/// it whenever HDR is on (`shadersystem.cpp:1855`) and `CTexture` falls back to
+/// the unsuffixed name when the suffixed one is missing
+/// (`ctexture.cpp:3882`) — so `$envmap "metal/foo"` means `metal/foo.hdr.vtf`
+/// **or** `metal/foo.vtf`, in that order. Portal 2 ships exactly one
+/// `.hdr.vtf`, so dropping the rule would look correct on nearly every
+/// material and load the wrong file for that one.
+pub fn envmap_name(vmt: &Vmt) -> Option<&str> {
+    let name = vmt.var("$envmap").and_then(|var| var.as_str())?;
+    if name.is_empty() || name.eq_ignore_ascii_case("env_cubemap") {
+        return None;
+    }
+    Some(name)
 }
 
 /// The colour a draw is modulated by: `$color * $color2`, with `$alpha` in `w`.
@@ -880,15 +1674,16 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
     // `IS_FLAG_SET( MATERIAL_VAR_MULTIPLY )` at the end of the shadow block
     // (`vertexlitgeneric_dx9_helper.cpp:1210`), after everything above.
     //
-    // **`UnlitGeneric` only, and that asymmetry is the original's.**
-    // `$multiply` is handled by the shared helper `vertexlitgeneric` reaches
-    // and by `CBaseShader::SetInitialShadowState` not at all
+    // **Not `LightmappedGeneric`, and that asymmetry is the original's.**
+    // `$multiply` is handled by the shared helper, which is the one both
+    // `UnlitGeneric` and `VertexLitGeneric` reach, and by
+    // `CBaseShader::SetInitialShadowState` not at all
     // (`shaderlib/BaseShader.cpp:183` has no `MATERIAL_VAR_MULTIPLY` case), so
     // a `LightmappedGeneric` material that sets `$multiply` gets ordinary
     // blending in Valve's engine too. Content does not set it on world
     // surfaces; reproducing the gap costs nothing and diverging from it would
     // be a silent change to how a wall blends.
-    if kind == ShaderKind::UnlitGeneric && flags.contains(MaterialFlags::MULTIPLY) {
+    if kind != ShaderKind::LightmappedGeneric && flags.contains(MaterialFlags::MULTIPLY) {
         state.blend = BlendMode::Multiply;
         state.depth_write = false;
     }
@@ -956,10 +1751,18 @@ mod tests {
             ShaderKind::from_name("lightmappedgeneric"),
             Some(ShaderKind::LightmappedGeneric)
         );
+        assert_eq!(
+            ShaderKind::from_name("vertexlitgeneric"),
+            Some(ShaderKind::VertexLitGeneric)
+        );
         // A fallback name is not a shader: that mechanism is deleted.
         assert_eq!(ShaderKind::from_name("UnlitGeneric_dx9"), None);
         assert_eq!(ShaderKind::from_name("LightmappedGeneric_dx9"), None);
-        assert_eq!(ShaderKind::from_name("VertexLitGeneric"), None);
+        assert_eq!(ShaderKind::from_name("VertexLitGeneric_dx9"), None);
+        // Phong is a real Valve shader name and is deliberately not ported:
+        // the materials that want it reach `VertexLitGeneric` instead. See
+        // `wants_phong`.
+        assert_eq!(ShaderKind::from_name("Phong"), None);
     }
 
     #[test]
@@ -1163,5 +1966,276 @@ mod tests {
     fn the_material_block_is_the_size_wgsl_expects() {
         assert_eq!(size_of::<UnlitUniforms>(), 48);
         assert_eq!(size_of::<UnlitUniforms>() % 16, 0);
+        // Three 2x4 transforms, five vec4s, then four words.
+        assert_eq!(size_of::<VertexLitUniforms>(), 3 * 32 + 5 * 16 + 16);
+        assert_eq!(size_of::<VertexLitUniforms>() % 16, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // VertexLitGeneric
+    // ---------------------------------------------------------------------
+
+    /// A `.vmt` naming `VertexLitGeneric` rather than the module's default.
+    fn model_vmt(body: &str) -> Vmt {
+        let text = format!("\"VertexLitGeneric\" {{ {body} }}");
+        let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
+        Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
+    }
+
+    #[test]
+    fn phong_materials_are_recognised_but_not_ported() {
+        // `WantsPhongShaderInternal` (`vertexlitgeneric_dx9_helper.cpp:70`),
+        // which decides whether a `VertexLitGeneric` `.vmt` is really drawn by
+        // `Phong` — 307 of Portal 2's 1,108 of them.
+
+        // `$phong` alone is not enough: there has to be a mask to use.
+        assert!(!wants_phong(&model_vmt(r#""$phong" "1""#)));
+        // A bump map is the usual one.
+        assert!(wants_phong(&model_vmt(r#""$phong" "1" "$bumpmap" "x""#)));
+        // A lightwarp short-circuits before the bump-map test.
+        assert!(wants_phong(&model_vmt(
+            r#""$phong" "1" "$lightwarptexture" "x""#
+        )));
+        // `$basemapalphaphongmask 1` exists precisely because there is no
+        // normal map, so it replaces the requirement rather than adding to it.
+        assert!(wants_phong(&model_vmt(
+            r#""$phong" "1" "$basemapalphaphongmask" "1""#
+        )));
+        // The test is `!= 1`, not `== 0`: any other value still needs a bump
+        // map.
+        assert!(!wants_phong(&model_vmt(
+            r#""$phong" "1" "$basemapalphaphongmask" "2""#
+        )));
+        // And without `$phong` nothing else matters.
+        assert!(!wants_phong(&model_vmt(r#""$bumpmap" "x""#)));
+        assert!(!wants_phong(&model_vmt(r#""$phong" "0" "$bumpmap" "x""#)));
+    }
+
+    #[test]
+    fn env_cubemap_is_not_a_texture_name() {
+        // `CShaderSystem::LoadCubeMap` (`shadersystem.cpp:1840`) special-cases
+        // the literal string and loads nothing; the cubemap arrives per draw
+        // from the render instance instead. 78 of Portal 2's non-phong
+        // `VertexLitGeneric` materials say it, so treating it as a filename
+        // would be 78 warnings and 78 checkerboards.
+        assert_eq!(envmap_name(&model_vmt(r#""$envmap" "env_cubemap""#)), None);
+        assert_eq!(envmap_name(&model_vmt(r#""$envmap" "ENV_CUBEMAP""#)), None);
+        assert_eq!(envmap_name(&model_vmt(r#""$envmap" """#)), None);
+        assert_eq!(envmap_name(&model_vmt("")), None);
+        assert_eq!(
+            envmap_name(&model_vmt(r#""$envmap" "metal/black_wall_envmap_002a""#)),
+            Some("metal/black_wall_envmap_002a")
+        );
+    }
+
+    #[test]
+    fn shader_supplied_defaults_beat_type_defaults() {
+        // The trap `init_float` exists for. `param_value` answers an undefined
+        // float with 0 — `InitShaderParameters`' answer — but the shader's own
+        // `InitParams` block ran first and wrote 4. Reaching for `param_value`
+        // and appending `.unwrap_or( 4.0 )` compiles, reads correctly, and is
+        // dead code.
+        let vmt = model_vmt("");
+        assert_eq!(
+            param_value(ShaderKind::VertexLitGeneric, &vmt, "$detailscale").map(|var| var.as_f32()),
+            Some(0.0),
+            "the type default, which is the one that is wrong here"
+        );
+        assert_eq!(init_float(&vmt, "$detailscale", 4.0), 4.0);
+        // And an explicit value still wins.
+        assert_eq!(
+            init_float(&model_vmt(r#""$detailscale" "8""#), "$detailscale", 4.0),
+            8.0
+        );
+    }
+
+    #[test]
+    fn the_detail_scale_is_folded_into_the_detail_transform() {
+        // `SetVertexShaderTextureScaledTransform` (`BaseVSShader.cpp:294`)
+        // multiplies the whole transform by `$detailscale`, translation
+        // included. A detail texture therefore tiles about the *texture*
+        // origin, not the surface's.
+        let uniforms = vertex_lit_uniforms(&model_vmt(r#""$detail" "x""#));
+        assert_eq!(uniforms.detail_transform[0], [4.0, 0.0, 0.0, 0.0]);
+        assert_eq!(uniforms.detail_transform[1], [0.0, 4.0, 0.0, 0.0]);
+
+        let uniforms = vertex_lit_uniforms(&model_vmt(
+            r#""$detail" "x" "$detailscale" "2"
+               "$detailtexturetransform" "center 0 0 scale 1 1 rotate 0 translate .5 0""#,
+        ));
+        assert_eq!(uniforms.detail_transform[0][0], 2.0);
+        assert_eq!(uniforms.detail_transform[0][3], 1.0, "the translation too");
+    }
+
+    #[test]
+    fn half_lambert_comes_back_from_the_flag() {
+        // The CS:GO divergence this port reverses:
+        // `vertexlitgeneric_dx9_helper.cpp:679` hard-codes `bHalfLambert =
+        // false` over a commented-out read of `MATERIAL_VAR_HALFLAMBERT`.
+        let uniforms = vertex_lit_uniforms(&model_vmt(r#""$halflambert" "1""#));
+        assert_eq!(
+            uniforms.flags & VertexLitFlags::HALF_LAMBERT,
+            VertexLitFlags::HALF_LAMBERT
+        );
+        assert_eq!(vertex_lit_uniforms(&model_vmt("")).flags, 0);
+    }
+
+    #[test]
+    fn the_three_envmap_masks_resolve_against_each_other() {
+        // `InitParamsVertexLitGeneric_DX9:255`. All three want the same
+        // scalar and two want the same alpha channel, so the order matters.
+        let flags = |body: &str| vertex_lit_uniforms(&model_vmt(body)).flags;
+        let envmap = r#""$envmap" "cubemaps/x""#;
+
+        // Normal-map alpha wins, and undefines `$envmapmask`.
+        let f = flags(&format!(
+            r#"{envmap} "$bumpmap" "b" "$normalmapalphaenvmapmask" "1" "$envmapmask" "m""#
+        ));
+        assert_eq!(
+            f & VertexLitFlags::NORMAL_ALPHA_ENVMAP_MASK,
+            VertexLitFlags::NORMAL_ALPHA_ENVMAP_MASK
+        );
+        assert_eq!(f & VertexLitFlags::ENVMAP_MASK, 0);
+
+        // An `$envmapmask` with no bump map is honoured.
+        let f = flags(&format!(r#"{envmap} "$envmapmask" "m""#));
+        assert_eq!(f & VertexLitFlags::ENVMAP_MASK, VertexLitFlags::ENVMAP_MASK);
+
+        // A bump map plus `$basealphaenvmapmask` and no
+        // `$normalmapalphaenvmapmask` is the content error Valve warns about;
+        // neither mask applies.
+        let f = flags(&format!(
+            r#"{envmap} "$bumpmap" "b" "$basealphaenvmapmask" "1""#
+        ));
+        assert_eq!(f & VertexLitFlags::BASE_ALPHA_ENVMAP_MASK, 0);
+
+        // Without an `$envmap` at all, no mask is set whatever content says.
+        let f = flags(r#""$envmapmask" "m" "$basealphaenvmapmask" "1""#);
+        assert_eq!(f & VertexLitFlags::ENVMAP, 0);
+        assert_eq!(f & VertexLitFlags::ENVMAP_MASK, 0);
+        assert_eq!(f & VertexLitFlags::BASE_ALPHA_ENVMAP_MASK, 0);
+    }
+
+    #[test]
+    fn alpha_testing_is_dropped_when_base_alpha_is_spoken_for() {
+        // "Don't alpha test if the alpha channel is used for other purposes"
+        // (`vertexlitgeneric_dx9_helper.cpp:417`). Both of these claim base
+        // alpha, and testing against it as well would discard exactly the
+        // texels the feature is about.
+        let flag =
+            |body: &str| vertex_lit_uniforms(&model_vmt(body)).flags & VertexLitFlags::ALPHA_TEST;
+
+        assert_eq!(flag(r#""$alphatest" "1""#), VertexLitFlags::ALPHA_TEST);
+        assert_eq!(flag(r#""$alphatest" "1" "$selfillum" "1""#), 0);
+        assert_eq!(flag(r#""$alphatest" "1" "$basealphaenvmapmask" "1""#), 0);
+        // A `$selfillummask` frees base alpha again, which is what
+        // `MATERIAL_VAR2_SELFILLUMMASK` is for.
+        assert_eq!(
+            flag(r#""$alphatest" "1" "$selfillum" "1" "$selfillummask" "m""#),
+            VertexLitFlags::ALPHA_TEST
+        );
+    }
+
+    #[test]
+    fn multiply_reaches_every_shader_that_uses_the_shared_helper() {
+        // `$multiply` is handled at the end of `vertexlitgeneric_dx9_helper`'s
+        // shadow block, which `UnlitGeneric` *and* `VertexLitGeneric` reach and
+        // `LightmappedGeneric` does not.
+        let body = r#""$multiply" "1""#;
+        let unlit = format!(r#""UnlitGeneric" {{ {body} }}"#);
+        let model = format!(r#""VertexLitGeneric" {{ {body} }}"#);
+        let world = format!(r#""LightmappedGeneric" {{ {body} }}"#);
+        let parse = |text: &str, name: &str| {
+            let document = keyvalues::parse(name, text).unwrap();
+            Vmt::from_keyvalues(name, &document).unwrap()
+        };
+
+        for (kind, text) in [
+            (ShaderKind::UnlitGeneric, &unlit),
+            (ShaderKind::VertexLitGeneric, &model),
+        ] {
+            let state = render_state(kind, &parse(text, "m.vmt"), None);
+            assert_eq!(state.blend, BlendMode::Multiply, "{}", kind.name());
+        }
+        let state = render_state(
+            ShaderKind::LightmappedGeneric,
+            &parse(&world, "w.vmt"),
+            None,
+        );
+        assert_eq!(
+            state.blend,
+            BlendMode::None,
+            "a world surface ignores $multiply in Valve's engine too"
+        );
+    }
+
+    #[test]
+    fn only_the_albedo_detail_modes_read_srgb() {
+        // `IsSRGBDetailTexture` (`BaseVSShader.h:227`). The other ten modes use
+        // the texture as a mask or a multiplier, where an sRGB decode bends a
+        // curve that was authored linear.
+        let space = |mode: i32| {
+            let body = format!(r#""$detail" "d" "$detailblendmode" "{mode}""#);
+            texture_requests(ShaderKind::VertexLitGeneric, &model_vmt(&body))
+                .into_iter()
+                .find(|request| request.param == "$detail")
+                .expect("the detail request is declared")
+                .color_space
+        };
+        for mode in [
+            detail_blend::DETAIL_OVER_BASE,
+            detail_blend::FADE,
+            detail_blend::BASE_OVER_DETAIL,
+        ] {
+            assert_eq!(space(mode), ColorSpace::Srgb, "mode {mode}");
+        }
+        for mode in [
+            detail_blend::MOD2X,
+            detail_blend::ADDITIVE,
+            detail_blend::MOD2X_SELECT_TWO_PATTERNS,
+            detail_blend::MULTIPLY,
+        ] {
+            assert_eq!(space(mode), ColorSpace::Linear, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn the_envmap_is_the_only_cube_binding() {
+        // A bind group layout names a view dimension, so this is what keeps
+        // `Material::new` from binding a 2D texture into a cube slot — a
+        // validation error rather than a wrong picture.
+        let requests = texture_requests(ShaderKind::VertexLitGeneric, &model_vmt(""));
+        for request in &requests {
+            let expected = if request.param == "$envmap" {
+                TextureDimension::Cube
+            } else {
+                TextureDimension::D2
+            };
+            assert_eq!(request.dimension, expected, "{}", request.param);
+        }
+        assert!(requests.iter().any(|r| r.param == "$envmap"));
+    }
+
+    #[test]
+    fn a_model_material_reserves_no_lightmap() {
+        // `MATERIAL_VAR2_LIGHTING_VERTEX_LIT`, which
+        // `RegisterLightmappedSurface` reads as "no atlas block": a model
+        // carries its baked light in its vertices.
+        assert_eq!(
+            lighting(
+                ShaderKind::VertexLitGeneric,
+                &model_vmt(r#""$bumpmap" "b""#)
+            ),
+            Lighting::None
+        );
+        assert_eq!(
+            ShaderKind::VertexLitGeneric.lighting_binding(),
+            Some(LightingBinding::ModelLighting)
+        );
+        assert_eq!(
+            ShaderKind::LightmappedGeneric.lighting_binding(),
+            Some(LightingBinding::LightmapPage)
+        );
+        assert_eq!(ShaderKind::UnlitGeneric.lighting_binding(), None);
     }
 }
