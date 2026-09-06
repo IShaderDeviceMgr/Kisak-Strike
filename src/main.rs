@@ -23,6 +23,7 @@ mod engine;
 mod filesystem;
 mod launcher;
 mod materials;
+mod studio;
 
 fn main() -> std::process::ExitCode {
     let code = launcher::run();

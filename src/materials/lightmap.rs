@@ -103,6 +103,31 @@ impl ColorRgbExp32 {
             f32::from(self.b) * scale,
         ]
     }
+
+    /// `ColorRGBExp32ToVector` (`mathlib/color_conversion.cpp:130`) — the
+    /// *other* decode, 255× [`to_linear`](ColorRgbExp32::to_linear).
+    ///
+    /// Both exist in the original and both are correct where they are used:
+    /// this one for `dworldlight_t` intensities, **leaf ambient cubes**
+    /// (`modelloader.cpp:7338`) and particle colours, `to_linear` for lightmap
+    /// luxels. They are the two halves of the trap `to_linear` documents, and
+    /// the reason the factor is not an inconsistency is that it is not applied
+    /// twice: a lightmap luxel reaches the shader through a texture and an
+    /// ambient cube through a uniform.
+    ///
+    /// **Measured, not assumed.** Over `sp_a1_intro1`, mean luminance is 0.0249
+    /// for the lightmap under `to_linear` and 0.0002 for the ambient cubes
+    /// under the same — a factor of 122, which the 255 here closes to 0.5.
+    /// `engine::world::props::tests::every_shipped_map_places_its_props` prints
+    /// both, so the check is repeatable.
+    pub fn to_vector(self) -> [f32; 3] {
+        let scale = exp2i(self.exponent);
+        [
+            f32::from(self.r) * scale,
+            f32::from(self.g) * scale,
+            f32::from(self.b) * scale,
+        ]
+    }
 }
 
 /// `2^n` for the exponent range a `ColorRGBExp32` can hold.

@@ -60,6 +60,11 @@ const LUMP_MODELS: usize = 14;
 const LUMP_LEAFBRUSHES: usize = 17;
 const LUMP_BRUSHES: usize = 18;
 const LUMP_BRUSHSIDES: usize = 19;
+const LUMP_GAME_LUMP: usize = 35;
+const LUMP_LEAF_AMBIENT_INDEX_HDR: usize = 51;
+const LUMP_LEAF_AMBIENT_INDEX: usize = 52;
+const LUMP_LEAF_AMBIENT_LIGHTING_HDR: usize = 55;
+const LUMP_LEAF_AMBIENT_LIGHTING: usize = 56;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
 const LUMP_LIGHTING_HDR: usize = 53;
@@ -517,6 +522,19 @@ pub struct Bsp {
     /// `LVLFLAGS_LIGHTSTYLES_WITH_CSM` to the light-style animator.
     #[allow(dead_code)]
     pub level_flags: u32,
+    /// `LUMP_GAME_LUMP`'s directory, payloads included. Empty for a map with
+    /// no game lumps, which is legal.
+    pub game_lumps: Vec<GameLump>,
+    /// `LUMP_LEAF_AMBIENT_LIGHTING_HDR` or its LDR twin — the baked ambient
+    /// cubes every model in the level is lit by. Empty on a map compiled
+    /// without `vrad`.
+    ///
+    /// Which lump this came from follows
+    /// [`lighting_is_hdr`](Bsp::lighting_is_hdr), for the same reason and by
+    /// the same rule.
+    pub leaf_ambient: Vec<LeafAmbientSample>,
+    /// `LUMP_LEAF_AMBIENT_INDEX*` — parallel to [`leaves`](Bsp::leaves).
+    pub leaf_ambient_index: Vec<LeafAmbientIndex>,
 }
 
 impl Bsp {
@@ -633,6 +651,17 @@ impl Bsp {
             lighting: reader.records(lighting_lump)?,
             lighting_is_hdr,
             level_flags,
+            game_lumps: reader.game_lumps()?,
+            leaf_ambient: reader.records(if lighting_is_hdr {
+                LUMP_LEAF_AMBIENT_LIGHTING_HDR
+            } else {
+                LUMP_LEAF_AMBIENT_LIGHTING
+            })?,
+            leaf_ambient_index: reader.records(if lighting_is_hdr {
+                LUMP_LEAF_AMBIENT_INDEX_HDR
+            } else {
+                LUMP_LEAF_AMBIENT_INDEX
+            })?,
             vertices: reader.records(LUMP_VERTEXES)?,
             edges: reader.records(LUMP_EDGES)?,
             surfedges: reader.records(LUMP_SURFEDGES)?,
@@ -830,6 +859,13 @@ impl Bsp {
         Ok(())
     }
 
+    /// One game lump by its four-CC id, e.g. [`GAMELUMP_STATIC_PROPS`].
+    ///
+    /// [`GAMELUMP_STATIC_PROPS`]: super::props::GAMELUMP_STATIC_PROPS
+    pub fn game_lump(&self, id: u32) -> Option<&GameLump> {
+        self.game_lumps.iter().find(|lump| lump.id == id)
+    }
+
     /// The world model — model 0, the static level geometry.
     pub fn world_model(&self) -> &Model {
         &self.models[0] // `validate` rejected an empty model lump
@@ -1024,6 +1060,66 @@ fn map_path(name: &str) -> String {
     format!("maps/{name}.bsp")
 }
 
+/// One baked ambient sample: a light cube and where in its leaf it was taken.
+///
+/// `dleafambientlighting_t` (`bspfile.h:967`). `vrad` places several of these
+/// per leaf and `Mod_LeafAmbientColorAtPos` interpolates between them, which is
+/// why a big room does not light every model in it identically.
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct LeafAmbientSample {
+    /// `CompressedLightCube` — light arriving from `+x, -x, +y, -y, +z, -z`,
+    /// in that order, which is the order
+    /// [`ModelLighting::ambient_cube`](crate::materials::uniforms::ModelLighting::ambient_cube)
+    /// wants.
+    pub cube: [ColorRgbExp32; 6],
+    /// The sample's position as a fixed-point fraction of the leaf's bounds:
+    /// `mins + (xyz / 255) * (maxs - mins)`. See
+    /// [`Bsp::leaf_ambient_at`].
+    pub x: u8,
+    pub y: u8,
+    pub z: u8,
+    pub _pad: u8,
+}
+
+/// One leaf's slice of [`Bsp::leaf_ambient`].
+///
+/// `dleafambientindex_t` (`bspfile.h:977`). **A zero count with a non-zero
+/// first sample is not an empty leaf** — it is a *solid* leaf borrowing another
+/// leaf's samples, and `firstAmbientSample` is that leaf's index rather than a
+/// sample index. Reading it the other way leaves every prop embedded in
+/// geometry unlit. `modelloader.cpp:7309`.
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct LeafAmbientIndex {
+    pub sample_count: u16,
+    pub first_sample: u16,
+}
+
+/// One entry of `LUMP_GAME_LUMP`'s directory, with its payload copied out.
+///
+/// A game lump is a lump *inside* a lump: `LUMP_GAME_LUMP` holds a count and a
+/// `dgamelump_t[]` directory (`bspfile.h:437`), and each entry names a range
+/// somewhere else in the file. It exists because the lump directory is a fixed
+/// 64 entries and a game DLL cannot claim one — so `sprp` (static props) and
+/// `dprp` (detail props) live here instead, and a mod could add its own.
+///
+/// The payload is copied rather than borrowed for the same reason every other
+/// lump is: a [`Bsp`] outlives the bytes it was parsed from.
+#[derive(Debug, Clone)]
+pub struct GameLump {
+    /// A four-CC read as a little-endian `i32`, so `'sprp'` is `0x73707270`.
+    pub id: u32,
+    /// `GAMELUMPFLAG_COMPRESSED` is the only defined bit and is X360-only, so
+    /// nothing on this port's POSIX-only path reads it.
+    #[allow(dead_code)]
+    pub flags: u16,
+    /// Versioned independently of the `.bsp` — Portal 2's `sprp` is 9 while
+    /// the file around it is 21.
+    pub version: u16,
+    pub data: Vec<u8>,
+}
+
 /// Bounds-checked access to the lump directory.
 struct LumpReader<'a> {
     path: &'a str,
@@ -1098,6 +1194,75 @@ impl LumpReader<'_> {
         // Lossy conversion keeps a stray high byte in a mapper's comment from
         // failing the load.
         Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// `LUMP_GAME_LUMP`'s directory, with each entry's payload copied out.
+    ///
+    /// Two things about this lump are not like any other. **A game lump's
+    /// `fileofs` is absolute in the file**, not relative to `LUMP_GAME_LUMP` —
+    /// the payloads usually sit inside the game lump's own range, but nothing
+    /// requires it and the field does not mean what its name suggests. And
+    /// **`filelen` is unreliable on the last entry**: Valve's own X360
+    /// compression path documents deriving a lump's size from *the next
+    /// entry's* `fileofs` (`bspfile.h:433`), and some compilers write a
+    /// terminating entry with a zero length to make that work. Both are handled
+    /// by clamping to the file rather than trusting the field.
+    fn game_lumps(&self) -> Result<Vec<GameLump>, BspError> {
+        let dir = self.raw(LUMP_GAME_LUMP)?;
+        if dir.len() < 4 {
+            // No game lumps at all. Legal — a map with no props has none.
+            return Ok(Vec::new());
+        }
+        let count = i32::from_le_bytes(dir[0..4].try_into().expect("4 bytes"));
+        let count = usize::try_from(count).map_err(|_| BspError::Corrupt {
+            path: self.path.to_owned(),
+            what: format!("the game lump directory declares {count} lumps"),
+        })?;
+
+        const ENTRY: usize = 16;
+        if dir.len() < 4 + count * ENTRY {
+            return Err(BspError::Corrupt {
+                path: self.path.to_owned(),
+                what: format!(
+                    "the game lump directory declares {count} lumps but is {} bytes",
+                    dir.len()
+                ),
+            });
+        }
+
+        let mut lumps = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = 4 + i * ENTRY;
+            let field = |n: usize| {
+                i32::from_le_bytes(dir[at + n..at + n + 4].try_into().expect("4 bytes"))
+            };
+            let half = |n: usize| u16::from_le_bytes(dir[at + n..at + n + 2].try_into().expect("2"));
+
+            let id = field(0) as u32;
+            let flags = half(4);
+            let version = half(6);
+            let offset = field(8).max(0) as usize;
+            let length = field(12).max(0) as usize;
+
+            // A terminating entry — id 0, or a range that is not in the file —
+            // carries no payload and is dropped rather than refused.
+            let end = offset.saturating_add(length);
+            let data = if id == 0 || length == 0 || end > self.bytes.len() {
+                Vec::new()
+            } else {
+                self.bytes[offset..end].to_vec()
+            };
+            if id == 0 {
+                continue;
+            }
+            lumps.push(GameLump {
+                id,
+                flags,
+                version,
+                data,
+            });
+        }
+        Ok(lumps)
     }
 
     /// `LUMP_TEXDATA_STRING_TABLE` resolved against `LUMP_TEXDATA_STRING_DATA`.

@@ -770,7 +770,7 @@ impl Pass<'_> {
         }
         self.pass.set_vertex_buffer(0, vertices.buffer_slice());
         self.pass
-            .set_index_buffer(indices.buffer_slice(), wgpu::IndexFormat::Uint16);
+            .set_index_buffer(indices.buffer_slice(), indices.format());
         self.pass.draw_indexed(0..indices.len(), 0, 0..1);
     }
 }

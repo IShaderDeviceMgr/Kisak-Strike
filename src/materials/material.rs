@@ -280,6 +280,7 @@ pub struct MaterialCache {
     pipelines: PipelineCache,
     materials: HashMap<String, Arc<Material>>,
     error: Arc<Material>,
+    error_model: Arc<Material>,
 }
 
 impl MaterialCache {
@@ -311,6 +312,21 @@ impl MaterialCache {
         )
         .expect("the error material's shader is ported");
 
+        let document = keyvalues::parse(ERROR_MODEL_MATERIAL_NAME, ERROR_MODEL_MATERIAL)
+            .expect("the error material is a literal in this file");
+        let vmt = Vmt::from_keyvalues(ERROR_MODEL_MATERIAL_NAME, &document)
+            .expect("the error material names a shader");
+        let error_model = Material::new(
+            device,
+            queue,
+            pipelines.layouts(),
+            ERROR_MODEL_MATERIAL_NAME,
+            &vmt,
+            &fallback,
+            |_, _, _| Arc::clone(&fallback.error),
+        )
+        .expect("the error material's shader is ported");
+
         MaterialCache {
             device: device.clone(),
             queue: queue.clone(),
@@ -318,6 +334,7 @@ impl MaterialCache {
             pipelines,
             materials: HashMap::new(),
             error: Arc::new(error),
+            error_model: Arc::new(error_model),
         }
     }
 
@@ -348,6 +365,24 @@ impl MaterialCache {
     /// The magenta checkerboard material, `___error.vmt`.
     pub fn error_material(&self) -> Arc<Material> {
         Arc::clone(&self.error)
+    }
+
+    /// The error material in the shape a *model* can be drawn with.
+    ///
+    /// The checkerboard is one material in the original because a `.vmt`'s
+    /// `$model 1` was a parameter and not a different shader: Valve's
+    /// `CreateDebugMaterials` writes exactly one error material and sets
+    /// `$model` on it (`cmaterialsystem.cpp:465`), and the `UnlitGeneric`
+    /// helper picks the vertex format from that flag at draw time.
+    ///
+    /// This port decides the vertex layout per *shader* instead — that is what
+    /// makes [`Pass::draw`](super::context::Pass::draw)'s layout assertion
+    /// possible at all — so the same material cannot serve both. The two are
+    /// the same `.vmt` under two shader names, and a caller picks the one its
+    /// geometry has: brush faces take [`error_material`](Self::error_material),
+    /// studio models take this.
+    pub fn error_model_material(&self) -> Arc<Material> {
+        Arc::clone(&self.error_model)
     }
 
     /// Loads `materials/<name>.vmt`, or returns the error material.
@@ -453,6 +488,23 @@ const ERROR_MATERIAL_NAME: &str = "___error";
 /// next reader wondering.
 const ERROR_MATERIAL: &str = r#"
 "UnlitGeneric"
+{
+	"$basetexture"    "error"
+	"$model"          "1"
+	"$gammacolorread" "1"
+}
+"#;
+
+const ERROR_MODEL_MATERIAL_NAME: &str = "___error_model";
+
+/// [`ERROR_MATERIAL`] under the shader that takes model vertices.
+///
+/// Not a second material in the original — see
+/// [`MaterialCache::error_model_material`] for why it has to be one here. It is
+/// deliberately the same three keys, so that the checkerboard a broken prop
+/// shows is the checkerboard a broken brush face shows.
+const ERROR_MODEL_MATERIAL: &str = r#"
+"VertexLitGeneric"
 {
 	"$basetexture"    "error"
 	"$model"          "1"

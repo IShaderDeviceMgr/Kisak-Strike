@@ -20,6 +20,7 @@ is not compiled, not linked, and not edited.
   src/materials/   the GPU device and frame boundary (wgpu), textures, materials
   src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
   src/client/      the game client — the player, CUserCmd, movement, the view
+  src/studio/      studio models — .mdl/.vvd/.vtx into drawable geometry
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -197,7 +198,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   the largest in the shipped game: 1,108 of Portal 2's 3,431 materials name it, 1,012 of
   them under `materials/models/`. Landed as `ShaderKind::VertexLitGeneric` with
   `shaders/vertexlitgeneric.wgsl`, `mesh::ModelVertex`, `uniforms::{Light, ModelLighting}`
-  — the ambient cube and up to four local lights that `R_StudioSetupLighting` fills — a
+  — the ambient cube and up to four local lights that `engine/lightcache.cpp`'s
+  `LightcacheGetStatic`/`Mod_LeafAmbientColorAtPos` fill (**there is no
+  `R_StudioSetupLighting` in this tree**; earlier drafts of this file named one) — a
   second shape for bind group 3, and the cubemap half of the texture path. **All 1,108 of
   those materials load and build a pipeline against the real game**; the whole set needs
   15 pipelines, which answers §10's "how many variants survive" with a measurement. The
@@ -362,6 +365,34 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
   before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
   test is only ever reachable from the air.
+- **`src/studio/` — stages 1-3 and 5 of `portdocs/STUDIO.md`'s six ported**, and with them
+  **static props draw**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
+  buffer, one index buffer, per-material `Batch`es. The instances are
+  `src/engine/world/props/` — the `sprp` game lump, `AngleMatrix` transforms, one upload
+  per distinct model and one draw per instance, lit by the map's baked leaf ambient cubes.
+  `sp_a1_intro1` now draws **1,080 props from 136 models, 224,924 triangles** on top of
+  the world's 14,546. Not done: the `.bsp` pak lump and the `.vhv` per-vertex bake
+  (stage 4), LOD selection (stage 6), `.phy` collision (that is `ENGINE_TRACE.md`'s), and
+  the local lights on a prop. `CMDLCache`'s eviction, budgets and async queues are
+  **deleted rather than deferred**, and so are skinning, flexes and sub-d — which are
+  absent from the *data*: all 968 models Portal 2 places as static props have one bone,
+  trilist strips and no flex deltas. **API: `rustdocs/STUDIO.md`** — read it before
+  calling in, in particular for the gotchas that produce a plausible wrong picture rather
+  than an error: **`sizeof(StaticPropLumpV9_t)` is 72 and not 69**, because Valve's prop
+  structs are the only ones on this path not `#pragma pack(1)`, and at 69 every prop
+  after the first drifts; **the ambient cube decodes with `ColorRGBExp32ToVector` and the
+  lightmap with `TexLightToLinear`**, which is the *opposite* of `rustdocs/MATERIALS.md`'s
+  rule and 255× either way (measured: 0.0249 against 0.0002 mean luminance on
+  `sp_a1_intro1`); **a `QAngle` is pitch, yaw, roll** composed `Rz·Ry·Rx`, so props with
+  only a yaw look right under any other reading and tilted ones do not; and **a leaf with
+  zero ambient samples and a non-zero `first_sample` is a solid leaf whose `first_sample`
+  is a *leaf* index**, which is what keeps a prop embedded in geometry lit.
+  Two verifications run against the real depot behind `KISAK_GAME_DIR` and `--ignored`:
+  **2,017 of the 2,041 shipped models parse** (all 1,444 flagged `STATIC_PROP`; the 16
+  refusals are animated flex-delta models and are correct), and **all 106 shipped maps
+  place their props — 56,955 of them**. The first of those found two wrong `.vtx` field
+  offsets that **every synthetic test had passed**, because the fixture had been written
+  from the reader instead of from `optimize.h`; `portdocs/STUDIO.md` §11.1 has it.
 - **Everything else is unported** and lives in `legacy/`.
 
 Next: **the boot path is complete as far as one player can take it.** `client/` stage 5
@@ -375,11 +406,9 @@ a long way from here. The candidates, in the order they are worth doing:
 - **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
   read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
   neither drawn nor collided with.
-- **`studiorender` / `src/engine/`'s static props.** `materialsystem` stage 6 has landed,
-  so the material-system half of a static prop is built and waiting: `VertexLitGeneric`,
-  `ModelVertex` and the `ModelLighting` block. What is missing is a `.mdl`/`.vvd`/`.vtx`
-  reader, the `.bsp`'s `sprp` game lump, and `R_StudioSetupLighting` to fill that block —
-  none of which is in `materials/`.
+- **`filesystem/`'s zip mount over `LUMP_PAKFILE`** (`portdocs/STUDIO.md` stage 4). One
+  change, two subsystems: it is what the `.vhv` per-prop vertex bake needs *and* what the
+  8 `maps/<map>/…` cubemap materials that draw as checkerboards are waiting for.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.
 

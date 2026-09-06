@@ -430,18 +430,18 @@ impl VertexBuffer {
 pub struct IndexBuffer {
     buffer: wgpu::Buffer,
     count: u32,
+    format: wgpu::IndexFormat,
 }
 
 #[allow(dead_code)]
 impl IndexBuffer {
-    /// Uploads `indices`, which may not be empty.
+    /// Uploads 16-bit `indices`, which may not be empty.
     ///
-    /// 16-bit only, as `IndexDesc_t::m_pIndices` is
-    /// (`public/materialsystem/imesh.h:167`): `MATERIAL_INDEX_FORMAT_32BIT`
-    /// exists in the enum but nothing in the engine's draw paths asks for it,
-    /// because a batch is bounded by `GetMaxIndicesToRender` long before it
-    /// reaches 65,536 vertices. Adding it later is a field here and a
-    /// `wgpu::IndexFormat` in [`IndexSlice`].
+    /// This is `IndexDesc_t::m_pIndices`' width
+    /// (`public/materialsystem/imesh.h:167`) and what every *world* batch uses,
+    /// because a brush batch is bounded by `GetMaxIndicesToRender` long before
+    /// it reaches 65,536 vertices. A studio model is not — see
+    /// [`new_u32`](IndexBuffer::new_u32).
     pub fn new(device: &wgpu::Device, label: &str, indices: &[u16]) -> IndexBuffer {
         assert!(!indices.is_empty(), "{label}: empty index buffer");
         IndexBuffer {
@@ -452,6 +452,42 @@ impl IndexBuffer {
                 bytemuck::cast_slice(indices),
             ),
             count: indices.len() as u32,
+            format: wgpu::IndexFormat::Uint16,
+        }
+    }
+
+    /// Uploads 32-bit `indices`, which may not be empty.
+    ///
+    /// `MATERIAL_INDEX_FORMAT_32BIT`, which exists in Valve's enum and which
+    /// nothing in the original's draw paths asks for — the original splits a
+    /// studio model into meshes small enough not to need it, because
+    /// `CMeshDX8` had one 16-bit index buffer per mesh.
+    ///
+    /// This port needs it, and the evidence is one file:
+    /// **`models/stars/allstars.mdl` is a static prop with 187,676 vertices**,
+    /// almost three times what a `u16` can name. Splitting it the way the
+    /// original does would mean re-basing indices per sub-buffer for one model
+    /// in 1,444; one wider buffer is the same GPU work and none of the
+    /// bookkeeping.
+    pub fn new_u32(device: &wgpu::Device, label: &str, indices: &[u32]) -> IndexBuffer {
+        assert!(!indices.is_empty(), "{label}: empty index buffer");
+        IndexBuffer {
+            buffer: upload(
+                device,
+                label,
+                wgpu::BufferUsages::INDEX,
+                bytemuck::cast_slice(indices),
+            ),
+            count: indices.len() as u32,
+            format: wgpu::IndexFormat::Uint32,
+        }
+    }
+
+    /// The width of one index, in bytes — 2 or 4.
+    fn stride(&self) -> u64 {
+        match self.format {
+            wgpu::IndexFormat::Uint16 => 2,
+            wgpu::IndexFormat::Uint32 => 4,
         }
     }
 
@@ -469,6 +505,7 @@ impl IndexBuffer {
             buffer: self.buffer.clone(),
             offset: 0,
             count: self.count,
+            format: self.format,
         }
     }
 
@@ -486,9 +523,10 @@ impl IndexBuffer {
         );
         IndexSlice {
             buffer: self.buffer.clone(),
-            // Times two because `set_index_buffer` takes bytes.
-            offset: u64::from(first) * 2,
+            // `set_index_buffer` takes bytes, so this is indices times width.
+            offset: u64::from(first) * self.stride(),
             count,
+            format: self.format,
         }
     }
 }
@@ -534,6 +572,9 @@ pub struct IndexSlice {
     buffer: wgpu::Buffer,
     offset: u64,
     count: u32,
+    /// 16-bit for everything the world and the dynamic arena draw; 32-bit only
+    /// for a studio model wide enough to need it.
+    format: wgpu::IndexFormat,
 }
 
 impl IndexSlice {
@@ -546,8 +587,16 @@ impl IndexSlice {
     }
 
     pub(super) fn buffer_slice(&self) -> wgpu::BufferSlice<'_> {
-        let bytes = u64::from(self.count) * 2;
+        let stride = match self.format {
+            wgpu::IndexFormat::Uint16 => 2,
+            wgpu::IndexFormat::Uint32 => 4,
+        };
+        let bytes = u64::from(self.count) * stride;
         self.buffer.slice(self.offset..self.offset + bytes)
+    }
+
+    pub(super) fn format(&self) -> wgpu::IndexFormat {
+        self.format
     }
 }
 
@@ -636,6 +685,9 @@ impl DynamicBuffers {
             buffer,
             offset,
             count: indices.len() as u32,
+            // The dynamic arena is 16-bit only: a frame's worth of generated
+            // geometry is bounded by `indices_remaining` well below 65,536.
+            format: wgpu::IndexFormat::Uint16,
         }
     }
 

@@ -21,6 +21,7 @@
 //!   (`gl_rsurf.cpp`). Grouping happens once, here, at load.
 
 pub mod bsp;
+pub mod props;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use crate::materials::shader::Lighting;
 use crate::materials::{Material, MaterialCache};
 
 use bsp::{Bsp, BspError, Face};
+use props::{PropModels, Props};
 
 /// Where a batch has to be split.
 ///
@@ -134,6 +136,11 @@ pub struct WorldStats {
     /// Faces carrying explicit primitives, which are fan-triangulated here
     /// instead. See [`build_meshes`].
     pub faces_with_primitives: usize,
+    /// Static prop instances placed by the `sprp` lump.
+    pub props: usize,
+    /// Distinct models those instances name — the number of models that
+    /// actually have to be loaded, which is far smaller.
+    pub prop_models: usize,
 }
 
 /// A loaded map.
@@ -165,6 +172,16 @@ pub struct World {
     /// the same reason the lightmap atlas is: it is derived from this map's
     /// file and dies with it. `trace/` reads it; nothing in `world/` does.
     pub collision: CollisionBsp,
+    /// The map's static prop placements — the `sprp` game lump, resolved.
+    ///
+    /// Stage 2 of `portdocs/STUDIO.md` §8: read and transformed, **not drawn**.
+    /// The models themselves are not loaded here either; that is stage 3's, and
+    /// it is what turns [`Props::models`] into uploaded geometry.
+    ///
+    /// [`Props::models`]: props::Props::models
+    pub props: Props,
+    /// The models those placements name, uploaded once each.
+    pub prop_models: PropModels,
     pub stats: WorldStats,
 }
 
@@ -259,6 +276,27 @@ impl World {
         let model = bsp.world_model();
         let entities = bsp.entities();
 
+        // A malformed `sprp` lump loses the map's props, not the map: the world
+        // geometry is already built and drawable by this point, and a map with
+        // no furniture beats no map at all. Valve is stricter — `Host_Error`
+        // — but it had no way to draw the level without the prop manager
+        // having run, and this port does.
+        let mut props = match Props::load(name, &bsp) {
+            Ok(props) => props,
+            Err(e) => {
+                eprintln!("source-engine: world: {e}");
+                Props::default()
+            }
+        };
+        // Built here rather than in the struct literal below because the props
+        // need it: a prop's lighting is sampled at a point, and finding the
+        // leaf that point is in is a walk of this tree.
+        let collision = CollisionBsp::build(&bsp);
+        props.light(&bsp, &collision);
+        stats.props = props.instances.len();
+        stats.prop_models = props.models.len();
+        let prop_models = PropModels::load(vfs, materials, device, &props);
+
         Ok(World {
             name: name.to_owned(),
             bsp_version: bsp.version,
@@ -273,7 +311,9 @@ impl World {
                 .map(str::to_owned),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
-            collision: CollisionBsp::build(&bsp),
+            collision,
+            props,
+            prop_models,
             stats,
         })
     }
@@ -284,6 +324,15 @@ impl World {
     /// space, which is the whole difference between the world model and the
     /// brush models that are not drawn yet.
     pub fn draw(&self, pass: &mut Pass<'_>) {
+        self.draw_brushes(pass);
+        // After the world, because a prop sits on top of the geometry it is
+        // placed against and the depth test is cheaper when the near thing is
+        // already there. `CStaticPropMgr::DrawStaticProps` runs in the same
+        // opaque pass for the same reason.
+        self.prop_models.draw(pass, &self.props);
+    }
+
+    fn draw_brushes(&self, pass: &mut Pass<'_>) {
         for batch in &self.batches {
             // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
             // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
@@ -320,6 +369,7 @@ impl World {
              {} vertices, {} triangles, {} batches, \
              {} materials ({} missing), \
              {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
+             {} static props from {} models ({}); \
              collision: {}",
             self.name,
             self.bsp_version,
@@ -339,6 +389,9 @@ impl World {
             self.lightmaps.len(),
             self.lightmaps.bytes() / (1024 * 1024),
             if self.lighting_is_hdr { "hdr" } else { "ldr" },
+            s.props,
+            s.prop_models,
+            self.prop_models.summary(),
             self.collision.summary(),
         )
     }

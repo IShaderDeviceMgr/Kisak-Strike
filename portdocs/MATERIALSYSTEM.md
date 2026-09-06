@@ -893,7 +893,9 @@ milestone the project has.
 Stages 1–6 are done, `VertexLitGeneric` being the whole of stage 6 so far. The rest of
 §7.8's shader set is a breadth move gated on nothing; the next thing *models* need is not
 in this module at all, but in `studiorender` — a `.mdl`/`.vvd`/`.vtx` reader — and in the
-engine's `sprp` game lump and `R_StudioSetupLighting`, which is what fills the
+engine's `sprp` game lump and `engine/lightcache.cpp`'s lighting reconstruction
+(`LightcacheGetStatic` / `Mod_LeafAmbientColorAtPos` — **not** `R_StudioSetupLighting`,
+which this tree does not have), which is what fills the
 `ModelLighting` block this stage built.
 
 ## 10. Open questions and risks

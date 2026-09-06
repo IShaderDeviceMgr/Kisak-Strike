@@ -169,6 +169,9 @@ impl Fixture {
 
     pub(crate) fn finish(self) -> CollisionBsp {
         let bsp = Bsp {
+            game_lumps: Vec::new(),
+            leaf_ambient: Vec::new(),
+            leaf_ambient_index: Vec::new(),
             path: "test".to_owned(),
             version: 21,
             revision: 0,
