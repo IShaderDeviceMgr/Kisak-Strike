@@ -988,6 +988,45 @@ mod tests {
         assert!(!miss.all_solid, "{miss:?}");
     }
 
+    /// `model_to_world` and `local_ray` are inverses, which is the property
+    /// that stops a brush model being *drawn* somewhere other than where it is
+    /// *collided with*.
+    ///
+    /// Both read the same two fields, so this cannot drift by accident — but it
+    /// could drift by edit, and a door you can see a foot to the left of the
+    /// one you walk into is a bug nobody would look for here.
+    #[test]
+    fn the_render_transform_inverts_the_trace_transform() {
+        let world = world_and_model();
+        for (origin, angles) in [
+            (Vec3::ZERO, Vec3::ZERO),
+            (Vec3::new(10.0, -20.0, 30.0), Vec3::ZERO),
+            (Vec3::new(10.0, -20.0, 30.0), Vec3::new(0.0, 90.0, 0.0)),
+            (Vec3::new(-400.0, 55.0, 7.0), Vec3::new(30.0, 45.0, 60.0)),
+        ] {
+            let model = world.brush_model(1, origin, angles).expect("model 1");
+            let to_world = model.model_to_world();
+
+            // A ray's start is not centred, so its local start is exactly the
+            // world point carried through the inverse transform.
+            let point = Vec3::new(120.0, 8.0, -3.0);
+            let local = model.local_ray(&Ray::line(point, point + Vec3::X));
+            let expected = to_world.inverse().transform_point3(point);
+            assert!(
+                (local.start - expected).length() < 1e-3,
+                "{origin} {angles}: local {} vs {expected}",
+                local.start,
+            );
+
+            // ...and a direction rotates back the same way the normal does.
+            assert!(
+                (to_world.transform_vector3(local.delta) - Vec3::X).length() < 1e-4,
+                "{origin} {angles}: delta {}",
+                local.delta,
+            );
+        }
+    }
+
     /// Every shipped map's brush entities, resolved and swept against for
     /// real — `portdocs/ENGINE_TRACE.md` stage 2's verification.
     ///

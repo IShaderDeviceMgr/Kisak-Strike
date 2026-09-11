@@ -3,10 +3,16 @@
 //! `portdocs/ENGINE.md` §7.14 sizes the original at ~16,300 lines
 //! (`modelloader.cpp`, `cmodel.cpp`, `mod_vis.cpp`, …). This is the slice of it
 //! that gets a map on screen: read the `.bsp` ([`bsp`]), turn its faces into
-//! vertex and index buffers grouped by material, and draw them. Everything the
-//! rest of that subsystem does — visibility, collision, displacements, static
-//! props, brush entities, `.mdl` models — is listed under "Not loaded" below
-//! and arrives with the subsystem that needs it.
+//! vertex and index buffers grouped by material, and draw them — the world
+//! model, the **brush entities** placed around it, and the static props on top.
+//! Everything the rest of that subsystem does — visibility, displacements,
+//! dynamic lighting, the 3D skybox — arrives with the subsystem that needs it.
+//!
+//! A brush entity is drawn exactly as the world is, under the placement its
+//! entity gives it: `R_DrawBrushModel` (`gl_rsurf.cpp`) is the world-surface
+//! draw with a matrix. **Nothing moves one** — that is `server/`'s — and the
+//! game state that would hide one is not here either, which is
+//! [`find_brush_models`]'s caveat.
 //!
 //! Three of Valve's structural decisions are deliberately *not* reproduced:
 //!
@@ -139,6 +145,17 @@ pub struct WorldStats {
     /// Faces carrying explicit primitives, which are fan-triangulated here
     /// instead. See [`build_meshes`].
     pub faces_with_primitives: usize,
+    /// Brush entities with drawable geometry, out of
+    /// [`World::brush_models`]'s total.
+    ///
+    /// These four are kept apart from the face counters above rather than
+    /// summed into them, because `faces_total`/`faces_drawn` answer "how much
+    /// of the level shell is on screen" and mixing a map's doors into that
+    /// makes both numbers harder to read.
+    pub brush_models_drawn: usize,
+    pub brush_model_faces: usize,
+    pub brush_model_triangles: usize,
+    pub brush_model_faces_lit: usize,
     /// Static prop instances placed by the `sprp` lump.
     pub props: usize,
     /// Distinct models those instances name — the number of models that
@@ -193,6 +210,12 @@ pub struct World {
     ///
     /// [`classname`]: PlacedBrushModel::classname
     pub brush_models: Vec<PlacedBrushModel>,
+    /// The drawable ones among them, with their geometry.
+    ///
+    /// Shorter than [`brush_models`](World::brush_models) — most brush entities
+    /// in a Portal 2 map are triggers and keep no drawable face — and each
+    /// entry names the placement it belongs to.
+    pub brush_model_geometry: Vec<BrushModelGeometry>,
     /// The map's static prop placements — the `sprp` game lump, resolved.
     ///
     /// Stage 2 of `portdocs/STUDIO.md` §8: read and transformed, **not drawn**.
@@ -249,10 +272,43 @@ impl World {
         // (`RegisterLightmappedSurface`, `gl_matsysiface.cpp:216`), and its
         // vertex layout depends on which shader the material named. Neither is
         // answerable from the `.bsp`.
-        let (groups, mut stats) = group_faces(&bsp);
+        let mut stats = WorldStats::default();
+        let groups = group_faces(&bsp, bsp.world_model(), &mut stats);
+
+        // The entity lump and the collision tree are read here rather than
+        // after the geometry, because the brush models need both *before* their
+        // faces can be grouped: the entity lump says which models are placed
+        // and the collision tree resolves a `"*N"` into a placement. The props
+        // below want the same tree for their leaf lookup.
+        let entities = bsp.entities();
+        let collision = CollisionBsp::build(&bsp);
+        let brush_models = find_brush_models(&entities, &collision);
+
+        // One group map per placement, and empty for the ones that draw
+        // nothing — which is most of them. Counted into their own stats block
+        // so that "5,512 of 5,638 faces" stays a statement about the world.
+        let mut brush_stats = WorldStats::default();
+        let brush_groups: Vec<BTreeMap<&str, Vec<&Face>>> = brush_models
+            .iter()
+            .map(|placed| {
+                if placed.render_mode == RENDER_NONE {
+                    return BTreeMap::new();
+                }
+                group_faces(&bsp, &bsp.models[placed.index], &mut brush_stats)
+            })
+            .collect();
+
         let error_material = materials.error_material();
         let mut resolved: BTreeMap<&str, (Arc<Material>, MaterialInfo)> = BTreeMap::new();
-        for name in groups.keys() {
+        // The union, because a door can wear a material no world surface does
+        // — and can equally share one, which must not be loaded or counted
+        // twice.
+        let material_names: std::collections::BTreeSet<&str> = groups
+            .keys()
+            .copied()
+            .chain(brush_groups.iter().flat_map(|g| g.keys().copied()))
+            .collect();
+        for name in &material_names {
             let mut material = materials.load(vfs, name);
             stats.materials += 1;
             if Arc::ptr_eq(&material, &error_material) {
@@ -282,7 +338,7 @@ impl World {
                 layout: material.shader.vertex_layout(),
                 lighting: material.lighting,
             };
-            resolved.insert(name, (material, info));
+            resolved.insert(*name, (material, info));
         }
 
         let mut lightmaps = LightmapAtlas::new();
@@ -294,29 +350,47 @@ impl World {
                 map: name.to_owned(),
             });
         }
+
+        // After the world, into the same atlas: a brush model's faces carry
+        // ordinary `vrad` lightmap samples in the same lighting lump, so they
+        // pack the same way and read the same pages. Doing it per model costs a
+        // little packing efficiency — `begin_material` closes pages whenever the
+        // material changes, and it changes more often across many small models
+        // — and buys each model its own batches, which is what a per-model
+        // transform needs.
+        let brush_model_geometry = brush_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, groups)| !groups.is_empty())
+            .map(|(placement, groups)| {
+                let meshes = build_meshes(&bsp, groups, &mut lightmaps, &mut brush_stats, |name| {
+                    resolved[name].1
+                });
+                (placement, meshes)
+            })
+            // Collected before any buffer is created, because `build_meshes`
+            // borrows the atlas mutably and uploading does not.
+            .collect::<Vec<_>>();
+
         stats.lightmap_pages = lightmaps.page_count() as usize;
 
-        let batches = meshes
-            .iter()
-            .map(|mesh| {
-                let material = Arc::clone(&resolved[mesh.material.as_str()].0);
-                let vertices = match &mesh.vertices {
-                    MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
-                    MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
-                };
-                Batch {
-                    material,
-                    lightmap_page: mesh.lightmap_page,
-                    vertices,
-                    indices: IndexBuffer::new(device, &mesh.material, &mesh.indices),
-                }
+        let batches = upload_batches(device, &meshes, &resolved);
+        let brush_model_geometry: Vec<BrushModelGeometry> = brush_model_geometry
+            .into_iter()
+            .map(|(placement, meshes)| BrushModelGeometry {
+                placement,
+                batches: upload_batches(device, &meshes, &resolved),
             })
             .collect();
+
+        stats.brush_models_drawn = brush_model_geometry.len();
+        stats.brush_model_faces = brush_stats.faces_drawn;
+        stats.brush_model_triangles = brush_stats.triangles;
+        stats.brush_model_faces_lit = brush_stats.faces_lit;
 
         let lightmaps = lightmaps.upload(device, materials.queue(), materials.layouts());
 
         let model = bsp.world_model();
-        let entities = bsp.entities();
 
         // A malformed `sprp` lump loses the map's props, not the map: the world
         // geometry is already built and drawable by this point, and a map with
@@ -354,7 +428,8 @@ impl World {
                 .map(str::to_owned),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
-            brush_models: find_brush_models(&entities, &collision),
+            brush_models,
+            brush_model_geometry,
             collision,
             props,
             prop_models,
@@ -369,11 +444,43 @@ impl World {
     /// brush models that are not drawn yet.
     pub fn draw(&self, pass: &mut Pass<'_>) {
         self.draw_brushes(pass);
+        // Brush entities next: they are part of the level shell — a door in a
+        // doorway, a panel in a wall — so they belong with the world rather
+        // than with its furniture. `R_DrawBrushModel` (`gl_rsurf.cpp`) is
+        // likewise a world-surface draw with a matrix, not a model draw.
+        self.draw_brush_models(pass);
         // After the world, because a prop sits on top of the geometry it is
         // placed against and the depth test is cheaper when the near thing is
         // already there. `CStaticPropMgr::DrawStaticProps` runs in the same
         // opaque pass for the same reason.
         self.prop_models.draw(pass, &self.props);
+    }
+
+    /// Records every brush entity's batches, each under its own transform.
+    ///
+    /// `R_DrawBrushModel` (`engine/gl_rsurf.cpp`): the same world-surface draw
+    /// as [`draw_brushes`](World::draw_brushes), with the entity's
+    /// model-to-world matrix in place of the identity. Valve pushed that matrix
+    /// onto the matrix stack and popped it afterwards; here it is an argument,
+    /// which is the same deletion `rustdocs/MATERIALS.md` records for the
+    /// render-target and scissor stacks.
+    ///
+    /// **The transform is asked for once per model and not cached**, so it can
+    /// never disagree with what `trace/` collides against — see
+    /// [`BrushModelGeometry`].
+    pub(crate) fn draw_brush_models(&self, pass: &mut Pass<'_>) {
+        for geometry in &self.brush_model_geometry {
+            let model_to_world = self.brush_models[geometry.placement].model.model_to_world();
+            for batch in &geometry.batches {
+                pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
+                pass.draw(
+                    &batch.material,
+                    &batch.vertices.slice(),
+                    &batch.indices.slice(),
+                    model_to_world,
+                );
+            }
+        }
     }
 
     pub(crate) fn draw_brushes(&self, pass: &mut Pass<'_>) {
@@ -413,9 +520,10 @@ impl World {
              {} vertices, {} triangles, {} batches, \
              {} materials ({} missing), \
              {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
+             {}/{} brush models drawn ({} faces, {} triangles, {} lit); \
              {} static props from {} models ({}); \
              {} files in the map pak; \
-             collision: {}, {} brush models placed",
+             collision: {}",
             self.name,
             self.bsp_version,
             self.bsp_revision,
@@ -434,12 +542,16 @@ impl World {
             self.lightmaps.len(),
             self.lightmaps.bytes() / (1024 * 1024),
             if self.lighting_is_hdr { "hdr" } else { "ldr" },
+            s.brush_models_drawn,
+            self.brush_models.len(),
+            s.brush_model_faces,
+            s.brush_model_triangles,
+            s.brush_model_faces_lit,
             s.props,
             s.prop_models,
             self.prop_models.summary(),
             s.pak_files,
             self.collision.summary(),
-            self.brush_models.len(),
         )
     }
 }
@@ -531,18 +643,35 @@ impl MeshVertices {
     }
 }
 
-/// Selects the faces worth drawing and groups them by material name.
+/// Selects the faces worth drawing in one model and groups them by material
+/// name.
 ///
 /// Face *selection* is separate from geometry building because it runs twice
 /// over: once to learn which materials the map uses, and again once those are
 /// resolved. Groups are keyed by name so the output is ordered and a `.bsp`
 /// always produces the same batches; Valve sorted by the material's
 /// enumeration ID, which is allocation order and therefore not reproducible.
-fn group_faces(bsp: &Bsp) -> (BTreeMap<&str, Vec<&Face>>, WorldStats) {
-    let mut stats = WorldStats::default();
+///
+/// `model` is the world for the level shell and a brush entity's for a door or
+/// a platform — the selection rules are identical, which is the finding that
+/// makes brush-model rendering small. In particular **the `SURF_*` filter is
+/// the whole of the visibility question**: every `trigger_*` class in Portal 2
+/// compiles to `SURF_NODRAW`/`SURF_TRIGGER` faces and drops out here on its
+/// own, with no per-classname rule. Measured over all 106 shipped maps: of
+/// 11,635 brush entities only 2,697 keep a single drawable face, and the ones
+/// that do are the ones you can see — including `trigger_portal_cleanser`,
+/// whose fizzler field is genuinely visible.
+///
+/// `stats` is the caller's, because the world's face counts and the brush
+/// models' are reported separately and summing them would hide both.
+fn group_faces<'a>(
+    bsp: &'a Bsp,
+    model: &bsp::Model,
+    stats: &mut WorldStats,
+) -> BTreeMap<&'a str, Vec<&'a Face>> {
     let mut groups: BTreeMap<&str, Vec<&Face>> = BTreeMap::new();
 
-    for face in bsp.model_faces(bsp.world_model()) {
+    for face in bsp.model_faces(model) {
         stats.faces_total += 1;
 
         // A displacement's rendered geometry is a subdivided grid in
@@ -579,7 +708,31 @@ fn group_faces(bsp: &Bsp) -> (BTreeMap<&str, Vec<&Face>>, WorldStats) {
         groups.entry(material).or_default().push(face);
     }
 
-    (groups, stats)
+    groups
+}
+
+/// Uploads built meshes to the device as drawable batches.
+///
+/// The one step in the pipeline that needs a GPU, kept apart from the rest so
+/// that everything above it — face selection, coordinate generation, lightmap
+/// packing, batch splitting — stays testable without one.
+fn upload_batches(
+    device: &wgpu::Device,
+    meshes: &[Mesh],
+    resolved: &BTreeMap<&str, (Arc<Material>, MaterialInfo)>,
+) -> Vec<Batch> {
+    meshes
+        .iter()
+        .map(|mesh| Batch {
+            material: Arc::clone(&resolved[mesh.material.as_str()].0),
+            lightmap_page: mesh.lightmap_page,
+            vertices: match &mesh.vertices {
+                MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
+                MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
+            },
+            indices: IndexBuffer::new(device, &mesh.material, &mesh.indices),
+        })
+        .collect()
 }
 
 /// Packs every face's lightmap, then turns the faces into per-batch meshes.
@@ -855,6 +1008,43 @@ pub struct PlacedBrushModel {
     /// Which model the entity named: `"model" "*12"` is 12.
     pub index: usize,
     pub model: BrushModel,
+    /// The entity's `rendermode` — `RenderMode_t` (`public/const.h:336`),
+    /// 0 (`kRenderNormal`) when the key is absent.
+    ///
+    /// Stored as the file's number rather than interpreted, because the
+    /// interpretation differs by consumer: [`RENDER_NONE`] means "do not draw"
+    /// and is the one value [`World`] acts on, while the translucent modes
+    /// 1-5 and 7-9 need a blended pass that does not exist. Collision ignores
+    /// it entirely — a `rendermode 10` brush is invisible and still solid.
+    pub render_mode: i32,
+}
+
+/// `kRenderNone` (`public/const.h:348`) — the one render mode that is a flat
+/// refusal to draw.
+///
+/// `C_BaseEntity::ShouldDraw` (`c_baseentity.cpp:1884`) tests exactly this and
+/// nothing else among the modes, which is why it is the only one honoured
+/// here. 94 brush entities across the 106 shipped maps set it.
+pub const RENDER_NONE: i32 = 10;
+
+/// One brush entity's drawable geometry.
+///
+/// Separate from [`PlacedBrushModel`] rather than a field on it, for two
+/// reasons: not every placement has any (a trigger keeps no drawable face, and
+/// nor does a `rendermode 10` brush), and a placement is a plain value that
+/// `trace/`'s tests build without a GPU while this owns device buffers.
+///
+/// **No transform is stored.** It is
+/// [`BrushModel::model_to_world`](crate::engine::trace::BrushModel::model_to_world),
+/// recomputed per draw, so that what is drawn and what is collided with cannot
+/// drift apart. It is two `Mat4` products for each of a map's few dozen brush
+/// models, against a frame that already records a thousand draws.
+pub struct BrushModelGeometry {
+    /// Which entry of [`World::brush_models`] this draws.
+    pub placement: usize,
+    /// Its batches, grouped by (material, lightmap page) exactly as the
+    /// world's are — a brush model is world geometry that happens to move.
+    pub batches: Vec<Batch>,
 }
 
 /// Every entity that names a brush model, placed.
@@ -869,6 +1059,25 @@ pub struct PlacedBrushModel {
 /// An entity naming a model the map does not have is skipped rather than
 /// refused — the same rule the entity parser itself follows, and one bad
 /// entity should not cost the map.
+///
+/// # What is deliberately not read
+///
+/// Three entity keys change whether a brush entity is drawn in the shipped game
+/// and are ignored here, because acting on them means running the game logic
+/// that owns them. Each is recorded with how much it actually costs, measured
+/// over the 106 shipped maps:
+///
+/// - **`StartDisabled`** — a `func_brush` that starts switched off is invisible
+///   *and* non-solid until something enables it. That is `CFuncBrush`'s spawn
+///   code and so `server/`'s, the same argument [`PlacedBrushModel`] makes for
+///   solidity. **86 of the 2,608 drawable brush entities** set it, so it is a
+///   footnote rather than a visible problem.
+/// - **The translucent render modes** (1-5, 7-9). Honouring them needs a sorted
+///   blended pass, which does not exist; they draw opaque. Only
+///   [`RENDER_NONE`] is acted on, which is also the only one
+///   `C_BaseEntity::ShouldDraw` rejects. Five entities in the whole game set a
+///   translucent mode.
+/// - **`renderamt`**, for the same reason — there is nothing to fade into.
 pub(crate) fn find_brush_models(
     entities: &[bsp::Entity],
     collision: &CollisionBsp,
@@ -891,6 +1100,12 @@ pub(crate) fn find_brush_models(
                     entity.vector("origin").unwrap_or(Vec3::ZERO),
                     entity.vector("angles").unwrap_or(Vec3::ZERO),
                 )?,
+                // Absent, or unparseable, is `kRenderNormal` — the same
+                // default the entity system's keyvalue would have left.
+                render_mode: entity
+                    .get("rendermode")
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0),
             })
         })
         .collect()
@@ -950,7 +1165,8 @@ mod tests {
     /// first supplied directly: one material description for every material in
     /// the map, and a fresh atlas.
     fn meshes_of(bsp: &Bsp, info: MaterialInfo) -> (Vec<Mesh>, WorldStats, LightmapAtlas) {
-        let (groups, mut stats) = group_faces(bsp);
+        let mut stats = WorldStats::default();
+        let groups = group_faces(bsp, bsp.world_model(), &mut stats);
         let mut lightmaps = LightmapAtlas::new();
         let meshes = build_meshes(bsp, &groups, &mut lightmaps, &mut stats, |_| info);
         stats.lightmap_pages = lightmaps.page_count() as usize;
@@ -1222,6 +1438,235 @@ mod tests {
         let names: Vec<&str> = meshes.iter().map(|m| m.material.as_str()).collect();
         assert_eq!(names, ["aaa/first", "tools/toolsblack", "zzz/last"]);
         assert_eq!(stats.faces_drawn, 3);
+    }
+
+    /// The one-face map with a second model added — a brush entity.
+    ///
+    /// `faces` is how many of the map's single face that model claims: 0 makes
+    /// a brush entity with nothing to draw, 1 makes one that shares the
+    /// world's face. A real map never shares a face between two models, but
+    /// this fixture has only one and what is under test is *which model was
+    /// asked about*.
+    fn with_brush_model(faces: i32, keys: &str) -> Bsp {
+        let mut bsp = test_bsp();
+        let mut model = bsp.models[0];
+        model.first_face = 0;
+        model.num_faces = faces;
+        bsp.models.push(model);
+        bsp.entity_lump = format!("{{\n\"classname\" \"func_door\"\n\"model\" \"*1\"\n{keys}}}\n");
+        bsp
+    }
+
+    /// The model argument is honoured, and a model claiming no faces draws
+    /// nothing — which is what a trigger looks like once the `SURF_*` filter
+    /// has had it.
+    #[test]
+    fn a_brush_models_faces_come_from_its_own_model() {
+        let bsp = with_brush_model(1, "");
+        let mut stats = WorldStats::default();
+        let groups = group_faces(&bsp, &bsp.models[1], &mut stats);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.values().next().map(Vec::len), Some(1));
+        assert_eq!(stats.faces_drawn, 1);
+
+        let bsp = with_brush_model(0, "");
+        let mut stats = WorldStats::default();
+        assert!(group_faces(&bsp, &bsp.models[1], &mut stats).is_empty());
+        assert_eq!(stats.faces_drawn, 0);
+        assert_eq!(stats.faces_total, 0);
+    }
+
+    /// The placement comes from the entity, not from the model lump, and the
+    /// transform it produces is the one the trace collides against.
+    #[test]
+    fn a_brush_entitys_placement_is_read_from_its_keys() {
+        let bsp = with_brush_model(1, "\"origin\" \"100 20 4\"\n\"angles\" \"0 90 0\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].index, 1);
+        assert_eq!(placed[0].classname, "func_door");
+        assert_eq!(
+            placed[0].render_mode, 0,
+            "absent rendermode is kRenderNormal"
+        );
+
+        let m = placed[0].model.model_to_world();
+        // The model's own origin lands on the entity's.
+        assert!(
+            (m.transform_point3(Vec3::ZERO) - Vec3::new(100.0, 20.0, 4.0)).length() < 1e-4,
+            "{m}"
+        );
+        // A yaw of 90 turns the model's +X onto the world's +Y.
+        assert!(
+            (m.transform_point3(Vec3::X * 10.0) - Vec3::new(100.0, 30.0, 4.0)).length() < 1e-4,
+            "{m}"
+        );
+    }
+
+    /// `Model::origin` is "for sounds and lights, not a render transform"
+    /// (`bsp.rs`), so a model whose lump origin is set and whose *entity* has
+    /// no `origin` key draws where its vertices already are.
+    #[test]
+    fn the_model_lumps_origin_is_not_a_transform() {
+        let mut bsp = with_brush_model(1, "");
+        bsp.models[1].origin = [500.0, 600.0, 700.0];
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+
+        assert_eq!(
+            placed[0].model.model_to_world(),
+            glam::Mat4::IDENTITY,
+            "the lump origin must not reach the transform"
+        );
+    }
+
+    /// `rendermode 10` is `kRenderNone`, and `C_BaseEntity::ShouldDraw`'s only
+    /// render-mode refusal. It must not reach the geometry — and must not
+    /// affect collision, which has its own reasons to care about a brush.
+    #[test]
+    fn rendermode_none_is_read_and_leaves_collision_alone() {
+        let bsp = with_brush_model(1, "\"rendermode\" \"10\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+
+        assert_eq!(placed.len(), 1, "still placed, and still solid");
+        assert_eq!(placed[0].render_mode, RENDER_NONE);
+
+        // The translucent modes are *not* honoured — they need a blended pass
+        // — so they must read as ordinary and be drawn rather than silently
+        // dropped.
+        for mode in ["0", "1", "5", "9"] {
+            let bsp = with_brush_model(1, &format!("\"rendermode\" \"{mode}\"\n"));
+            let collision = CollisionBsp::build(&bsp);
+            let placed = find_brush_models(&bsp.entities(), &collision);
+            assert_ne!(placed[0].render_mode, RENDER_NONE, "mode {mode}");
+        }
+    }
+
+    /// Every shipped map's brush entities, built for real.
+    ///
+    /// Ignored by default and gated on `KISAK_GAME_DIR`, like the `studio/` and
+    /// `trace/` depot tests. Needs no GPU — everything up to
+    /// [`upload_batches`] runs on the CPU, which is the reason it is split out.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_map_brush_geometry -- --ignored --nocapture
+    /// ```
+    ///
+    /// The assertion that earns the runtime: **a drawn brush model's vertices,
+    /// carried through `model_to_world`, must land inside its own model box
+    /// carried through the same transform**. `trace/`'s depot test already
+    /// established that box is where the map's *collision* puts the entity, so
+    /// this is the statement that what gets drawn and what gets walked into are
+    /// the same object. Drop the transform, apply it twice, or reach for
+    /// `Model::origin` instead of the entity's, and a displaced entity fails.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn every_shipped_map_builds_its_brush_model_geometry() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "only {} maps found", names.len());
+
+        let (mut maps, mut placed, mut drawn) = (0, 0usize, 0usize);
+        let (mut faces, mut triangles, mut lit, mut none) = (0usize, 0usize, 0usize, 0usize);
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            let collision = CollisionBsp::build(&bsp);
+            let brush_models = find_brush_models(&bsp.entities(), &collision);
+            maps += 1;
+            placed += brush_models.len();
+
+            for model in &brush_models {
+                if model.render_mode == RENDER_NONE {
+                    none += 1;
+                    continue;
+                }
+                let lump = &bsp.models[model.index];
+                let mut stats = WorldStats::default();
+                let groups = group_faces(&bsp, lump, &mut stats);
+                if groups.is_empty() {
+                    continue;
+                }
+                drawn += 1;
+
+                let mut lightmaps = LightmapAtlas::new();
+                let meshes =
+                    build_meshes(&bsp, &groups, &mut lightmaps, &mut stats, |_| LIGHTMAPPED);
+                assert!(!meshes.is_empty(), "{name}: *{} built nothing", model.index);
+                faces += stats.faces_drawn;
+                triangles += stats.triangles;
+                lit += stats.faces_lit;
+
+                // The model's own box, and its vertices, both carried out to
+                // world space by the placement. One unit of slack for `f32`
+                // across a 16k map.
+                let to_world = model.model.model_to_world();
+                let (lo, hi) = (Vec3::from(lump.mins), Vec3::from(lump.maxs));
+                let (mut bmin, mut bmax) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for i in 0..8 {
+                    let corner = to_world.transform_point3(Vec3::new(
+                        if i & 1 == 0 { lo.x } else { hi.x },
+                        if i & 2 == 0 { lo.y } else { hi.y },
+                        if i & 4 == 0 { lo.z } else { hi.z },
+                    ));
+                    bmin = bmin.min(corner);
+                    bmax = bmax.max(corner);
+                }
+                // ...and the map's own box, which is the *independent* half of
+                // the check: the box above is derived with the same transform,
+                // so it proves the geometry and the box share a frame but not
+                // that the frame is the right one. The world model's bounds come
+                // from a different lump entry entirely. Measured over the whole
+                // game: all 92,870 brush-model vertices land inside it once
+                // transformed, with a worst-case excursion of 0.00 units —
+                // while 13,122 of them fall outside if the transform is skipped.
+                let world_model = bsp.world_model();
+                let (wlo, whi) = (Vec3::from(world_model.mins), Vec3::from(world_model.maxs));
+
+                let slack = Vec3::ONE;
+                for mesh in &meshes {
+                    for vertex in world_vertices(mesh) {
+                        let world = to_world.transform_point3(Vec3::from(vertex.position));
+                        assert!(
+                            world.cmpge(bmin - slack).all() && world.cmple(bmax + slack).all(),
+                            "{name}: *{} \"{}\" vertex {world} outside its own box \
+                             {bmin}..{bmax}",
+                            model.index,
+                            model.classname,
+                        );
+                        assert!(
+                            world.cmpge(wlo - slack).all() && world.cmple(whi + slack).all(),
+                            "{name}: *{} \"{}\" vertex {world} outside the map \
+                             {wlo}..{whi} — is the placement being applied?",
+                            model.index,
+                            model.classname,
+                        );
+                    }
+                }
+            }
+        }
+
+        println!(
+            "\n{maps} maps: {placed} brush entities placed, {drawn} drawn \
+             ({none} refused for rendermode 10), {faces} faces, {triangles} triangles, \
+             {lit} lit"
+        );
+        assert!(drawn > 1000, "only {drawn} drawn across {maps} maps");
     }
 
     #[test]

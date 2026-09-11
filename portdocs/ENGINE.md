@@ -652,7 +652,11 @@ reached.** Remaining, in dependency order:
    pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
    from checkerboard into content. **Highest visual return of anything on this list.**
 4. **The rest of `world/`** (§7.14, §7.15) — visibility (every face is drawn every frame
-   today), displacements, brush entities, static props — plus `trace/` (§7.17).
+   today) and displacements, plus `trace/` (§7.17)'s remaining stages. **Static props and
+   brush entities have landed**: the props are `portdocs/STUDIO.md`, and the brush
+   entities turned out to be the *existing* face-grouping and lightmap path run per model
+   with the entity's matrix, because a brush model's faces are in its own frame and the
+   `SURF_*` filter already removes every trigger. See `rustdocs/ENGINE.md`.
    - `render/` (§7.16) + `paint/` — as the consumer side of the `src/materials/` work,
      not as a separate port. `Engine::camera` and `World::draw` are its seed.
    - `audio/` (§7.18) — large but self-contained, no `winit`/`wgpu` entanglement, and the

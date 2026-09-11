@@ -8,7 +8,7 @@
 //! that is *derived* rather than read: the surface table, the box brushes, and
 //! the contents summary.
 
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 
 use super::result::SURFACE_INDEX_INVALID;
 use super::{Contents, Ray, Surface, Tracer};
@@ -457,6 +457,28 @@ pub struct BrushModel {
 }
 
 impl BrushModel {
+    /// The model-to-world transform — `translate(origin) · angle_matrix(angles)`.
+    ///
+    /// The same shape as
+    /// [`StaticProp::model_to_world`](crate::engine::world::props::StaticProp::model_to_world),
+    /// and built from **the same placement the trace uses**: anything drawing a
+    /// brush model with this matrix cannot disagree with
+    /// [`Tracer::trace_model`](super::Tracer::trace_model) about where the door
+    /// it just refused to let you through actually is. That is the whole reason
+    /// it lives here rather than beside the geometry.
+    ///
+    /// The inverse of what [`local_ray`](BrushModel::local_ray) does to a ray,
+    /// which is why the two are neighbours.
+    pub fn model_to_world(&self) -> Mat4 {
+        match self.rotation {
+            Some(rotation) => Mat4::from_translation(self.origin) * Mat4::from_mat3(rotation),
+            // Not merely an optimisation: `Mat4::from_mat3(Mat3::IDENTITY)` is
+            // the same matrix, but skipping it keeps the common case exact
+            // rather than exact-to-rounding.
+            None => Mat4::from_translation(self.origin),
+        }
+    }
+
     /// `ray` expressed in this model's own frame.
     ///
     /// The first half of `CM_TransformedBoxTrace` (`engine/cmodel.cpp:3253`).

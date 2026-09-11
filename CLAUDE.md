@@ -86,11 +86,14 @@ layout the `.vmt`'s shader declared — a model material is drawn under a synthe
 cube and one point light, which is not a real lighting environment and does not pretend to
 be.
 
-**`sp_a1_intro1` draws lit**: 5,512 of 5,638 faces, 64 of its 66 materials resolving,
-4,846 surfaces with real baked lighting over 13 atlas pages, and **1,080 static props
-from 136 models** on top of that. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
+**`sp_a1_intro1` draws lit**: 5,512 of 5,638 world faces, 71 of its 74 materials
+resolving, 4,846 surfaces with real baked lighting over 13 atlas pages, and **1,080 static
+props from 136 models** on top of that. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
 now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO.md`
-stage 4); 2 materials still do not, and they name shaders this port has not ported. The scene is **dimmer than
+stage 4); 3 of its 74 materials still do not, and they name shaders this port has not
+ported — `SolidEnergy` (the fizzler field), `Refract` and `Black`. **26 of its 78 brush
+entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
+triangles, each under the placement its entity gives it. The scene is **dimmer than
 the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
 unexposed. The view is the **player's eye**: WASD to walk, space to jump, left control to
 crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
@@ -253,6 +256,22 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks, packs each
   surface's baked light into the material system's lightmap atlas, and groups faces into
   per-(material, page) batches at load — which is exactly what Valve's *sort ID* was.
+  **Brush entities draw**, which closed the one place this port had collision ahead of
+  rendering: model 0 is the world and models 1.. are the doors, panels and platforms, each
+  built by the *same* face-grouping and lightmap-packing path and drawn with the entity's
+  matrix in place of the identity (`R_DrawBrushModel`). Three measurements made that
+  small: a brush model's faces are in its own frame like a static prop's (4,088 of 4,309
+  displaced models match their model box exactly, **none** matches it offset); the
+  existing `SURF_*` filter is the whole of the visibility question, so every `trigger_*`
+  class drops out with no per-classname rule (11,635 brush entities in the game, 2,697
+  with a drawable face — `trigger_portal_cleanser` keeps its, because a fizzler really is
+  visible); and where a brush model *is* comes from the entity, never from
+  `Model::origin`. **The transform is `BrushModel::model_to_world` and is not cached**, so
+  what is drawn and what `trace_model` collides with cannot drift apart. Not honoured, and
+  each measured rather than guessed: `StartDisabled` (86 of 2,608 drawable entities — it
+  is `server/`'s), the translucent render modes (five entities in the game; they need a
+  blended pass) and `renderamt`. `rendermode 10` **is** honoured, because it is the one
+  mode `C_BaseEntity::ShouldDraw` refuses — 94 entities.
   **Materials are resolved before the geometry**, because a surface's vertex layout comes
   from its shader and how wide a lightmap block it reserves comes from whether its
   material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
@@ -290,8 +309,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   models** — `CM_TransformedBoxTrace`, which is the whole of `ClipRayToBSP`: the ray moves
   into the model's frame, the ordinary sweep runs against the model's *own* head node, and
   the normal turns back out. Doors, platforms and the moving parts of a test chamber are
-  now solid; **nothing moves them**, which is `server/`'s, and nothing draws them, which is
-  `world/`'s. Where a brush model *is* does not come from the model lump (`Model::origin`
+  now solid, and `world/` draws them; **nothing moves them**, which is `server/`'s.
+  Where a brush model *is* does not come from the model lump (`Model::origin`
   is "for sounds and lights, not a render transform") but from the entity that names it as
   `"*N"`, so `World::brush_models` resolves the entity lump at load — **placements, not
   policy**: triggers are carried too, because a trigger's brushes are `CONTENTS_SOLID` in
@@ -316,9 +335,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   is pinned by a test so nobody "fixes" it; and **the swept box is not rotated into the
   model's frame**, so the obvious symmetry test — turn the model and the query together,
   expect the answer to turn — holds for a ray and not for a hull.
-  Not implemented: simulation, visibility, displacements, static props,
-  the skybox, dynamic lights and lightstyle animation — and **brush entities are solid
-  but not drawn**, which is the one place this port has collision ahead of rendering.
+  Not implemented: simulation, visibility, displacements, the skybox, dynamic lights and
+  lightstyle animation. Brush entities are solid **and** drawn now; what they are not is
+  *moved*, which is `server/`'s.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
   (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
@@ -456,9 +475,6 @@ a long way from here. The candidates, in the order they are worth doing:
 - **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
   read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
   neither drawn nor collided with.
-- **Brush model *rendering*** in `world/` — stage 2 made 78 of `sp_a1_intro1`'s models
-  solid and none of them visible, which is the opposite of the usual order and is worth
-  closing. Their faces are already in the face lump, under `Model::first_face`.
 - **`world/`'s 3D skybox and the displacement rendering** — the two remaining reasons
   `sp_a1_intro1` does not look like the shipped game, now that props are lit.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in

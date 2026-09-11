@@ -135,6 +135,7 @@ mod tests {
 
         println!("{map}:");
         run("brushes only", &|pass| world.draw_brushes(pass));
+        run("brush models", &|pass| world.draw_brush_models(pass));
         run("props only", &|pass| {
             world.prop_models.draw(pass, &world.props)
         });

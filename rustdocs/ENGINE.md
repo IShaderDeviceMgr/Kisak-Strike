@@ -14,11 +14,12 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 
 The binary now loads a real Portal 2 `.bsp` and draws it **lit**: base textures multiplied
 by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` that is
-5,512 of 5,638 faces over 77 batches, 58 of its 66 materials resolving, and 4,828 surfaces
-with real lighting across 12 atlas pages, and **WASD and the mouse fly through it**.
+5,512 of 5,638 world faces over 77 batches, 71 of its 74 materials resolving, and 4,846
+surfaces with real lighting across 13 atlas pages — plus 26 of its 78 brush entities and
+1,080 static props — and **WASD and the mouse walk through it**.
 What is still missing is listed under
 [Known limits](#known-limits-of-what-is-drawn); the largest items are visibility (every
-face is drawn every frame), displacements and props.
+face is drawn every frame), displacements and the 3D skybox.
 
 ---
 
@@ -209,8 +210,8 @@ A loaded map and the geometry it draws.
 | | |
 |---|---|
 | Module | `crate::engine::world` |
-| Lines | ~2,000 including tests |
-| Tests | 23 (`cargo test engine::world`) |
+| Lines | ~2,200 including tests |
+| Tests | 27 (`cargo test engine::world`), plus one depot-gated |
 | Dependencies | `bytemuck`, `glam`, `crate::filesystem`, `crate::materials` |
 
 ### `World`
@@ -232,6 +233,10 @@ pub struct World {
     pub sky_name: Option<String>,
     pub lighting_is_hdr: bool,
     pub lightmaps: LightmapPages,
+    /// Every brush entity the map places — `ENGINE_TRACE.md` stage 2.
+    pub brush_models: Vec<PlacedBrushModel>,
+    /// The drawable ones among them, with their geometry.
+    pub brush_model_geometry: Vec<BrushModelGeometry>,
     pub stats: WorldStats,
 }
 ```
@@ -241,9 +246,9 @@ into the one step that currently has meaning. **A material that fails to load is
 error** — `MaterialCache::load` cannot fail — so the only failures are a missing or
 malformed `.bsp`.
 
-`draw` binds each batch's lightmap page and then records the batch with an identity model
-matrix: world geometry is already in world space, which is the whole difference between
-the world model and the brush models that are not drawn yet.
+`draw` records the world's batches, then the brush entities', then the static props. The
+world's go under an identity model matrix — world geometry is already in world space —
+and each brush entity's go under its own placement.
 
 **Materials are resolved before the geometry is built**, which is forced rather than
 stylistic: a surface's vertex layout comes from the shader its material named, and how
@@ -251,6 +256,58 @@ wide a lightmap block it reserves comes from whether that material has a `$bumpm
 (`RegisterLightmappedSurface`, `gl_matsysiface.cpp:216`). Neither is answerable from the
 `.bsp`. `load` therefore groups faces by material name, loads every material, and only
 then packs lightmaps and emits vertices.
+
+### Brush models — `PlacedBrushModel` and `BrushModelGeometry`
+
+```rust
+pub struct PlacedBrushModel {
+    pub classname: String,   // func_door, trigger_multiple, func_brush
+    pub index: usize,        // the model the entity named: "*12" is 12
+    pub model: BrushModel,   // the placement, shared with trace/
+    pub render_mode: i32,    // RenderMode_t, 0 when the key is absent
+}
+
+pub struct BrushModelGeometry {
+    pub placement: usize,    // which entry of World::brush_models
+    pub batches: Vec<Batch>,
+}
+
+pub const RENDER_NONE: i32 = 10;   // kRenderNone
+```
+
+Model 0 of a `.bsp` is the world; models 1.. are the **brush entities** — doors,
+platforms, the moving parts of a test chamber. They are drawn by `R_DrawBrushModel`
+(`engine/gl_rsurf.cpp`), which is the ordinary world-surface draw with the entity's
+matrix in place of the identity, and that is exactly what this is.
+
+**Three facts make this small, and all three were measured rather than assumed:**
+
+1. **A brush model's faces are in the model's own frame**, like a static prop's — so
+   vertices and texture coordinates are built unchanged and the placement is a matrix.
+   Checked over the whole game: of 4,309 displaced, unrotated brush models, 4,088 have
+   face bounds matching their model box exactly and **none** matches it offset by the
+   entity origin.
+2. **The `SURF_*` filter is the whole of the visibility question.** Every `trigger_*`
+   class in Portal 2 compiles to `SURF_NODRAW`/`SURF_TRIGGER` faces and drops out of
+   `group_faces` with no per-classname rule — 11,635 brush entities across 106 maps, of
+   which only 2,697 keep a drawable face. `trigger_portal_cleanser` is the instructive
+   exception: it keeps 1,174 of its faces because a fizzler field really is visible.
+3. **Where a brush model is comes from the entity, not the model lump.** `Model::origin`
+   is "for sounds and lights, not a render transform"; the placement is the naming
+   entity's `"origin"` and `"angles"`.
+
+**The transform is `BrushModel::model_to_world`, recomputed per draw and never cached** —
+deliberately, so that what is drawn and what `Tracer::trace_model` collides with cannot
+drift apart. It is a handful of `Mat4` products for a map's few dozen brush models.
+
+`render_mode` is stored as the file's number rather than interpreted, because consumers
+differ: `World` acts only on `RENDER_NONE`, which is the only render mode
+`C_BaseEntity::ShouldDraw` (`c_baseentity.cpp:1884`) refuses, and collision ignores it
+entirely — a `rendermode 10` brush is invisible and still solid. 94 brush entities in the
+shipped game set it.
+
+On `sp_a1_intro1`: **26 of 78 brush models draw**, 148 faces and 308 triangles, 117 of
+them lit. Across all 106 maps, 2,608 draw with 22,502 faces and 47,866 triangles.
 
 ### `Batch`
 
@@ -266,8 +323,10 @@ pub struct Batch {
 `AllocateLightmap` returns one and increments it whenever either half changes
 (`cmatlightmaps.cpp:306`), because the page is one texture binding and cannot vary within
 a draw. A material whose surfaces did not all fit on one atlas page is several batches,
-emitted in page order. On `sp_a1_intro1` that is 77 batches for 66 materials over 12
-pages.
+emitted in page order. On `sp_a1_intro1` that is 77 batches over 13 pages for the world;
+each brush entity's batches are its own and live in
+[`BrushModelGeometry`](#brush-models--placedbrushmodel-and-brushmodelgeometry), because
+they are drawn under a different matrix.
 
 Every face sharing a material and a page, up to 65,536 vertices. Both halves are **static**, which
 is a deliberate difference from the engine: Valve keeps static vertices and gathers the
@@ -296,6 +355,14 @@ pub struct WorldStats {
     pub faces_fullbright: usize,      // wanted one and could not have one
     pub faces_with_lightstyles: usize,// more than style 0; only style 0 is baked
     pub lightmap_pages: usize,        // including the 1x1 white page
+
+    // Brush entities, kept apart from the face counters above: those answer
+    // "how much of the level shell is on screen", and mixing a map's doors
+    // into them makes both numbers harder to read.
+    pub brush_models_drawn: usize,    // out of World::brush_models.len()
+    pub brush_model_faces: usize,
+    pub brush_model_triangles: usize,
+    pub brush_model_faces_lit: usize,
 }
 ```
 
@@ -1859,17 +1926,17 @@ Not bugs; each names what it waits on.
 
 | Not drawn | Why |
 |---|---|
-| Materials patched into the `.bsp` | 8 of `sp_a1_intro1`'s 66 are `maps/<map>/…` cubemap patches that live in the `.bsp`'s embedded pak lump, which `Vfs` does not mount. They are the magenta checkerboard; the rest resolve. |
+| Shaders this port has not ported | 3 of `sp_a1_intro1`'s 74 materials name one — `SolidEnergy` (the fizzler field), `Refract` and `Black`. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
 | Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
 | Displacements | Geometry lives in `LUMP_DISPINFO`/`LUMP_DISP_VERTS`; `world/disp/` (§7.15). Counted in `WorldStats::faces_displaced`. |
-| Brush entities (models 1..n) | Positioned by the entity that names them, so they need the entity system, not just the lump. |
-| Static props, `.mdl` models | `staticpropmgr.cpp`, `studiorender`. |
+| Translucent brush entities | Render modes 1-5 and 7-9 need a sorted blended pass and draw opaque instead; only `kRenderNone` is honoured. Five entities in the shipped game set one. |
+| Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
-| Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. Now that the camera flies, it is also possible to fly *out* of the level and look back in, which nothing culls. |
+| Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. It is also possible to noclip *out* of the level and look back in, which nothing culls. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
-| Collision, traces | `cmodel.cpp`, `enginetrace.cpp` — needed by gameplay, not by drawing. |
-| Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. There is a player, but it can only noclip: nothing collides, falls or is simulated. |
+| Prop and displacement collision | `trace/` covers the world's brushes and the brush models; `.phy`/vcollide is its stage 5 and displacements its stage 3. |
+| Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. There is a player who walks, falls and is stopped by the world, and nothing else is simulated at all. |
 
 ### The camera is the player's eye
 

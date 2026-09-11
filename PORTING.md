@@ -646,10 +646,17 @@ which is the only thing in `client/` still blocked on another module.
 Collision is **planned in `portdocs/ENGINE_TRACE.md`** and lands as `src/engine/trace/`.
 **Stages 1-2 are done**: `CM_BoxTrace` and everything under it over the world's brushes,
 and `CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
-a test chamber, all solid, none of them moving (that is `server/`'s) and none of them drawn
-(that is `world/`'s). Stage 3 is displacements, stage 4 entities and the dispatch, stage 5
-vcollide — and `spatialpartition.cpp` is not ported and will not be, because `parry`'s
-`Qbvh` replaces it when entities arrive.
+a test chamber, all solid and, since `world/` learned to draw them, all visible; what none
+of them do is *move*, which is `server/`'s. Stage 3 is displacements, stage 4 entities and
+the dispatch, stage 5 vcollide — and `spatialpartition.cpp` is not ported and will not be,
+because `parry`'s `Qbvh` replaces it when entities arrive.
+
+Drawing them was `world/`'s and shares the placement: `BrushModel::model_to_world` is the
+inverse of the transform the trace applies to a ray, computed per draw and never cached,
+so a door cannot be drawn anywhere other than where it is collided with. The rest of it
+reused what was already there — a brush model's faces are in its own frame like a static
+prop's, and the `SURF_*` filter that hides nodraw world surfaces removes every trigger
+entity without a single per-classname rule.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`
