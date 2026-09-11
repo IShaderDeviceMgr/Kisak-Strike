@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
-use crate::engine::trace::CollisionBsp;
+use crate::engine::trace::{BrushModel, CollisionBsp};
 use crate::filesystem::mount::pak::PakMount;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
@@ -177,6 +177,22 @@ pub struct World {
     /// the same reason the lightmap atlas is: it is derived from this map's
     /// file and dies with it. `trace/` reads it; nothing in `world/` does.
     pub collision: CollisionBsp,
+    /// The map's brush entities, resolved to something the trace can sweep
+    /// against — `ENGINE_TRACE.md` stage 2.
+    ///
+    /// **Placements, not policy.** Every entity naming a `"*N"` model is here,
+    /// including the ones a game would never collide with: triggers, and the
+    /// `func_brush`es that are switched off. Whether a given one is solid is
+    /// the game's answer (`SOLID_BSP` plus `FSOLID_*`, set by the entity's own
+    /// spawn code) and there is no game to give it, so nothing is filtered out
+    /// here — a consumer that knows better filters on [`classname`].
+    ///
+    /// Read, traced by the `trace` console command, and **not drawn**: brush
+    /// models have their own faces and their own batches, which is `world/`
+    /// work nobody has done.
+    ///
+    /// [`classname`]: PlacedBrushModel::classname
+    pub brush_models: Vec<PlacedBrushModel>,
     /// The map's static prop placements — the `sprp` game lump, resolved.
     ///
     /// Stage 2 of `portdocs/STUDIO.md` §8: read and transformed, **not drawn**.
@@ -338,6 +354,7 @@ impl World {
                 .map(str::to_owned),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
+            brush_models: find_brush_models(&entities, &collision),
             collision,
             props,
             prop_models,
@@ -398,7 +415,7 @@ impl World {
              {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
              {} static props from {} models ({}); \
              {} files in the map pak; \
-             collision: {}",
+             collision: {}, {} brush models placed",
             self.name,
             self.bsp_version,
             self.bsp_revision,
@@ -422,6 +439,7 @@ impl World {
             self.prop_models.summary(),
             s.pak_files,
             self.collision.summary(),
+            self.brush_models.len(),
         )
     }
 }
@@ -821,6 +839,61 @@ fn lightmap_block_offset(face: &Face, lighting: Lighting, page_size: (u32, u32))
         return 0.0;
     }
     Bsp::face_lightmap_size(face).0 as f32 / page_size.0 as f32
+}
+
+/// A brush entity, resolved to something [`Tracer::trace_model`] can sweep
+/// against.
+///
+/// [`Tracer::trace_model`]: crate::engine::trace::Tracer::trace_model
+#[derive(Debug, Clone)]
+pub struct PlacedBrushModel {
+    /// The entity's `classname` — `func_door`, `trigger_multiple`,
+    /// `func_brush`. Carried because it is the only thing here that says what
+    /// the model is *for*, and every consumer's first question is whether to
+    /// collide with it at all.
+    pub classname: String,
+    /// Which model the entity named: `"model" "*12"` is 12.
+    pub index: usize,
+    pub model: BrushModel,
+}
+
+/// Every entity that names a brush model, placed.
+///
+/// A brush entity carries its geometry as `"*N"` — an index into the `.bsp`'s
+/// model lump — plus the `"origin"` and `"angles"` that say where that
+/// geometry goes. Both default to zero, and for most brush entities both
+/// *are* zero: `vbsp` leaves the geometry where the mapper drew it and only
+/// rebases a model onto an origin brush, which is what a rotating door needs
+/// and a wall does not.
+///
+/// An entity naming a model the map does not have is skipped rather than
+/// refused — the same rule the entity parser itself follows, and one bad
+/// entity should not cost the map.
+pub(crate) fn find_brush_models(
+    entities: &[bsp::Entity],
+    collision: &CollisionBsp,
+) -> Vec<PlacedBrushModel> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let index: usize = entity.get("model")?.strip_prefix('*')?.parse().ok()?;
+            // Model 0 is the world, which `worldspawn` names and which
+            // `Tracer::trace` already covers; carrying it here would have
+            // every consumer trace the whole map twice.
+            if index == 0 {
+                return None;
+            }
+            Some(PlacedBrushModel {
+                classname: entity.classname().unwrap_or_default().to_owned(),
+                index,
+                model: collision.brush_model(
+                    index,
+                    entity.vector("origin").unwrap_or(Vec3::ZERO),
+                    entity.vector("angles").unwrap_or(Vec3::ZERO),
+                )?,
+            })
+        })
+        .collect()
 }
 
 /// The player start, if the map has one.

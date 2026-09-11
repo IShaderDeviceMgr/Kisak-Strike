@@ -638,8 +638,18 @@ port's frame (input is sampled immediately before rendering, with nothing betwee
 because `winit` delivers one batch of events per frame where Valve re-polls the OS
 mid-frame. It comes back on the table when simulation lands between the two.
 
-**That is everything in `client/` that is not blocked on another module.** Stage 4 is
-walking and waits for `trace/`; stage 5 is prediction and waits for `net/` and `server/`.
+**Stage 4 is walking, and it landed once `trace/` stage 1 did** — `FullWalkMove` with
+gravity, friction, stair stepping, jumping and ducking, against `CPortalGameMovement`
+rather than `CGameMovement`. Stage 5 is prediction and waits for `net/` and `server/`,
+which is the only thing in `client/` still blocked on another module.
+
+Collision is **planned in `portdocs/ENGINE_TRACE.md`** and lands as `src/engine/trace/`.
+**Stages 1-2 are done**: `CM_BoxTrace` and everything under it over the world's brushes,
+and `CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
+a test chamber, all solid, none of them moving (that is `server/`'s) and none of them drawn
+(that is `world/`'s). Stage 3 is displacements, stage 4 entities and the dispatch, stage 5
+vcollide — and `spatialpartition.cpp` is not ported and will not be, because `parry`'s
+`Qbvh` replaces it when entities arrive.
 
 Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own module,
 `src/engine/input/`, rather than inside `window/` and `console/` as `portdocs/ENGINE.md`

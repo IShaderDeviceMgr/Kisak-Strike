@@ -21,6 +21,8 @@ is not compiled, not linked, and not edited.
   src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
   src/client/      the game client — the player, CUserCmd, movement, the view
   src/studio/      studio models — .mdl/.vvd/.vtx into drawable geometry
+  src/cmdline.rs   CommandLine(), at the root because everything reads it
+  src/math.rs      the parts of mathlib that are a convention, not arithmetic
   legacy/          the original C++ tree, verbatim; read-only reference
   portdocs/        per-module porting design docs (what to build)
   rustdocs/        per-module API references (what exists)
@@ -238,7 +240,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
   one, because the tangent is in the `.vvd` either way.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `trace/` (stage 1 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
+  lightmaps, `trace/` (stages 1-2 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
   stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
@@ -280,12 +282,23 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `FCVAR_NEVER_AS_STRING` cvar**, so anything comparing or displaying a value goes through
   `describe::value`/`describe::is_at_default` — otherwise `differences` reports every such
   cvar as unchanged for ever.
-  `trace/` is stage 1 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
+  `trace/` is stages 1-2 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
   it — the recursive hull check, the brush clip, box brushes, the position test,
   `point_contents` and the leaf lookup — over six new collision lumps read by the
   *existing* `bsp.rs` rather than by a second reader, which is a duplication Valve only had
-  because collision could not see `modelloader.cpp`'s allocations. **The world's brushes
-  only**; brush models, displacements, entities and props are stages 2-5.
+  because collision could not see `modelloader.cpp`'s allocations. **Stage 2 adds brush
+  models** — `CM_TransformedBoxTrace`, which is the whole of `ClipRayToBSP`: the ray moves
+  into the model's frame, the ordinary sweep runs against the model's *own* head node, and
+  the normal turns back out. Doors, platforms and the moving parts of a test chamber are
+  now solid; **nothing moves them**, which is `server/`'s, and nothing draws them, which is
+  `world/`'s. Where a brush model *is* does not come from the model lump (`Model::origin`
+  is "for sounds and lights, not a render transform") but from the entity that names it as
+  `"*N"`, so `World::brush_models` resolves the entity lump at load — **placements, not
+  policy**: triggers are carried too, because a trigger's brushes are `CONTENTS_SOLID` in
+  the file and what makes them non-solid is `FSOLID_TRIGGER`, set by a game DLL that does
+  not exist. Measured on the depot: **106 maps place 11,635 brush models, 5,115 of them
+  rotated** — the rotated path is 44% of them and not a corner case — and `sp_a1_intro1`
+  has 78. Displacements, entities and props are stages 3-5.
   `spatialpartition.cpp` is not ported and will not be — `parry`'s `Qbvh` replaces it when
   entities land, and `rapier` replaces `vphysics/`; `ENGINE_TRACE.md` §5 is the full
   evaluation of where those two crates do and do not fit, and the world brush trace is one
@@ -296,9 +309,16 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   probes and `TryPlayerMove`'s clip-and-retry are all written around that gap; and **a
   leaf's `contents` describes its own volume, not the OR of its brush list**, so an empty
   leaf beside a wall has contents 0 — reading it the other way makes every position test in
-  open air report `all_solid`.
-  Not implemented: simulation, visibility, displacements, brush
-  entities, static props, the skybox, dynamic lights and lightstyle animation.
+  open air report `all_solid`. Stage 2 adds three more: **`trace` and `trace_model` are
+  separate questions and neither includes the other**, so a door is invisible to a world
+  trace and combining them is the caller's job until stage 4; **a brush model's `normal`
+  comes back in world space and its `plane_dist` does not**, which is Valve's asymmetry and
+  is pinned by a test so nobody "fixes" it; and **the swept box is not rotated into the
+  model's frame**, so the obvious symmetry test — turn the model and the query together,
+  expect the answer to turn — holds for a ray and not for a hull.
+  Not implemented: simulation, visibility, displacements, static props,
+  the skybox, dynamic lights and lightstyle animation — and **brush entities are solid
+  but not drawn**, which is the one place this port has collision ahead of rendering.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
   (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
@@ -433,13 +453,12 @@ Next: **the boot path is complete as far as one player can take it.** `client/` 
 and everything below it needs `net/` and `server/`, which is the last of the core path and
 a long way from here. The candidates, in the order they are worth doing:
 
-- **`trace/` stage 2** (brush models — `CM_TransformedBoxTrace`). Small, unblocked, and it
-  is what makes doors, platforms and the moving parts of a test chamber solid.
-  `Model::head_node` is already parsed. Nothing *moves* them yet, but they stop being
-  scenery you walk through.
 - **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
   read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
   neither drawn nor collided with.
+- **Brush model *rendering*** in `world/` — stage 2 made 78 of `sp_a1_intro1`'s models
+  solid and none of them visible, which is the opposite of the usual order and is worth
+  closing. Their faces are already in the face lump, under `Model::first_face`.
 - **`world/`'s 3D skybox and the displacement rendering** — the two remaining reasons
   `sp_a1_intro1` does not look like the shipped game, now that props are lit.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in

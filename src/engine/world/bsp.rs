@@ -783,10 +783,20 @@ impl Bsp {
                     self.faces.len()
                 )));
             }
-            if model.head_node < 0 && !self.nodes.is_empty() {
+            // Bounded at *both* ends, because `Tracer::trace_model` descends
+            // from here and indexes the node array without a bounds test —
+            // the same bargain the collision lumps below are validated under.
+            // Only the lower bound mattered while head node 0 was the only one
+            // anything traced (`ENGINE_TRACE.md` stage 1); stage 2 traces
+            // models 1.., so an out-of-range head node stops being unreachable
+            // and starts being a panic.
+            if !self.nodes.is_empty()
+                && (model.head_node < 0 || model.head_node as usize >= self.nodes.len())
+            {
                 return Err(corrupt(format!(
-                    "model {i} has head node {}, which is not a node",
-                    model.head_node
+                    "model {i} has head node {}, which is not one of {} nodes",
+                    model.head_node,
+                    self.nodes.len()
                 )));
             }
         }

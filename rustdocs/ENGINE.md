@@ -371,15 +371,16 @@ which has real internal pointers.
 
 ## `src/engine/trace/`
 
-Ray and swept-box traces against the world's brushes. Stage 1 of
+Ray and swept-box traces against the world's brushes, and against the brush models built
+out of them. Stages 1-2 of
 [`portdocs/ENGINE_TRACE.md`](../portdocs/ENGINE_TRACE.md), and what `src/client/` stage 4
 walks on — [`rustdocs/CLIENT.md`](CLIENT.md) is its one real consumer.
 
 | | |
 |---|---|
 | Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
-| Depends on | `world::bsp` (the lumps), `glam`. **No GPU, no window, no I/O** |
-| Status | world brushes only — no brush models, displacements, entities or props |
+| Depends on | `world::bsp` (the lumps), `glam`, `crate::math`. **No GPU, no window, no I/O** |
+| Status | world brushes and brush models — no displacements, entities or props |
 
 ### Quick start
 
@@ -407,7 +408,22 @@ let ground = tracer.trace(
     Contents::MASK_PLAYERSOLID,
 );
 let standing = ground.did_hit() && ground.normal.z > 0.7;
+
+// A brush model — a door, a platform. `World::brush_models` has the map's,
+// resolved from the entity lump; `collision.brush_model(i, origin, angles)`
+// builds one directly.
+for placed in &world.brush_models {
+    let hit = tracer.trace_model(&ray, &placed.model, Contents::MASK_PLAYERSOLID);
+    if hit.did_hit() {
+        println!("{} *{} at {:?}", placed.classname, placed.index, hit.end);
+    }
+}
 ```
+
+**Nothing combines the world trace and the brush models for you.** A caller that wants
+"what is in the way" asks both and keeps the smaller `fraction`. Doing that *for* the
+caller is `ClipRayToCollideable`'s job and needs a filter and a broadphase, which need
+entities — stage 4.
 
 ### `Ray` — the query
 
@@ -478,12 +494,41 @@ impl CollisionBsp {
     pub fn surface_name(&self, surface: Option<u16>) -> &str;
     pub fn is_empty(&self) -> bool;
     pub fn summary(&self) -> String;
+    /// Model `index` of the `.bsp`'s model lump, placed. `None` if there is no
+    /// such model. `angles` is a `QAngle`: pitch, yaw, roll, in degrees.
+    pub fn brush_model(&self, index: usize, origin: Vec3, angles: Vec3)
+        -> Option<BrushModel>;
 }
 
 impl Tracer<'_> {
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace;
+    pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
 }
 ```
+
+### `BrushModel` — a door, a platform, a piston
+
+`CM_TransformedBoxTrace` (`engine/cmodel.cpp:3253`) is the whole of stage 2, and
+`ClipRayToBSP` (`engine/enginetrace.cpp:1203`) is nothing but a call to it: move the ray
+into the model's frame, run the ordinary sweep against the model's *own* head node, turn
+the normal back out.
+
+A `.bsp` stores model 0 (the world) and models 1.. (the brush entities), each with its own
+subtree of the one shared BSP. **Where a brush model is does not come from the model
+lump** — `Model::origin` is "for sounds and lights, not a render transform". It comes from
+the entity that names it: `"model" "*12"` with an `"origin"` and an `"angles"`.
+`World::brush_models` is that resolution done once at load, as
+`PlacedBrushModel { classname, index, model }`.
+
+`brush_model` resolves the index once so the trace does not have to; the returned handle
+is `Copy` and cheap to rebuild, which is what a mover does every time it moves. The
+placement is opaque — build a new one rather than mutating the old.
+
+**Placements, not policy.** `World::brush_models` holds *every* entity naming a `"*N"`
+model, triggers included. A `trigger_multiple`'s brushes are `CONTENTS_SOLID` in the file
+and not solid in the game; what makes the difference is `FSOLID_TRIGGER` on the entity,
+set by the game DLL, and there is no game DLL. Filter on `classname` until `server/`
+exists.
 
 `build` is infallible because [`Bsp::parse`](#worldbsp) has already checked every
 cross-lump reference the trace walks — that check is what buys the right to index without
@@ -583,6 +628,27 @@ Ordered by how likely each is to bite.
     paths are asserted to agree in
     `a_box_brush_answers_the_same_as_its_six_planes`.
 
+11. **A brush model's `normal` comes back in world space; its `plane_dist` does not.**
+    `CM_TransformedBoxTrace` rotates `plane.normal` out of the model's frame and says
+    nothing about `plane.dist`, so the distance describes a plane in the *model's* frame
+    and pairs with the world-space normal to describe nothing at all. Ported as written —
+    every consumer reads the normal and none reads the distance — and guarded by
+    `a_brush_models_plane_dist_stays_in_its_own_frame` so that nobody "fixes" it by
+    accident.
+
+12. **A swept box is not rotated into a brush model's frame.** Valve copies `m_Extents`
+    across untouched, so a hull meeting a door turned 45° sweeps a box that is axis
+    aligned in *the door's* space rather than the world's. For the square-in-`x`/`y` hulls
+    Source actually sweeps the difference is small, and it is the behaviour every line of
+    movement code was tuned against. It also means the obvious symmetry test — rotate the
+    model and the query together, expect the answer to rotate — holds for a **ray** and
+    not for a hull.
+
+13. **`trace` and `trace_model` are separate questions and neither includes the other.**
+    A door is not in the world's subtree, so `trace` sweeps straight through it; model 0
+    *is* the world, so `trace_model` with it is the world trace field for field. Combining
+    them is the caller's job until stage 4.
+
 ### One place this is stricter than Valve
 
 `IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
@@ -596,10 +662,11 @@ path either way.
 
 | Missing | Waits on |
 |---|---|
-| Brush models (`CM_TransformedBoxTrace`) — doors, platforms | stage 2; `Model::head_node` is already parsed |
 | Displacements — terrain, and the "stab" | stage 3, jointly with `world/disp/` |
 | Entities, trace filters, `ClipTraceToTrace` | stage 4, and `server/` |
 | Static props and `.phy`/vcollide | stage 5, where `parry` enters |
+| Brush models *moving* | `server/` — stage 2 makes them solid, nothing makes them move |
+| Brush model *rendering* | `world/` — their faces are not batched or drawn |
 | PVS, areas, areaportals | `world/`'s visibility work, not this module's |
 | `surfaceProps`, hitboxes, occlusion queries | `vphysics/`, `.mdl`, and never |
 
@@ -607,24 +674,35 @@ path either way.
 
 `trace` fires a ray from the player's eye along the view; `trace hull` sweeps the player
 hull from the feet. Both print the fraction, distance, endpoint, normal, surface, contents
-and solid flags, then the contents and leaf at the eye and a ground probe with
-`CategorizePosition`'s 0.7 standable test.
+and solid flags, then the contents and leaf at the eye, a ground probe with
+`CategorizePosition`'s 0.7 standable test, and — stage 2 — the same ray against every
+brush model the map places, reporting the nearest by classname and model index.
 
 **This port's own, not Valve's** — the C++ equivalents (`debugrayenable`, the trace
-counter) exist to work around a DLL boundary this build does not have. It is stage 1's
-acceptance test: it asks the one question the module exists to answer using only a
+counter) exist to work around a DLL boundary this build does not have. It is stages 1
+and 2's acceptance test: it asks the one question the module exists to answer using only a
 console, a player and a view, all of which already existed.
 
-On `sp_a1_intro1` it reports the spawn standing 8.97 units above `MOTEL/HOTEL_CARPET001`
-with a `(0, 0, 1)` normal, and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with
-contents `0x8010000` (`PLAYERCLIP | DETAIL`) and surface flags `0x480`
-(`NODRAW | NOLIGHT`).
+The brush-model pass asks every model at full length, where `CEngineTrace::TraceRay`
+shortens the ray to the world hit first and lets the spatial partition pick candidates
+(`enginetrace.cpp:2870`). Both of those are stage 4's and neither exists; asking all of
+them is the same answer more slowly, because `ClipTraceToTrace` keeps the minimum
+fraction and enumeration order is not observable.
+
+On `sp_a1_intro1` it reports the spawn standing on `MOTEL/HOTEL_CARPET001` with a
+`(0, 0, 1)` normal (8.97 units above it at the spawn instant, 0.00 once the player has
+fallen), and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x8010000`
+(`PLAYERCLIP | DETAIL`) and surface flags `0x480` (`NODRAW | NOLIGHT`). The map places
+**78 brush models**, and the nearest along that same ray is `*38 "func_illusionary"` at
+284 units on `LIGHTS/WHITE001` — which is also the caveat in one line: a
+`func_illusionary` is not solid in the shipped game, and nothing here knows that yet.
 
 ### Test coverage (trace)
 
-15 tests, none of which need a map, a GPU or a window — the fixtures build a
+25 tests, none of which need a map, a GPU or a window — the fixtures build a
 `CollisionBsp` through `CollisionBsp::build` from a hand-written `Bsp`, so the box
-extraction and surface table are under test too.
+extraction and surface table are under test too — plus one depot-gated test that needs
+a Portal 2 install.
 
 | Test | Guards |
 |---|---|
@@ -644,8 +722,47 @@ extraction and surface table are under test too.
 | `a_map_with_no_brushes_traces_as_a_clean_miss` | the empty-model early-out |
 | `a_tracer_gives_the_same_answer_twice` | the visit stamps not leaking between traces |
 
+Stage 2, all on a fixture whose world subtree and model subtree hold *different* brushes,
+so a trace against the wrong head node is caught rather than merely suspected:
+
+| Test | Guards |
+|---|---|
+| `a_brush_model_is_traced_against_its_own_subtree` | the head node — the one thing stage 2 is |
+| `an_unrotated_brush_model_moves_with_its_origin` | the cheap branch, at three offsets |
+| `model_zero_is_the_world` | gotcha 13, field for field |
+| `a_model_the_map_does_not_have_is_none` | the index resolution |
+| `a_rotated_brush_model_reports_a_world_space_normal` | the rotate-back, and the wall having moved |
+| `rotating_the_model_and_the_query_together_rotates_the_answer` | `VectorITransform`'s transposes and translation sign |
+| `a_rotated_model_keeps_the_hulls_centring` | the `- offset` re-application — 36 units if dropped |
+| `a_hull_is_not_rotated_into_the_models_frame` | gotcha 12, with an oblong box that makes it visible |
+| `a_brush_models_plane_dist_stays_in_its_own_frame` | gotcha 11 |
+| `a_position_test_against_a_brush_model_finds_it` | the unswept path reaching the model's head node |
+
 Plus `collision_lump_strides_match_the_file` and `leaf_area_and_flags_unpack` in
-`world::bsp`.
+`world::bsp`, and `valves_angle_order_is_yaw_then_pitch_then_roll` /
+`the_transpose_undoes_the_rotation` in `crate::math` — see
+[the root-module note in `rustdocs/README.md`](README.md#root-modules).
+
+**`every_shipped_map_traces_its_brush_models`** is `--ignored` and gated on
+`KISAK_GAME_DIR`, like the `studio/` and `world/props/` depot tests:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_map_brush_models -- --ignored --nocapture
+```
+
+It loads all 106 shipped maps, resolves their brush entities, and sweeps each model with a
+ray down the middle of its own box — then **requires the hit to land inside that box,
+carried out to world space through the placement**. That is the assertion that earns the
+runtime: a wrong head node reports another model's geometry, a dropped origin reports it
+in the wrong place, and an inverted rotation reports it turned the wrong way, and all
+three land outside. Both of the last two were confirmed to fail the test before it was
+trusted.
+
+Measured: **11,635 brush models across 106 maps, 5,115 rotated, 10,550 off the origin, 39
+classnames** — `func_brush` (2,502), `func_portal_bumper` (2,383), `trigger_once` (1,476),
+`trigger_multiple` (899) lead. 9,372 of the 11,635 centre rays hit; the rest are models
+whose geometry does not span their own bounding-box centre, which an L-shaped or hollow
+brush entity does not.
 
 ## `src/engine/input/`
 

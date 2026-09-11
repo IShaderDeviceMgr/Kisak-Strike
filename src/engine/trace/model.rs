@@ -8,10 +8,10 @@
 //! that is *derived* rather than read: the surface table, the box brushes, and
 //! the contents summary.
 
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 use super::result::SURFACE_INDEX_INVALID;
-use super::{Contents, Surface, Tracer};
+use super::{Contents, Ray, Surface, Tracer};
 use crate::engine::world::bsp::Bsp;
 
 /// The name `csurface_t::nullsurface` carries (`engine/cmodel.cpp:53`).
@@ -126,11 +126,14 @@ pub struct CollisionBsp {
     /// The head node of each model — model 0 is the world, 1.. are the brush
     /// entities.
     ///
-    /// Stage 2's input. [`Tracer::trace`] does not read it: it traces head
-    /// node 0, which is what `CEngineTrace::TraceRay` passes for the world
-    /// (`engine/enginetrace.cpp:2838`), and models 1.. need the transform that
-    /// stage 2 brings.
-    #[allow(dead_code)]
+    /// Read by [`CollisionBsp::brush_model`], and by nothing else.
+    /// [`Tracer::trace`] does not consult it: it traces head node 0, which is
+    /// what `CEngineTrace::TraceRay` passes for the world
+    /// (`engine/enginetrace.cpp:2838`).
+    ///
+    /// Every entry is a valid index into [`nodes`](CollisionBsp::nodes) —
+    /// `Bsp::parse`'s `validate` bounds it at both ends, which is what lets
+    /// [`Tracer::trace_model`] descend from an arbitrary one without a check.
     pub(super) head_nodes: Vec<i32>,
     /// The OR of every leaf's contents.
     ///
@@ -252,6 +255,35 @@ impl CollisionBsp {
     /// visited-brush stamps, which is the only per-trace allocation.
     pub fn tracer(&self) -> Tracer<'_> {
         Tracer::new(self)
+    }
+
+    /// Brush model `index`, placed at `origin` and turned by `angles`.
+    ///
+    /// `index` is into the `.bsp`'s model lump, which is how an entity names
+    /// one: `"model" "*12"` is index 12. **Model 0 is the world**, and passing
+    /// it here is legal but pointless — it is what [`Tracer::trace`] already
+    /// traces, and the world is never placed anywhere but the origin.
+    ///
+    /// `angles` is a `QAngle` — **pitch, yaw, roll, in degrees**, which is the
+    /// order the entity lump writes and *not* the order the axes are named in
+    /// (`x` is a rotation about `y`). See
+    /// [`angle_matrix`](crate::math::angle_matrix).
+    ///
+    /// `None` when the map has no such model. Resolving the index here rather
+    /// than in the trace is the point of the type: a mover is traced against
+    /// many times per frame and looked up once.
+    pub fn brush_model(&self, index: usize, origin: Vec3, angles: Vec3) -> Option<BrushModel> {
+        Some(BrushModel {
+            head_node: *self.head_nodes.get(index)?,
+            origin,
+            // `bool rotated = (angles[0] || angles[1] || angles[2])`
+            // (`engine/cmodel.cpp:3265`) — an exact comparison against zero,
+            // kept exact. The two branches it selects are the same
+            // arithmetic; what it saves is building and transposing a matrix
+            // for the overwhelmingly common case of a brush entity that has
+            // never been turned.
+            rotation: (angles != Vec3::ZERO).then(|| crate::math::angle_matrix(angles)),
+        })
     }
 
     /// The material name behind a [`Trace::surface`](super::Trace::surface).
@@ -395,4 +427,70 @@ fn extract_box(
         maxs: Vec3::from_array(maxs),
         surfaces,
     })
+}
+
+/// One of the `.bsp`'s brush models, placed in the world.
+///
+/// Model 0 is the world itself; models 1.. are the **brush entities** — doors,
+/// platforms, the moving parts of a test chamber. A `.bsp` stores each one's
+/// geometry wherever the mapper drew it and gives it its own subtree of the
+/// BSP, but *where it is* comes from the entity that names it (`"model" "*12"`,
+/// with an `"origin"` and an `"angles"`), which is why a placement has to be
+/// carried alongside the index.
+///
+/// Build one with [`CollisionBsp::brush_model`]. Cheap to copy and cheap to
+/// rebuild, so a mover rebuilds its own every time it moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushModel {
+    /// Where in the shared BSP this model's subtree starts. Always a valid
+    /// node index — `Bsp::parse`'s `validate` guarantees it.
+    pub(super) head_node: i32,
+    pub(super) origin: Vec3,
+    /// The rotation, or `None` when there is none.
+    ///
+    /// Valve's `rotated` flag (`engine/cmodel.cpp:3265`) made explicit. The
+    /// two branches are not different *geometry* — substitute the identity
+    /// into the rotated form and it collapses to the unrotated one — they are
+    /// a fast path, and the reason to keep the distinction is that the fast
+    /// path is what almost every brush entity in a Portal 2 map takes.
+    pub(super) rotation: Option<Mat3>,
+}
+
+impl BrushModel {
+    /// `ray` expressed in this model's own frame.
+    ///
+    /// The first half of `CM_TransformedBoxTrace` (`engine/cmodel.cpp:3253`).
+    /// Everything below this — the tree descent, the brush clip, the
+    /// epsilons — then runs unchanged, against a model that believes it is at
+    /// the origin.
+    ///
+    /// **The box is not rotated with the ray**, which is Valve's decision and
+    /// is visible in a rotated model: `extents` is copied across untouched, so
+    /// a hull sweep against a door turned 45° sweeps a box that is axis
+    /// aligned *in the door's frame*. For the cube-shaped hulls Source
+    /// actually sweeps this is close to exact, and it is the behaviour every
+    /// piece of movement code was tuned against.
+    pub(super) fn local_ray(&self, ray: &Ray) -> Ray {
+        let mut local = *ray;
+        match self.rotation {
+            Some(rotation) => {
+                // `VectorIRotate`/`VectorITransform` (`mathlib_base.cpp:375`,
+                // `:303`): the inverse of an orthonormal rotation is its
+                // transpose, and `angle_matrix` never has a scale to spoil it.
+                let world_to_local = rotation.transpose();
+                local.delta = world_to_local * ray.delta;
+                // Valve transforms the **caller's** start rather than the
+                // centred one and re-applies the centring afterwards, so that
+                // "all traces with the same box centering will have the same
+                // transformation into local space". `Ray::offset` is Valve's
+                // `m_StartOffset`, which is the *negated* centre — hence the
+                // subtraction where the comment says to add it back.
+                local.start = world_to_local * (ray.origin() - self.origin) - ray.offset;
+            }
+            // `VectorSubtract( ray.m_Start, origin, ray_l.m_Start )`, with the
+            // delta left alone.
+            None => local.start = ray.start - self.origin,
+        }
+        local
+    }
 }

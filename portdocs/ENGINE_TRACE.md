@@ -828,7 +828,7 @@ normal, and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x801
   covered), and a `Tracer` reused across traces, which is the only way the visit stamps
   can be observed at all.
 
-### Stage 2 — brush models (small)
+### Stage 2 — brush models — **DONE** (10 unit tests + 1 depot test)
 
 `CM_TransformedBoxTrace` (`cmodel.cpp:3253`): transform the ray into the model's frame,
 trace against `Model::head_node`, rotate the normal back. `Model` is already parsed
@@ -836,6 +836,51 @@ trace against `Model::head_node`, rotate the normal back. `Model` is already par
 
 Unblocks doors, platforms, and the moving parts of a test chamber — none of which move
 yet, but all of which are solid.
+
+**Done.** `Tracer::trace_model`, `CollisionBsp::brush_model` and a `BrushModel` handle;
+`crate::math::angle_matrix` extracted so the `AngleMatrix` convention has one definition;
+`World::brush_models` resolving the entity lump's `"*N"` references at load; and the
+`trace` console command extended to sweep them. **API: `rustdocs/ENGINE.md`** — read the
+brush-model gotchas (11-13) before calling in.
+
+Measured on the real depot: **106 maps place 11,635 brush models, 5,115 of them rotated**
+and 10,550 off the origin, across 39 classnames — `func_brush` (2,502) and
+`func_portal_bumper` (2,383) lead, and triggers are most of the rest. `sp_a1_intro1` has
+78. **The rotated path is not a corner case in Portal 2**: 44% of brush models use it,
+which is worth knowing before treating it as the branch that never runs.
+
+#### Corrections to this plan, found while implementing
+
+- **§7.2's `trace_model(ray, model: &Model, origin, angles, mask)` is wrong in two ways.**
+  Taking `world::bsp::Model` reintroduces the `&Bsp` coupling that `head_nodes` exists to
+  avoid, and lets a caller pass a `Model` from a *different* `Bsp` than the `CollisionBsp`
+  was built from — a silent wrong answer. And two adjacent `Vec3`s that must not be
+  swapped is a footgun. Landed as `CollisionBsp::brush_model(index, origin, angles) ->
+  Option<BrushModel>` plus `trace_model(ray, &BrushModel, mask)`: the index is resolved
+  once, against the right map, and the placement is named at the call site.
+- **`Bsp::parse`'s `validate` had a gap that only stage 2 could reach.** It checked
+  `model.head_node < 0` and not the upper bound, which was unreachable while head node 0
+  was the only one traced and is a panic the moment models 1.. are. Bounded at both ends
+  now — the same bargain the other collision lumps are validated under.
+- **`AngleMatrix` already existed, in `world/props/`.** Rather than a second copy, it
+  moved to `crate::math::angle_matrix` and both call it. A duplicated angle *convention*
+  is the failure mode `STUDIO.md`'s own gotcha warns about: props with only a yaw look
+  right under any reading, so a divergence would hide until something was tilted.
+- **`CM_TransformedBoxTrace` leaves `plane.dist` in the model's frame** while rotating
+  `plane.normal` out of it. Ported as written and pinned by a test, because it reads as a
+  bug and is not this port's to fix.
+- **The swept box is not rotated into the model's frame** — `m_Extents` is copied across
+  untouched. Worth knowing before writing the obvious symmetry test, which holds for a ray
+  and not for a hull.
+- **Where a brush model *is* is not in the model lump.** `Model::origin` is "for sounds
+  and lights, not a render transform"; the placement is the naming entity's `"origin"` and
+  `"angles"`. That resolution is `world/`'s (it needs the entity lump) and landed as
+  `World::brush_models`, alongside `find_spawn` which reads the same lump for the same
+  kind of reason.
+- **Solidity is not this module's to decide, and is not decided.** Every entity naming a
+  `"*N"` model is carried, triggers included: a trigger's brushes are `CONTENTS_SOLID` in
+  the file and the thing that makes it non-solid is `FSOLID_TRIGGER`, set by the game DLL.
+  Filtering here would have been inventing policy for a game that does not exist yet.
 
 ### Stage 3 — displacements (medium, and the ugly one)
 

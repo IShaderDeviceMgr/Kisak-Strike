@@ -982,6 +982,63 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
             "  ground: nothing within {GROUND_PROBE} units below the feet"
         )),
     }
+
+    trace_brush_models(world, &ray, from, cx);
+}
+
+/// The same ray, against every brush model the map places —
+/// `portdocs/ENGINE_TRACE.md` stage 2's acceptance test.
+///
+/// `CEngineTrace::TraceRay` would shorten the ray to the world hit first and
+/// then let the spatial partition decide which entities are worth asking
+/// (`enginetrace.cpp:2870`). Both halves of that are stage 4's and neither
+/// exists, so this asks all of them at full length and keeps the nearest,
+/// which is the same answer more slowly — `ClipTraceToTrace` keeps the minimum
+/// fraction and enumeration order is not observable.
+///
+/// **Nothing is filtered for solidity.** A `trigger_multiple`'s brushes are
+/// `CONTENTS_SOLID` in the file and are not solid in the game; what makes the
+/// difference is `FSOLID_TRIGGER` on the entity, which the game DLL sets and
+/// this port has no game to set it. So the classname is printed and the
+/// judgement is left to the reader.
+fn trace_brush_models(world: &World, ray: &Ray, from: glam::Vec3, cx: &mut ExecContext<'_>) {
+    if world.brush_models.is_empty() {
+        cx.print("  brush models: the map places none");
+        return;
+    }
+
+    let mut tracer = world.collision.tracer();
+    let nearest = world
+        .brush_models
+        .iter()
+        .map(|placed| {
+            (
+                placed,
+                tracer.trace_model(ray, &placed.model, Contents::MASK_PLAYERSOLID),
+            )
+        })
+        .filter(|(_, hit)| hit.did_hit())
+        // `f32` is not `Ord`, and a NaN fraction would be a bug worth seeing
+        // rather than a panic: `total_cmp` orders it last instead.
+        .min_by(|(_, a), (_, b)| a.fraction.total_cmp(&b.fraction));
+
+    let v = |v: glam::Vec3| format!("({:.1} {:.1} {:.1})", v.x, v.y, v.z);
+    match nearest {
+        Some((placed, hit)) => cx.print(&format!(
+            "  brush models: {} placed; nearest is *{} \"{}\" at {:.2} units, \
+             surface \"{}\", normal {}",
+            world.brush_models.len(),
+            placed.index,
+            placed.classname,
+            (hit.end - from).length(),
+            world.collision.surface_name(hit.surface),
+            v(hit.normal),
+        )),
+        None => cx.print(&format!(
+            "  brush models: {} placed, none in the way",
+            world.brush_models.len()
+        )),
+    }
 }
 
 impl CommandTarget for EngineCommands<'_> {

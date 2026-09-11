@@ -135,12 +135,7 @@ impl StaticProp {
 
     /// Just the rotation half of [`model_to_world`](Self::model_to_world).
     pub fn rotation(&self) -> Mat3 {
-        let (pitch, yaw, roll) = (
-            self.angles.x.to_radians(),
-            self.angles.y.to_radians(),
-            self.angles.z.to_radians(),
-        );
-        Mat3::from_rotation_z(yaw) * Mat3::from_rotation_y(pitch) * Mat3::from_rotation_x(roll)
+        crate::math::angle_matrix(self.angles)
     }
 }
 

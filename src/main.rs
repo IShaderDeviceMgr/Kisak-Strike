@@ -11,11 +11,15 @@
 //! Valve's `client.so`, a sibling of `engine.so` and so a sibling of `engine`
 //! here. The rest arrives as it is ported.
 //!
-//! `cmdline` is the exception to "one module per Valve module": Valve kept
-//! `CommandLine()` in `tier0` because *everything* reads it, and it sits at the
-//! crate root here for the same reason. It moved out of `launcher/` when
-//! `engine::console` became its third consumer — `stuffcmds` and the `+<cvar>`
-//! default seeding both read it (`portdocs/ENGINE_CONSOLE.md` §6.5).
+//! `cmdline` and `math` are the exceptions to "one module per Valve module".
+//! Valve kept `CommandLine()` in `tier0` because *everything* reads it, and it
+//! sits at the crate root here for the same reason — it moved out of
+//! `launcher/` when `engine::console` became its third consumer (`stuffcmds`
+//! and the `+<cvar>` default seeding both read it,
+//! `portdocs/ENGINE_CONSOLE.md` §6.5). `math` holds the parts of `mathlib`
+//! that are a *convention* rather than arithmetic, which `glam` therefore
+//! cannot supply; its consumers are in `engine/` and `client/`, which are
+//! siblings, so it can live nowhere below the root either.
 
 mod client;
 mod cmdline;
@@ -23,6 +27,7 @@ mod engine;
 mod filesystem;
 mod launcher;
 mod materials;
+mod math;
 mod studio;
 
 fn main() -> std::process::ExitCode {

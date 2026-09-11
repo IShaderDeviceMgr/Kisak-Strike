@@ -9,7 +9,7 @@
 use glam::Vec3;
 
 use super::{CollisionBsp, Contents};
-use crate::engine::world::bsp::{Brush, BrushSide, Bsp, Leaf, Node, Plane};
+use crate::engine::world::bsp::{Brush, BrushSide, Bsp, Leaf, Model, Node, Plane};
 
 /// Builds a collision model without a map.
 ///
@@ -25,6 +25,7 @@ pub(crate) struct Fixture {
     pub(crate) leaves: Vec<Leaf>,
     pub(crate) nodes: Vec<Node>,
     pub(crate) leaf_brushes: Vec<u16>,
+    pub(crate) models: Vec<Model>,
 }
 
 impl Fixture {
@@ -167,6 +168,69 @@ impl Fixture {
         self.finish()
     }
 
+    /// A world subtree and a brush model's, side by side in one tree —
+    /// which is what a real `.bsp` is. The world is model 0 and the brush
+    /// model is model 1, exactly as an entity's `"model" "*1"` names it.
+    ///
+    /// The point of the shape is that **the two subtrees hold different
+    /// brushes under different head nodes**: a `trace_model` that descended
+    /// from node 0 instead of the model's own would find the world's brushes
+    /// and pass every test that only checked distances.
+    pub(crate) fn world_and_model(mut self, world: &[u16], model: &[u16]) -> CollisionBsp {
+        let subtree = |brushes: &[u16], fixture: &mut Fixture| {
+            let first = fixture.leaf_brushes.len() as u16;
+            fixture.leaf_brushes.extend_from_slice(brushes);
+            fixture.leaves.push(Leaf {
+                // Open air, as in `single_leaf` — a leaf's contents are its
+                // own volume's, not the OR of everything touching it.
+                contents: 0,
+                cluster: 0,
+                area_flags: 0,
+                mins: [-32768; 3],
+                maxs: [32767; 3],
+                first_leaf_face: 0,
+                num_leaf_faces: 0,
+                first_leaf_brush: first,
+                num_leaf_brushes: brushes.len() as u16,
+                leaf_water_data_id: -1,
+                _pad: 0,
+            });
+            let leaf = fixture.leaves.len() as i32 - 1;
+
+            // Both children are the one leaf, so every descent reaches it.
+            let plane_num = fixture.plane([1.0, 0.0, 0.0], 0.0, true);
+            fixture.nodes.push(Node {
+                plane_num: plane_num as i32,
+                children: [-1 - leaf, -1 - leaf],
+                mins: [-32768; 3],
+                maxs: [32767; 3],
+                first_face: 0,
+                num_faces: 0,
+                area: -1,
+                _pad: 0,
+            });
+            fixture.nodes.len() as i32 - 1
+        };
+
+        let world_head = subtree(world, &mut self);
+        let model_head = subtree(model, &mut self);
+        assert_eq!(world_head, 0, "the world has to be the first head node");
+
+        for head_node in [world_head, model_head] {
+            self.models.push(Model {
+                mins: [-32768.0; 3],
+                maxs: [32767.0; 3],
+                // Not a render transform — a brush model's placement comes
+                // from the entity that names it, never from here.
+                origin: [0.0; 3],
+                head_node,
+                first_face: 0,
+                num_faces: 0,
+            });
+        }
+        self.finish()
+    }
+
     pub(crate) fn finish(self) -> CollisionBsp {
         let bsp = Bsp {
             game_lumps: Vec::new(),
@@ -184,7 +248,7 @@ impl Fixture {
             texinfo: Vec::new(),
             texdata: Vec::new(),
             texdata_string_table: Vec::new(),
-            models: Vec::new(),
+            models: self.models,
             lighting: Vec::new(),
             lighting_is_hdr: false,
             level_flags: 0,
