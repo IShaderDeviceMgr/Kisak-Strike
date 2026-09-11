@@ -879,7 +879,8 @@ impl Pass<'_> {
 
         // Always set: the offset below is different for every draw by
         // construction, so there is nothing here to elide.
-        self.pass.set_bind_group(2, self.draws.bind_group(), &[offset]);
+        self.pass
+            .set_bind_group(2, self.draws.bind_group(), &[offset]);
 
         match material.shader.lighting_binding() {
             None => {}
@@ -903,7 +904,8 @@ impl Pass<'_> {
         }
 
         let (buffer, offset, count) = vertices.identity();
-        if self.bound.vertices.as_ref().map(|(b, o, c)| (b, *o, *c)) != Some((buffer, offset, count))
+        if self.bound.vertices.as_ref().map(|(b, o, c)| (b, *o, *c))
+            != Some((buffer, offset, count))
         {
             self.pass.set_vertex_buffer(0, vertices.buffer_slice());
             self.bound.vertices = Some((buffer.clone(), offset, count));
@@ -927,7 +929,11 @@ impl Pass<'_> {
                 vertices.len()
             );
             let (buffer, offset, count) = light.identity();
-            if self.bound.static_light.as_ref().map(|(b, o, c)| (b, *o, *c))
+            if self
+                .bound
+                .static_light
+                .as_ref()
+                .map(|(b, o, c)| (b, *o, *c))
                 != Some((buffer, offset, count))
             {
                 self.pass.set_vertex_buffer(1, light.buffer_slice());

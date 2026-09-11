@@ -247,7 +247,11 @@ impl Mdl {
             let base = r.offset(236, "bodypartindex")?;
             let mut parts = Vec::with_capacity(count);
             for i in 0..count {
-                parts.push(Self::body_part(&r, base + i * BODY_PART_STRIDE, textures.len())?);
+                parts.push(Self::body_part(
+                    &r,
+                    base + i * BODY_PART_STRIDE,
+                    textures.len(),
+                )?);
             }
             parts
         };

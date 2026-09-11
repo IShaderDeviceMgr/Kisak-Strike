@@ -270,7 +270,10 @@ impl PropModels {
             // `STATIC_PROP_NO_PER_VERTEX_LIGHTING` is `vrad` saying it wrote
             // no file for this one, so this saves a lookup rather than
             // changing the answer.
-            if prop.flags.contains(super::PropFlags::NO_PER_VERTEX_LIGHTING) {
+            if prop
+                .flags
+                .contains(super::PropFlags::NO_PER_VERTEX_LIGHTING)
+            {
                 stats.instances_not_baked += 1;
                 continue;
             }

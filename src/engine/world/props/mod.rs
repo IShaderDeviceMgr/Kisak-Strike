@@ -310,12 +310,7 @@ mod tests {
             out.extend_from_slice(&p.lighting_origin.y.to_le_bytes());
             out.extend_from_slice(&p.lighting_origin.z.to_le_bytes());
             out.extend_from_slice(&p.forced_fade_scale.to_le_bytes());
-            out.extend_from_slice(&[
-                p.cpu_level.0,
-                p.cpu_level.1,
-                p.gpu_level.0,
-                p.gpu_level.1,
-            ]);
+            out.extend_from_slice(&[p.cpu_level.0, p.cpu_level.1, p.gpu_level.0, p.gpu_level.1]);
             out.extend_from_slice(&p.diffuse_modulation);
             out.push(0); // m_bDisableX360
             assert_eq!(out.len() - start, 69, "the fields sum to 69");
@@ -382,7 +377,10 @@ mod tests {
     /// A lump written at any other stride is refused rather than misread.
     #[test]
     fn a_stride_that_is_not_seventy_two_is_refused() {
-        let props = [prop_at(Vec3::ZERO, Vec3::ZERO), prop_at(Vec3::ONE, Vec3::ZERO)];
+        let props = [
+            prop_at(Vec3::ZERO, Vec3::ZERO),
+            prop_at(Vec3::ONE, Vec3::ZERO),
+        ];
         let mut raw = sprp(&["models/a.mdl"], &[], &props);
         raw.data.truncate(raw.data.len() - 6); // 69 bytes each
         let e = StaticPropLump::parse("test", &raw).expect_err("a bad stride");
@@ -455,7 +453,10 @@ mod tests {
         assert!((m.transform_point3(Vec3::ZERO) - Vec3::new(100.0, 0.0, 0.0)).length() < 1e-4);
         // A point 10 units down the model's +X ends up 10 units along world +Y.
         let moved = m.transform_point3(Vec3::new(10.0, 0.0, 0.0));
-        assert!((moved - Vec3::new(100.0, 10.0, 0.0)).length() < 1e-4, "{moved}");
+        assert!(
+            (moved - Vec3::new(100.0, 10.0, 0.0)).length() < 1e-4,
+            "{moved}"
+        );
     }
 
     /// `m_LightingOrigin` is only meaningful with the flag that says so;
@@ -469,7 +470,10 @@ mod tests {
             &StaticPropLump::parse("test", &sprp(&["models/a.mdl"], &[], &[prop.clone()])).unwrap(),
         )
         .unwrap();
-        assert_eq!(without.instances[0].lighting_origin, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(
+            without.instances[0].lighting_origin,
+            Vec3::new(1.0, 2.0, 3.0)
+        );
 
         prop.flags = PropFlags::USE_LIGHTING_ORIGIN;
         let with = Props::from_lump(
@@ -483,7 +487,10 @@ mod tests {
     /// and the indirection is what makes that 136 uploads instead of 1,080.
     #[test]
     fn instances_share_the_dictionary() {
-        let props = [prop_at(Vec3::ZERO, Vec3::ZERO), prop_at(Vec3::ONE, Vec3::ZERO)];
+        let props = [
+            prop_at(Vec3::ZERO, Vec3::ZERO),
+            prop_at(Vec3::ONE, Vec3::ZERO),
+        ];
         let set = Props::from_lump(
             &StaticPropLump::parse("test", &sprp(&["models/a.mdl"], &[], &props)).unwrap(),
         )
@@ -545,11 +552,9 @@ mod tests {
             // disagrees is the reader being wrong about that order rather than
             // the data being odd — `vrad` writes one file per prop and it is
             // generated from the same `.mdl` this loads.
-            let pak = crate::filesystem::mount::pak::PakMount::new(
-                name,
-                std::sync::Arc::clone(&bsp.pak),
-            )
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let pak =
+                crate::filesystem::mount::pak::PakMount::new(name, std::sync::Arc::clone(&bsp.pak))
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
             vfs.set_map_pak(Some((
                 crate::filesystem::PathId::Game,
                 std::sync::Arc::new(pak),
@@ -564,9 +569,9 @@ mod tests {
                 let Ok(bytes) = vfs.read(&path) else { continue };
                 let vhv = crate::studio::Vhv::parse(path.clone(), &bytes)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
-                let model = cache.entry(prop.model_index).or_insert_with(|| {
-                    crate::studio::StudioModel::load(&vfs, &prop.model).ok()
-                });
+                let model = cache
+                    .entry(prop.model_index)
+                    .or_insert_with(|| crate::studio::StudioModel::load(&vfs, &prop.model).ok());
                 let Some(model) = model else { continue };
                 vhv_total += 1;
                 // Not asserted: `r_ignoreStaticColorChecksum` defaults to 1 and
@@ -582,8 +587,14 @@ mod tests {
                         .is_some(),
                     "{name}: {path} does not describe {} — .vhv lod 0 {:?}, model {:?}",
                     prop.model,
-                    vhv.lod_meshes(0).map(|m| m.vertex_count).collect::<Vec<_>>(),
-                    model.meshes.iter().map(|m| m.vertices.len()).collect::<Vec<_>>(),
+                    vhv.lod_meshes(0)
+                        .map(|m| m.vertex_count)
+                        .collect::<Vec<_>>(),
+                    model
+                        .meshes
+                        .iter()
+                        .map(|m| m.vertices.len())
+                        .collect::<Vec<_>>(),
                 );
                 vhv_matched += 1;
             }

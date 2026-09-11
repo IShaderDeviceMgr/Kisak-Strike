@@ -266,15 +266,21 @@ impl Cursor<'_> {
     }
 
     fn u16(&mut self) -> Result<u16, PropLumpError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2 bytes")))
+        Ok(u16::from_le_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
     }
 
     fn i32(&mut self) -> Result<i32, PropLumpError> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(i32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn f32(&mut self) -> Result<f32, PropLumpError> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(f32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn vec3(&mut self) -> Result<Vec3, PropLumpError> {

@@ -677,8 +677,7 @@ mod tests {
     fn a_vertexindex_that_is_not_a_whole_vertex_is_refused() {
         let (mut mdl_bytes, _, _) = Spec::default().build();
         // Find the model and corrupt its `vertexindex` by one byte.
-        let body_part_base =
-            i32::from_le_bytes(mdl_bytes[236..240].try_into().unwrap()) as usize;
+        let body_part_base = i32::from_le_bytes(mdl_bytes[236..240].try_into().unwrap()) as usize;
         let model_at = body_part_base
             + (i32::from_le_bytes(
                 mdl_bytes[body_part_base + 12..body_part_base + 16]
@@ -839,6 +838,10 @@ mod tests {
         for line in failed.iter().take(20) {
             println!("  {line}");
         }
-        assert!(failed.is_empty(), "{} static props failed to load", failed.len());
+        assert!(
+            failed.is_empty(),
+            "{} static props failed to load",
+            failed.len()
+        );
     }
 }

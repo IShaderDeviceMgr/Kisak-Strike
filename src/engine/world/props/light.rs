@@ -44,8 +44,10 @@ pub fn ambient_at(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> Ambien
     else {
         return [[0.0; 3]; AMBIENT_CUBE_FACES];
     };
-    let (Some(leaf), Some(samples)) = (bsp.leaves.get(leaf_index), bsp.leaf_ambient.get(first..first + count))
-    else {
+    let (Some(leaf), Some(samples)) = (
+        bsp.leaves.get(leaf_index),
+        bsp.leaf_ambient.get(first..first + count),
+    ) else {
         return [[0.0; 3]; AMBIENT_CUBE_FACES];
     };
     let bounds = |v: [i16; 3]| Vec3::new(f32::from(v[0]), f32::from(v[1]), f32::from(v[2]));

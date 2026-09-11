@@ -20,9 +20,9 @@
 //!   every `mtexinfo_t` and re-sorted surfaces by it every frame
 //!   (`gl_rsurf.cpp`). Grouping happens once, here, at load.
 
-pub mod bsp;
 #[cfg(test)]
 mod bench;
+pub mod bsp;
 pub mod props;
 
 use std::collections::BTreeMap;

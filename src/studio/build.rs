@@ -86,9 +86,7 @@ pub(super) fn build(
     let mut batches: Vec<Batch> = Vec::new();
     let mut meshes: Vec<HardwareMesh> = Vec::new();
 
-    for (bp_index, (mdl_part, vtx_part)) in
-        mdl.body_parts.iter().zip(&vtx.body_parts).enumerate()
-    {
+    for (bp_index, (mdl_part, vtx_part)) in mdl.body_parts.iter().zip(&vtx.body_parts).enumerate() {
         for (model_index, (mdl_model, vtx_model)) in
             mdl_part.models.iter().zip(&vtx_part.models).enumerate()
         {
@@ -120,7 +118,10 @@ pub(super) fn build(
                 if vtx_mesh.indices.is_empty() {
                     continue;
                 }
-                let slot = match by_material.iter().position(|(m, _)| *m == mdl_mesh.material) {
+                let slot = match by_material
+                    .iter()
+                    .position(|(m, _)| *m == mdl_mesh.material)
+                {
                     Some(slot) => slot,
                     None => {
                         by_material.push((mdl_mesh.material, Vec::new()));

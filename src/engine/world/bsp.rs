@@ -1256,10 +1256,10 @@ impl LumpReader<'_> {
         let mut lumps = Vec::with_capacity(count);
         for i in 0..count {
             let at = 4 + i * ENTRY;
-            let field = |n: usize| {
-                i32::from_le_bytes(dir[at + n..at + n + 4].try_into().expect("4 bytes"))
-            };
-            let half = |n: usize| u16::from_le_bytes(dir[at + n..at + n + 2].try_into().expect("2"));
+            let field =
+                |n: usize| i32::from_le_bytes(dir[at + n..at + n + 4].try_into().expect("4 bytes"));
+            let half =
+                |n: usize| u16::from_le_bytes(dir[at + n..at + n + 2].try_into().expect("2"));
 
             let id = field(0) as u32;
             let flags = half(4);

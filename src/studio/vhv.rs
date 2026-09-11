@@ -331,7 +331,9 @@ mod tests {
         let file = Vhv::parse("test.vhv".into(), &bytes).unwrap();
 
         let model = [mesh(&[0]), mesh(&[]), mesh(&[1])];
-        let colors = file.colors(&bytes, 0, &model, 2).expect("the empty one drops out");
+        let colors = file
+            .colors(&bytes, 0, &model, 2)
+            .expect("the empty one drops out");
         assert_eq!(colors[0], StaticLightVertex::new(a));
         assert_eq!(colors[1], StaticLightVertex::new(b));
     }
@@ -344,9 +346,13 @@ mod tests {
     fn a_file_that_does_not_describe_the_model_is_refused() {
         let bytes = vhv(0, &[(0, vec![[1, 2, 3, 4], [5, 6, 7, 8]])]);
         let file = Vhv::parse("test.vhv".into(), &bytes).unwrap();
-        assert!(file.colors(&bytes, 0, &[mesh(&[0, 1, 2])], 3).is_none(), "count");
         assert!(
-            file.colors(&bytes, 0, &[mesh(&[0]), mesh(&[1])], 2).is_none(),
+            file.colors(&bytes, 0, &[mesh(&[0, 1, 2])], 3).is_none(),
+            "count"
+        );
+        assert!(
+            file.colors(&bytes, 0, &[mesh(&[0]), mesh(&[1])], 2)
+                .is_none(),
             "mesh count"
         );
     }
@@ -360,7 +366,10 @@ mod tests {
         let mut bytes = vhv(0, &[(0, vec![[0; 4]])]);
         // 12 bytes a vertex is `r_staticlight_streams` 3, the console path.
         bytes[12..16].copy_from_slice(&12u32.to_le_bytes());
-        assert!(Vhv::parse("test.vhv".into(), &bytes).is_err(), "vertex size");
+        assert!(
+            Vhv::parse("test.vhv".into(), &bytes).is_err(),
+            "vertex size"
+        );
     }
 
     /// HDR and LDR compiles write different names for the same prop.

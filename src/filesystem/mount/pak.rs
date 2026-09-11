@@ -103,13 +103,15 @@ impl PakMount {
                 .map(|at| start + at)
                 .ok_or_else(|| bad("no end-of-central-directory record".to_owned()))?;
             if eocd + EOCD_SIZE > bytes.len() {
-                return Err(bad("the end-of-central-directory record is truncated".into()));
+                return Err(bad(
+                    "the end-of-central-directory record is truncated".into()
+                ));
             }
 
             let count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
-            let mut at = u32::from_le_bytes(
-                bytes[eocd + 16..eocd + 20].try_into().expect("4 bytes"),
-            ) as usize;
+            let mut at =
+                u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().expect("4 bytes"))
+                    as usize;
 
             for i in 0..count {
                 if at + CENTRAL_SIZE > bytes.len() || bytes[at..at + 4] != CENTRAL_MAGIC {
@@ -149,13 +151,7 @@ impl PakMount {
                 if !name.ends_with('/') {
                     let folded = fold(&name);
                     register_dirs(&mut dirs, &folded);
-                    files.insert(
-                        folded,
-                        PakEntry {
-                            local_header,
-                            size,
-                        },
-                    );
+                    files.insert(folded, PakEntry { local_header, size });
                 }
                 at += CENTRAL_SIZE + name_len + extra_len + comment_len;
             }
@@ -389,7 +385,10 @@ mod tests {
         );
 
         let mut dir = Vec::new();
-        pak.list(Some(&RelPath::new("materials/maps/test").unwrap()), &mut dir);
+        pak.list(
+            Some(&RelPath::new("materials/maps/test").unwrap()),
+            &mut dir,
+        );
         assert_eq!(dir.len(), 2);
         assert!(dir.iter().all(|e| !e.is_dir));
     }

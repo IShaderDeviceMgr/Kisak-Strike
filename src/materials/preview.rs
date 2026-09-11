@@ -356,11 +356,11 @@ impl RenderContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::materials::mesh::StaticLightVertex;
     use crate::filesystem::keyvalues;
     use crate::materials::context::{Load, RenderContext, StateOverride};
     use crate::materials::image_format::{ColorSpace, ImageFormat};
     use crate::materials::material::{MaterialCache, TextureFallbacks};
+    use crate::materials::mesh::StaticLightVertex;
     use crate::materials::pipeline::PipelineCache;
     use crate::materials::shader::TextureDimension;
     use crate::materials::target::RenderTarget;
@@ -1415,8 +1415,7 @@ mod tests {
         normal: [f32; 3],
         static_light: [f32; 4],
     ) -> ([ModelVertex; 4], [StaticLightVertex; 4], [u16; 6]) {
-        let corner =
-            |x: f32, y: f32, u: f32, v: f32| ModelVertex::new([x, y, 0.0], normal, [u, v]);
+        let corner = |x: f32, y: f32, u: f32, v: f32| ModelVertex::new([x, y, 0.0], normal, [u, v]);
         let light = StaticLightVertex::new(static_light.map(|c| (c * 255.0).round() as u8));
         (
             [
@@ -1473,8 +1472,8 @@ mod tests {
             let pixels = h.render(|pass| {
                 pass.set_model_lighting(&lighting);
                 let l = pass.vertices(&light);
-            pass.bind_static_light(&l);
-            let v = pass.vertices(&vertices);
+                pass.bind_static_light(&l);
+                let v = pass.vertices(&vertices);
                 let i = pass.indices(&indices);
                 pass.draw(&material, &v, &i, Mat4::IDENTITY);
             });

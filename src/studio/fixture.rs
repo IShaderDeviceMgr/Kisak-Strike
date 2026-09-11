@@ -195,7 +195,11 @@ impl Spec {
         let mut out = vec![0u8; 64];
         out[0..4].copy_from_slice(b"IDSV");
         put_i32(&mut out, 4, self.vvd_version);
-        put_i32(&mut out, 8, self.vvd_checksum.unwrap_or(self.checksum) as i32);
+        put_i32(
+            &mut out,
+            8,
+            self.vvd_checksum.unwrap_or(self.checksum) as i32,
+        );
         put_i32(&mut out, 12, 1); // numLODs
 
         let counts = self
@@ -261,7 +265,11 @@ impl Spec {
     fn vtx(&self) -> Vec<u8> {
         let mut out = vec![0u8; 36];
         put_i32(&mut out, 0, self.vtx_version);
-        put_i32(&mut out, 16, self.vtx_checksum.unwrap_or(self.checksum) as i32);
+        put_i32(
+            &mut out,
+            16,
+            self.vtx_checksum.unwrap_or(self.checksum) as i32,
+        );
         put_i32(&mut out, 20, 1); // numLODs
 
         let body_part_base = out.len();
@@ -315,7 +323,11 @@ impl Spec {
                 out.resize(strip_at + 35, 0);
 
                 put_i32(&mut out, group_at, mesh.vertex_count as i32);
-                put_i32(&mut out, group_at + 4, group_vertex_base as i32 - group_at as i32);
+                put_i32(
+                    &mut out,
+                    group_at + 4,
+                    group_vertex_base as i32 - group_at as i32,
+                );
                 put_i32(&mut out, group_at + 8, index_count as i32);
                 put_i32(&mut out, group_at + 12, index_base as i32 - group_at as i32);
                 put_i32(&mut out, group_at + 16, 1); // numStrips
