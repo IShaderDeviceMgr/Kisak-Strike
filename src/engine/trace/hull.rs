@@ -101,12 +101,33 @@ pub(super) fn recursive_hull_check<const IS_POINT: bool>(
     recursive_hull_check::<IS_POINT>(work, node.children[side ^ 1], midf, p2f, mid, p2);
 }
 
-/// Clips against every brush in one leaf.
+/// Clips against every brush in one leaf, then against its displacements.
+///
+/// `CM_TraceToLeaf` (`engine/cmodel.cpp:2064`). The order is Valve's and the
+/// early-out between the two halves is too: a sweep that already begins inside
+/// a *brush* never looks at the terrain, which is what stops
+/// [`post_trace_to_disp_tree`](super::post_trace_to_disp_tree) from second-
+/// guessing a solid verdict the brushes were sure of.
 fn trace_to_leaf<const IS_POINT: bool>(work: &mut Work<'_>, leaf_index: usize) {
     let leaf = work.bsp.leaves[leaf_index];
-    if leaf.num_leaf_brushes == 0 {
-        return;
+    if leaf.num_leaf_brushes != 0 {
+        trace_to_brush_list::<IS_POINT>(work, leaf);
+        if work.trace.start_solid {
+            return;
+        }
     }
+
+    if leaf.num_disps != 0 {
+        super::trace_to_disp_list::<IS_POINT>(
+            work,
+            leaf.first_disp as usize,
+            leaf.num_disps as usize,
+        );
+    }
+}
+
+/// `CM_TraceToBrushList` (`engine/cmodel.cpp:1952`).
+fn trace_to_brush_list<const IS_POINT: bool>(work: &mut Work<'_>, leaf: super::model::CLeaf) {
     let first = leaf.first_leaf_brush as usize;
     let count = leaf.num_leaf_brushes as usize;
 
@@ -215,6 +236,17 @@ fn test_in_leaf(work: &mut Work<'_>, leaf_index: usize) {
         if work.trace.fraction == 0.0 {
             return;
         }
+    }
+
+    // **The guard, not an optimisation.** A brush that already said solid is
+    // the answer, and the displacement test below ends in a stab that would
+    // clear it (see `super::test_in_disp_tree`).
+    if work.trace.start_solid {
+        return;
+    }
+
+    if leaf.num_disps != 0 {
+        super::test_in_disp_tree(work, leaf.first_disp as usize, leaf.num_disps as usize);
     }
 }
 

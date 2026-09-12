@@ -390,8 +390,13 @@ second trace along `m_DispStabDir` to find which side of the surface the box is 
 synthesizes the contents from that. It is the ugliest code in the subsystem and it is
 load-bearing for anything that spawns inside terrain.
 
-Deferred to stage 3, and it is the one stage where `parry`'s `TriMesh` is a genuine
-candidate rather than a bad fit — §5.5.
+**That last paragraph is what the code looks like and not what it does** — see stage 3's
+corrections in §8. The stab fires along the surface's *outward* normal, which is the one
+direction every triangle test in the subsystem rejects, so it can only ever clear a solid
+verdict. The box-versus-triangle test that precedes it is what decides "am I inside
+terrain", and a *point* test inside terrain is reported as not solid.
+
+Done at stage 3, which is also where §5.5's `parry` question was answered — and declined.
 
 ### 4.9 Entities, brush models and props: the clip chain
 
@@ -882,17 +887,90 @@ which is worth knowing before treating it as the branch that never runs.
   the file and the thing that makes it non-solid is `FSOLID_TRIGGER`, set by the game DLL.
   Filtering here would have been inventing policy for a game that does not exist yet.
 
-### Stage 3 — displacements (medium, and the ugly one)
+### Stage 3 — displacements — **DONE** (13 unit tests + 1 depot test)
 
 `LUMP_DISPINFO`/`LUMP_DISP_VERTS`/`LUMP_DISP_TRIS`; a `DispTree` (AABB tree over
 triangles); the per-leaf displacement lists; `CM_TraceToDispList`; the stab (§4.8).
 Pairs with `world/disp/`'s rendering work (§7.15) — one lump read, two consumers, and
 the same argument as §7.4 for doing them together.
 
-**This is the stage where `parry` should be reconsidered on its merits** (§5.5), because
-a displacement is a triangle soup and this is the one part of the module where the Valve
-structure has no semantics a library would have to reproduce — beyond the per-triangle
-`DISPSURF_*` flags, which map onto feature ids.
+**Done**, as `src/engine/trace/disp.rs` plus the integration in `mod.rs`, `hull.rs`,
+`brush.rs` and `model.rs`, and three new lumps in `src/engine/world/bsp.rs`. Terrain is
+solid: a ray stops on it, a swept box stops a hair above it, a box straddling it is
+`all_solid`, and `Trace::disp_flags` reports VBSP's per-triangle `DISPSURF_*` tags.
+`world/disp/`'s *rendering* is **not** done and is still stage 2 of the "what's next"
+list in `CLAUDE.md` — displacement faces are collided with and not drawn.
+
+Measured on the depot: **106 maps, 29 of them with terrain, 1,181 displacements, all
+1,181 built**, over 14,190 leaf references; 904 at power 2, 202 at 3, 75 at 4. Building
+the collision model for `sp_a3_end` — the map with the most, 201 — takes **1-3 ms**, and
+a player-hull ground probe on it costs 0.2 µs.
+
+**`parry` was reconsidered here, as §5.5 said to, and declined.** The tell §9.2 asked
+for came out the wrong way: of `CDispCollTree`'s 1,565 lines, the tree walking that a
+`Qbvh` would replace is about 120 (`BuildRayLeafList` plus the box tests), and the rest
+is displacement *semantics* — the one-sided tests, the nine cached edge-cross planes, the
+`DIST_EPSILON` interval, the `DISPSURF_*` tags, the collision flags in `minTess`, and the
+stab. `TriMesh` would answer a different question and the answers would differ in the
+epsilon, which §5.4's reason 3 says is the behaviour. The decision stands to be revisited
+at stage 5, when `parry` is in the tree for `.phy` anyway and the comparison costs
+nothing.
+
+#### Corrections to this plan, found while implementing
+
+- **§4.8 oversells the stab.** "Valve fires a second trace along `m_DispStabDir` to find
+  which side of the surface the box is on and synthesizes the contents from that" is what
+  the code looks like it does. What it *does*: `m_vecStabDir` is the base face's own
+  normal, pointing out of the terrain, and **every triangle test in the subsystem is
+  one-sided against that same normal** — `IntersectRayWithTriangle`'s `oneSided` and
+  `SweepAABBTriIntersect`'s `flDistAlongNormal > DISPCOLL_DIST_EPSILON` both reject a
+  query travelling along it. So the stab travels in the one direction that cannot hit the
+  surface, `m_bDispHit` stays false, and `CM_PostStab` takes its **clearing** branch. The
+  stab can essentially only *clear* a solid verdict, never set one. It is safe because
+  `CM_TestInLeaf` returns before reaching it if a brush already said solid. Ported as
+  written and pinned by a test, because it reads as a bug and is not this port's to fix.
+- **The box half of `CM_TestInDispTree` is what actually decides "am I inside terrain"**,
+  and it is a plain separating-axis box-versus-triangle test. A *point* test inside
+  terrain therefore reports **not solid**, because there is no box to test and the stab
+  cannot help.
+- **`ddispinfo_t::minTess` is not a tessellation level.** On all 1,181 shipped
+  displacements the top bit is set, which makes the rest a flags field
+  (`CCoreDispInfo::InitDispInfo`, `builddisp.cpp:777`) carrying `SURF_NOPHYSICS_COLL`,
+  `SURF_NOHULL_COLL` and `SURF_NORAY_COLL`. **44 of them have all three set and 7 more
+  have hull collision off** — decoration that a faithful port must *not* make solid.
+- **A ray additionally needs the displacement's contents to include `MASK_OPAQUE`**
+  (`AABBTree_Ray`, `dispcoll_common.cpp:672`). 51 of Portal 2's displacements are
+  `CONTENTS_WINDOW | CONTENTS_TRANSLUCENT`, so a ray goes straight through them and a
+  hull sweep does not.
+- **The winding is the thing to get right.** A triangle's normal is `(v2 - v0) × (v1 -
+  v0)` — the reverse of the obvious order — and the base quad's is `(p3 - p0) × (p1 -
+  p0)`, likewise reversed. Both point *out* of the terrain; measured on the depot, where a
+  displacement's base face still has solid on one side of it, the solid is on the
+  `-normal` side 60 times to 8. Get it backwards and every patch in the game is terrain
+  you fall through.
+- **`dispFlags` goes stale in Valve, and this port fixes it** — the one deliberate
+  divergence in the module. It is written in exactly two places
+  (`dispcoll_common.cpp:696`, `:1416`) and cleared in none, so a brush hit that
+  supersedes a displacement hit keeps the displacement's flags and
+  `CGameTrace::IsDispSurface()` calls a wall terrain. `m_bDispHit`, cleared on the
+  adjacent line in `CM_ClipBoxToBrush`, is Valve's own evidence that the pairing was
+  intended. Measured: over one ray and one hull sweep through every shipped
+  displacement — 2,362 traces — Valve's behaviour mislabels 45 brush hits as terrain.
+- **`ddispinfo_t::m_iMapFace` is not used, though it would work.** Valve builds the
+  disp-to-face mapping by scanning the face lump (`cmodel_bsp.cpp:1108`) and this port
+  scans too; the field agrees with the scan on all 1,181 shipped displacements, but
+  nothing in the format makes it a `LUMP_FACES` index.
+- **`MAX_CHECK_COUNT_DEPTH` earns its keep here.** §7.2 said Valve's re-entrancy
+  machinery "is a second `Tracer` on the rare path that needs one"; the rare path turned
+  out to be *inside* a trace, so it is a second set of visit stamps on the same `Tracer`
+  instead — `Visits` with a depth, which is `PushTraceVisits`/`PopTraceVisits` with the
+  bookkeeping checked.
+- **`CollisionBsp::build` was being called twice per map load** (`World::load`, once for
+  the brush models and once for the props). Harmless while the tree was brushes and not
+  harmless once building it also builds 201 AABB trees, so it builds once now.
+- **Nothing here needed `parry`, and nothing here needed a second `.bsp` reader either.**
+  The three displacement lumps went into `world/bsp.rs` beside the six collision ones,
+  exactly as §7.4 said they would.
 
 ### Stage 4 — entities and the dispatch (blocked on entities)
 
@@ -918,9 +996,11 @@ and it turns a design argument into a measurement.
    (`cmodel_private.h:169`, `:197`) are a CS:GO-era addition. Load the flag at stage 1
    regardless — it is in the format — but check a Portal 2 map before porting the branch
    that reads it, and record the answer here.
-2. **`parry` for displacements — decide at stage 3, not now.** §5.5. The tell will be how
-   much of `CDispCollTree`'s 1,565 lines is tree-walking (replaceable) versus
-   displacement semantics (not).
+   *Still open; nothing in stages 1-3 reads it.*
+2. ~~**`parry` for displacements — decide at stage 3, not now.**~~ **Decided at stage 3,
+   and declined.** The tell came out about 120 lines of tree-walking against ~1,400 of
+   displacement semantics; see stage 3's corrections. Revisit at stage 5, when `parry` is
+   in the tree for `.phy` and the comparison is free.
 3. **The port has no `sp_a1_intro1` to measure against on this machine.** The stats in
    `CLAUDE.md` came from a session with the depots mounted; nothing in §2 or §8 depends on
    them, but **stage 1's "done when" does**, and whoever picks this up needs the game

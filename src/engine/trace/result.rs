@@ -52,6 +52,16 @@ pub struct Trace {
     /// surface. Resolve with
     /// [`CollisionBsp::surface_name`](super::CollisionBsp::surface_name).
     pub surface: Option<u16>,
+    /// `DISPSURF_FLAG_*` for a displacement hit, and **0 for everything
+    /// else** — see [`disp_surf`](super::disp_surf).
+    ///
+    /// The engine ORs `DISPSURF_FLAG_SURFACE` into every displacement
+    /// triangle, so a non-zero value here is exactly `CGameTrace::IsDispSurface`
+    /// (`public/trace.h:43`): *this was terrain*. `disp_surf::WALKABLE` is the
+    /// bit gameplay reads most — it is VBSP's judgement, made at compile time
+    /// against the triangle's slope, and is not the same question as
+    /// `normal.z > 0.7`.
+    pub disp_flags: u16,
     /// `SURF_*` for the surface hit.
     ///
     /// **Per *material*, not per side.** Valve ORs every texinfo's flags into
@@ -80,6 +90,7 @@ impl Trace {
             fraction_left_solid: 0.0,
             contents: Contents::EMPTY,
             surface: None,
+            disp_flags: 0,
             surface_flags: 0,
             all_solid: false,
             start_solid: false,

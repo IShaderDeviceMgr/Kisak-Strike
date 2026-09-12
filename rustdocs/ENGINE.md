@@ -6,9 +6,9 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry and lightmaps done; no visibility, collision or props |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models and props done; no visibility, no displacement rendering |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
-| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg` and the `egui` dialog done; no list commands |
+| [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | complete — cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg`, the list commands and the `egui` dialog |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
 | `net/`, `client/`, `server/`, `audio/`, … | the other 9 | not started |
 
@@ -395,6 +395,18 @@ pub struct Bsp {
     pub lighting: Vec<ColorRgbExp32>,
     pub lighting_is_hdr: bool,
     pub level_flags: u32,
+    // Collision, read here and given meaning by `trace/` — see
+    // "Where the data comes from" below.
+    pub planes: Vec<Plane>,
+    pub nodes: Vec<Node>,
+    pub leaves: Vec<Leaf>,
+    pub leaf_brushes: Vec<u16>,
+    pub brushes: Vec<Brush>,
+    pub brush_sides: Vec<BrushSide>,
+    pub disp_info: Vec<DispInfo>,
+    pub disp_verts: Vec<DispVert>,
+    pub disp_tris: Vec<DispTri>,
+    // ...plus the game lumps, leaf ambient lighting and the pak lump.
 }
 
 pub fn world_model(&self) -> &Model;
@@ -408,6 +420,11 @@ pub fn face_lightmap_blocks(&self, face: &Face) -> u32;   // 1, or 4 for SURF_BU
 pub fn face_lightmap_size(face: &Face) -> (u32, u32);     // extents + 1, in luxels
 pub fn face_lightstyle_count(face: &Face) -> usize;
 pub fn entities(&self) -> Vec<Entity>;
+
+// A displacement's two counts, which the file does not record.
+pub fn DispInfo::vert_count(power: i32) -> usize;   // (2^power + 1)^2
+pub fn DispInfo::tri_count(power: i32) -> usize;    // 2^power * 2^power * 2
+pub fn DispInfo::disp_flags(&self) -> u32;          // minTess, decoded
 ```
 
 **Which lighting lump, and which faces lump, are one decision.** `LUMP_LIGHTING_HDR` wins
@@ -438,21 +455,21 @@ which has real internal pointers.
 
 ## `src/engine/trace/`
 
-Ray and swept-box traces against the world's brushes, and against the brush models built
-out of them. Stages 1-2 of
+Ray and swept-box traces against the world's brushes, against the brush models built out
+of them, and against its terrain. Stages 1-3 of
 [`portdocs/ENGINE_TRACE.md`](../portdocs/ENGINE_TRACE.md), and what `src/client/` stage 4
 walks on — [`rustdocs/CLIENT.md`](CLIENT.md) is its one real consumer.
 
 | | |
 |---|---|
-| Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
+| Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_disp.cpp`, `public/dispcoll_common.cpp`, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
 | Depends on | `world::bsp` (the lumps), `glam`, `crate::math`. **No GPU, no window, no I/O** |
-| Status | world brushes and brush models — no displacements, entities or props |
+| Status | world brushes, brush models and displacements — no entities or props |
 
 ### Quick start
 
 ```rust
-use crate::engine::trace::{Contents, Ray};
+use crate::engine::trace::{disp_surf, Contents, Ray};
 
 // `World::load` builds one; it is `world.collision`.
 let collision = &world.collision;
@@ -475,6 +492,9 @@ let ground = tracer.trace(
     Contents::MASK_PLAYERSOLID,
 );
 let standing = ground.did_hit() && ground.normal.z > 0.7;
+// Terrain is part of the world and needs no separate call; it only announces
+// itself in `disp_flags`.
+let on_terrain = ground.disp_flags & disp_surf::SURFACE != 0;
 
 // A brush model — a door, a platform. `World::brush_models` has the map's,
 // resolved from the entity lump; `collision.brush_model(i, origin, angles)`
@@ -536,6 +556,7 @@ pub struct Trace {
     pub fraction_left_solid: f32,  // rays only; see gotcha 4
     pub contents: Contents,
     pub surface: Option<u16>,      // index; resolve with `surface_name`
+    pub disp_flags: u16,           // DISPSURF_FLAG_*; 0 unless terrain was hit
     pub surface_flags: i32,
     pub all_solid: bool,
     pub start_solid: bool,
@@ -550,6 +571,29 @@ and `.mdl`, stages 4-5), `worldSurfaceIndex` (decals and paint, `render/`'s), an
 `vphysics/` — a field that was always zero would read as "this surface has the default
 properties", which is a different claim).
 
+### `disp_surf` — was this terrain, and is it walkable
+
+```rust
+use crate::engine::trace::disp_surf;
+
+if hit.disp_flags & disp_surf::SURFACE != 0 {
+    let vbsp_says_walkable = hit.disp_flags & disp_surf::WALKABLE != 0;
+}
+```
+
+`DISPSURF_FLAG_*` (`public/trace.h:25`), the per-triangle tags VBSP bakes into
+`LUMP_DISP_TRIS` — `SURFACE`, `WALKABLE`, `BUILDABLE` and four `SURFPROP` slots. The
+engine ORs `SURFACE` onto every displacement triangle, so a non-zero `disp_flags` is
+exactly `CGameTrace::IsDispSurface()`: *this was terrain*.
+
+`WALKABLE` is **not** the same question as `normal.z > 0.7`. The first is VBSP's
+compile-time verdict on the triangle's slope; the second is `CategorizePosition` asking at
+runtime about the triangle actually hit. Gameplay reads both, for different reasons.
+
+The `SURFPROP` bits pick which of a material's `$surfaceprop`…`$surfaceprop4` applies.
+They are carried and go no further: resolving one needs the physics surface-property
+database, which arrives with `vphysics/`.
+
 ### `CollisionBsp` and `Tracer`
 
 ```rust
@@ -561,6 +605,10 @@ impl CollisionBsp {
     pub fn surface_name(&self, surface: Option<u16>) -> &str;
     pub fn is_empty(&self) -> bool;
     pub fn summary(&self) -> String;
+    /// How many displacements built collision geometry — stage 3.
+    pub fn disp_count(&self) -> usize;
+    /// One displacement's world bounds, bloated by a unit. `None` if it built none.
+    pub fn disp_bounds(&self, index: usize) -> Option<(Vec3, Vec3)>;
     /// Model `index` of the `.bsp`'s model lump, placed. `None` if there is no
     /// such model. `angles` is a `QAngle`: pitch, yaw, roll, in degrees.
     pub fn brush_model(&self, index: usize, origin: Vec3, angles: Vec3)
@@ -614,17 +662,54 @@ eight times, which is wasted work *and* wrong for `fraction_left_solid`.
 `point_contents` and `leaf` take `&self`: neither needs the scratch, because a point is in
 exactly one leaf and there is nothing to deduplicate.
 
+### Displacements — the terrain
+
+There is **no API for these**. A displacement is not something a caller names: it is part
+of the world, `trace` finds it the way it finds a brush, and the only visible difference
+is that `Trace::disp_flags` comes back non-zero. `CollisionBsp::disp_count` and
+`disp_bounds` exist for reporting and for the depot test, not for tracing.
+
+What is behind that, because it explains every gotcha below: a displacement replaces one
+**four-sided world face** with a `(2^power + 1)²` grid of vertices, each pushed off the
+flat quad along its own direction, triangulated two per cell and indexed by an AABB
+quadtree. Portal 2 ships 1,181 of them across 29 of its 106 maps — 904 at power 2 (32
+triangles), 202 at power 3 (128) and 75 at power 4 (512).
+
+Three things follow from "a surface, not a volume":
+
+- **Every test is one-sided.** A ray travelling *along* a triangle's normal is rejected
+  before anything else happens, and a sweep the same way with `DIST_EPSILON` of slack.
+  Terrain is solid from the front and transparent from the back — walk under a hillside
+  and nothing stops you coming back out through it.
+- **There is no `fraction_left_solid` and no plane set.** The sweep builds its Minkowski
+  sum out of 3 axis planes, 9 edge-cross planes and the face plane — the separating-axis
+  theorem with a direction of travel — rather than clipping against sides the way a brush
+  does.
+- **"Am I inside terrain" is a box-versus-triangle overlap test**, and a *point* has no
+  box, so a point inside terrain is reported as not solid. See gotcha 16.
+
+Two per-displacement switches are live in Portal 2 and are easy to miss because they are
+smuggled through a field called `minTess`:
+
+| Switch | What it hides the patch from | Portal 2 |
+|---|---|---|
+| `SURF_NOHULL_COLL` | swept boxes | 51 patches |
+| `SURF_NORAY_COLL` | rays | 44 patches |
+| contents without `MASK_OPAQUE` | rays | 51 patches (`WINDOW \| TRANSLUCENT`) |
+
 ### Where the data comes from
 
 **`world/bsp.rs` reads the collision lumps; `trace/` derives from them.** Valve has two
 `.bsp` readers (`modelloader.cpp` and `cmodel_bsp.cpp`) because rendering and collision
 lived in code that could not see each other's allocations; one crate has no such excuse.
 `Bsp` gained `planes`, `nodes`, `leaves`, `leaf_brushes`, `brushes` and `brush_sides`
-(lumps 1, 5, 10, 17, 18, 19), all `Pod` struct arrays read by the same bounds-checked
+(lumps 1, 5, 10, 17, 18, 19) at stage 1, and `disp_info`, `disp_verts` and `disp_tris`
+(lumps 26, 33, 48) at stage 3 — all `Pod` struct arrays read by the same bounds-checked
 reader as everything else. What `trace/` builds is the part that is *derived*: the surface
-table, the box brushes, and the contents summary.
+table, the box brushes, the contents summary, each displacement's vertex grid and AABB
+tree, and the per-leaf displacement lists.
 
-Two format notes:
+Four format notes:
 
 - **`LUMP_LEAFS` has two versions and only the directory says which.** Version 0 carries
   a `CompressedLightCube` inline at 56 bytes a leaf; version 1 is 32. Portal 2 ships
@@ -633,7 +718,17 @@ Two format notes:
 - **`dnode_t` and `dleaf_t` carry an explicit `_pad: u16`.** Their fields sum to 30 bytes
   at 4-byte alignment, so the compiler that wrote the file put two bytes there.
   `bytemuck::Pod` refuses a type with *implicit* padding, so naming it is what proves the
-  stride is 32. `collision_lump_strides_match_the_file` asserts all five.
+  stride is 32. `collision_lump_strides_match_the_file` asserts all eight.
+- **Nothing in the file says how big a displacement is.** `LUMP_DISP_VERTS` and
+  `LUMP_DISP_TRIS` are one run per displacement with no lengths; both counts follow from
+  `DispInfo::power`, so a power outside 2..=4 does not overrun *that* record, it silently
+  slides every later one's slice. `Bsp::validate` refuses it. Confirmed against the depot:
+  every shipped displacement's `disp_vert_start` and `disp_tri_start` are exactly the
+  running totals implied by the powers before it.
+- **`ddispinfo_t::minTess` is a flags field, not a tessellation level** — the top bit is
+  set on all 1,181 shipped displacements, and the rest carries `SURF_NOPHYSICS_COLL`,
+  `SURF_NOHULL_COLL` and `SURF_NORAY_COLL`. `DispInfo::disp_flags()` decodes it. Reading
+  it as a number gives 0x80000000 and no flags at all.
 
 ### Invariants and gotchas (trace)
 
@@ -716,6 +811,43 @@ Ordered by how likely each is to bite.
     *is* the world, so `trace_model` with it is the world trace field for field. Combining
     them is the caller's job until stage 4.
 
+14. **A ray stops *on* a displacement and `DIST_EPSILON` short of a brush.** The
+    displacement ray path is `IntersectRayWithTriangle`, which has no epsilon pullback,
+    where `clip_box_to_brush` subtracts one. A **hull** sweep stops short of both, because
+    the sweep path resolves its planes through `ResolveRayPlaneIntersect`, which does have
+    it. So an impact point on terrain and one on a wall are not directly comparable, and
+    a ray that ends exactly at the surface is the degenerate case rather than the normal
+    one.
+
+15. **Terrain is one-sided.** A ray or sweep travelling along a triangle's normal is
+    rejected outright, so a query that starts under a hillside passes straight out
+    through it. The normal that decides this is `(v2 - v0) × (v1 - v0)` — the reverse of
+    the obvious order — built from a base quad whose own normal is `(p3 - p0) × (p1 -
+    p0)`, likewise reversed. Both point out of the terrain, measured on the depot 60 to 8
+    against the leaves either side of a base face. Wind a displacement the other way and
+    you get terrain you fall through.
+
+16. **A *point* inside terrain is reported as not solid, and that is Valve's answer.**
+    `CM_TestInDispTree`'s box-versus-triangle test is what decides "inside", and a point
+    has no box; what is left is the **stab**, which fires along the surface's own outward
+    normal — the one direction gotcha 15 says nothing can be hit in — so `CM_PostStab`
+    takes its clearing branch. A *box* inside terrain is correctly `all_solid`. Pinned by
+    `a_point_inside_terrain_is_reported_as_not_solid` so that nobody "fixes" the stab
+    without meaning to. `portdocs/ENGINE_TRACE.md` §4.8 has the full reading.
+
+17. **`disp_flags` is cleared when a brush beats a displacement, and in Valve it is
+    not.** This is the module's **one deliberate divergence**. `dispFlags` is written in
+    two places (`dispcoll_common.cpp:696`, `:1416`) and cleared in none, so in the
+    original a nearer brush keeps the displacement's flags and `IsDispSurface()` calls a
+    wall terrain — measured at 45 of 2,362 depot traces. `m_bDispHit`, cleared on the
+    adjacent line, is Valve's own evidence the pairing was intended. **Delete the two
+    `work.trace.disp_flags = 0;` lines in `brush.rs` to get Valve's behaviour back**;
+    `a_brush_hit_after_a_displacement_does_not_report_terrain` is what fails when you do.
+
+18. **Two per-displacement switches hide a patch from half the queries**, and Portal 2
+    uses both — see the table under "Displacements" above. A patch with
+    `SURF_NOHULL_COLL` is decoration; making it solid puts invisible walls in the ruins.
+
 ### One place this is stricter than Valve
 
 `IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
@@ -729,11 +861,12 @@ path either way.
 
 | Missing | Waits on |
 |---|---|
-| Displacements — terrain, and the "stab" | stage 3, jointly with `world/disp/` |
 | Entities, trace filters, `ClipTraceToTrace` | stage 4, and `server/` |
 | Static props and `.phy`/vcollide | stage 5, where `parry` enters |
 | Brush models *moving* | `server/` — stage 2 makes them solid, nothing makes them move |
-| Brush model *rendering* | `world/` — their faces are not batched or drawn |
+| Displacement *rendering* | `world/disp/` — stage 3 makes terrain solid, nothing draws it |
+| `LUMP_PHYSDISP`, `CM_CreateDispPhysCollide` | `vphysics/` — the displacement's *physics* mesh, not its trace |
+| Displacement multiblend (`LUMP_DISP_MULTIBLEND`) | nothing — no Portal 2 displacement sets `DISP_INFO_FLAG_HAS_MULTIBLEND` |
 | PVS, areas, areaportals | `world/`'s visibility work, not this module's |
 | `surfaceProps`, hitboxes, occlusion queries | `vphysics/`, `.mdl`, and never |
 
@@ -741,9 +874,11 @@ path either way.
 
 `trace` fires a ray from the player's eye along the view; `trace hull` sweeps the player
 hull from the feet. Both print the fraction, distance, endpoint, normal, surface, contents
-and solid flags, then the contents and leaf at the eye, a ground probe with
-`CategorizePosition`'s 0.7 standable test, and — stage 2 — the same ray against every
-brush model the map places, reporting the nearest by classname and model index.
+and solid flags, then — stage 3 — whether what was hit was terrain and whether VBSP
+compiled it as walkable, then the contents and leaf at the eye, a ground probe with
+`CategorizePosition`'s 0.7 standable test (and the same walkable contrast), and — stage
+2 — the same ray against every brush model the map places, reporting the nearest by
+classname and model index.
 
 **This port's own, not Valve's** — the C++ equivalents (`debugrayenable`, the trace
 counter) exist to work around a DLL boundary this build does not have. It is stages 1
@@ -766,10 +901,10 @@ fallen), and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x80
 
 ### Test coverage (trace)
 
-25 tests, none of which need a map, a GPU or a window — the fixtures build a
+41 tests, none of which need a map, a GPU or a window — the fixtures build a
 `CollisionBsp` through `CollisionBsp::build` from a hand-written `Bsp`, so the box
-extraction and surface table are under test too — plus one depot-gated test that needs
-a Portal 2 install.
+extraction, the displacement build and the surface table are under test too — plus two
+depot-gated tests that need a Portal 2 install.
 
 | Test | Guards |
 |---|---|
@@ -805,7 +940,30 @@ so a trace against the wrong head node is caught rather than merely suspected:
 | `a_brush_models_plane_dist_stays_in_its_own_frame` | gotcha 11 |
 | `a_position_test_against_a_brush_model_finds_it` | the unswept path reaching the model's head node |
 
-Plus `collision_lump_strides_match_the_file` and `leaf_area_and_flags_unpack` in
+Stage 3, on a fixture that builds a real displacement — base face, vertex grid, triangle
+tags and all — over a quad wound so its normals point `+Z`:
+
+| Test | Guards |
+|---|---|
+| `a_displacement_is_built_and_reachable_from_its_leaf` | the build, and the per-leaf lists |
+| `a_ray_stops_on_a_displacement` | gotcha 14's ray half, the normal, the contents, `disp_flags` and the surface name |
+| `a_hull_stops_a_hair_above_a_displacement` | gotcha 14's hull half, and `CategorizePosition`'s test on terrain |
+| `a_displacement_is_transparent_from_behind` | gotcha 15, for both a ray and a hull |
+| `a_displaced_vertex_raises_the_surface_under_it` | the bilinear grid and the offsets — a ramp, sampled at three points |
+| `the_start_position_rotates_the_grid` | `FindSurfPointStartIndex`/`AdjustSurfPointData`, which have no geometric tell |
+| `the_collision_flags_hide_a_displacement_from_one_kind_of_query` | gotcha 18, both flags both ways |
+| `a_ray_passes_through_a_displacement_that_blocks_a_hull` | the `MASK_OPAQUE` condition on rays |
+| `a_mask_that_excludes_the_displacement_hits_nothing` | contents filtering |
+| `a_box_straddling_a_displacement_is_all_solid` | the box-versus-triangle position test |
+| `a_box_above_a_displacement_is_not_solid` | the stab's clearing branch, the case it gets right |
+| `a_point_inside_terrain_is_reported_as_not_solid` | gotcha 16 |
+| `a_brush_and_a_displacement_compete_on_distance` | the nearer of the two wins, in both orders |
+| `a_brush_hit_after_a_displacement_does_not_report_terrain` | gotcha 17 — **confirmed to fail without the fix** |
+| `a_tracer_gives_the_same_displacement_answer_twice` | the displacement visit stamps not leaking between traces |
+
+Plus `collision_lump_strides_match_the_file`, `displacement_sizes_follow_from_the_power`,
+`min_tess_decodes_as_flags_only_when_the_top_bit_is_set` and
+`leaf_area_and_flags_unpack` in
 `world::bsp`, and `valves_angle_order_is_yaw_then_pitch_then_roll` /
 `the_transpose_undoes_the_rotation` in `crate::math` — see
 [the root-module note in `rustdocs/README.md`](README.md#root-modules).
@@ -830,6 +988,25 @@ classnames** — `func_brush` (2,502), `func_portal_bumper` (2,383), `trigger_on
 `trigger_multiple` (899) lead. 9,372 of the 11,635 centre rays hit; the rest are models
 whose geometry does not span their own bounding-box centre, which an L-shaped or hollow
 brush entity does not.
+
+**`every_shipped_map_traces_its_displacements`** is the same shape for stage 3:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_map_displacements -- --ignored --nocapture
+```
+
+It builds every map's collision model, requires **every** displacement to build and to be
+named by at least one leaf, and then fires two traces at each: one down the middle of its
+own box, and one **head-on along the base face's normal — derived from the `.bsp`'s own
+face lump rather than asked of the module**, so the check is against the file rather than
+against itself. A hit attributed to terrain has to land inside a displacement's bounds.
+
+Measured: **1,181 displacements across 29 of 106 maps, all 1,181 built**, 14,190 leaf
+references, 904 at power 2 / 202 at 3 / 75 at 4. Of the 1,106 that a ray may hit at all,
+**897 are hit head-on inside their own box**, 27 hit a neighbouring patch first (the ray
+starts as far out as the vertex offsets can reach, which on a deep patch is far enough to
+cross another), and 182 meet a brush on the way. If the winding convention were inverted,
+that first number would be zero — which is what the test asserts on.
 
 ## `src/engine/input/`
 
@@ -1929,13 +2106,13 @@ Not bugs; each names what it waits on.
 | Shaders this port has not ported | 3 of `sp_a1_intro1`'s 74 materials name one — `SolidEnergy` (the fizzler field), `Refract` and `Black`. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
 | Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
-| Displacements | Geometry lives in `LUMP_DISPINFO`/`LUMP_DISP_VERTS`; `world/disp/` (§7.15). Counted in `WorldStats::faces_displaced`. |
+| Displacement *rendering* | Their collision is done (`trace/` stage 3 — terrain is solid and reports `disp_flags`); **nothing draws them**. That is `world/disp/` (§7.15), and the vertex grid it needs is the one `trace::disp` already builds. Counted in `WorldStats::faces_displaced`. |
 | Translucent brush entities | Render modes 1-5 and 7-9 need a sorted blended pass and draw opaque instead; only `kRenderNone` is honoured. Five entities in the shipped game set one. |
 | Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
 | Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. It is also possible to noclip *out* of the level and look back in, which nothing culls. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
-| Prop and displacement collision | `trace/` covers the world's brushes and the brush models; `.phy`/vcollide is its stage 5 and displacements its stage 3. |
+| Prop collision | `trace/` covers the world's brushes, the brush models and the displacements; `.phy`/vcollide is its stage 5. |
 | Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. There is a player who walks, falls and is stopped by the world, and nothing else is simulated at all. |
 
 ### The camera is the player's eye

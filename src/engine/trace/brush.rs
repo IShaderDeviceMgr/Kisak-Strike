@@ -126,6 +126,22 @@ pub(super) fn clip_box_to_brush<const IS_POINT: bool>(work: &mut Work<'_>, brush
         let plane = &bsp.planes[side.plane as usize];
         let (surface, flags) = bsp.surface_at(side.surface);
 
+        // This brush is nearer than whatever was there, so the best hit is no
+        // longer a displacement's (`engine/cmodel.cpp:1704`). Without this,
+        // `post_trace_to_disp_tree` would test a *brush's* normal against the
+        // travel direction and could call a clean hit `all_solid`.
+        work.disp_hit = false;
+        // **Deliberate divergence**, and the one place this module fixes Valve
+        // rather than reproducing it. `dispFlags` is written in exactly two
+        // places (`dispcoll_common.cpp:696`, `:1416`) and cleared in none, so
+        // in the original a brush hit that supersedes a displacement hit keeps
+        // the displacement's flags — and `CGameTrace::IsDispSurface()` then
+        // says "terrain" about a wall. `m_bDispHit`, one line up, is Valve's
+        // own evidence that the pairing was intended. Measured on the depot:
+        // over one ray and one hull sweep through every shipped
+        // displacement — 2,362 traces — Valve's behaviour mislabels 45 brush
+        // hits as terrain. Delete this line and its twin below to get it back.
+        work.trace.disp_flags = 0;
         work.trace.fraction = enter_frac.max(0.0);
         work.trace.normal = plane.normal;
         work.trace.plane_dist = plane.dist;
@@ -256,6 +272,10 @@ fn intersect_ray_with_box_brush<const IS_POINT: bool>(
         }
     } else if last_in < work.trace.fraction {
         let (surface, flags) = bsp.surface_at(brush.surfaces[face]);
+        // As in the plane path: a nearer brush hit displaces a displacement's
+        // (`engine/cmodel.cpp:1065`), and clears the flags Valve leaves stale.
+        work.disp_hit = false;
+        work.trace.disp_flags = 0;
         work.trace.fraction = last_in;
         work.trace.surface = surface;
         work.trace.surface_flags = flags;

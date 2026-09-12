@@ -5,8 +5,11 @@
 //! that gets a map on screen: read the `.bsp` ([`bsp`]), turn its faces into
 //! vertex and index buffers grouped by material, and draw them — the world
 //! model, the **brush entities** placed around it, and the static props on top.
-//! Everything the rest of that subsystem does — visibility, displacements,
-//! dynamic lighting, the 3D skybox — arrives with the subsystem that needs it.
+//! Everything the rest of that subsystem does — visibility, displacement
+//! *rendering*, dynamic lighting, the 3D skybox — arrives with the subsystem
+//! that needs it. (Displacement *collision* has landed: the lumps are read by
+//! [`bsp`] and [`trace`](crate::engine::trace) makes terrain solid. What is
+//! missing here is drawing it.)
 //!
 //! A brush entity is drawn exactly as the world is, under the placement its
 //! entity gives it: `R_DrawBrushModel` (`gl_rsurf.cpp`) is the world-surface
@@ -118,8 +121,10 @@ pub struct WorldStats {
     pub faces_drawn: usize,
     /// Faces skipped for a [`surf`](bsp::surf) flag — sky, nodraw, hints.
     pub faces_not_drawn: usize,
-    /// Faces skipped because they are displacements, whose geometry lives in
-    /// lumps this reader does not open yet.
+    /// Faces skipped because they are displacements, whose rendered geometry
+    /// is a grid in `LUMP_DISPINFO`/`LUMP_DISP_VERTS` rather than this face's
+    /// winding. The lumps *are* read — `trace/` builds collision from them —
+    /// and nothing draws them.
     pub faces_displaced: usize,
     pub vertices: usize,
     pub triangles: usize,
@@ -404,10 +409,10 @@ impl World {
                 Props::default()
             }
         };
-        // Built here rather than in the struct literal below because the props
-        // need it: a prop's lighting is sampled at a point, and finding the
-        // leaf that point is in is a walk of this tree.
-        let collision = CollisionBsp::build(&bsp);
+        // The one built above, not a second one. It used to be rebuilt here
+        // and the duplicate was cheap while the tree was brushes; it stopped
+        // being cheap when `ENGINE_TRACE.md` stage 3 made building it also
+        // build an AABB tree per displacement.
         props.light(&bsp, &collision);
         stats.pak_files = pak_files;
         stats.props = props.instances.len();
@@ -678,7 +683,8 @@ fn group_faces<'a>(
         // `LUMP_DISPINFO`/`LUMP_DISP_VERTS`, not this face's winding. Drawing
         // the face anyway gives the flat quad the displacement was carved from
         // — a floor where there should be terrain — so it is skipped until
-        // `world/disp/` exists (`portdocs/ENGINE.md` §7.15).
+        // `world/disp/` exists (`portdocs/ENGINE.md` §7.15). The grid it will
+        // need is already built, by `trace::disp` for collision.
         if face.disp_info >= 0 {
             stats.faces_displaced += 1;
             continue;

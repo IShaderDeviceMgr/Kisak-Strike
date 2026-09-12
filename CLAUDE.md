@@ -243,7 +243,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
   one, because the tangent is in the `.vvd` either way.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `trace/` (stages 1-2 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
+  lightmaps, `trace/` (stages 1-3 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
   stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
@@ -301,7 +301,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `FCVAR_NEVER_AS_STRING` cvar**, so anything comparing or displaying a value goes through
   `describe::value`/`describe::is_at_default` — otherwise `differences` reports every such
   cvar as unchanged for ever.
-  `trace/` is stages 1-2 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
+  `trace/` is stages 1-3 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
   it — the recursive hull check, the brush clip, box brushes, the position test,
   `point_contents` and the leaf lookup — over six new collision lumps read by the
   *existing* `bsp.rs` rather than by a second reader, which is a duplication Valve only had
@@ -317,7 +317,18 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   the file and what makes them non-solid is `FSOLID_TRIGGER`, set by a game DLL that does
   not exist. Measured on the depot: **106 maps place 11,635 brush models, 5,115 of them
   rotated** — the rotated path is 44% of them and not a corner case — and `sp_a1_intro1`
-  has 78. Displacements, entities and props are stages 3-5.
+  has 78. **Stage 3 is displacements, and terrain is now solid**: `CDispCollTree` and the
+  parts of `builddisp.cpp` that turn a `ddispinfo_t` into geometry, plus the per-leaf
+  displacement lists, `CM_TraceToDispList`, the box-versus-triangle position test and the
+  stab. Three more lumps in the *same* `bsp.rs`, and a `Trace::disp_flags` carrying VBSP's
+  per-triangle `DISPSURF_*` tags — a non-zero value is `IsDispSurface()`, and
+  `disp_surf::WALKABLE` is VBSP's compile-time verdict rather than `CategorizePosition`'s
+  runtime one. Measured: **1,181 displacements across 29 of Portal 2's 106 maps, all
+  1,181 built**, 904 at power 2 / 202 at 3 / 75 at 4, over 14,190 leaf references;
+  building `sp_a3_end`'s 201 costs 1-3 ms and a ground probe on it 0.2 µs.
+  **`parry` was reconsidered here, as `ENGINE_TRACE.md` §5.5 said to, and declined** —
+  of `CDispCollTree`'s 1,565 lines about 120 are the tree walk a `Qbvh` would replace and
+  the rest is displacement semantics. Entities and props are stages 4-5.
   `spatialpartition.cpp` is not ported and will not be — `parry`'s `Qbvh` replaces it when
   entities land, and `rapier` replaces `vphysics/`; `ENGINE_TRACE.md` §5 is the full
   evaluation of where those two crates do and do not fit, and the world brush trace is one
@@ -335,9 +346,27 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   is pinned by a test so nobody "fixes" it; and **the swept box is not rotated into the
   model's frame**, so the obvious symmetry test — turn the model and the query together,
   expect the answer to turn — holds for a ray and not for a hull.
-  Not implemented: simulation, visibility, displacements, the skybox, dynamic lights and
+  Stage 3 adds four, and the first two are the ones that make terrain terrain:
+  **every displacement test is one-sided** — a query travelling along the triangle's
+  normal is rejected, so walk under a hillside and nothing stops you coming back out
+  through it — and the normal is `(v2 - v0) × (v1 - v0)` over a base quad whose own is
+  `(p3 - p0) × (p1 - p0)`, both the reverse of the obvious order and both pointing *out*
+  of the solid; **a ray stops *on* a displacement and `DIST_EPSILON` short of a brush**,
+  because the displacement ray path has no epsilon pullback (a hull sweep stops short of
+  both); **a *point* inside terrain is reported as not solid**, because the box-versus-
+  triangle test is what decides "inside" and the stab, which is all that is left for a
+  point, fires along the one direction nothing can be hit in — Valve's, pinned by a test;
+  and **two switches hidden in `ddispinfo_t::minTess` take a patch out of half the
+  queries**, which 51 of Portal 2's use for hulls and 44 for rays.
+  **The module's one deliberate divergence is also stage 3's:** Valve writes
+  `dispFlags` in two places and clears it in none, so a brush that beats a displacement
+  keeps the displacement's flags and `IsDispSurface()` calls a wall terrain — 45 of 2,362
+  depot traces. This port clears them where `m_bDispHit` is cleared; `rustdocs/ENGINE.md`
+  gotcha 17 names the two lines to delete to get Valve's behaviour back.
+  Not implemented: simulation, visibility, the skybox, dynamic lights and
   lightstyle animation. Brush entities are solid **and** drawn now; what they are not is
-  *moved*, which is `server/`'s.
+  *moved*, which is `server/`'s. Displacements are solid and **not** drawn, which is
+  `world/disp/`'s.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
   (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
@@ -472,10 +501,10 @@ Next: **the boot path is complete as far as one player can take it.** `client/` 
 and everything below it needs `net/` and `server/`, which is the last of the core path and
 a long way from here. The candidates, in the order they are worth doing:
 
-- **`trace/` stage 3** (displacements), jointly with `world/disp/`'s rendering — one lump
-  read, two consumers, and `sp_a1_intro1` has 11 displacement faces that are currently
-  neither drawn nor collided with.
-- **`world/`'s 3D skybox and the displacement rendering** — the two remaining reasons
+- **`world/disp/`'s rendering** — the other half of the lump read `trace/` stage 3 just
+  did. `sp_a1_intro1`'s 11 displacement faces are collided with now and still not drawn,
+  and the vertex grid the renderer needs is the one `trace::disp` already builds.
+- **`world/`'s 3D skybox** — with the displacements, the two remaining reasons
   `sp_a1_intro1` does not look like the shipped game, now that props are lit.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.

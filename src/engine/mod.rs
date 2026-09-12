@@ -58,7 +58,7 @@ use crate::materials::context::{Camera, Load};
 use crate::materials::renderer::Frame;
 use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
 
-use self::trace::{Contents, Ray};
+use self::trace::{disp_surf, Contents, Ray};
 use console::{
     Command, CommandSpec, CommandTarget, ConfigFiles, Console, ConsoleUi, Cvar, CvarFlags,
     CvarRegistry, Dispatch, ExecContext, Source,
@@ -924,6 +924,19 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
             hit.surface_flags,
             hit.contents,
         ));
+        // Terrain, when it is terrain. `DISPSURF_FLAG_SURFACE` is ORed onto
+        // every displacement triangle, so a non-zero value here is the whole
+        // of `CGameTrace::IsDispSurface`.
+        if hit.disp_flags & disp_surf::SURFACE != 0 {
+            cx.print(&format!(
+                "  displacement: flags {:#x} — {}",
+                hit.disp_flags,
+                match hit.disp_flags & disp_surf::WALKABLE != 0 {
+                    true => "walkable",
+                    false => "not walkable",
+                },
+            ));
+        }
     }
     if hit.start_solid || hit.all_solid {
         cx.print(&format!(
@@ -977,6 +990,18 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
                     "in the air (CategorizePosition only looks 2 units down)"
                 },
             ));
+            // The two questions are not the same one: `normal.z > 0.7` is
+            // asked at runtime about the triangle actually hit, and
+            // `DISPSURF_FLAG_WALKABLE` is VBSP's compile-time verdict.
+            if ground.disp_flags & disp_surf::SURFACE != 0 {
+                cx.print(&format!(
+                    "    a displacement; vbsp compiled it as {}",
+                    match ground.disp_flags & disp_surf::WALKABLE != 0 {
+                        true => "walkable",
+                        false => "not walkable",
+                    },
+                ));
+            }
         }
         false => cx.print(&format!(
             "  ground: nothing within {GROUND_PROBE} units below the feet"

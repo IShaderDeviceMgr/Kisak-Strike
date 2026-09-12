@@ -79,9 +79,15 @@ impl Ray {
     /// `Ray_t::InvDelta` — reciprocals with a sentinel for the zero axes,
     /// because the slab test multiplies by these rather than dividing.
     pub(super) fn inv_delta(&self) -> Vec3 {
-        let axis = |d: f32| if d != 0.0 { 1.0 / d } else { f32::MAX };
-        Vec3::new(axis(self.delta.x), axis(self.delta.y), axis(self.delta.z))
+        inv_delta(self.delta)
     }
+}
+
+/// The same, for a delta that is not a [`Ray`]'s — the displacement stab builds
+/// one mid-trace (`InvDelta`, `engine/cmodel_disp.cpp:256`).
+pub(super) fn inv_delta(delta: Vec3) -> Vec3 {
+    let axis = |d: f32| if d != 0.0 { 1.0 / d } else { f32::MAX };
+    Vec3::new(axis(delta.x), axis(delta.y), axis(delta.z))
 }
 
 /// `CONTENTS_*` (`public/bspflags.h`) — what a brush is made of, and what a

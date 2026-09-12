@@ -1,17 +1,25 @@
 //! Ray and swept-box traces against the world.
 //!
 //! Replaces `engine/cmodel.cpp`'s trace (`CM_BoxTrace` and everything under
-//! it) and, later, `engine/enginetrace.cpp`'s dispatch over entities. This is
-//! stages 1-2 of `portdocs/ENGINE_TRACE.md`: the world's brushes
-//! ([`Tracer::trace`]) and the **brush models** built out of them —
-//! doors, platforms, pistons ([`Tracer::trace_model`]). No displacements, no
-//! entities, no static props.
+//! it), `engine/cmodel_disp.cpp`, `public/dispcoll_common.cpp`, and later
+//! `engine/enginetrace.cpp`'s dispatch over entities. This is stages 1-3 of
+//! `portdocs/ENGINE_TRACE.md`: the world's brushes ([`Tracer::trace`]), the
+//! **brush models** built out of them — doors, platforms, pistons
+//! ([`Tracer::trace_model`]) — and the **displacements**, the map's terrain.
+//! No entities, no static props.
 //!
-//! The two are deliberately separate calls and nothing yet combines them: a
-//! caller that wants "what is in the way" asks the world, then asks each brush
-//! model, and keeps the nearest. Doing that *for* the caller is
-//! `ClipRayToCollideable`'s job and needs a filter and a broadphase, which
-//! need entities (stage 4).
+//! Terrain needs no call of its own: it is part of the world, [`Tracer::trace`]
+//! finds it the way it finds a brush, and the only visible difference is that
+//! [`Trace::disp_flags`] comes back non-zero. [`disp`] is where it lives, and
+//! its module doc is the one to read before believing anything about it — every
+//! test there is **one-sided**, so terrain is solid from the front and
+//! transparent from behind.
+//!
+//! The world and the brush models are deliberately separate calls and nothing
+//! yet combines them: a caller that wants "what is in the way" asks the world,
+//! then asks each brush model, and keeps the nearest. Doing that *for* the
+//! caller is `ClipRayToCollideable`'s job and needs a filter and a broadphase,
+//! which need entities (stage 4).
 //!
 //! ```ignore
 //! let collision = CollisionBsp::build(&bsp);
@@ -25,20 +33,28 @@
 //! }
 //! ```
 //!
-//! Three things here produce a plausible wrong answer rather than an error,
-//! and all three are Valve's rather than this port's:
+//! These produce a plausible wrong answer rather than an error, and all but
+//! the last are Valve's rather than this port's:
 //!
 //! 1. **[`Ray`]'s start is the centre of the box; [`Trace`]'s is not.** A
 //!    player hull is 72 units tall, so the two differ by 36 — see [`Ray`].
 //! 2. **[`Trace::fraction`] stops `DIST_EPSILON` (1/32 unit) short** of the
-//!    surface, deliberately, and movement code depends on the gap.
+//!    surface, deliberately, and movement code depends on the gap — **except
+//!    for a ray against a displacement**, which stops exactly on it.
 //! 3. **[`Trace::fraction_left_solid`] is meaningful for rays only.** A hull
 //!    sweep gets zero, matching `CEngineTrace::TraceRay`.
 //! 4. **A brush model's [`Trace::plane_dist`] stays in the model's frame**,
 //!    where its `normal` comes back rotated into the caller's — see
 //!    [`Tracer::trace_model`].
+//! 5. **A *point* inside terrain is reported as not solid**, because the test
+//!    that decides "inside" is a box-versus-triangle overlap and a point has no
+//!    box — see [`test_in_disp_tree`].
+//! 6. **[`Trace::disp_flags`] is cleared when a brush beats a displacement,
+//!    and in Valve it is not.** The module's one deliberate divergence; the
+//!    two lines are in [`brush`] and are commented as such.
 
 mod brush;
+mod disp;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod hull;
@@ -46,10 +62,12 @@ mod model;
 mod ray;
 mod result;
 
+pub use disp::disp_surf;
 pub use model::{BrushModel, CollisionBsp};
 pub use ray::{Contents, Ray};
 pub use result::{Surface, Trace};
 
+use disp::STAB_LENGTH;
 use glam::Vec3;
 
 /// `DIST_EPSILON` (`public/coordsize.h:35`) — 1/32 of a unit.
@@ -63,6 +81,84 @@ const DIST_EPSILON: f32 = 0.03125;
 /// `NEVER_UPDATED` (`engine/cmodel_private.h:157`) — an enter fraction that no
 /// real one can be below.
 const NEVER_UPDATED: f32 = -99999.0;
+
+/// `MAX_CHECK_COUNT_DEPTH` (`engine/cmodel_private.h:26`) — how deeply a trace
+/// can nest inside itself.
+///
+/// Two, and the second level exists for exactly one caller: the displacement
+/// **stab** (`CM_Stab`, `engine/cmodel_disp.cpp:276`) fires a fresh trace from
+/// inside a position test and must not inherit the outer one's visit marks.
+const MAX_VISIT_DEPTH: usize = 2;
+
+/// One nesting level's visit stamps — `TraceInfo_t`'s `m_Count[i]`,
+/// `m_BrushCounters[i]` and `m_DispCounters[i]`.
+#[derive(Debug)]
+struct VisitLevel {
+    count: u32,
+    brushes: Vec<u32>,
+    disps: Vec<u32>,
+}
+
+/// The visit stamps for a trace and anything nested inside it.
+///
+/// `PushTraceVisits`/`PopTraceVisits` (`engine/cmodel.cpp:90`, `:105`)
+/// expressed as a stack rather than a global depth counter. Valve gives each
+/// level its *own* arrays so that a nested trace cannot un-mark what the outer
+/// one has already visited — sharing one array and bumping the stamp would
+/// look equivalent and is not: a brush the outer trace had marked would be
+/// re-visitable once the stab restored the outer stamp.
+#[derive(Debug)]
+struct Visits {
+    levels: [VisitLevel; MAX_VISIT_DEPTH],
+    depth: usize,
+}
+
+impl Visits {
+    fn new(brushes: usize, disps: usize) -> Visits {
+        Visits {
+            levels: std::array::from_fn(|_| VisitLevel {
+                count: 0,
+                brushes: vec![0; brushes],
+                disps: vec![0; disps],
+            }),
+            depth: 0,
+        }
+    }
+
+    /// Begins a new trace at this level — `PushTraceVisits`' counter bump,
+    /// including the wrap, where a stamp of 0 would compare equal to a stale
+    /// one and the whole array has to be cleared.
+    fn begin(&mut self) {
+        let level = &mut self.levels[self.depth];
+        level.count = level.count.wrapping_add(1);
+        if level.count == 0 {
+            level.count = 1;
+            level.brushes.fill(0);
+            level.disps.fill(0);
+        }
+    }
+
+    /// Enters a nested trace. The caller must [`pop`](Visits::pop).
+    fn push(&mut self) {
+        self.depth += 1;
+        assert!(self.depth < MAX_VISIT_DEPTH, "traces nested too deeply");
+        self.begin();
+    }
+
+    fn pop(&mut self) {
+        self.depth -= 1;
+    }
+
+    fn brush(&mut self, index: usize) -> bool {
+        let level = &mut self.levels[self.depth];
+        std::mem::replace(&mut level.brushes[index], level.count) != level.count
+    }
+
+    fn disp(&mut self, index: usize) -> bool {
+        let level = &mut self.levels[self.depth];
+        std::mem::replace(&mut level.disps[index], level.count) != level.count
+    }
+}
 
 /// A trace in progress: the query, the scratch, and the answer so far.
 ///
@@ -80,12 +176,22 @@ struct Work<'a> {
     extents: Vec3,
     delta: Vec3,
     inv_delta: Vec3,
+    /// `m_ispoint` — the extents are (near enough) zero.
+    is_point: bool,
+    /// `m_isswept` — the sweep goes somewhere.
+    is_swept: bool,
     /// The mask this trace is testing against.
     contents: Contents,
     trace: Trace,
-    /// One stamp per brush; equal to `stamp` means "already visited".
-    stamps: &'a mut [u32],
-    stamp: u32,
+    /// `m_bDispHit` — whether the hit the trace is *currently* holding came
+    /// from a displacement.
+    ///
+    /// Cleared by every brush hit that wins (`engine/cmodel.cpp:1065`,
+    /// `:1704`), which is what makes it mean "the best hit so far is terrain"
+    /// rather than "terrain was touched at some point". Read by
+    /// [`post_trace_to_disp_tree`].
+    disp_hit: bool,
+    visits: &'a mut Visits,
 }
 
 impl Work<'_> {
@@ -96,34 +202,34 @@ impl Work<'_> {
     /// clipped eight times — wasted work, and wrong for
     /// [`Trace::fraction_left_solid`], which accumulates.
     fn visit(&mut self, brush: usize) -> bool {
-        if self.stamps[brush] == self.stamp {
-            return false;
-        }
-        self.stamps[brush] = self.stamp;
-        true
+        self.visits.brush(brush)
+    }
+
+    /// The same, for a displacement — which likewise belongs to every leaf its
+    /// bounding box touches.
+    fn visit_disp(&mut self, disp: usize) -> bool {
+        self.visits.disp(disp)
     }
 }
 
 /// Traces against one collision model.
 ///
 /// Holds the per-trace scratch, so **make one and keep it**: a fresh `Tracer`
-/// allocates a stamp per brush. This is Valve's `BeginTrace`/`EndTrace` pair
-/// (`engine/cmodel.cpp:66`, `:111`) expressed as a borrow — including the
-/// re-entrancy those two managed by hand with `PushTraceVisits` and a depth
-/// counter, which here is simply a second `Tracer`.
+/// allocates a stamp per brush and per displacement. This is Valve's
+/// `BeginTrace`/`EndTrace` pair (`engine/cmodel.cpp:66`, `:111`) expressed as a
+/// borrow — including the re-entrancy those two managed by hand with
+/// `PushTraceVisits` and a depth counter, which here is [`Visits`].
 #[derive(Debug)]
 pub struct Tracer<'a> {
     bsp: &'a CollisionBsp,
-    stamps: Vec<u32>,
-    stamp: u32,
+    visits: Visits,
 }
 
 impl<'a> Tracer<'a> {
     pub(super) fn new(bsp: &'a CollisionBsp) -> Tracer<'a> {
         Tracer {
             bsp,
-            stamps: vec![0; bsp.brushes.len()],
-            stamp: 0,
+            visits: Visits::new(bsp.brushes.len(), bsp.disps.len()),
         }
     }
 
@@ -198,12 +304,7 @@ impl<'a> Tracer<'a> {
             return Trace::miss(ray.start, ray.start + ray.delta);
         }
 
-        self.stamp = self.stamp.wrapping_add(1);
-        if self.stamp == 0 {
-            // Wrapped: every stamp would compare equal to a stale one.
-            self.stamps.fill(0);
-            self.stamp = 1;
-        }
+        self.visits.begin();
 
         let start = ray.start;
         let end = ray.start + ray.delta;
@@ -214,10 +315,12 @@ impl<'a> Tracer<'a> {
             extents: ray.extents,
             delta: ray.delta,
             inv_delta: ray.inv_delta(),
+            is_point: ray.is_ray,
+            is_swept: ray.is_swept,
             contents: mask,
             trace: Trace::miss(start, end),
-            stamps: &mut self.stamps,
-            stamp: self.stamp,
+            disp_hit: false,
+            visits: &mut self.visits,
         };
 
         if !ray.is_swept {
@@ -231,6 +334,273 @@ impl<'a> Tracer<'a> {
         }
         work.trace
     }
+}
+
+/// Sweeps every displacement in one leaf's list — `CM_TraceToDispList`
+/// (`engine/cmodel.cpp:1761`).
+///
+/// The per-displacement rejection is a box test against the patch's bounds,
+/// grown by the sweeping box's extents; the tree walk inside
+/// [`DispTree`](disp::DispTree) then culls to the leaves the ray touches. Both
+/// are needed — a displacement's bounds are as big as its whole patch.
+fn trace_to_disp_list<const IS_POINT: bool>(work: &mut Work<'_>, first: usize, count: usize) {
+    let bsp = work.bsp;
+    for i in first..first + count {
+        let index = bsp.leaf_disps[i] as usize;
+        let Some(disp) = &bsp.disps[index] else {
+            continue;
+        };
+
+        // Only collide with what the caller asked for.
+        if !disp.contents.intersects(work.contents) {
+            continue;
+        }
+        // `if( CHECK_COUNTERS && pTraceInfo->m_isswept )` — the stamp is
+        // skipped for an unswept trace, because `CM_TestInDispTree` has its
+        // own loop and wants to see every patch.
+        if work.is_swept && !work.visit_disp(index) {
+            continue;
+        }
+
+        // The bounds test. A ray is tested against the patch's own box, a hull
+        // against the box grown by its extents.
+        let (mins, maxs) = match IS_POINT {
+            true => (disp.mins, disp.maxs),
+            false => (disp.mins - work.extents, disp.maxs + work.extents),
+        };
+        if !box_intersects_ray(mins, maxs, work.start, work.delta, work.inv_delta) {
+            continue;
+        }
+
+        // `CM_TraceToDispTree` (`engine/cmodel_disp.cpp:364`).
+        let hit = match IS_POINT {
+            true => disp.trace_ray(work.start, work.delta, work.inv_delta, &mut work.trace),
+            false => disp.sweep_box(
+                work.start,
+                work.delta,
+                work.extents,
+                work.inv_delta,
+                &mut work.trace,
+            ),
+        };
+        if hit {
+            work.disp_hit = true;
+            work.trace.contents = disp.contents;
+            set_disp_surface(work, index);
+        }
+
+        if work.trace.fraction == 0.0 {
+            break;
+        }
+    }
+
+    post_trace_to_disp_tree(work);
+}
+
+/// `SetDispTraceSurfaceProps` (`engine/cmodel_disp.cpp:37`).
+///
+/// **One deliberate divergence.** Valve names the surface `"**displacement**"`,
+/// a constant string with no information in it; this reports the base face's
+/// own material instead, so `trace` prints `CONCRETE/CONCRETE_MODULAR_FLOOR001`
+/// rather than a placeholder. The *flags* are unchanged, and they are the
+/// load-bearing half: Valve's `pDisp->GetTexinfoFlags()` is the surface table's
+/// entry for that same texdata, which is exactly what this index resolves to.
+fn set_disp_surface(work: &mut Work<'_>, index: usize) {
+    let surface = work.bsp.disps[index]
+        .as_ref()
+        .expect("a hit came from this displacement")
+        .surface();
+    let (surface, flags) = work.bsp.surface_at(surface);
+    work.trace.surface = surface;
+    work.trace.surface_flags = flags;
+}
+
+/// `CM_PostTraceToDispTree` (`engine/cmodel_disp.cpp:344`) — decides, after the
+/// fact, that a displacement hit means the sweep began inside the terrain.
+///
+/// The test is "did we hit the surface from behind", and it can only *just*
+/// fire: both triangle tests are one-sided, and the sweep's is one-sided with
+/// `DIST_EPSILON` of slack (`disp::sweep_triangle`'s first line), so
+/// `normal · delta` is at most 1/32 when a hit is recorded at all. Ported as
+/// written; it is not this port's asymmetry to fix.
+fn post_trace_to_disp_tree(work: &mut Work<'_>) {
+    if !work.disp_hit {
+        return;
+    }
+    if work.trace.normal.dot(work.delta) > 0.0 {
+        work.trace.start_solid = true;
+        work.trace.all_solid = true;
+    }
+}
+
+/// The position test against one leaf's displacements — `CM_TestInDispTree`
+/// (`engine/cmodel_disp.cpp:364`).
+///
+/// Two halves, and only the first one does real work:
+///
+/// 1. **A box** is tested against each patch's triangles with a
+///    separating-axis test ([`DispTree::intersects_box`](disp::DispTree)). An
+///    overlap is `all_solid` and returns immediately.
+/// 2. **Otherwise the stab** — a second, full trace fired from the query point
+///    along the patch's own surface normal, whose result decides whether the
+///    point was behind the surface.
+///
+/// The stab is the ugliest code in the subsystem, and reading it against the
+/// triangle tests shows it can **essentially only clear a solid verdict, never
+/// set one**: both triangle tests reject a query travelling *along* the
+/// normal, and the stab travels along the normal by construction, so nothing
+/// is hit and [`post_stab`] takes its clearing branch. That is Valve's, it is
+/// ported as written, and it is safe because `test_in_leaf` returns before
+/// reaching here if a *brush* already reported solid.
+fn test_in_disp_tree(work: &mut Work<'_>, first: usize, count: usize) {
+    let bsp = work.bsp;
+
+    // `bIsBox`: Valve tests `m_mins`/`m_maxs` for any non-zero component,
+    // which is the extents being non-zero. Note this is **not** `!is_point`:
+    // a hull small enough to have taken the point path still has extents.
+    if work.extents != Vec3::ZERO {
+        let abs_mins = work.start - work.extents;
+        let abs_maxs = work.start + work.extents;
+
+        for i in first..first + count {
+            let index = bsp.leaf_disps[i] as usize;
+            let Some(disp) = &bsp.disps[index] else {
+                continue;
+            };
+            if !disp.contents.intersects(work.contents) {
+                continue;
+            }
+            if !work.visit_disp(index) {
+                continue;
+            }
+            if !(abs_mins.cmple(disp.maxs).all() && abs_maxs.cmpge(disp.mins).all()) {
+                continue;
+            }
+            if disp.intersects_box(abs_mins, abs_maxs) {
+                work.trace.start_solid = true;
+                work.trace.all_solid = true;
+                work.trace.fraction = 0.0;
+                work.trace.fraction_left_solid = 0.0;
+                work.trace.contents = disp.contents;
+                return;
+            }
+        }
+    }
+
+    let dir = pre_stab(work, first, count);
+    stab(work, dir);
+    post_stab(work);
+}
+
+/// Which way to stab — `CM_PreStab` (`engine/cmodel_disp.cpp:422`).
+///
+/// The direction belongs to whichever patch in the leaf the query is inside the
+/// bounds of; failing that, to the first one in the list, "and set contents to
+/// solid". Valve's `contents` out-parameter is dropped here because `CM_Stab`
+/// takes it and never reads it.
+fn pre_stab(work: &mut Work<'_>, first: usize, count: usize) -> Vec3 {
+    let bsp = work.bsp;
+    let mut dir = Vec3::ZERO;
+    let mut found_any = false;
+
+    for i in first..first + count {
+        let Some(disp) = &bsp.disps[work.bsp.leaf_disps[i] as usize] else {
+            continue;
+        };
+        if !found_any {
+            dir = disp.stab_dir();
+            found_any = true;
+        }
+        if !disp.contents.intersects(work.contents) {
+            continue;
+        }
+        if disp.point_in_bounds(work.start, work.extents, work.is_point) {
+            return disp.stab_dir();
+        }
+    }
+    dir
+}
+
+/// `CM_Stab` (`engine/cmodel_disp.cpp:476`) — a whole second trace, fired from
+/// inside a position test.
+///
+/// It re-aims the query along `dir` for `STAB_LENGTH` units and re-runs the
+/// hull check from **head node 0**, the world. That is right rather than
+/// lucky: displacements are world faces, so only the world subtree's leaves
+/// ever carry them, and this is unreachable from
+/// [`trace_model`](Tracer::trace_model) for the same reason.
+fn stab(work: &mut Work<'_>, dir: Vec3) {
+    work.trace.fraction = 1.0;
+    work.trace.fraction_left_solid = 0.0;
+    work.trace.surface = None;
+    work.trace.surface_flags = 0;
+    work.trace.start_solid = false;
+    work.trace.all_solid = false;
+    work.disp_hit = false;
+
+    let saved = (work.end, work.delta, work.inv_delta);
+    work.end = work.start + dir * STAB_LENGTH;
+    work.delta = work.end - work.start;
+    work.inv_delta = ray::inv_delta(work.delta);
+
+    // A nested trace needs its own visit marks, or every brush and patch the
+    // outer position test has already looked at is invisible to it.
+    work.visits.push();
+    let (p1, p2) = (work.start, work.end);
+    match work.is_point {
+        true => hull::recursive_hull_check::<true>(work, 0, 0.0, 1.0, p1, p2),
+        false => hull::recursive_hull_check::<false>(work, 0, 0.0, 1.0, p1, p2),
+    }
+    work.visits.pop();
+
+    // Valve restores `m_end` alone and leaves the stab's delta behind. That is
+    // unobservable — nothing after this reads the delta of an unswept trace —
+    // but it is restored here rather than left as a trap for stage 4.
+    (work.end, work.delta, work.inv_delta) = saved;
+}
+
+/// `CM_PostStab` (`engine/cmodel_disp.cpp:518`).
+fn post_stab(work: &mut Work<'_>) {
+    if work.disp_hit && work.trace.start_solid {
+        work.trace.all_solid = true;
+        work.trace.fraction = 0.0;
+        work.trace.fraction_left_solid = 0.0;
+    } else {
+        work.trace.start_solid = false;
+        work.trace.all_solid = false;
+        work.trace.contents = Contents::EMPTY;
+        work.trace.fraction = 1.0;
+        work.trace.fraction_left_solid = 0.0;
+    }
+}
+
+/// `IsBoxIntersectingRay` with a tolerance (`public/collisionutils.cpp:766`),
+/// scalar path.
+///
+/// The `DISPCOLL_DIST_EPSILON` tolerance is Valve's at every displacement call
+/// site, and it is the same 1/32 [`DIST_EPSILON`] is — the two constants are
+/// spelled separately in the C++ and have never differed.
+fn box_intersects_ray(mins: Vec3, maxs: Vec3, start: Vec3, delta: Vec3, inv_delta: Vec3) -> bool {
+    let mut t_min = -f32::MAX;
+    let mut t_max = f32::MAX;
+    for i in 0..3 {
+        if delta[i].abs() < 1e-8 {
+            // Parallel to this slab: the start has to already be inside it.
+            if start[i] < mins[i] - DIST_EPSILON || start[i] > maxs[i] + DIST_EPSILON {
+                return false;
+            }
+            continue;
+        }
+        let t1 = (mins[i] - DIST_EPSILON - start[i]) * inv_delta[i];
+        let t2 = (maxs[i] + DIST_EPSILON - start[i]) * inv_delta[i];
+        let (t1, t2) = (t1.min(t2), t1.max(t2));
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max || t_max < 0.0 || t_min > 1.0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// `CEngineTrace::TraceRay`'s last act (`engine/enginetrace.cpp:2956`): a box
@@ -1179,5 +1549,626 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(tracer.trace(&ray, Contents::MASK_SOLID), first);
         }
+    }
+
+    // ---- Stage 3: displacements ------------------------------------------
+
+    /// The base quad of every displacement fixture below: 256 units square in
+    /// the `z = 0` plane, wound so that `(p3 - p0) × (p1 - p0)` — which is what
+    /// every triangle's normal comes out along — points **`+Z`**.
+    ///
+    /// The winding is the thing to get right and the easiest to get wrong: the
+    /// obvious counter-clockwise order gives `-Z`, and terrain whose normals
+    /// point down is terrain you fall through in one direction and cannot
+    /// leave in the other.
+    ///
+    /// Grid coordinates: `i` runs `p0 → p1`, which is `+Y` here, and `j` runs
+    /// across to the `p3 → p2` edge, which is `+X`. So `height(i, j)` raises
+    /// the point at world `(256 j / n, 256 i / n)`.
+    const QUAD: [Vec3; 4] = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 256.0, 0.0),
+        Vec3::new(256.0, 256.0, 0.0),
+        Vec3::new(256.0, 0.0, 0.0),
+    ];
+
+    /// A flat displacement over [`QUAD`], and nothing else in the map.
+    fn terrain(contents: Contents, flags: u32) -> CollisionBsp {
+        terrain_shaped(contents, flags, |_, _| 0.0)
+    }
+
+    fn terrain_shaped(
+        contents: Contents,
+        flags: u32,
+        height: impl Fn(usize, usize) -> f32,
+    ) -> CollisionBsp {
+        let mut fixture = Fixture::default();
+        fixture.add_displacement(QUAD, QUAD[0], 2, contents, flags, height);
+        fixture.single_leaf()
+    }
+
+    /// Straight down the middle of a flat patch.
+    fn down(from: Vec3) -> Ray {
+        Ray::line(from, from - Vec3::Z * 200.0)
+    }
+
+    #[test]
+    fn a_displacement_is_built_and_reachable_from_its_leaf() {
+        let world = terrain(Contents::SOLID, 0);
+        assert_eq!(world.disp_count(), 1);
+        assert!(!world.leaf_disps.is_empty(), "the leaf list names it");
+    }
+
+    /// The headline: terrain stops a ray, reports the surface normal, and says
+    /// it was terrain.
+    #[test]
+    fn a_ray_stops_on_a_displacement() {
+        let world = terrain(Contents::SOLID, 0);
+        let hit = world
+            .tracer()
+            .trace(&down(Vec3::new(128.0, 128.0, 100.0)), Contents::MASK_SOLID);
+
+        assert!(hit.did_hit(), "{hit:?}");
+        assert!((hit.normal - Vec3::Z).length() < 1e-5, "{hit:?}");
+        // **A ray stops *on* a displacement, not `DIST_EPSILON` short of it.**
+        // `IntersectRayWithTriangle` has no epsilon pullback where
+        // `clip_box_to_brush` does — Valve's asymmetry, and the reason a ray's
+        // impact point on terrain and on a wall are not directly comparable.
+        assert!(hit.end.z.abs() < 1e-3, "{hit:?}");
+        assert_eq!(hit.contents, Contents::SOLID);
+        assert!(
+            hit.disp_flags & disp_surf::SURFACE != 0,
+            "a terrain hit says so: {hit:?}"
+        );
+        assert_eq!(world.surface_name(hit.surface), "nature/test_displacement");
+    }
+
+    /// A hull *does* stop short, because the sweep path resolves its planes
+    /// through `ResolveRayPlaneIntersect`, which has the epsilon.
+    #[test]
+    fn a_hull_stops_a_hair_above_a_displacement() {
+        let world = terrain(Contents::SOLID, 0);
+        let from = Vec3::new(128.0, 128.0, 100.0);
+        let hit = world.tracer().trace(
+            &Ray::hull(from, from - Vec3::Z * 200.0, HULL_MIN, HULL_MAX),
+            Contents::MASK_PLAYERSOLID,
+        );
+
+        assert!(hit.did_hit(), "{hit:?}");
+        assert!((hit.normal - Vec3::Z).length() < 1e-5, "{hit:?}");
+        assert!(hit.normal.z > 0.7, "standable: {hit:?}");
+        // The feet, not the box centre.
+        assert!((hit.end.z - DIST_EPSILON).abs() < 1e-3, "{hit:?}");
+        assert!(hit.disp_flags & disp_surf::SURFACE != 0, "{hit:?}");
+    }
+
+    /// **Every displacement test is one-sided.** Terrain is solid from the
+    /// front and transparent from behind, which is what makes the stab the
+    /// strange thing it is — see [`test_in_disp_tree`].
+    #[test]
+    fn a_displacement_is_transparent_from_behind() {
+        let world = terrain(Contents::SOLID, 0);
+        let from = Vec3::new(128.0, 128.0, -100.0);
+
+        let ray = world.tracer().trace(
+            &Ray::line(from, from + Vec3::Z * 200.0),
+            Contents::MASK_SOLID,
+        );
+        assert!(!ray.did_hit(), "{ray:?}");
+
+        let hull = world.tracer().trace(
+            &Ray::hull(from, from + Vec3::Z * 200.0, HULL_MIN, HULL_MAX),
+            Contents::MASK_PLAYERSOLID,
+        );
+        assert!(!hull.did_hit(), "{hull:?}");
+    }
+
+    /// The displacement vectors are what make it terrain rather than a quad.
+    #[test]
+    fn a_displaced_vertex_raises_the_surface_under_it() {
+        // A ramp along the grid's `i` axis, which is world `+Y`.
+        let world = terrain_shaped(Contents::SOLID, 0, |i, _| i as f32 * 16.0);
+        let mut tracer = world.tracer();
+
+        let mut at = |y: f32| {
+            let hit = tracer.trace(&down(Vec3::new(128.0, y, 200.0)), Contents::MASK_SOLID);
+            assert!(hit.did_hit(), "at y={y}: {hit:?}");
+            hit.end.z
+        };
+
+        // Four cells over 256 units, rising 16 per grid step: 0 at y=0 and 64
+        // at y=256, linear in between.
+        assert!((at(0.5) - 0.0).abs() < 1.0, "{}", at(0.5));
+        assert!((at(128.0) - 32.0).abs() < 1.0, "{}", at(128.0));
+        assert!((at(255.0) - 64.0).abs() < 1.0, "{}", at(255.0));
+    }
+
+    /// `startPosition` rotates the grid, and the grid is what the vertex
+    /// offsets are indexed by — so the same offsets over the same quad make a
+    /// *different* shape depending on which corner the file names.
+    ///
+    /// This is the one piece of the build that is pure bookkeeping and has no
+    /// geometric tell: get it wrong and every patch in the map is the right
+    /// shape turned by a multiple of 90°.
+    #[test]
+    fn the_start_position_rotates_the_grid() {
+        let ramp = |start: Vec3| {
+            let mut fixture = Fixture::default();
+            fixture.add_displacement(QUAD, start, 2, Contents::SOLID, 0, |i, _| i as f32 * 16.0);
+            fixture.single_leaf()
+        };
+
+        let height = |world: &CollisionBsp, x: f32, y: f32| {
+            let hit = world
+                .tracer()
+                .trace(&down(Vec3::new(x, y, 200.0)), Contents::MASK_SOLID);
+            assert!(hit.did_hit(), "({x}, {y}): {hit:?}");
+            hit.end.z
+        };
+
+        // Corner 0 is the quad's own first point, so the ramp rises along +Y.
+        let a = ramp(QUAD[0]);
+        assert!(height(&a, 32.0, 224.0) > height(&a, 224.0, 32.0));
+
+        // Corner 1 becomes the new origin, so `i` now runs along +X.
+        let b = ramp(QUAD[1]);
+        assert!(height(&b, 224.0, 32.0) > height(&b, 32.0, 224.0));
+    }
+
+    /// `SURF_NOHULL_COLL` and `SURF_NORAY_COLL` are live in Portal 2 — 44 of
+    /// its 1,181 displacements carry both — and a patch that ignores them is
+    /// an invisible wall in the ruins.
+    #[test]
+    fn the_collision_flags_hide_a_displacement_from_one_kind_of_query() {
+        const NOHULL: u32 = 0x4;
+        const NORAY: u32 = 0x8;
+
+        let from = Vec3::new(128.0, 128.0, 100.0);
+        let ray = down(from);
+        let hull = Ray::hull(from, from - Vec3::Z * 200.0, HULL_MIN, HULL_MAX);
+
+        let world = terrain(Contents::SOLID, NOHULL);
+        assert!(world.tracer().trace(&ray, Contents::MASK_SOLID).did_hit());
+        assert!(!world
+            .tracer()
+            .trace(&hull, Contents::MASK_PLAYERSOLID)
+            .did_hit());
+
+        let world = terrain(Contents::SOLID, NORAY);
+        assert!(!world.tracer().trace(&ray, Contents::MASK_SOLID).did_hit());
+        assert!(world
+            .tracer()
+            .trace(&hull, Contents::MASK_PLAYERSOLID)
+            .did_hit());
+    }
+
+    /// A ray needs the displacement's contents to be *opaque*, where a hull
+    /// only needs them to be in the mask. Portal 2's 51 `WINDOW | TRANSLUCENT`
+    /// patches are exactly this case.
+    #[test]
+    fn a_ray_passes_through_a_displacement_that_blocks_a_hull() {
+        // `CONTENTS_WINDOW | CONTENTS_TRANSLUCENT`, which is what the depot
+        // holds for 51 of its displacements.
+        let world = terrain(Contents(0x1000_0002), 0);
+        let from = Vec3::new(128.0, 128.0, 100.0);
+
+        assert!(!world
+            .tracer()
+            .trace(&down(from), Contents::MASK_SOLID)
+            .did_hit());
+        assert!(world
+            .tracer()
+            .trace(
+                &Ray::hull(from, from - Vec3::Z * 200.0, HULL_MIN, HULL_MAX),
+                Contents::MASK_SOLID,
+            )
+            .did_hit());
+    }
+
+    #[test]
+    fn a_mask_that_excludes_the_displacement_hits_nothing() {
+        let world = terrain(Contents::WATER, 0);
+        let from = Vec3::new(128.0, 128.0, 100.0);
+        assert!(!world
+            .tracer()
+            .trace(
+                &Ray::hull(from, from - Vec3::Z * 200.0, HULL_MIN, HULL_MAX),
+                Contents::MASK_PLAYERSOLID,
+            )
+            .did_hit());
+        assert!(world
+            .tracer()
+            .trace(
+                &Ray::hull(from, from - Vec3::Z * 200.0, HULL_MIN, HULL_MAX),
+                Contents::MASK_WATER,
+            )
+            .did_hit());
+    }
+
+    /// The position test: a box straddling the surface is inside it.
+    ///
+    /// This is the half of `CM_TestInDispTree` that works — the separating-axis
+    /// box-versus-triangle test. The other half, the stab, is tested below.
+    #[test]
+    fn a_box_straddling_a_displacement_is_all_solid() {
+        let world = terrain(Contents::SOLID, 0);
+        // Feet 36 below the surface, so the 72-tall hull is cut in half by it.
+        let feet = Vec3::new(128.0, 128.0, -36.0);
+        let hit = world.tracer().trace(
+            &Ray::hull(feet, feet, HULL_MIN, HULL_MAX),
+            Contents::MASK_PLAYERSOLID,
+        );
+
+        assert!(hit.all_solid && hit.start_solid, "{hit:?}");
+        assert_eq!(hit.fraction, 0.0);
+        assert_eq!(hit.contents, Contents::SOLID);
+    }
+
+    /// ...and a box in open air over terrain is not, which is the case the
+    /// stab decides and the one it gets right.
+    #[test]
+    fn a_box_above_a_displacement_is_not_solid() {
+        let world = terrain(Contents::SOLID, 0);
+        let feet = Vec3::new(128.0, 128.0, 64.0);
+        let hit = world.tracer().trace(
+            &Ray::hull(feet, feet, HULL_MIN, HULL_MAX),
+            Contents::MASK_PLAYERSOLID,
+        );
+
+        assert!(!hit.all_solid && !hit.start_solid, "{hit:?}");
+        assert_eq!(hit.fraction, 1.0);
+    }
+
+    /// A point buried in terrain reports **not solid**, and that is Valve's
+    /// answer rather than this port's.
+    ///
+    /// `CM_TestInDispTree` has no box test to run for a point, so it falls
+    /// through to the stab — which fires along the surface's own normal, into
+    /// the back of every triangle it could reach, where every triangle test in
+    /// [`disp`] culls it. `CM_PostStab` then takes its clearing branch. Pinned
+    /// here so that nobody "fixes" the stab into reporting solid without
+    /// meaning to.
+    #[test]
+    fn a_point_inside_terrain_is_reported_as_not_solid() {
+        let world = terrain(Contents::SOLID, 0);
+        let inside = Vec3::new(128.0, 128.0, -16.0);
+        let hit = world
+            .tracer()
+            .trace(&Ray::line(inside, inside), Contents::MASK_SOLID);
+
+        assert!(!hit.all_solid && !hit.start_solid, "{hit:?}");
+        assert_eq!(hit.fraction, 1.0);
+    }
+
+    /// A brush and a displacement in one leaf, and the nearer one wins —
+    /// including [`Trace::disp_flags`], which must not claim terrain when a
+    /// brush was hit.
+    #[test]
+    fn a_brush_and_a_displacement_compete_on_distance() {
+        let build = |brush_z: f32| {
+            let mut fixture = Fixture::default();
+            fixture.add_displacement(QUAD, QUAD[0], 2, Contents::SOLID, 0, |_, _| 0.0);
+            fixture.add_box(
+                Vec3::new(0.0, 0.0, brush_z),
+                Vec3::new(256.0, 256.0, brush_z + 8.0),
+                Contents::SOLID,
+                true,
+            );
+            fixture.single_leaf()
+        };
+
+        // A ledge above the terrain: the brush is hit and nothing says terrain.
+        let world = build(64.0);
+        let hit = world
+            .tracer()
+            .trace(&down(Vec3::new(128.0, 128.0, 200.0)), Contents::MASK_SOLID);
+        assert!((hit.end.z - (72.0 + DIST_EPSILON)).abs() < 1e-2, "{hit:?}");
+        assert_eq!(hit.disp_flags, 0, "a brush hit is not terrain: {hit:?}");
+
+        // The brush buried below: the terrain is what stops the ray.
+        let world = build(-64.0);
+        // Past the terrain rather than exactly onto it: a ray whose *end* is
+        // the surface is the degenerate case, not the interesting one.
+        let from = Vec3::new(128.0, 128.0, 200.0);
+        let hit = world.tracer().trace(
+            &Ray::line(from, from - Vec3::Z * 400.0),
+            Contents::MASK_SOLID,
+        );
+        assert!(hit.end.z.abs() < 1e-2, "{hit:?}");
+        assert!(hit.disp_flags & disp_surf::SURFACE != 0, "{hit:?}");
+    }
+
+    /// **The one place this module fixes Valve rather than reproducing it.**
+    ///
+    /// `dispFlags` is written when a displacement wins and cleared nowhere, so
+    /// in the original a brush that supersedes a displacement *keeps the
+    /// displacement's flags* and `IsDispSurface()` calls a wall terrain. This
+    /// port clears them where `m_bDispHit` is cleared — see `brush.rs`.
+    ///
+    /// The shape that reaches it needs care, because within one leaf the
+    /// brushes are clipped first and cannot come second. What makes it
+    /// reachable is that **a displacement is traced against the whole ray from
+    /// whichever leaf reaches it first** — its bounding box spans many — so a
+    /// near leaf can record a hit far down the ray, and a brush in a later leaf
+    /// can then beat it.
+    #[test]
+    fn a_brush_hit_after_a_displacement_does_not_report_terrain() {
+        let mut fixture = Fixture::default();
+        // Terrain across the whole map, so its bounding box is in both leaves
+        // and the *near* one traces it.
+        fixture.add_displacement(
+            [
+                Vec3::new(-256.0, 0.0, 0.0),
+                Vec3::new(-256.0, 256.0, 0.0),
+                Vec3::new(256.0, 256.0, 0.0),
+                Vec3::new(256.0, 0.0, 0.0),
+            ],
+            Vec3::new(-256.0, 0.0, 0.0),
+            2,
+            Contents::SOLID,
+            0,
+            |_, _| 0.0,
+        );
+        // A ledge above the terrain, entirely in the far (`x < 0`) leaf.
+        let brush = fixture.add_box(
+            Vec3::new(-100.0, 0.0, 10.0),
+            Vec3::new(-20.0, 256.0, 30.0),
+            Contents::SOLID,
+            true,
+        );
+        let world = fixture.split(&[], &[brush]);
+
+        // Down and to the left: it crosses `x = 0` at fraction 0.5, enters the
+        // ledge at about 0.55, and would reach the terrain at about 0.71. So
+        // the near leaf records the terrain first and the far leaf's brush
+        // then wins.
+        let from = Vec3::new(200.0, 128.0, 100.0);
+        let hit = world.tracer().trace(
+            &Ray::line(from, Vec3::new(-200.0, 128.0, -40.0)),
+            Contents::MASK_SOLID,
+        );
+
+        assert!(hit.did_hit(), "{hit:?}");
+        assert!(
+            (hit.normal - Vec3::X).length() < 1e-5,
+            "the ledge's +X face, not the terrain: {hit:?}"
+        );
+        assert_eq!(
+            hit.disp_flags, 0,
+            "the brush won, so nothing may claim terrain: {hit:?}"
+        );
+    }
+
+    /// The displacement visit stamps are a second array beside the brushes',
+    /// and they must reset between traces the same way.
+    #[test]
+    fn a_tracer_gives_the_same_displacement_answer_twice() {
+        let world = terrain(Contents::SOLID, 0);
+        let mut tracer = world.tracer();
+        let ray = down(Vec3::new(128.0, 128.0, 100.0));
+
+        let first = tracer.trace(&ray, Contents::MASK_SOLID);
+        assert!(first.did_hit());
+        for _ in 0..4 {
+            assert_eq!(tracer.trace(&ray, Contents::MASK_SOLID), first);
+        }
+    }
+
+    /// Every shipped map's terrain, built and swept for real —
+    /// `portdocs/ENGINE_TRACE.md` stage 3's verification.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_map_displacements -- --ignored --nocapture
+    /// ```
+    ///
+    /// The assertion that earns the runtime is the **bounds check**: a hit has
+    /// to land inside the patch it came from. A wrong start corner rotates the
+    /// grid, a wrong vertex stride reads another patch's offsets, and a wrong
+    /// triangle winding drops the hit entirely — the first two land outside the
+    /// box and the third shows up in the hit count.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn every_shipped_map_traces_its_displacements() {
+        use crate::engine::world::bsp::Bsp;
+
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "only {} maps found", names.len());
+
+        let (mut maps, mut with_terrain, mut total, mut built) = (0, 0, 0usize, 0usize);
+        let (mut ray_hits, mut hull_hits, mut walkable) = (0usize, 0usize, 0usize);
+        let mut powers = std::collections::BTreeMap::<i32, usize>::new();
+        let mut listed = 0usize;
+        let (mut eligible, mut head_on) = (0usize, 0usize);
+        let (mut head_on_other, mut head_on_blocked) = (0usize, 0usize);
+
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            let collision = CollisionBsp::build(&bsp);
+            maps += 1;
+            total += bsp.disp_info.len();
+            built += collision.disp_count();
+            listed += collision.leaf_disps.len();
+            if bsp.disp_info.is_empty() {
+                continue;
+            }
+            with_terrain += 1;
+            for info in &bsp.disp_info {
+                *powers.entry(info.power).or_default() += 1;
+            }
+            // Every displacement is named by at least one leaf, or nothing
+            // could ever reach it.
+            assert!(
+                !collision.leaf_disps.is_empty(),
+                "{name}: {} displacements and no leaf lists them",
+                bsp.disp_info.len()
+            );
+
+            // The base quad of each displacement, read straight out of the
+            // `.bsp` rather than asked of the module — so the head-on test
+            // below is checking the build against the file rather than against
+            // itself.
+            let mut quads: Vec<Option<[Vec3; 4]>> = vec![None; bsp.disp_info.len()];
+            for face in &bsp.faces {
+                if let Ok(index) = usize::try_from(face.disp_info) {
+                    let corners: Vec<Vec3> = bsp.face_vertices(face).collect();
+                    if let (Some(slot @ None), Ok(corners)) =
+                        (quads.get_mut(index), <[Vec3; 4]>::try_from(corners))
+                    {
+                        *slot = Some(corners);
+                    }
+                }
+            }
+
+            let mut tracer = collision.tracer();
+            for (index, quad) in quads.iter().enumerate() {
+                // Every shipped displacement builds, which the assertion at the
+                // end pins; a slot that did not is skipped rather than assumed
+                // away, because the indices are not compacted.
+                let Some((mins, maxs)) = collision.disp_bounds(index) else {
+                    continue;
+                };
+
+                // **Head-on.** Every triangle test in `disp` is one-sided
+                // against `(p3 - p0) × (p1 - p0)`, so a ray fired back along
+                // that normal, from just outside the envelope the vertex
+                // offsets can reach, has to hit — and if the winding
+                // convention were inverted, *nothing* would.
+                let info = &bsp.disp_info[index];
+                let opaque = Contents(info.contents as u32).intersects(Contents::MASK_OPAQUE);
+                let rays_collide = info.disp_flags() & 0x8 == 0;
+                if let (Some(quad), true, true) = (*quad, opaque, rays_collide) {
+                    eligible += 1;
+                    let normal = (quad[3] - quad[0])
+                        .cross(quad[1] - quad[0])
+                        .normalize_or_zero();
+                    let first = info.disp_vert_start as usize;
+                    let reach = bsp.disp_verts[first
+                        ..first + crate::engine::world::bsp::DispInfo::vert_count(info.power)]
+                        .iter()
+                        .fold(1.0f32, |m, v| m.max(v.dist.abs()))
+                        + 2.0;
+                    let mid = (quad[0] + quad[1] + quad[2] + quad[3]) * 0.25;
+                    let hit = tracer.trace(
+                        &Ray::line(mid + normal * reach, mid - normal * reach),
+                        Contents::MASK_SOLID,
+                    );
+                    if hit.disp_flags & disp_surf::SURFACE == 0 {
+                        head_on_blocked += 1;
+                    }
+                    if hit.disp_flags & disp_surf::SURFACE != 0 {
+                        let slack = Vec3::ONE;
+                        let inside = |lo: Vec3, hi: Vec3| {
+                            hit.end.cmpge(lo - slack).all() && hit.end.cmple(hi + slack).all()
+                        };
+                        if inside(mins, maxs) {
+                            head_on += 1;
+                        } else {
+                            head_on_other += 1;
+                            // The ray starts as far out as the vertex offsets
+                            // could possibly carry the surface, which on a
+                            // deeply-displaced patch is far enough to cross a
+                            // *different* one first. That is the trace working,
+                            // not failing — but the hit still has to be
+                            // somebody's terrain.
+                            assert!(
+                                (0..collision.disp_count())
+                                    .filter_map(|i| collision.disp_bounds(i))
+                                    .any(|(lo, hi)| inside(lo, hi)),
+                                "{name}: displacement {index} head-on hit {} inside no \
+                                 displacement's box at all",
+                                hit.end,
+                            );
+                        }
+                    }
+                }
+
+                let centre = (mins + maxs) * 0.5;
+                // From just above this patch's own box to just below it, and
+                // **not** from far away: a map's patches overlap in plan —
+                // terrain over a cave, a rubble pile against a wall — so a long
+                // ray reports whichever one it reaches first and says nothing
+                // about this one. Starting inside the box's own vertical span
+                // is what makes the assertion below about *this* displacement.
+                let from = Vec3::new(centre.x, centre.y, maxs.z + 1.0);
+                let to = Vec3::new(centre.x, centre.y, mins.z - 1.0);
+
+                for (is_hull, hit) in [
+                    (
+                        false,
+                        tracer.trace(&Ray::line(from, to), Contents::MASK_SOLID),
+                    ),
+                    (
+                        true,
+                        tracer.trace(
+                            &Ray::hull(from, to, HULL_MIN, HULL_MAX),
+                            Contents::MASK_PLAYERSOLID,
+                        ),
+                    ),
+                ] {
+                    assert!(
+                        hit.fraction.is_finite() && (0.0..=1.0).contains(&hit.fraction),
+                        "{name}: displacement {index} fraction {}",
+                        hit.fraction
+                    );
+                    if hit.disp_flags == 0 {
+                        continue; // a brush or nothing at all was in the way
+                    }
+                    match is_hull {
+                        true => hull_hits += 1,
+                        false => ray_hits += 1,
+                    }
+                    if hit.disp_flags & disp_surf::WALKABLE != 0 {
+                        walkable += 1;
+                    }
+                    // The hull's extents push the impact out by up to a hull
+                    // half-width beyond the patch, so the slack is the hull.
+                    let slack = match is_hull {
+                        true => Vec3::new(17.0, 17.0, 73.0),
+                        false => Vec3::ONE,
+                    };
+                    assert!(
+                        hit.end.cmpge(mins - slack).all() && hit.end.cmple(maxs + slack).all(),
+                        "{name}: displacement {index} hit {} outside its own box {mins}..{maxs}",
+                        hit.end,
+                    );
+                }
+            }
+        }
+
+        println!(
+            "{maps} maps, {with_terrain} with terrain: {total} displacements, {built} built, \
+             {listed} leaf references; powers {powers:?};\n  \
+             head-on along the base normal: {head_on} of {eligible} ray-eligible hit their own \
+             patch, {head_on_other} another patch, {head_on_blocked} something else;\n  \
+             straight down the middle of the box: {ray_hits} ray hits, {hull_hits} hull hits, \
+             {walkable} of them walkable."
+        );
+        assert!(
+            total > 1000,
+            "only {total} displacements across {maps} maps"
+        );
+        assert_eq!(built, total, "every shipped displacement builds");
+        // The winding check. A patch can still be missed head-on — a vertex
+        // offset can carry the surface sideways out of the ray's path — but if
+        // the normals came out inverted this would be zero.
+        assert!(
+            head_on * 4 > eligible * 3,
+            "only {head_on} of {eligible} displacements were hit along their own normal"
+        );
     }
 }

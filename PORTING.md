@@ -644,12 +644,23 @@ rather than `CGameMovement`. Stage 5 is prediction and waits for `net/` and `ser
 which is the only thing in `client/` still blocked on another module.
 
 Collision is **planned in `portdocs/ENGINE_TRACE.md`** and lands as `src/engine/trace/`.
-**Stages 1-2 are done**: `CM_BoxTrace` and everything under it over the world's brushes,
-and `CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
-a test chamber, all solid and, since `world/` learned to draw them, all visible; what none
-of them do is *move*, which is `server/`'s. Stage 3 is displacements, stage 4 entities and
-the dispatch, stage 5 vcollide — and `spatialpartition.cpp` is not ported and will not be,
-because `parry`'s `Qbvh` replaces it when entities arrive.
+**Stages 1-3 are done**: `CM_BoxTrace` and everything under it over the world's brushes;
+`CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
+a test chamber, all solid and, since `world/` learned to draw them, all visible; and
+`CDispCollTree` over the **displacements**, so the game's terrain is solid too. Stage 4 is
+entities and the dispatch, stage 5 vcollide — and `spatialpartition.cpp` is not ported and
+will not be, because `parry`'s `Qbvh` replaces it when entities arrive.
+
+Stage 3 also answered the one open question this file's crate policy had left hanging:
+**`parry` was reconsidered for displacements on its merits, as `ENGINE_TRACE.md` §5.5 said
+to, and declined.** A displacement really is a triangle soup, but of `CDispCollTree`'s
+1,565 lines only about 120 are the tree walk a `Qbvh` would replace; the rest is
+displacement *semantics* — the one-sided tests, the nine cached edge-cross planes, the
+`DIST_EPSILON` interval, the `DISPSURF_*` tags and the stab — and swapping the arithmetic
+would change the epsilon, which is the behaviour. It is on the table again at stage 5,
+when `parry` is in the tree for `.phy` anyway and the comparison costs nothing. All 1,181
+of Portal 2's displacements build and trace; `sp_a1_intro1`'s 11 are solid and still not
+drawn, which is `world/disp/`'s half of the same lump read.
 
 Drawing them was `world/`'s and shares the placement: `BrushModel::model_to_world` is the
 inverse of the transform the trace applies to a ray, computed per draw and never cached,

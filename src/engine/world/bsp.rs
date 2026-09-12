@@ -62,6 +62,13 @@ const LUMP_MODELS: usize = 14;
 const LUMP_LEAFBRUSHES: usize = 17;
 const LUMP_BRUSHES: usize = 18;
 const LUMP_BRUSHSIDES: usize = 19;
+/// The displacement lumps. Read here for the same reason the brush lumps are —
+/// this is the `.bsp` reader — and consumed by
+/// [`trace`](crate::engine::trace), which turns each one into an AABB tree over
+/// its triangles. `portdocs/ENGINE_TRACE.md` stage 3.
+const LUMP_DISPINFO: usize = 26;
+const LUMP_DISP_VERTS: usize = 33;
+const LUMP_DISP_TRIS: usize = 48;
 const LUMP_GAME_LUMP: usize = 35;
 const LUMP_PAKFILE: usize = 40;
 const LUMP_LEAF_AMBIENT_INDEX_HDR: usize = 51;
@@ -100,6 +107,17 @@ const LEAFS_VERSION: i32 = 1;
 /// carry. A style of 255 means "no more".
 const MAX_LIGHTMAPS: usize = 4;
 const NO_LIGHTSTYLE: u8 = 255;
+
+/// `MIN_MAP_DISP_POWER`/`MAX_MAP_DISP_POWER` (`public/bspfile.h:48`).
+///
+/// A displacement is a `(2^power + 1)²` grid of verts over a four-sided face.
+/// The power is the *only* thing that says how many verts and triangles the
+/// lumps hold for it — neither count is stored — so a power outside this range
+/// makes every displacement after it read at the wrong offset. Measured on the
+/// depot: Portal 2's 1,181 displacements are 904 at power 2, 202 at 3 and 75 at
+/// 4, and none outside.
+pub const MIN_DISP_POWER: i32 = 2;
+pub const MAX_DISP_POWER: i32 = 4;
 
 /// Surface flags, from `public/bspflags.h`. Only the ones this reader acts on.
 pub mod surf {
@@ -373,6 +391,126 @@ pub struct BrushSide {
     pub thin: u8,
 }
 
+/// `ddispinfo_t` (`public/bspfile.h:732`), 176 bytes.
+///
+/// One per displacement. A displacement replaces the flat geometry of a
+/// **four-sided world face** with a `(2^power + 1)²` grid of vertices, each
+/// pushed off the flat quad along its own direction — which is why the base
+/// quad is not in here: it is the face's four corners, and the face is found by
+/// scanning [`Bsp::faces`] for the one whose
+/// [`disp_info`](Face::disp_info) names this record.
+///
+/// Neither the vertex count nor the triangle count is stored. Both follow from
+/// [`power`](DispInfo::power) — see [`MIN_DISP_POWER`] — and the two `start`
+/// fields index the flat [`Bsp::disp_verts`] and [`Bsp::disp_tris`] arrays,
+/// which are one run per displacement in file order.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DispInfo {
+    /// Which corner of the base quad the grid starts at — **not** a position in
+    /// the grid. The nearest of the face's four corners to this point becomes
+    /// corner 0, and the other three rotate to follow
+    /// (`CCoreDispSurface::FindSurfPointStartIndex`, `builddisp.cpp:345`).
+    pub start_position: [f32; 3],
+    /// Index into [`Bsp::disp_verts`].
+    pub disp_vert_start: i32,
+    /// Index into [`Bsp::disp_tris`].
+    pub disp_tri_start: i32,
+    pub power: i32,
+    /// **Not a tessellation level in a shipped map.** When the top bit is set —
+    /// which it is on all 1,181 of Portal 2's — the rest is a *flags* field
+    /// (`CCoreDispInfo::InitDispInfo`, `builddisp.cpp:777`), carrying
+    /// `SURF_NOPHYSICS_COLL`/`NOHULL_COLL`/`NORAY_COLL`. See
+    /// [`disp_flags`](DispInfo::disp_flags).
+    pub min_tess: i32,
+    pub smoothing_angle: f32,
+    /// `CONTENTS_*` for the whole displacement.
+    pub contents: i32,
+    /// `m_iMapFace` — VBSP's record of which face this came from.
+    ///
+    /// Measured against the depot: it agrees with the scanned mapping for all
+    /// 1,181 shipped displacements. It is still not what the engine reads —
+    /// `CollisionBSPData_LoadDispInfo` (`cmodel_bsp.cpp:1108`) builds the
+    /// inverse mapping by scanning the face lump — so this port scans too, and
+    /// this field is carried for the record rather than used.
+    pub map_face: u16,
+    /// `ddispinfo_t` is 38 bytes of fields with 4-byte alignment here; the
+    /// compiler that wrote the file put two bytes in. Named because
+    /// `bytemuck::Pod` refuses implicit padding — see [`Node::_pad`].
+    pub _pad: u16,
+    pub lightmap_alpha_start: i32,
+    pub lightmap_sample_position_start: i32,
+    /// `CDispNeighbor m_EdgeNeighbors[4]` (48 bytes) followed by
+    /// `CDispCornerNeighbors m_CornerNeighbors[4]` (40).
+    ///
+    /// Kept as bytes rather than transcribed: they are how the *renderer*
+    /// stitches a displacement's edge normals to its neighbours', nothing in
+    /// collision reads them, and decoding two nested bitfield-free-but-padded
+    /// structs to leave them unused would be transcription risk for nothing.
+    /// Reading them is still what proves the stride is 176.
+    pub _neighbors: [u8; 88],
+    /// `m_AllowedVerts` — which grid vertices may be active, given the
+    /// neighbours' powers. A rendering LOD concern; collision always uses the
+    /// full grid.
+    pub _allowed_verts: [u32; 10],
+}
+
+impl DispInfo {
+    /// How many vertices this displacement's grid has —
+    /// `NUM_DISP_POWER_VERTS` (`public/bspfile.h:54`).
+    pub fn vert_count(power: i32) -> usize {
+        let side = (1usize << power) + 1;
+        side * side
+    }
+
+    /// How many triangles it has — `NUM_DISP_POWER_TRIS`. Two per grid cell.
+    pub fn tri_count(power: i32) -> usize {
+        let cells = 1usize << power;
+        cells * cells * 2
+    }
+
+    /// The `SURF_*` bits [`min_tess`](DispInfo::min_tess) is really carrying,
+    /// or 0 when it is a genuine tessellation level.
+    ///
+    /// `if ( ( minTess & 0x80000000 ) != 0 )` (`builddisp.cpp:777`): the high
+    /// bit means "this is flags", and the flags are
+    /// [`disp_surf`](crate::engine::trace::disp_surf)'s.
+    pub fn disp_flags(&self) -> u32 {
+        match self.min_tess as u32 & 0x8000_0000 {
+            0 => 0,
+            _ => self.min_tess as u32 & !0x8000_0000,
+        }
+    }
+}
+
+/// `CDispVert` (`public/bspfile.h:691`), 20 bytes.
+///
+/// One grid vertex's displacement *from* the flat quad: a unit direction and a
+/// distance along it. The flat position it is added to is a bilinear
+/// interpolation of the base face's four corners.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DispVert {
+    pub vector: [f32; 3],
+    pub dist: f32,
+    /// The blend between the material's two textures. Collision reads it only
+    /// to pick which `$surfaceprop` a triangle reports.
+    pub alpha: f32,
+}
+
+/// `CDispTri` (`public/bspfile.h:708`), 2 bytes.
+///
+/// The per-triangle tags VBSP computed — walkable, buildable, and which
+/// surface-property slot applies. The bit values are `DISPTRI_TAG_*`, which are
+/// the same numbers as the `DISPSURF_FLAG_*` a trace reports in
+/// [`Trace::disp_flags`](crate::engine::trace::Trace::disp_flags); see
+/// [`disp_surf`](crate::engine::trace::disp_surf).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DispTri {
+    pub tags: u16,
+}
+
 /// Anything that stops a `.bsp` from being read.
 #[derive(Debug, thiserror::Error)]
 pub enum BspError {
@@ -501,6 +639,15 @@ pub struct Bsp {
     pub leaf_brushes: Vec<u16>,
     pub brushes: Vec<Brush>,
     pub brush_sides: Vec<BrushSide>,
+    /// The displacement lumps: one [`DispInfo`] per displacement, and two flat
+    /// arrays it slices with its `start` indices.
+    ///
+    /// Empty on the 77 of Portal 2's 106 maps that have no terrain, which is
+    /// not an error — `CollisionBSPData_LoadDispInfo` returns immediately when
+    /// the lump is empty (`cmodel_bsp.cpp:1051`).
+    pub disp_info: Vec<DispInfo>,
+    pub disp_verts: Vec<DispVert>,
+    pub disp_tris: Vec<DispTri>,
     /// `LUMP_LIGHTING_HDR` if the map has one, else `LUMP_LIGHTING`: the baked
     /// light samples every lit face indexes with its `light_ofs`.
     ///
@@ -689,6 +836,9 @@ impl Bsp {
             leaf_brushes: reader.records(LUMP_LEAFBRUSHES)?,
             brushes: reader.records(LUMP_BRUSHES)?,
             brush_sides: reader.records(LUMP_BRUSHSIDES)?,
+            disp_info: reader.records(LUMP_DISPINFO)?,
+            disp_verts: reader.records(LUMP_DISP_VERTS)?,
+            disp_tris: reader.records(LUMP_DISP_TRIS)?,
             path: path.clone(),
             version,
             revision,
@@ -875,6 +1025,45 @@ impl Bsp {
                     "brush side {i} names texinfo {} of {}",
                     side.tex_info,
                     self.texinfo.len()
+                )));
+            }
+        }
+
+        // The displacement lumps. The power is checked first and hardest:
+        // nothing in the file says how many verts or triangles a displacement
+        // owns, so an out-of-range power does not overrun *this* record, it
+        // silently slides every later one's slice.
+        for (i, disp) in self.disp_info.iter().enumerate() {
+            if !(MIN_DISP_POWER..=MAX_DISP_POWER).contains(&disp.power) {
+                return Err(corrupt(format!(
+                    "displacement {i} has power {}, outside {MIN_DISP_POWER}..={MAX_DISP_POWER}",
+                    disp.power
+                )));
+            }
+            let first = disp.disp_vert_start.max(0) as usize;
+            let end = first + DispInfo::vert_count(disp.power);
+            if disp.disp_vert_start < 0 || end > self.disp_verts.len() {
+                return Err(corrupt(format!(
+                    "displacement {i} names disp verts {first}..{end} of {}",
+                    self.disp_verts.len()
+                )));
+            }
+            let first = disp.disp_tri_start.max(0) as usize;
+            let end = first + DispInfo::tri_count(disp.power);
+            if disp.disp_tri_start < 0 || end > self.disp_tris.len() {
+                return Err(corrupt(format!(
+                    "displacement {i} names disp tris {first}..{end} of {}",
+                    self.disp_tris.len()
+                )));
+            }
+        }
+
+        for (i, face) in self.faces.iter().enumerate() {
+            if face.disp_info >= 0 && face.disp_info as usize >= self.disp_info.len() {
+                return Err(corrupt(format!(
+                    "face {i} names displacement {} of {}",
+                    face.disp_info,
+                    self.disp_info.len()
                 )));
             }
         }
@@ -1590,6 +1779,52 @@ mod tests {
         assert_eq!(size_of::<Leaf>(), 32, "dleaf_t version 1");
         assert_eq!(size_of::<Brush>(), 12, "dbrush_t");
         assert_eq!(size_of::<BrushSide>(), 8, "dbrushside_t");
+        // The displacement lumps are one run per displacement with no lengths
+        // in the file, so a wrong stride here is not an out-of-range read, it
+        // is every later displacement's geometry taken from somewhere else.
+        // Confirmed against the depot: all 29 maps with terrain have a
+        // `LUMP_DISPINFO` that is a whole number of 176-byte records, and every
+        // record's vert and tri starts are exactly the running totals implied
+        // by the powers before it.
+        assert_eq!(size_of::<DispInfo>(), 176, "ddispinfo_t");
+        assert_eq!(size_of::<DispVert>(), 20, "CDispVert");
+        assert_eq!(size_of::<DispTri>(), 2, "CDispTri");
+    }
+
+    /// The two counts nothing in the file records.
+    #[test]
+    fn displacement_sizes_follow_from_the_power() {
+        for (power, verts, tris) in [(2, 25, 32), (3, 81, 128), (4, 289, 512)] {
+            assert_eq!(DispInfo::vert_count(power), verts, "power {power}");
+            assert_eq!(DispInfo::tri_count(power), tris, "power {power}");
+        }
+    }
+
+    /// `minTess` is a flags field with the top bit set, not a tessellation
+    /// level — on every shipped Portal 2 displacement.
+    #[test]
+    fn min_tess_decodes_as_flags_only_when_the_top_bit_is_set() {
+        let disp = |min_tess: i32| DispInfo {
+            start_position: [0.0; 3],
+            disp_vert_start: 0,
+            disp_tri_start: 0,
+            power: 2,
+            min_tess,
+            smoothing_angle: 0.0,
+            contents: 0,
+            map_face: 0,
+            _pad: 0,
+            lightmap_alpha_start: 0,
+            lightmap_sample_position_start: 0,
+            _neighbors: [0; 88],
+            _allowed_verts: [0; 10],
+        };
+        // The three values the depot actually holds.
+        assert_eq!(disp(0x8000_0000u32 as i32).disp_flags(), 0);
+        assert_eq!(disp(0x8000_000Eu32 as i32).disp_flags(), 0xE);
+        assert_eq!(disp(0x8000_0006u32 as i32).disp_flags(), 0x6);
+        // ...and a real tessellation level carries no flags.
+        assert_eq!(disp(4).disp_flags(), 0);
     }
 
     /// The `area:9`/`flags:7` bitfield, LSB first.

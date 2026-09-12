@@ -9,7 +9,10 @@
 use glam::Vec3;
 
 use super::{CollisionBsp, Contents};
-use crate::engine::world::bsp::{Brush, BrushSide, Bsp, Leaf, Model, Node, Plane};
+use crate::engine::world::bsp::{
+    Brush, BrushSide, Bsp, DispInfo, DispTri, DispVert, Edge, Face, Leaf, Model, Node, Plane,
+    TexData, TexInfo,
+};
 
 /// Builds a collision model without a map.
 ///
@@ -26,6 +29,13 @@ pub(crate) struct Fixture {
     pub(crate) nodes: Vec<Node>,
     pub(crate) leaf_brushes: Vec<u16>,
     pub(crate) models: Vec<Model>,
+    pub(crate) vertices: Vec<[f32; 3]>,
+    pub(crate) edges: Vec<Edge>,
+    pub(crate) surfedges: Vec<i32>,
+    pub(crate) faces: Vec<Face>,
+    pub(crate) disp_info: Vec<DispInfo>,
+    pub(crate) disp_verts: Vec<DispVert>,
+    pub(crate) disp_tris: Vec<DispTri>,
 }
 
 impl Fixture {
@@ -76,6 +86,108 @@ impl Fixture {
             contents: contents.0 as i32,
         });
         self.brushes.len() as u16 - 1
+    }
+
+    /// A displacement over a four-cornered face, with a per-vertex offset.
+    ///
+    /// `corners` are given in the order the `.bsp` would hold them —
+    /// `p0 → p1 → p2 → p3` round the quad — and `start` is
+    /// `ddispinfo_t::startPosition`, the corner the grid is rotated to begin
+    /// at. `height(i, j)` is the displacement along `up` for grid position
+    /// `(i, j)`, `i` running `p0 → p1` and `j` running `p0 → p3`, so a flat
+    /// patch is `|_, _| 0.0`.
+    ///
+    /// **The winding decides which way the terrain is solid.** The triangle
+    /// normals come out along `(p3 - p0) × (p1 - p0)`, and every test in
+    /// `disp` is one-sided against that, so a quad wound the other way is
+    /// terrain you fall through.
+    pub(crate) fn add_displacement(
+        &mut self,
+        corners: [Vec3; 4],
+        start: Vec3,
+        power: i32,
+        contents: Contents,
+        flags: u32,
+        height: impl Fn(usize, usize) -> f32,
+    ) -> usize {
+        let index = self.disp_info.len();
+        let spacing = (1usize << power) + 1;
+        let up = (corners[3] - corners[0])
+            .cross(corners[1] - corners[0])
+            .normalize();
+
+        self.disp_info.push(DispInfo {
+            start_position: start.to_array(),
+            disp_vert_start: self.disp_verts.len() as i32,
+            disp_tri_start: self.disp_tris.len() as i32,
+            power,
+            // The top bit is what makes the rest read as flags at all.
+            min_tess: (0x8000_0000u32 | flags) as i32,
+            smoothing_angle: 0.0,
+            contents: contents.0 as i32,
+            map_face: self.faces.len() as u16,
+            _pad: 0,
+            lightmap_alpha_start: -1,
+            lightmap_sample_position_start: -1,
+            _neighbors: [0xFF; 88],
+            _allowed_verts: [0xFFFF_FFFF; 10],
+        });
+
+        // The grid is indexed `i * spacing + j`, and the fixture's `height` is
+        // asked in the same order, so a test can reason about one corner.
+        for i in 0..spacing {
+            for j in 0..spacing {
+                self.disp_verts.push(DispVert {
+                    vector: up.to_array(),
+                    dist: height(i, j),
+                    alpha: 0.0,
+                });
+            }
+        }
+        for _ in 0..DispInfo::tri_count(power) {
+            self.disp_tris.push(DispTri { tags: 0 });
+        }
+
+        self.add_face(corners, index as i16);
+        index
+    }
+
+    /// A four-cornered face, built out of fresh vertices, edges and surfedges.
+    fn add_face(&mut self, corners: [Vec3; 4], disp_info: i16) {
+        let first_vertex = self.vertices.len() as u16;
+        self.vertices.extend(corners.map(|v| v.to_array()));
+        // Edge 0 is never used — a negative surfedge means "this edge,
+        // backwards", and zero has no sign — so the first fixture to add a
+        // face pads it out.
+        if self.edges.is_empty() {
+            self.edges.push(Edge { v: [0, 0] });
+        }
+        let first_edge = self.surfedges.len() as i32;
+        for i in 0..4u16 {
+            self.edges.push(Edge {
+                v: [first_vertex + i, first_vertex + (i + 1) % 4],
+            });
+            self.surfedges.push(self.edges.len() as i32 - 1);
+        }
+        self.faces.push(Face {
+            plane_num: 0,
+            side: 0,
+            on_node: 1,
+            first_edge,
+            num_edges: 4,
+            tex_info: 0,
+            disp_info,
+            surface_fog_volume_id: -1,
+            styles: [255; 4],
+            light_ofs: -1,
+            area: 0.0,
+            lightmap_mins: [0, 0],
+            lightmap_size: [0, 0],
+            orig_face: -1,
+            num_prims: 0,
+            first_prim_id: 0,
+            smoothing_groups: 0,
+        });
     }
 
     /// One leaf holding every brush, under a node whose children are both
@@ -132,7 +244,7 @@ impl Fixture {
     /// Two leaves either side of `x = 0`, so the trace has a real tree to
     /// descend and a real split to make.
     pub(crate) fn split(mut self, front: &[u16], back: &[u16]) -> CollisionBsp {
-        let mut leaf = |brushes: &[u16], fixture: &mut Fixture| {
+        let leaf = |brushes: &[u16], fixture: &mut Fixture| {
             let first = fixture.leaf_brushes.len() as u16;
             fixture.leaf_brushes.extend_from_slice(brushes);
             fixture.leaves.push(Leaf {
@@ -231,7 +343,43 @@ impl Fixture {
         self.finish()
     }
 
-    pub(crate) fn finish(self) -> CollisionBsp {
+    pub(crate) fn finish(mut self) -> CollisionBsp {
+        // The displacement-to-leaf lists are pushed down model 0's subtree, so
+        // a fixture that never named a model still needs one. Node 0 is the
+        // root in every shape this builds.
+        if self.models.is_empty() {
+            self.models.push(Model {
+                mins: [-32768.0; 3],
+                maxs: [32767.0; 3],
+                origin: [0.0; 3],
+                head_node: 0,
+                first_face: 0,
+                num_faces: 0,
+            });
+        }
+        // One texinfo and texdata, so a displacement's surface resolves to a
+        // real table entry rather than the null surface.
+        let (texinfo, texdata, texdata_string_table) = match self.faces.is_empty() {
+            true => (Vec::new(), Vec::new(), Vec::new()),
+            false => (
+                vec![TexInfo {
+                    texture_vecs: [[0.0; 4]; 2],
+                    lightmap_vecs: [[0.0; 4]; 2],
+                    flags: 0,
+                    tex_data: 0,
+                }],
+                vec![TexData {
+                    reflectivity: [0.5; 3],
+                    name_string_table_id: 0,
+                    width: 64,
+                    height: 64,
+                    view_width: 64,
+                    view_height: 64,
+                }],
+                vec!["nature/test_displacement".to_owned()],
+            ),
+        };
+
         let bsp = Bsp {
             game_lumps: Vec::new(),
             leaf_ambient: Vec::new(),
@@ -241,13 +389,13 @@ impl Fixture {
             version: 21,
             revision: 0,
             entity_lump: String::new(),
-            vertices: Vec::new(),
-            edges: Vec::new(),
-            surfedges: Vec::new(),
-            faces: Vec::new(),
-            texinfo: Vec::new(),
-            texdata: Vec::new(),
-            texdata_string_table: Vec::new(),
+            vertices: self.vertices,
+            edges: self.edges,
+            surfedges: self.surfedges,
+            faces: self.faces,
+            texinfo,
+            texdata,
+            texdata_string_table,
             models: self.models,
             lighting: Vec::new(),
             lighting_is_hdr: false,
@@ -258,6 +406,9 @@ impl Fixture {
             leaf_brushes: self.leaf_brushes,
             brushes: self.brushes,
             brush_sides: self.brush_sides,
+            disp_info: self.disp_info,
+            disp_verts: self.disp_verts,
+            disp_tris: self.disp_tris,
         };
         CollisionBsp::build(&bsp)
     }

@@ -10,6 +10,7 @@
 
 use glam::{Mat3, Mat4, Vec3};
 
+use super::disp::{self, DispTree};
 use super::result::SURFACE_INDEX_INVALID;
 use super::{Contents, Ray, Surface, Tracer};
 use crate::engine::world::bsp::Bsp;
@@ -60,6 +61,15 @@ pub(super) struct CLeaf {
     pub cluster: i16,
     pub first_leaf_brush: u32,
     pub num_leaf_brushes: u32,
+    /// This leaf's slice of [`CollisionBsp::leaf_disps`] —
+    /// `cleaf_t::dispListStart`/`dispCount` (`engine/cmodel_private.h`).
+    ///
+    /// Derived, not read: nothing in the `.bsp` says which leaves a
+    /// displacement touches, so [`disp_leaf_lists`] pushes every patch's
+    /// bounding box down the tree at load. See
+    /// `portdocs/ENGINE_TRACE.md` §4.8.
+    pub first_disp: u32,
+    pub num_disps: u32,
 }
 
 /// Where a brush keeps its sides.
@@ -122,6 +132,17 @@ pub struct CollisionBsp {
     pub(super) brushes: Vec<CBrush>,
     pub(super) brush_sides: Vec<CBrushSide>,
     pub(super) box_brushes: Vec<BoxBrush>,
+    /// One AABB tree per displacement, in `LUMP_DISPINFO` order.
+    ///
+    /// A displacement whose base face is missing or is not a quad leaves a
+    /// `None` here rather than shifting the rest: the index is how a leaf list
+    /// names one, and Valve keeps the slot too (`pDispTree->SetPower( 0 )`
+    /// before the `continue`, which makes the tree exist but match nothing).
+    pub(super) disps: Vec<Option<DispTree>>,
+    /// The displacement indices each leaf's
+    /// [`first_disp`](CLeaf::first_disp) range points into —
+    /// `CCollisionBSPData::map_dispList`.
+    pub(super) leaf_disps: Vec<u16>,
     pub(super) surfaces: Vec<Surface>,
     /// The head node of each model — model 0 is the world, 1.. are the brush
     /// entities.
@@ -166,7 +187,7 @@ impl CollisionBsp {
             })
             .collect::<Vec<_>>();
 
-        let nodes = bsp
+        let nodes: Vec<CNode> = bsp
             .nodes
             .iter()
             .map(|n| CNode {
@@ -176,7 +197,7 @@ impl CollisionBsp {
             .collect();
 
         let mut all_contents = Contents::EMPTY;
-        let leaves = bsp
+        let mut leaves: Vec<CLeaf> = bsp
             .leaves
             .iter()
             .map(|l| {
@@ -187,6 +208,8 @@ impl CollisionBsp {
                     cluster: l.cluster,
                     first_leaf_brush: l.first_leaf_brush as u32,
                     num_leaf_brushes: l.num_leaf_brushes as u32,
+                    first_disp: 0,
+                    num_disps: 0,
                 }
             })
             .collect();
@@ -237,6 +260,14 @@ impl CollisionBsp {
             brushes.push(CBrush { contents, sides });
         }
 
+        // The displacements, and the per-leaf lists that find them. Both are
+        // derived rather than read: the `.bsp` has no disp-to-face mapping and
+        // no disp-to-leaf mapping, so this is the whole of
+        // `CollisionBSPData_LoadDispInfo` (`engine/cmodel_bsp.cpp:1046`) and
+        // `CM_DispTreeLeafnum` (`engine/cmodel_disp.cpp:194`).
+        let disps = build_disps(bsp);
+        let leaf_disps = disp_leaf_lists(bsp, &planes, &nodes, &disps, &mut leaves);
+
         CollisionBsp {
             planes,
             nodes,
@@ -245,6 +276,8 @@ impl CollisionBsp {
             brushes,
             brush_sides,
             box_brushes,
+            disps,
+            leaf_disps,
             surfaces,
             head_nodes: bsp.models.iter().map(|m| m.head_node).collect(),
             all_contents,
@@ -316,10 +349,35 @@ impl CollisionBsp {
         self.nodes.is_empty()
     }
 
+    /// How many displacements have collision geometry.
+    ///
+    /// Not `bsp.disp_info.len()`: a displacement whose base face is missing or
+    /// is not a quad keeps its slot and builds nothing. On the shipped game the
+    /// two are equal — all 1,181 build.
+    pub fn disp_count(&self) -> usize {
+        self.disps.iter().filter(|d| d.is_some()).count()
+    }
+
+    /// One displacement's world-space bounds, **bloated by a unit** the way
+    /// `AABBTree_CalcBounds` leaves them. `None` for a slot that built nothing.
+    ///
+    /// Its only caller today is the depot verification, which needs to know
+    /// where a patch is in order to aim at it; it is also the accessor a debug
+    /// overlay wants once `world/disp/` draws them.
+    #[allow(dead_code)]
+    pub fn disp_bounds(&self, index: usize) -> Option<(Vec3, Vec3)> {
+        let disp = self.disps.get(index)?.as_ref()?;
+        Some((disp.mins, disp.maxs))
+    }
+
     /// Counts, for `status`-style reporting.
     pub fn summary(&self) -> String {
+        let disps = match self.disps.is_empty() {
+            true => String::new(),
+            false => format!(", {} displacements", self.disp_count()),
+        };
         format!(
-            "{} brushes ({} box), {} sides, {} nodes, {} leaves, {} planes",
+            "{} brushes ({} box), {} sides, {} nodes, {} leaves, {} planes{disps}",
             self.brushes.len(),
             self.box_brushes.len(),
             self.brush_sides.len(),
@@ -365,6 +423,136 @@ fn surface_table(bsp: &Bsp) -> Vec<Surface> {
         }
     }
     surfaces
+}
+
+/// One [`DispTree`] per `LUMP_DISPINFO` record, over the face that names it.
+///
+/// `CollisionBSPData_LoadDispInfo` (`engine/cmodel_bsp.cpp:1046`). The
+/// disp-to-face direction is **scanned out of the face lump**, not read from
+/// `ddispinfo_t::m_iMapFace`, which is Valve's choice and is kept: the field
+/// agrees with the scan on all 1,181 shipped displacements, but it is VBSP's
+/// record of a *map* face and nothing in the format makes it a `LUMP_FACES`
+/// index.
+///
+/// The scan is over the same face lump `Bsp::parse` chose, which on an
+/// HDR map is `LUMP_FACES_HDR` — matching `CollisionBSPData_LoadDispInfo`'s own
+/// `GetHDRType()` branch (`:1082`). Measured: the two lumps agree on which face
+/// index each displacement belongs to for every shipped map, so this only
+/// matters for a map where they would not.
+fn build_disps(bsp: &Bsp) -> Vec<Option<DispTree>> {
+    if bsp.disp_info.is_empty() {
+        return Vec::new();
+    }
+
+    let mut face_of = vec![None; bsp.disp_info.len()];
+    for (index, face) in bsp.faces.iter().enumerate() {
+        if let Ok(disp) = usize::try_from(face.disp_info) {
+            // First wins, as Valve's `pDispIndexToFaceIndex[...] = i` does not
+            // — it overwrites. Two faces naming one displacement is malformed
+            // either way; taking the first is the stable choice.
+            if let Some(slot @ None) = face_of.get_mut(disp) {
+                *slot = Some(index);
+            }
+        }
+    }
+
+    face_of
+        .into_iter()
+        .enumerate()
+        .map(|(index, face)| {
+            let face = &bsp.faces[face?];
+            // `pDispTree->SetTexinfoFlags( map_surfaces[texdata].flags )`
+            // (`cmodel_bsp.cpp:1270`) — the displacement reports the *surface
+            // table's* flags for its material, which is what this index
+            // resolves to.
+            let surface = usize::try_from(face.tex_info)
+                .ok()
+                .and_then(|i| bsp.texinfo.get(i))
+                .and_then(|info| u16::try_from(info.tex_data).ok())
+                .unwrap_or(SURFACE_INDEX_INVALID);
+            DispTree::build(bsp, index, face, surface)
+        })
+        .collect()
+}
+
+/// Which leaves each displacement touches, inverted into one list per leaf.
+///
+/// `CDispLeafBuilder` + `CM_DispTreeLeafnum` (`engine/cmodel_disp.cpp:60`,
+/// `:194`). Each patch's (bloated) bounding box is pushed down the **world**
+/// subtree — head node of model 0, which is where displacements live, because a
+/// displacement is a world face — and every leaf it reaches records it.
+///
+/// Valve's two-pass counting exists to pack the result into one hunk
+/// allocation; the same shape survives here because the *layout* is what the
+/// trace reads, a leaf being a `(first, count)` into one flat array.
+fn disp_leaf_lists(
+    bsp: &Bsp,
+    planes: &[CPlane],
+    nodes: &[CNode],
+    disps: &[Option<DispTree>],
+    leaves: &mut [CLeaf],
+) -> Vec<u16> {
+    if disps.is_empty() || nodes.is_empty() {
+        return Vec::new();
+    }
+    let head_node = bsp.models[0].head_node;
+
+    // Per displacement, the leaves it lands in.
+    let mut per_disp: Vec<Vec<usize>> = Vec::with_capacity(disps.len());
+    for disp in disps {
+        let mut found = Vec::new();
+        if let Some(disp) = disp {
+            let mut pending = vec![head_node];
+            let mut read = 0;
+            while read < pending.len() {
+                let num = pending[read];
+                read += 1;
+                if num < 0 {
+                    found.push((-1 - num) as usize);
+                    continue;
+                }
+                let node = nodes[num as usize];
+                let plane = &planes[node.plane as usize];
+                let side = disp::box_on_plane_side(
+                    disp.mins,
+                    disp.maxs,
+                    plane.normal,
+                    plane.dist,
+                    plane.axis,
+                );
+                if side & 1 != 0 {
+                    pending.push(node.children[0]);
+                }
+                if side & 2 != 0 {
+                    pending.push(node.children[1]);
+                }
+            }
+        }
+        per_disp.push(found);
+    }
+
+    // Count per leaf, turn the counts into offsets, then fill.
+    for entries in &per_disp {
+        for &leaf in entries {
+            leaves[leaf].num_disps += 1;
+        }
+    }
+    let mut next = 0;
+    for leaf in leaves.iter_mut() {
+        leaf.first_disp = next;
+        next += leaf.num_disps;
+        leaf.num_disps = 0;
+    }
+
+    let mut list = vec![0u16; next as usize];
+    for (index, entries) in per_disp.iter().enumerate() {
+        for &leaf in entries {
+            let leaf = &mut leaves[leaf];
+            list[(leaf.first_disp + leaf.num_disps) as usize] = index as u16;
+            leaf.num_disps += 1;
+        }
+    }
+    list
 }
 
 /// `IsBoxBrush` + `ExtractBoxBrush` (`engine/cmodel_bsp.cpp:667`, `:683`) in
