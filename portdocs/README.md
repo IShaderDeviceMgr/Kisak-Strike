@@ -108,6 +108,22 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   what the shipped maps actually ask for: **105 of 106 place an `env_tonemap_controller`**,
   and none of them uses the cvar defaults this port falls back on.
 
+- [`SERVER.md`](SERVER.md) — the **game server**: the entity system. `game/server/`'s
+  447,000 lines, of which the framework — `CBaseEntity`, `CGlobalEntityList`, the
+  datadesc, entity I/O, the event queue, thinks, `MOVETYPE_PUSH` — is ~29,800 and is the
+  module; the rest is entity classes and `ai_*`. Scoped by **measuring the shipped maps
+  rather than the tree**: 106 maps place **60,925 entities of 200 classnames**, the top
+  25 of which are 79.8% of them, while the whole 122,298-line `ai_*`/`nav_*` tree serves
+  **293 `npc_*` instances of 6 classnames**. Two findings change what porting means here:
+  **41 of the 200 classnames have no source in this tree at all** (`server_portal2.vpc`
+  lists 63 `.cpp` and 59 are missing — `func_portal_bumper`, the turrets, the whole paint
+  system), and **the shipped `portal2.fgd` and its includes define 494 classes covering
+  199 of the 200**, so the interface of the deleted ones survives even though the
+  behaviour does not. Concludes the inheritance tree becomes a `&'static ClassDef` plus a
+  three-method trait, that networking and save/restore delete outright, and that **the
+  fixed server tick is the one decision to take before stage 1**. Five stages; stage 2
+  lands `env_tonemap_controller` and closes `CLIENT_TONEMAP.md`'s one measured gap.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current
