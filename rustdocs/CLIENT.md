@@ -324,9 +324,25 @@ Porting analysis: [`portdocs/CLIENT_TONEMAP.md`](../portdocs/CLIENT_TONEMAP.md).
 pub const BUCKETS: usize = 16;
 pub fn bucket_bounds() -> [f32; BUCKETS + 1];        // UpdateBucketRanges
 
+/// What the map's `env_tonemap_controller` is asking for — the thirteen
+/// file-scope globals `GetTonemapSettingsFromEnvTonemapController` writes.
+/// `Default` is Valve's no-controller fallback.
+pub struct TonemapSettings {
+    pub use_custom_auto_exposure_min: bool, pub custom_auto_exposure_min: f32,
+    pub use_custom_auto_exposure_max: bool, pub custom_auto_exposure_max: f32,
+    pub use_custom_bloom_scale: bool, pub custom_bloom_scale: f32,
+    pub custom_bloom_scale_minimum: f32,
+    pub bloom_exponent: f32, pub bloom_saturation: f32,
+    pub percent_target: f32, pub percent_bright_pixels: f32,
+    pub min_avg_lum: f32, pub rate: f32,
+}
+
 pub struct ToneMap;
 impl ToneMap {
     pub fn new(console: &mut Console<'_>) -> ToneMap;
+
+    pub fn set_settings(&mut self, settings: TonemapSettings);   // once per frame
+    pub fn settings(&self) -> &TonemapSettings;
 
     pub fn scale(&mut self) -> f32;                  // UpdateMaterialSystemTonemapScalar
     pub fn measured(&mut self, counts: &[u32], dt: f32);  // DoTonemapping
@@ -602,12 +618,17 @@ Same ordering: most likely to bite first.
     cvar resumes from where the picture actually is.
 20. **A negative `mat_force_tonemap_*` means "no override", and zero is an override.** The
     test is `>= 0.0`, so `mat_force_tonemap_percent_target 0` really does aim at 0%.
-21. **Without entities the exposure limits are the cvar defaults, and no shipped map uses
-    them.** 105 of Portal 2's 106 maps place an `env_tonemap_controller` and drive it from
-    map I/O; the commonest `SetAutoExposureMax` is 3 or 5 against this port's default of
-    2, and `sp_a1_intro1` asks for 1.5 at the spawn point. `portdocs/CLIENT_TONEMAP.md` §6
-    has the full census. `mat_autoexposure_max` from the console is the workaround until
-    `server/` exists.
+21. **The map's exposure limits win over the cvars, and `server/` is what supplies
+    them.** `ToneMap::set_settings` must be called **once per frame, before
+    `scale()`** — `Engine::render` does it, from `Server::tonemap_settings()` — because
+    a controller's values are set by map I/O and change whenever a map says so;
+    `sp_a1_intro1` changes them 0.21 seconds in, to a ceiling of 1.5 against the cvar
+    default of 2. Pass `TonemapSettings::default()` when no map is loaded: that is
+    Valve's fallback branch, and it is **not** the same as leaving the previous map's
+    values in place. A controller value of zero is ignored rather than obeyed (Valve's
+    test is `> 0.0f`), and `mat_force_tonemap_*` overrides *the map*, not the constant.
+    105 of Portal 2's 106 maps place a controller; `portdocs/CLIENT_TONEMAP.md` §6 has
+    the census and `rustdocs/SERVER.md` the entity.
 
 ## Not implemented, and why
 

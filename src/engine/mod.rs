@@ -61,6 +61,7 @@ use crate::materials::renderer::Frame;
 use crate::materials::{
     Material, MaterialCache, MaterialPreview, PostProcess, RenderContext, CLEAR_COLOR,
 };
+use crate::server::think::ServerClock;
 use crate::server::Server;
 
 use self::trace::{disp_surf, Contents, Ray};
@@ -255,6 +256,14 @@ impl<'a> Engine<'a> {
             // client no.
             CommandSpec::new("report_entities", "List the map's entities by class."),
             CommandSpec::new("ent_dump", "Usage: ent_dump <entity name / index / class>"),
+            // `ent_fire` is the only way to drive entity I/O by hand, which is
+            // what makes a module of invisible bookkeeping inspectable at all.
+            // `dumpeventqueue` is its companion (`cbase.cpp:1010`).
+            CommandSpec::new(
+                "ent_fire",
+                "Usage: ent_fire <target> [input] [value] [delay]",
+            ),
+            CommandSpec::new("dumpeventqueue", "List the pending entity I/O events."),
         ] {
             console
                 .register_command(spec)
@@ -310,7 +319,15 @@ impl<'a> Engine<'a> {
                 world: None,
                 preview,
                 client,
-                server: Server::new(),
+                // `CServerGameDLL::GetTickInterval` (`gameinterface.cpp:1015`).
+                // The rate is a constant with one definition site
+                // (`portdocs/SERVER.md` §5) and this is the only thing that
+                // overrides it.
+                server: Server::with_tick_interval(ServerClock::interval_from_tickrate(
+                    command_line
+                        .and_then(|line| line.value("-tickrate"))
+                        .and_then(|rate| rate.parse().ok()),
+                )),
                 curtime: 0.0,
             },
             input: Input::new(),
@@ -540,7 +557,7 @@ impl<'a> Engine<'a> {
             input,
             ui: console_ui,
             world: scene.world.as_ref(),
-            server: &scene.server,
+            server: &mut scene.server,
             client: &mut scene.client,
         });
 
@@ -585,6 +602,17 @@ impl<'a> Engine<'a> {
                  are not implemented yet"
             );
         }
+
+        // `CServerGameDLL::GameFrame` (`gameinterface.cpp:1383`), which
+        // `_Host_RunFrame` runs once per *server tick* rather than once per
+        // rendered frame — so this call runs zero or more of them, whatever
+        // the elapsed time bought. `portdocs/SERVER.md` §5 is why the server
+        // is quantised and the client is not.
+        //
+        // **Before `update_client`**, because Valve's order is
+        // `SV_Frame` then `CL_Move`: an entity that moved this tick has moved
+        // before the player is asked where it is standing.
+        self.scene.server.frame(seconds);
 
         // `CL_Move` (`engine/cl_main.cpp:2734`), which is
         // `_Host_RunFrame_Input`'s third step — after the client processed
@@ -695,8 +723,17 @@ impl<'a> Engine<'a> {
             world,
             preview,
             client,
+            server,
             ..
         } = &mut self.scene;
+
+        // `GetTonemapSettingsFromEnvTonemapController`
+        // (`c_env_tonemap_controller.cpp:97`), which a running game calls once
+        // per frame before the exposure is computed — and so must this, because
+        // a controller's values are set by map I/O and can change on any tick.
+        // With no map, or a map that places no controller, this is Valve's
+        // no-controller fallback rather than the previous map's values.
+        client.tonemap_mut().set_settings(server.tonemap_settings());
 
         // **Unconditionally, and before anything branches.** This is what
         // drains the readback slots, so skipping it on a frame that draws
@@ -927,7 +964,7 @@ struct EngineCommands<'e> {
     world: Option<&'e World>,
     /// The entity list, for `report_entities` and `ent_dump`. Shared, like
     /// [`world`](EngineCommands::world): neither command changes anything.
-    server: &'e Server,
+    server: &'e mut Server,
 }
 
 /// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
@@ -957,6 +994,24 @@ fn tonemap_command(client: &Client, cx: &mut ExecContext<'_>) {
             true => "",
             false => " (mat_dynamic_tonemapping 0)",
         }
+    ));
+
+    // What the map's `env_tonemap_controller` is asking for, and which of the
+    // limits above came from it rather than from a cvar. 105 of the game's 106
+    // maps place one, so "none" here means either no map is loaded or
+    // `logic_auto`'s 0.2-second bootstrap has not run yet.
+    let settings = tonemap.settings();
+    let source = |custom: bool| match custom {
+        true => "map",
+        false => "cvar",
+    };
+    cx.print(&format!(
+        "map: min from {}, max from {}, rate {:.2}, target {:.0}% of the top {:.0}%",
+        source(settings.use_custom_auto_exposure_min),
+        source(settings.use_custom_auto_exposure_max),
+        settings.rate,
+        settings.percent_target,
+        settings.percent_bright_pixels,
     ));
 
     let Some((actual, wanted)) = tonemap.bright_end() else {
@@ -1250,6 +1305,8 @@ impl CommandTarget for EngineCommands<'_> {
             "trace" => trace_command(self.world, self.client, cmd, cx),
             "report_entities" => self.server.report_entities(cx),
             "ent_dump" => self.server.ent_dump(cmd, cx),
+            "ent_fire" => self.server.ent_fire(cmd, cx),
+            "dumpeventqueue" => self.server.dump_event_queue(cx),
             "tonemap" => tonemap_command(self.client, cx),
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
@@ -1548,7 +1605,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -1567,7 +1624,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert!(
@@ -1584,7 +1641,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert_eq!(client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove, 0.0);
@@ -1617,7 +1674,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1631,7 +1688,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert!(ui.is_open(), "the console key opened the console");
@@ -1647,7 +1704,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1695,7 +1752,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
 
@@ -1785,7 +1842,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         sensitivity.set_string("6");
@@ -1795,7 +1852,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
 
@@ -1822,7 +1879,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
 
@@ -1861,7 +1918,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
 
@@ -1889,7 +1946,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
-            server: &Server::new(),
+            server: &mut Server::new(),
             client: &mut client,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());

@@ -58,21 +58,24 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 718 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 772 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
 `cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
 draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
 `egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
-list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), and
+list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), the
+entity commands (`report_entities`, `ent_dump`, `ent_fire`, `dumpeventqueue`), and
 every cvar and command the port has registered. **There is now a player who walks.** A real one, in
 `MOVETYPE_WALK`, built from a `CUserCmd` and moved by `FullWalkMove`: it falls under
 gravity, stands on the floor, is stopped by walls and slides along them, climbs stairs
 under `sv_stepsize`, jumps 45 units, and crouches under things it does not fit past.
-`noclip` still flies. It is **still not a runnable game** — no simulation of anything but
-the player, no entities, no sound, no netcode — but the boot path is continuous from
-`main` to a rendered, lit level you can walk around.
+`noclip` still flies. **The map's entity logic now runs**: entities spawn, fire outputs
+at each other through one event queue and think on a fixed 64 Hz server tick, so a map
+bootstraps itself the way the shipped game does. It is **still not a runnable game** —
+nothing moves but the player, no triggers, no sound, no netcode — but the boot path is
+continuous from `main` to a rendered, lit, self-starting level you can walk around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -98,9 +101,9 @@ entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces 
 triangles, each under the placement its entity gives it. **The scene is auto-exposed**: it is drawn into an
 offscreen target, a compute pass bins its pixels by luminance, and a port of
 `CTonemapSystem` picks the scalar the lit shaders multiply by — `tonemap` in the console
-reports what it is doing. What is missing is the map's *own* exposure limits, which come
-from an `env_tonemap_controller` and need entities: 105 of the game's 106 maps place one,
-and `sp_a1_intro1` asks for a ceiling of 1.5 where the cvar default is 2.
+reports what it is doing. **The map's own exposure limits apply too**, now that entities run: 105 of the game's
+106 maps place an `env_tonemap_controller`, and `sp_a1_intro1` asks for — and gets — a
+ceiling of 1.5 where the cvar default is 2.
 The view is the **player's eye**: WASD to walk, space to jump, left control to
 crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
 `noclip` toggles a real `MOVETYPE_NOCLIP` rather than a camera pretending to be one — so
@@ -540,10 +543,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   resetting it to 1. Deleted rather than deferred: `mat_tonemap_algorithm 0` (selected by
   a game-directory match against `{dod, cstrike, lostcoast}`, so unreachable),
   `SetOverrideTonemapScale`, and `DisplayHistogram`'s 200-line bar chart — the `tonemap`
-  console command prints the same numbers. **Not ported and measured:**
-  `env_tonemap_controller`, which needs entities — **105 of Portal 2's 106 maps place
-  one** and drive it from map I/O, the commonest `SetAutoExposureMax` is 3 or 5 against
-  this port's default of 2, and `sp_a1_intro1` asks for 1.5 at its spawn.
+  console command prints the same numbers. **`env_tonemap_controller` was its one
+  measured gap and `server/` stage 2 closed it**: the thirteen file-scope globals
+  `GetTonemapSettingsFromEnvTonemapController` writes became
+  `client::tonemap::TonemapSettings`, which the server fills in and `Engine::render`
+  hands over once a frame — 105 of Portal 2's 106 maps place a controller, and
+  `sp_a1_intro1` now gets the ceiling of 1.5 it asks for. **One Valve bug deliberately
+  not reproduced**: the no-controller fallback resets every custom flag *except*
+  `g_bUseCustomAutoExposureMin`, so a custom minimum is sticky for the rest of the level;
+  `TonemapSettings::default` resets all of them.
 - **`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported**, and with them
   **static props draw, lit the way the shipped game lights them**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
   buffer, one index buffer, per-material `Batch`es. The instances are
@@ -586,22 +594,23 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
-- **`src/server/` — stage 1 of `portdocs/SERVER.md`'s five ported**, and with it the map's
-  **entity list exists**. Valve's `server.so` — 446,861 lines, of which the framework is
+- **`src/server/` — stages 1 and 2 of `portdocs/SERVER.md`'s five ported**, and with them
+  the map's **entity logic runs**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
   `SortSpawnListByHierarchy`, then `Spawn` and `Activate` over the whole list — with
   `UTIL_Remove`'s deferred deletion under it. `EntityId` is `CBaseHandle` as a generational
-  index. `report_entities` and `ent_dump` report the result. **API: `rustdocs/SERVER.md`**
-  — read it before calling in.
+  index. **API: `rustdocs/SERVER.md`** — read it before calling in.
   Scoped by **measuring the shipped maps rather than the tree**: 106 maps place
   **60,925 entities of exactly 200 classnames**, the top 25 of which are 79.8% of them,
   while the whole 122,298-line `ai_*`/`nav_*` tree serves **293 `npc_*` instances of 6
-  classnames**. Ten classnames are implemented and they cover **17,069 of the 60,925
+  classnames**. Sixteen classnames are implemented and they cover **19,229 of the 60,925
   blocks**: `logic_relay` (8,082, the commonest entity in the game), the light family
-  (7,150), `func_instance_io_proxy` (1,184), `info_target`, `info_player_start` and
-  `worldspawn`. `sp_a1_intro1` spawns 127 entities from 598 blocks.
+  (7,150), `func_instance_io_proxy` (1,184), `logic_auto` (1,112), `logic_branch` (601),
+  `info_target`, `logic_timer`, `info_player_start`, `env_tonemap_controller`,
+  `worldspawn`, `math_counter` and `logic_case`. `sp_a1_intro1` spawns 163 entities from
+  598 blocks.
   The one piece of stage-1 *behaviour* is `CLight::Spawn`, and it is load-bearing:
   **an unnamed light deletes itself**, which is 6,937 of the game's 7,150, because `vrad`
   has already baked its whole contribution — a port that skipped that one `if` would carry
@@ -619,18 +628,67 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   names nothing consumes. **`names_match`'s `*` does not have to be trailing** whatever
   `baseentity.cpp`'s comment says — `"*door"` matches everything — though all 234 wildcard
   targets in the shipped maps are plain trailing ones. And **"unhandled key" is not
-  "unimplemented"**: of the 28 key names in the whole game that nothing consumes, 17 are
+  "unimplemented"**: of the 29 key names in the whole game that nothing consumes, 17 are
   the *map compiler's* (`_light`, `_quadratic_attn` and the falloff family are `vrad`'s and
-  have no run-time consumer in Valve's engine either) and 4 are mapper mistakes shipped in
+  have no run-time consumer in Valve's engine either) and 6 are mapper mistakes shipped in
   the game.
-  **The module names no GPU type** — not `wgpu`, not `materials`, not `studio` — so all 28
+  **The module names no GPU type** — not `wgpu`, not `materials`, not `studio` — so all 78
   of its unit tests run without a window, the way `host/`, `trace/` and `input/` do. An
   entity holds a model *name*.
-  Not implemented, and each is a stage: entity I/O and the event queue, `AcceptInput`,
-  thinks, movement, touch. **The one decision to take before stage 2 is the fixed server
-  tick** (`portdocs/SERVER.md` §5): Source quantises every `SetNextThink` to ticks and this
-  port's frame is variable-dt, and the tree's `DEFAULT_TICK_INTERVAL_PC` of 1/64 is CS:GO's
-  number.
+
+  **Stage 2 is entity I/O, the event queue and thinks, and it is what makes a map do
+  anything.** `CEventAction`/`CBaseEntityOutput`/`CEventQueue`, `AcceptInput` with
+  `variant_t`'s coercion table, the think schedule and the `SimThink` list, the frame
+  order from `CServerGameDLL::GameFrame`, six more classes, and `ent_fire`/`dumpeventqueue`
+  beside the two stage-1 commands. **The visible outcome is the exposure**:
+  `sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default of 2, through
+  `logic_relay`'s `OnSpawn` → two exposure relays → `env_tonemap_controller`, and now gets
+  it. Measured over the depot: **two seconds of server time on each of the 106 maps is
+  5,763 events dispatched, 2,070 inputs accepted and 1,197 thinks**, with zero values
+  that would not convert and a peak of 43 entities thinking at once.
+
+  **The tick decision (`portdocs/SERVER.md` §5) is taken: the server is fixed-tick and the
+  client is not.** `ServerClock` accumulates the rendered frame's time and runs zero or
+  more 1/64 s ticks inside it; the client keeps moving the player on the rendered frame,
+  which is Valve's own split. It is forced rather than chosen — `SetNextThink` quantises
+  to ticks, so a schedule built on a variable `dt` is a different schedule at every frame
+  rate. **The rate is one constant and is still unverified**: 1/64 is
+  `DEFAULT_TICK_INTERVAL_PC`, which is CS:GO's number, and Portal 2's real
+  `interval_per_tick` is not in the tree, the maps, or the depot, which ships only
+  `vbsp`/`vvis`/`vrad`. `-tickrate` overrides it, quantised to `N/512` and clamped to
+  20.48–128 Hz as `GetTickInterval` does.
+
+  Seven rules here produce a plausible wrong answer rather than an error, and the first
+  two are the ones that decide whether a map runs at all. **The server's `curtime` is not
+  `Scene::curtime`** — the server's is `tick * interval` and moves in steps, the scene's
+  is the accumulated wall clock. **`SetNextThink` rounds to the nearest tick and a think
+  tick of zero never runs**, so `curtime + 0.01` is next tick at 64 Hz and *never* at
+  30 Hz — and `logic_auto`'s 0.2-second bootstrap, which every map in the game starts
+  through, lives on that edge. **The event queue restarts from the head after every
+  event**, so a chain of eight zero-delay relays completes in one tick and not eight; get
+  it wrong and every map runs its logic in slow motion. **An output's connections fire in
+  *reverse* lump order**, because `AddEventAction` prepends. **A `variant_t` accessor
+  returns zero unless the value already is that type**, so a handler is only safe because
+  `AcceptInput` converted against the type `ClassDef::inputs` declared — a wrong
+  declaration there is a silent zero, not a compile error. **The think schedule is
+  cleared before the think runs**, so anything recurring re-arms on the way out. And
+  **a per-action parameter override silently discards the caller's extra delay**, which
+  is Valve's bug at `cbase.cpp:280` against `:289` and is reproduced.
+
+  Two findings worth carrying to stage 3. **`SERVER.md` §10.3's borrow risk is not one**:
+  `FireOutput` appends to the queue rather than calling the target, so nothing in the
+  subsystem is re-entrant and a behaviour's `Context` does not hold the entity list at
+  all — the condition that changes that is `logic_branch_listener`, the first class in
+  the game that must read *another* entity during dispatch. And **`CUniformRandomStream`
+  was ported rather than replaced by a crate**, one of the few places `PORTING.md`'s
+  "prefer the crate" rule points the other way: `ran1`'s rejection sampling and its lossy
+  seed convention (0, 1 and -1 are one stream) are behaviour a dependency would silently
+  replace, and `logic_case` is what would change.
+
+  Not implemented, and each is a stage: movement and `MOVETYPE_PUSH` (3), touch and
+  triggers (4), the player as an entity (5). The size of that last prize is measured:
+  **171 of the 186 inputs in the whole game that reach an implemented class and are
+  refused are `!player`, `!player_blue` and `!player_orange`.**
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -653,17 +711,22 @@ second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it**, the level shell
 is geometrically complete — world, brush entities, static props and terrain — it is
-**auto-exposed**, and the map's **entity list now exists** though nothing runs it yet.
+**auto-exposed to the map's own limits**, and the map's **entity logic runs**.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 The candidates, in the order they are worth doing:
 
-- **`server/` stage 2 — entity I/O, the event queue and thinks.** The biggest single
-  return in the list, and the only candidate that makes the *shipped picture* change
-  without a line of rendering code: `env_tonemap_controller` lands with it, and
-  `sp_a1_intro1` asks for an exposure ceiling of 1.5 against the cvar default of 2
-  through a chain of `logic_auto` → `logic_relay` → controller that stage 2 makes run.
-  105 of the game's 106 maps place one, and four of its inputs are among the twelve
-  commonest in the entire game. Take `portdocs/SERVER.md` §5's tick decision first.
+- **`server/` stage 3 — brush entities move.** `MOVETYPE_PUSH`,
+  `LinearMove`/`AngularMove` and the `SetMoveDoneTime` alarm, plus making
+  `BrushModel`'s placement mutable and taking it from the entity. The first time
+  anything in the level moves, and everything it needs is now in place: `world/` draws
+  the 26 brush entities in `sp_a1_intro1`, `trace/` stage 2 collides with them, and
+  stage 2's event queue is what tells them to open. **`func_door_rotating` outnumbers
+  `func_door` 346 to 275**, so do `AngularMove` first. Deliberately *not* in it:
+  pushing the player, which is `CPhysicsPushedEntities`' ~1,000 lines of speculative
+  push and rollback and wants `trace/` stage 4 underneath it.
+- **`server/` stage 4 — triggers and touch**, which is the first time the map responds
+  to the player. It is built alongside `trace/` stage 4 (entities in the clip chain),
+  which is the reciprocal dependency and has been blocked on this module since stage 1.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale.

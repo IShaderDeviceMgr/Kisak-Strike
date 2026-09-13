@@ -43,13 +43,17 @@
 //!   unreachable, and it computes a different target from a different histogram
 //!   (`0.005 / averageLuminance`) with a different bucket count. The cvar is not
 //!   registered either: one that cannot change anything is worse than none.
-//! - **`env_tonemap_controller`**. A map's own exposure limits, rate and
-//!   percentage targets arrive over the wire from a server entity
-//!   (`c_env_tonemap_controller.cpp:97`), and there are no entities. The
-//!   constants here are the *no-controller* fallback that same function
-//!   installs — note that its `g_flTonemapPercentTarget` is **65**, where the
-//!   file-scope initialiser twenty lines away says 60. 65 is what a running
-//!   game uses before a controller says otherwise.
+//! - ~~**`env_tonemap_controller`**~~ — **it has landed**, as
+//!   [`TonemapSettings`]. A map's own exposure limits, rate and percentage
+//!   targets reach the client in Valve's engine over the wire from a server
+//!   entity → `localPlayer->m_hTonemapController` →
+//!   `GetTonemapSettingsFromEnvTonemapController` → thirteen file-scope
+//!   globals in `viewpostprocess.cpp`. In one process that whole path is a
+//!   struct, which is what this is. [`TonemapSettings::default`] is the
+//!   *no-controller* fallback that same function installs — note that its
+//!   `g_flTonemapPercentTarget` is **65**, where the file-scope initialiser
+//!   twenty lines away says 60. 65 is what a running game uses before a
+//!   controller says otherwise.
 //! - **`SetOverrideTonemapScale`**, which VScript and the commentary system
 //!   call. Nothing in this port can reach it, and `mat_force_tonemap_scale`
 //!   covers the same ground from the console.
@@ -143,9 +147,86 @@ struct Cvars {
     mat_force_tonemap_min_avglum: Cvar,
 }
 
+/// What the map's `env_tonemap_controller` is asking for.
+///
+/// The thirteen file-scope globals `GetTonemapSettingsFromEnvTonemapController`
+/// (`c_env_tonemap_controller.cpp:97`) writes every frame, as one value. In
+/// Valve's engine they arrive by `SendTable` from a server entity; here the
+/// server hands this over directly, because there is one process
+/// (`portdocs/SERVER.md` §6).
+///
+/// # This type lives on the client on purpose
+///
+/// It is the tone mapper's *input*, and the tone mapper is its only consumer;
+/// `src/server/classes/env.rs` fills one in and names this type to do it. The
+/// alternative — defining it in `server/` and having the client import it —
+/// would make the client depend on a server, which is backwards for a value
+/// whose default is what you get when there is no server entity at all.
+///
+/// # The defaults are the no-controller fallback, including the bug that is not
+///
+/// Valve's fallback resets `g_bUseCustomAutoExposureMax` and
+/// `g_bUseCustomBloomScale` but **not** `g_bUseCustomAutoExposureMin`, so once
+/// any controller has set a custom minimum it is sticky for the rest of the
+/// level even after the controller is gone. `portdocs/SERVER.md` §7.4 flags it
+/// as a bug not to reproduce, and [`Default`] does not: every field resets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TonemapSettings {
+    /// `g_bUseCustomAutoExposureMin` and `g_flCustomAutoExposureMin`.
+    pub use_custom_auto_exposure_min: bool,
+    pub custom_auto_exposure_min: f32,
+    /// `g_bUseCustomAutoExposureMax` and `g_flCustomAutoExposureMax`.
+    pub use_custom_auto_exposure_max: bool,
+    pub custom_auto_exposure_max: f32,
+    /// `g_bUseCustomBloomScale`, `g_flCustomBloomScale` and
+    /// `g_flCustomBloomScaleMinimum`. **Carried and not used**: there is no
+    /// bloom pass yet (`portdocs/CLIENT_TONEMAP.md` §7 ranks it next), and 462
+    /// shipped connections set it, so dropping the values would mean
+    /// re-deriving them when bloom lands.
+    pub use_custom_bloom_scale: bool,
+    pub custom_bloom_scale: f32,
+    pub custom_bloom_scale_minimum: f32,
+    /// `g_flBloomExponent`/`g_flBloomSaturation`. Also carried, also unused.
+    pub bloom_exponent: f32,
+    pub bloom_saturation: f32,
+    /// `g_flTonemapPercentTarget` — where the bright end of the picture should
+    /// sit, as a percentage of the luminance range.
+    pub percent_target: f32,
+    /// `g_flTonemapPercentBrightPixels`.
+    pub percent_bright_pixels: f32,
+    /// `g_flTonemapMinAvgLum`.
+    pub min_avg_lum: f32,
+    /// `g_flTonemapRate` — how fast the current scale chases the target, per
+    /// second. **Zero means instantaneous**, and only a controller can set it.
+    pub rate: f32,
+}
+
+impl Default for TonemapSettings {
+    fn default() -> TonemapSettings {
+        TonemapSettings {
+            use_custom_auto_exposure_min: false,
+            custom_auto_exposure_min: 0.0,
+            use_custom_auto_exposure_max: false,
+            custom_auto_exposure_max: 0.0,
+            use_custom_bloom_scale: false,
+            custom_bloom_scale: 0.0,
+            custom_bloom_scale_minimum: 0.0,
+            bloom_exponent: 2.5,
+            bloom_saturation: 1.0,
+            percent_target: TONEMAP_PERCENT_TARGET,
+            percent_bright_pixels: TONEMAP_PERCENT_BRIGHT_PIXELS,
+            min_avg_lum: TONEMAP_MIN_AVG_LUM,
+            rate: TONEMAP_RATE,
+        }
+    }
+}
+
 /// The exposure controller.
 pub struct ToneMap {
     cvars: Cvars,
+    /// What the map asked for, or [`TonemapSettings::default`] if no map has.
+    /// See [`ToneMap::set_settings`].
+    settings: TonemapSettings,
     /// `m_flCurrentTonemapScale` — what the shaders are multiplying by now.
     current: f32,
     /// `m_flTargetTonemapScale` — what they are heading towards.
@@ -246,6 +327,7 @@ impl ToneMap {
         };
         ToneMap {
             cvars,
+            settings: TonemapSettings::default(),
             current: 1.0,
             target: 1.0,
             average: [1.0; MOVING_AVERAGE],
@@ -253,6 +335,24 @@ impl ToneMap {
             histogram: [0; BUCKETS],
             measured: false,
         }
+    }
+
+    /// Installs what the map's master `env_tonemap_controller` is asking for.
+    ///
+    /// `GetTonemapSettingsFromEnvTonemapController` runs **once per frame**
+    /// before the exposure is computed, and so should this: a controller's
+    /// values can change at any moment because they are set by map I/O, and
+    /// `sp_a1_intro1` changes them 0.21 seconds into the level. Pass
+    /// [`TonemapSettings::default`] when no map is loaded or the map places no
+    /// controller — that is Valve's fallback branch, and it is not the same as
+    /// leaving the previous map's values in place.
+    pub fn set_settings(&mut self, settings: TonemapSettings) {
+        self.settings = settings;
+    }
+
+    /// What the map is currently asking for.
+    pub fn settings(&self) -> &TonemapSettings {
+        &self.settings
     }
 
     /// What the material system should multiply lit output by this frame:
@@ -341,18 +441,22 @@ impl ToneMap {
     }
 
     /// `ComputeTargetTonemapScalar( false )` (`viewpostprocess.cpp:889`).
+    ///
+    /// Each of the three percentages is `mat_force_tonemap_*` if that cvar is
+    /// non-negative, and **the map's controller otherwise** — the cvar is an
+    /// override of the map, not of the default.
     fn target_scale(&self) -> f32 {
         let percent_target = force_or(
             &self.cvars.mat_force_tonemap_percent_target,
-            TONEMAP_PERCENT_TARGET,
+            self.settings.percent_target,
         );
         let percent_bright = force_or(
             &self.cvars.mat_force_tonemap_percent_bright_pixels,
-            TONEMAP_PERCENT_BRIGHT_PIXELS,
+            self.settings.percent_bright_pixels,
         );
         let min_avg_lum = force_or(
             &self.cvars.mat_force_tonemap_min_avglum,
-            TONEMAP_MIN_AVG_LUM,
+            self.settings.min_avg_lum,
         );
 
         let mut location = self.percentile(percent_bright, Some(percent_target));
@@ -471,12 +575,12 @@ impl ToneMap {
             self.set_target(target);
         }
 
-        let mut rate = TONEMAP_RATE * TONEMAP_RATE_SCALE;
+        let mut rate = self.settings.rate * TONEMAP_RATE_SCALE;
         if rate == 0.0 {
             // Zero is documented as "instantaneous", and only an
-            // `env_tonemap_controller` can set it. Unreachable today, kept
-            // because the branch is what makes a rate of zero mean that rather
-            // than mean "never move".
+            // `env_tonemap_controller` can set it — which one now can, so this
+            // branch is reachable. `SetTonemapRate 0` is what a map uses to
+            // snap the exposure rather than ease it.
             self.current = self.target;
             return;
         }
@@ -526,12 +630,32 @@ impl ToneMap {
         }
     }
 
-    /// `GetExposureRange` (`viewpostprocess.cpp:988`), minus the
-    /// `env_tonemap_controller` overrides, which need entities.
+    /// `GetExposureRange` (`viewpostprocess.cpp:988`).
+    ///
+    /// The map's controller wins over the cvar, but **only if its value is
+    /// greater than zero** — Valve tests `g_bUseCustomAutoExposureMin &&
+    /// g_flCustomAutoExposureMin > 0.0f`, so a controller that sets a
+    /// ceiling of 0 is ignored rather than blacking the screen out.
+    ///
+    /// `mat_autoexposure_max_multiplier` is applied *after* the choice, so it
+    /// scales the map's ceiling as well as the cvar's.
     pub fn exposure_range(&self) -> (f32, f32) {
-        let mut min = self.cvars.mat_autoexposure_min.float();
-        let mut max = self.cvars.mat_autoexposure_max.float()
-            * self.cvars.mat_autoexposure_max_multiplier.float();
+        let settings = &self.settings;
+
+        let mut min = match settings.use_custom_auto_exposure_min
+            && settings.custom_auto_exposure_min > 0.0
+        {
+            true => settings.custom_auto_exposure_min,
+            false => self.cvars.mat_autoexposure_min.float(),
+        };
+        let mut max = match settings.use_custom_auto_exposure_max
+            && settings.custom_auto_exposure_max > 0.0
+        {
+            true => settings.custom_auto_exposure_max,
+            false => self.cvars.mat_autoexposure_max.float(),
+        };
+        max *= self.cvars.mat_autoexposure_max_multiplier.float();
+
         if self.cvars.mat_hdr_uncapexposure.bool() {
             min = 0.0;
             max = 100.0;
@@ -573,11 +697,11 @@ impl ToneMap {
     pub fn bright_end(&self) -> Option<(f32, f32)> {
         let wanted = force_or(
             &self.cvars.mat_force_tonemap_percent_target,
-            TONEMAP_PERCENT_TARGET,
+            self.settings.percent_target,
         ) / 100.0;
         let percent_bright = force_or(
             &self.cvars.mat_force_tonemap_percent_bright_pixels,
-            TONEMAP_PERCENT_BRIGHT_PIXELS,
+            self.settings.percent_bright_pixels,
         );
         // No `snap`: the sticky bin would report the picture as exactly on
         // target whenever it is within a bucket of it, which is the one thing a
@@ -949,5 +1073,72 @@ mod tests {
             ),
             0.0
         );
+    }
+
+    /// The client half of the `env_tonemap_controller` join: what the server
+    /// hands over wins over the cvar. This is `sp_a1_intro1`'s own numbers.
+    #[test]
+    fn a_maps_exposure_limits_win_over_the_cvars() {
+        let mut map = tonemap();
+        // The cvar defaults, with no controller.
+        assert_eq!(map.exposure_range(), (0.5, 2.0));
+
+        map.set_settings(TonemapSettings {
+            use_custom_auto_exposure_min: true,
+            custom_auto_exposure_min: 1.0,
+            use_custom_auto_exposure_max: true,
+            custom_auto_exposure_max: 1.5,
+            rate: 0.25,
+            ..TonemapSettings::default()
+        });
+        assert_eq!(map.exposure_range(), (1.0, 1.5));
+
+        // …and a controller that asks for zero is ignored rather than
+        // blacking the screen out: Valve's test is `> 0.0f`.
+        map.set_settings(TonemapSettings {
+            use_custom_auto_exposure_max: true,
+            custom_auto_exposure_max: 0.0,
+            ..TonemapSettings::default()
+        });
+        assert_eq!(map.exposure_range(), (0.5, 2.0));
+    }
+
+    /// `SetTonemapRate 0` is documented as instantaneous, and only a map can
+    /// set it — so this branch became reachable at `server/` stage 2.
+    #[test]
+    fn a_tonemap_rate_of_zero_snaps_the_exposure() {
+        let mut map = tonemap();
+        map.set_settings(TonemapSettings {
+            rate: 0.0,
+            ..TonemapSettings::default()
+        });
+        // A frame that is far too bright: the whole picture in the top bucket.
+        map.measured(&only(BUCKETS - 1, 1000), 1.0 / 60.0);
+        assert_eq!(
+            map.current(),
+            map.target(),
+            "a rate of zero means this frame, not never"
+        );
+    }
+
+    /// The percentages the controller supplies are what the *default* is, and
+    /// `mat_force_tonemap_*` overrides the map rather than the constant.
+    #[test]
+    fn a_maps_percentages_are_the_default_the_force_cvars_override() {
+        let mut console = console();
+        let mut map = ToneMap::new(&mut console);
+        map.set_settings(TonemapSettings {
+            percent_target: 40.0,
+            ..TonemapSettings::default()
+        });
+        map.measured(&only(BUCKETS / 2, 1000), 1.0 / 60.0);
+        assert_eq!(map.bright_end().expect("measured").1, 0.4);
+
+        console
+            .cvars()
+            .find("mat_force_tonemap_percent_target")
+            .expect("registered")
+            .set_float(80.0);
+        assert_eq!(map.bright_end().expect("measured").1, 0.8);
     }
 }

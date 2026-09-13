@@ -2,15 +2,15 @@
 //!
 //! Valve's `server.so` — `game/server/` — reduced to the framework
 //! `portdocs/SERVER.md` §1.1 identifies: the entity list, the class table, the
-//! keyvalue parse, and the three-pass spawn. It is a sibling of
-//! [`crate::client`] and [`crate::engine`] because `server.so` was a sibling of
-//! `client.so` and `engine.so`.
+//! keyvalue parse, the three-pass spawn, entity I/O, the event queue and
+//! thinks. It is a sibling of [`crate::client`] and [`crate::engine`] because
+//! `server.so` was a sibling of `client.so` and `engine.so`.
 //!
-//! Stage 1 of five. What exists: entities are created from the map's entity
-//! lump, their keys are parsed, they are spawned in hierarchy order and
-//! activated, and what the port did not understand is counted rather than
-//! dropped. What does not: entity I/O and the event queue (stage 2), thinks
-//! (stage 2), movement (stage 3), touch (stage 4).
+//! Stage 2 of five. What exists: entities are created from the map's entity
+//! lump, spawned in hierarchy order and activated; they fire outputs at each
+//! other through one queue; they think on a fixed tick. What does not:
+//! movement (stage 3), touch and triggers (stage 4), the player as an entity
+//! (stage 5).
 //!
 //! # This module names no GPU type
 //!
@@ -21,11 +21,12 @@
 //! [`crate::engine::input`] already do — and it is much easier to hold from
 //! the start than to recover later.
 //!
-//! The one type it does name from outside is [`bsp::Entity`], the parsed entity
-//! lump. That is Valve's shape too: `CServerGameDLL::LevelInit( pMapName,
-//! pMapEntities, ... )` is handed the lump by the engine, because the engine is
-//! what read the `.bsp`. Re-parsing it here would be the duplication
-//! `PORTING.md` warns about.
+//! Two types it names from outside, and both are deliberate. [`bsp::Entity`]
+//! is the parsed entity lump, which is Valve's shape too:
+//! `CServerGameDLL::LevelInit( pMapName, pMapEntities, ... )` is handed the
+//! lump by the engine, because the engine is what read the `.bsp`. And
+//! [`TonemapSettings`](crate::client::tonemap::TonemapSettings) is what
+//! `env_tonemap_controller` produces — see [`Server::tonemap_settings`].
 //!
 //! # The load
 //!
@@ -40,39 +41,94 @@
 //!                   SetupParentsForSpawnList    resolve parentname
 //!                   Spawn pass                  then Activate pass
 //!                   CleanupDeleteList           free what Spawn removed
+//!                   LevelInitPostEntity         pick the master tone mapper
 //! ```
+//!
+//! # The frame
+//!
+//! ```text
+//! Engine::frame -> Server::frame( frame_time )
+//!                   ServerClock::accumulate -> 0..n fixed ticks
+//!                   for each tick:
+//!                     CleanupDeleteList         anything removed outside the loop
+//!                     Physics_RunThinkFunctions the due thinks, in entity order
+//!                     ServiceEventQueue         everything due, restart-from-head
+//!                     CleanupDeleteList         anything a think removed
+//! ```
+//!
+//! That is `CServerGameDLL::GameFrame` (`gameinterface.cpp:1383`) with the
+//! CS:GO, Steam, nav-mesh and benchmarking steps removed. **The order is
+//! observable and maps depend on it**: an output fired during a think is
+//! dispatched later in the *same* tick, but an input handler cannot see a
+//! think that has not run yet.
 
 pub mod class;
 pub mod classes;
 pub mod entity;
+pub mod io;
 pub mod keyvalue;
 pub mod name;
+pub mod random;
+pub mod think;
 
 use std::collections::BTreeMap;
 
+use crate::client::tonemap::TonemapSettings;
 use crate::engine::console::{Command, ExecContext};
 use crate::engine::world::bsp;
 
-use class::SpawnResult;
-use entity::{Entity, EntityId, EntityList};
+use class::{base_accept_input, Behaviour, Context, SpawnResult};
+use entity::{Entity, EntityCore, EntityId, EntityList};
+use io::{Event, EventQueue, FieldType, Input, IoStats, Target, Variant};
+use name::Procedural;
+use random::RandomStream;
+use think::{ServerClock, ThinkList};
 
-/// The server. `CServerGameDLL` plus `gEntList`.
+/// The seed the level's random stream starts from.
+///
+/// Valve seeds once at host startup from the wall clock
+/// (`engine/host.cpp:5626`), so its `logic_case` picks differ between runs.
+/// This port seeds per level from a constant, which makes a map's behaviour
+/// reproducible — and reproducibility is worth more here than variety: it is
+/// what lets the depot test assert exact totals over a hundred and six maps
+/// that contain random pickers. `-randomseed` would be the switch if variety
+/// is ever wanted.
+const LEVEL_RANDOM_SEED: i32 = 0;
+
+/// The server. `CServerGameDLL` plus `gEntList` plus `g_EventQueue`.
 ///
 /// Level-scoped, and so a field of the engine's `Scene` rather than of the
 /// engine: the entity list is emptied and refilled by every map change, and
 /// `Scene` is what [`Level`](crate::engine::host::Level) hands to the host.
 pub struct Server {
     entities: EntityList,
+    /// `g_EventQueue`. One per server rather than a file-scope global, which
+    /// is `PORTING.md`'s rule and is also what lets a test run two.
+    queue: EventQueue,
+    /// The entities with a think scheduled. `CSimThinkManager`.
+    thinks: ThinkList,
+    /// The fixed server tick. `portdocs/SERVER.md` §5.
+    clock: ServerClock,
+    /// `random->` — see [`LEVEL_RANDOM_SEED`].
+    random: RandomStream,
+    /// `CEventAction::s_iNextIDStamp`, restarted per level.
+    next_output_id: u32,
+    /// `CTonemapSystem::m_hMasterController`, resolved at
+    /// `LevelInitPostEntity`.
+    master_tonemap: Option<EntityId>,
     /// The map whose entities these are, for reporting. `None` between levels.
     map: Option<String>,
     stats: LevelStats,
+    io: IoStats,
+    /// Scratch for [`ThinkList::due`], so that a tick does not allocate.
+    due: Vec<EntityId>,
 }
 
 /// What one `level_init` produced.
 ///
 /// Most of this exists to answer "how much of the entity system is there yet",
-/// which is the only interesting question about stage 1 and stays interesting
-/// for several stages after it.
+/// which is the only interesting question about the early stages and stays
+/// interesting for several stages after them.
 #[derive(Default, Clone)]
 pub struct LevelStats {
     /// Blocks in the entity lump.
@@ -83,7 +139,7 @@ pub struct LevelStats {
     pub spawned: usize,
     /// Entities their own `Spawn` deleted — almost all of them unnamed lights.
     pub removed_on_spawn: usize,
-    /// Output connections recognised. Parsed in stage 2.
+    /// Output connections parsed.
     pub outputs: usize,
     /// Entities that named a parent, and how many of those resolved.
     pub parented: usize,
@@ -166,10 +222,25 @@ fn spawn_priority(classname: &str) -> i32 {
 
 impl Server {
     pub fn new() -> Server {
+        Server::with_tick_interval(think::DEFAULT_TICK_INTERVAL)
+    }
+
+    /// A server running at a given tick interval. `-tickrate` is the only
+    /// caller that passes anything but the default; see
+    /// [`ServerClock::interval_from_tickrate`].
+    pub fn with_tick_interval(interval: f32) -> Server {
         Server {
             entities: EntityList::new(),
+            queue: EventQueue::new(),
+            thinks: ThinkList::new(),
+            clock: ServerClock::new(interval),
+            random: RandomStream::new(LEVEL_RANDOM_SEED),
+            next_output_id: 0,
+            master_tonemap: None,
             map: None,
             stats: LevelStats::default(),
+            io: IoStats::default(),
+            due: Vec::new(),
         }
     }
 
@@ -209,8 +280,8 @@ impl Server {
             stats.matched += 1;
 
             let mut entity = Entity::new(class);
-            parse_map_data(&mut entity, block);
-            stats.outputs += entity.outputs.len();
+            self.parse_map_data(&mut entity, block);
+            stats.outputs += entity.outputs.iter().map(io::Output::len).sum::<usize>();
             // Counted here rather than after the spawn pass, so that what an
             // entity did not understand is recorded whether or not that entity
             // survived its own `Spawn`. Half the unhandled keys in the game
@@ -232,11 +303,7 @@ impl Server {
                 // Spawned at once and outside the sorted list, because
                 // everything else may ask about the world and nothing may ask
                 // about anything else yet.
-                true => {
-                    if self.dispatch_spawn(id) == SpawnResult::Remove {
-                        self.entities.mark_for_deletion(id);
-                    }
-                }
+                true => self.dispatch_spawn(id),
                 false => spawn_list.push(id),
             }
         }
@@ -266,25 +333,27 @@ impl Server {
 
         // `SpawnAllEntities` (`:253`): spawn every one, then activate every
         // survivor. Two complete passes, which is what makes `Activate` the
-        // first place a class may look at another entity.
+        // first place a class may look at another entity — and, for
+        // `logic_auto` and `logic_relay`, the first place a think may be
+        // scheduled.
         for &id in &ordered {
-            if self.dispatch_spawn(id) == SpawnResult::Remove {
-                self.entities.mark_for_deletion(id);
-            }
+            self.dispatch_spawn(id);
         }
         for &id in &ordered {
-            let Some(entity) = self.entities.get_mut(id) else {
-                continue;
-            };
-            if entity.removed {
-                continue;
-            }
-            let Entity { core, behaviour } = entity;
-            behaviour.activate(core);
+            self.dispatch(id, |core, behaviour, cx| {
+                if !core.removed {
+                    behaviour.activate(core, cx);
+                }
+            });
         }
 
-        stats.removed_on_spawn = self.entities.cleanup_delete_list();
+        stats.removed_on_spawn = self.cleanup_delete_list();
         stats.spawned = self.entities.len();
+
+        // `IGameSystem::LevelInitPostEntity`. One system so far, so it is a
+        // method rather than a `Vec<Box<dyn GameSystem>>` — see
+        // [`Server::update_master_tonemap`].
+        self.update_master_tonemap();
 
         self.stats = stats.clone();
         stats
@@ -320,13 +389,16 @@ impl Server {
         ordered.into_iter().map(|(_, _, _, id)| id).collect()
     }
 
-    /// `DispatchSpawn` (`mapentities.cpp:74`). Split out because the borrow of
-    /// the entity has to end before the caller can mark it for deletion.
-    fn dispatch_spawn(&mut self, id: EntityId) -> SpawnResult {
-        match self.entities.get_mut(id) {
-            Some(Entity { core, behaviour }) => behaviour.spawn(core),
-            None => SpawnResult::Ok,
-        }
+    /// `DispatchSpawn` (`mapentities.cpp:74`) — spawn one entity and mark it
+    /// if it asked to go.
+    fn dispatch_spawn(&mut self, id: EntityId) {
+        self.dispatch(id, |core, behaviour, cx| {
+            match behaviour.spawn(core, cx) {
+                SpawnResult::Ok => {}
+                // `UTIL_Remove( this )`: marked, not freed.
+                SpawnResult::Remove => core.remove(),
+            }
+        });
     }
 
     /// `ComputeSpawnHierarchyDepth_r` (`mapentities.cpp:133`), iteratively.
@@ -376,8 +448,417 @@ impl Server {
     /// being called with nothing loaded.
     pub fn level_shutdown(&mut self) {
         self.entities.clear();
+        self.queue.clear();
+        self.thinks.clear();
+        self.clock.reset();
+        self.random = RandomStream::new(LEVEL_RANDOM_SEED);
+        self.next_output_id = 0;
+        self.master_tonemap = None;
         self.map = None;
         self.stats = LevelStats::default();
+        self.io = IoStats::default();
+    }
+
+    // -----------------------------------------------------------------------
+    // the frame
+    // -----------------------------------------------------------------------
+
+    /// Runs however many fixed server ticks `frame_time` seconds bought.
+    ///
+    /// Returns how many ran — zero is normal and is what happens on most
+    /// rendered frames at a high frame rate.
+    ///
+    /// `frame_time` is the host's already-clamped frame time, so the
+    /// accumulator cannot be handed a stall; see
+    /// [`ServerClock::accumulate`].
+    pub fn frame(&mut self, frame_time: f32) -> u32 {
+        if self.map.is_none() {
+            return 0;
+        }
+        let ticks = self.clock.accumulate(frame_time);
+        for _ in 0..ticks {
+            self.clock.advance();
+            self.run_tick();
+        }
+        ticks
+    }
+
+    /// One server tick. `CServerGameDLL::GameFrame` (`gameinterface.cpp:1383`).
+    ///
+    /// The five steps that survive, in Valve's order. The two things to know
+    /// about that order are both consequences of `ServiceEventQueue` running
+    /// **once, after every think**: an output a think fires is delivered in the
+    /// same tick, and an input handler cannot observe a think that has not run
+    /// yet.
+    fn run_tick(&mut self) {
+        // Anything removed outside the loop — by a console command, say.
+        self.cleanup_delete_list();
+        self.run_think_functions();
+        self.service_events();
+        // Anything a think or an input removed.
+        self.cleanup_delete_list();
+    }
+
+    /// `Physics_RunThinkFunctions` (`physics_main.cpp:2282`) reduced to its
+    /// think half — there are no movetypes until stage 3, so
+    /// `Physics_SimulateEntity` is `PhysicsRunThink` for every entity.
+    ///
+    /// The due list is **copied** before anything runs, so a think may
+    /// schedule, cancel or delete anything including itself. That is what
+    /// Valve's `stackalloc` + `SimThink_ListCopy` is for.
+    fn run_think_functions(&mut self) {
+        let tick = self.clock.time().tick;
+        let mut due = std::mem::take(&mut self.due);
+        self.thinks.due(tick, &mut due);
+
+        for &id in due.iter() {
+            // The entity may have been removed by an earlier think in the same
+            // pass; `PhysicsRunThink` is not called on a corpse.
+            let alive = self.entities.get(id).is_some_and(|e| !e.removed);
+            if !alive {
+                continue;
+            }
+            self.dispatch(id, |core, behaviour, cx| {
+                // `PhysicsRunSpecificThink` (`physics_main_shared.cpp:2080`).
+                //
+                // > **The schedule is cleared before the think runs**, so a
+                // > think that does not re-arm itself never runs again. Every
+                // > recurring behaviour in the game re-arms on the way out —
+                // > `logic_timer`'s `ResetTimer` is the example.
+                core.clear_next_think();
+                behaviour.think(core, cx);
+            });
+            self.io.thinks += 1;
+        }
+
+        due.clear();
+        self.due = due;
+    }
+
+    /// `CEventQueue::ServiceEvents` (`cbase.cpp:911`).
+    ///
+    /// Pops the next due event and dispatches it until nothing is due, which
+    /// is Valve's restart-from-the-head loop — see [`EventQueue::pop_due`] for
+    /// why the two are the same thing. The consequence is the one that defines
+    /// how a Source map behaves: **a chain of eight zero-delay `logic_relay`s
+    /// completes in one tick, not eight.**
+    fn service_events(&mut self) {
+        let now = self.clock.time().curtime;
+        // A zero-delay chain is finite in every shipped map, but a map *can*
+        // write a loop (a relay that triggers itself with no delay), and Valve
+        // hangs on one. This bounds it: 100,000 events is four times the
+        // largest map's entire connection count.
+        let mut budget = 100_000_u32;
+
+        while let Some(event) = self.queue.pop_due(now) {
+            self.io.dispatched += 1;
+            self.deliver(event);
+
+            budget -= 1;
+            if budget == 0 {
+                eprintln!(
+                    "source-engine: server: the event queue has not drained in 100000 events; \
+                     a map's I/O is looping. Dropping the rest of this tick."
+                );
+                self.queue.clear();
+                break;
+            }
+        }
+    }
+
+    /// One event's target resolution and delivery.
+    ///
+    /// The order is Valve's: **by name, then by handle, then — only if neither
+    /// found anything — by classname**. The classname fallback is not a
+    /// curiosity: 2,747 shipped connections fire `SetFogController` at the
+    /// literal string `env_fog_controller` and reach every fog controller in
+    /// the map without naming one.
+    fn deliver(&mut self, event: Event) {
+        let mut targets: Vec<EntityId> = Vec::new();
+        let mut found = false;
+
+        match &event.target {
+            Target::Name(query) if name::is_procedural(query) => {
+                // `FindEntityByName` short-circuits a `!name` to exactly one
+                // entity and never iterates — "avoid an infinite loop, only
+                // find one match per procedural search".
+                match name::find_procedural(query, event.caller, event.activator, event.caller) {
+                    Procedural::Resolved(Some(id)) => {
+                        targets.push(id);
+                        found = true;
+                    }
+                    // A null activator is a legitimate answer in Valve too;
+                    // the event simply reaches nothing.
+                    Procedural::Resolved(None) => {}
+                    Procedural::NeedsPlayer => {
+                        *self
+                            .io
+                            .unhandled
+                            .entry(format!("{query} (needs a player)"))
+                            .or_default() += 1;
+                    }
+                    Procedural::Unknown => {
+                        *self
+                            .io
+                            .unhandled
+                            .entry(format!("{query} (not a procedural name)"))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            Target::Name(query) => {
+                targets.extend(name::find_by_name(&self.entities, query));
+                found = !targets.is_empty();
+            }
+            Target::Entity(id) => {
+                // A dead handle resolves to null and the event is reported as
+                // "target entity not found", exactly as `m_pEntTarget` does.
+                if self.entities.is_alive(*id) {
+                    targets.push(*id);
+                    found = true;
+                }
+            }
+        }
+
+        // The classname fallback, guarded on the name form the way Valve
+        // guards it on `m_iTarget != NULL_STRING`.
+        if !found {
+            if let Target::Name(query) = &event.target {
+                if !name::is_procedural(query) {
+                    targets.extend(
+                        self.entities
+                            .iter()
+                            .filter(|(_, e)| e.classname().eq_ignore_ascii_case(query))
+                            .map(|(id, _)| id),
+                    );
+                    found = !targets.is_empty();
+                }
+            }
+        }
+
+        if !found && targets.is_empty() {
+            self.io.no_target += 1;
+        }
+
+        for id in targets {
+            self.accept_input(
+                id,
+                &event.input,
+                event.value.clone(),
+                event.activator,
+                event.caller,
+                event.output_id,
+            );
+        }
+    }
+
+    /// `CBaseEntity::AcceptInput` (`baseentity.cpp:4457`).
+    ///
+    /// Finds the declared type for the input name — the class's table first,
+    /// then `CBaseEntity`'s, which is what the `baseMap` walk reduces to here
+    /// — converts the value to it, and dispatches.
+    ///
+    /// Returns whether anything took the input. An unmatched input is a
+    /// `DevMsg` in the original, not an error; here it is counted, because
+    /// "which inputs does the port not implement yet" is the stage's progress
+    /// metric.
+    fn accept_input(
+        &mut self,
+        id: EntityId,
+        input_name: &str,
+        value: Variant,
+        activator: Option<EntityId>,
+        caller: Option<EntityId>,
+        output_id: u32,
+    ) -> bool {
+        let Some(class) = self.entities.get(id).map(|e| e.class) else {
+            return false;
+        };
+
+        let (field, on_class) = match class.input_type(input_name) {
+            Some(field) => (field, true),
+            None => match class::base_input(input_name) {
+                Some(field) => (field, false),
+                None => {
+                    *self
+                        .io
+                        .unhandled
+                        .entry(format!("{}.{input_name}", class.name))
+                        .or_default() += 1;
+                    return false;
+                }
+            },
+        };
+
+        let mut value = value;
+        if value.field_type() != field {
+            // "allow empty strings": a `FIELD_VOID` value reaching a
+            // `FIELD_STRING` handler is passed through unconverted rather than
+            // refused. Without this, every parameterless connection into a
+            // string input — `FireUser1`, every proxy relay — would be
+            // rejected as a bad link.
+            let exempt = value.field_type() == FieldType::Void && field == FieldType::String;
+            if !exempt && !value.convert(field) {
+                eprintln!(
+                    "source-engine: server: bad input/output link: {}.{input_name} \
+                     does not take a {:?}",
+                    class.name,
+                    value.field_type()
+                );
+                self.io.bad_conversion += 1;
+                return false;
+            }
+        }
+
+        let accepted = self
+            .dispatch(id, |core, behaviour, cx| {
+                let input = Input {
+                    name: input_name,
+                    value,
+                    activator,
+                    caller,
+                    output_id,
+                };
+                match on_class {
+                    true => behaviour.accept_input(core, &input, cx),
+                    false => base_accept_input(core, &input, cx),
+                }
+            })
+            .unwrap_or(false);
+
+        match accepted {
+            true => self.io.accepted += 1,
+            // Only reachable if a class declares an input its handler refuses,
+            // which `classes`' invariant test makes impossible — so this arm
+            // is the test's safety net rather than a live path.
+            false => {
+                *self
+                    .io
+                    .unhandled
+                    .entry(format!("{}.{input_name}", class.name))
+                    .or_default() += 1
+            }
+        }
+        accepted
+    }
+
+    /// Runs `f` against one entity with a [`Context`], and reconciles the
+    /// think list afterwards.
+    ///
+    /// **This is the borrow seam.** The entity list, the queue and the random
+    /// stream are three fields of one struct, so they are destructured before
+    /// the entity is borrowed — which is the same disjoint-field move
+    /// `Engine::frame`'s `EngineCommands` makes, and the reason `Context` does
+    /// not hold the entity list (see its docs).
+    ///
+    /// Reconciling afterwards rather than inside `set_next_think` is what
+    /// keeps [`EntityCore`] free of a back-reference to the server. Every
+    /// place a schedule can change is a place that has a `Context`, and every
+    /// place that has a `Context` goes through here.
+    fn dispatch<R>(
+        &mut self,
+        id: EntityId,
+        f: impl FnOnce(&mut EntityCore, &mut dyn Behaviour, &mut Context<'_>) -> R,
+    ) -> Option<R> {
+        let Server {
+            entities,
+            queue,
+            random,
+            clock,
+            ..
+        } = self;
+        let time = clock.time();
+
+        let (result, next_think, removed) = {
+            let entity = entities.get_mut(id)?;
+            let mut cx = Context::new(time, queue, random);
+            let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
+            (result, entity.core.next_think_tick(), entity.core.removed)
+        };
+
+        // `SimThink_EntityChanged` (`entitylist.cpp:302`).
+        self.thinks.entity_changed(id, next_think, removed);
+        Some(result)
+    }
+
+    /// `gEntList.CleanupDeleteList` plus the two lists that name entities.
+    fn cleanup_delete_list(&mut self) -> usize {
+        let freed = self.entities.cleanup_delete_list();
+        if freed > 0 {
+            let entities = &self.entities;
+            self.thinks.retain_alive(|id| entities.is_alive(id));
+            self.queue.retain_targets(|id| entities.is_alive(id));
+            // The master tone mapper may have been one of them.
+            if self.master_tonemap.is_some_and(|id| !entities.is_alive(id)) {
+                self.master_tonemap = None;
+            }
+        }
+        freed
+    }
+
+    // -----------------------------------------------------------------------
+    // the tone mapper
+    // -----------------------------------------------------------------------
+
+    /// `CTonemapSystem::LevelInitPostEntity`
+    /// (`env_tonemap_controller.cpp:320`).
+    ///
+    /// > **The first controller found becomes master, and any later one that
+    /// > carries `SF_TONEMAP_MASTER` replaces it** — so with several flagged
+    /// > controllers the *last* wins, and with none the *first* does. Portal 2
+    /// > never reaches the ambiguity: 105 of its 110 controllers carry the
+    /// > flag, and the five that do not are exactly the second controller in
+    /// > the five maps that have two.
+    ///
+    /// This is Valve's one `IGameSystem` on this path. `portdocs/SERVER.md`
+    /// §4.9 asks for the registry to be ported as a plain list; with exactly
+    /// one system it is a method instead, and the condition that makes the
+    /// list worth writing is the second system that needs a level hook.
+    fn update_master_tonemap(&mut self) {
+        let mut master: Option<EntityId> = None;
+        for (id, entity) in self.entities.iter() {
+            if entity.classname() != "env_tonemap_controller" {
+                continue;
+            }
+            let is_master = classes::TonemapController::is_master(&entity.core);
+            if master.is_none() || is_master {
+                master = Some(id);
+            }
+        }
+        self.master_tonemap = master;
+    }
+
+    /// What the map's master `env_tonemap_controller` is asking for, or the
+    /// no-controller fallback.
+    ///
+    /// `GetTonemapSettingsFromEnvTonemapController`
+    /// (`c_env_tonemap_controller.cpp:97`) collapsed into one call: in Valve's
+    /// engine the values travel server entity → `SendTable` → client entity →
+    /// `localPlayer->m_hTonemapController` → thirteen file-scope globals. One
+    /// process, one struct (`portdocs/SERVER.md` §6).
+    ///
+    /// Read once per rendered frame by `Engine::render`, because a controller's
+    /// values change whenever map I/O says so — `sp_a1_intro1` changes them
+    /// 0.21 seconds in.
+    pub fn tonemap_settings(&self) -> TonemapSettings {
+        self.master_tonemap
+            .and_then(|id| self.entities.get(id))
+            .and_then(|entity| {
+                entity
+                    .behaviour
+                    .downcast_ref::<classes::TonemapController>()
+            })
+            .map(classes::TonemapController::settings)
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // reporting
+    // -----------------------------------------------------------------------
+
+    /// Where the server's clock is. `gpGlobals`' time fields.
+    pub fn time(&self) -> think::Time {
+        self.clock.time()
     }
 
     /// `report_entities` (`entitylist.cpp:1944`) — a count per classname,
@@ -412,8 +893,8 @@ impl Server {
             per_class.len()
         ));
 
-        // Everything below is this port's, not Valve's: it is the stage-1
-        // progress report, and it goes away as the classes land.
+        // Everything below is this port's, not Valve's: it is the progress
+        // report, and it goes away as the classes land.
         let stats = &self.stats;
         cx.print(&format!(
             "{} of {} entity blocks matched a class; {} removed themselves on spawn",
@@ -425,23 +906,33 @@ impl Server {
                 stats.parented, stats.parents_missing
             ));
         }
+
+        let time = self.time();
         cx.print(&format!(
-            "{} output connections recognised (unparsed until stage 2)",
-            stats.outputs
+            "tick {} ({:.2}s), {} events dispatched, {} inputs accepted, {} thinks run",
+            time.tick, time.curtime, self.io.dispatched, self.io.accepted, self.io.thinks
+        ));
+        cx.print(&format!(
+            "{} connections parsed, {} queued now, {} entities thinking, \
+             {} events found no target",
+            stats.outputs,
+            self.queue.len(),
+            self.thinks.len(),
+            self.io.no_target
         ));
 
         print_counts(cx, "unimplemented classnames", &stats.unknown, 12);
         print_counts(cx, "keys nothing consumed", &stats.unhandled, 12);
+        print_counts(cx, "inputs nothing handled", &self.io.unhandled, 12);
     }
 
     /// `ent_dump` (`baseentity.cpp:6103`) — one entity's state, by name, by
     /// classname, or by list index.
     ///
     /// `GetNextCommandEntity` accepts all three and so does this. The state it
-    /// prints is [`EntityCore`](entity::EntityCore)'s plus whatever the class
-    /// says in [`Behaviour::describe`](class::Behaviour::describe), which is
-    /// what replaces `DumpEntity`'s walk over a datadesc that no longer
-    /// exists.
+    /// prints is [`EntityCore`]'s plus whatever the class says in
+    /// [`Behaviour::describe`], which is what replaces `DumpEntity`'s walk
+    /// over a datadesc that no longer exists.
     pub fn ent_dump(&self, cmd: &Command, cx: &mut ExecContext<'_>) {
         let Some(query) = cmd.arg(1) else {
             cx.print("ent_dump <entity name / index / class>");
@@ -452,34 +943,7 @@ impl Server {
             return;
         }
 
-        let by_index: Vec<EntityId> = match query.trim().parse::<u32>() {
-            Ok(slot) => self
-                .entities
-                .iter()
-                .filter(|(id, _)| id.slot() == slot)
-                .map(|(id, _)| id)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let by_name: Vec<EntityId> = name::find_by_name(&self.entities, query).collect();
-        let by_class: Vec<EntityId> = self
-            .entities
-            .iter()
-            .filter(|(_, e)| e.classname().eq_ignore_ascii_case(query))
-            .map(|(id, _)| id)
-            .collect();
-
-        // Valve's order: index, then name, then classname.
-        let found = match (by_index.is_empty(), by_name.is_empty()) {
-            (false, _) => by_index,
-            (true, false) => by_name,
-            (true, true) => by_class,
-        };
-        if found.is_empty() {
-            cx.print("ent_dump: no such entity");
-            return;
-        }
-        for id in found {
+        for id in self.command_entities(query) {
             let Some(entity) = self.entities.get(id) else {
                 continue;
             };
@@ -513,22 +977,191 @@ impl Server {
             if entity.effects != 0 {
                 cx.print(&format!("  effects: {:#x}", entity.effects));
             }
+            let next_think = entity.next_think_tick();
+            if next_think != think::TICK_NEVER_THINK {
+                cx.print(&format!(
+                    "  next think: tick {next_think} ({:.2}s, now {:.2}s)",
+                    self.clock.time().ticks_to_time(next_think),
+                    self.clock.time().curtime
+                ));
+            }
             for (key, value) in entity.behaviour.describe() {
                 cx.print(&format!("  {key}: {value}"));
             }
-            for (key, value) in &entity.outputs {
-                // The lump's ESC delimiter would be invisible in the console,
-                // so it is shown as the `,` a mapper typed in Hammer.
-                cx.print(&format!("  output {key}: {}", value.replace('\u{1b}', ",")));
+            for output in &entity.outputs {
+                for action in &output.actions {
+                    cx.print(&format!(
+                        "  {} -> {}.{}({}) delay {} times {}",
+                        output.name,
+                        action.target,
+                        action.input,
+                        action.parameter.as_deref().unwrap_or(""),
+                        action.delay,
+                        action.times_to_fire
+                    ));
+                }
             }
             for (key, value) in &entity.unhandled {
                 cx.print(&format!("  (unhandled) {key}: {value}"));
             }
         }
     }
+
+    /// `ent_fire <target> [input] [value] [delay]`
+    /// (`baseentity.cpp:6122`) — post an input from the console.
+    ///
+    /// The one way to drive entity I/O by hand, and the reason it is worth the
+    /// thirty lines: everything in this module is invisible without it.
+    ///
+    /// Valve's version passes the issuing player as both activator and caller;
+    /// there is no player entity until stage 5, so both are null — which means
+    /// an `!activator` in whatever it sets off will resolve to nothing.
+    ///
+    /// **The delay is `atoi`, not `atof`**, in Valve's implementation, so
+    /// `ent_fire x Trigger "" 0.5` fires immediately. Reproduced.
+    pub fn ent_fire(&mut self, cmd: &Command, cx: &mut ExecContext<'_>) {
+        let Some(target) = cmd.arg(1) else {
+            cx.print("ent_fire <target> [input] [value] [delay]");
+            return;
+        };
+        if self.map.is_none() {
+            cx.print("ent_fire: no map is loaded");
+            return;
+        }
+        let input = cmd.arg(2).unwrap_or("Use");
+        let value = match cmd.arg(3) {
+            Some(value) if !value.is_empty() => Variant::String(value.to_owned()),
+            _ => Variant::Void,
+        };
+        let delay = cmd.arg(4).map_or(0, keyvalue::atoi) as f32;
+
+        let fire_time = self.clock.time().curtime + delay;
+        self.queue.add(Event {
+            fire_time,
+            target: Target::Name(target.to_owned()),
+            input: input.to_owned(),
+            value,
+            activator: None,
+            caller: None,
+            output_id: 0,
+        });
+        cx.print(&format!(
+            "queued {target}.{input} for {fire_time:.2}s (now {:.2}s)",
+            self.clock.time().curtime
+        ));
+    }
+
+    /// `dumpeventqueue` (`cbase.cpp:1010`) — everything waiting, in fire
+    /// order.
+    pub fn dump_event_queue(&self, cx: &mut ExecContext<'_>) {
+        let now = self.clock.time().curtime;
+        cx.print(&format!(
+            "Dumping event queue. Current time is: {now:.2} (tick {})",
+            self.clock.time().tick
+        ));
+        for event in self.queue.iter() {
+            let target = match &event.target {
+                Target::Name(name) => name.clone(),
+                Target::Entity(id) => match self.entities.get(*id) {
+                    Some(entity) => format!("[{}] {}", id.slot(), entity.debug_name()),
+                    None => format!("[{}] <gone>", id.slot()),
+                },
+            };
+            let who = |id: Option<EntityId>| match id.and_then(|id| self.entities.get(id)) {
+                Some(entity) => entity.debug_name().to_owned(),
+                None => String::from("None"),
+            };
+            cx.print(&format!(
+                "   ({:.2}) Target: '{target}', Input: '{}', Parameter '{}'. \
+                 Activator: '{}', Caller '{}'.",
+                event.fire_time,
+                event.input,
+                event.value.to_string(),
+                who(event.activator),
+                who(event.caller),
+            ));
+        }
+        cx.print(&format!("Finished dump. {} queued.", self.queue.len()));
+    }
+
+    /// `GetNextCommandEntity`'s three forms: a list index, a targetname, or a
+    /// classname, tried in that order.
+    fn command_entities(&self, query: &str) -> Vec<EntityId> {
+        if let Ok(slot) = query.trim().parse::<u32>() {
+            let by_index: Vec<EntityId> = self
+                .entities
+                .iter()
+                .filter(|(id, _)| id.slot() == slot)
+                .map(|(id, _)| id)
+                .collect();
+            if !by_index.is_empty() {
+                return by_index;
+            }
+        }
+        let by_name: Vec<EntityId> = name::find_by_name(&self.entities, query).collect();
+        if !by_name.is_empty() {
+            return by_name;
+        }
+        self.entities
+            .iter()
+            .filter(|(_, e)| e.classname().eq_ignore_ascii_case(query))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// `CBaseEntity::ParseMapData` (`baseentity_shared.cpp:334`): every key in
+    /// the block, in lump order, through `KeyValue`.
+    ///
+    /// # The order of the three attempts
+    ///
+    /// The class first, then the shared ladder, then the output table. That is
+    /// Valve's: `ParseMapData` calls `KeyValue` *virtually*, so a class that
+    /// overrides it — `CWorld`, `CLight`, `CEnvLight` — tests its own keys and
+    /// only then calls `BaseClass::KeyValue`, which is where the if-ladder
+    /// lives. The outputs are matched last because Valve matches them in the
+    /// datadesc walk that `CBaseEntity::KeyValue` ends with.
+    ///
+    /// (One nuance not reproduced, because nothing reaches it: a key declared
+    /// with `DEFINE_KEYFIELD` rather than handled by an override is matched in
+    /// that final walk, so in the original it loses to the ladder rather than
+    /// beating it. `StartDisabled` is the only example and no ladder key
+    /// shares its name.)
+    fn parse_map_data(&mut self, entity: &mut Entity, block: &bsp::Entity) {
+        for (key, value) in &block.pairs {
+            let Entity { core, behaviour } = &mut *entity;
+            if behaviour.key_value(core, key, value) {
+                continue;
+            }
+            if keyvalue::base_key_value(core, key, value) {
+                continue;
+            }
+            // An output key is recognised by the *declared* name, and the
+            // connection is filed under that spelling rather than the map's —
+            // see [`EntityCore::add_connection`].
+            let declared = core.class.declared_output(key).or_else(|| {
+                keyvalue::BASE_OUTPUTS
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(key))
+                    .copied()
+            });
+            match declared {
+                Some(name) => {
+                    self.next_output_id += 1;
+                    core.add_connection(name, value, self.next_output_id);
+                }
+                None => core.unhandled.push((key.clone(), value.clone())),
+            }
+        }
+    }
 }
 
-/// A sorted-by-count listing, truncated. Used for both progress reports.
+impl Default for Server {
+    fn default() -> Server {
+        Server::new()
+    }
+}
+
+/// A sorted-by-count listing, truncated. Used for all three progress reports.
 fn print_counts(
     cx: &mut ExecContext<'_>,
     what: &str,
@@ -553,42 +1186,7 @@ fn print_counts(
     }
 }
 
-/// `CBaseEntity::ParseMapData` (`baseentity_shared.cpp:334`): every key in the
-/// block, in lump order, through `KeyValue`.
-///
-/// # The order of the three attempts
-///
-/// The class first, then the shared ladder, then the output table. That is
-/// Valve's: `ParseMapData` calls `KeyValue` *virtually*, so a class that
-/// overrides it — `CWorld`, `CLight`, `CEnvLight` — tests its own keys and
-/// only then calls `BaseClass::KeyValue`, which is where the if-ladder lives.
-/// The outputs are matched last because Valve matches them in the datadesc
-/// walk that `CBaseEntity::KeyValue` ends with.
-///
-/// (One nuance not reproduced, because nothing reaches it: a key declared with
-/// `DEFINE_KEYFIELD` rather than handled by an override is matched in that
-/// final walk, so in the original it loses to the ladder rather than beating
-/// it. `StartDisabled` is the only stage-1 example and no ladder key shares
-/// its name.)
-fn parse_map_data(entity: &mut Entity, block: &bsp::Entity) {
-    for (key, value) in &block.pairs {
-        let Entity { core, behaviour } = &mut *entity;
-        if behaviour.key_value(core, key, value) {
-            continue;
-        }
-        if keyvalue::base_key_value(core, key, value) {
-            continue;
-        }
-        let is_output = core.class.declares_output(key)
-            || keyvalue::BASE_OUTPUTS
-                .iter()
-                .any(|o| o.eq_ignore_ascii_case(key));
-        match is_output {
-            true => core.outputs.push((key.clone(), value.clone())),
-            false => core.unhandled.push((key.clone(), value.clone())),
-        }
-    }
-}
-
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

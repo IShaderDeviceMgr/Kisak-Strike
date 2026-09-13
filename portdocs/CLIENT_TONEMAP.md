@@ -40,7 +40,7 @@ Everything below is relative to `legacy/`.
 | File | Lines | Disposition |
 |---|---:|---|
 | `game/client/viewpostprocess.cpp` | 4,006 | **~900 in scope.** `CTonemapSystem` (`:702-1530`), `GetExposureRange` (`:988`), `DoTonemapping` (`:2371`) and the head of `DoEnginePostProcessing` (`:2485`). The rest is bloom, blur, colour correction, software AA, FXAA, depth of field, vomit — none ported. |
-| `game/client/c_env_tonemap_controller.cpp` | 140 | **Not ported, but read.** Its no-controller fallback (`:97`) is where the constants in `src/client/tonemap.rs` come from. The entity itself needs `server/` and `net/`. |
+| `game/client/c_env_tonemap_controller.cpp` | 140 | **Its fallback is ported** (`:97`) as `TonemapSettings::default`, and the entity it reads from landed with `server/` stage 2 — as a struct, not a network path. |
 | `materialsystem/stdshaders/luminance_compare_ps2x.fxc` | 54 | **Replaced.** Its luminance formula survives verbatim in `shaders/histogram.wgsl`; the `step()` range test does not. |
 | `materialsystem/stdshaders/screenspace_general.cpp` | ~330 | **Read, not ported.** The shader `dev/lumcompare.vmt` names. What matters is `SHADER_INIT`'s sRGB-read decision (`:98`), which is what makes the histogram linear. |
 | `materialsystem/shaderapidx9/shaderapidx8.cpp` | — | `CShaderAPIDx8::SetToneMappingScaleLinear` (`:16227`) only. Ported into `uniforms::tone_mapping_scale`. |
@@ -178,6 +178,13 @@ Three things in step 6 that look like bugs and are not:
 ---
 
 ## 6. `env_tonemap_controller`, and the one measured divergence
+
+> **Closed by `server/` stage 2.** The entity is `src/server/classes/env.rs`, the
+> value it produces is `client::tonemap::TonemapSettings`, and `Engine::render`
+> hands one to the other once a frame — which is where Valve's server entity →
+> `SendTable` → client entity → thirteen globals path collapses to in one process.
+> `sp_a1_intro1` gets its ceiling of 1.5. The section below stands as the analysis
+> that sized it.
 
 **105 of Portal 2's 106 maps place an `env_tonemap_controller`**, and they drive it hard.
 Scanning every map's entity lump for `SetAutoExposure*`/`SetTonemapRate` outputs:

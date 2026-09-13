@@ -4,10 +4,11 @@
 event queue, thinks, `MOVETYPE_PUSH`, and the ~200 entity classes Portal 2 actually
 places.
 
-Status: **stage 1 of 5 done** — see `src/server/` and
+Status: **stages 1 and 2 of 5 done** — see `src/server/` and
 [`../rustdocs/SERVER.md`](../rustdocs/SERVER.md). Written before the port, against the
-current architecture; the three sections stage 1 corrected say so inline (§4.4, §7.3
-twice). Read [`../PORTING.md`](../PORTING.md) first; this is the module detail.
+current architecture; the sections the port corrected say so inline (§4.3, §4.4, §5,
+§7.3 twice, §10.3). Read [`../PORTING.md`](../PORTING.md) first; this is the module
+detail.
 
 Siblings worth having open: [`CLIENT.md`](CLIENT.md) (the player that already exists),
 [`ENGINE_TRACE.md`](ENGINE_TRACE.md) (stage 4 of which is blocked on this document),
@@ -401,8 +402,13 @@ function. Such a field can be set from the map *and* from an input at run time, 
 `target ␛ input ␛ parameter ␛ delay ␛ times-to-fire`. The delimiter is `0x1B` (ESC)
 if the string contains one and a comma otherwise
 (`cbase.cpp:128`, `public/entitydefs.h:17` — ESC so that a parameter may contain commas).
-Measured across all 106 maps: **61,375 values use ESC and 16 use a comma.** Both paths
-are live; the comma path is 16 connections in the whole game.
+
+> **Corrected by stage 2.** Re-measured over *output-key* values only:
+> **all 61,451 connections in the shipped maps use the ESC and none uses a comma.**
+> The sixteen comma-delimited values this section counted are `AddOutput`
+> *parameters*, which are comma-separated by a different rule and are not
+> connections. The comma path is unreachable in Portal 2 — it is reproduced anyway,
+> because it costs one line and a map from another game reaches it.
 
 ```
 connections                61,391      on 17,091 entities (28.1%)
@@ -695,6 +701,21 @@ same family). `CServerGameDLL::GetTickInterval` (`gameinterface.cpp:1015`) takes
 straight from the macro unless `-tickrate` is given, quantised to `N/512` and clamped to
 `[4/512, 25/512]` — i.e. 20.48 to 128 Hz.
 
+> **Taken at stage 2, as recommended.** `src/server/think.rs` is `ServerClock`
+> (the accumulator), `Time` (`curtime`/`tickcount`/`interval_per_tick`) and
+> `ThinkList` (`CSimThinkManager`). The client keeps running on the rendered
+> frame. The rate is one constant with one definition site, overridable with
+> `-tickrate` — quantised to `N/512` and clamped to `[4/512, 25/512]`, as
+> `GetTickInterval` does — and it is still **1/64, still CS:GO's number and
+> still unverified**: the depot ships no engine binary to read Portal 2's
+> `interval_per_tick` out of, only `vbsp`/`vvis`/`vrad`. The consequence a
+> reader needs is that **the server's `curtime` is not `Scene::curtime`**.
+>
+> One thing this section predicted exactly: `logic_timer` is where it would have
+> hurt. Its floor is 0.01 s, which is less than a tick at every rate the engine
+> allows, so a timer at its minimum fires every tick — and that is Valve's
+> behaviour, reachable only because the schedule is quantised.
+
 **Recommendation: give the server a fixed tick, accumulated inside `Engine::frame`.**
 A `ServerClock` that accumulates real frame time and runs zero or more fixed server
 ticks per rendered frame, with `tickcount` and `curtime` derived from the tick number.
@@ -808,6 +829,12 @@ pub trait Behaviour: Any {
 name, remove an entity, trace). This is the same disjoint-field-borrow move
 `console.run(&mut EngineCommands { … })` already makes in `Engine::frame`, and the same
 reason `host::Level` is a trait. Do not try to give a behaviour `&mut Server`.
+
+> **Corrected by stage 2: the seam is real, and it is much smaller than this.** What
+> shipped is `(&mut EntityCore, &mut dyn Behaviour, &mut Context)`, where `Context`
+> holds the clock, the event queue and the random stream and **not the entity list**.
+> A handler never needs to see another entity, because firing an output is a queue
+> append and removing an entity is a flag on the one it already holds. See §10.3.
 
 ### 7.3 A class is a table plus a trait, not a base class
 
@@ -964,7 +991,83 @@ entities use it), and the four `KeyValue` ladder entries that appear zero times 
 shipped maps — one of which, `angle`, is **infinitely recursive** in Valve's
 implementation.
 
-### Stage 2 — entity I/O, the event queue, and thinks
+### Stage 2 — entity I/O, the event queue, and thinks — **DONE**
+
+**See `src/server/` and `rustdocs/SERVER.md` for the API.** 78 unit tests and one
+depot test, none of them needing a GPU.
+
+Everything below landed, plus the fixed tick (§5) and `src/server/random.rs`, which
+this plan did not anticipate: `logic_case` and `logic_timer` both call
+`random->RandomInt`/`RandomFloat`, so `CUniformRandomStream` — *Numerical Recipes*'
+`ran1` — came with them rather than a crate, because its rejection sampling and its
+lossy seed convention are behaviour a dependency would silently replace.
+
+**Classes: sixteen now, six of them new** — `logic_auto`, `logic_branch`,
+`logic_case`, `logic_timer`, `math_counter` and `env_tonemap_controller`, on top of
+stage 1's ten given their real behaviour. That is **17,479 of the game's 60,925
+entities**.
+
+Measured over all 106 shipped maps, and asserted exactly by
+`server::tests::every_shipped_map_spawns_its_entities`, which now also **runs two
+seconds of server time on every map**:
+
+```
+60,925 entity blocks   19,229 matched a class   12,292 spawned
+ 6,937 removed themselves (all unnamed lights; 213 named ones survive)
+46,489 connections parsed      185 unimplemented classnames (41,696 blocks)
+    29 key names nothing consumes — 17 the map compiler's, 6 mapper mistakes
+
+after 2s per map:
+ 5,763 events dispatched   2,070 inputs accepted   1,197 thinks run
+ 3,700 events found no target      0 values would not convert
+   105 maps have a master tone mapper, 100 of them set a custom ceiling
+    43 entities thinking at once, at the peak, across the whole game
+     7 input names reach an implemented class and are refused (186 occurrences),
+       171 of which are the three player procedurals
+```
+
+**`sp_a1_intro1` asks for an exposure ceiling of 1.5 against the cvar default of 2**,
+and it gets it — the stage's headline, asserted by name in the depot test.
+
+Six findings worth carrying forward.
+
+**§10.3's borrow risk is not one, and the reason is structural.** This plan expected
+`EntityMut` to carry a `&mut ServerContext` "for everything it needs to reach outward",
+and flagged a re-entrant panic as the expensive thing to discover late. `FireOutput`
+**does not call the target** — it appends to the queue, which one top-level loop
+drains — so nothing in stage 2 is re-entrant and `Context` does not borrow the entity
+list at all. The condition that changes this is a handler that must *read* another
+entity during dispatch, and `logic_branch_listener` is the first one in the game.
+
+**An output's connections fire in reverse lump order.** `AddEventAction` prepends.
+Three lines of C++, observable whenever two connections on one output reach the same
+target, and not something this document knew.
+
+**The comma delimiter is unreachable** — §4.3, corrected above.
+
+**`env_tonemap_controller` has no keyvalues at all.** Every setting arrives as an
+input, which is why `logic_auto` had to land first: without something to fire at it,
+the entity does nothing for the whole level.
+
+**The tone mapper's `rate` of zero became reachable.** `client/tonemap.rs` carried a
+branch for it marked "unreachable today, kept because the branch is what makes a rate
+of zero mean that"; `SetTonemapRate 0` now reaches it.
+
+**Two more unhandled key names appeared, and both are progress**: a `logic_auto` with
+an `OnTrigger` it has no output for and one with `_OnMapSpawn`, both mapper mistakes
+shipped in the game. They were invisible at stage 1 because the whole entity was an
+unknown classname and its keys were never counted.
+
+**Deliberately deferred inside the stage**, each measured: named think *contexts*
+(no class has two timers yet), `IGameSystem` as a registry (one system exists),
+`FIELD_EHANDLE` (no class declares one), `AddOutput` and the parenting inputs
+(stage 3's), and `env_global`'s state table — which makes `logic_auto`'s `globalstate`
+read `GLOBAL_OFF` for every global, and that **is** Valve's behaviour against an empty
+table rather than an approximation of it. Two entities in the game are affected.
+
+#### The plan, as written
+
+
 
 `Output`/`EventAction` parsing with both delimiters, the `times-to-fire` self-deletion,
 `EventQueue` with the restart-from-head semantic (§4.3), `AcceptInput` and `Variant`
@@ -1067,14 +1170,26 @@ question into a number.
 
 ## 10. Open questions and risks
 
-1. **The tick rate.** §5. Portal 2's shipped `interval_per_tick` is not recoverable from
-   this tree or from the map files; the tree's 1/64 is CS:GO's. One definition site.
+1. **The tick rate.** §5. **The decision is taken** — fixed tick, accumulated inside
+   the rendered frame — but the *rate* is still open: Portal 2's shipped
+   `interval_per_tick` is not recoverable from this tree, from the map files, or from
+   the depot, which ships only `vbsp`/`vvis`/`vrad`. The tree's 1/64 is CS:GO's, and
+   it is `think::DEFAULT_TICK_INTERVAL`: one definition site, one line to change.
 2. **Whether the player is an entity or adjacent to one.** §7.4 recommends "is", for
    `!player` and touch. The risk is dragging `client/`'s variable-`dt` movement into the
-   server's fixed tick. Stage 5, deliberately late, so the seam is known by then.
-3. **Borrow shape of `EntityMut`.** An input handler that fires an output that reaches
-   the same entity is normal and legal in C++. Verify early that the chosen shape
-   survives it; a re-entrant `RefCell` panic discovered at stage 4 is expensive.
+   server's fixed tick — which stage 2 has now made concrete rather than hypothetical,
+   because the two clocks exist and are different. Stage 5, deliberately late.
+   The size of the prize is measured: **171 of the 186 inputs that reach an
+   implemented class and are refused are `!player`, `!player_blue` and
+   `!player_orange`.**
+3. ~~**Borrow shape of `EntityMut`.**~~ **Closed at stage 2, and it was never a
+   risk.** An input handler that fires an output that reaches the same entity is
+   normal and legal in C++ — because `FireOutput` does not *call* anything, it
+   appends to the queue. Nothing in the subsystem is re-entrant, so the borrow shape
+   is three disjoint fields and there is no cell anywhere. The condition that
+   reopens it is a handler that must *read* another entity during dispatch;
+   `logic_branch_listener` is the first one in the game, and the shape to reach for
+   then is the entity list minus the one entity being dispatched, not a `RefCell`.
 4. **How much of `CPhysicsPushedEntities` is really needed.** Stage 3 defers all of it.
    Portal 2 has crushing doors and moving platforms the player rides; the condition that
    forces the port is the first puzzle that cannot be solved without standing on

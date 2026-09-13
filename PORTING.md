@@ -699,22 +699,54 @@ Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own mo
 free-fly camera, bindings, UI precedence and the key-up latch). Stage 5 (controllers,
 `gilrs`) is deliberately last and is all that remains.
 
-**The game server has landed — stage 1 of `portdocs/SERVER.md`'s five.** It is
+**The game server has landed — stages 1 and 2 of `portdocs/SERVER.md`'s five.** It is
 `src/server/`, the sibling the client's entry above said would follow it, and it is the
-module that turns the `.bsp`'s entity lump into an entity list: `ClassDef` chooses the
-class, `CBaseEntity::KeyValue`'s ladder and the class's own `key_value` parse the keys,
-and the three-pass spawn runs — hierarchy depth, `SortSpawnListByHierarchy`, then `Spawn`
-and `Activate` over the whole list. `EntityId` is `CBaseHandle` as a generational index
-and `UTIL_Remove` is still deferred, for the same reason it is in the original and
-separately because the Rust borrow rules want it. **API: `rustdocs/SERVER.md`.**
+module that turns the `.bsp`'s entity lump into an entity list and then *runs* it:
+`ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's own
+`key_value` parse the keys, and the three-pass spawn runs — hierarchy depth,
+`SortSpawnListByHierarchy`, then `Spawn` and `Activate` over the whole list. `EntityId`
+is `CBaseHandle` as a generational index and `UTIL_Remove` is still deferred, for the
+same reason it is in the original and separately because the Rust borrow rules want it.
+**API: `rustdocs/SERVER.md`.**
+
+**Stage 2 is entity I/O, the event queue and thinks, and with it the map's own logic
+runs.** `CEventAction`, `CBaseEntityOutput`, `CEventQueue` and `AcceptInput` with
+`variant_t`'s coercion table; the think schedule and the `SimThink` list; sixteen
+classnames covering 17,479 of the game's 60,925 entities. The visible outcome is the
+one `portdocs/CLIENT_TONEMAP.md` had been holding: **`env_tonemap_controller` works,
+and `sp_a1_intro1` asks for an exposure ceiling of 1.5 against the cvar default of 2** —
+through a chain of `logic_relay`'s `OnSpawn` → two exposure relays, one of them
+`StartDisabled`, → the controller, which is exactly the shape stage 2 existed to make
+run.
+
+Three things it settled. **The server gets a fixed tick** (`SERVER.md` §5's "one
+architectural decision"), accumulated inside the rendered frame, while the client keeps
+running on the frame — Valve's own split, and forced rather than chosen, because
+`SetNextThink` quantises to ticks and a schedule built on a variable `dt` is a different
+schedule at every frame rate. The rate is one constant, `-tickrate`-overridable, and
+still **1/64 — CS:GO's number, unverified for Portal 2**, because the depot ships no
+engine binary to read it out of. **The borrow risk §10.3 flagged is not one**:
+`FireOutput` appends to a queue rather than calling the target, so nothing in the
+subsystem is re-entrant and a behaviour's context does not need the entity list at all.
+And **`CUniformRandomStream` was ported rather than replaced by a crate** — one of the
+few places this file's own "prefer the crate" rule points the other way, because
+`ran1`'s rejection sampling and its lossy seed convention are behaviour a dependency
+would silently replace, and `logic_case` is the thing that would change.
 
 `game/server/` is 446,861 lines and the framework inside it is ~29,800; the rest is
 entity classes and `ai_*`. The scoping came from measuring the shipped maps rather than
 the tree, and it changed the answer: 106 maps place **60,925 entities of exactly 200
 classnames**, the top 25 of which are 79.8% of them, while the whole 122,298-line
 `ai_*`/`nav_*` tree serves **293 `npc_*` instances of 6 classnames** — four of which have
-no source in this tree at all. Ten classnames are implemented and they cover **17,069 of
-the 60,925 blocks**.
+no source in this tree at all. Sixteen classnames are implemented and they cover
+**19,229 of the 60,925 blocks**.
+
+The same measure-the-maps discipline paid at stage 2: **`env_tonemap_controller` has no
+keyvalues at all** — every setting arrives as an input, which is why `logic_auto` had to
+land before it could do anything — and **two thirds of `logic_case`'s use in Portal 2
+ignores its case values**, because `PickRandom` chooses among the cases whose *output*
+has connections rather than the ones whose *value* is set. Neither is a conclusion
+reading `game/server/` would reach.
 
 Two things are worth carrying to the next module. **Valve's inheritance became Rust's
 composition, and the datadesc chain walk disappeared with it** — `SERVER.md` §7.3 planned
