@@ -92,6 +92,22 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   winding argument was backwards, and §6.2 under-stated `$ssbump`'s reach by two orders of
   magnitude.
 
+- [`CLIENT_TONEMAP.md`](CLIENT_TONEMAP.md) — **auto exposure. Ported; see
+  `src/client/tonemap.rs`, `src/materials/{post,histogram}.rs`, and both rustdocs.**
+  `CTonemapSystem` and the head of `DoEnginePostProcessing` (~1,000 lines of
+  `viewpostprocess.cpp`), plus `dev/lumcompare`, `luminance_compare_ps2x.fxc` and
+  `SetToneMappingScaleLinear`. Written *after* the port rather than before it, because the
+  tone mapper was not on `CLIENT.md`'s plan. Records why the exposure scalar needs no float
+  render target (Valve applies it in the shader in both HDR modes), why the scene
+  nonetheless has to stop going straight to the back buffer, and the finding that decides
+  the whole calibration: **the histogram measures linear light, not gamma**, because
+  `dev/lumcompare.vmt` leaves `$LINEARREAD_BASETEXTURE` unset — Valve's own comment says
+  the opposite and is stale. Also records three things that look like bugs and are not
+  (the V-shaped moving-average weights, the per-frame step cap, and the
+  `mat_accelerate_adjust_exposure_down` it renders inert below 128 fps), and a census of
+  what the shipped maps actually ask for: **105 of 106 place an `env_tonemap_controller`**,
+  and none of them uses the cvar defaults this port falls back on.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current

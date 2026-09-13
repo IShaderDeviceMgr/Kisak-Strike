@@ -23,8 +23,9 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
 - [`MATERIALS.md`](MATERIALS.md) — `src/materials/`. `Renderer` and the frame boundary,
   the `wgpu` decisions the rest of the renderer inherits, the texture path (`Vtf`,
   `ImageFormat`, `Texture`, `TextureCache`), the material path (`Vmt`, `MaterialVar`,
-  `ShaderKind`, `PipelineCache`, `Material`), meshes and the render context, and the
-  lightmap atlas. Its porting doc is
+  `ShaderKind`, `PipelineCache`, `Material`), meshes and the render context, the
+  lightmap atlas, and the post-processing chain — the offscreen scene target, the GPU
+  luminance histogram the tone mapper measures, and the pass that presents it. Its porting doc is
   [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named after the C++
   module, while this one is named after the Rust module.
 - [`ENGINE.md`](ENGINE.md) — `src/engine/`. `window` (the `winit` event loop,
@@ -39,8 +40,9 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
   `ViewAngles`, and the movement — `FullNoClipMove` and `FullWalkMove` with gravity,
   friction, stair stepping, jumping and ducking. Records the ten places
   **`CPortalGameMovement` differs from `CGameMovement`** in ways that have nothing to do
-  with portals. Not to be confused with `ENGINE.md` §7.5's *client connection*, which does
-  not exist yet.
+  with portals — plus `ToneMap`, the auto-exposure controller
+  (`portdocs/CLIENT_TONEMAP.md`), which is policy over a histogram and names no GPU type.
+  Not to be confused with `ENGINE.md` §7.5's *client connection*, which does not exist yet.
 
 ## Root modules
 

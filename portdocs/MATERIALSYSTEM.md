@@ -970,10 +970,23 @@ which this tree does not have), which is what fills the
   headers that go with the tower, and one Perl build script. `engine/` and `game/` do not
   reference it at all, so there is nothing to design a replacement API for.
 - **HDR.** `GetHDRType`/`SupportsHDRMode` gate a whole rendering mode (float render
-  targets + tonemapping). Portal 2 ships HDR-lit maps. **Still open, and now deferred by
-  default:** stage 1 configures the swap chain SDR (`SurfaceColorSpace::Auto` with an
-  sRGB format). That is a one-field change to reverse, but the rest — a float format and
-  a tonemap pass — is real work, so decide before the post-processing shaders, not after.
+  targets + tonemapping). Portal 2 ships HDR-lit maps. ~~Still open, and now deferred by
+  default~~ — **half answered, and the half that was answered turned out not to need the
+  other.** The tone mapper has landed (`portdocs/CLIENT_TONEMAP.md`, `src/materials/post.rs`,
+  `src/client/tonemap.rs`), and it needed **no float target**: Valve applies the exposure
+  scalar in `FinalOutput` before the sRGB write in *both* HDR modes, so an 8-bit sRGB
+  frame buffer written pre-exposed already is `HDR_TYPE_INTEGER`'s, which is what this
+  port has. What it did need was for the scene to stop going straight to the back buffer,
+  because the controller has to measure the frame it exposes and a swap-chain image cannot
+  be sampled — so the scene target and the presenting pass that `_rt_FullFrameFB` and
+  `Engine_Post` were are now there, and the rest of the post chain has somewhere to go.
+
+  **What is still open is `HDR_TYPE_FLOAT` specifically**, and it is no longer free: a
+  float scene target would stop the picture clipping at 1.0, which moves the 98th
+  percentile the exposure is aimed at, so it is a retune of `CLIENT_TONEMAP.md` §4's
+  constants as well as a format change. The swap chain itself stays SDR
+  (`SurfaceColorSpace::Auto`), which is a separate question again — that one is about the
+  *display*, not about the render path.
 - **Threading.** The queued context is deleted (§5.3), but the eventual replacement —
   parallel command encoding — should be designed for, not retrofitted. *Stage 4 update:
   the property is held so far.* `RenderContext` owns its arenas and reaches no global

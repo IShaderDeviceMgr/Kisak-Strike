@@ -492,8 +492,13 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   pair, which is what Valve's *sort ID* was, and the page is bind group 3 rather than part
   of the material, because one material spans as many pages as its surfaces needed.
   **Portal 2 ships HDR-only maps** (`sp_a1_intro1`'s `LUMP_LIGHTING` is empty), which
-  narrows the HDR open question to the render path: the lightmaps are HDR either way, and
-  what is still missing is a float target and a tone mapper.
+  narrows the HDR open question to the render path. **The tone mapper has since landed**
+  (`portdocs/CLIENT_TONEMAP.md`): the scene is drawn into an offscreen target, a compute
+  pass bins its pixels by luminance, and `src/client/tonemap.rs` picks the exposure the
+  shaders multiply by — which is where Valve applies it too, in both HDR modes. What is
+  still open is only the *float target*, i.e. `HDR_TYPE_FLOAT`; the port's 8-bit sRGB
+  frame buffer written pre-exposed is `HDR_TYPE_INTEGER`'s, and that is what the tone
+  mapper was ported against.
   `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the

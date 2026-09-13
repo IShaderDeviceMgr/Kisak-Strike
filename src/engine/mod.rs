@@ -41,6 +41,7 @@
 //! one run is one tick, which is what makes `wait 1` mean "next frame".
 
 pub mod console;
+mod exposure;
 pub mod host;
 pub mod input;
 pub mod trace;
@@ -51,12 +52,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::client::player::{VEC_HULL_MAX, VEC_HULL_MIN};
-use crate::client::{Client, MoveType, BUTTONS};
+use crate::client::{tonemap, Client, MoveType, BUTTONS};
 use crate::cmdline::CommandLine;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::{Camera, Load};
+use crate::materials::pipeline::TargetFormat;
 use crate::materials::renderer::Frame;
-use crate::materials::{Material, MaterialCache, MaterialPreview, RenderContext, CLEAR_COLOR};
+use crate::materials::{
+    Material, MaterialCache, MaterialPreview, PostProcess, RenderContext, CLEAR_COLOR,
+};
 
 use self::trace::{disp_surf, Contents, Ray};
 use console::{
@@ -123,6 +127,14 @@ struct Scene<'a> {
     device: wgpu::Device,
     materials: MaterialCache,
     context: RenderContext,
+    /// Where the scene is drawn, how bright it came out, and what puts it on
+    /// the screen (`src/materials/post.rs`).
+    ///
+    /// In [`Scene`] rather than beside the renderer for the same reason the
+    /// material cache is: it is sized to the window and reallocated from
+    /// inside [`Engine::render`], which is the one place that has both a
+    /// [`Frame`] and the exposure the client chose.
+    post: PostProcess,
     world: Option<World>,
     /// `-vmt <name>`: one material on two cubes, drawn *instead of* the world.
     /// See [`Engine::render`].
@@ -152,6 +164,7 @@ impl<'a> Engine<'a> {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        target: TargetFormat,
         vfs: Option<&'a Vfs>,
         command_line: Option<&CommandLine>,
         test_material: Option<&str>,
@@ -218,6 +231,12 @@ impl<'a> Engine<'a> {
                 "trace",
                 "Trace from the eye along the view. `trace hull` sweeps the player hull.",
             ),
+            // Also this port's own, and for the same reason: it is the only
+            // way to see what the exposure controller is doing. Valve's
+            // equivalent is `mat_show_histogram`, 200 lines of `Viewport` and
+            // `ClearBuffers` used as a bar chart (`viewpostprocess.cpp:1115`),
+            // which is not worth rebuilding in `egui` to read six numbers.
+            CommandSpec::new("tonemap", "Report what the exposure controller is doing."),
         ] {
             console
                 .register_command(spec)
@@ -269,6 +288,7 @@ impl<'a> Engine<'a> {
                 device: device.clone(),
                 materials,
                 context,
+                post: PostProcess::new(device, queue, target, &tonemap::bucket_bounds()),
                 world: None,
                 preview,
                 client,
@@ -628,23 +648,44 @@ impl<'a> Engine<'a> {
 
     /// Records the frame.
     ///
-    /// One pass, clearing colour and depth, with the world in it. A frame with
-    /// no map loaded still clears, so that the window is a window rather than
-    /// whatever was behind it.
+    /// The world goes into an offscreen target, the exposure controller is
+    /// given the measurement of the *previous* frame, and the result is put on
+    /// the back buffer. That is `CViewRender::RenderView`
+    /// (`viewrender.cpp:2989` onwards) reduced to the three steps this port
+    /// has: `UpdateMaterialSystemTonemapScalar`, the scene, and
+    /// `DoEnginePostProcessing`.
+    ///
+    /// A frame with no map loaded still clears, so that the window is a window
+    /// rather than whatever was behind it.
     ///
     /// `-vmt` draws its cubes *instead of* the world, and owns the frame when
     /// it is set: it is an inspector for one material, so anything else in the
-    /// shot defeats the purpose.
+    /// shot defeats the purpose — including the exposure, which is why it
+    /// draws straight to the back buffer and is never measured.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let camera = self.camera(frame.size());
         let curtime = self.scene.curtime;
+        // `gpGlobals->frametime`, which is what the exposure is smoothed
+        // against. Read before the split borrow below, since it is the host's.
+        let frametime = self.host.frame_time();
         let Scene {
             context,
             materials,
+            post,
             world,
             preview,
+            client,
             ..
         } = &mut self.scene;
+
+        // **Unconditionally, and before anything branches.** This is what
+        // drains the readback slots, so skipping it on a frame that draws
+        // nothing would leave a measurement recorded and never collected, and
+        // eventually no slot free to record into. It is also
+        // `DoTonemapping`'s first act.
+        if let Some(counts) = post.measurement() {
+            client.tonemap_mut().measured(counts.as_slice(), frametime);
+        }
 
         if let Some((preview, material)) = preview {
             context.draw_preview(frame, materials.pipelines(), preview, material, curtime);
@@ -659,15 +700,30 @@ impl<'a> Engine<'a> {
             return;
         };
 
-        // A drawing frame clears as part of its first pass instead, rather
-        // than paying for two passes over the target.
-        let mut pass = context.pass(
-            frame,
-            materials.pipelines(),
-            &camera,
-            Load::Clear(CLEAR_COLOR),
-        );
-        world.draw(&mut pass);
+        // `UpdateMaterialSystemTonemapScalar` (`viewrender.cpp:2989`), which
+        // runs **before** the scene is drawn and not after it: this is the
+        // number the whole frame is multiplied by, and a pass that has already
+        // opened has its constants written.
+        let tonemap = client.tonemap_mut();
+        context.set_exposure(tonemap.scale());
+        let measure = tonemap.measuring().then(|| tonemap.exposure_region());
+
+        // The block ends both borrows of `post` before `resolve` takes it
+        // mutably.
+        {
+            // A drawing frame clears as part of its first pass instead, rather
+            // than paying for two passes over the target.
+            let scene = post.scene(frame.size());
+            let mut pass = context.target_pass(
+                frame,
+                materials.pipelines(),
+                scene,
+                &camera,
+                Load::Clear(CLEAR_COLOR),
+            );
+            world.draw(&mut pass);
+        }
+        post.resolve(frame, measure);
     }
 
     /// Where the view is: [`ViewSetup`](crate::client::ViewSetup) turned into
@@ -845,6 +901,56 @@ impl CommandSink for Console<'_> {
         // `kCommandSrcUserInput`: this came from a key the user pressed, which
         // is the distinction `ENGINE_CONSOLE.md` §4.7 exists to preserve.
         Console::enqueue(self, command, Source::UserInput);
+    }
+}
+
+/// The `tonemap` command: what the exposure controller is doing, in text.
+///
+/// `CTonemapSystem::DisplayHistogram` (`viewpostprocess.cpp:1115`) without the
+/// bar chart. The three lines it prints are the three its `Con_NPrintf` calls
+/// printed, plus the buckets themselves — which Valve only ever drew.
+fn tonemap_command(client: &Client, cx: &mut ExecContext<'_>) {
+    let tonemap = client.tonemap();
+    let (min, max) = tonemap.exposure_range();
+    cx.print(&format!(
+        "exposure {:.3} -> {:.3}, allowed {min:.2}..{max:.2}{}",
+        tonemap.current(),
+        tonemap.target(),
+        match tonemap.measuring() {
+            true => "",
+            false => " (mat_dynamic_tonemapping 0)",
+        }
+    ));
+
+    let Some((actual, wanted)) = tonemap.bright_end() else {
+        cx.print("no frame has been measured yet");
+        return;
+    };
+    cx.print(&format!(
+        "bright end at {:.1}% of range, wants {:.1}%; median {:.1}%",
+        actual * 100.0,
+        wanted * 100.0,
+        tonemap.median_luminance().unwrap_or(0.0) * 100.0,
+    ));
+
+    // The buckets, darkest first, as a share of the pixels measured. A width
+    // rather than a count, because what matters is the shape.
+    let buckets = tonemap.histogram();
+    let total: u32 = buckets.iter().sum();
+    let bounds = tonemap::bucket_bounds();
+    for (i, &count) in buckets.iter().enumerate() {
+        let share = match total {
+            0 => 0.0,
+            total => count as f32 / total as f32,
+        };
+        cx.print(&format!(
+            "{:5.3}..{:5.3} {:6.2}% {:7} {}",
+            bounds[i],
+            bounds[i + 1],
+            share * 100.0,
+            count,
+            "#".repeat((share * 50.0).round() as usize),
+        ));
     }
 }
 
@@ -1105,6 +1211,7 @@ impl CommandTarget for EngineCommands<'_> {
                 None => cx.print("impulse <number>"),
             },
             "trace" => trace_command(self.world, self.client, cmd, cx),
+            "tonemap" => tonemap_command(self.client, cx),
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
 
@@ -1325,6 +1432,24 @@ mod tests {
             button,
             repeat: false,
         }
+    }
+
+    /// The one thing joining `client/`'s exposure policy to `materials/`'s
+    /// measurement is that they agree on how many buckets there are, and the
+    /// two modules deliberately do not name each other. This is where they
+    /// meet, so this is where the agreement is checked — [`Engine::new`] would
+    /// otherwise panic inside `Histogram::new`, at startup, on a GPU.
+    #[test]
+    fn the_tone_mapper_s_buckets_fit_the_histogram_shader() {
+        assert_eq!(
+            tonemap::bucket_bounds().len() - 1,
+            tonemap::BUCKETS,
+            "one boundary more than there are buckets"
+        );
+        // A `const` block, so a bucket table that outgrew the shader's
+        // workgroup scratch array would not compile rather than panic on a
+        // machine with a GPU.
+        const { assert!(tonemap::BUCKETS <= crate::materials::histogram::MAX_BUCKETS) };
     }
 
     #[test]

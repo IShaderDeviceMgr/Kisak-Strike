@@ -469,6 +469,7 @@ impl<'a> GameWindow<'a> {
         let mut engine = Engine::new(
             renderer.device(),
             renderer.queue(),
+            renderer.target_format(),
             self.boot.vfs,
             self.boot.command_line,
             self.boot.test_material,

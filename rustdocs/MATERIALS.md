@@ -1,10 +1,11 @@
 # `src/materials/` — API reference
 
-The material system. Right now that means six things: the GPU device and the frame
+The material system. Right now that means seven things: the GPU device and the frame
 boundary; the texture path from a `.vtf` on disk to a sampler on the GPU; the material
 path from a `.vmt` to a compiled pipeline; the geometry that pipeline draws; the render
-context that opens a pass and puts a camera behind it; and the lightmap atlas a map's
-baked lighting is packed into.
+context that opens a pass and puts a camera behind it; the lightmap atlas a map's baked
+lighting is packed into; and the post-processing chain that draws the scene somewhere it
+can be read, measures how bright it came out, and puts it on the screen.
 
 Porting design doc: [`portdocs/MATERIALSYSTEM.md`](../portdocs/MATERIALSYSTEM.md) — named
 after the *original* module (`materialsystem/`), while this file is named after the Rust
@@ -13,10 +14,10 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~14,900 Rust including tests, plus ~1,200 of WGSL |
-| Tests | 168 (`cargo test materials`) — 28 of them run on a real GPU |
+| Lines | ~17,400 Rust including tests, plus ~1,500 of WGSL |
+| Tests | 190 (`cargo test materials`) — 38 of them run on a real GPU |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-6 of 8.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, and `VertexLitGeneric`. Stage 6's remaining shaders and stages 7-8 not started |
+| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, and the scene target + luminance histogram the tone mapper measures. Stage 6's remaining shaders and stages 7-8 not started |
 
 ```
 src/materials/
@@ -34,12 +35,16 @@ src/materials/
   mesh.rs          SimpleVertex, WorldVertex, ModelVertex, VertexLayout, VertexBuffer, IndexBuffer, DynamicBuffers
   target.rs        DepthBuffer, RenderTarget, DEPTH_FORMAT — what a pass draws into
   context.rs       RenderContext, Pass, Camera, Load, StateOverride — passes and the constants under them
+  post.rs          PostProcess — the scene target, the measurement, and the pass that presents it
+  histogram.rs     Histogram, Counts, Region — a luminance histogram of a texture, on the GPU
   preview.rs       MaterialPreview — the stage-4 verification draw. Temporary
   ui.rs            UiRenderer — the egui pass over the frame. Not part of the material system
   shaders/prelude.wgsl             the shared prelude (§7.5)
   shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
   shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
+  shaders/blit.wgsl                one texture onto another, full screen
+  shaders/histogram.wgsl           a compute pass that bins a frame's pixels by luminance
   error.rs         RendererError, VtfError, VmtError, TextureError
 ```
 
@@ -1595,6 +1600,146 @@ Multiple colour attachments (`MAX_RENDER_TARGETS` is 4) are not implemented: the
 things in the tree that bind more than one are a lighting-preview G-buffer path behind an
 `#if 0` and CS:GO's `character_ssao`.
 
+`RenderTarget::view()` is public because
+[`PostProcess::record`](#postprocess--the-scene-target-and-the-measurement) takes a
+`wgpu::TextureView`: a swap-chain image is one and nothing else, so anything that can
+present into the back buffer must be able to present into a render target too. Opening a
+*material* pass against a target still goes through `RenderContext::target_pass`, which is
+what decides the pass's constants.
+
+
+## Post-processing and exposure
+
+`src/materials/post.rs` and `src/materials/histogram.rs`. Porting analysis:
+[`portdocs/CLIENT_TONEMAP.md`](../portdocs/CLIENT_TONEMAP.md).
+
+**The scene is no longer drawn straight to the back buffer.** It goes into an offscreen
+target the same size and format, which is then measured and blitted forward. The reason is
+one sentence: the exposure controller has to look at the frame it is exposing, and a
+swap-chain image cannot be sampled. That is what `_rt_FullFrameFB` and
+`UpdateScreenEffectTexture` were, with the copy folded into the rendering rather than done
+afterwards.
+
+The **policy** — what the buckets are, what to do with the counts, how fast to react —
+is **not here**. It is `crate::client::tonemap`, which names no `wgpu` type, the same way
+this module names no cvar. See [`rustdocs/CLIENT.md`](CLIENT.md).
+
+### `PostProcess` — the scene target and the measurement
+
+```rust
+pub struct PostProcess;
+impl PostProcess {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue,
+               format: TargetFormat, bounds: &[f32]) -> PostProcess;
+
+    pub fn scene(&mut self, size: (u32, u32)) -> &RenderTarget;   // panics on zero
+    pub fn measurement(&mut self) -> Option<Counts>;
+    pub fn resolve(&mut self, frame: &mut Frame<'_>, measure: Option<(f32, f32)>);
+    pub fn record(&mut self, encoder: &mut wgpu::CommandEncoder,
+                  destination: &wgpu::TextureView, measure: Option<(f32, f32)>);
+    pub fn buckets(&self) -> usize;
+}
+```
+
+A frame that draws the world looks like this, and `Engine::render` is the one caller:
+
+```rust
+// Before anything branches: this drains the readback and is `DoTonemapping`'s first act.
+if let Some(counts) = post.measurement() {
+    client.tonemap_mut().measured(counts.as_slice(), frametime);
+}
+
+// `UpdateMaterialSystemTonemapScalar` — *before* the scene, not after it.
+context.set_exposure(client.tonemap_mut().scale());
+let measure = tonemap.measuring().then(|| tonemap.exposure_region());
+
+{
+    let scene = post.scene(frame.size());
+    let mut pass = context.target_pass(frame, pipelines, scene, &camera, Load::Clear(CLEAR_COLOR));
+    world.draw(&mut pass);
+}
+post.resolve(frame, measure);
+```
+
+`measure` is `mat_exposure_center_region_x`/`_y` — the fraction of the target's width and
+height the exposure is taken over. `None` presents without measuring, which is what
+`mat_dynamic_tonemapping 0` asks for.
+
+**The scene target has the back buffer's exact format**, so every pipeline built for the
+back buffer draws into it unchanged. A different colour format here would double the
+pipeline count, because `TargetFormat` is part of `PipelineKey`. It is 8-bit and sRGB for
+the same reason Valve's was: the shaders apply the exposure scalar themselves and write
+encoded, which is `HDR_TYPE_INTEGER`'s frame buffer. A float target is `HDR_TYPE_FLOAT`
+and a separate decision — `portdocs/MATERIALSYSTEM.md` §10.
+
+It carries **its own depth buffer**. The one `Renderer` keeps for the back buffer is still
+there and is still what a pass drawn straight to the screen uses (`-vmt`, `Frame::clear`);
+a depth attachment must match its colour attachment's dimensions, not merely its size, so
+they cannot be one allocation.
+
+The UI is drawn *after* `resolve`, straight onto the back buffer, so it is neither measured
+nor round-tripped. That is where `vgui` sat too.
+
+### `Histogram` — the measurement itself
+
+```rust
+pub const MAX_BUCKETS: usize = 16;
+
+pub struct Counts { pub buckets: [u32; MAX_BUCKETS], pub len: usize }
+impl Counts {
+    pub fn as_slice(&self) -> &[u32];
+    pub fn total(&self) -> u32;
+}
+
+pub struct Region { pub x: u32, pub y: u32, pub width: u32, pub height: u32 }
+impl Region {
+    pub fn centered(width: u32, height: u32, fraction_x: f32, fraction_y: f32) -> Region;
+}
+
+pub struct Histogram;
+impl Histogram {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, bounds: &[f32]) -> Histogram;
+    pub fn len(&self) -> usize;
+    pub fn set_source(&mut self, source: &wgpu::TextureView);
+    pub fn record(&mut self, encoder: &mut wgpu::CommandEncoder, region: Region) -> bool;
+    pub fn take(&mut self) -> Option<Counts>;
+}
+```
+
+`bounds` is `count + 1` ascending luminance boundaries; bucket `i` covers
+`[bounds[i], bounds[i + 1])`. The first and last are widened by the shader — everything
+darker than `bounds[1]` lands in bucket 0 and everything from the last lower bound up lands
+in the last — which is what Valve's `-1e20`/`+1e20` special cases did, arrived at by
+construction instead of by special case.
+
+One compute dispatch bins every pixel into every bucket, where Valve issued **one occlusion
+query per frame** over sixteen buckets and therefore worked from a histogram sixteen frames
+old and rebuilt in a rolling wave. The question is kept; the encoding is not.
+
+The luminance formula *is* Valve's, unchanged:
+`dot(rgb, vec3(0.2125, 0.7154, 0.0721))`.
+
+### The readback is never waited on
+
+`record` queues the dispatch and a copy into one of two staging buffers; `take` picks up
+whatever has finished. Nothing blocks, so a measurement is about two frames old and a frame
+with nothing ready is a frame the exposure does not move on.
+
+**`take` is also what arms the readback**, one call after the record, and that ordering is
+not a style choice: `map_async` on a buffer whose copy has been *recorded* but not
+*submitted* would map it immediately, and the submit would then be a validation error for
+writing into a mapped buffer. Deferring by one call means the frame it was recorded into
+has been presented. Call `PostProcess::measurement` **once at the top of a frame,
+unconditionally** — skipping it on a frame that draws nothing leaves a measurement
+recorded and never collected, and eventually no staging buffer free to record into.
+
+### What it costs
+
+Measured by `engine::exposure` on `sp_a1_intro1` at 1280x720, release, an M1 Pro:
+**0.008 ms of CPU per frame** to record the compute dispatch and the presenting pass,
+against 1.21 ms for the world draw they sit around. One screen-sized texture, one
+screen-sized depth buffer, and two 64-byte staging buffers.
+
 
 ## Invariants and gotchas
 
@@ -1705,10 +1850,13 @@ Ordered by how likely each is to bite.
     over as many atlas pages as the packer needed, so the page is bound per *batch* with
     `Pass::bind_lightmap_page` — that is what Valve's sort ID encodes. Putting it in the
     material's bind group would mean one `Material` per page.
-23. **HDR lightmaps reach the shader unexposed.** `cLightScale.x` is 1.0 because there is
-    no tone mapper, so a map is as bright as `vrad` left it — dimmer than the shipped
-    game, which auto-exposes. It is one uniform field, not a redesign; see the divergence
-    table.
+23. **`RenderContext::set_exposure` takes effect on the *next pass opened*, not on one
+    already open.** The frame block is written when a pass opens, and rewriting the buffer
+    underneath a recorded draw would reach every draw in the frame rather than the ones
+    after it — gotcha #5, in its most tempting form. Set it before the scene pass, which
+    is also where `UpdateMaterialSystemTonemapScalar` sits (`viewrender.cpp:2989`).
+    (This gotcha used to read "HDR lightmaps reach the shader unexposed". They do not any
+    more; see [Post-processing and exposure](#post-processing-and-exposure).)
 24. **A parameter with a non-type default must be read with `init_float`/`init_vec`, not
     `param_value`.** There are two default mechanisms and `param_value` is the second one,
     so `param_value(..., "$detailscale").unwrap_or( 4.0 )` compiles, reads correctly and
@@ -1742,6 +1890,24 @@ Ordered by how likely each is to bite.
     interpolated result. Lighting it per pixel instead is prettier and wrong: content was
     authored against the flatter shading, and a lighting number measured at the middle of
     a surface will not match what the middle pixel shows.
+30. **`PostProcess::measurement` must be called once a frame, unconditionally, before
+    anything branches.** It is what arms the previous frame's readback as well as what
+    returns it, so a frame that returns early without calling it strands a staging buffer
+    — and after two such frames there is none free and the exposure silently stops
+    adapting for ever. See [the readback](#the-readback-is-never-waited-on).
+31. **The histogram measures *linear* light, and the bucket boundaries are linear.** An
+    sRGB texture decodes on `textureLoad`, which is what makes that true for free, and it
+    is what `dev/lumcompare.vmt` got by leaving `$LINEARREAD_BASETEXTURE` unset. Valve's
+    own comment at `CHistogramBucket::IssueQuery` says "gamma-space" and is stale. Reading
+    the boundaries as gamma values puts the exposure target at 0.32 linear instead of 0.65
+    and halves every scene; `an_srgb_source_is_measured_in_linear_light` is the test that
+    pins it, because the decode is an assumption rather than something visible in the
+    source.
+32. **`Histogram::set_source` is explicit, and forgetting it after a resize is a
+    validation error rather than a wrong number.** A `wgpu::TextureView` carries no
+    identity a caller could compare against, so the bind group cannot be invalidated
+    automatically. `PostProcess::scene` does both halves, which is why nothing outside
+    this module has to remember.
 
 ## Deliberate divergences from Valve's behavior
 
@@ -1769,7 +1935,11 @@ Each of these changes what the engine does, and each names the thing that revers
 | Bumpedness is read from `SURF_BUMPLIGHT`, not re-derived from the material | the flag is the file describing its own layout; Valve's engine re-derives it and reads the lump at the wrong stride if a `.vmt` changed after compilation. The two are reconciled rather than assumed equal | `LightmapAtlas::write` |
 | Only lightstyle 0 is baked into the atlas | the other three are switchable and animated lights, and summing them needs `LightStyleValue( style )` and a per-frame page rebuild (`R_BuildLightMap`) — the whole dynamic lighting path. `WorldStats::faces_with_lightstyles` counts the surfaces this understates | — |
 | A map with interleaved lightmap alpha is refused | `LVLFLAGS_LIGHTMAP_ALPHA` puts a CS:GO-era cascaded-shadow term between every face's samples, so the stride changes for the whole lump. Portal 2 does not set it; misreading it would draw noise | `BspError::UnsupportedLightmapAlpha` |
-| No tone mapping: `cLightScale` is all ones | HDR lightmaps arrive in `[0..16]` and `SetToneMappingScaleLinear` normally carries the exposure the tone-map controller chose. There is no controller, so a map is as bright as `vrad` left it | `FrameUniforms::light_scale` |
+| `cLightScale.y` (`LIGHT_MAP_SCALE`) is 1 where Valve's integer-HDR mode uses 16 | `GetLightMapScaleFactor()` is 16 for an HDR-*integer* lightmap page and 1 for an HDR-*float* one, and this port's pages are `Rgba16Float` holding the numbers. Not a placeholder — the right factor for the format in use | `uniforms::LIGHTMAP_SCALE` |
+| `cLightScale.z` (`ENV_MAP_SCALE`) is 1 where Valve's integer-HDR mode uses 16 | that 16 decodes a cube map stored in a compressed HDR encoding. Whether this port's `.vtf` cube-map path produces values in that encoding is a question about `$envmap`, not about exposure, and answering it here would rescale every specular reflection in the game as a side effect | `uniforms::ENVMAP_SCALE` |
+| Histogram buckets are half-open; Valve's were closed | `luminance_compare_ps2x.fxc` tests `step(min, l) * step(l, max)`, so a pixel on a boundary is counted by both neighbours and the bucket totals do not sum to the pixel count. With an 8-bit frame buffer large flat areas quantize to one value, so that is not a corner case. Here `Counts::total()` is the pixel count, and nothing downstream depended on the double counting | `shaders/histogram.wgsl`'s bucket search |
+| The scene is drawn offscreen and blitted forward, where Valve drew to the back buffer and *copied* | a swap-chain image cannot be sampled, and on some backends cannot be copied from either. One full-screen textured triangle, and the same decode-then-encode round trip `UpdateScreenEffectTexture` + `Engine_Post` charged in the shipped game — accurate to within one of 255 steps per channel | `PostProcess::scene`/`resolve` |
+| The whole histogram is one frame's worth; Valve's was sixteen frames old | one occlusion query per frame (`MAX_QUERIES_PER_FRAME` is 1) over sixteen buckets, rebuilt in a rolling wave. `SetTonemapScale`'s per-frame step cap exists partly to damp that wave and is kept anyway, because it is also what bounds the adaptation rate | `histogram.rs` |
 | The dynamic geometry arena grows instead of overflowing | `CDynamicVB` was a fixed allocation and callers split batches to fit. The `*_remaining` queries are still there for callers that want to | `mesh::ARENA_BYTES` |
 | **Half-lambert is read from `$halflambert` again** | the tree this port is derived from hard-codes `bHalfLambert = false` over a commented-out read of the flag, with the comment *"Disabling half-lambert for CSGO (not compatible with CSM's, causes bad shadow aliasing)"* (`vertexlitgeneric_dx9_helper.cpp:679`). Portal 2 has no cascaded shadow maps and neither does this port, so the commented-out line is the behaviour and the constant is the divergence | `shader::vertex_lit_uniforms` |
 | **`SoftenCosineTerm` is not applied to the diffuse term** | `(d + d²)/2` (`common_fxc.h:112`), tagged `// For CS:GO` at both of its call sites (`common_vs_fxc.h:796`, `common_vertexlitgeneric_dx9.h:99`). It changes the falloff of every lit surface in the game and postdates Portal 2 | `cosine_term` in `vertexlitgeneric.wgsl` |
@@ -1834,6 +2004,16 @@ nobody looks for them:
   §7.8 puts them with the shaders that share them, and each needs content to verify
   against. They are left out of the parameter table rather than declared-and-ignored,
   because a table that lists a parameter is a promise that setting it does something.
+- **Everything in `DoEnginePostProcessing` past the two steps exposure needed.** Bloom
+  (`Generate8BitBloomTexture` and its downsample/blur chain), colour correction, local
+  contrast, the vignette, film grain, depth of field, software AA and FXAA. Each is a
+  screen-space pass that would go *between* `PostProcess`'s scene target and its presenting
+  pass, which is why the seam is where it is;
+  [`portdocs/CLIENT_TONEMAP.md`](../portdocs/CLIENT_TONEMAP.md) §7 ranks them. Bloom is the
+  most visible thing still missing and Portal 2 leans on it.
+- **A float scene target** — `HDR_TYPE_FLOAT`. It would change what the histogram means,
+  because nothing would clip at 1.0 any more and the 98th percentile would move, so it is
+  the tone mapper's tuning constants as well as a format. §10.
 - **Material proxies.** `IMaterialProxy` and the `CreateInterface`-registered factory. The
   concept survives as a per-frame hook over the vars; the factory does not.
 - **`$frame` animation.** Read but not acted on — `TextureCache` loads frame 0 (see the
@@ -1967,9 +2147,9 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 
 ## Test coverage
 
-143 tests, in two groups.
+189 tests, in two groups.
 
-**Pure logic, no GPU** (124) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (145) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
@@ -1985,6 +2165,7 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 | `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
 | `mesh` (6) | the vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
+| `histogram` (5, of 13) | `Region::centered` against `mat_exposure_center_region_x`/`_y`, including the border truncation that matches Valve's float-to-int conversion and the floor that stops a rectangle collapsing to nothing; and the `Params` block size WGSL declares |
 
 The `vtf` tests build files with an in-memory writer that can produce *archaic* and
 *malformed* ones deliberately — a 7.1 cubemap with its spheremap face, a 7.4 cubemap
@@ -1999,9 +2180,11 @@ module path apart, and its `near`/`far` are distances along `-z` rather than `z`
 first time round — the GPU depth test is what caught it, and this is the cheap check that
 keeps it caught.
 
-**End to end, on a real GPU** (28, in `preview.rs`) — a `.vmt` and a `.vtf`, through the
+**End to end, on a real GPU** (44 — 30 in `preview.rs`, 7 in `histogram.rs`, 5 in
+`post.rs`, and one each in `pipeline.rs` and `ui.rs`) — a `.vmt` and a `.vtf`, through the
 material system, onto the GPU, through real WGSL, and back to the CPU by rendering to an
-offscreen `RenderTarget` and reading the pixels back:
+offscreen `RenderTarget` and reading the pixels back. Each skips rather than fails on a
+machine with no usable adapter:
 
 | Test | What it would catch |
 |---|---|
@@ -2033,6 +2216,15 @@ offscreen `RenderTarget` and reading the pixels back:
 | `self_illumination_emits_where_the_lighting_is_black` | `$selfillum`, and with it the whole shader-supplied-defaults path — `$selfillummaskscale` reading 0 makes this test's quad black |
 | `a_bumped_model_takes_no_baked_vertex_light` | Valve's asymmetry between its two files: `bStaticLight = false` on the bumped path only |
 | `model_lighting_is_per_instance_and_two_draws_can_differ` | the group-3 arena — one lighting buffer rewritten between draws would give every draw in the frame the last values written |
+| `every_shader_compiles_and_builds_a_pipeline` (`pipeline.rs`) | a WGSL file nothing draws — that `lightmappedgeneric.wgsl` was never compiled by `cargo test` was itself a gap — and, for each, that the bind group layout and the `@group`/`@binding` declarations agree |
+| `an_srgb_source_is_measured_in_linear_light` | **the assumption the whole exposure loop rests on**: that `textureLoad` on an sRGB format decodes. Mid-grey is six buckets apart between the two readings, so a wrong answer is unmissable |
+| `every_pixel_lands_in_exactly_one_bucket` | the half-open bucket search, and that `Counts::total()` is the pixel count |
+| `only_the_region_is_measured` | the exposure rectangle reaching the dispatch — a histogram of the whole screen would expose for the corners |
+| `black_lands_in_the_first_bucket_and_nothing_is_lost` | the widened first bucket, which is Valve's `-1e20` |
+| `a_measurement_does_not_accumulate_across_frames` | the `clear_buffer` before the dispatch: without it the histogram only ever grows |
+| `the_scene_reaches_the_back_buffer_unchanged` | the presenting pass, byte for byte against the scene target — a blit that dropped or re-encoded a channel |
+| `the_measurement_is_of_the_scene_and_not_of_the_back_buffer` | the whole chain end to end, with a known linear grey landing in the bucket the tone mapper's boundaries put it in |
+| `the_scene_target_matches_the_back_buffer_and_is_reused_until_the_size_changes` | a reallocation every frame (a screen-sized texture per frame), and a format that would double the pipeline count |
 
 They earn the GPU: row pitch, block layout, channel order, winding, matrix convention,
 depth direction and bind group layout are all invisible to a unit test, and each produces

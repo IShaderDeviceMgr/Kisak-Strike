@@ -39,12 +39,14 @@
 pub mod button;
 pub mod movement;
 pub mod player;
+pub mod tonemap;
 pub mod usercmd;
 pub mod view;
 
 pub use button::{ButtonBits, Buttons, MoveButton, BUTTONS};
 pub use movement::MoveData;
 pub use player::{MoveType, Player};
+pub use tonemap::ToneMap;
 pub use usercmd::UserCmd;
 pub use view::{ViewAngles, ViewSetup};
 
@@ -142,6 +144,14 @@ pub struct Client {
     /// **command** by `DetermineKeySpeed`. See both for why the two are not the
     /// same thing.
     keyboard_sample_time: f32,
+    /// Auto exposure: `CTonemapSystem` (`game/client/viewpostprocess.cpp`).
+    ///
+    /// Here for the same reason the player is: `ResetToneMapping( 1.0 )` runs
+    /// at level load (`cdll_client_int.cpp:2470`), and loading a level is what
+    /// reaches a [`Client`]. It is the client's in the original too — the
+    /// exposure controller is game code, and only the *measurement* of the
+    /// frame it exposes belongs to the material system.
+    tonemap: ToneMap,
 }
 
 impl Client {
@@ -391,7 +401,20 @@ impl Client {
             tick_count: 0,
             impulse: 0,
             keyboard_sample_time: 0.0,
+            tonemap: ToneMap::new(console),
         }
+    }
+
+    /// The exposure controller: what the lit shaders multiply their output by,
+    /// and the policy that chooses it. See [`tonemap`].
+    pub fn tonemap(&self) -> &ToneMap {
+        &self.tonemap
+    }
+
+    /// [`tonemap`](Client::tonemap), for the one caller that drives it — the
+    /// engine, once a frame, from [`Engine::render`](crate::engine::Engine::render).
+    pub fn tonemap_mut(&mut self) -> &mut ToneMap {
+        &mut self.tonemap
     }
 
     /// What a `+command`/`-command` reaches.
@@ -441,6 +464,12 @@ impl Client {
     /// one's momentum is a bug you would spend a while attributing.
     pub fn spawn(&mut self, origin: Vec3, pitch: f32, yaw: f32) {
         self.player = Player::new(origin, pitch, yaw);
+        // `ResetToneMapping( 1.0 )` at `LevelInitPreEntity`
+        // (`cdll_client_int.cpp:2470`). Arriving at a new level carrying the
+        // last one's exposure means a second of visible adaptation over the
+        // first thing the player is shown — the same argument as dropping the
+        // velocity above, for the same reason.
+        self.tonemap.reset(1.0);
     }
 
     /// `impulse <n>` (`in_main.cpp:757`). Latched until the next command.

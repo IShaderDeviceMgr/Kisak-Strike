@@ -255,6 +255,15 @@ pub struct RenderContext {
     /// model rather than sample a lightmap page.
     lights: UniformArena,
     dynamic: DynamicBuffers,
+    /// What every pass opened from here multiplies its lit output by:
+    /// `CMatRenderContext::m_LastSetToneMapScale` (`cmatrendercontext.cpp:171`).
+    ///
+    /// On the context and not on a pass because it is per *frame* in every
+    /// sense that matters — `UpdateMaterialSystemTonemapScalar` is called once,
+    /// before the scene is drawn (`viewrender.cpp:2989`) — and because a
+    /// portal view or a water reflection must be exposed the same way the scene
+    /// around it is, or the seam is visible.
+    exposure: f32,
     /// Group 3 for a pass that has not bound a real lightmap page.
     ///
     /// `MATERIAL_SYSTEM_LIGHTMAP_PAGE_WHITE`, which `AllocateWhiteLightmap`
@@ -308,9 +317,38 @@ impl RenderContext {
                 INITIAL_LIGHTING,
             ),
             dynamic: DynamicBuffers::new(device),
+            // `CMatRenderContext::BeginRender`'s starting value, and what a
+            // context with no tone mapper keeps for ever: as bright as `vrad`
+            // left it.
+            exposure: 1.0,
             device: device.clone(),
             queue: queue.clone(),
         }
+    }
+
+    /// `IMatRenderContext::SetToneMappingScaleLinear`
+    /// (`cmatrendercontext.cpp:3291`), minus the two components of the vector
+    /// that never differed from the first.
+    ///
+    /// Valve's takes a `Vector` and every caller passes the same number three
+    /// times; the per-channel form only ever mattered for
+    /// `HDR_TYPE_INTEGER`'s `m_ToneMappingScale.y`/`.z`, which
+    /// [`tone_mapping_scale`](super::uniforms::tone_mapping_scale) derives from
+    /// the format rather than from the caller.
+    ///
+    /// Takes effect on the **next pass opened**, not on one already open: the
+    /// frame block is written when a pass opens, and rewriting the buffer
+    /// underneath a recorded draw would reach every draw in the frame rather
+    /// than the ones after it — `rustdocs/MATERIALS.md` gotcha #5.
+    pub fn set_exposure(&mut self, exposure: f32) {
+        self.exposure = exposure;
+    }
+
+    /// What [`set_exposure`](RenderContext::set_exposure) was last given.
+    /// `IMatRenderContext::GetToneMappingScaleLinear`.
+    #[allow(dead_code)]
+    pub fn exposure(&self) -> f32 {
+        self.exposure
     }
 
     /// Reclaims everything last frame allocated.
@@ -413,6 +451,7 @@ impl RenderContext {
             uniforms::from_mat4(camera.view_proj()),
             camera.eye.to_array(),
             size,
+            self.exposure,
         );
         let frame_offset = self.frames.push(
             &self.device,

@@ -7,12 +7,12 @@ Porting plan and the C++ inventory: [`portdocs/CLIENT.md`](../portdocs/CLIENT.md
 
 | | |
 |---|---|
-| Module | `crate::client`, with `client::{button, movement, player, usercmd, view}` |
-| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, and `FullNoClipMove`/`Accelerate` from `game/shared/gamemovement.cpp` |
-| Lines | 2,750 including tests |
-| Tests | 65 (`cargo test client::`) |
+| Module | `crate::client`, with `client::{button, movement, player, tonemap, usercmd, view}` |
+| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, `FullNoClipMove`/`FullWalkMove` from `game/shared/gamemovement.cpp` (via `portal_gamemovement.cpp`), and `CTonemapSystem` from `viewpostprocess.cpp` |
+| Lines | ~5,500 including tests |
+| Tests | 99 (`cargo test client::`) |
 | Dependencies | `std`, `glam`, and `crate::engine::console` for cvar handles. **Not `winit`, not `egui`, not `wgpu`, not `crate::engine::input`** |
-| Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8). Stage 5 waits for `net/` |
+| Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8), plus the tone mapper (`portdocs/CLIENT_TONEMAP.md`). Stage 5 waits for `net/` |
 
 ## This is not `src/engine/client/`
 
@@ -97,6 +97,10 @@ impl Client {
     pub fn toggle_noclip(&mut self) -> MoveType;
 
     pub fn view(&self, width: u32, height: u32) -> ViewSetup;     // CViewRender::SetUpView
+
+    pub fn player(&self) -> &Player;
+    pub fn tonemap(&self) -> &ToneMap;
+    pub fn tonemap_mut(&mut self) -> &mut ToneMap;
 }
 ```
 
@@ -311,6 +315,60 @@ pub fn scale_mouse(dx: f32, dy: f32, sensitivity: f32) -> (f32, f32);   // Scale
 the port takes the FIXME. `src/engine/client/`, when it arrives, asks rather than keeping
 a second copy.
 
+### `ToneMap` — auto exposure
+
+`src/client/tonemap.rs`. `CTonemapSystem` (`game/client/viewpostprocess.cpp:702`).
+Porting analysis: [`portdocs/CLIENT_TONEMAP.md`](../portdocs/CLIENT_TONEMAP.md).
+
+```rust
+pub const BUCKETS: usize = 16;
+pub fn bucket_bounds() -> [f32; BUCKETS + 1];        // UpdateBucketRanges
+
+pub struct ToneMap;
+impl ToneMap {
+    pub fn new(console: &mut Console<'_>) -> ToneMap;
+
+    pub fn scale(&mut self) -> f32;                  // UpdateMaterialSystemTonemapScalar
+    pub fn measured(&mut self, counts: &[u32], dt: f32);  // DoTonemapping
+    pub fn reset(&mut self, scale: f32);             // ResetToneMapping
+    pub fn measuring(&self) -> bool;                 // mat_dynamic_tonemapping
+    pub fn exposure_region(&self) -> (f32, f32);     // mat_exposure_center_region_x/_y
+    pub fn exposure_range(&self) -> (f32, f32);      // GetExposureRange
+
+    pub fn current(&self) -> f32;
+    pub fn target(&self) -> f32;
+    pub fn histogram(&self) -> &[u32; BUCKETS];
+    pub fn median_luminance(&self) -> Option<f32>;
+    pub fn bright_end(&self) -> Option<(f32, f32)>;  // (where it is, where it wants to be)
+}
+```
+
+**It names no GPU type.** The measurement is
+[`materials::histogram`](MATERIALS.md#post-processing-and-exposure)'s; this is arithmetic
+over the counts it hands back. The two meet in `Engine::render`, and that is the only
+place either one is driven. `ToneMap` lives on `Client` because `ResetToneMapping( 1.0 )`
+runs at level load and loading a level is what reaches a `Client` — `Client::spawn` does
+it, for the same reason it drops the player's velocity.
+
+The loop, which is one thing to get right and one thing to order right:
+
+```text
+frame N     scale()  ---> cLightScale.x ---> the scene is drawn exposed
+                                                     |
+                                              a histogram of *that* frame
+                                                     |
+frame N+2   measured(counts, dt) <-------------------+
+```
+
+**The measurement is of an already-exposed frame**, so `measured` treats its answer as a
+*correction* to the scale currently in force and multiplies by it
+(`ComputeTargetTonemapScalar`'s "Apply this against last frames scalar"). Reading it as an
+absolute exposure makes the loop oscillate instead of converge.
+
+The `tonemap` console command prints `current`, `target`, `exposure_range`, `bright_end`,
+`median_luminance` and the buckets. It is this port's own, the way `trace` is;
+`mat_show_histogram` and its 200-line bar chart are not ported.
+
 ## The cvars
 
 Registered by `Client::new`. Names, defaults, bounds and flags are Valve's; `FCVAR_NOTIFY`,
@@ -342,8 +400,29 @@ dropped rather than approximated.
 | `sv_stopspeed` | 80 | — | `movevars_shared.cpp:23` |
 | `sv_noclipspeed` / `sv_noclipaccelerate` | 5 | archive | `movevars_shared.cpp:25`, `:24` |
 
+`ToneMap::new` registers twelve more, all `FCVAR_CHEAT` and all Valve's
+(`viewpostprocess.cpp:83-135`):
+
+| Cvar | Default | What it does |
+|---|---|---|
+| `mat_dynamic_tonemapping` | 1 | 0 stops measuring; the exposure stays exactly where it was, which is not the same as forcing it to 1 |
+| `mat_autoexposure_min` / `mat_autoexposure_max` | 0.5 / 2 | the range the exposure may settle in |
+| `mat_autoexposure_max_multiplier` | 1.0 | scales the maximum |
+| `mat_hdr_uncapexposure` | 0 | replaces both ends with `0..100` |
+| `mat_force_tonemap_scale` | 0.0 | above zero, pins the exposure there — and *resets* the controller onto it, so clearing it resumes from the picture rather than from wherever the controller had drifted |
+| `mat_accelerate_adjust_exposure_down` | 40.0 | how much faster to darken than to brighten. **Inert below ~128 fps** — see gotcha #16 |
+| `mat_exposure_center_region_x` / `_y` | 0.9 / 0.85 | the fraction of the screen the exposure is measured over |
+| `mat_force_tonemap_percent_target` | -1 | overrides the 65% target. Negative means no override, and **zero is an override** |
+| `mat_force_tonemap_percent_bright_pixels` | -1 | overrides the 2% |
+| `mat_force_tonemap_min_avglum` | -1 | overrides the 3% median floor |
+
+Not registered, and each for a stated reason in `tonemap.rs`'s module docs:
+`mat_tonemap_algorithm` (only one algorithm is ported, so the cvar could not change
+anything), `mat_show_histogram` (the overlay is not ported), `mat_fullbright` (an
+engine-wide unlit mode, not a tone-mapping switch).
+
 Commands, registered by the engine alongside its own: the 22 `+`/`-` pairs from
-`BUTTONS`, plus `noclip` and `impulse`.
+`BUTTONS`, plus `noclip`, `impulse` and `tonemap`.
 
 ## Invariants and gotchas
 
@@ -495,6 +574,41 @@ Same ordering: most likely to bite first.
   `rustdocs/ENGINE.md`'s trace gotcha 1, and every one of this module's ~14 traces goes
   through `trace_player_bbox`, which is the only place that pairing is written down.
 
+### The tone mapper's own
+
+14. **The histogram measures an already-exposed frame, so `measured` produces a
+    *correction* and not an exposure.** It multiplies by the scale currently in force.
+    Treating the result as absolute makes the loop oscillate rather than converge, and it
+    is one line (`ComputeTargetTonemapScalar`'s "Apply this against last frames scalar").
+15. **`mat_dynamic_tonemapping 0` freezes the exposure where it is; it does not reset it
+    to 1.** That is Valve's behaviour and it is the difference between "stop adapting" and
+    "turn HDR off". `mat_force_tonemap_scale 1` is the second one.
+16. **`mat_accelerate_adjust_exposure_down` does nothing below about 128 fps.** The step
+    is capped at `(1/16) * 0.25` **per frame**, and the base rate is 2 per second, so
+    `rate * dt` exceeds the cap whenever a frame is longer than 1/128 s — at which point
+    darkening and brightening move by exactly the same amount. Measured, and tested both
+    ways. The same cap makes **adaptation frame-rate dependent** above that threshold.
+17. **The moving-average weights are `|i - 5| / 5`: the oldest sample counts most and the
+    *middle* one counts for nothing.** Nobody would write that on purpose and it is what
+    every Source game's exposure has been smoothed with. The buffer is also scrolled
+    *before* it is weighted, so the sample that lands on the zero-weight slot is the one
+    that was one place newer. Do not tidy it.
+18. **`bucket_bounds` are *linear-light* luminances.** Valve's comment at
+    `CHistogramBucket::IssueQuery` says "gamma-space" and is stale — `dev/lumcompare.vmt`
+    reads the frame buffer through an sRGB sampler. Reading them as gamma values puts the
+    65% target at 0.32 linear and halves every scene.
+19. **`ToneMap::scale` takes `&mut self`.** `mat_force_tonemap_scale` does not merely
+    report a different number, it *resets* the controller onto it, so that clearing the
+    cvar resumes from where the picture actually is.
+20. **A negative `mat_force_tonemap_*` means "no override", and zero is an override.** The
+    test is `>= 0.0`, so `mat_force_tonemap_percent_target 0` really does aim at 0%.
+21. **Without entities the exposure limits are the cvar defaults, and no shipped map uses
+    them.** 105 of Portal 2's 106 maps place an `env_tonemap_controller` and drive it from
+    map I/O; the commonest `SetAutoExposureMax` is 3 or 5 against this port's default of
+    2, and `sp_a1_intro1` asks for 1.5 at the spawn point. `portdocs/CLIENT_TONEMAP.md` §6
+    has the full census. `mat_autoexposure_max` from the console is the workaround until
+    `server/` exists.
+
 ## Not implemented, and why
 
 | | Why, and what unblocks it |
@@ -505,6 +619,10 @@ Same ordering: most likely to bite first.
 | Water — `CheckWater`, `WaterMove`, `WaterJump`, `CheckWaterJump`, water level and type | Needs a water level, which needs `CategorizePosition`'s water probes and the leaf water data the `.bsp` reader does not load. `full_walk_move` keeps the shape of the branch and takes the not-in-water side. Portal 2's goo is a `trigger_hurt` over a water brush, so this is a *drowning* feature more than a swimming one. |
 | Ladders — `LadderMove`, `MOVETYPE_LADDER`, `OnLadder` | **Deleted, not deferred.** `CPortalGameMovement::GameHasLadders()` returns `false` (`portal_gamemovement.h:132`), so none of it is reachable in Portal 2. |
 | The duck-jump machinery — `m_bInDuckJump`, `StartUnDuckJump`, `CanUnDuckJump`, `FinishUnDuckJump`, `UpdateDuckJumpEyeOffset`, `m_nJumpTimeMsecs` | **Unreachable in Portal 2**, and by Valve's choice: `CheckJumpButton` sets `bSetDuckJump = false` over a comment reading "temp fix for camera snapping when ducking in the air ( NO DUCKJUMP for now )". Nothing sets the timer, so every branch that reads it is dead. |
+| `env_tonemap_controller` — the map's own exposure limits, rate and percentage targets | `GetTonemapSettingsFromEnvTonemapController` (`c_env_tonemap_controller.cpp:97`) copies eight floats off the entity the local player points at, and they arrive over the wire. Needs `server/` and `net/`. When they land this is **one function** plus the `g_bUseCustomAutoExposure*` branch `ToneMap::exposure_range` is missing; `portdocs/CLIENT_TONEMAP.md` §6 has what the maps actually ask for. |
+| `mat_tonemap_algorithm 0` — the 31-bucket log-spaced original | Selected by matching the game directory against `{"dod", "cstrike", "lostcoast"}`, so unreachable for Portal 2, and a different bucket count *and* a different target formula. Deleted rather than deferred. |
+| `SetOverrideTonemapScale` | VScript and the commentary system call it; neither exists. `mat_force_tonemap_scale` covers it from a console. |
+| `DisplayHistogram` / `mat_show_histogram` | 200 lines of `Viewport` + `ClearBuffers` used as a bar chart. The `tonemap` command prints the same numbers. |
 | `CheckStuck`, `FixPlayerCrouchStuck`, `IsMovingPlayerStuck`, `UnblockPusher` | The unstick passes. They nudge a player out of geometry they should never have been in, and every path into that state needs entities — a door closing on you, a platform rising through you. |
 | `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | Fall damage, the landing sound and the landing animation. Needs health, sound and animation. |
 | Base velocity — conveyors, moving platforms, `GetBaseVelocity` | Entities. `SetGroundEntity`'s velocity exchange goes with it, and it is the reason Valve adds and subtracts it around every move. |
@@ -536,6 +654,12 @@ Same ordering: most likely to bite first.
 - **A new movement mode**: add a `MoveType` variant and an arm in `run_move`. Keep the
   work in `movement.rs` and keep it reading only `MoveData` — it is shared with the
   server that does not exist yet.
+- **Anything in the tone mapper**: keep `wgpu` out of `tonemap.rs`. If the measurement
+  needs to change shape, change `materials::histogram` and pass the result through
+  `measured`; if the *policy* needs a new input, it is a cvar or a parameter, not a
+  texture. The one thing the two modules share is the bucket count, and
+  `engine::tests::the_tone_mapper_s_buckets_fit_the_histogram_shader` is where that is
+  checked.
 
 ## Which tests guard what
 
@@ -597,3 +721,19 @@ player fits under.
 | `walking_turns_at_two_thirds_speed_and_moves_at_one_half` | `cl_anglespeedkey` 0.67 against `+speed`'s 0.5 |
 | `the_keyboard_budget_is_spent_once_per_frame`, `without_a_refill_keyboard_look_does_nothing`, `in_usekeyboardsampletime_zero_removes_the_budget` | gotcha 2 — the budget, its silent failure mode, and the cvar that removes it |
 | `engine::tests::a_bound_key_moves_the_camera_through_the_command_buffer` | the whole chain with nothing mocked: `bind` → press → command text → console → `Buttons` → `UserCmd` |
+| `client::tonemap::a_dark_frame_brightens_and_a_bright_frame_darkens` | the loop closing at all, in both directions |
+| `bucket_bounds_are_valve_s_power_distribution`, `bucket_bounds_tile_zero_to_one_and_ascend` | `(i/16)^2.5` against spot values, and that the buckets tile `[0, 1]` — which is what makes the percentile's telescoped range sum exact |
+| `the_target_is_a_correction_to_the_current_scale_and_not_a_replacement` | gotcha 14, as arithmetic: doubling the current scale doubles the answer |
+| `the_sticky_bin_reports_the_target_exactly` | the deadband, and that it makes the correction exactly 1 |
+| `the_percentile_is_linear_inside_the_bucket_it_lands_in` | the interpolation, which is the only part of `FindLocationOfPercentBrightPixels` with a wrong answer that looks plausible |
+| `the_median_floor_only_ever_brightens` | the secondary target, on a scene that is on target at the bright end and dark in the middle |
+| `the_exposure_range_bounds_where_it_can_settle`, `mat_hdr_uncapexposure_replaces_both_ends`, `a_minimum_above_the_maximum_widens_the_maximum` | `GetExposureRange`, all three branches |
+| `mat_dynamic_tonemapping_zero_freezes_the_exposure_where_it_is` | gotcha 15 — frozen, not reset |
+| `mat_force_tonemap_scale_pins_the_exposure` | that forcing is not clamped into the auto-exposure range |
+| `darkening_is_faster_than_brightening`, `the_per_frame_cap_hides_the_accelerated_darkening_below_128_fps` | gotcha 16, both sides of the threshold |
+| `the_moving_average_weights_are_valve_s_v_shape` | gotcha 17, including that the buffer is scrolled before it is weighted |
+| `one_step_is_capped_at_a_quarter_of_a_bucket` | the per-frame cap, against a ten-second frame |
+| `an_empty_histogram_leaves_the_exposure_alone`, `reset_forgets_the_history`, `reset_with_a_non_positive_scale_takes_the_middle_of_the_range` | the first frames of a level, and both arms of `ResetTonemappingScale` |
+| `a_negative_force_cvar_means_no_override` | gotcha 20 — including that zero *is* an override |
+| `engine::tests::the_tone_mapper_s_buckets_fit_the_histogram_shader` | the one thing `client/` and `materials/` must agree on while naming none of each other's types |
+| `engine::exposure::exposure_settles_on_a_real_map` (depot-gated) | the whole loop against real content: `sp_a1_intro1` drawn, measured and corrected for 120 frames, with the histogram printed |

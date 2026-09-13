@@ -63,11 +63,13 @@
 
 pub mod context;
 pub mod error;
+pub mod histogram;
 pub mod image_format;
 pub mod lightmap;
 pub mod material;
 pub mod mesh;
 pub mod pipeline;
+pub mod post;
 pub mod preview;
 pub mod renderer;
 pub mod shader;
@@ -88,6 +90,7 @@ pub use context::RenderContext;
 pub use error::RendererError;
 pub use image_format::ColorSpace;
 pub use material::{Material, MaterialCache};
+pub use post::PostProcess;
 pub use preview::MaterialPreview;
 pub use renderer::{Renderer, RendererOptions, CLEAR_COLOR};
 pub use ui::UiRenderer;

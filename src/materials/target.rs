@@ -138,10 +138,9 @@ impl DepthBuffer {
 /// `$basetexture` and a `.vtf` of the same name would silently shadow it. Here a
 /// render target is a value the caller holds, and binding one to a material is
 /// an explicit act.
-// No caller in the binary yet -- portal views, water reflections and the
-// post-processing chain are what allocate these, and none is ported. The GPU
-// tests render through one, which is where the render-to-texture-and-sample
-// path is checked.
+// `PostProcess` allocates one for the scene, and the GPU tests render through
+// one, which is where the render-to-texture-and-sample path is checked. Portal
+// views and water reflections are what will want the rest.
 #[allow(dead_code)]
 pub struct RenderTarget {
     color: Arc<Texture>,
@@ -207,7 +206,15 @@ impl RenderTarget {
         (self.color.width, self.color.height)
     }
 
-    pub(super) fn view(&self) -> &wgpu::TextureView {
+    /// The colour attachment's view, for a pass that is opened by hand.
+    ///
+    /// Public because [`PostProcess::record`](super::post::PostProcess::record)
+    /// takes one: a swap-chain image is a `TextureView` and nothing else, so
+    /// anything that can present into one must be able to present into this
+    /// too. Opening a *material* pass against a target still goes through
+    /// [`RenderContext::target_pass`](super::context::RenderContext::target_pass),
+    /// which is what decides the pass's constants.
+    pub fn view(&self) -> &wgpu::TextureView {
         self.color.view()
     }
 

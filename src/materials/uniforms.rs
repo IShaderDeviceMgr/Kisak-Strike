@@ -157,6 +157,8 @@ pub struct FrameUniforms {
     /// scales — the tone-mapping multipliers `FinalOutput` picks between.
     /// `UnlitGeneric` asks for none of them, but every lit shader does, and the
     /// point of a shared block is that it does not change per shader.
+    ///
+    /// Built by [`tone_mapping_scale`]; `x` is the only one that varies.
     pub light_scale: [f32; 4],
 
     /// `cScreenSize`, PS `c32`: `(width, height, 1/width, 1/height)`.
@@ -171,23 +173,75 @@ impl FrameUniforms {
         [0.0, f32::MIN, 0.0, 0.0]
     }
 
-    /// A frame with no fog, no tone mapping and the given view.
+    /// A frame with no fog, the given view, and the given exposure.
     ///
-    /// What the engine would upload before it has a fog controller or an
-    /// exposure curve — which is to say, all of stage 3.
-    pub fn new(view_proj: ColumnMajor, eye: [f32; 3], size: (u32, u32)) -> FrameUniforms {
+    /// `exposure` is what the tone mapper chose — 1.0 is "as bright as `vrad`
+    /// left it". There is still no fog controller, which is the other half of
+    /// what this block would carry in a finished engine.
+    pub fn new(
+        view_proj: ColumnMajor,
+        eye: [f32; 3],
+        size: (u32, u32),
+        exposure: f32,
+    ) -> FrameUniforms {
         let (width, height) = (size.0.max(1) as f32, size.1.max(1) as f32);
         FrameUniforms {
             view_proj,
             eye_pos_water_height: [eye[0], eye[1], eye[2], 0.0],
             fog_params: FrameUniforms::no_fog(),
             fog_color: [0.0, 0.0, 0.0, 1.0],
-            // `TONEMAP_SCALE_NONE` is a shader-side constant, but the scales
-            // themselves are still 1: no exposure, no HDR.
-            light_scale: [1.0, 1.0, 1.0, 1.0],
+            light_scale: tone_mapping_scale(exposure),
             screen_size: [width, height, 1.0 / width, 1.0 / height],
         }
     }
+}
+
+/// `LIGHT_MAP_SCALE`, `cLightScale.y`: what a sampled lightmap texel is
+/// multiplied by.
+///
+/// `CShaderAPIDx8::SetToneMappingScaleLinear` fills this from
+/// `GetLightMapScaleFactor()`, which is 16 for an HDR-integer page and **1 for
+/// an HDR-float one** (`shaderapidx8.cpp:16262`). This port's pages are
+/// `Rgba16Float` holding linear radiance — `rustdocs/MATERIALS.md`, "a page is
+/// the numbers" — so 1 is not a placeholder, it is the right factor for the
+/// format actually in use.
+pub const LIGHTMAP_SCALE: f32 = 1.0;
+
+/// `ENV_MAP_SCALE`, `cLightScale.z`: what a sampled cube map is multiplied by.
+///
+/// **16 in Valve's integer-HDR mode and 1 here, deliberately.** That 16 decodes
+/// a cube map stored in a compressed HDR encoding; whether this port's `.vtf`
+/// cube-map path produces values in that encoding or in plain linear is a
+/// question about [`Vtf`](super::vtf::Vtf) and `$envmap`, not about exposure,
+/// and answering it by changing this number would rescale every specular
+/// reflection in the game as a side effect of adding a tone mapper. Left where
+/// it was; see `portdocs/MATERIALSYSTEM.md` §10.
+pub const ENVMAP_SCALE: f32 = 1.0;
+
+/// `CShaderAPIDx8::SetToneMappingScaleLinear` (`shaderapidx8.cpp:16227`): one
+/// exposure scalar becomes the four components of `cLightScale`.
+///
+/// Valve's function branches on `GetHDRType()` and this takes the
+/// `HDR_TYPE_INTEGER` arm, because that is the frame buffer this port has: an
+/// 8-bit sRGB target that the shaders write *already exposed*, rather than a
+/// float target exposed by a later pass. The `HDR_TYPE_NONE` arm — `x` forced
+/// to 1 — is what `mat_hdr_level 0` would select and is not ported; the tone
+/// mapper turns itself off by choosing an exposure of 1, which reaches the same
+/// place without a second switch.
+///
+/// `w` is `LinearToGammaFullRange` — a plain `1/2.2` power, *not* the sRGB
+/// piecewise curve — and is read only by `TONEMAP_SCALE_GAMMA`, which no ported
+/// shader asks for yet. It is filled anyway, because the whole point of one
+/// shared constant block is that it does not depend on who is reading it.
+pub fn tone_mapping_scale(linear: f32) -> [f32; 4] {
+    [
+        linear,
+        LIGHTMAP_SCALE,
+        ENVMAP_SCALE,
+        // `powf` of a negative base is NaN; an exposure cannot be negative, but
+        // a uniform full of NaN would blank the screen rather than say so.
+        linear.max(0.0).powf(1.0 / 2.2),
+    ]
 }
 
 /// Constants that change once a draw — group 2, binding 0.

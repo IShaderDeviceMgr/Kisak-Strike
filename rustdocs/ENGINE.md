@@ -2367,8 +2367,9 @@ hands out `&mut` where one needs another, replacing the ambient `g_p*` globals. 
 which is now the order of the statements in `Engine::new`.
 
 ```rust
-pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, vfs: Option<&'a Vfs>,
-           command_line: Option<&CommandLine>, test_material: Option<&str>) -> Engine<'a>;
+pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: TargetFormat,
+           vfs: Option<&'a Vfs>, command_line: Option<&CommandLine>,
+           test_material: Option<&str>) -> Engine<'a>;
 
 pub fn boot(&mut self);                 // queues `exec valve.rc`; Host_Init's last act
 pub fn frame(&mut self, now: Instant) -> Option<Outcome>;
@@ -2390,13 +2391,16 @@ pub fn ui_bypasses(&self, button: Button) -> bool;  // the toggleconsole key
 
 The renderer stays with the window because the surface is tied to the window handle, and
 a live `Frame` borrows it; the engine takes device handles instead, which are cheap
-refcounted clones.
+refcounted clones. `target` is `Renderer::target_format()`, and it is a parameter rather
+than something the engine discovers because the scene render target
+([`PostProcess`](MATERIALS.md#post-processing-and-exposure)) must be allocated in the back
+buffer's exact format — a different one would double the pipeline count.
 
 Internally `Engine` is seven fields: the `Console`, the `ConsoleUi` that draws it, the
 `Host`, the `Input` (which owns the binding table), the engine's own `fps_max` handle with
 the generation it last saw, the two booleans that sequence startup, and a private `Scene`
-holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the `World`, the
-[`Client`](CLIENT.md) and `curtime`. `Scene` is what implements [`Level`], so
+holding the `Vfs`, the device, the `MaterialCache`, the `RenderContext`, the
+`PostProcess`, the `World`, the [`Client`](CLIENT.md) and `curtime`. `Scene` is what implements [`Level`], so
 `host.frame(&mut self.scene)` is a split borrow of two fields rather than `&mut self`
 twice — that is the whole reason for the split.
 
@@ -2415,8 +2419,42 @@ is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut In
 `&mut ConsoleUi` and `&mut Client` (which is `scene.client` — a field of a field, and
 disjoint from the rest).
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
-`key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`, and
-the 22 `+`/`-` button pairs from `client::BUTTONS`.
+`key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
+`trace`, `tonemap`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
+
+### `Engine::render` — the frame, in four steps
+
+`CViewRender::RenderView` (`viewrender.cpp:2989` onwards), reduced to what this port has:
+
+```text
+post.measurement()          drain the readback, feed client.tonemap   DoTonemapping
+context.set_exposure(...)   BEFORE the scene, never after             UpdateMaterialSystemTonemapScalar
+world.draw(into post.scene) the scene, into an offscreen target       the 3D view
+post.resolve(frame, ...)    measure it, then put it on the screen     DoEnginePostProcessing
+```
+
+Three rules, each of which fails quietly rather than loudly:
+
+- **`post.measurement()` runs unconditionally, before anything branches.** It arms the
+  previous frame's readback as well as returning it, so a frame that returns early
+  (no map, `-vmt`) without calling it strands a staging buffer — and after two such frames
+  the exposure silently stops adapting for ever.
+- **The exposure is set before the scene pass opens.** A pass writes its frame constants
+  when it opens, so setting it afterwards affects the *next* pass.
+- **`-vmt` and the no-map clear draw straight to the back buffer** and are never measured
+  or resolved. A material inspector with an auto-exposing background is not an inspector.
+
+`src/engine/exposure.rs` is the depot-gated measurement of the whole loop against a real
+map — the sibling of `world/bench.rs`, and the same shape:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release exposure -- --ignored --nocapture
+```
+
+`KISAK_MAP` picks the map and `KISAK_AUTOEXPOSURE_MAX` raises the ceiling, which is how to
+ask what a map looks like under the limit its own `env_tonemap_controller` sets. On
+`sp_a2_bts2` — a dark maintenance area — the default ceiling of 2 binds immediately and
+the map's own 5 takes the exposure to 4.4.
 
 `Engine::boot` prefers `//mod/cfg/config.cfg` and falls back to `config_default.cfg`, then
 queues `exec valve.rc` — see [config persistence](#config-persistence). `Engine::frame`

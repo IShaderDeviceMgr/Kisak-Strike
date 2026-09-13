@@ -17,9 +17,9 @@ is not compiled, not linked, and not edited.
   src/main.rs      entry point
   src/launcher/    process bootstrap
   src/filesystem/  search paths, gameinfo.txt, VPK reading
-  src/materials/   the GPU device and frame boundary (wgpu), textures, materials
+  src/materials/   the GPU device and frame boundary (wgpu), textures, materials, post
   src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
-  src/client/      the game client — the player, CUserCmd, movement, the view
+  src/client/      the game client — the player, CUserCmd, movement, the view, exposure
   src/studio/      studio models — .mdl/.vvd/.vtx into drawable geometry
   src/cmdline.rs   CommandLine(), at the root because everything reads it
   src/math.rs      the parts of mathlib that are a convention, not arithmetic
@@ -57,7 +57,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 600 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 690 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -94,9 +94,13 @@ now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO
 stage 4); 3 of its 76 materials still do not, and they name shaders this port has not
 ported — `SolidEnergy` (the fizzler field), `Refract` and `Black`. **26 of its 78 brush
 entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
-triangles, each under the placement its entity gives it. The scene is **dimmer than
-the shipped game** because there is no tone mapper: HDR lightmaps reach the shader
-unexposed. The view is the **player's eye**: WASD to walk, space to jump, left control to
+triangles, each under the placement its entity gives it. **The scene is auto-exposed**: it is drawn into an
+offscreen target, a compute pass bins its pixels by luminance, and a port of
+`CTonemapSystem` picks the scalar the lit shaders multiply by — `tonemap` in the console
+reports what it is doing. What is missing is the map's *own* exposure limits, which come
+from an `env_tonemap_controller` and need entities: 105 of the game's 106 maps place one,
+and `sp_a1_intro1` asks for a ceiling of 1.5 where the cvar default is 2.
+The view is the **player's eye**: WASD to walk, space to jump, left control to
 crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
 `noclip` toggles a real `MOVETYPE_NOCLIP` rather than a camera pretending to be one — so
 **it has momentum**, because `sv_noclipaccelerate` is 5 and not 0; set
@@ -234,6 +238,22 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
   `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
   Portal 2 has neither.
+
+  **`post.rs` and `histogram.rs` landed with the tone mapper, and they close half of §10's
+  HDR question.** `PostProcess` is `_rt_FullFrameFB` plus the final pass of
+  `DoEnginePostProcessing`: the scene is drawn into an offscreen target in the back
+  buffer's exact format, measured, and blitted forward. `Histogram` is a compute dispatch
+  that bins a frame's pixels by luminance and reads the counts back without ever blocking
+  — replacing sixteen occlusion queries issued one per frame. **No float render target was
+  needed**, because Valve applies the exposure scalar in `FinalOutput` before the sRGB
+  write in *both* HDR modes, so this port's 8-bit sRGB frame buffer already is
+  `HDR_TYPE_INTEGER`'s; what was needed was for the scene to stop going straight to the
+  back buffer, since a swap-chain image cannot be sampled. Two rules there produce a
+  plausible wrong answer rather than an error: **`RenderContext::set_exposure` takes effect
+  on the next pass *opened*, not one already open**, and **`PostProcess::measurement` must
+  be called once a frame unconditionally** — it arms the previous frame's readback as well
+  as returning it, so a frame that returns early strands a staging buffer and the exposure
+  silently stops adapting for ever.
 
   §10's "how are variants expressed" question is **closed**: four shader names in, none
   needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
@@ -496,6 +516,33 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
   before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
   test is only ever reachable from the air.
+
+  **`client/tonemap.rs` landed alongside the five stages rather than inside them**
+  (`portdocs/CLIENT_TONEMAP.md`, and it is `viewpostprocess.cpp`'s `CTonemapSystem`, not
+  the input-and-view layer `portdocs/CLIENT.md` plans). It is the **policy** half of auto
+  exposure — bucket boundaries, the percentile search, the moving average, the rate
+  limiting and twelve `mat_*` cvars — and **it names no GPU type**, the way
+  `materials/histogram.rs` names no cvar; the two meet only in `Engine::render`. The
+  finding that decides the whole calibration is that **the histogram measures linear
+  light, not gamma**: `dev/lumcompare.vmt` leaves `$LINEARREAD_BASETEXTURE` unset so
+  `screenspace_general` reads the frame buffer through an sRGB sampler, and Valve's own
+  comment at `IssueQuery` says the opposite and is stale — reading the boundaries as gamma
+  puts the 65% target at 0.32 linear and halves every scene. Four more that produce a
+  plausible wrong answer rather than an error: **the measurement is of an
+  already-exposed frame**, so the result is a *correction* to the current scale and
+  multiplying is what makes the loop converge rather than oscillate; **the moving-average
+  weights are `|i - 5| / 5`**, so the oldest sample counts most and the middle one counts
+  for nothing, which is absurd and is what every Source game has been smoothed with;
+  **the step is capped per frame and not per second**, which makes adaptation frame-rate
+  dependent above ~128 fps and renders `mat_accelerate_adjust_exposure_down` inert below
+  it; and **`mat_dynamic_tonemapping 0` freezes the exposure where it is** rather than
+  resetting it to 1. Deleted rather than deferred: `mat_tonemap_algorithm 0` (selected by
+  a game-directory match against `{dod, cstrike, lostcoast}`, so unreachable),
+  `SetOverrideTonemapScale`, and `DisplayHistogram`'s 200-line bar chart — the `tonemap`
+  console command prints the same numbers. **Not ported and measured:**
+  `env_tonemap_controller`, which needs entities — **105 of Portal 2's 106 maps place
+  one** and drive it from map I/O, the commonest `SetAutoExposureMax` is 3 or 5 against
+  this port's default of 2, and `sp_a1_intro1` asks for 1.5 at its spawn.
 - **`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported**, and with them
   **static props draw, lit the way the shipped game lights them**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
   buffer, one index buffer, per-material `Batch`es. The instances are
@@ -542,7 +589,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
 `--ignored`) loads a real map, records real passes against a real device with no window in
-the way, and times the CPU. Reach for it before and after any change to the draw path —
+the way, and times the CPU. **`engine::exposure` is its sibling** — same shape, same
+gating — and answers the other headless question: where the exposure settles on a real map
+and what the histogram looks like when it gets there. On `sp_a1_intro1` at 1280x720 the
+two passes the tone mapper added cost **0.008 ms of CPU a frame** against 1.21 ms for the
+world draw they sit around. Reach for it before and after any change to the draw path —
 the running game cannot be profiled from outside, because macOS stops delivering redraws
 to an occluded window and `sample` only ever shows a main thread parked in `mach_msg`.
 `sp_a1_intro1` records a whole frame in **about 1 ms** (release) / 6.6 ms (debug); it was
@@ -554,8 +605,9 @@ state and read 2x high. The two rules that came out of it live in `rustdocs/MATE
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the
 second is A/B/A, not A/B.
 
-Next: **the boot path is complete as far as one player can take it**, and the level shell
-is now geometrically complete — world, brush entities, static props and terrain. `client/` stage 5
+Next: **the boot path is complete as far as one player can take it**, the level shell
+is geometrically complete — world, brush entities, static props and terrain — and it is
+**auto-exposed**. `client/` stage 5
 and everything below it needs `net/` and `server/`, which is the last of the core path and
 a long way from here. The candidates, in the order they are worth doing:
 
@@ -564,9 +616,10 @@ a long way from here. The candidates, in the order they are worth doing:
   geometry, plus `sky_camera`'s scale.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.
-- **A tone mapper.** Cheap next to the two above and the reason the whole scene reads
-  dim: HDR lightmaps reach the shader with `cLightScale` at 1.0 because there is no
-  exposure controller.
+- **Bloom**, now that there is a scene target and a presenting pass to put it between.
+  `Generate8BitBloomTexture`'s downsample/blur chain plus `BloomAdd`, three quarter-size
+  render targets. It is the most visible thing still missing from the post chain and
+  Portal 2 leans on it. `portdocs/CLIENT_TONEMAP.md` §7 ranks the rest.
 - **`LightmappedGeneric`'s second vertex layout**, if `sp_a3_*` matters — a world-space
   normal on `WorldVertex` is what `$seamless_scale` (553 displacement faces) and `$envmap`
   both want, and it is the open question `MATERIALSYSTEM.md` §10 has been holding.
@@ -617,6 +670,11 @@ design/porting doc belongs in `portdocs/<MODULE>.md`, named after the module dir
 `SCREAMING_SNAKE_CASE` (`engine/` → `portdocs/ENGINE.md`). Write and consult it before
 doing that module's port; see `PORTING.md`'s "Per-module porting docs" section for what
 goes in one.
+
+`portdocs/CLIENT_TONEMAP.md` is the exception to "written before the port": the tone
+mapper was not on `portdocs/CLIENT.md`'s five-stage plan, so its portdoc was written
+afterwards and says so at the top. Read it as the analysis that justifies the shape rather
+than as a plan to follow.
 
 `portdocs/LAUNCHER.md` predates the current architecture and carries a banner saying what
 changed for it. Its *plan* assumes the old FFI-bridged model; its factual content — module
