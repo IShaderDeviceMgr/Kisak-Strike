@@ -92,6 +92,29 @@ pub enum ShaderKind {
     /// `lightmappedgeneric_ps2_3_x.h`.
     LightmappedGeneric,
 
+    /// **The same shader as [`LightmappedGeneric`](ShaderKind::LightmappedGeneric)**,
+    /// under the name content uses when it means "two base textures blended by
+    /// the vertex alpha". Terrain, almost exclusively: 937 of Portal 2's 1,181
+    /// displacement faces name it, against 157 for `LightmappedGeneric`.
+    ///
+    /// `stdshaders/worldvertextransition.cpp` is 222 lines, of which ~190 are a
+    /// parameter table and the remaining three forward to
+    /// `InitParamsLightmappedGeneric_DX9`, `InitLightmappedGeneric_DX9` and
+    /// `DrawLightmappedGeneric_DX9` — the same helper, the same `.fxc`, the
+    /// same vertex format. `lightmappedgeneric_dx9.cpp` even declares
+    /// `$basetexture2`, `$bumpmap2`, `$blendmodulatetexture` and `$ssbump`
+    /// itself, so the two differ only in which parameters they expose and, in
+    /// practice, in whether content happens to set `$basetexture2`.
+    ///
+    /// It is a separate variant rather than an alias because Valve kept it as a
+    /// separate `IShader` —
+    /// `DEFINE_FALLBACK_SHADER( WorldVertexTransition, WorldVertexTransition_DX9 )`
+    /// — and because [`name`](ShaderKind::name) should say what the `.vmt` said.
+    /// Everything else about it delegates: same
+    /// [`wgsl`](ShaderKind::wgsl), same [`vertex_layout`](ShaderKind::vertex_layout),
+    /// same [`lighting_binding`](ShaderKind::lighting_binding), same uniforms.
+    WorldVertexTransition,
+
     /// Models: props, characters, gibs and debris. A base texture lit by an
     /// ambient cube, up to four local lights, and whatever `vrad` baked into
     /// the vertex stream — 1,012 of Portal 2's 1,096 `materials/models/`
@@ -156,6 +179,9 @@ impl ShaderKind {
             n if n.eq_ignore_ascii_case("LightmappedGeneric") => {
                 Some(ShaderKind::LightmappedGeneric)
             }
+            n if n.eq_ignore_ascii_case("WorldVertexTransition") => {
+                Some(ShaderKind::WorldVertexTransition)
+            }
             n if n.eq_ignore_ascii_case("VertexLitGeneric") => Some(ShaderKind::VertexLitGeneric),
             _ => None,
         }
@@ -166,6 +192,7 @@ impl ShaderKind {
         match self {
             ShaderKind::UnlitGeneric => "UnlitGeneric",
             ShaderKind::LightmappedGeneric => "LightmappedGeneric",
+            ShaderKind::WorldVertexTransition => "WorldVertexTransition",
             ShaderKind::VertexLitGeneric => "VertexLitGeneric",
         }
     }
@@ -208,7 +235,9 @@ impl ShaderKind {
             // cases anyway — "PORTAL 2 FIX - paint shader assumes it can use 3
             // lightmapped coordinates in all cases"
             // (`matsys_interface.cpp:1502`).
-            ShaderKind::LightmappedGeneric => VertexLayout::World,
+            ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
+                VertexLayout::World
+            }
             // `VertexShaderVertexFormat( VERTEX_POSITION | VERTEX_NORMAL |
             // VERTEX_COLOR_STREAM_1, 1, {2}, userDataSize )`
             // (`vertexlitgeneric_dx9_helper.cpp:895`).
@@ -222,12 +251,21 @@ impl ShaderKind {
     /// builds by concatenating `CBaseShader`'s table with the shader's own
     /// (`public/shaderlib/cshader.h:212`).
     pub fn params(self) -> impl Iterator<Item = &'static ShaderParam> {
-        let own = match self {
-            ShaderKind::UnlitGeneric => UNLIT_GENERIC_PARAMS,
-            ShaderKind::LightmappedGeneric => LIGHTMAPPED_GENERIC_PARAMS,
-            ShaderKind::VertexLitGeneric => VERTEX_LIT_GENERIC_PARAMS,
+        // Three slices rather than two, because `WorldVertexTransition`'s table
+        // really is `LightmappedGeneric`'s plus two — see
+        // [`WORLD_VERTEX_TRANSITION_PARAMS`]. Listing them separately keeps the
+        // rule that a table entry is a promise: setting `$basetexturetransform2`
+        // on a `LightmappedGeneric` material does nothing in Valve's engine,
+        // because that shader does not declare it, and so it does nothing here.
+        let (own, extra): (_, &'static [ShaderParam]) = match self {
+            ShaderKind::UnlitGeneric => (UNLIT_GENERIC_PARAMS, &[]),
+            ShaderKind::LightmappedGeneric => (LIGHTMAPPED_GENERIC_PARAMS, &[]),
+            ShaderKind::WorldVertexTransition => {
+                (LIGHTMAPPED_GENERIC_PARAMS, WORLD_VERTEX_TRANSITION_PARAMS)
+            }
+            ShaderKind::VertexLitGeneric => (VERTEX_LIT_GENERIC_PARAMS, &[]),
         };
-        STANDARD_PARAMS.iter().chain(own)
+        STANDARD_PARAMS.iter().chain(own).chain(extra)
     }
 
     /// The declared parameter of that name, if the shader has one.
@@ -244,7 +282,9 @@ impl ShaderKind {
     pub fn lighting_binding(self) -> Option<LightingBinding> {
         match self {
             ShaderKind::UnlitGeneric => None,
-            ShaderKind::LightmappedGeneric => Some(LightingBinding::LightmapPage),
+            ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
+                Some(LightingBinding::LightmapPage)
+            }
             ShaderKind::VertexLitGeneric => Some(LightingBinding::ModelLighting),
         }
     }
@@ -261,7 +301,12 @@ impl ShaderKind {
     pub fn wgsl(self) -> String {
         let body = match self {
             ShaderKind::UnlitGeneric => include_str!("shaders/unlitgeneric.wgsl"),
-            ShaderKind::LightmappedGeneric => include_str!("shaders/lightmappedgeneric.wgsl"),
+            // One module for two shader names, which is what the original
+            // does too: `WorldVertexTransition`'s `SHADER_DRAW` is a call to
+            // `DrawLightmappedGeneric_DX9`.
+            ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
+                include_str!("shaders/lightmappedgeneric.wgsl")
+            }
             ShaderKind::VertexLitGeneric => include_str!("shaders/vertexlitgeneric.wgsl"),
         };
         format!("{}\n{}", include_str!("shaders/prelude.wgsl"), body)
@@ -477,6 +522,72 @@ const LIGHTMAPPED_GENERIC_PARAMS: &[ShaderParam] = &[
         kind: ParamKind::Float,
         declared_default: "0.0",
         help: "alpha below which $alphatest discards a pixel",
+    },
+    // The two-layer blend. Declared *here*, on `LightmappedGeneric`, because
+    // that is where `lightmappedgeneric_dx9.cpp:53-60` declares them — a world
+    // surface can blend two textures without the material naming
+    // `WorldVertexTransition`, and 157 of Portal 2's displacement faces do
+    // exactly that.
+    ShaderParam {
+        name: "$basetexture2",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/lightmappedtexture",
+        help: "the second layer, blended over the first by the vertex alpha",
+    },
+    ShaderParam {
+        name: "$frame2",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $basetexture2",
+    },
+    ShaderParam {
+        name: "$bumpmap2",
+        kind: ParamKind::Texture,
+        declared_default: "models/shadertest/shader3_normal",
+        help: "the second layer's bump map",
+    },
+    ShaderParam {
+        name: "$bumpframe2",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $bumpmap2",
+    },
+    ShaderParam {
+        name: "$blendmodulatetexture",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "texture to use r/g channels for blend range for",
+    },
+    ShaderParam {
+        name: "$ssbump",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "whether or not to use alternate bumpmap format with height",
+    },
+];
+
+/// `WorldVertexTransition`'s parameters *beyond*
+/// [`LIGHTMAPPED_GENERIC_PARAMS`] (`stdshaders/worldvertextransition.cpp:84`
+/// and `:89`).
+///
+/// Two, and only two, of the ~60 that declaration adds are read here: the
+/// transforms for the second base texture and for the blend modulation, which
+/// `LightmappedGeneric` genuinely does not declare. Everything else it adds —
+/// layer tints, `$newlayerblending` and the border/edge terms, drop shadows,
+/// `$detail2`, phong — belongs to a feature listed as deferred in this module's
+/// header, and no Portal 2 displacement material sets any of them.
+const WORLD_VERTEX_TRANSITION_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$basetexturetransform2",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$basetexture2 texcoord transform",
+    },
+    ShaderParam {
+        name: "$blendmodulatetransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$blendmodulatetexture texcoord transform",
     },
 ];
 
@@ -750,6 +861,16 @@ pub const BINDING_ENVMAP_MASK_SAMPLER: u32 = 10;
 pub const BINDING_ENVMAP_TEXTURE: u32 = 11;
 pub const BINDING_ENVMAP_SAMPLER: u32 = 12;
 
+/// The two-layer blend's three textures, which `LightmappedGeneric` and
+/// `WorldVertexTransition` share — see
+/// [`ShaderKind::WorldVertexTransition`].
+pub const BINDING_BASE2_TEXTURE: u32 = 13;
+pub const BINDING_BASE2_SAMPLER: u32 = 14;
+pub const BINDING_BUMP2_TEXTURE: u32 = 15;
+pub const BINDING_BUMP2_SAMPLER: u32 = 16;
+pub const BINDING_BLEND_MODULATE_TEXTURE: u32 = 17;
+pub const BINDING_BLEND_MODULATE_SAMPLER: u32 = 18;
+
 /// Where the lightmap page is bound, in group **3**.
 ///
 /// Not in the material's group, and that is structural rather than a
@@ -864,7 +985,7 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
         // no sRGB (`lightmappedgeneric_dx9_helper.cpp:731`). A normal map is
         // three signed directions stored as bytes, not a colour; decoding it
         // as one bends every normal towards the surface.
-        ShaderKind::LightmappedGeneric => vec![
+        ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => vec![
             TextureRequest {
                 param: "$basetexture",
                 binding: BINDING_BASE_TEXTURE,
@@ -874,6 +995,32 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
             TextureRequest {
                 param: "$bumpmap",
                 binding: BINDING_BUMP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            // The second layer, bound by both shader names because both
+            // declare it. An undefined one binds the standard white texture
+            // and is never sampled, because `LightmappedFlags::BASE_TEXTURE2`
+            // is what turns the blend on.
+            TextureRequest {
+                param: "$basetexture2",
+                binding: BINDING_BASE2_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$bumpmap2",
+                binding: BINDING_BUMP2_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            // **Not colour**, despite being a texture the artist authored: the
+            // shader reads `.r` as a blend *width* and `.g` as a blend
+            // *centre* (`lightmappedgeneric_ps2_3_x.h:419`), so an sRGB decode
+            // would bend the crossfade rather than the picture.
+            TextureRequest {
+                param: "$blendmodulatetexture",
+                binding: BINDING_BLEND_MODULATE_TEXTURE,
                 color_space: ColorSpace::Linear,
                 dimension: TextureDimension::D2,
             },
@@ -1155,7 +1302,7 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         // which `RegisterLightmappedSurface` treats as "no lightmap": a model
         // carries its baked light in its vertices, not in the atlas.
         ShaderKind::UnlitGeneric | ShaderKind::VertexLitGeneric => Lighting::None,
-        ShaderKind::LightmappedGeneric => {
+        ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
                 .and_then(|var| var.as_str())
@@ -1187,6 +1334,31 @@ impl LightmappedFlags {
     /// normal mapping, sampling the three directional lightmap blocks instead
     /// of the flat one. [`Lighting::BumpedLightmap`].
     pub const BUMPED_LIGHTMAP: u32 = 1 << 3;
+
+    /// `BASETEXTURE2`, and with it `VERTEXALPHATEXBLENDFACTOR` — the two-layer
+    /// blend, with the vertex alpha as the factor. What makes a
+    /// `WorldVertexTransition` material a blend rather than an ordinary lit
+    /// surface, and the flag every displacement in Portal 2's terrain sets.
+    pub const BASE_TEXTURE2: u32 = 1 << 4;
+
+    /// `FANCY_BLENDING == 1` — `$blendmodulatetexture`, which turns the linear
+    /// crossfade into a per-texel one. Without it the two layers dissolve into
+    /// each other instead of dirt settling into the low parts of the rock.
+    pub const BLEND_MODULATE: u32 = 1 << 5;
+
+    /// `BUMPMAP2` — the second layer's normal map, lerped with the first by the
+    /// same blend factor.
+    pub const BUMP_MAP2: u32 = 1 << 6;
+
+    /// `BUMPMAP == 2` — a **self-shadowed** bump map, which is not a normal map
+    /// and must not be decoded as one.
+    ///
+    /// Two things change (`lightmappedgeneric_ps2_3_x.h:322` and `:649`): the
+    /// texel is used raw rather than `2 * t - 1`, and the bumped lighting stops
+    /// being `saturate(dot(n, basis))²` weights and becomes a plain weighted
+    /// sum scaled by `1/√3`. Portal 2's entire blend-terrain set sets
+    /// `$ssbump 1`, and so does a good deal of its ordinary world geometry.
+    pub const SSBUMP: u32 = 1 << 7;
 }
 
 /// `LightmappedGeneric`'s material block — group 1, binding 0.
@@ -1199,6 +1371,12 @@ pub struct LightmappedUniforms {
     /// coordinate, which is what `lightmappedgeneric_vs20.fxc:205` does — the
     /// bump map shares texture space with the albedo.
     pub bump_transform: [[f32; 4]; 2],
+    /// `$basetexturetransform2`, for the second layer. Declared only by
+    /// `WorldVertexTransition`; identity for a `LightmappedGeneric` that blends,
+    /// which is what `lightmappedgeneric_vs20.fxc`'s `FASTPATH` branch gives it.
+    pub base_texture2_transform: [[f32; 4]; 2],
+    /// `$blendmodulatetransform`, likewise.
+    pub blend_modulate_transform: [[f32; 4]; 2],
     /// `$alphatestreference`, or the fixed-function default of 0.7.
     pub alpha_test_reference: f32,
     /// [`LightmappedFlags`].
@@ -1207,8 +1385,7 @@ pub struct LightmappedUniforms {
 }
 
 /// Builds the material block for a `.vmt`.
-pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms {
-    let kind = ShaderKind::LightmappedGeneric;
+pub fn lightmapped_uniforms(kind: ShaderKind, vmt: &Vmt) -> LightmappedUniforms {
     let transform = |name| {
         param_value(kind, vmt, name)
             .map(|var| var.as_matrix())
@@ -1216,6 +1393,14 @@ pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms {
     };
     let base = transform("$basetexturetransform");
     let bump = transform("$bumptransform");
+    let base2 = transform("$basetexturetransform2");
+    let modulate = transform("$blendmodulatetransform");
+
+    let defined = |name: &str| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
 
     let mut flags = 0;
     if vmt.flags.contains(MaterialFlags::VERTEXCOLOR) {
@@ -1231,9 +1416,35 @@ pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms {
         flags |= LightmappedFlags::BUMPED_LIGHTMAP;
     }
 
+    // `hasBaseTexture2 = hasBaseTexture && params[BASETEXTURE2]->IsTexture()`
+    // (`lightmappedgeneric_dx9_helper.cpp:442`), which also drives
+    // `VERTEXALPHATEXBLENDFACTOR` and therefore where the blend factor comes
+    // from. Without a `$basetexture` there is nothing to blend *with*, so the
+    // conjunction is Valve's and not a guard.
+    let blends = defined("$basetexture") && defined("$basetexture2");
+    if blends {
+        flags |= LightmappedFlags::BASE_TEXTURE2;
+    }
+    // `nFancyBlendMode = bHasBlendModulateTexture` (`:458`), which the helper
+    // clears when there is no second layer to modulate (`:456`).
+    if blends && defined("$blendmodulatetexture") {
+        flags |= LightmappedFlags::BLEND_MODULATE;
+    }
+    if defined("$bumpmap") && defined("$bumpmap2") {
+        flags |= LightmappedFlags::BUMP_MAP2;
+    }
+    // `bumpmap_variant = hasSSBump ? 2 : hasBump` (`:686`), where `hasSSBump`
+    // is `hasBump && $ssbump` (`:441`) — an `$ssbump` with no `$bumpmap` is not
+    // a variant, it is nothing.
+    if defined("$bumpmap") && param_value(kind, vmt, "$ssbump").is_some_and(|var| var.as_bool()) {
+        flags |= LightmappedFlags::SSBUMP;
+    }
+
     LightmappedUniforms {
         base_texture_transform: [base[0], base[1]],
         bump_transform: [bump[0], bump[1]],
+        base_texture2_transform: [base2[0], base2[1]],
+        blend_modulate_transform: [modulate[0], modulate[1]],
         alpha_test_reference: alpha_test_reference(kind, vmt),
         flags,
         _padding: [0; 2],
@@ -1683,7 +1894,11 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
     // blending in Valve's engine too. Content does not set it on world
     // surfaces; reproducing the gap costs nothing and diverging from it would
     // be a silent change to how a wall blends.
-    if kind != ShaderKind::LightmappedGeneric && flags.contains(MaterialFlags::MULTIPLY) {
+    if !matches!(
+        kind,
+        ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition
+    ) && flags.contains(MaterialFlags::MULTIPLY)
+    {
         state.blend = BlendMode::Multiply;
         state.depth_write = false;
     }

@@ -23,8 +23,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::shader::{
-    LightingBinding, ShaderKind, BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BUMP_SAMPLER,
-    BINDING_BUMP_TEXTURE, BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE,
+    LightingBinding, ShaderKind, BINDING_BASE2_SAMPLER, BINDING_BASE2_TEXTURE,
+    BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BLEND_MODULATE_SAMPLER,
+    BINDING_BLEND_MODULATE_TEXTURE, BINDING_BUMP2_SAMPLER, BINDING_BUMP2_TEXTURE,
+    BINDING_BUMP_SAMPLER, BINDING_BUMP_TEXTURE, BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE,
     BINDING_ENVMAP_MASK_SAMPLER, BINDING_ENVMAP_MASK_TEXTURE, BINDING_ENVMAP_SAMPLER,
     BINDING_ENVMAP_TEXTURE, BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE,
     BINDING_MATERIAL_UNIFORMS, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
@@ -265,7 +267,7 @@ impl BindLayouts {
             }),
             lightmapped_material: device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
-                    label: Some("material: LightmappedGeneric"),
+                    label: Some("material: LightmappedGeneric/WorldVertexTransition"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: BINDING_MATERIAL_UNIFORMS,
@@ -281,6 +283,17 @@ impl BindLayouts {
                         sampler_entry(BINDING_BASE_SAMPLER),
                         texture_entry(BINDING_BUMP_TEXTURE),
                         sampler_entry(BINDING_BUMP_SAMPLER),
+                        // The two-layer blend, declared by
+                        // `lightmappedgeneric_dx9.cpp` itself and not only by
+                        // `WorldVertexTransition`. A material that sets none of
+                        // them binds the standard white texture three times and
+                        // samples none of it, because the flags gate the reads.
+                        texture_entry(BINDING_BASE2_TEXTURE),
+                        sampler_entry(BINDING_BASE2_SAMPLER),
+                        texture_entry(BINDING_BUMP2_TEXTURE),
+                        sampler_entry(BINDING_BUMP2_SAMPLER),
+                        texture_entry(BINDING_BLEND_MODULATE_TEXTURE),
+                        sampler_entry(BINDING_BLEND_MODULATE_SAMPLER),
                     ],
                 },
             ),
@@ -342,7 +355,12 @@ impl BindLayouts {
     pub fn material(&self, shader: ShaderKind) -> &wgpu::BindGroupLayout {
         match shader {
             ShaderKind::UnlitGeneric => &self.unlit_material,
-            ShaderKind::LightmappedGeneric => &self.lightmapped_material,
+            // One layout for two shader names: `WorldVertexTransition` is
+            // `LightmappedGeneric` with `$basetexture2` set, and both declare
+            // the same textures. See `ShaderKind::WorldVertexTransition`.
+            ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
+                &self.lightmapped_material
+            }
             ShaderKind::VertexLitGeneric => &self.vertex_lit_material,
         }
     }
@@ -684,5 +702,85 @@ mod tests {
         // And a key equal in every field is the same key, which is the whole
         // basis of the cache.
         assert_eq!(opaque, opaque);
+    }
+
+    /// **Every shader's WGSL compiles and builds a real pipeline.**
+    ///
+    /// The gap this closes: `ShaderKind::wgsl` is only ever parsed when a
+    /// pipeline is built, and `preview.rs`'s GPU tests draw `UnlitGeneric` and
+    /// `VertexLitGeneric` only — so a syntax error or a bad binding in
+    /// `lightmappedgeneric.wgsl`, the shader most of a map wears, passed
+    /// `cargo test` and only showed up when a map was loaded.
+    ///
+    /// It also checks the thing a WGSL author gets wrong most often: that the
+    /// bind group layout in [`BindLayouts`] and the `@group`/`@binding`
+    /// declarations in the shader agree. `create_render_pipeline` validates
+    /// that pairing, and nothing else does.
+    ///
+    /// Skipped, not failed, on a machine with no usable adapter — the same
+    /// rule the other GPU tests follow.
+    #[test]
+    fn every_shader_compiles_and_builds_a_pipeline() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::<'_>::default()))
+        else {
+            eprintln!("skipping: no usable device");
+            return;
+        };
+
+        // A validation error reaches us through the uncaptured-error handler
+        // rather than as a `Result`, so it is latched here and asserted on.
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        device.on_uncaptured_error({
+            let failure = std::sync::Arc::clone(&failure);
+            std::sync::Arc::new(move |error: wgpu::Error| {
+                failure.lock().unwrap().push(error.to_string())
+            })
+        });
+
+        let mut cache = PipelineCache::new(&device);
+        for shader in [
+            ShaderKind::UnlitGeneric,
+            ShaderKind::LightmappedGeneric,
+            ShaderKind::WorldVertexTransition,
+            ShaderKind::VertexLitGeneric,
+        ] {
+            // Both blend modes and both target formats, so the state axes that
+            // do change the pipeline are exercised rather than just the module.
+            for blend in [BlendMode::None, BlendMode::Blend] {
+                cache.get(&PipelineKey {
+                    shader,
+                    state: RenderState {
+                        blend,
+                        ..Default::default()
+                    },
+                    target: TargetFormat {
+                        color: wgpu::TextureFormat::Rgba8Unorm,
+                        depth: Some(wgpu::TextureFormat::Depth32Float),
+                        samples: 1,
+                    },
+                });
+            }
+            let errors = failure.lock().unwrap();
+            assert!(
+                errors.is_empty(),
+                "{}: {}",
+                shader.name(),
+                errors.join("\n")
+            );
+        }
+
+        // Two names, one module: `WorldVertexTransition` is
+        // `LightmappedGeneric`, so it must not have compiled a second one.
+        assert_eq!(
+            ShaderKind::LightmappedGeneric.wgsl(),
+            ShaderKind::WorldVertexTransition.wgsl()
+        );
     }
 }

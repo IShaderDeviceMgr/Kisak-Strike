@@ -81,16 +81,17 @@ cargo run -- -basedir /path/to/game -game portal2 -window -vmt tools/toolsblack
 cargo run -- -basedir /path/to/game -game portal2 -window -vmt models/props/box_dropper
 ```
 
-`-vmt` previews any of the three ported shaders on a pair of cubes, in whichever vertex
+`-vmt` previews any ported shader on a pair of cubes, in whichever vertex
 layout the `.vmt`'s shader declared — a model material is drawn under a synthetic ambient
 cube and one point light, which is not a real lighting environment and does not pretend to
 be.
 
-**`sp_a1_intro1` draws lit**: 5,512 of 5,638 world faces, 71 of its 74 materials
-resolving, 4,846 surfaces with real baked lighting over 13 atlas pages, and **1,080 static
-props from 136 models** on top of that. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
+**`sp_a1_intro1` draws lit**: 5,523 of 5,638 world faces, 73 of its 76 materials
+resolving, 4,857 surfaces with real baked lighting over 13 atlas pages, and **1,080 static
+props from 136 models** on top of that. **Its terrain draws too** — 11 displacements,
+1,408 triangles — which is the last of the big absences in the level shell. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
 now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO.md`
-stage 4); 3 of its 74 materials still do not, and they name shaders this port has not
+stage 4); 3 of its 76 materials still do not, and they name shaders this port has not
 ported — `SolidEnergy` (the fizzler field), `Refract` and `Black`. **26 of its 78 brush
 entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
 triangles, each under the placement its entity gives it. The scene is **dimmer than
@@ -234,17 +235,19 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
   Portal 2 has neither.
 
-  §10's "how are variants expressed" question is **closed**: three shaders in, none needed
-  a source-text variant — `VertexLitGeneric` merges two Valve *files* into one module with
-  a uniform branch — so the prelude is prepended by string concatenation and `naga_oil`,
-  `override` constants and a build-time preprocessor are all declined on evidence.
+  §10's "how are variants expressed" question is **closed**: four shader names in, none
+  needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
+  module with a uniform branch, and `WorldVertexTransition` is a second *name* on
+  `LightmappedGeneric`'s module rather than a variant of it — so the prelude is prepended
+  by string concatenation and `naga_oil`, `override` constants and a build-time
+  preprocessor are all declined on evidence.
   **`LightmappedGeneric` was expected to force the second vertex layout and did not**
   (bumped and unbumped share one, because the bumped diffuse path never leaves tangent
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
   one, because the tangent is in the `.vvd` either way.
-- **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry and
-  lightmaps, `trace/` (stages 1-3 of 5), `input/` (stages 1-4 of 5), and `console/` (all five
-  stages, complete)**
+- **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
+  lightmaps and terrain, `trace/` (stages 1-3 of 5), `input/` (stages 1-4 of 5), and
+  `console/` (all five stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -365,8 +368,61 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   gotcha 17 names the two lines to delete to get Valve's behaviour back.
   Not implemented: simulation, visibility, the skybox, dynamic lights and
   lightstyle animation. Brush entities are solid **and** drawn now; what they are not is
-  *moved*, which is `server/`'s. Displacements are solid and **not** drawn, which is
-  `world/disp/`'s.
+  *moved*, which is `server/`'s. **Displacements are solid and drawn** —
+  `world/disp/` has landed, below.
+  **`world/disp/` is the rendering half of `trace/` stage 3's lumps, and terrain now
+  draws** (`portdocs/ENGINE_WORLD_DISP.md`, `rustdocs/ENGINE.md`). ~9,100 lines of C++
+  across `engine/disp*.cpp`, `public/builddisp.cpp`, `disp_powerinfo.cpp` and
+  `disp_tesselate.h`; about 350 have a counterpart, because the LOD tree, decals,
+  neighbour stitching and `SetupAllowedVerts` all delete — the last because `vbsp` already
+  wrote its answer into the lump. **There is no separate terrain draw path**: a
+  displacement is selected, materialed, lightmapped, batched by `(material, page)` and
+  split at 65,536 vertices by the *same* pipeline an ordinary face is, and the only
+  difference is that `build_page_meshes` asks the patch for its grid instead of fanning the
+  face's winding. That is also Valve's `DispInfo_CreateMaterialGroups`. Measured rather
+  than assumed: **all 1,181 shipped displacements are in model 0**, so brush entities need
+  no change, and all 1,181 have a four-cornered base face.
+  Four rules here produce a plausible wrong picture rather than an error. **Texture
+  coordinates are bilinear over the base face's four *flat* corners**, not the projection
+  evaluated at the displaced position — the two agree on a flat patch and diverge with the
+  displacement, so the wrong one looks right until you stand next to a cliff. **Lightmap
+  coordinates are not the base face's at all**: `vrad` bakes against the *grid*, so
+  `BuildDispSurfInit` computes the face's luxel corners and then overwrites them with a
+  canonical square, collapsing to `(0.5 + w·j/n, 0.5 + h·i/n)` where `w`,`h` are the
+  *extents* and not the block size. **The render tessellation is not the collision one** —
+  it is a quadtree walk that skips any vertex `vbsp` disallowed, which is what stops a
+  power-4 patch cracking against a power-2 neighbour (100 of the 1,181, and **none in
+  `sp_a1_intro1`**, so only the depot test reaches it) — and yet for a patch with nothing
+  disallowed the two coincide **exactly**, which is the unit test that makes the walk
+  checkable at all. And **terrain triangles are reversed like every other piece of
+  Valve-authored geometry**; this port's own portdoc argued they should not be, and the
+  depot test caught it on its first run. That anchor is worth copying: the sum of a
+  patch's rendered triangle normals must agree in sign with the *rendered* normal of the
+  base face it was carved from — 1,181 of 1,181 agree, 1,181 of 1,181 disagree without the
+  reversal, and it is taken per patch rather than per triangle because 131 of 92,622
+  individual triangles genuinely overhang.
+  **`WorldVertexTransition` landed with it, and it is `LightmappedGeneric`.** 937 of the
+  game's 1,181 displacement faces name it — including all 11 of `sp_a1_intro1`'s — so
+  without it this module's output was eleven magenta checkerboards.
+  `worldvertextransition.cpp` forwards to `DrawLightmappedGeneric_DX9` and nothing else, so
+  the WGSL, the vertex layout, the lighting binding and the bind group layout are shared;
+  only `name()` and the parameter table differ. Measured: **zero** non-displacement faces
+  in the game name it. What it added to the shader is `$basetexture2` blended by the vertex
+  alpha, `$blendmodulatetexture`, `$bumpmap2` — and **`$ssbump`, which was a live bug in
+  the world path all along**: a self-shadowed bump map is three positive coefficients, not
+  a signed normal, so both the `2t-1` decode and the `saturate(dot(n,basis))²` weighting
+  are wrong for it, and **128,139 of Portal 2's 288,250 drawable world faces** wear one.
+  Deferred and measured: `$seamless_scale` (553 displacement faces, all in `sp_a3_*`, none
+  in `sp_a1_intro1`) and `$envmap` — which are now **the** reason `LightmappedGeneric` will
+  eventually need a second vertex layout, since both want a world-space normal that a
+  `WorldVertex` does not carry. `MATERIALSYSTEM.md` §10 expected bumpedness to force that
+  and it did not.
+  A gap closed on the way past: **nothing in `cargo test` had ever compiled
+  `lightmappedgeneric.wgsl`**, because `preview.rs`'s GPU tests draw `UnlitGeneric` and
+  `VertexLitGeneric` only. `materials::pipeline`'s
+  `every_shader_compiles_and_builds_a_pipeline` now builds a real pipeline for every
+  `ShaderKind`, which also checks the thing a WGSL author gets wrong most often — that the
+  bind group layout and the `@group`/`@binding` declarations agree.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
   (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
@@ -491,23 +547,29 @@ the running game cannot be profiled from outside, because macOS stops delivering
 to an occluded window and `sample` only ever shows a main thread parked in `mach_msg`.
 `sp_a1_intro1` records a whole frame in **about 1 ms** (release) / 6.6 ms (debug); it was
 12.7 ms when static props first drew, and `portdocs/STUDIO.md` §11.8 has what the three
-causes were. Run the three sub-benchmarks on their own — back to back they share thermal
+causes were. Terrain did not move that number: it added 2 batches and 1,408 triangles to a
+frame whose cost is 1,080 prop draws. Run the three sub-benchmarks on their own — back to back they share thermal
 state and read 2x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the
 second is A/B/A, not A/B.
 
-Next: **the boot path is complete as far as one player can take it.** `client/` stage 5
+Next: **the boot path is complete as far as one player can take it**, and the level shell
+is now geometrically complete — world, brush entities, static props and terrain. `client/` stage 5
 and everything below it needs `net/` and `server/`, which is the last of the core path and
 a long way from here. The candidates, in the order they are worth doing:
 
-- **`world/disp/`'s rendering** — the other half of the lump read `trace/` stage 3 just
-  did. `sp_a1_intro1`'s 11 displacement faces are collided with now and still not drawn,
-  and the vertex grid the renderer needs is the one `trace::disp` already builds.
-- **`world/`'s 3D skybox** — with the displacements, the two remaining reasons
-  `sp_a1_intro1` does not look like the shipped game, now that props are lit.
+- **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
+  `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
+  geometry, plus `sky_camera`'s scale.
 - **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
   `cmodel.cpp` and belong to it). Every face is still drawn every frame.
+- **A tone mapper.** Cheap next to the two above and the reason the whole scene reads
+  dim: HDR lightmaps reach the shader with `cLightScale` at 1.0 because there is no
+  exposure controller.
+- **`LightmappedGeneric`'s second vertex layout**, if `sp_a3_*` matters — a world-space
+  normal on `WorldVertex` is what `$seamless_scale` (553 displacement faces) and `$envmap`
+  both want, and it is the open question `MATERIALSYSTEM.md` §10 has been holding.
 
 ### Known warts, and what triggers fixing them
 

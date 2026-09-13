@@ -130,7 +130,7 @@ impl Fixture {
             lightmap_alpha_start: -1,
             lightmap_sample_position_start: -1,
             _neighbors: [0xFF; 88],
-            _allowed_verts: [0xFFFF_FFFF; 10],
+            allowed_verts: [0xFFFF_FFFF; 10],
         });
 
         // The grid is indexed `i * spacing + j`, and the fixture's `height` is
@@ -343,7 +343,17 @@ impl Fixture {
         self.finish()
     }
 
-    pub(crate) fn finish(mut self) -> CollisionBsp {
+    pub(crate) fn finish(self) -> CollisionBsp {
+        CollisionBsp::build(&self.bsp())
+    }
+
+    /// The same fixture as a `.bsp`, for the readers that want one.
+    ///
+    /// `world/disp/` builds render geometry out of a `Bsp` rather than a
+    /// [`CollisionBsp`], and its tests need the same hand-built patches these
+    /// do — so the two stay one construction site, and a fixture change cannot
+    /// make the drawn surface and the solid one describe different geometry.
+    pub(crate) fn bsp(mut self) -> Bsp {
         // The displacement-to-leaf lists are pushed down model 0's subtree, so
         // a fixture that never named a model still needs one. Node 0 is the
         // root in every shape this builds.
@@ -380,7 +390,7 @@ impl Fixture {
             ),
         };
 
-        let bsp = Bsp {
+        Bsp {
             game_lumps: Vec::new(),
             leaf_ambient: Vec::new(),
             leaf_ambient_index: Vec::new(),
@@ -409,7 +419,6 @@ impl Fixture {
             disp_info: self.disp_info,
             disp_verts: self.disp_verts,
             disp_tris: self.disp_tris,
-        };
-        CollisionBsp::build(&bsp)
+        }
     }
 }

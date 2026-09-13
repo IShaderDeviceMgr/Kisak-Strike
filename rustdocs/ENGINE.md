@@ -210,8 +210,8 @@ A loaded map and the geometry it draws.
 | | |
 |---|---|
 | Module | `crate::engine::world` |
-| Lines | ~2,200 including tests |
-| Tests | 27 (`cargo test engine::world`), plus one depot-gated |
+| Lines | ~2,900 including tests |
+| Tests | 60 (`cargo test engine::world`), plus two depot-gated |
 | Dependencies | `bytemuck`, `glam`, `crate::filesystem`, `crate::materials` |
 
 ### `World`
@@ -248,7 +248,9 @@ malformed `.bsp`.
 
 `draw` records the world's batches, then the brush entities', then the static props. The
 world's go under an identity model matrix — world geometry is already in world space —
-and each brush entity's go under its own placement.
+and each brush entity's go under its own placement. **Terrain is in the world's batches**:
+a displacement is world geometry with a different way of generating its vertices, not a
+separate pass. See [`world::disp`](#worlddisp--the-terrain).
 
 **Materials are resolved before the geometry is built**, which is forced rather than
 stylistic: a surface's vertex layout comes from the shader its material named, and how
@@ -345,7 +347,8 @@ pub struct WorldStats {
     pub faces_total: usize,
     pub faces_drawn: usize,
     pub faces_not_drawn: usize,       // a surf flag said so
-    pub faces_displaced: usize,       // geometry is in the displacement lumps
+    pub faces_displaced: usize,       // terrain: a SUBSET of faces_drawn
+    pub triangles_displaced: usize,   // how many of `triangles` were terrain
     pub faces_with_primitives: usize, // fan-approximated; see below
     pub vertices: usize,
     pub triangles: usize,
@@ -370,8 +373,65 @@ pub struct WorldStats {
 whose *material* is not lit at all — tool textures, and anything that fell back to the
 error material. Those never ask for a block, so neither counter moves.
 
+**`faces_displaced` is a subset of `faces_drawn`, not a sibling of it.** It used to count
+faces that were *skipped* because their geometry lived in the displacement lumps; terrain
+draws now, so it counts terrain. `triangles_displaced` is the matching share of
+`triangles`, and it is worth having separately because a power-4 patch is 512 triangles —
+a map with a lot of terrain has a triangle count that says nothing about how big its level
+shell is. On `sp_a1_intro1`: 11 displacements, 1,408 of 15,954 triangles.
+
 `Spawn` is `info_player_start`'s origin raised by `VEC_VIEW` (64 units) — the entity's
 origin is at the player's feet, and a camera placed there looks at the floor.
+
+### `world::disp` — the terrain
+
+```rust
+// Private to `world/`; this is what the module does, not an API to call.
+pub(super) struct Displacement { vertices: Vec<DispVertex>, indices: Vec<u16> }
+pub(super) struct DispVertex { position: Vec3, texcoord: [f32; 2], luxel: [f32; 2], alpha: f32 }
+pub(super) fn Displacement::build(bsp: &Bsp, face: &Face) -> Option<Displacement>;
+```
+
+A displacement replaces one four-sided world face with a `(2^power + 1)²` grid.
+`portdocs/ENGINE_WORLD_DISP.md` is the porting doc; what matters at this level is that
+**there is no separate terrain draw path**. A displacement is selected by
+[`group_faces`](#batch), resolved to a material, packed into the same lightmap atlas,
+grouped into the same `(material, page)` [`Batch`](#batch) and split by the same 16-bit
+rule as an ordinary face — the only difference is that `build_page_meshes` asks the patch
+for its vertices instead of fanning the face's winding. That is also what Valve does:
+`DispInfo_CreateMaterialGroups` groups by `(lightmapPageID, material)`, which is what a
+sort ID already was.
+
+**Every one of Portal 2's 1,181 displacements is in model 0**, so nothing about brush
+entities changes. Measured, not assumed.
+
+Four rules here produce a plausible wrong picture rather than an error:
+
+- **A displacement's texture coordinates are bilinear over the base face's four *flat*
+  corner coordinates**, not the planar projection evaluated at the displaced position.
+  The two agree on a flat patch and diverge with the displacement, so the wrong one looks
+  correct until you stand next to a cliff.
+- **Its lightmap coordinates are not the base face's at all.** `vrad` bakes a
+  displacement against the *grid*, so `BuildDispSurfInit` computes the face's luxel
+  corners and then overwrites them with a canonical square — collapsing to
+  `luxel(i, j) = (0.5 + width * j/n, 0.5 + height * i/n)`, where `width`/`height` are
+  `dface_t::lightmap_size`, the **extents**, one less than the block dimensions
+  `Bsp::face_lightmap_size` returns. Swapping the two axes mirrors the lighting about the
+  patch's diagonal, which on gentle terrain looks like nothing at all.
+- **The render tessellation is not the collision one** — it is a quadtree walk that fans
+  each node and skips any vertex `vbsp` disallowed (`DispInfo::allowed_verts`), which is
+  what stops a power-4 patch cracking against a power-2 neighbour. 100 of the game's
+  1,181 have at least one bit cleared, and **`sp_a1_intro1` has none**, so only the depot
+  test exercises it. For a patch with every bit set the two coincide exactly, which is
+  what `tessellation_matches_the_collision_surface` asserts — see the note on
+  `world::disp::tessellate`.
+- **Terrain triangles are reversed like everything else Valve authored** (gotcha 1). The
+  reversal is in `Displacement::build`, not in the tessellation walk, so that the walk's
+  output can be compared against `trace::disp`'s list winding and all.
+
+The grid *positions* are `Bsp::disp_base_quad` + `Bsp::disp_grid`, **shared with
+`trace::disp`** rather than derived twice — if the two ever disagreed the map would be
+solid somewhere it is not drawn.
 
 ### `world::bsp`
 
@@ -425,6 +485,11 @@ pub fn entities(&self) -> Vec<Entity>;
 pub fn DispInfo::vert_count(power: i32) -> usize;   // (2^power + 1)^2
 pub fn DispInfo::tri_count(power: i32) -> usize;    // 2^power * 2^power * 2
 pub fn DispInfo::disp_flags(&self) -> u32;          // minTess, decoded
+
+// A displacement's geometry, shared by `trace/` (collision) and `world/disp/`
+// (drawing) so that the two cannot describe different surfaces.
+pub fn disp_base_quad(&self, face: &Face, info: &DispInfo) -> Option<[Vec3; 4]>;
+pub fn disp_grid(&self, info: &DispInfo, points: &[Vec3; 4]) -> Vec<Vec3>;
 ```
 
 **Which lighting lump, and which faces lump, are one decision.** `LUMP_LIGHTING_HDR` wins
@@ -2056,7 +2121,10 @@ Ordered by how likely each is to bite. Input has its own list, with the module:
    flips between them, so the same `Ccw` names the opposite triangles. Valve content is
    therefore `Cw`-front here. The reversal happens once, at the boundary where external
    content enters — the same treatment [`MATERIALS.md`](MATERIALS.md) gives Valve's
-   row-major matrices. **See [the open question](#open-question-the-culling-convention).**
+   row-major matrices. **Terrain is reversed at the same boundary**, in
+   `disp::Displacement::build` rather than in the fan loop, and for the same reason —
+   there is no shader or geometry kind that escapes this. **See
+   [the open question](#open-question-the-culling-convention).**
 2. **A request takes effect on the frame *after* it is made.** `FrameUpdate` breaks out
    of its loop whenever the state it just ran was `HS_RUN` (`host_state.cpp:817`), so
    `State_Run` only *arms* the transition. This is Valve's behavior, not an artifact: it
@@ -2106,7 +2174,7 @@ Not bugs; each names what it waits on.
 | Shaders this port has not ported | 3 of `sp_a1_intro1`'s 74 materials name one — `SolidEnergy` (the fizzler field), `Refract` and `Black`. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
 | Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
-| Displacement *rendering* | Their collision is done (`trace/` stage 3 — terrain is solid and reports `disp_flags`); **nothing draws them**. That is `world/disp/` (§7.15), and the vertex grid it needs is the one `trace::disp` already builds. Counted in `WorldStats::faces_displaced`. |
+| Displacement `$seamless_scale` | Terrain **draws** now (`world/disp/`), but seamless mapping is a triplanar projection blended by the world normal, and a `WorldVertex` has none. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` underground maps and **none in `sp_a1_intro1`**; they draw with the texinfo's ordinary planar mapping — the right texture at the wrong scale. It is the feature that will force `LightmappedGeneric`'s second vertex layout. |
 | Translucent brush entities | Render modes 1-5 and 7-9 need a sorted blended pass and draw opaque instead; only `kRenderNone` is honoured. Five entities in the shipped game set one. |
 | Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |

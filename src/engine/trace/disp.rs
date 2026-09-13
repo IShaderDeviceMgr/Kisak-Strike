@@ -206,25 +206,12 @@ impl DispTree {
     /// is a guard against a malformed map rather than a case that happens.
     pub(super) fn build(bsp: &Bsp, index: usize, face: &Face, surface: u16) -> Option<DispTree> {
         let info = bsp.disp_info.get(index)?;
-        let corners: Vec<Vec3> = bsp.face_vertices(face).collect();
-        let corners: [Vec3; 4] = corners.try_into().ok()?;
 
-        // `FindSurfPointStartIndex` (`builddisp.cpp:345`) then
-        // `AdjustSurfPointData` (`:373`): the corner nearest `startPosition`
-        // becomes corner 0 and the rest rotate with it, preserving the winding.
-        // This is what makes the grid's `u`/`v` axes agree with the lightmap
-        // and with the order `LUMP_DISP_VERTS` was written in — get it wrong
-        // and the patch is the right shape rotated by a multiple of 90°.
-        let start = Vec3::from(info.start_position);
-        let first = (0..4)
-            .min_by(|&a, &b| {
-                let d = |i: usize| (start - corners[i]).length_squared();
-                d(a).total_cmp(&d(b))
-            })
-            .expect("four corners");
-        let points: [Vec3; 4] = std::array::from_fn(|i| corners[(i + first) % 4]);
-
-        let verts = build_verts(info, &points, bsp);
+        // The corner rotation and the grid itself are `bsp`'s, not this
+        // module's: `world/disp/` draws the same grid, and deriving it twice is
+        // how the drawn surface and the solid one come to disagree.
+        let points = bsp.disp_base_quad(face, info)?;
+        let verts = bsp.disp_grid(info, &points);
         let mut tris = build_tris(info, bsp, &verts);
         for tri in &mut tris {
             tri.calc_plane(&verts);
@@ -868,39 +855,6 @@ fn edge_cross_plane(axis: usize, edge: Vec3, on_edge: Vec3, off_edge: Vec3) -> O
         normal[axis] = dist;
     }
     Some(normal)
-}
-
-/// The flat grid, displaced — `CCoreDispInfo::GenerateDispSurf`
-/// (`builddisp.cpp:1961`).
-///
-/// Vertex `(i, j)` is a bilinear interpolation of the four base corners, `i`
-/// running along the `p0 → p1` edge and `j` across to the `p3 → p2` edge, plus
-/// that vertex's own `vector * dist`. Valve's `m_Elevation` and `m_SubdivPos`
-/// terms are dropped: both are the map editor's, and a `ddispinfo_t` carries
-/// neither.
-fn build_verts(info: &DispInfo, points: &[Vec3; 4], bsp: &Bsp) -> Vec<Vec3> {
-    let spacing = (1usize << info.power) + 1;
-    let step = 1.0 / (spacing - 1) as f32;
-    let edge = [
-        (points[1] - points[0]) * step,
-        (points[2] - points[3]) * step,
-    ];
-
-    let first = info.disp_vert_start as usize;
-    let mut verts = Vec::with_capacity(spacing * spacing);
-    for i in 0..spacing {
-        let ends = [
-            points[0] + edge[0] * i as f32,
-            points[3] + edge[1] * i as f32,
-        ];
-        let seg = (ends[1] - ends[0]) * step;
-        for j in 0..spacing {
-            let flat = ends[0] + seg * j as f32;
-            let dv = &bsp.disp_verts[first + i * spacing + j];
-            verts.push(flat + Vec3::from(dv.vector) * dv.dist);
-        }
-    }
-    verts
 }
 
 /// Two triangles per grid cell — `GenerateCollisionSurface`

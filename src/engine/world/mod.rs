@@ -32,6 +32,7 @@
 #[cfg(test)]
 mod bench;
 pub mod bsp;
+pub mod disp;
 pub mod props;
 
 use std::collections::BTreeMap;
@@ -121,11 +122,19 @@ pub struct WorldStats {
     pub faces_drawn: usize,
     /// Faces skipped for a [`surf`](bsp::surf) flag — sky, nodraw, hints.
     pub faces_not_drawn: usize,
-    /// Faces skipped because they are displacements, whose rendered geometry
-    /// is a grid in `LUMP_DISPINFO`/`LUMP_DISP_VERTS` rather than this face's
-    /// winding. The lumps *are* read — `trace/` builds collision from them —
-    /// and nothing draws them.
+    /// Faces that are displacements — terrain, drawn as the
+    /// `(2^power + 1)²` grid in `LUMP_DISPINFO`/`LUMP_DISP_VERTS` rather than
+    /// as this face's winding.
+    ///
+    /// **A subset of [`faces_drawn`](WorldStats::faces_drawn), not a sibling
+    /// of it**: a displacement is selected, materialed and lightmapped by the
+    /// same rules as any other surface, so it is counted there too. The
+    /// triangles it contributes are [`triangles_displaced`](WorldStats::triangles_displaced).
     pub faces_displaced: usize,
+    /// How many of [`triangles`](WorldStats::triangles) came from terrain — a
+    /// power-4 patch is 512 of them, so a map with a lot of terrain has a
+    /// triangle count that says nothing about how big its level shell is.
+    pub triangles_displaced: usize,
     pub vertices: usize,
     pub triangles: usize,
     pub materials: usize,
@@ -521,8 +530,8 @@ impl World {
         };
         format!(
             "{} (bsp v{}, revision {}): {}/{} faces drawn \
-             ({} hidden, {} displacement{primitives}), \
-             {} vertices, {} triangles, {} batches, \
+             ({} hidden{primitives}), \
+             {} vertices, {} triangles ({} terrain, over {} displacements), {} batches, \
              {} materials ({} missing), \
              {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
              {}/{} brush models drawn ({} faces, {} triangles, {} lit); \
@@ -535,9 +544,10 @@ impl World {
             s.faces_drawn,
             s.faces_total,
             s.faces_not_drawn,
-            s.faces_displaced,
             s.vertices,
             s.triangles,
+            s.triangles_displaced,
+            s.faces_displaced,
             self.batches.len(),
             s.materials,
             s.materials_missing,
@@ -679,15 +689,16 @@ fn group_faces<'a>(
     for face in bsp.model_faces(model) {
         stats.faces_total += 1;
 
-        // A displacement's rendered geometry is a subdivided grid in
-        // `LUMP_DISPINFO`/`LUMP_DISP_VERTS`, not this face's winding. Drawing
-        // the face anyway gives the flat quad the displacement was carved from
-        // — a floor where there should be terrain — so it is skipped until
-        // `world/disp/` exists (`portdocs/ENGINE.md` §7.15). The grid it will
-        // need is already built, by `trace::disp` for collision.
+        // A displacement's geometry is a subdivided grid in
+        // `LUMP_DISPINFO`/`LUMP_DISP_VERTS` rather than this face's winding,
+        // and `build_page_meshes` emits that grid instead of fanning the
+        // quad — but everything *else* about the surface is ordinary, so it
+        // is selected, materialed, sorted and lightmapped by the same rules.
+        // That is `DispInfo_CreateMaterialGroups` (`disp_mapload.cpp:368`)
+        // grouping by `(lightmapPageID, material)`, which is what a `Batch`
+        // already is.
         if face.disp_info >= 0 {
             stats.faces_displaced += 1;
-            continue;
         }
         if face.num_edges < 3 {
             stats.faces_not_drawn += 1;
@@ -874,17 +885,56 @@ fn build_page_meshes(
         };
 
     for &(face, allocation) in faces {
-        let count = face.num_edges as usize;
+        let displaced = face.disp_info >= 0;
+        let count = match displaced {
+            true => disp::Displacement::vertex_count(bsp, face),
+            false => face.num_edges as usize,
+        };
 
-        // Split before the face that would overflow 16-bit indices, never in
-        // the middle of one: a face's vertices have to be contiguous for the
-        // fan below to index them.
+        // Split before the surface that would overflow 16-bit indices, never in
+        // the middle of one: a surface's vertices have to be contiguous for the
+        // indices below to name them.
         if vertices.len() + count > MAX_BATCH_VERTICES {
             flush(&mut vertices, &mut indices, stats);
         }
 
         let base = vertices.len() as u16;
         let lightmap_offset = lightmap_block_offset(face, info.lighting, page_size);
+
+        // A displacement replaces the face's winding with its own grid, and
+        // brings its own texture and lightmap coordinates with it — a
+        // displacement's lightmap is parameterized by the grid rather than by
+        // the texinfo's lightmap axes, which is `portdocs/ENGINE_WORLD_DISP.md`
+        // §3.2 and the one thing here that is not the ordinary face path.
+        if displaced {
+            let Some(patch) = disp::Displacement::build(bsp, face) else {
+                // A displacement that will not build loses its terrain and not
+                // the map. Unreachable for shipped content — every one of the
+                // 1,181 is a quad naming a real entry — so it is reported.
+                eprintln!(
+                    "source-engine: world: a displacement on a {}-edge face did not build",
+                    face.num_edges
+                );
+                stats.faces_drawn = stats.faces_drawn.saturating_sub(1);
+                continue;
+            };
+            for vertex in &patch.vertices {
+                let mut out = WorldVertex::new(vertex.position.to_array(), vertex.texcoord);
+                out.lightmap_texcoord = lightmap_page_texcoord(vertex.luxel, allocation, page_size);
+                out.lightmap_offset = lightmap_offset;
+                // `builder.Color4f( 1, 1, 1, flAlpha )`
+                // (`disp_mapload.cpp:330`) — the blend factor between
+                // `$basetexture` and `$basetexture2`.
+                out.color = [1.0, 1.0, 1.0, vertex.alpha];
+                vertices.push(out);
+            }
+            // Already reversed, by `Displacement::build`, for the same
+            // `front_face: Ccw` reason the fan below is reversed here.
+            indices.extend(patch.indices.iter().map(|i| base + i));
+            stats.triangles_displaced += patch.indices.len() / 3;
+            continue;
+        }
+
         for position in bsp.face_vertices(face) {
             let mut vertex =
                 WorldVertex::new(position.to_array(), bsp.texture_coordinate(face, position));
@@ -963,12 +1013,6 @@ fn lightmap_texcoord(
     allocation: Option<Allocation>,
     page_size: (u32, u32),
 ) -> [f32; 2] {
-    let Some(allocation) = allocation else {
-        return [0.5, 0.5];
-    };
-    let scale = (1.0 / page_size.0 as f32, 1.0 / page_size.1 as f32);
-    let offset = (allocation.x as f32 * scale.0, allocation.y as f32 * scale.1);
-
     // `else if ( MSurf_LightmapExtents( surfID )[0] == 0 )` — Valve tests the
     // s extent only, and takes the luxel centre on both axes when it is zero.
     let luxel = if face.lightmap_size[0] == 0 {
@@ -976,6 +1020,26 @@ fn lightmap_texcoord(
     } else {
         bsp.lightmap_coordinate(face, position)
     };
+    lightmap_page_texcoord(luxel, allocation, page_size)
+}
+
+/// `SurfSetupSurfaceContext`'s half of the above: a luxel coordinate scaled
+/// into its page and offset to its block, then clamped into the page.
+///
+/// Split out because a displacement computes its luxel coordinate from the grid
+/// rather than from a plane projection — `SurfaceCtx_t`'s `m_Scale` and
+/// `m_Offset` are then applied to it identically, which is exactly what
+/// `BuildDispSurfInit` (`disp_mapload.cpp:189`) does.
+fn lightmap_page_texcoord(
+    luxel: [f32; 2],
+    allocation: Option<Allocation>,
+    page_size: (u32, u32),
+) -> [f32; 2] {
+    let Some(allocation) = allocation else {
+        return [0.5, 0.5];
+    };
+    let scale = (1.0 / page_size.0 as f32, 1.0 / page_size.1 as f32);
+    let offset = (allocation.x as f32 * scale.0, allocation.y as f32 * scale.1);
 
     [
         (luxel[0] * scale.0 + offset.0).clamp(0.0, 1.0),
@@ -1140,6 +1204,7 @@ fn find_spawn(entities: &[bsp::Entity]) -> Option<Spawn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsp::DispInfo;
 
     fn test_bsp() -> Bsp {
         Bsp::parse("test.bsp".into(), &bsp::one_face_bsp()).expect("valid")
@@ -1357,16 +1422,126 @@ mod tests {
     }
 
     #[test]
-    fn displacement_faces_are_counted_separately_from_hidden_ones() {
-        // They are skipped for a different reason — the geometry is elsewhere,
-        // not absent — and conflating the two would hide how much of a map is
-        // missing once displacements matter.
+    fn a_displacement_that_will_not_build_loses_its_terrain_and_not_the_map() {
+        // `disp_info` naming an entry the file does not have. Unreachable for
+        // shipped content, but it is untrusted input, and the answer is one
+        // missing patch rather than a missing map — so it is counted as
+        // displaced and *not* as drawn.
         let mut bsp = test_bsp();
         bsp.faces[0].disp_info = 0;
+        assert!(bsp.disp_info.is_empty());
+
         let (meshes, stats, _) = meshes_of(&bsp, UNLIT);
         assert!(meshes.is_empty());
         assert_eq!(stats.faces_displaced, 1);
+        assert_eq!(stats.faces_drawn, 0);
         assert_eq!(stats.faces_not_drawn, 0);
+    }
+
+    /// A flat 64x64 power-2 patch as its own `.bsp`, drawable by
+    /// [`meshes_of`]. `alpha(i, j)` fills `CDispVert::alpha`, 0..255.
+    fn displaced_bsp(alpha: impl Fn(usize, usize) -> f32) -> Bsp {
+        use crate::engine::trace::fixture::Fixture;
+        use crate::engine::trace::Contents;
+
+        let mut fixture = Fixture::default();
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 64.0, 0.0),
+            Vec3::new(64.0, 64.0, 0.0),
+            Vec3::new(64.0, 0.0, 0.0),
+        ];
+        fixture.add_displacement(corners, corners[0], 2, Contents::SOLID, 0, |_, _| 0.0);
+        let spacing = 5;
+        for i in 0..spacing {
+            for j in 0..spacing {
+                fixture.disp_verts[i * spacing + j].alpha = alpha(i, j);
+            }
+        }
+        let mut bsp = fixture.bsp();
+        // The fixture builds a model for the collision tree, which has no
+        // faces on it; the world draw walks `model_faces`.
+        bsp.models[0].num_faces = bsp.faces.len() as i32;
+        bsp
+    }
+
+    /// **A displacement draws its grid, not its base quad.** The face is four
+    /// vertices and two triangles; the power-2 patch it names is 25 and 32.
+    ///
+    /// Drawing the face anyway is the failure this replaced: a flat floor where
+    /// there should be terrain, in exactly the right outline.
+    #[test]
+    fn a_displacement_draws_its_grid_rather_than_its_face() {
+        let (meshes, stats, _) = meshes_of(&displaced_bsp(|_, _| 0.0), LIGHTMAPPED);
+
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].vertices.len(), 25);
+        assert_eq!(meshes[0].indices.len() / 3, 32);
+
+        // `faces_displaced` is a subset of `faces_drawn`, not a sibling of it.
+        assert_eq!(stats.faces_total, 1);
+        assert_eq!(stats.faces_drawn, 1);
+        assert_eq!(stats.faces_displaced, 1);
+        assert_eq!(stats.triangles, 32);
+        assert_eq!(stats.triangles_displaced, 32);
+    }
+
+    /// The per-vertex blend alpha reaches the vertex colour, which is what
+    /// `WorldVertexTransition` lerps `$basetexture2` with. Nothing else writes
+    /// a world vertex's alpha, so a patch drawn with alpha 1 everywhere is a
+    /// patch wearing only its second texture.
+    #[test]
+    fn the_blend_alpha_reaches_the_vertex_colour() {
+        let bsp = displaced_bsp(|i, j| match (i, j) {
+            (0, 0) => 0.0,
+            (4, 4) => 255.0,
+            _ => 127.5,
+        });
+        let (meshes, _, _) = meshes_of(&bsp, LIGHTMAPPED);
+        let vertices = world_vertices(&meshes[0]);
+
+        assert_eq!(vertices[0].color, [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(vertices[24].color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(vertices[12].color, [1.0, 1.0, 1.0, 0.5]);
+    }
+
+    /// A displacement's lightmap coordinates land inside its own atlas block,
+    /// and span it corner to corner — the grid parameterization of
+    /// `BuildDispSurfInit`, mapped into the page by the *same*
+    /// [`lightmap_page_texcoord`] an ordinary face uses.
+    #[test]
+    fn a_displacement_lands_in_its_own_lightmap_block() {
+        let mut bsp = displaced_bsp(|_, _| 0.0);
+        bsp.faces[0].lightmap_size = [7, 7];
+        bsp.faces[0].styles = [0, 255, 255, 255];
+        bsp.faces[0].light_ofs = 0;
+        bsp.lighting = vec![
+            crate::materials::lightmap::ColorRgbExp32 {
+                r: 8,
+                g: 8,
+                b: 8,
+                exponent: 0,
+            };
+            8 * 8
+        ];
+
+        let (meshes, stats, lightmaps) = meshes_of(&bsp, LIGHTMAPPED);
+        assert_eq!(stats.faces_lit, 1, "the patch got a real block");
+
+        let page = lightmaps.page_size(meshes[0].lightmap_page);
+        let vertices = world_vertices(&meshes[0]);
+        let s: Vec<f32> = vertices.iter().map(|v| v.lightmap_texcoord[0]).collect();
+        let t: Vec<f32> = vertices.iter().map(|v| v.lightmap_texcoord[1]).collect();
+
+        let lo = |v: &[f32]| v.iter().copied().fold(f32::MAX, f32::min);
+        let hi = |v: &[f32]| v.iter().copied().fold(f32::MIN, f32::max);
+
+        // The block is 8x8 luxels at the page's origin, and the grid spans the
+        // centres of its first and last luxel: 0.5/page .. 7.5/page.
+        assert!((lo(&s) - 0.5 / page.0 as f32).abs() < 1e-6, "{}", lo(&s));
+        assert!((hi(&s) - 7.5 / page.0 as f32).abs() < 1e-6, "{}", hi(&s));
+        assert!((lo(&t) - 0.5 / page.1 as f32).abs() < 1e-6);
+        assert!((hi(&t) - 7.5 / page.1 as f32).abs() < 1e-6);
     }
 
     #[test]
@@ -1673,6 +1848,149 @@ mod tests {
              {lit} lit"
         );
         assert!(drawn > 1000, "only {drawn} drawn across {maps} maps");
+    }
+
+    /// Every shipped map's terrain, built for real —
+    /// `portdocs/ENGINE_WORLD_DISP.md` §7.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_map_displacement_geometry -- --ignored --nocapture
+    /// ```
+    ///
+    /// **The assertion that earns the runtime is the winding anchor.** Every
+    /// analytical argument about which way a displacement triangle faces runs
+    /// through two independent conventions — Valve's `(v2-v0) × (v1-v0)`
+    /// collision normal and this port's reversal of a world fan — and getting
+    /// either backwards produces terrain that is invisible from above and
+    /// solid anyway. So it is not argued here: the base face those same
+    /// vertices were carved from is a world surface, its rendered winding is
+    /// already pinned by `a_quad_triangulates_as_a_reversed_fan_from_its_first_vertex`,
+    /// and a displacement is a perturbation of it. The two must agree in sign.
+    ///
+    /// The other two assertions cover what `sp_a1_intro1` cannot: it has none
+    /// of the **100 displacements with a disallowed vertex**, which is the
+    /// whole of `tessellate`'s reason to exist.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn every_shipped_map_builds_its_displacement_geometry() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "only {} maps found", names.len());
+
+        let (mut maps, mut total, mut built, mut restricted) = (0, 0usize, 0usize, 0usize);
+        let (mut triangles, mut dropped, mut checked) = (0usize, 0usize, 0usize);
+        let mut overhanging = 0usize;
+        let mut powers = BTreeMap::<i32, usize>::new();
+
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            if bsp.disp_info.is_empty() {
+                continue;
+            }
+            maps += 1;
+
+            for face in bsp.model_faces(bsp.world_model()) {
+                let Ok(index) = usize::try_from(face.disp_info) else {
+                    continue;
+                };
+                let info = &bsp.disp_info[index];
+                total += 1;
+                *powers.entry(info.power).or_default() += 1;
+
+                let patch = disp::Displacement::build(&bsp, face)
+                    .unwrap_or_else(|| panic!("{name}: displacement {index} did not build"));
+                built += 1;
+                triangles += patch.indices.len() / 3;
+
+                let grid = DispInfo::vert_count(info.power);
+                assert_eq!(patch.vertices.len(), grid, "{name}: disp {index}");
+
+                // **The disallowed set is honoured.** 100 of the game's 1,181
+                // have one, and a patch that named one would be drawing a
+                // vertex its lower-power neighbour does not have — which is
+                // the crack `vbsp` cleared the bit to prevent.
+                let allowed = |v: usize| info.allowed_verts[v / 32] & (1u32 << (v % 32)) != 0;
+                let disallowed: Vec<usize> = (0..grid).filter(|&v| !allowed(v)).collect();
+                if !disallowed.is_empty() {
+                    restricted += 1;
+                    dropped += disallowed.len();
+                    for &v in &disallowed {
+                        assert!(
+                            !patch.indices.contains(&(v as u16)),
+                            "{name}: disp {index} draws disallowed vertex {v}"
+                        );
+                    }
+                    assert!(
+                        patch.indices.len() < DispInfo::tri_count(info.power) * 3,
+                        "{name}: disp {index} dropped a vertex and kept every triangle"
+                    );
+                }
+
+                assert!(!patch.indices.is_empty(), "{name}: disp {index} is empty");
+
+                // **The winding anchor**, and the reason this test is worth its
+                // runtime. The reference is the base face's own *rendered*
+                // winding: `build_page_meshes` emits `(0, i+1, i)`, the
+                // reversed fan, so `(c2-c0) x (c1-c0)` is which way that
+                // surface would have faced. A displacement is a perturbation of
+                // that quad, so its geometry has to face the same way.
+                //
+                // Taken over the **patch**, area-weighted, rather than triangle
+                // by triangle -- because terrain genuinely overhangs. Measured
+                // over the game: 131 of 92,622 individual triangles face the
+                // other way, all of them on steep patches, while **all 1,181
+                // patches agree** -- and all 1,181 disagree if the reversal in
+                // `Displacement::build` is dropped. So the per-patch form is
+                // exact where the per-triangle form is a heuristic.
+                let corners: Vec<Vec3> = bsp.face_vertices(face).collect();
+                let face_normal = (corners[2] - corners[0]).cross(corners[1] - corners[0]);
+
+                let mut area = Vec3::ZERO;
+                for tri in patch.indices.chunks_exact(3) {
+                    let v = |k: usize| patch.vertices[tri[k] as usize].position;
+                    let normal = (v(1) - v(0)).cross(v(2) - v(0));
+                    area += normal;
+                    if normal.length_squared() > 1e-6 {
+                        checked += 1;
+                        if normal.dot(face_normal) <= 0.0 {
+                            overhanging += 1;
+                        }
+                    }
+                }
+                assert!(
+                    area.dot(face_normal) > 0.0,
+                    "{name}: disp {index} faces {area} against its base face's {face_normal} -- the winding is inverted, and the terrain will be invisible from the side you stand on"
+                );
+            }
+        }
+
+        println!(
+            "\n{maps} maps: {total} displacements, {built} built, {triangles} triangles; \
+             {restricted} with disallowed vertices ({dropped} vertices dropped); \
+             {checked} triangle windings checked ({overhanging} overhanging); powers {powers:?}"
+        );
+        assert_eq!(built, total);
+        assert!(
+            total > 1000,
+            "only {total} displacements across {maps} maps"
+        );
+        assert!(
+            restricted > 50,
+            "only {restricted} restricted — is the mask read?"
+        );
     }
 
     #[test]

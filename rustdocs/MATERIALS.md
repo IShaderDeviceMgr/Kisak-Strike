@@ -675,7 +675,12 @@ all).
 ### `ShaderKind`
 
 ```rust
-pub enum ShaderKind { UnlitGeneric, LightmappedGeneric, VertexLitGeneric }
+pub enum ShaderKind {
+    UnlitGeneric,
+    LightmappedGeneric,
+    WorldVertexTransition,   // the same shader as LightmappedGeneric
+    VertexLitGeneric,
+}
 
 pub fn from_name(name: &str) -> Option<ShaderKind>;
 pub fn name(self) -> &'static str;
@@ -686,12 +691,29 @@ pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Three deep. `UnlitGeneric` is sprites, tool textures and anything whose colour is entirely
-in its texture; `LightmappedGeneric` is world brush surfaces — 62 of `sp_a1_intro1`'s 66
-world materials — and multiplies a base texture by a baked lightmap, flat or
-radiosity-normal-mapped; `VertexLitGeneric` is models, and is the largest shader in the
-shipped game — 1,108 of Portal 2's 3,431 materials name it, including 1,012 of the 1,096
-under `materials/models/`.
+Four names, three implementations. `UnlitGeneric` is sprites, tool textures and anything
+whose colour is entirely in its texture; `LightmappedGeneric` is world brush surfaces — 62
+of `sp_a1_intro1`'s 66 world materials — and multiplies a base texture by a baked lightmap,
+flat or radiosity-normal-mapped; `VertexLitGeneric` is models, and is the largest shader in
+the shipped game — 1,108 of Portal 2's 3,431 materials name it, including 1,012 of the
+1,096 under `materials/models/`.
+
+**`WorldVertexTransition` *is* `LightmappedGeneric`**, under the name content uses when it
+means "two base textures blended by the vertex alpha". `worldvertextransition.cpp` is 222
+lines, of which ~190 are a parameter table and the remaining three forward to
+`InitParamsLightmappedGeneric_DX9`, `InitLightmappedGeneric_DX9` and
+`DrawLightmappedGeneric_DX9` — the same helper, the same `.fxc`, the same vertex format,
+and `lightmappedgeneric_dx9.cpp` declares `$basetexture2`/`$bumpmap2`/
+`$blendmodulatetexture`/`$ssbump` itself. So `wgsl`, `vertex_layout`, `lighting_binding`,
+the uniform block and the bind group layout are all *shared*, and the variant exists only
+because Valve kept it as a separate `IShader`
+(`DEFINE_FALLBACK_SHADER( WorldVertexTransition, WorldVertexTransition_DX9 )`) and because
+`name()` should say what the `.vmt` said. `params()` is the one place they differ: WVT's
+table is `LightmappedGeneric`'s plus `$basetexturetransform2` and `$blendmodulatetransform`,
+which that shader genuinely does not declare.
+
+It is **terrain's shader and nothing else's**: 937 of Portal 2's 1,181 displacement faces
+name it and, measured over all 106 maps, **zero** non-displacement faces do.
 
 **A `.vmt` naming `VertexLitGeneric` does not always reach `VertexLitGeneric`.**
 `DrawVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:2346`) opens by handing the
@@ -960,8 +982,15 @@ tangent-space normal against a constant basis and never leaves tangent space, so
 and unbumped read the same vertices. `VertexLitGeneric`'s bumped variant *is* a second
 layout in Valve's engine — the tangent is `userDataSize = 4` only when the material is
 bumped — and this port declines it because the tangent is in the `.vvd` either way; the
-reasoning and the trigger to revisit are on `ModelVertex`. The envmap variant of
-`LightmappedGeneric` is still the one most likely to force it.
+reasoning and the trigger to revisit are on `ModelVertex`.
+
+**A third near-miss arrived with terrain, and it is the closest yet.**
+`WorldVertexTransition`'s two-layer blend needed *no* new layout — the blend factor rides
+in `WorldVertex::color.a`, which was already there — but `$seamless_scale` and `$envmap`
+both want a **world-space normal**, which `WorldVertex` does not carry, and 553 of Portal
+2's 1,181 displacement faces set the former. Those two are now the concrete trigger: the
+day `LightmappedGeneric` grows a second layout, it will be for a normal and not for a
+tangent.
 
 **How many pipelines actually survive the combo cull**, which `portdocs/MATERIALSYSTEM.md`
 §10 asks: loading all 1,108 of Portal 2's `VertexLitGeneric` materials and asking the cache
@@ -1588,113 +1617,127 @@ Ordered by how likely each is to bite.
    (`modelloader.cpp:7338`) and `ColorRgbExp32::to_vector` is it. Measured, not assumed —
    `rustdocs/STUDIO.md` gotcha 2 has the numbers. Use `to_linear` for a lightmap luxel and
    `to_vector` for a light cube, and nothing else.
-3. **`ColorSpace` is decided by the shader, and nothing checks it.** Getting it wrong
+3. **A `$ssbump` texture is not a normal map and must not be decoded as one.** It is
+   three already-positive coefficients, one per radiosity basis vector — so the signed
+   decode `2 * t - 1` is wrong for it, and so is the `saturate(dot(n, basis))²` weighting
+   that follows. `#if BUMPMAP == 1 // not ssbump` guards the first
+   (`lightmappedgeneric_ps2_3_x.h:322`) and `#if ( BUMPMAP == 2 )` replaces the second
+   with a plain weighted sum scaled by `0.57735` — `1/√3`, because vrad's three weights
+   are barycentric and sum to 1 while an ssbump's sum to 1.733.
+
+   This is not a corner case and it is worth stating in numbers: **128,139 of Portal 2's
+   288,250 drawable non-displacement world faces** wear a `$ssbump` material, across 92
+   materials, plus essentially all of its terrain. The port lit every one of them through
+   the signed decode until `world/disp/` landed and the terrain made it obvious. The
+   symptom is a surface that is *plausibly* lit — darker and flatter — rather than
+   anything that reads as broken, which is why it survived so long.
+4. **`ColorSpace` is decided by the shader, and nothing checks it.** Getting it wrong
    produces a picture that looks *plausible* — a washed-out albedo, or a normal map that
    lights slightly wrong — rather than anything that errors.
    [`shader::texture_requests`](#texture_requests) is where the answer lives; a call site
    that decides for itself is a bug waiting to diverge from the shader that samples it.
-4. **Read parameters through `shader::param_value`, not `Vmt::var`.** A `.vmt` that does
+5. **Read parameters through `shader::param_value`, not `Vmt::var`.** A `.vmt` that does
    not mention `$alpha` has no `$alpha` var, and treating that as zero makes every such
    material invisible. `param_value` is where `InitShaderParameters`' defaults live.
-5. **Per-draw constants must go in distinct arena slots, and this is not obvious.**
+6. **Per-draw constants must go in distinct arena slots, and this is not obvious.**
    `Queue::write_buffer` stages its copy to run before the *whole* command buffer, not at
    the point in the recording where it was called — so one uniform buffer rewritten
    between draws gives every draw in the frame the last values written. `RenderContext`
    handles it; anything that adds a new per-draw block must too. See
    [Uniforms are arenas](#uniforms-are-arenas-not-single-buffers).
-6. **`RenderContext::begin_frame` must run before anything allocates, once a frame.** It
+7. **`RenderContext::begin_frame` must run before anything allocates, once a frame.** It
    resets the uniform and geometry arenas. A slice held over from the previous frame
    reads whatever overwrites it — silently, and only under load, because the arena has to
    wrap round to the same offset first.
-7. **A `Frame` borrows the renderer.** `resize` and a second `begin_frame` have to happen
+8. **A `Frame` borrows the renderer.** `resize` and a second `begin_frame` have to happen
    outside that borrow: `Surface::configure` panics if a frame is alive, so the borrow
    checker is enforcing a real `wgpu` rule. Drawing is unaffected — `RenderContext` holds
    its own device handles.
-8. **`wgpu` render passes do not nest**, so a render target is filled by a pass that has
+9. **`wgpu` render passes do not nest**, so a render target is filled by a pass that has
    *ended* before the pass that samples it begins. See
    [Passes replace three stacks](#passes-replace-three-stacks).
-9. **`Pass::draw` panics on a vertex-layout mismatch.** The layout comes from the
+10. **`Pass::draw` panics on a vertex-layout mismatch.** The layout comes from the
    material's shader (`ShaderKind::vertex_layout`), not from the buffer, and drawing
    model data through a world shader would otherwise reinterpret bone weights as
    coordinates and draw something merely wrong.
-10. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
+11. **A zero-size window is legal and must not reach `Surface::configure`, which panics on
    it.** Minimizing a window reports width or height 0. `resize(w, 0)` marks the surface
    unconfigured and `begin_frame` then returns `None` until real dimensions arrive. If you
    add another path that configures the surface, replicate that guard.
-11. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
+12. **`pre_present_notify` is the caller's job.** The renderer does not own a `winit`
    window, so it cannot make the call itself. It must happen immediately before
    `Frame::present`; skipping it costs compositor scheduling accuracy, not correctness.
-12. **Sizes are physical pixels.** See `Renderer::new` above.
-13. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
+13. **Sizes are physical pixels.** See `Renderer::new` above.
+14. **The surface format is sRGB when the platform offers one** (`Bgra8UnormSrgb` on
    macOS/Metal). That is the replacement for `IShaderDevice::SetHardwareGammaRamp`: the
    hardware encodes on write instead of the engine warping the display's gamma ramp
    process-wide — and leaving it warped if it crashed. **Consequence:** values written by
    a shader are treated as *linear* and encoded on the way out. Do not apply an sRGB curve
    in shader code as well.
-14. **Copies into a compressed texture use the level's *physical* size, not its logical
+15. **Copies into a compressed texture use the level's *physical* size, not its logical
     one.** The tail of a DXT mip chain is levels smaller than a 4x4 block (a 64x64 DXT1
     texture ends 2x2, 1x1), and WebGPU requires a copy to be a whole number of blocks —
     writing the logical 2x2 is a validation error, not a silent truncation.
     `ImageFormat::mem_required` rounds the same way, because `GetMemRequired` did, so the
     byte counts agree. This bit once; `Texture::from_vtf` handles it.
-15. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
+16. **`Features::TEXTURE_COMPRESSION_BC` is required, not requested.** Essentially every
     texture Valve ships is DXT, and there is no fallback tier — decompressing on the CPU
     would quadruple both load time and video memory for the whole game. An adapter without
     it fails at startup with `RendererError::NoBlockCompression` rather than half-working.
-16. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
+17. **`required_limits` is `wgpu::Limits::default()` — the portable floor, not the
     adapter's ceiling.** Deliberate: §4.6 replaces `IMaterialSystemHardwareConfig`'s ~50
     caps queries and the `dxlevel` ladder with one fixed capability tier, and asking every
     machine for the same limits is what makes that tier mean anything. Raise it
     deliberately when a shader needs more; never adapter-by-adapter.
-17. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
+18. **Colour space of the swap chain is `Auto`, i.e. SDR.** Portal 2 ships HDR-lit maps,
     and HDR is still an open question (`portdocs/MATERIALSYSTEM.md` §10). Switching it on
     means a float format and a tonemap pass, not just changing this field.
-18. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
+19. **Backends are `METAL | VULKAN | GL`.** DX12 and BrowserWebGPU are omitted rather than
     merely unreachable, per `PORTING.md`'s POSIX-only rule. `WGPU_BACKEND` still overrides
     at runtime (as do `WGPU_ADAPTER_NAME` and `WGPU_DEBUG`) — those are left enabled on
     purpose as the modern equivalent of the old `-gl`/`-dx9` switches.
-19. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
+20. **`Renderer::new` blocks** on `pollster::block_on` for the adapter and device requests.
     Fine at startup, on the main thread, once. Do not call it from a frame.
-20. **`LightmapAtlas::begin_material` must bracket each material's run of allocations.**
+21. **`LightmapAtlas::begin_material` must bracket each material's run of allocations.**
     Forgetting it costs draw batches, not correctness; calling it inside a run costs more
     of them. See [`LightmapAtlas`](#lightmapatlas-and-lightmappages).
-21. **The lightmap page is not a material property.** One material's surfaces are spread
+22. **The lightmap page is not a material property.** One material's surfaces are spread
     over as many atlas pages as the packer needed, so the page is bound per *batch* with
     `Pass::bind_lightmap_page` — that is what Valve's sort ID encodes. Putting it in the
     material's bind group would mean one `Material` per page.
-22. **HDR lightmaps reach the shader unexposed.** `cLightScale.x` is 1.0 because there is
+23. **HDR lightmaps reach the shader unexposed.** `cLightScale.x` is 1.0 because there is
     no tone mapper, so a map is as bright as `vrad` left it — dimmer than the shipped
     game, which auto-exposes. It is one uniform field, not a redesign; see the divergence
     table.
-23. **A parameter with a non-type default must be read with `init_float`/`init_vec`, not
+24. **A parameter with a non-type default must be read with `init_float`/`init_vec`, not
     `param_value`.** There are two default mechanisms and `param_value` is the second one,
     so `param_value(..., "$detailscale").unwrap_or( 4.0 )` compiles, reads correctly and
     silently yields 0. See [the two defaults](#two-defaults) — this cost a debugging
     session on the shader it was introduced with.
-24. **A model's baked vertex light is gamma space times a half, and white is not
+25. **A model's baked vertex light is gamma space times a half, and white is not
     neutral.** `GammaToLinear( color * cOverbright )` with `cOverbright` 2
     (`common_vs_fxc.h:852`): a baked 0.5 is a linear 1.0, and an unlit vertex is *black*.
     Filling `ModelVertex::color` with white is twice the brightest value `vrad` can bake.
     `ModelLighting::static_light` is the switch that says whether the stream means
     anything at all.
-25. **The ambient cube is ordered `+x, -x, +y, -y, +z, -z`.** It comes from three
+26. **The ambient cube is ordered `+x, -x, +y, -y, +z, -z`.** It comes from three
     `float3[2]` register pairs (`cAmbientCubeX` at VS `c21`, `Y` at `c23`, `Z` at `c25`),
     so positive is always the even slot. A swapped pair lights every model in the level
     from the wrong side and looks entirely plausible;
     `the_ambient_cube_lights_each_axis_from_its_own_entry` pins all six.
-26. **A local light's *type* lives in the `w` of two of its vectors**, not in an enum:
+27. **A local light's *type* lives in the `w` of two of its vectors**, not in an enum:
     `color.w` is 1 for a directional light and `direction.w` is 1 for a spot
     (`common_vs_fxc.h:119`). The shader selects with two `lerp`s, which is what a shader
     model with no branches had instead of an `if`. Build lights with `Light::point`,
     `Light::spot` and `Light::directional` rather than filling the fields, and fill unused
     slots with `Light::NONE` — a *zeroed* slot divides by zero in the attenuation
     denominator, which is why `s_pTwoEmptyLights` has a constant attenuation of 1.
-27. **A bumped model gets no baked vertex light at all, and an unbumped one does.** That
+28. **A bumped model gets no baked vertex light at all, and an unbumped one does.** That
     asymmetry is Valve's: `vertexlit_and_unlit_generic_bump_ps2x.fxc:452` calls
     `PixelShaderDoLighting` with `bStaticLight = false`, because the per-vertex stream
     cannot be re-evaluated against a per-pixel normal. The same model with and without a
     `$bumpmap` is therefore lit by different things, not by the same thing more precisely.
-28. **Unbumped `VertexLitGeneric` is Gouraud-shaded** — `DoLighting` runs in the *vertex*
+29. **Unbumped `VertexLitGeneric` is Gouraud-shaded** — `DoLighting` runs in the *vertex*
     shader (`vertexlit_and_unlit_generic_vs20.fxc:437`) and the fragment shader reads the
     interpolated result. Lighting it per pixel instead is prettier and wrong: content was
     authored against the flatter shading, and a lighting number measured at the middle of
@@ -1734,23 +1777,31 @@ Each of these changes what the engine does, and each names the thing that revers
 | `$phong` materials draw without specular | `WantsPhongShader` sends them to `DrawPhong_DX9`, a separate §7.8 shader that is not ported. 317 of Portal 2's 1,108 `VertexLitGeneric` materials; each says so once on stderr at load | port `Phong` |
 | `$envmap "env_cubemap"` reflects nothing | it names no file — it is a request for the render instance's local cubemap, which needs the `.bsp`'s pak lump mounted. 78 materials; they bind the 1x1 black cube, so the reflection term contributes zero rather than a checkerboard | `shader::envmap_name` |
 | An **opaque** material writes its base texture's alpha to the frame, where Valve writes 1 | `g_EyePos_BaseTextureTranslucency.w` is `TextureIsTranslucent( BASETEXTURE, true )` — 1 for a `$translucent` or `$alphatest` material, 0 for an opaque one — and the shader lerps the base alpha in by it. Blending and the alpha-test `discard` are unaffected, because both cases have `w` of 1; only the frame's alpha channel differs, and the underwater fog pass that reads it is not ported. Shared with `UnlitGeneric`, which reaches the same Valve source file | thread the resolved base texture into `*_uniforms` and add a flag |
+| `$seamless_scale` draws with ordinary planar mapping | seamless mapping is a triplanar projection of `worldPos * scale` blended by the squared world normal, and a `WorldVertex` carries no normal. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` maps and none in `sp_a1_intro1` | a second `VertexLayout` for `LightmappedGeneric` with a normal in it |
 | `$lightwarptexture`, `$rimlight` and self-illum fresnel are ignored | each belongs to the `Phong` path or needs a texture kind not yet loaded; all three are declared-and-unread rather than silently accepted, since the params table omits what it does not honour | — |
 
 ## Not implemented
 
 Stage 6 is `VertexLitGeneric` and is done; the rest of §7.8's shader set, paint maps and
-GPU morph (stages 7-8) are not. The shader set is three shaders deep, so a `.vmt` naming
-any of the other 160-odd still resolves to the error material — measured against Portal 2,
-those three cover 2,836 of its 3,431 materials. Also deliberately absent, and listed so
+GPU morph (stages 7-8) are not. The shader set is three implementations under four names,
+so a `.vmt` naming any of the other 160-odd still resolves to the error material —
+measured against Portal 2, those cover 2,836 of its 3,431 materials plus the 16 that name
+`WorldVertexTransition`. Also deliberately absent, and listed so
 nobody looks for them:
 
-- **Everything `LightmappedGeneric` can do past a base texture, a bump map and a
-  lightmap.** `$basetexture2`/`$bumpmap2` two-layer blending and `$blendmodulatetexture`,
-  `$detail`, `$envmap`/`$envmapmask` (the one that needs tangent space, and therefore a
-  second vertex layout), `$selfillum`, phong, seamless mapping, the flashlight, cascaded
-  shadow maps, and Portal 2's paint layer. Each is declared in
-  `lightmappedgeneric_dx9_helper.cpp` and each is left out of the parameter table rather
-  than declared-and-ignored.
+- **Everything `LightmappedGeneric` can do past a base texture, a bump map, a lightmap and
+  the two-layer blend.** `$detail`, `$envmap`/`$envmapmask`, **`$seamless_scale`**,
+  `$selfillum`, phong, the `FANCY_BLENDING >= 2` layer-border and edge terms, drop
+  shadows, the flashlight, cascaded shadow maps, and Portal 2's paint layer. Each is
+  declared in `lightmappedgeneric_dx9_helper.cpp` and each is left out of the parameter
+  table rather than declared-and-ignored.
+
+  **`$envmap` and `$seamless_scale` are now the two that matter**, because they are the
+  two that want a *world-space normal* — the attribute a `WorldVertex` does not carry —
+  and so they are what will finally force this shader's second vertex layout, which §10
+  expected bumpedness to force and it did not. 553 of Portal 2's 1,181 displacement faces
+  set `$seamless_scale`, all in the `sp_a3_*` underground maps; they draw with ordinary
+  planar mapping, which is the right texture at the wrong scale.
 - **Dynamic lights and lightstyle animation.** `R_BuildLightMap` rebuilt a page every
   frame from `LightStyleValue( style )` and the visible `dlight_t`s; a page here is
   written once at load. `LockLightmap`/`UpdateLightmap` and the ring of dynamic pages go

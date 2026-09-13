@@ -659,8 +659,27 @@ displacement *semantics* — the one-sided tests, the nine cached edge-cross pla
 `DIST_EPSILON` interval, the `DISPSURF_*` tags and the stab — and swapping the arithmetic
 would change the epsilon, which is the behaviour. It is on the table again at stage 5,
 when `parry` is in the tree for `.phy` anyway and the comparison costs nothing. All 1,181
-of Portal 2's displacements build and trace; `sp_a1_intro1`'s 11 are solid and still not
-drawn, which is `world/disp/`'s half of the same lump read.
+of Portal 2's displacements build and trace.
+
+**Drawing them is `world/disp/`, planned in `portdocs/ENGINE_WORLD_DISP.md` and done** —
+the other half of the same lump read, and the last structural absence in a map's level
+shell. It is a small module because there is **no separate terrain draw path**: a
+displacement goes through `world/`'s existing material grouping, lightmap packing and
+`(material, page)` batching with its grid in place of the face's winding, which is what
+Valve's `DispInfo_CreateMaterialGroups` does too. Two things about it are worth carrying
+forward. The render tessellation is **not** the collision triangulation — it is a quadtree
+walk honouring a per-vertex allowed set that stops a high-power patch cracking against a
+coarser neighbour — and yet the two coincide exactly when nothing is disallowed, which is
+what makes the walk testable against code that already works. And the winding: this file's
+own portdoc argued terrain should *not* be reversed the way world faces are, and a depot
+test disproved it on its first run. **A winding argument that runs through two sign
+conventions is not worth trusting**; anchor it to something already measured instead.
+
+It also landed `WorldVertexTransition`, which is `LightmappedGeneric` under a second name
+and which 937 of the game's 1,181 displacement faces wear — and with it `$ssbump`, whose
+absence turned out to be mis-lighting **128,139 of Portal 2's 288,250 drawable world
+faces**, not just terrain. That is the general shape of this port's surprises: a feature
+looks local until it is measured.
 
 Drawing them was `world/`'s and shares the placement: `BrushModel::model_to_world` is the
 inverse of the transform the trace applies to a ray, computed per draw and never cached,

@@ -145,8 +145,8 @@ impl Material {
                 let block = shader::unlit_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
-            ShaderKind::LightmappedGeneric => {
-                let block = shader::lightmapped_uniforms(vmt);
+            ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
+                let block = shader::lightmapped_uniforms(shader, vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
             ShaderKind::VertexLitGeneric => {

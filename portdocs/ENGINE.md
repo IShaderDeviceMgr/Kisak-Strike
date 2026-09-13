@@ -441,8 +441,17 @@ parse with `binrw`/`nom`. `zone.cpp`/`mem.cpp`/`mem_fgets.cpp` are the hunk/zone
 allocators and **delete outright** — that's what `std` allocation is for.
 
 ### 7.15 Displacements (terrain) — ~3,700 → `world/disp/`
+**Ported — see `src/engine/world/disp/` and `portdocs/ENGINE_WORLD_DISP.md`.**
 `disp_interface.cpp` (1,461), `disp.cpp` (1,203), `disp_mapload.cpp` (1,009),
-`disp_defs.cpp` (40), `disp_helpers.cpp` (20).
+`disp_defs.cpp` (40), `disp_helpers.cpp` (20), plus `public/builddisp.cpp`'s coordinate
+generation and `public/disp_tesselate.h`'s quadtree walk. About 350 lines of the ~9,100
+have a counterpart; the LOD tree, decals, neighbour stitching and `SetupAllowedVerts` all
+delete, the last because `vbsp` already wrote its answer into the lump.
+Two findings sized the work: the render tessellation is **not** the collision one (it
+honours a per-vertex allowed set, live on 100 of the game's 1,181 patches) but coincides
+with it exactly when nothing is disallowed; and **937 of 1,181 displacement faces name
+`WorldVertexTransition`**, which turned out to be `LightmappedGeneric` under another name
+and landed with them.
 
 ### 7.16 Renderer front-end — ~40,000 → `render/` + `paint/`, mostly folded into `src/materials/`
 `gl_rsurf.cpp` (6,465), `l_studio.cpp` (5,659), `shadowmgr.cpp` (4,747),
@@ -652,11 +661,13 @@ reached.** Remaining, in dependency order:
    pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
    from checkerboard into content. **Highest visual return of anything on this list.**
 4. **The rest of `world/`** (§7.14, §7.15) — visibility (every face is drawn every frame
-   today) and displacements, plus `trace/` (§7.17)'s remaining stages. **Static props and
-   brush entities have landed**: the props are `portdocs/STUDIO.md`, and the brush
-   entities turned out to be the *existing* face-grouping and lightmap path run per model
-   with the entity's matrix, because a brush model's faces are in its own frame and the
-   `SURF_*` filter already removes every trigger. See `rustdocs/ENGINE.md`.
+   today) and the 3D skybox, plus `trace/` (§7.17)'s remaining stages. **Static props,
+   brush entities and displacements have landed**: the props are `portdocs/STUDIO.md`; the
+   brush entities turned out to be the *existing* face-grouping and lightmap path run per
+   model with the entity's matrix, because a brush model's faces are in its own frame and
+   the `SURF_*` filter already removes every trigger; and terrain turned out to be the
+   same path again, with the patch's grid in place of the face's winding
+   (`portdocs/ENGINE_WORLD_DISP.md`). See `rustdocs/ENGINE.md`.
    - `render/` (§7.16) + `paint/` — as the consumer side of the `src/materials/` work,
      not as a separate port. `Engine::camera` and `World::draw` are its seed.
    - `audio/` (§7.18) — large but self-contained, no `winit`/`wgpu` entanglement, and the

@@ -75,6 +75,23 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   brush trace, with the six reasons and the conditions that would reverse it. Five
   stages; stage 1 has landed and is what `portdocs/CLIENT.md` stage 4 was waiting on.
 
+- [`ENGINE_WORLD_DISP.md`](ENGINE_WORLD_DISP.md) — displacements, the **rendering** half.
+  **Ported — see `src/engine/world/disp/` and `rustdocs/ENGINE.md`.** The collision half
+  landed with `ENGINE_TRACE.md` stage 3; this is the other half of the same lumps.
+  Inventory across `engine/disp*.cpp`, `public/builddisp.cpp`, `disp_powerinfo.cpp` and
+  `disp_tesselate.h` (~9,100 lines, ~350 with a counterpart), the four things a render
+  vertex needs beyond the grid `trace/` already builds, and Valve's quadtree tessellation
+  — which is **not** the collision triangulation, because it honours a per-vertex
+  `m_AllowedVerts` set that stops a power-4 patch cracking against a power-2 neighbour,
+  and which nonetheless coincides with it exactly when nothing is disallowed. Concludes
+  there is **no separate terrain draw path**: a displacement goes through the existing
+  material-grouping and lightmap-packing pipeline with its grid in place of the face's
+  winding. Its other finding is a shader: **937 of the game's 1,181 displacement faces
+  name `WorldVertexTransition`**, which is `LightmappedGeneric` under a second name and
+  landed with this. Two of its sections were **corrected by the port** and say so: §4.4's
+  winding argument was backwards, and §6.2 under-stated `$ssbump`'s reach by two orders of
+  magnitude.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current

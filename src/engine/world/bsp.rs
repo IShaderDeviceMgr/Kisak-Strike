@@ -449,10 +449,22 @@ pub struct DispInfo {
     /// structs to leave them unused would be transcription risk for nothing.
     /// Reading them is still what proves the stride is 176.
     pub _neighbors: [u8; 88],
-    /// `m_AllowedVerts` — which grid vertices may be active, given the
-    /// neighbours' powers. A rendering LOD concern; collision always uses the
-    /// full grid.
-    pub _allowed_verts: [u32; 10],
+    /// `m_AllowedVerts` — which grid vertices the *renderer* may use, one bit
+    /// per grid vertex in `y * side + x` order.
+    ///
+    /// VBSP clears a bit when the vertex sits on an edge shared with a
+    /// lower-power neighbour that has no matching vertex, and then propagates
+    /// the clear inward through the quadtree's dependency graph
+    /// (`SetupAllowedVerts`, `public/disp_common.cpp:1269`) — so a cleared bit
+    /// is **not** necessarily on an edge. Dropping those vertices is what stops
+    /// a power-4 patch cracking against a power-2 one.
+    ///
+    /// **Collision ignores this and always uses the full grid**, which is
+    /// Valve's asymmetry: `CDispCollTree` is built from
+    /// `GenerateCollisionSurface`, which never consults it. 100 of Portal 2's
+    /// 1,181 displacements have at least one bit cleared. Read by
+    /// [`world::disp`](crate::engine::world::disp).
+    pub allowed_verts: [u32; 10],
 }
 
 impl DispInfo {
@@ -1160,6 +1172,76 @@ impl Bsp {
         ]
     }
 
+    /// A displacement's base quad, rotated so that corner 0 is the one nearest
+    /// the patch's `start_position`.
+    ///
+    /// `CCoreDispSurface::FindSurfPointStartIndex` (`builddisp.cpp:345`) then
+    /// `AdjustSurfPointData` (`:373`): the nearest corner becomes corner 0 and
+    /// the other three rotate with it, preserving the winding. This is what
+    /// makes the grid's two axes agree with the order `LUMP_DISP_VERTS` was
+    /// written in — get it wrong and the patch is the right shape rotated by a
+    /// multiple of 90°.
+    ///
+    /// `None` when the base face is not a quad, which no shipped displacement
+    /// is: `if ( pFaces->numedges > 4 ) continue;` and the `pointCount != 4`
+    /// check after it, checked against the depot over all 1,181.
+    ///
+    /// **Shared by both readers on purpose.** `trace/` collides with this grid
+    /// and `world/disp/` draws it; if the two ever derived the corner order
+    /// separately they could disagree, and the map would be solid somewhere it
+    /// is not drawn.
+    pub fn disp_base_quad(&self, face: &Face, info: &DispInfo) -> Option<[Vec3; 4]> {
+        let corners: Vec<Vec3> = self.face_vertices(face).collect();
+        let corners: [Vec3; 4] = corners.try_into().ok()?;
+
+        let start = Vec3::from(info.start_position);
+        let first = (0..4).min_by(|&a, &b| {
+            let d = |i: usize| (start - corners[i]).length_squared();
+            d(a).total_cmp(&d(b))
+        })?;
+        Some(std::array::from_fn(|i| corners[(i + first) % 4]))
+    }
+
+    /// The `(2^power + 1)²` grid of displaced positions, in world space.
+    ///
+    /// `CCoreDispInfo::GenerateDispSurf` (`builddisp.cpp:1961`). Vertex
+    /// `(i, j)` is a bilinear interpolation of the four base corners — `i`
+    /// running along the `p0 → p1` edge and `j` across to the `p3 → p2` edge —
+    /// plus that vertex's own `vector * dist`. The index is `i * spacing + j`,
+    /// which is Valve's `y * side + x` under the other spelling of the same two
+    /// axes.
+    ///
+    /// Valve's `m_Elevation` and `m_SubdivPos` terms are dropped: both are the
+    /// map editor's, and a `ddispinfo_t` carries neither.
+    ///
+    /// `points` is [`disp_base_quad`](Bsp::disp_base_quad)'s output, and passing
+    /// anything else silently builds a rotated patch. Shared by `trace/` and
+    /// `world/disp/` for the reason on `disp_base_quad`.
+    pub fn disp_grid(&self, info: &DispInfo, points: &[Vec3; 4]) -> Vec<Vec3> {
+        let spacing = (1usize << info.power) + 1;
+        let step = 1.0 / (spacing - 1) as f32;
+        let edge = [
+            (points[1] - points[0]) * step,
+            (points[2] - points[3]) * step,
+        ];
+
+        let first = info.disp_vert_start as usize;
+        let mut verts = Vec::with_capacity(spacing * spacing);
+        for i in 0..spacing {
+            let ends = [
+                points[0] + edge[0] * i as f32,
+                points[3] + edge[1] * i as f32,
+            ];
+            let seg = (ends[1] - ends[0]) * step;
+            for j in 0..spacing {
+                let flat = ends[0] + seg * j as f32;
+                let dv = &self.disp_verts[first + i * spacing + j];
+                verts.push(flat + Vec3::from(dv.vector) * dv.dist);
+            }
+        }
+        verts
+    }
+
     /// How many lightstyles a face carries, and therefore how many copies of
     /// its samples the lighting lump holds.
     ///
@@ -1817,7 +1899,7 @@ mod tests {
             lightmap_alpha_start: 0,
             lightmap_sample_position_start: 0,
             _neighbors: [0; 88],
-            _allowed_verts: [0; 10],
+            allowed_verts: [0; 10],
         };
         // The three values the depot actually holds.
         assert_eq!(disp(0x8000_0000u32 as i32).disp_flags(), 0);
