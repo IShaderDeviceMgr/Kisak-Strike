@@ -4,8 +4,10 @@
 event queue, thinks, `MOVETYPE_PUSH`, and the ~200 entity classes Portal 2 actually
 places.
 
-Status: **not started.** This document is written before the port, against the current
-architecture. Read [`../PORTING.md`](../PORTING.md) first; this is the module detail.
+Status: **stage 1 of 5 done** — see `src/server/` and
+[`../rustdocs/SERVER.md`](../rustdocs/SERVER.md). Written before the port, against the
+current architecture; the three sections stage 1 corrected say so inline (§4.4, §7.3
+twice). Read [`../PORTING.md`](../PORTING.md) first; this is the module detail.
 
 Siblings worth having open: [`CLIENT.md`](CLIENT.md) (the player that already exists),
 [`ENGINE_TRACE.md`](ENGINE_TRACE.md) (stage 4 of which is blocked on this document),
@@ -491,8 +493,16 @@ it exercises nearly the whole subsystem (`logicrelay.cpp`, 171 lines):
 ### 4.4 Finding an entity by name
 
 `FindEntityByName` (`entitylist.cpp:752`) is a linear walk of the entity list, and the
-comparison is `EntityNamesMatchCStrings` (`baseentity.cpp:644`): case-insensitive, and
-the **only** wildcard is a trailing `*`. 234 connections in the shipped maps use one.
+comparison is `EntityNamesMatchCStrings` (`baseentity.cpp:644`): case-insensitive, with a
+`*` wildcard. 234 connections in the shipped maps use one.
+
+> **Corrected by stage 1.** Valve's comment says "only thing supported is trailing `*`"
+> and this section repeated it. The *code* walks until the two strings diverge and then
+> asks whether the query is sitting on a `*` — so the `*` need not be trailing at all:
+> `"*door"` matches everything and `"do*r"` matches `"dover"`. Measured afterwards: all
+> 234 wildcard targets in the shipped maps are a plain trailing `*` and no `targetname`
+> in the game contains one, so Portal 2 never reaches the difference. Reproduced anyway.
+
 
 A name beginning with `!` is *procedural* and resolves to exactly one entity
 (`FindEntityProcedural`, `entitylist.cpp:651`), never iterated. Portal 2's maps use five
@@ -801,18 +811,26 @@ reason `host::Level` is a trait. Do not try to give a behaviour `&mut Server`.
 
 ### 7.3 A class is a table plus a trait, not a base class
 
+> **Corrected by stage 1, in two places.** The `parent` pointer below is not needed —
+> the chain walk it exists for dissolves into ordinary composition — and the FGD is not
+> the cross-check this section expected. Both are marked inline; `rustdocs/SERVER.md` is
+> what shipped.
+
 `ClassDef` replaces `datamap_t` + `LINK_ENTITY_TO_CLASS`:
 
 ```rust
 pub struct ClassDef {
     pub name: &'static str,                       // "logic_relay"
-    pub parent: Option<&'static ClassDef>,        // the baseMap chain
+    pub parent: Option<&'static ClassDef>,        // the baseMap chain  <- DELETED, below
     pub keys: &'static [KeyDef],                  // FTYPEDESC_KEY
     pub inputs: &'static [&'static str],          // FTYPEDESC_INPUT, by name
     pub outputs: &'static [&'static str],         // FTYPEDESC_OUTPUT, by name
     pub create: fn() -> Box<dyn Behaviour>,
 }
 ```
+
+(`inputs` and `KeyDef`'s field type are stage 2's: both exist only to serve
+`AcceptInput`, and stage 1 ships `keys: &'static [&'static str]` and no `inputs` at all.)
 
 Three things change relative to the C++ and each is deliberate:
 
@@ -821,16 +839,28 @@ Three things change relative to the C++ and each is deliberate:
   assigns a real field. Slightly more typing per class; no `unsafe`, no `sizeof`
   agreement, and the compiler checks the type. The offsets only existed to let save/
   restore reuse the table, and save/restore is deleted (§6).
-- **The chain walk stays.** `keys`/`inputs`/`outputs` resolve by walking `parent` exactly
-  as `for (datamap_t *dmap = GetDataDescMap(); dmap; dmap = dmap->baseMap)` does, so
-  `StartDisabled` is declared once on a shared `ClassDef` and inherited. This is the one
-  piece of the inheritance tree worth keeping, and keeping it as *data* rather than as
-  vtables is the whole trick.
-- **The table is checkable against the FGD.** §1.4. A depot-gated test that loads the
-  four shipped FGDs and asserts every `KeyDef`/input/output name and type agrees is
-  worth writing on day one — it catches the entire category of "ported the wrong key
-  name", which synthetic tests never will (compare `STUDIO.md` §11's two wrong `.vtx`
-  offsets that every synthetic test passed).
+- **~~The chain walk stays.~~ It dissolves into composition — this was wrong.** The plan
+  was for `keys`/`inputs`/`outputs` to resolve by walking `parent`, the way
+  `for (datamap_t *dmap = GetDataDescMap(); dmap; dmap = dmap->baseMap)` does. Writing it
+  showed there is nothing for the walk to do. `CEnvLight : public CLight` becomes an
+  `EnvLight` that **holds** a `Light` and ends its `key_value` with
+  `self.light.key_value(..)` — same order, same result, one less indirection, and the
+  compiler checks it. Every place the C++ needs `baseMap`, Rust needs a field. So stage 1
+  ships no `parent`, and what a class inherits, it contains. The declaration — the key
+  and output *names* — stays as data, because an output key has to be recognised as an
+  output rather than counted as an unknown key.
+- **~~The table is checkable against the FGD.~~ Against the *map data*, which is
+  stronger.** The plan was a depot test asserting every declared name agrees with the
+  four shipped FGDs. **The FGD is not a superset of the datadesc**, so that assertion
+  fails on correct code: `world_mins`/`world_maxs` are written by `vbsp` and appear in no
+  FGD, `CLight`'s `defaultstyle` is internal, and the FGD declares the *unnumbered*
+  `OnProxyRelay` where the server has `OnProxyRelay1`-`30`. What does have teeth, and is
+  what stage 1 shipped, is the pair
+  `classes::every_declared_key_is_consumed_and_every_consumed_key_is_declared` (the table
+  against the code) and the depot test's `EXPECTED_UNHANDLED` table (the code against all
+  106 maps' real keys). A misspelled declaration fails both. The FGDs remain the best
+  *reference* for what a class's keys are called — §1.4 stands — they are just not an
+  oracle.
 
 ### 7.4 The seams
 
@@ -891,21 +921,48 @@ level.
 Each stage is meant to end somewhere observable, and stage 2 is where the module starts
 paying for itself.
 
-### Stage 1 — the entity list, spawn, and the class table
+### Stage 1 — the entity list, spawn, and the class table — **DONE**
 
-The list (`Vec<Option<Entity>>` + generations), `ClassDef` and the chain walk, the
-factory, `ParseMapData`/`KeyValue` over `bsp::Entity`, the three-pass spawn ordering
-(§4.1), `UTIL_Remove`'s deferred deletion, and `LevelInit`/`Activate`/`LevelShutdown`
-hung off `host::HostState`. Classes: `worldspawn`, `info_player_start`, `info_target`,
-`logic_relay` and `func_instance_io_proxy` as stubs with keys parsed and no behaviour.
+**See `src/server/` and `rustdocs/SERVER.md` for the API.** 28 unit tests and one depot
+test, none of them needing a GPU.
 
-Ends with: `ent_dump`-style console output listing every entity a map spawned, with its
-class, name, origin and unparsed keys. That last column is the progress metric for the
-rest of the module.
+The list (`Vec<Option<Entity>>` + generations), `ClassDef`, the factory,
+`ParseMapData`/`KeyValue` over `bsp::Entity`, the three-pass spawn ordering (§4.1),
+`UTIL_Remove`'s deferred deletion, and `LevelInit`/`Activate`/`LevelShutdown` hung off
+`host::HostState` through `Scene`. `report_entities` and `ent_dump` are the two console
+commands, both Valve's.
 
-Depends on: nothing unbuilt. Tests without a GPU. A depot-gated test spawns all 106 maps
-and asserts every entity gets a class or is counted — the same shape as
-`world/`'s existing all-maps test.
+**Classes: ten, not five.** The plan's `worldspawn`, `info_player_start`, `info_target`,
+`logic_relay` and `func_instance_io_proxy` — plus the light family (`light`,
+`light_spot`, `light_directional`, `light_glspot`, `light_environment`), which was worth
+adding twice over. It is **7,150 entities, the second largest family in the game**, and
+`CLight::Spawn` is the one piece of stage-1 behaviour that does something: it deletes
+**6,937 of them**, because a light with no `targetname` has already had its whole
+contribution baked into the lightmaps by `vrad`. A port that skipped that one `if` would
+carry eleven per cent of the game's entity list as garbage and every other number would
+still look right.
+
+Measured over all 106 shipped maps, and asserted exactly by
+`server::tests::every_shipped_map_spawns_its_entities`:
+
+```
+60,925 entity blocks   17,069 matched a class   10,132 spawned
+ 6,937 removed themselves (all of them unnamed lights; 213 named ones survive)
+42,065 output connections recognised     191 unimplemented classnames (43,856 blocks)
+    28 key names nothing consumes — 17 of them the map compiler's, 4 mapper mistakes
+```
+
+`sp_a1_intro1`: 598 blocks, 149 matched, 127 spawned, 22 lights removed, 531 outputs.
+
+Three findings worth carrying forward. **§7.3's `parent` pointer is not needed** —
+inheritance became composition. **The FGD is not an oracle** — §7.3 again. And
+**§4.4's wildcard rule was wrong**: the `*` does not have to be trailing.
+
+Deliberately deferred inside the stage: `ClassDef::inputs` and `fieldtype_t` (they serve
+`AcceptInput` alone), the `parentname` attachment form (zero of the 4,582 parented
+entities use it), and the four `KeyValue` ladder entries that appear zero times in the
+shipped maps — one of which, `angle`, is **infinitely recursive** in Valve's
+implementation.
 
 ### Stage 2 — entity I/O, the event queue, and thinks
 

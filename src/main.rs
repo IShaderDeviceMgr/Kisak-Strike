@@ -7,9 +7,9 @@
 //!
 //! Subsystems are modules under `src/`. `launcher` (process bootstrap),
 //! `filesystem` (search paths, VPKs), `materials` (the GPU device) and most of
-//! `engine` exist so far, and `client` is the first of the *game* modules —
-//! Valve's `client.so`, a sibling of `engine.so` and so a sibling of `engine`
-//! here. The rest arrives as it is ported.
+//! `engine` exist so far, and `client` and `server` are the *game* modules —
+//! Valve's `client.so` and `server.so`, siblings of `engine.so` and so
+//! siblings of `engine` here. The rest arrives as it is ported.
 //!
 //! `cmdline` and `math` are the exceptions to "one module per Valve module".
 //! Valve kept `CommandLine()` in `tier0` because *everything* reads it, and it
@@ -28,6 +28,7 @@ mod filesystem;
 mod launcher;
 mod materials;
 mod math;
+mod server;
 mod studio;
 
 fn main() -> std::process::ExitCode {

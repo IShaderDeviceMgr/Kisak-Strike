@@ -240,6 +240,16 @@ pub struct World {
     pub props: Props,
     /// The models those placements name, uploaded once each.
     pub prop_models: PropModels,
+    /// The entity lump, parsed, kept for the map's lifetime.
+    ///
+    /// The engine reads the `.bsp`, so the engine is what holds the lump and
+    /// hands it to the game — `CServerGameDLL::LevelInit( pMapName,
+    /// pMapEntities, ... )` (`gameinterface.cpp:1167`) is given it for exactly
+    /// this reason. [`crate::server::Server::level_init`] is the consumer;
+    /// `world/`'s own uses of it ([`spawn`](World::spawn),
+    /// [`sky_name`](World::sky_name), [`brush_models`](World::brush_models))
+    /// are resolved at load and do not read it again.
+    pub entities: Vec<bsp::Entity>,
     pub stats: WorldStats,
 }
 
@@ -447,6 +457,7 @@ impl World {
             collision,
             props,
             prop_models,
+            entities,
             stats,
         })
     }

@@ -61,6 +61,7 @@ use crate::materials::renderer::Frame;
 use crate::materials::{
     Material, MaterialCache, MaterialPreview, PostProcess, RenderContext, CLEAR_COLOR,
 };
+use crate::server::Server;
 
 use self::trace::{disp_surf, Contents, Ray};
 use console::{
@@ -148,6 +149,15 @@ struct Scene<'a> {
     /// cvar handles and the button state outlive any map — but its one
     /// level-scoped field is what decides where it has to be reachable from.
     client: Client,
+    /// The game server: the map's entity list (`src/server/`,
+    /// `portdocs/SERVER.md`).
+    ///
+    /// In [`Scene`] rather than beside [`Host`] because the entity list is
+    /// level state — it is emptied and refilled by every map change — and
+    /// [`Level::load`] is the call that has the map. It holds no GPU handle
+    /// and names no material type, which is what keeps `server/` testable
+    /// without a window.
+    server: Server,
     /// Seconds of simulated time since startup — `gpGlobals->curtime`,
     /// accumulated from the host's frame times rather than read from the clock,
     /// so that it advances with the game and not with the wall.
@@ -237,6 +247,14 @@ impl<'a> Engine<'a> {
             // `ClearBuffers` used as a bar chart (`viewpostprocess.cpp:1115`),
             // which is not worth rebuilding in `egui` to read six numbers.
             CommandSpec::new("tonemap", "Report what the exposure controller is doing."),
+            // The game server's. `CON_COMMAND(report_entities, ...)`
+            // (`game/server/entitylist.cpp:1944`) and
+            // `ConCommand ent_dump(...)` (`game/server/baseentity.cpp:6103`),
+            // both `FCVAR_CHEAT` there — a flag `ENGINE_CONSOLE.md` §4.6
+            // deletes, because cheat protection needs a server telling a
+            // client no.
+            CommandSpec::new("report_entities", "List the map's entities by class."),
+            CommandSpec::new("ent_dump", "Usage: ent_dump <entity name / index / class>"),
         ] {
             console
                 .register_command(spec)
@@ -292,6 +310,7 @@ impl<'a> Engine<'a> {
                 world: None,
                 preview,
                 client,
+                server: Server::new(),
                 curtime: 0.0,
             },
             input: Input::new(),
@@ -521,6 +540,7 @@ impl<'a> Engine<'a> {
             input,
             ui: console_ui,
             world: scene.world.as_ref(),
+            server: &scene.server,
             client: &mut scene.client,
         });
 
@@ -822,6 +842,15 @@ impl Level for Scene<'_> {
             None => self.client.spawn(world.center(), 0.0, 0.0),
         }
 
+        // `CServerGameDLL::LevelInit` plus `ServerActivate`
+        // (`gameinterface.cpp:1167` and `:1305`), which in the original run
+        // either side of the engine's own level load and here run after it —
+        // the entity lump is the engine's to read and the game's to
+        // interpret. A map whose entities fail to spawn is not a failed load:
+        // there is nothing in stage 1 that can fail, and a level shell with no
+        // entity list is exactly what the port had before this module.
+        let entities = self.server.level_init(map, &world.entities);
+
         // Valve bracketed the load with `COM_TimestampedLog`; the interesting
         // number now is how much of the map actually draws, which is what
         // `summary` reports.
@@ -848,6 +877,7 @@ impl Level for Scene<'_> {
         if let Some(sky) = &world.sky_name {
             eprintln!("source-engine: world: skybox {sky} (not drawn yet)");
         }
+        eprintln!("source-engine: server: {}", entities.summary());
         self.world = Some(world);
         Ok(())
     }
@@ -858,6 +888,10 @@ impl Level for Scene<'_> {
     /// the hunk allocator that made this a subsystem in the original is exactly
     /// what `PORTING.md` says to delete rather than port.
     fn unload(&mut self) {
+        // Before the world, because the entity list is built from its lump and
+        // `LevelShutdownPreEntity` runs before the engine frees the model in
+        // the original too.
+        self.server.level_shutdown();
         if let Some(world) = self.world.take() {
             eprintln!("source-engine: world: unloaded {}", world.name);
         }
@@ -891,6 +925,9 @@ struct EngineCommands<'e> {
     /// because they are separate fields — the same move the destructuring at
     /// the call site already makes.
     world: Option<&'e World>,
+    /// The entity list, for `report_entities` and `ent_dump`. Shared, like
+    /// [`world`](EngineCommands::world): neither command changes anything.
+    server: &'e Server,
 }
 
 /// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
@@ -1211,6 +1248,8 @@ impl CommandTarget for EngineCommands<'_> {
                 None => cx.print("impulse <number>"),
             },
             "trace" => trace_command(self.world, self.client, cmd, cx),
+            "report_entities" => self.server.report_entities(cx),
+            "ent_dump" => self.server.ent_dump(cmd, cx),
             "tonemap" => tonemap_command(self.client, cx),
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
@@ -1509,6 +1548,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -1527,6 +1567,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert!(
@@ -1543,6 +1584,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert_eq!(client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove, 0.0);
@@ -1575,6 +1617,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1588,6 +1631,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert!(ui.is_open(), "the console key opened the console");
@@ -1603,6 +1647,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert!(!ui.is_open());
@@ -1650,6 +1695,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
 
@@ -1739,6 +1785,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         sensitivity.set_string("6");
@@ -1748,6 +1795,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
 
@@ -1774,6 +1822,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
 
@@ -1812,6 +1861,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
 
@@ -1839,6 +1889,7 @@ mod tests {
             input: &mut input,
             ui: &mut ui,
             world: None,
+            server: &Server::new(),
             client: &mut client,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());

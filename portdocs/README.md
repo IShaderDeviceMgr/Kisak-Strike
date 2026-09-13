@@ -108,7 +108,8 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   what the shipped maps actually ask for: **105 of 106 place an `env_tonemap_controller`**,
   and none of them uses the cvar defaults this port falls back on.
 
-- [`SERVER.md`](SERVER.md) — the **game server**: the entity system. `game/server/`'s
+- [`SERVER.md`](SERVER.md) — the **game server**: the entity system. **Stage 1 of 5 done;
+  see `src/server/` and `rustdocs/SERVER.md`.** `game/server/`'s
   447,000 lines, of which the framework — `CBaseEntity`, `CGlobalEntityList`, the
   datadesc, entity I/O, the event queue, thinks, `MOVETYPE_PUSH` — is ~29,800 and is the
   module; the rest is entity classes and `ai_*`. Scoped by **measuring the shipped maps
@@ -121,8 +122,13 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   199 of the 200**, so the interface of the deleted ones survives even though the
   behaviour does not. Concludes the inheritance tree becomes a `&'static ClassDef` plus a
   three-method trait, that networking and save/restore delete outright, and that **the
-  fixed server tick is the one decision to take before stage 1**. Five stages; stage 2
-  lands `env_tonemap_controller` and closes `CLIENT_TONEMAP.md`'s one measured gap.
+  fixed server tick is the one decision to take before stage 1**. Five stages; stage 1 has
+  landed — 17,069 of the 60,925 entity blocks in the shipped game now spawn, and
+  `CLight::Spawn` deletes 6,937 of them because an unnamed light is already baked — and
+  stage 2 lands `env_tonemap_controller`, closing `CLIENT_TONEMAP.md`'s one measured gap.
+  Three of its sections were **corrected by the port** and say so: §7.3's `parent` pointer
+  (inheritance became composition), §7.3's FGD cross-check (the FGD is not a superset of
+  the datadesc, so the check with teeth is against map data), and §4.4's wildcard rule.
 
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.

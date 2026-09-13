@@ -43,6 +43,17 @@ Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
   with portals — plus `ToneMap`, the auto-exposure controller
   (`portdocs/CLIENT_TONEMAP.md`), which is policy over a histogram and names no GPU type.
   Not to be confused with `ENGINE.md` §7.5's *client connection*, which does not exist yet.
+- [`SERVER.md`](SERVER.md) — `src/server/`. The **game server**, and the second game
+  module: `Server` and the level lifecycle, `EntityList`'s generational handles, `Entity`
+  split into `EntityCore` plus a `Behaviour`, `ClassDef` and the ten classes implemented
+  so far, the `CBaseEntity::KeyValue` ladder with Valve's `atoi`/`atof` prefix semantics,
+  and name matching. Stage 1 of five: entities are created, parsed, spawned and
+  activated; entity I/O, thinks, movement and touch are stages 2-4. Records that
+  **inheritance became composition** (there is no datadesc chain to walk), that
+  "unhandled key" is not "unimplemented" (17 of the 28 in the whole game are the map
+  compiler's), and that `names_match`'s `*` does not have to be trailing whatever the
+  comment in `baseentity.cpp` says. Names no GPU type, so all 28 of its unit tests run
+  without a window.
 
 ## Root modules
 

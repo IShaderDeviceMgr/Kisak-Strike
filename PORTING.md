@@ -699,6 +699,33 @@ Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own mo
 free-fly camera, bindings, UI precedence and the key-up latch). Stage 5 (controllers,
 `gilrs`) is deliberately last and is all that remains.
 
+**The game server has landed — stage 1 of `portdocs/SERVER.md`'s five.** It is
+`src/server/`, the sibling the client's entry above said would follow it, and it is the
+module that turns the `.bsp`'s entity lump into an entity list: `ClassDef` chooses the
+class, `CBaseEntity::KeyValue`'s ladder and the class's own `key_value` parse the keys,
+and the three-pass spawn runs — hierarchy depth, `SortSpawnListByHierarchy`, then `Spawn`
+and `Activate` over the whole list. `EntityId` is `CBaseHandle` as a generational index
+and `UTIL_Remove` is still deferred, for the same reason it is in the original and
+separately because the Rust borrow rules want it. **API: `rustdocs/SERVER.md`.**
+
+`game/server/` is 446,861 lines and the framework inside it is ~29,800; the rest is
+entity classes and `ai_*`. The scoping came from measuring the shipped maps rather than
+the tree, and it changed the answer: 106 maps place **60,925 entities of exactly 200
+classnames**, the top 25 of which are 79.8% of them, while the whole 122,298-line
+`ai_*`/`nav_*` tree serves **293 `npc_*` instances of 6 classnames** — four of which have
+no source in this tree at all. Ten classnames are implemented and they cover **17,069 of
+the 60,925 blocks**.
+
+Two things are worth carrying to the next module. **Valve's inheritance became Rust's
+composition, and the datadesc chain walk disappeared with it** — `SERVER.md` §7.3 planned
+a `parent` pointer on `ClassDef` so `KeyValue` could walk `baseMap`, and there is nothing
+for the walk to do once a derived class *holds* its base rather than deriving from it.
+And **the shipped `.fgd` files are a reference, not an oracle**: they describe 199 of the
+200 classnames the maps place, including every class whose C++ was cut from this tree,
+but they are not a superset of the datadesc, so the check with teeth is against map
+data — every declared key must be consumed, and a depot test over all 106 maps pins the
+exact set of key names nothing consumes.
+
 **Caveat on `legacy/` as a runnable reference:** the original C++ `launcher` and
 `launcher_main` were deleted before the restructure, so `legacy/` no longer links a
 game binary as-is. Everything else is intact and readable. If a *running* reference is

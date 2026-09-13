@@ -20,6 +20,7 @@ is not compiled, not linked, and not edited.
   src/materials/   the GPU device and frame boundary (wgpu), textures, materials, post
   src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
   src/client/      the game client — the player, CUserCmd, movement, the view, exposure
+  src/server/      the game server — the entity list, the class table, spawn
   src/studio/      studio models — .mdl/.vvd/.vtx into drawable geometry
   src/cmdline.rs   CommandLine(), at the root because everything reads it
   src/math.rs      the parts of mathlib that are a convention, not arithmetic
@@ -57,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 690 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 718 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -585,6 +586,51 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
+- **`src/server/` — stage 1 of `portdocs/SERVER.md`'s five ported**, and with it the map's
+  **entity list exists**. Valve's `server.so` — 446,861 lines, of which the framework is
+  ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
+  entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
+  own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
+  `SortSpawnListByHierarchy`, then `Spawn` and `Activate` over the whole list — with
+  `UTIL_Remove`'s deferred deletion under it. `EntityId` is `CBaseHandle` as a generational
+  index. `report_entities` and `ent_dump` report the result. **API: `rustdocs/SERVER.md`**
+  — read it before calling in.
+  Scoped by **measuring the shipped maps rather than the tree**: 106 maps place
+  **60,925 entities of exactly 200 classnames**, the top 25 of which are 79.8% of them,
+  while the whole 122,298-line `ai_*`/`nav_*` tree serves **293 `npc_*` instances of 6
+  classnames**. Ten classnames are implemented and they cover **17,069 of the 60,925
+  blocks**: `logic_relay` (8,082, the commonest entity in the game), the light family
+  (7,150), `func_instance_io_proxy` (1,184), `info_target`, `info_player_start` and
+  `worldspawn`. `sp_a1_intro1` spawns 127 entities from 598 blocks.
+  The one piece of stage-1 *behaviour* is `CLight::Spawn`, and it is load-bearing:
+  **an unnamed light deletes itself**, which is 6,937 of the game's 7,150, because `vrad`
+  has already baked its whole contribution — a port that skipped that one `if` would carry
+  eleven per cent of the entity list as garbage and every other number would still look
+  right. 213 named lights survive.
+  Four findings from writing it. **Inheritance became composition**: `SERVER.md` §7.3
+  planned a `parent` pointer so `KeyValue` could walk the `baseMap` chain, and there is
+  nothing for the walk to do — `CEnvLight : public CLight` is an `EnvLight` that *holds* a
+  `Light` and ends its `key_value` by calling the contained one's. **The FGD is not an
+  oracle**: the four shipped `.fgd` files describe 199 of the 200 classnames and are the
+  best reference for what a key is called, but they are not a superset of the datadesc
+  (`world_mins` is `vbsp`'s, `defaultstyle` is internal, the FGD's `OnProxyRelay` is the
+  server's `OnProxyRelay1`-`30`), so the check with teeth is against **map data** — every
+  declared key must be consumed, and the 106-map depot test pins the exact set of key
+  names nothing consumes. **`names_match`'s `*` does not have to be trailing** whatever
+  `baseentity.cpp`'s comment says — `"*door"` matches everything — though all 234 wildcard
+  targets in the shipped maps are plain trailing ones. And **"unhandled key" is not
+  "unimplemented"**: of the 28 key names in the whole game that nothing consumes, 17 are
+  the *map compiler's* (`_light`, `_quadratic_attn` and the falloff family are `vrad`'s and
+  have no run-time consumer in Valve's engine either) and 4 are mapper mistakes shipped in
+  the game.
+  **The module names no GPU type** — not `wgpu`, not `materials`, not `studio` — so all 28
+  of its unit tests run without a window, the way `host/`, `trace/` and `input/` do. An
+  entity holds a model *name*.
+  Not implemented, and each is a stage: entity I/O and the event queue, `AcceptInput`,
+  thinks, movement, touch. **The one decision to take before stage 2 is the fixed server
+  tick** (`portdocs/SERVER.md` §5): Source quantises every `SetNextThink` to ticks and this
+  port's frame is variable-dt, and the tree's `DEFAULT_TICK_INTERVAL_PC` of 1/64 is CS:GO's
+  number.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -606,11 +652,18 @@ state and read 2x high. The two rules that came out of it live in `rustdocs/MATE
 second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it**, the level shell
-is geometrically complete — world, brush entities, static props and terrain — and it is
-**auto-exposed**. `client/` stage 5
-and everything below it needs `net/` and `server/`, which is the last of the core path and
-a long way from here. The candidates, in the order they are worth doing:
+is geometrically complete — world, brush entities, static props and terrain — it is
+**auto-exposed**, and the map's **entity list now exists** though nothing runs it yet.
+`client/` stage 5 and everything below it needs `net/`, which is a long way from here.
+The candidates, in the order they are worth doing:
 
+- **`server/` stage 2 — entity I/O, the event queue and thinks.** The biggest single
+  return in the list, and the only candidate that makes the *shipped picture* change
+  without a line of rendering code: `env_tonemap_controller` lands with it, and
+  `sp_a1_intro1` asks for an exposure ceiling of 1.5 against the cvar default of 2
+  through a chain of `logic_auto` → `logic_relay` → controller that stage 2 makes run.
+  105 of the game's 106 maps place one, and four of its inputs are among the twelve
+  commonest in the entire game. Take `portdocs/SERVER.md` §5's tick decision first.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale.
@@ -652,9 +705,10 @@ refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the 
 - **`noclip` is registered by the game client, and it is a *server* command.** Move type
   is server state that gets networked down, so `ConCommand noclip` lives in
   `game/server/` in the original. With one process and no server it has to live
-  somewhere, and `src/client/` is where the move type is. **Move it when `src/server/`
-  exists**, which is also when `MOVETYPE_WALK` stops being the state that freezes the
-  player. `portdocs/CLIENT.md` §9.2.
+  somewhere, and `src/client/` is where the move type is. `src/server/` now exists, but
+  the wart does not move with it: **the condition is `portdocs/SERVER.md` stage 5**,
+  where the player becomes an entity and move type becomes the server's state rather
+  than a field on `client::Player`. `portdocs/CLIENT.md` §9.2.
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
   `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The
