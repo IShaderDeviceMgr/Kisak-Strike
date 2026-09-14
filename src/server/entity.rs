@@ -36,6 +36,7 @@ use glam::Vec3;
 
 use super::class::{Behaviour, ClassDef, Context};
 use super::io::{EventAction, Output, Variant};
+use super::movement::{ModelBounds, MoveType};
 use super::think::TICK_NEVER_THINK;
 
 /// A handle to an entity — Valve's `CBaseHandle`/`EHANDLE`.
@@ -67,10 +68,13 @@ impl EntityId {
 
 /// The state every entity has, whatever its class. `CBaseEntity`'s fields.
 ///
-/// The fields are the ones stages 1 and 2 populate and nothing more. Movement
-/// state (`MOVETYPE_*`, `SOLID_*`, velocity) arrives with
-/// `portdocs/SERVER.md` stage 3 — an unreachable field is scaffolding, and
-/// `PORTING.md` asks for the knowledge without the encoding.
+/// The fields are the ones stages 1 to 3 populate and nothing more — an
+/// unreachable field is scaffolding, and `PORTING.md` asks for the knowledge
+/// without the encoding. Stage 3 added the movement block: a move type, the
+/// two velocities, `m_flSpeed`, the local clock and the move-done alarm.
+/// `SOLID_*` is still not here, because nothing chooses between the solidity
+/// *types*; [`solid_flags`](EntityCore::solid_flags) carries the one bit a
+/// class sets.
 pub struct EntityCore {
     /// The class table this entity was built from. `m_iClassname` is
     /// `class.name`, so there is no separate string.
@@ -135,6 +139,50 @@ pub struct EntityCore {
     /// metric: the exact list of what the entity system does not understand
     /// yet, per entity, which `report_entities` totals.
     pub unhandled: Vec<(String, String)>,
+    /// The bounding box of the brush model [`model`](EntityCore::model) names,
+    /// or zero. See [`ModelBounds`] — it is the one piece of entity state that
+    /// comes from the `.bsp` rather than from the entity lump.
+    pub model_bounds: ModelBounds,
+    /// `m_MoveType` — how this entity is simulated. Set by a class's `Spawn`,
+    /// never by a map key.
+    pub move_type: MoveType,
+    /// `m_vecVelocity`, in units a second. Integrated by the pusher.
+    ///
+    /// **Local velocity, used as absolute.** Valve keeps a local/abs pair and
+    /// a parent transform; this port has neither, so for the 174 movers that
+    /// name a parent the two differ — see
+    /// [`movement::perform_push`](super::movement).
+    pub velocity: Vec3,
+    /// `m_vecAngVelocity`, in degrees a second, as pitch/yaw/roll.
+    pub angular_velocity: Vec3,
+    /// `m_flSpeed` — the `speed` key, and what `LinearMove`/`AngularMove` are
+    /// given. A `CBaseEntity` field rather than a mover's, because
+    /// `func_rotating` uses it as its *current* rotation rate rather than as a
+    /// setting.
+    pub speed: f32,
+    /// `m_flLocalTime` — this entity's own clock, advanced only while it is
+    /// being pushed.
+    ///
+    /// Zero at spawn and **not** `curtime`: it is "seconds this pusher has
+    /// simulated", which is what lets a blocked one fall behind the world.
+    /// Nothing blocks yet, so it tracks the time the entity has spent with a
+    /// live alarm.
+    pub local_time: f32,
+    /// `m_flMoveDoneTime` — when the move in progress ends, **in local time**,
+    /// or `-1` for no alarm.
+    ///
+    /// Private because Valve's getter and setter are not symmetric:
+    /// [`set_move_done_time`](EntityCore::set_move_done_time) takes a *delay*
+    /// and [`move_done_time`](EntityCore::move_done_time) returns the
+    /// *remaining* time, while this field holds neither. Reading it raw is
+    /// [`raw_move_done_time`](EntityCore::raw_move_done_time), which only the
+    /// pusher wants.
+    move_done_time: f32,
+    /// `m_fFlags`' solidity half — the `FSOLID_*` bits, of which exactly one
+    /// is set from anywhere:
+    /// [`FSOLID_NOT_SOLID`](super::movement::FSOLID_NOT_SOLID), by
+    /// `func_brush`.
+    pub solid_flags: u32,
     /// `m_nNextThinkTick` — the tick this entity's `Think` is due, or
     /// [`TICK_NEVER_THINK`].
     ///
@@ -323,6 +371,70 @@ impl EntityCore {
     }
 
     // -----------------------------------------------------------------------
+    // moving
+    // -----------------------------------------------------------------------
+
+    /// `CBaseEntity::SetMoveDoneTime` (`baseentity.cpp:3150`) — arm the
+    /// arrival alarm `delay` seconds of *local* time from now, or disarm it
+    /// with anything negative.
+    ///
+    /// > **This is not the think schedule.** It is a second timer with its own
+    /// > field, and a mover uses both at once
+    /// > (`portdocs/SERVER.md` §4.7). It is also not quantised: unlike
+    /// > [`set_next_think`](EntityCore::set_next_think) it keeps the float it
+    /// > was given, because the pusher lands *on* it by shortening the last
+    /// > step rather than by rounding to a tick.
+    ///
+    /// > **A delay of exactly zero arms an alarm that can never fire**, and
+    /// > takes the entity straight out of the simulation list with it — see
+    /// > [`will_simulate_game_physics`](EntityCore::will_simulate_game_physics).
+    /// > Valve's, and four of the shipped game's `func_door_rotating`s
+    /// > (`wait 0`) stand open for ever because of it.
+    pub fn set_move_done_time(&mut self, delay: f32) {
+        self.move_done_time = match delay >= 0.0 {
+            true => self.local_time + delay,
+            false => -1.0,
+        };
+    }
+
+    /// `CBaseEntity::GetMoveDoneTime` (`baseentity.h:2479`) — how much local
+    /// time is left before the alarm, or `-1` if none is armed.
+    ///
+    /// **Not what [`set_move_done_time`](EntityCore::set_move_done_time) was
+    /// given**, once any time has passed: the getter subtracts the local
+    /// clock, which is what makes `min(remaining, frametime)` the pusher's
+    /// whole step calculation.
+    pub fn move_done_time(&self) -> f32 {
+        match self.move_done_time >= 0.0 {
+            true => self.move_done_time - self.local_time,
+            false => -1.0,
+        }
+    }
+
+    /// The alarm as stored — absolute local time, or `-1`.
+    ///
+    /// `PerformPush`'s test is against this rather than against the remaining
+    /// time (`physics_main.cpp:1685`), and the two differ at exactly one
+    /// value: an alarm armed for zero delay at local time zero.
+    pub(super) fn raw_move_done_time(&self) -> f32 {
+        self.move_done_time
+    }
+
+    /// `CBaseEntity::WillSimulateGamePhysics`
+    /// (`baseentity_shared.cpp:1194`) — whether this entity needs a slot in
+    /// the simulation list for movement, as opposed to for thinking.
+    ///
+    /// A `MOVETYPE_PUSH` entity qualifies only while its alarm is in the
+    /// future, which is what keeps 11,000 motionless brush entities out of the
+    /// per-tick loop. `MOVETYPE_NONE` never qualifies.
+    pub fn will_simulate_game_physics(&self) -> bool {
+        match self.move_type {
+            MoveType::None => false,
+            MoveType::Push => self.move_done_time() > 0.0,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // thinking
     // -----------------------------------------------------------------------
 
@@ -423,6 +535,17 @@ impl Entity {
                 render_fx: 0,
                 effects: 0,
                 entity_flags: 0,
+                model_bounds: ModelBounds::default(),
+                move_type: MoveType::None,
+                velocity: Vec3::ZERO,
+                angular_velocity: Vec3::ZERO,
+                // `m_flSpeed` is zero-initialised in the C++ too, and every
+                // mover's `Spawn` substitutes its own default for a zero —
+                // 100 for a door, 40 for a button.
+                speed: 0.0,
+                local_time: 0.0,
+                move_done_time: -1.0,
+                solid_flags: 0,
                 outputs: Vec::new(),
                 unhandled: Vec::new(),
                 next_think_tick: TICK_NEVER_THINK,

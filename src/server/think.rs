@@ -183,13 +183,19 @@ impl ServerClock {
     }
 }
 
-/// One entity's place in the think list. `simthinkentry_t`.
+/// One entity's place in the list. `simthinkentry_t` (`entitylist.cpp:150`).
 struct ThinkEntry {
     id: EntityId,
+    /// **Zero for an entity that is simulating game physics**, whatever its
+    /// think schedule says, which is what makes [`ThinkList::due`] copy it out
+    /// every tick. Valve writes the same zero for the same reason
+    /// (`CSimThinkManager::EntityChanged`), and it is why
+    /// `movement::simulate` re-checks the think tick for itself.
     next_think_tick: i32,
 }
 
-/// The entities that have a think scheduled. `CSimThinkManager`.
+/// The entities that have a think scheduled **or are moving**.
+/// `CSimThinkManager`.
 ///
 /// # Why this is not "iterate the entity list"
 ///
@@ -204,15 +210,16 @@ struct ThinkEntry {
 ///
 /// Valve's is a `CUtlVector` plus a 16,384-entry `unsigned short` index array
 /// for `FastRemove`. The index array exists because its list can hold every
-/// entity in the level (anything with *physics* is in it too, not just
-/// thinkers). Stage 2 has no movetypes, so only actual thinkers are in it, and
-/// the depot test measures how many that is: **at most 43 entities at once
-/// across all 106 shipped maps**, which is short enough that a linear scan
-/// beats a hash lookup
-/// and far short of anything that would justify a binary heap with lazy
-/// deletion. `ENGINE_WORLD_DISP.md`'s rule — measure before optimising —
-/// applies; when stage 3 puts every mover in here the measurement should be
-/// retaken.
+/// entity in the level — anything with *physics* is in it too, not just
+/// thinkers. Stage 3 put the movers in, which is what the index array is for,
+/// so the measurement was retaken and the answer did not change: **at most 43
+/// entities in the list at once across all 106 shipped maps**, because a
+/// mover only qualifies while it is actually travelling and a Portal 2 map
+/// starts with all of its doors shut. A linear scan over a list that short
+/// beats a hash lookup, and is far short of anything that would justify a
+/// binary heap with lazy deletion. `ENGINE_WORLD_DISP.md`'s rule — measure
+/// before optimising — applies; retake it again when the player can walk into
+/// a trigger.
 #[derive(Default)]
 pub struct ThinkList {
     entries: Vec<ThinkEntry>,
@@ -224,19 +231,40 @@ impl ThinkList {
     }
 
     /// `SimThink_EntityChanged` (`entitylist.cpp:302`): reconcile one entity's
-    /// membership against its current schedule.
+    /// membership against its current schedule and move state.
     ///
-    /// Called after every dispatch that could have changed a schedule — spawn,
-    /// activate, think, input — which is every place a [`Context`](super::class::Context)
-    /// exists. An entity marked for deletion is removed and **not re-added**,
-    /// which is Valve's first line and is what stops a think firing on a
-    /// corpse.
-    pub fn entity_changed(&mut self, id: EntityId, next_think_tick: i32, removed: bool) {
+    /// Called after every dispatch that could have changed either — spawn,
+    /// activate, think, input, arrival — which is every place a
+    /// [`Context`](super::class::Context) exists. An entity marked for
+    /// deletion is removed and **not re-added**, which is Valve's first line
+    /// and is what stops a think firing on a corpse.
+    ///
+    /// `simulates` is
+    /// [`EntityCore::will_simulate_game_physics`](super::entity::EntityCore::will_simulate_game_physics)
+    /// — a mover with a live arrival alarm. Such an entity is in the list with
+    /// a stored tick of **zero**, so it is copied out every tick and decides
+    /// for itself whether its think is due; a think-only entity is stored with
+    /// its real tick and filtered here. That split is Valve's, and it is what
+    /// lets one list serve two different questions.
+    pub fn entity_changed(
+        &mut self,
+        id: EntityId,
+        next_think_tick: i32,
+        simulates: bool,
+        removed: bool,
+    ) {
         let existing = self.entries.iter().position(|entry| entry.id == id);
-        let wants_in = !removed && next_think_tick != TICK_NEVER_THINK;
+        let will_think = next_think_tick > 0;
+        let wants_in = !removed && (will_think || simulates);
+        // `if ( pEntity->IsEFlagSet(EFL_NO_GAME_PHYSICS_SIMULATION) )
+        //      entry.nextThinkTick = GetFirstThinkTick(); else = 0;`
+        let stored = match simulates {
+            true => 0,
+            false => next_think_tick,
+        };
 
         match (existing, wants_in) {
-            (Some(at), true) => self.entries[at].next_think_tick = next_think_tick,
+            (Some(at), true) => self.entries[at].next_think_tick = stored,
             // `FastRemove`: order in this list is not meaningful, because
             // `ListCopy` filters it and the filtered order is entity order.
             (Some(at), false) => {
@@ -244,7 +272,7 @@ impl ThinkList {
             }
             (None, true) => self.entries.push(ThinkEntry {
                 id,
-                next_think_tick,
+                next_think_tick: stored,
             }),
             (None, false) => {}
         }
@@ -261,12 +289,19 @@ impl ThinkList {
     /// and a `logic_relay` due on the same tick must run in the order the map
     /// placed them, and `swap_remove` above has already destroyed the
     /// insertion order.
+    ///
+    /// The filter is Valve's `nextThinkTick <= gpGlobals->tickcount` and
+    /// nothing else, so a moving entity — stored as zero — is always in the
+    /// answer. A `next_think_tick` of zero for a *non*-moving entity never
+    /// reaches the list at all (see
+    /// [`entity_changed`](ThinkList::entity_changed)), which is what keeps
+    /// `SetNextThink(0)` meaning "not scheduled".
     pub fn due(&self, tick: i32, out: &mut Vec<EntityId>) {
         out.clear();
         out.extend(
             self.entries
                 .iter()
-                .filter(|entry| entry.next_think_tick > 0 && entry.next_think_tick <= tick)
+                .filter(|entry| entry.next_think_tick <= tick)
                 .map(|entry| entry.id),
         );
         out.sort_unstable_by_key(|id| id.slot());
@@ -278,7 +313,7 @@ impl ThinkList {
         self.entries.retain(|entry| alive(entry.id));
     }
 
-    /// How many entities have a think scheduled.
+    /// How many entities are in the list — thinking, moving, or both.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -369,11 +404,11 @@ mod tests {
         let (a, b) = (entity(&mut list), entity(&mut list));
 
         let mut thinks = ThinkList::new();
-        thinks.entity_changed(a, TICK_NEVER_THINK, false);
+        thinks.entity_changed(a, TICK_NEVER_THINK, false, false);
         assert_eq!(thinks.len(), 0, "no schedule, not in the list");
 
-        thinks.entity_changed(a, 5, false);
-        thinks.entity_changed(b, 9, false);
+        thinks.entity_changed(a, 5, false, false);
+        thinks.entity_changed(b, 9, false, false);
         assert_eq!(thinks.len(), 2);
 
         let mut due = Vec::new();
@@ -385,7 +420,7 @@ mod tests {
         assert_eq!(due, vec![a, b]);
 
         // Cancelling takes it back out.
-        thinks.entity_changed(a, TICK_NEVER_THINK, false);
+        thinks.entity_changed(a, TICK_NEVER_THINK, false, false);
         assert_eq!(thinks.len(), 1);
         thinks.due(100, &mut due);
         assert_eq!(due, vec![b]);
@@ -399,12 +434,48 @@ mod tests {
         let a = entity(&mut list);
         let mut thinks = ThinkList::new();
 
-        thinks.entity_changed(a, 3, false);
+        thinks.entity_changed(a, 3, false, false);
         assert_eq!(thinks.len(), 1);
-        thinks.entity_changed(a, 3, true);
+        thinks.entity_changed(a, 3, false, true);
         assert_eq!(thinks.len(), 0);
-        thinks.entity_changed(a, 3, true);
+        thinks.entity_changed(a, 3, false, true);
         assert_eq!(thinks.len(), 0, "and it does not come back");
+    }
+
+    /// A mover is in the list with a stored tick of zero and is therefore
+    /// copied out **every** tick, whatever its think schedule says — which is
+    /// why `movement::simulate` re-checks the think tick for itself.
+    #[test]
+    fn a_moving_entity_is_due_every_tick() {
+        let mut list = EntityList::new();
+        let a = entity(&mut list);
+        let mut thinks = ThinkList::new();
+
+        // No think at all, but it is moving.
+        thinks.entity_changed(a, TICK_NEVER_THINK, true, false);
+        assert_eq!(thinks.len(), 1);
+        let mut due = Vec::new();
+        for tick in 0..5 {
+            thinks.due(tick, &mut due);
+            assert_eq!(due, vec![a], "tick {tick}");
+        }
+
+        // A think far in the future does not take it back out, and does not
+        // stop it being copied.
+        thinks.entity_changed(a, 500, true, false);
+        thinks.due(0, &mut due);
+        assert_eq!(due, vec![a]);
+
+        // It stops moving, and now only the think decides.
+        thinks.entity_changed(a, 500, false, false);
+        thinks.due(0, &mut due);
+        assert!(due.is_empty());
+        thinks.due(500, &mut due);
+        assert_eq!(due, vec![a]);
+
+        // Neither thinking nor moving: out of the list.
+        thinks.entity_changed(a, TICK_NEVER_THINK, false, false);
+        assert_eq!(thinks.len(), 0);
     }
 
     /// A think at tick 0 or a negative one never comes due — which is what
@@ -414,7 +485,7 @@ mod tests {
         let mut list = EntityList::new();
         let a = entity(&mut list);
         let mut thinks = ThinkList::new();
-        thinks.entity_changed(a, 0, false);
+        thinks.entity_changed(a, 0, false, false);
 
         let mut due = Vec::new();
         thinks.due(0, &mut due);

@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 772 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 802 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -73,9 +73,11 @@ gravity, stands on the floor, is stopped by walls and slides along them, climbs 
 under `sv_stepsize`, jumps 45 units, and crouches under things it does not fit past.
 `noclip` still flies. **The map's entity logic now runs**: entities spawn, fire outputs
 at each other through one event queue and think on a fixed 64 Hz server tick, so a map
-bootstraps itself the way the shipped game does. It is **still not a runnable game** —
-nothing moves but the player, no triggers, no sound, no netcode — but the boot path is
-continuous from `main` to a rendered, lit, self-starting level you can walk around.
+bootstraps itself the way the shipped game does — **and the brush entities move**, so
+doors open and shut, panels slide, buttons press in and come back out and fans spin up.
+It is **still not a runnable game** — no triggers, no sound, no netcode, and a door
+moves *through* the player rather than shoving it — but the boot path is continuous from
+`main` to a rendered, lit, self-starting level you can walk around.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -294,11 +296,15 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   with a drawable face — `trigger_portal_cleanser` keeps its, because a fizzler really is
   visible); and where a brush model *is* comes from the entity, never from
   `Model::origin`. **The transform is `BrushModel::model_to_world` and is not cached**, so
-  what is drawn and what `trace_model` collides with cannot drift apart. Not honoured, and
-  each measured rather than guessed: `StartDisabled` (86 of 2,608 drawable entities — it
-  is `server/`'s), the translucent render modes (five entities in the game; they need a
-  blended pass) and `renderamt`. `rendermode 10` **is** honoured, because it is the one
-  mode `C_BaseEntity::ShouldDraw` refuses — 94 entities.
+  what is drawn and what `trace_model` collides with cannot drift apart — and **the
+  placement is live now**: `World::sync_brush_models` takes it from the game server once a
+  frame, keyed by the `"*N"` model index, which is why doors open. Not honoured, and each
+  measured rather than guessed: the translucent render modes (five entities in the game;
+  they need a blended pass) and `renderamt`. `rendermode 10` **is** honoured, because it
+  is the one mode `C_BaseEntity::ShouldDraw` refuses — 94 entities; and `StartDisabled`
+  **is** honoured for `func_brush`, which is the class whose `Spawn` reads it — 337 of
+  the game's 2,502 start invisible and non-solid, where before `server/` stage 3 all of
+  them drew.
   **Materials are resolved before the geometry**, because a surface's vertex layout comes
   from its shader and how wide a lightmap block it reserves comes from whether its
   material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
@@ -336,7 +342,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   models** — `CM_TransformedBoxTrace`, which is the whole of `ClipRayToBSP`: the ray moves
   into the model's frame, the ordinary sweep runs against the model's *own* head node, and
   the normal turns back out. Doors, platforms and the moving parts of a test chamber are
-  now solid, and `world/` draws them; **nothing moves them**, which is `server/`'s.
+  now solid, `world/` draws them, and since `server/` stage 3 **they move** — the
+  placement is `BrushModel::set_placement`, written once a frame from the entity.
   Where a brush model *is* does not come from the model lump (`Model::origin`
   is "for sounds and lights, not a render transform") but from the entity that names it as
   `"*N"`, so `World::brush_models` resolves the entity lump at load — **placements, not
@@ -391,8 +398,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   depot traces. This port clears them where `m_bDispHit` is cleared; `rustdocs/ENGINE.md`
   gotcha 17 names the two lines to delete to get Valve's behaviour back.
   Not implemented: simulation, visibility, the skybox, dynamic lights and
-  lightstyle animation. Brush entities are solid **and** drawn now; what they are not is
-  *moved*, which is `server/`'s. **Displacements are solid and drawn** —
+  lightstyle animation. Brush entities are solid, drawn **and moved**. **Displacements
+  are solid and drawn** —
   `world/disp/` has landed, below.
   **`world/disp/` is the rendering half of `trace/` stage 3's lumps, and terrain now
   draws** (`portdocs/ENGINE_WORLD_DISP.md`, `rustdocs/ENGINE.md`). ~9,100 lines of C++
@@ -594,8 +601,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
-- **`src/server/` — stages 1 and 2 of `portdocs/SERVER.md`'s five ported**, and with them
-  the map's **entity logic runs**. Valve's `server.so` — 446,861 lines, of which the framework is
+- **`src/server/` — stages 1, 2 and 3 of `portdocs/SERVER.md`'s five ported**, and with
+  them the map's **entity logic runs and its brush entities move**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
@@ -685,10 +692,76 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   seed convention (0, 1 and -1 are one stream) are behaviour a dependency would silently
   replace, and `logic_case` is what would change.
 
-  Not implemented, and each is a stage: movement and `MOVETYPE_PUSH` (3), touch and
-  triggers (4), the player as an entity (5). The size of that last prize is measured:
-  **171 of the 186 inputs in the whole game that reach an implemented class and are
-  refused are `!player`, `!player_blue` and `!player_orange`.**
+  **Stage 3 is `MOVETYPE_PUSH`, and it is the first time anything in a map moves.**
+  `src/server/movement.rs` is `CBaseToggle`'s two moves — set a velocity, set an
+  arrival alarm — plus `PerformPush` with the blocker always null, and
+  `src/server/classes/brush.rs` is six classes: `func_brush` (2,502), `func_door_rotating`
+  (346), `func_door` (275), `func_movelinear` (196), `func_button` (64) and
+  `func_rotating` (27), **3,410 entities**, taking the port to 22 classnames and 22,639
+  of the game's 60,925 blocks. Pushing the player is deliberately absent —
+  `CPhysicsPushedEntities` is ~1,000 lines of speculative push and rollback that want
+  `ENGINE_TRACE.md` stage 4 underneath them — so a door moves *through* a player rather
+  than shoving one.
+  Measured over the depot: two seconds of each of the 106 maps now moves **67 brush
+  entities off their spawn placement, 34 of them still travelling** when the clock stops.
+  Before stage 3 that number was zero. **To see it, load a co-op map**: no
+  single-player map moves a brush entity in its first twenty seconds — a Portal 2
+  chamber starts shut and waits for the player, which is why `sp_a1_intro1` looks
+  identical to before — while `mp_coop_fan` spins `brush_fan` and opens two doors at map
+  spawn and `mp_coop_lobby_2` slides eleven `func_movelinear` screen panels.
+
+  Four findings. **The scope of "brush entities" is not the mover census**: §4.7 counted
+  1,164 movers and the six classes are 3,410 entities, because `func_brush` is 2,502 of
+  them, does not move at all, and is where **`StartDisabled` finally comes home** — 337
+  of them start switched off and until this stage `world/` drew every one. **The join
+  between the game and the renderer is the `"*N"` model index**, and that is a
+  measurement rather than a convention: 106 maps place 11,635 `(map, "*N")` pairs and
+  **not one** is claimed by two entities, so `BrushModel`'s placement is refreshed once a
+  frame by index — `Engine::frame` does it between the server's ticks and the player's
+  trace — and `world/` and `server/` still name no type of each other's.
+  **`CSimThinkManager` is two questions in one list** and stage 2 only saw one: an entity
+  is in it when it will think *or* when it is a mover with a live alarm, and a mover is
+  stored with a tick of **zero** so that it is handed out every tick and refuses its own
+  think — which makes `PhysicsRunSpecificThink`'s tick guard load-bearing rather than
+  defensive. And **a mover needs one number that is not in the entity lump**: a door's
+  travel is the size of its own brushes, which `SetModel` reads out of the `.bsp`'s model
+  lump, so `level_init` grew a `&[bsp::Model]` argument.
+
+  Nine more rules produce a plausible wrong answer rather than an error, and the first
+  three are the ones that decide whether a door works at all. **The arrival alarm is not
+  the think schedule** — it is a second timer with its own field, it is *not* quantised
+  to a tick, and it runs on the entity's own `local_time`; a `func_door` uses it for both
+  the travel and the wait. **`SetMoveDoneTime(0)` arms an alarm that can never fire**,
+  because `PerformPush` tests the absolute alarm with `> 0` and `WillSimulateGamePhysics`
+  then drops the entity out of the simulation list entirely — which is why the four
+  `func_door_rotating`s in the shipped game with `wait 0` stand open for ever, and why
+  `CBaseButton::Spawn`'s apparently pointless substitution of `wait 1` for `wait 0` is
+  load-bearing for 14 of the game's 64 buttons. **A class holding a `Toggle` must call
+  `Toggle::move_done` first**, because that call *is* `CBaseToggle::MoveDone` and it is
+  what snaps the mover onto its exact destination. **`linear_move` returning `false` means
+  "already there" and the caller must run `move_done` itself, *before* firing any
+  output** — in the C++ that call happens inside `LinearMove`, so a zero-length open
+  queues `OnFullyOpen` before `OnOpen`. **`speed` is `CBaseEntity`'s**, not the mover's,
+  because `func_rotating` uses it as its current rotation rate. **`DotProductAbs` is not
+  `|a·b|`**, and a door's travel subtracts two units for the bbox expansion before the
+  lip. **`AngleVectors` of a right angle is not exact**, so a door travelling 64 units
+  straight up also travels 2.8 millionths of a unit sideways — Valve's residue too.
+  **The `Use` input's *type* is the connection's serial number, cast**
+  (`InputUse` passes `(USE_TYPE)inputdata.nOutputID`), which is why an I/O `Use` does
+  nothing on a `func_movelinear` and works on a `func_button`. And **a parented mover
+  moves in world space**, where Valve moves it in the parent's frame — 174 of the game's
+  1,164 movers name a parent, and the missing local/abs pair is the same thing that keeps
+  the `SetParent` family unimplemented (**1,078 of the depot's 1,081 unhandled inputs**).
+
+  One find worth keeping for its own sake: **`inputfilter` is declared by `base.fgd` for
+  `func_brush`, written onto 2,497 of them by Hammer, and consumed by nothing anywhere in
+  `legacy/`** — not in `game/server/`, not in the engine, not in the tools. The sharpest
+  example yet of `portdocs/SERVER.md` §1.4's "the FGD is a reference, not an oracle".
+
+  Not implemented, and each is a stage: touch and triggers (4), the player as an entity
+  (5). The size of that last prize is measured: **171 of the 186 inputs in the whole game
+  that reach an implemented class and are refused are `!player`, `!player_blue` and
+  `!player_orange`.**
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -711,22 +784,24 @@ second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it**, the level shell
 is geometrically complete — world, brush entities, static props and terrain — it is
-**auto-exposed to the map's own limits**, and the map's **entity logic runs**.
+**auto-exposed to the map's own limits**, the map's **entity logic runs**, and its
+**doors and panels move**.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 The candidates, in the order they are worth doing:
 
-- **`server/` stage 3 — brush entities move.** `MOVETYPE_PUSH`,
-  `LinearMove`/`AngularMove` and the `SetMoveDoneTime` alarm, plus making
-  `BrushModel`'s placement mutable and taking it from the entity. The first time
-  anything in the level moves, and everything it needs is now in place: `world/` draws
-  the 26 brush entities in `sp_a1_intro1`, `trace/` stage 2 collides with them, and
-  stage 2's event queue is what tells them to open. **`func_door_rotating` outnumbers
-  `func_door` 346 to 275**, so do `AngularMove` first. Deliberately *not* in it:
-  pushing the player, which is `CPhysicsPushedEntities`' ~1,000 lines of speculative
-  push and rollback and wants `trace/` stage 4 underneath it.
 - **`server/` stage 4 — triggers and touch**, which is the first time the map responds
   to the player. It is built alongside `trace/` stage 4 (entities in the clip chain),
   which is the reciprocal dependency and has been blocked on this module since stage 1.
+  `trigger_once` (1,476), `trigger_multiple` (899), `trigger_hurt` (215),
+  `trigger_push` (192), `point_teleport` (128), `trigger_teleport` (110) and the
+  `filter_*` family (302) that several of them consult.
+- **The local/abs transform pair on `EntityCore`**, which is smaller than a stage and
+  unblocks two things at once: `SetParent`/`ClearParent`/`SetParentAttachment*` —
+  **1,078 of the 1,081 inputs the depot test reports as unhandled** — and parented
+  movers, which currently move in world space where Valve moves them in the parent's
+  frame (174 of the game's 1,164 movers name a parent). The attachment forms also want
+  `LookupAttachment` on a studio model, which would be `server/`'s first dependency on
+  `studio/`.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale.

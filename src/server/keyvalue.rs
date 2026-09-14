@@ -237,11 +237,11 @@ pub fn string_to_color32(s: &str) -> [u8; 4] {
 /// - **`mins`/`maxs`** (0 each) — they set collision bounds, which belong to a
 ///   collision property this port has not got.
 ///
-/// A `CBaseEntity` key whose *field* this port has not needed yet — `speed`,
-/// `health`, `effects`, `velocity` and two dozen more — is left unconsumed on
-/// purpose rather than parsed into nothing, so that it appears in the
-/// unhandled report instead of being quietly dropped the way the original
-/// drops it.
+/// A `CBaseEntity` key whose *field* this port has not needed yet — `health`,
+/// `effects`, `velocity` and two dozen more — is left unconsumed on purpose
+/// rather than parsed into nothing, so that it appears in the unhandled report
+/// instead of being quietly dropped the way the original drops it. `speed`
+/// left that list at stage 3, when four mover classes started reading it.
 pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
     // Case-insensitive throughout: every name comparison in the original is
     // `FStrEq`, which is `stricmp`.
@@ -328,6 +328,15 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
     }
     if is("spawnflags") {
         entity.spawn_flags = atoi(value) as u32;
+        return true;
+    }
+    // `DEFINE_KEYFIELD( m_flSpeed, FIELD_FLOAT, "speed" )`
+    // (`baseentity.cpp:2219`). A `CBaseEntity` field, which is why it is here
+    // rather than on the four mover classes that read it — and
+    // `func_rotating` treats it as its *current* rotation rate rather than as
+    // a setting, so it is written from code as often as from the map.
+    if is("speed") {
+        entity.speed = atof(value);
         return true;
     }
     if is("hammerid") {

@@ -6,18 +6,22 @@
 //!
 //! # What is here, and what it covers
 //!
-//! Sixteen classnames, **17,479 of the shipped game's 60,925 entities**. Stage
-//! 1 brought ten of them — `worldspawn`, the light family, `info_target`,
-//! `info_player_start`, `logic_relay` and `func_instance_io_proxy` — as
-//! keyvalue bags with one piece of behaviour between them. Stage 2 gives those
-//! ten their behaviour and adds six more: `logic_auto`, `logic_branch`,
-//! `logic_case`, `logic_timer`, `math_counter` and
-//! `env_tonemap_controller`.
+//! Twenty-two classnames, **22,639 of the shipped game's 60,925 entities**.
+//! Stage 1 brought ten of them — `worldspawn`, the light family,
+//! `info_target`, `info_player_start`, `logic_relay` and
+//! `func_instance_io_proxy` — as keyvalue bags with one piece of behaviour
+//! between them. Stage 2 gave those ten their behaviour and added six more:
+//! `logic_auto`, `logic_branch`, `logic_case`, `logic_timer`, `math_counter`
+//! and `env_tonemap_controller`. Stage 3 adds the brush family — `func_brush`,
+//! `func_door`, `func_door_rotating`, `func_movelinear`, `func_button` and
+//! `func_rotating`, 3,410 entities — and with it everything in a map that
+//! moves.
 //!
-//! The additions are not chosen by instance count — `logic_case` is 84
+//! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities — but by what a map needs in order to *run*: `logic_auto` is how
-//! every map in the game starts itself, and `env_tonemap_controller` is how
-//! 105 of the 106 say how bright they should be.
+//! every map in the game starts itself, `env_tonemap_controller` is how 105 of
+//! the 106 say how bright they should be, and `func_brush` is the third
+//! commonest classname in the game.
 //!
 //! # One file per family
 //!
@@ -25,6 +29,7 @@
 //! family, and stage 1 said it would split "when stage 2's logic family
 //! arrives". It has.
 
+pub mod brush;
 pub mod env;
 pub mod light;
 pub mod logic;
@@ -33,6 +38,7 @@ pub mod world;
 use crate::server::class::{ClassDef, InputDef, InputDefs, PointEntity};
 use crate::server::io::FieldType;
 
+pub use brush::{Brush, Button, Door, MoveLinear, Rotating};
 pub use env::TonemapController;
 pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
@@ -90,11 +96,56 @@ pub(super) static CLASSES: &[ClassDef] = &[
         create: EnvLight::create,
     },
     ClassDef {
+        name: "func_brush",
+        keys: brush::BRUSH_KEYS,
+        inputs: BRUSH_INPUTS,
+        outputs: &[],
+        create: Brush::create,
+    },
+    ClassDef {
         name: "func_instance_io_proxy",
         keys: &[],
         inputs: PROXY_INPUTS,
         outputs: logic::PROXY_RELAYS,
         create: InstanceIoProxy::create,
+    },
+    // `CRotDoor : public CBaseDoor` — the same struct, told at construction
+    // that it turns instead of sliding. It outnumbers `func_door`, which is
+    // why `portdocs/SERVER.md` §4.7 says to write `AngularMove` first.
+    ClassDef {
+        name: "func_door_rotating",
+        keys: brush::DOOR_KEYS,
+        inputs: DOOR_INPUTS,
+        outputs: brush::DOOR_OUTPUTS,
+        create: Door::create_rotating,
+    },
+    ClassDef {
+        name: "func_door",
+        keys: brush::DOOR_KEYS,
+        inputs: DOOR_INPUTS,
+        outputs: brush::DOOR_OUTPUTS,
+        create: Door::create,
+    },
+    ClassDef {
+        name: "func_movelinear",
+        keys: brush::MOVELINEAR_KEYS,
+        inputs: MOVELINEAR_INPUTS,
+        outputs: &["OnFullyOpen", "OnFullyClosed"],
+        create: MoveLinear::create,
+    },
+    ClassDef {
+        name: "func_button",
+        keys: brush::BUTTON_KEYS,
+        inputs: BUTTON_INPUTS,
+        outputs: brush::BUTTON_OUTPUTS,
+        create: Button::create,
+    },
+    ClassDef {
+        name: "func_rotating",
+        keys: brush::ROTATING_KEYS,
+        inputs: ROTATING_INPUTS,
+        outputs: brush::ROTATING_OUTPUTS,
+        create: Rotating::create,
     },
     ClassDef {
         name: "logic_auto",
@@ -249,6 +300,11 @@ static CASE_INPUTS: InputDefs = &[
 ];
 
 // The tables the class files own, under the names [`CLASSES`] reads.
+static BRUSH_INPUTS: InputDefs = brush::BRUSH_INPUTS;
+static DOOR_INPUTS: InputDefs = brush::DOOR_INPUTS;
+static MOVELINEAR_INPUTS: InputDefs = brush::MOVELINEAR_INPUTS;
+static BUTTON_INPUTS: InputDefs = brush::BUTTON_INPUTS;
+static ROTATING_INPUTS: InputDefs = brush::ROTATING_INPUTS;
 static LIGHT_INPUTS: InputDefs = light::LIGHT_INPUTS;
 static PROXY_INPUTS: InputDefs = logic::PROXY_INPUTS;
 static TONEMAP_INPUTS: InputDefs = env::TONEMAP_INPUTS;

@@ -220,6 +220,7 @@ A loaded map and the geometry it draws.
 pub fn load(vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device, name: &str)
     -> Result<World, WorldError>;
 pub fn draw(&self, pass: &mut Pass<'_>);
+pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 pub fn center(&self) -> Vec3;
 pub fn summary(&self) -> String;
 
@@ -233,6 +234,8 @@ pub struct World {
     pub sky_name: Option<String>,
     pub lighting_is_hdr: bool,
     pub lightmaps: LightmapPages,
+    /// The `.bsp`'s model lump — bounding boxes, for `Server::level_init`.
+    pub models: Vec<bsp::Model>,
     /// Every brush entity the map places — `ENGINE_TRACE.md` stage 2.
     pub brush_models: Vec<PlacedBrushModel>,
     /// The drawable ones among them, with their geometry.
@@ -252,6 +255,12 @@ and each brush entity's go under its own placement. **Terrain is in the world's 
 a displacement is world geometry with a different way of generating its vertices, not a
 separate pass. See [`world::disp`](#worlddisp--the-terrain).
 
+`models` is the `.bsp`'s model lump kept for somebody else: the *server* needs it, because
+a `func_door` computes how far it slides from the size of its own brushes and that number
+is in the file rather than in the entity lump (`UTIL_SetModel`, `game/server/util.cpp:1426`).
+`Level::load` hands it to `Server::level_init` beside `entities`, for the same reason and
+by the same caller. 32 bytes each; the largest shipped map has 258.
+
 **Materials are resolved before the geometry is built**, which is forced rather than
 stylistic: a surface's vertex layout comes from the shader its material named, and how
 wide a lightmap block it reserves comes from whether that material has a `$bumpmap`
@@ -267,11 +276,26 @@ pub struct PlacedBrushModel {
     pub index: usize,        // the model the entity named: "*12" is 12
     pub model: BrushModel,   // the placement, shared with trace/
     pub render_mode: i32,    // RenderMode_t, 0 when the key is absent
+    pub visible: bool,       // EF_NODRAW clear — live, from the server
+    pub solid: bool,         // FSOLID_NOT_SOLID clear — ditto
 }
 
 pub struct BrushModelGeometry {
     pub placement: usize,    // which entry of World::brush_models
     pub batches: Vec<Batch>,
+}
+
+/// Where a brush entity is, as the game server sees it.
+pub struct Placement {
+    pub origin: Vec3,
+    pub angles: Vec3,
+    pub visible: bool,
+    pub solid: bool,
+}
+
+impl World {
+    /// Take every placement from whoever owns it. Once a frame.
+    pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 }
 
 pub const RENDER_NONE: i32 = 10;   // kRenderNone
@@ -301,6 +325,38 @@ matrix in place of the identity, and that is exactly what this is.
 **The transform is `BrushModel::model_to_world`, recomputed per draw and never cached** —
 deliberately, so that what is drawn and what `Tracer::trace_model` collides with cannot
 drift apart. It is a handful of `Mat4` products for a map's few dozen brush models.
+
+#### The placement is *live* — `sync_brush_models`
+
+Until `src/server/` stage 3 the placement was read out of the entity lump once at
+load and never written again, which is precisely why nothing in a map moved.
+Now `Engine::frame` copies it out of the game server once a frame, after the
+server's ticks and before the player is traced against anything:
+
+```text
+server.frame( dt )                    a door integrates its velocity
+sync_brush_models( world, server )    engine/mod.rs — the joining layer
+  world.sync_brush_models(|index| …)  asks by "*N" index
+    BrushModel::set_placement(…)      the one transform both consumers read
+update_client( … )                    …the player is traced against it
+```
+
+Four things about it:
+
+- **The `"*N"` index is the key**, and it is usable because it is unique: across
+  all 106 shipped maps there are 11,635 `(map, "*N")` pairs and **not one** is
+  named by two entities.
+- **`None` means "leave it where the lump put it"**, which is the answer for
+  8,225 of those 11,635 — the brush entities whose classname the server has no
+  class for. Nothing regresses for them.
+- **`visible` and `solid` are live state, not map keys.** A `func_brush` is
+  switched on and off by `Enable`/`Disable` all through a level and 337 of the
+  game's 2,502 start switched off; `draw_brush_models` skips an invisible one
+  and the `trace` command skips a non-solid one. `render_mode` stays a load-time
+  decision beside them because it cannot change.
+- **Neither module names the other.** `world/` defines `Placement` and
+  `src/server/` answers with an `EntityCore`; `engine/mod.rs` converts, the same
+  arrangement `console/` and `input/` already have.
 
 `render_mode` is stored as the file's number rather than interpreted, because consumers
 differ: `World` acts only on `RENDER_NONE`, which is the only render mode
@@ -680,6 +736,12 @@ impl CollisionBsp {
         -> Option<BrushModel>;
 }
 
+impl BrushModel {
+    pub fn model_to_world(&self) -> Mat4;
+    /// Move it. `UTIL_SetOrigin` plus `SetLocalAngles`, from the entity.
+    pub fn set_placement(&mut self, origin: Vec3, angles: Vec3);
+}
+
 impl Tracer<'_> {
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace;
     pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
@@ -700,15 +762,21 @@ the entity that names it: `"model" "*12"` with an `"origin"` and an `"angles"`.
 `World::brush_models` is that resolution done once at load, as
 `PlacedBrushModel { classname, index, model }`.
 
-`brush_model` resolves the index once so the trace does not have to; the returned handle
-is `Copy` and cheap to rebuild, which is what a mover does every time it moves. The
-placement is opaque — build a new one rather than mutating the old.
+`brush_model` resolves the index once so the trace does not have to. The placement is
+**mutable**, through `BrushModel::set_placement( origin, angles )`, and that is the one
+change `src/server/` stage 3 needed from this module: a door has a velocity now, and this
+is where the result of integrating it lands. The two fields it writes are the only ones
+`model_to_world` and `local_ray` read, so the drawn door and the collided door cannot be
+in different places. Note that it re-evaluates `CM_TransformedBoxTrace`'s `rotated` flag
+every call rather than keeping it: a door that starts unrotated and swings is rotated from
+its first tick onwards, and a stale flag would trace it as though it never turned.
 
 **Placements, not policy.** `World::brush_models` holds *every* entity naming a `"*N"`
 model, triggers included. A `trigger_multiple`'s brushes are `CONTENTS_SOLID` in the file
-and not solid in the game; what makes the difference is `FSOLID_TRIGGER` on the entity,
-set by the game DLL, and there is no game DLL. Filter on `classname` until `server/`
-exists.
+and not solid in the game; what makes the difference is `FSOLID_TRIGGER` on the entity —
+still set by nobody, because the classes that would set it are `server/` stage 4's. What
+*has* arrived is `FSOLID_NOT_SOLID` on a switched-off `func_brush`, carried as
+`PlacedBrushModel::solid`. Keep filtering on `classname` for the rest.
 
 `build` is infallible because [`Bsp::parse`](#worldbsp) has already checked every
 cross-lump reference the trace walks — that check is what buys the right to index without
@@ -928,8 +996,7 @@ path either way.
 |---|---|
 | Entities, trace filters, `ClipTraceToTrace` | stage 4, and `server/` |
 | Static props and `.phy`/vcollide | stage 5, where `parry` enters |
-| Brush models *moving* | `server/` — stage 2 makes them solid, nothing makes them move |
-| Displacement *rendering* | `world/disp/` — stage 3 makes terrain solid, nothing draws it |
+| Displacement *rendering* | done — `world/disp/` |
 | `LUMP_PHYSDISP`, `CM_CreateDispPhysCollide` | `vphysics/` — the displacement's *physics* mesh, not its trace |
 | Displacement multiblend (`LUMP_DISP_MULTIBLEND`) | nothing — no Portal 2 displacement sets `DISP_INFO_FLAG_HAS_MULTIBLEND` |
 | PVS, areas, areaportals | `world/`'s visibility work, not this module's |
@@ -949,6 +1016,11 @@ classname and model index.
 counter) exist to work around a DLL boundary this build does not have. It is stages 1
 and 2's acceptance test: it asks the one question the module exists to answer using only a
 console, a player and a view, all of which already existed.
+
+Since `server/` stage 3 the brush-model pass **skips anything the game says is not
+solid**, which today is a switched-off `func_brush` and nothing else. It is still not the
+whole solidity question — `FSOLID_TRIGGER` and the entity clip chain are stage 4's — so
+the classname is still printed and the judgement is still left to the reader.
 
 The brush-model pass asks every model at full length, where `CEngineTrace::TraceRay`
 shortens the ray to the world hit first and lets the spatial partition pick candidates

@@ -614,6 +614,15 @@ impl<'a> Engine<'a> {
         // before the player is asked where it is standing.
         self.scene.server.frame(seconds);
 
+        // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
+        // it — **after the ticks and before anything reads it**, so the player
+        // is traced against the doors where they are now and the renderer
+        // draws the same thing later in this frame. The two modules are joined
+        // here because neither names the other.
+        if let Some(world) = self.scene.world.as_mut() {
+            sync_brush_models(world, &self.scene.server);
+        }
+
         // `CL_Move` (`engine/cl_main.cpp:2734`), which is
         // `_Host_RunFrame_Input`'s third step — after the client processed
         // input and after `Cbuf_Execute`, so a key pressed this tick moves the
@@ -837,6 +846,29 @@ impl<'a> Engine<'a> {
 ///
 /// Last event wins, so a click and an Escape in the same tick resolve in the
 /// order they arrived rather than by precedence.
+/// Copies every brush entity's placement out of the server and into the
+/// world's `BrushModel`s.
+///
+/// The join `portdocs/SERVER.md` §7.4 asks for, and it lives here rather than
+/// in either module because `world/` names no server type and `server/` names
+/// no `world/` type — the same arrangement `console/` and `input/` already
+/// have. `Server::brush_entity` is a binary search over one entry per brush
+/// entity the port has a class for, so this is a few dozen lookups a frame on
+/// a real map: 26 on `sp_a1_intro1`.
+fn sync_brush_models(world: &mut World, server: &Server) {
+    use crate::server::movement::{EF_NODRAW, FSOLID_NOT_SOLID};
+
+    world.sync_brush_models(|index| {
+        let entity = server.brush_entity(index)?;
+        Some(world::Placement {
+            origin: entity.origin,
+            angles: entity.angles,
+            visible: entity.effects & EF_NODRAW == 0,
+            solid: entity.solid_flags & FSOLID_NOT_SOLID == 0,
+        })
+    });
+}
+
 fn mouse_look_after(current: bool, events: &[input::Event]) -> bool {
     events.iter().fold(current, |look, event| match event {
         input::Event::Pressed {
@@ -886,7 +918,7 @@ impl Level for Scene<'_> {
         // interpret. A map whose entities fail to spawn is not a failed load:
         // there is nothing in stage 1 that can fail, and a level shell with no
         // entity list is exactly what the port had before this module.
-        let entities = self.server.level_init(map, &world.entities);
+        let entities = self.server.level_init(map, &world.entities, &world.models);
 
         // Valve bracketed the load with `COM_TimestampedLog`; the interesting
         // number now is how much of the map actually draws, which is what
@@ -915,6 +947,13 @@ impl Level for Scene<'_> {
             eprintln!("source-engine: world: skybox {sky} (not drawn yet)");
         }
         eprintln!("source-engine: server: {}", entities.summary());
+
+        // A `Spawn` may already have moved something: 40 of the game's doors
+        // carry `spawnpos 1` and stand open from the first frame, and 337
+        // `func_brush`es are `StartDisabled`. So the placements are taken from
+        // the entities once here as well as once per frame.
+        let mut world = world;
+        sync_brush_models(&mut world, &self.server);
         self.world = Some(world);
         Ok(())
     }
@@ -1219,11 +1258,13 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
 /// which is the same answer more slowly — `ClipTraceToTrace` keeps the minimum
 /// fraction and enumeration order is not observable.
 ///
-/// **Nothing is filtered for solidity.** A `trigger_multiple`'s brushes are
-/// `CONTENTS_SOLID` in the file and are not solid in the game; what makes the
-/// difference is `FSOLID_TRIGGER` on the entity, which the game DLL sets and
-/// this port has no game to set it. So the classname is printed and the
-/// judgement is left to the reader.
+/// **Only `FSOLID_NOT_SOLID` is filtered**, which since `server/` stage 3 is a
+/// real answer for `func_brush` and nothing else. A `trigger_multiple`'s
+/// brushes are `CONTENTS_SOLID` in the file and are not solid in the game, and
+/// what makes the difference is `FSOLID_TRIGGER` — set by a class this port
+/// has not got, and read by an entity clip chain that is `ENGINE_TRACE.md`
+/// stage 4's. So the classname is still printed and the judgement is still
+/// left to the reader.
 fn trace_brush_models(world: &World, ray: &Ray, from: glam::Vec3, cx: &mut ExecContext<'_>) {
     if world.brush_models.is_empty() {
         cx.print("  brush models: the map places none");
@@ -1234,6 +1275,11 @@ fn trace_brush_models(world: &World, ray: &Ray, from: glam::Vec3, cx: &mut ExecC
     let nearest = world
         .brush_models
         .iter()
+        // What the *game* says, which since `server/` stage 3 is a real
+        // answer for `func_brush`: a switched-off one is neither drawn nor
+        // collided with. It is still not the whole solidity question — see
+        // [`PlacedBrushModel::solid`].
+        .filter(|placed| placed.solid)
         .map(|placed| {
             (
                 placed,

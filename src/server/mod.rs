@@ -6,11 +6,11 @@
 //! thinks. It is a sibling of [`crate::client`] and [`crate::engine`] because
 //! `server.so` was a sibling of `client.so` and `engine.so`.
 //!
-//! Stage 2 of five. What exists: entities are created from the map's entity
+//! Stage 3 of five. What exists: entities are created from the map's entity
 //! lump, spawned in hierarchy order and activated; they fire outputs at each
-//! other through one queue; they think on a fixed tick. What does not:
-//! movement (stage 3), touch and triggers (stage 4), the player as an entity
-//! (stage 5).
+//! other through one queue; they think on a fixed tick; and the brush ones
+//! **move** — doors open, panels slide, fans spin. What does not: touch and
+//! triggers (stage 4), the player as an entity (stage 5).
 //!
 //! # This module names no GPU type
 //!
@@ -21,12 +21,15 @@
 //! [`crate::engine::input`] already do — and it is much easier to hold from
 //! the start than to recover later.
 //!
-//! Two types it names from outside, and both are deliberate. [`bsp::Entity`]
-//! is the parsed entity lump, which is Valve's shape too:
+//! Three types it names from outside, and all three are deliberate.
+//! [`bsp::Entity`] is the parsed entity lump and [`bsp::Model`] is the model
+//! lump's bounding boxes, which is Valve's shape too:
 //! `CServerGameDLL::LevelInit( pMapName, pMapEntities, ... )` is handed the
-//! lump by the engine, because the engine is what read the `.bsp`. And
-//! [`TonemapSettings`](crate::client::tonemap::TonemapSettings) is what
-//! `env_tonemap_controller` produces — see [`Server::tonemap_settings`].
+//! lump by the engine, because the engine is what read the `.bsp`, and
+//! `UTIL_SetModel` reads the model's size out of `modelinfo` for the same
+//! reason. And [`TonemapSettings`](crate::client::tonemap::TonemapSettings) is
+//! what `env_tonemap_controller` produces — see
+//! [`Server::tonemap_settings`].
 //!
 //! # The load
 //!
@@ -51,7 +54,7 @@
 //!                   ServerClock::accumulate -> 0..n fixed ticks
 //!                   for each tick:
 //!                     CleanupDeleteList         anything removed outside the loop
-//!                     Physics_RunThinkFunctions the due thinks, in entity order
+//!                     Physics_RunThinkFunctions think, then push, in entity order
 //!                     ServiceEventQueue         everything due, restart-from-head
 //!                     CleanupDeleteList         anything a think removed
 //! ```
@@ -67,6 +70,7 @@ pub mod classes;
 pub mod entity;
 pub mod io;
 pub mod keyvalue;
+pub mod movement;
 pub mod name;
 pub mod random;
 pub mod think;
@@ -80,6 +84,7 @@ use crate::engine::world::bsp;
 use class::{base_accept_input, Behaviour, Context, SpawnResult};
 use entity::{Entity, EntityCore, EntityId, EntityList};
 use io::{Event, EventQueue, FieldType, Input, IoStats, Target, Variant};
+use movement::ModelBounds;
 use name::Procedural;
 use random::RandomStream;
 use think::{ServerClock, ThinkList};
@@ -122,6 +127,20 @@ pub struct Server {
     io: IoStats,
     /// Scratch for [`ThinkList::due`], so that a tick does not allocate.
     due: Vec<EntityId>,
+    /// Every entity that names a `"*N"` brush model, by `N`, sorted.
+    ///
+    /// The join `world/` and `trace/` need in order to take a brush entity's
+    /// placement from the entity rather than from the lump
+    /// (`portdocs/SERVER.md` §7.4). **The model index is a usable key because
+    /// it is unique**: across all 106 shipped maps there are 11,635
+    /// `(map, "*N")` pairs and **not one** is named by two entities, so no
+    /// disambiguation is needed and nothing has to carry a lump index around.
+    ///
+    /// Built once at `level_init` and not maintained afterwards — an entity
+    /// that is removed leaves a handle here that stops resolving, which
+    /// [`Server::brush_entity`] treats as "no placement", and nothing in the
+    /// game creates a brush entity at run time.
+    brush_models: Vec<(usize, EntityId)>,
 }
 
 /// What one `level_init` produced.
@@ -241,6 +260,7 @@ impl Server {
             stats: LevelStats::default(),
             io: IoStats::default(),
             due: Vec::new(),
+            brush_models: Vec::new(),
         }
     }
 
@@ -252,7 +272,18 @@ impl Server {
     /// engine/game-DLL boundaries that do not exist: `LevelInit` parses,
     /// `ServerActivate` activates, and the engine calls one and then the other
     /// with nothing in between that this port has.
-    pub fn level_init(&mut self, map: &str, blocks: &[bsp::Entity]) -> LevelStats {
+    /// `models` is the `.bsp`'s model lump, indexed by brush-model number, and
+    /// it is what `SetModel` reads: a mover computes how far it travels from
+    /// the size of its own brushes, and that number is in the file rather than
+    /// in the entity lump. `&[]` is legal and gives every mover a zero-sized
+    /// box, which is what `UTIL_SetModel` does for a missing model too — the
+    /// unit tests pass it.
+    pub fn level_init(
+        &mut self,
+        map: &str,
+        blocks: &[bsp::Entity],
+        models: &[bsp::Model],
+    ) -> LevelStats {
         self.level_shutdown();
         self.map = Some(map.to_owned());
 
@@ -290,6 +321,23 @@ impl Server {
                 *stats.unhandled.entry(key.to_ascii_lowercase()).or_default() += 1;
             }
 
+            // `UTIL_SetModel` (`util.cpp:1426`) — `SetMinMaxSize` from the
+            // model lump. Done here rather than in each class's `Spawn`
+            // because `SetModel` is `CBaseEntity`'s and every class calls it
+            // for the same reason.
+            let brush_index = entity
+                .core
+                .model
+                .as_deref()
+                .and_then(|name| name.strip_prefix('*'))
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(model) = brush_index.and_then(|i| models.get(i)) {
+                entity.core.model_bounds = ModelBounds {
+                    mins: glam::Vec3::from(model.mins),
+                    maxs: glam::Vec3::from(model.maxs),
+                };
+            }
+
             let is_world = class.name == "worldspawn";
             if is_world {
                 // `mapentities.cpp:373`: "don't allow a parent on the first
@@ -298,6 +346,12 @@ impl Server {
                 entity.core.parent_name = None;
             }
             let id = self.entities.insert(entity);
+            // Model 0 is the world, which `worldspawn` names and which is not
+            // a *placement* — `world/` draws it in world space and `trace`
+            // already covers it. The same exclusion `find_brush_models` makes.
+            if let Some(index) = brush_index.filter(|&i| i != 0) {
+                self.brush_models.push((index, id));
+            }
 
             match is_world {
                 // Spawned at once and outside the sorted list, because
@@ -349,6 +403,10 @@ impl Server {
 
         stats.removed_on_spawn = self.cleanup_delete_list();
         stats.spawned = self.entities.len();
+
+        // Sorted so that [`Server::brush_entity`] can binary-search it. The
+        // lump order it loses is not meaningful: the key is unique.
+        self.brush_models.sort_unstable_by_key(|&(index, _)| index);
 
         // `IGameSystem::LevelInitPostEntity`. One system so far, so it is a
         // method rather than a `Vec<Box<dyn GameSystem>>` — see
@@ -457,6 +515,7 @@ impl Server {
         self.map = None;
         self.stats = LevelStats::default();
         self.io = IoStats::default();
+        self.brush_models.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -499,13 +558,18 @@ impl Server {
         self.cleanup_delete_list();
     }
 
-    /// `Physics_RunThinkFunctions` (`physics_main.cpp:2282`) reduced to its
-    /// think half — there are no movetypes until stage 3, so
-    /// `Physics_SimulateEntity` is `PhysicsRunThink` for every entity.
+    /// `Physics_RunThinkFunctions` (`physics_main.cpp:2282`).
     ///
-    /// The due list is **copied** before anything runs, so a think may
-    /// schedule, cancel or delete anything including itself. That is what
-    /// Valve's `stackalloc` + `SimThink_ListCopy` is for.
+    /// The simulation list is **copied** before anything runs, so a think or
+    /// an arrival may schedule, cancel or delete anything including itself.
+    /// That is what Valve's `stackalloc` + `SimThink_ListCopy` is for.
+    ///
+    /// Stage 3 turned the body from "run the think" into
+    /// `Physics_SimulateEntity`, which is a think *and* a push
+    /// ([`movement::simulate`]). The list now holds movers as well as
+    /// thinkers, and a mover is copied out every tick whatever its schedule
+    /// says — so the "is the think due" question moved down into
+    /// `movement::simulate` with it.
     fn run_think_functions(&mut self) {
         let tick = self.clock.time().tick;
         let mut due = std::mem::take(&mut self.due);
@@ -513,22 +577,24 @@ impl Server {
 
         for &id in due.iter() {
             // The entity may have been removed by an earlier think in the same
-            // pass; `PhysicsRunThink` is not called on a corpse.
+            // pass; `PhysicsSimulate` is not called on a corpse.
             let alive = self.entities.get(id).is_some_and(|e| !e.removed);
             if !alive {
                 continue;
             }
-            self.dispatch(id, |core, behaviour, cx| {
-                // `PhysicsRunSpecificThink` (`physics_main_shared.cpp:2080`).
-                //
-                // > **The schedule is cleared before the think runs**, so a
-                // > think that does not re-arm itself never runs again. Every
-                // > recurring behaviour in the game re-arms on the way out —
-                // > `logic_timer`'s `ResetTimer` is the example.
-                core.clear_next_think();
-                behaviour.think(core, cx);
-            });
-            self.io.thinks += 1;
+            let thought = self
+                .dispatch(id, |core, behaviour, cx| {
+                    let before = core.next_think_tick();
+                    movement::simulate(core, behaviour, cx);
+                    // What `PhysicsRunSpecificThink` did: the schedule is
+                    // cleared before the think runs, so a think that happened
+                    // is one whose tick is no longer the one it was.
+                    before > 0 && before <= cx.time.tick
+                })
+                .unwrap_or(false);
+            if thought {
+                self.io.thinks += 1;
+            }
         }
 
         due.clear();
@@ -721,7 +787,7 @@ impl Server {
                 };
                 match on_class {
                     true => behaviour.accept_input(core, &input, cx),
-                    false => base_accept_input(core, &input, cx),
+                    false => base_accept_input(core, behaviour, &input, cx),
                 }
             })
             .unwrap_or(false);
@@ -769,15 +835,26 @@ impl Server {
         } = self;
         let time = clock.time();
 
-        let (result, next_think, removed) = {
+        let (result, next_think, simulates, removed) = {
             let entity = entities.get_mut(id)?;
             let mut cx = Context::new(time, queue, random);
             let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
-            (result, entity.core.next_think_tick(), entity.core.removed)
+            (
+                result,
+                entity.core.next_think_tick(),
+                // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
+                // `SetMoveType` both call — reconciled here for the same
+                // reason the think schedule is: every place either can change
+                // is a place that has a `Context`, and every place that has a
+                // `Context` goes through this function.
+                entity.core.will_simulate_game_physics(),
+                entity.core.removed,
+            )
         };
 
         // `SimThink_EntityChanged` (`entitylist.cpp:302`).
-        self.thinks.entity_changed(id, next_think, removed);
+        self.thinks
+            .entity_changed(id, next_think, simulates, removed);
         Some(result)
     }
 
@@ -853,6 +930,37 @@ impl Server {
     }
 
     // -----------------------------------------------------------------------
+    // the brush entities, for whoever draws and collides with them
+    // -----------------------------------------------------------------------
+
+    /// The entity that names brush model `"*index"`, if one is alive.
+    ///
+    /// **This is the stage-3 seam** `portdocs/SERVER.md` §7.4 asked for: a
+    /// brush entity's placement is the *entity's*, not the lump's, the moment
+    /// anything can move it. `world/` reads `origin`, `angles`, `effects` and
+    /// `solid_flags` off the answer once a frame and writes them into the one
+    /// `BrushModel` that both the draw and the trace go through — so what is
+    /// drawn and what is collided with still cannot drift apart.
+    ///
+    /// `None` means the map has no entity for that model, or the port has no
+    /// class for its classname (8,225 of the game's 11,635 brush entities are
+    /// `trigger_*` and similar), or the entity has been removed. All three are
+    /// "leave it where the lump put it".
+    pub fn brush_entity(&self, index: usize) -> Option<&EntityCore> {
+        let at = self
+            .brush_models
+            .binary_search_by_key(&index, |&(i, _)| i)
+            .ok()?;
+        let (_, id) = self.brush_models[at];
+        self.entities.get(id).map(|entity| &entity.core)
+    }
+
+    /// How many brush entities this map placed that the port has a class for.
+    pub fn brush_entity_count(&self) -> usize {
+        self.brush_models.len()
+    }
+
+    // -----------------------------------------------------------------------
     // reporting
     // -----------------------------------------------------------------------
 
@@ -913,12 +1021,16 @@ impl Server {
             time.tick, time.curtime, self.io.dispatched, self.io.accepted, self.io.thinks
         ));
         cx.print(&format!(
-            "{} connections parsed, {} queued now, {} entities thinking, \
+            "{} connections parsed, {} queued now, {} entities thinking or moving, \
              {} events found no target",
             stats.outputs,
             self.queue.len(),
             self.thinks.len(),
             self.io.no_target
+        ));
+        cx.print(&format!(
+            "{} brush entities have a class; their placements are the server's",
+            self.brush_entity_count()
         ));
 
         print_counts(cx, "unimplemented classnames", &stats.unknown, 12);

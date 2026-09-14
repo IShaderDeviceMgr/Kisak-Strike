@@ -208,6 +208,16 @@ pub struct World {
     /// the same reason the lightmap atlas is: it is derived from this map's
     /// file and dies with it. `trace/` reads it; nothing in `world/` does.
     pub collision: CollisionBsp,
+    /// The `.bsp`'s model lump: the world model and every brush model, with
+    /// their bounding boxes.
+    ///
+    /// Kept because the *server* needs it — a `func_door` computes how far it
+    /// slides from the size of its own brushes, which is in the file and not
+    /// in the entity lump (`UTIL_SetModel`, `game/server/util.cpp:1426`). It
+    /// is handed to [`Server::level_init`](crate::server::Server::level_init)
+    /// beside [`entities`](World::entities), for the same reason and by the
+    /// same caller. 32 bytes each; the largest shipped map has 258.
+    pub models: Vec<bsp::Model>,
     /// The map's brush entities, resolved to something the trace can sweep
     /// against — `ENGINE_TRACE.md` stage 2.
     ///
@@ -218,9 +228,10 @@ pub struct World {
     /// spawn code) and there is no game to give it, so nothing is filtered out
     /// here — a consumer that knows better filters on [`classname`].
     ///
-    /// Read, traced by the `trace` console command, and **not drawn**: brush
-    /// models have their own faces and their own batches, which is `world/`
-    /// work nobody has done.
+    /// Read, drawn ([`brush_model_geometry`](World::brush_model_geometry)),
+    /// traced by the `trace` console command — and **moved**, by
+    /// [`sync_brush_models`](World::sync_brush_models), which takes each
+    /// placement from the entity that owns it once a frame.
     ///
     /// [`classname`]: PlacedBrushModel::classname
     pub brush_models: Vec<PlacedBrushModel>,
@@ -452,6 +463,7 @@ impl World {
                 .map(str::to_owned),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
+            models: bsp.models.clone(),
             brush_models,
             brush_model_geometry,
             collision,
@@ -481,6 +493,29 @@ impl World {
         self.prop_models.draw(pass, &self.props);
     }
 
+    /// Takes every brush entity's placement from whoever owns it — the game
+    /// server — and writes it into the one transform the draw and the trace
+    /// both read.
+    ///
+    /// `placement` is asked once per placed model, by the model's `"*N"`
+    /// index; `None` leaves that one exactly where the entity lump put it,
+    /// which is the right answer for the 8,225 brush entities in the game
+    /// whose classname the server has no implementation for.
+    ///
+    /// # Once a frame, after the server's ticks and before anything reads it
+    ///
+    /// `Engine::frame` calls this between `Server::frame` and
+    /// `update_client`, so the player is traced against the doors as they are
+    /// *now* and the renderer draws the same thing later in the same frame.
+    /// Call it more often and nothing breaks; call it less and a door is drawn
+    /// where it was.
+    ///
+    /// `world/` names no server type: the caller converts, which is the same
+    /// split `engine/mod.rs` already makes between `console/` and `input/`.
+    pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>) {
+        sync_placements(&mut self.brush_models, placement);
+    }
+
     /// Records every brush entity's batches, each under its own transform.
     ///
     /// `R_DrawBrushModel` (`engine/gl_rsurf.cpp`): the same world-surface draw
@@ -495,7 +530,14 @@ impl World {
     /// [`BrushModelGeometry`].
     pub(crate) fn draw_brush_models(&self, pass: &mut Pass<'_>) {
         for geometry in &self.brush_model_geometry {
-            let model_to_world = self.brush_models[geometry.placement].model.model_to_world();
+            let placed = &self.brush_models[geometry.placement];
+            // `EF_NODRAW`, which a `func_brush` toggles. The `rendermode 10`
+            // test happened at load, because that one cannot change; this one
+            // can, on any tick.
+            if !placed.visible {
+                continue;
+            }
+            let model_to_world = placed.model.model_to_world();
             for batch in &geometry.batches {
                 pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
                 pass.draw(
@@ -1098,6 +1140,43 @@ pub struct PlacedBrushModel {
     /// 1-5 and 7-9 need a blended pass that does not exist. Collision ignores
     /// it entirely — a `rendermode 10` brush is invisible and still solid.
     pub render_mode: i32,
+    /// Whether the game says to draw this one *right now* — `EF_NODRAW`
+    /// cleared.
+    ///
+    /// Unlike [`render_mode`](PlacedBrushModel::render_mode) this is live
+    /// state, not a map key: a `func_brush` is switched on and off by
+    /// `Enable`/`Disable` all through a level, and 337 of the game's 2,502
+    /// start switched off. Refreshed by
+    /// [`sync_brush_models`](World::sync_brush_models); `true` for a model
+    /// whose entity the server has no class for.
+    pub visible: bool,
+    /// Whether the game says to collide with it — `FSOLID_NOT_SOLID` clear.
+    ///
+    /// The same live state as [`visible`](PlacedBrushModel::visible) and set
+    /// by the same `func_brush` inputs. **It is not the whole solidity
+    /// question**: a `trigger_multiple`'s brushes are `CONTENTS_SOLID` in the
+    /// file and non-solid in the game because of `FSOLID_TRIGGER`, which is
+    /// `ENGINE_TRACE.md` stage 4's along with the entity clip chain that would
+    /// read it. So `true` here means "nothing has said otherwise", not "solid".
+    pub solid: bool,
+}
+
+/// Where a brush entity is, and whether it counts — the answer
+/// [`World::sync_brush_models`] asks for.
+///
+/// Deliberately a plain value with no server types in it: `world/` does not
+/// name `src/server/` and `src/server/` does not name `world/`, and the two
+/// are joined in `engine/mod.rs`, which already knows both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// The entity's `m_vecAbsOrigin`.
+    pub origin: Vec3,
+    /// Its `m_angAbsRotation`, pitch/yaw/roll.
+    pub angles: Vec3,
+    /// `!IsEffectActive( EF_NODRAW )`.
+    pub visible: bool,
+    /// `!IsSolidFlagSet( FSOLID_NOT_SOLID )`.
+    pub solid: bool,
 }
 
 /// `kRenderNone` (`public/const.h:348`) — the one render mode that is a flat
@@ -1187,9 +1266,31 @@ pub(crate) fn find_brush_models(
                     .get("rendermode")
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(0),
+                // Until the server says otherwise, which it does once a frame
+                // for the classnames it implements.
+                visible: true,
+                solid: true,
             })
         })
         .collect()
+}
+
+/// [`World::sync_brush_models`]'s loop, over the slice rather than the world.
+///
+/// Separate so that a test can run the real thing: a [`World`] cannot be built
+/// without a GPU and this has nothing to do with one.
+fn sync_placements(
+    models: &mut [PlacedBrushModel],
+    placement: impl Fn(usize) -> Option<Placement>,
+) {
+    for placed in models {
+        let Some(p) = placement(placed.index) else {
+            continue;
+        };
+        placed.model.set_placement(p.origin, p.angles);
+        placed.visible = p.visible;
+        placed.solid = p.solid;
+    }
 }
 
 /// The player start, if the map has one.
@@ -1666,6 +1767,90 @@ mod tests {
         assert!(group_faces(&bsp, &bsp.models[1], &mut stats).is_empty());
         assert_eq!(stats.faces_drawn, 0);
         assert_eq!(stats.faces_total, 0);
+    }
+
+    /// The stage-3 seam: a placement that was baked at load can be **moved**,
+    /// and the one transform the draw and the trace share moves with it.
+    ///
+    /// Before `server/` stage 3 this could not happen — the origin and the
+    /// rotation were written once by `find_brush_models` and never again,
+    /// which is exactly why nothing in a map moved
+    /// (`portdocs/SERVER.md` §7.4).
+    #[test]
+    fn a_placement_can_be_moved_by_whoever_owns_it() {
+        let bsp = with_brush_model(1, "\"origin\" \"0 0 0\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let mut world_brush_models = find_brush_models(&bsp.entities(), &collision);
+        assert!(world_brush_models[0].visible && world_brush_models[0].solid);
+
+        // The placement is the identity to begin with.
+        let before = world_brush_models[0].model.model_to_world();
+        assert!((before.transform_point3(Vec3::ZERO)).length() < 1e-4);
+
+        // Move it, turn it, and switch it off — which is what one tick of a
+        // `func_door` opening and a `func_brush` being disabled looks like.
+        world_brush_models[0]
+            .model
+            .set_placement(Vec3::new(0.0, 0.0, 64.0), Vec3::new(0.0, 90.0, 0.0));
+        world_brush_models[0].visible = false;
+        world_brush_models[0].solid = false;
+
+        let after = world_brush_models[0].model.model_to_world();
+        assert!(
+            (after.transform_point3(Vec3::ZERO) - Vec3::new(0.0, 0.0, 64.0)).length() < 1e-4,
+            "the origin moved"
+        );
+        assert!(
+            (after.transform_point3(Vec3::X) - Vec3::new(0.0, 1.0, 64.0)).length() < 1e-4,
+            "and the rotation came with it"
+        );
+
+        // …and back to unrotated, which must drop the matrix rather than keep
+        // a stale one: a door that swings shut is not rotated any more.
+        world_brush_models[0]
+            .model
+            .set_placement(Vec3::ZERO, Vec3::ZERO);
+        let back = world_brush_models[0].model.model_to_world();
+        assert!((back.transform_point3(Vec3::X) - Vec3::X).length() < 1e-4);
+    }
+
+    /// `sync_placements` asks by model index and **leaves alone anything the
+    /// answer does not cover** — which is most of a map, because 8,225 of the
+    /// game's 11,635 brush entities name a classname the server has no class
+    /// for.
+    #[test]
+    fn syncing_leaves_a_placement_nobody_owns_where_it_was() {
+        let bsp = with_brush_model(1, "\"origin\" \"10 0 0\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let mut placed = find_brush_models(&bsp.entities(), &collision);
+
+        sync_placements(&mut placed, |_| None);
+        let at = |p: &PlacedBrushModel| p.model.model_to_world().transform_point3(Vec3::ZERO);
+        assert!((at(&placed[0]) - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-4);
+        assert!(placed[0].visible);
+
+        // A different index is not this one.
+        sync_placements(&mut placed, |index| {
+            (index == 7).then_some(Placement {
+                origin: Vec3::new(0.0, 0.0, 99.0),
+                angles: Vec3::ZERO,
+                visible: false,
+                solid: false,
+            })
+        });
+        assert!((at(&placed[0]) - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-4);
+
+        // …and its own index is.
+        sync_placements(&mut placed, |index| {
+            (index == 1).then_some(Placement {
+                origin: Vec3::new(0.0, 0.0, 99.0),
+                angles: Vec3::ZERO,
+                visible: false,
+                solid: false,
+            })
+        });
+        assert!((at(&placed[0]) - Vec3::new(0.0, 0.0, 99.0)).length() < 1e-4);
+        assert!(!placed[0].visible && !placed[0].solid);
     }
 
     /// The placement comes from the entity, not from the model lump, and the

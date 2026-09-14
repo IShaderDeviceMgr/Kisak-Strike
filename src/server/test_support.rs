@@ -7,8 +7,8 @@
 //! `classes`, which has to offer every class every input without a map, and
 //! the class unit tests, which want to watch one entity in isolation.
 
-use super::class::{ClassDef, Context, SpawnResult};
-use super::entity::Entity;
+use super::class::{Behaviour, ClassDef, Context, SpawnResult};
+use super::entity::{Entity, EntityCore};
 use super::io::{EventQueue, FieldType, Input, Variant};
 use super::random::RandomStream;
 use super::think::{ServerClock, DEFAULT_TICK_INTERVAL};
@@ -34,6 +34,19 @@ impl Harness {
         let Entity { core, behaviour } = entity;
         let mut cx = Context::new(self.clock.time(), &mut self.queue, &mut self.random);
         behaviour.spawn(core, &mut cx)
+    }
+
+    /// One server tick against one entity: advance the clock, then
+    /// `Physics_SimulateEntity`.
+    ///
+    /// No [`ThinkList`](super::think::ThinkList), so the caller is standing in
+    /// for the simulation list — which is what makes this useful for a mover:
+    /// `movement::simulate` re-checks the think tick itself, so an entity
+    /// handed to it out of turn does nothing rather than thinking early.
+    pub fn tick(&mut self, core: &mut EntityCore, behaviour: &mut dyn Behaviour) {
+        self.clock.advance();
+        let mut cx = Context::new(self.clock.time(), &mut self.queue, &mut self.random);
+        super::movement::simulate(core, behaviour, &mut cx);
     }
 
     /// Whether `class`'s handler takes `name`, given a value of the type it

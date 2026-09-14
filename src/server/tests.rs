@@ -83,7 +83,7 @@ fn sample() -> Vec<bsp::Entity> {
 #[test]
 fn a_map_becomes_an_entity_list() {
     let mut server = Server::new();
-    let stats = server.level_init("test", &sample());
+    let stats = server.level_init("test", &sample(), &[]);
 
     assert_eq!(stats.blocks, 8);
     assert_eq!(stats.matched, 6, "prop_dynamic is not implemented yet");
@@ -117,7 +117,7 @@ fn a_map_becomes_an_entity_list() {
 #[test]
 fn the_keys_land_where_the_class_says_they_do() {
     let mut server = Server::new();
-    server.level_init("test", &sample());
+    server.level_init("test", &sample(), &[]);
 
     let world = find(&server, "worldspawn");
     let world = world
@@ -182,6 +182,7 @@ fn worldspawn_is_never_parented() {
             block(&[("classname", "info_target"), ("targetname", "anchor")]),
             block(&[("classname", "worldspawn"), ("parentname", "anchor")]),
         ],
+        &[],
     );
     let world = find(&server, "worldspawn");
     assert!(world.parent_name.is_none());
@@ -209,6 +210,7 @@ fn a_child_spawns_after_its_parent_whatever_the_lump_order() {
             ]),
             block(&[("classname", "info_target"), ("targetname", "root")]),
         ],
+        &[],
     );
 
     let by_name = |name: &str| {
@@ -241,6 +243,7 @@ fn a_missing_parent_is_counted_and_not_fatal() {
             ("targetname", "orphan"),
             ("parentname", "nobody"),
         ])],
+        &[],
     );
     assert_eq!((stats.parented, stats.parents_missing), (1, 1));
     assert!(find(&server, "info_target").parent.is_none());
@@ -270,6 +273,7 @@ fn a_parent_cycle_terminates() {
                 ("parentname", "self"),
             ]),
         ],
+        &[],
     );
     assert_eq!(server.entities.len(), 3);
 }
@@ -296,10 +300,10 @@ fn spawn_priority_is_valves_table() {
 #[test]
 fn a_second_level_replaces_the_first_and_shutdown_empties_the_list() {
     let mut server = Server::new();
-    server.level_init("first", &sample());
+    server.level_init("first", &sample(), &[]);
     assert_eq!(server.entities.len(), 5);
 
-    let stats = server.level_init("second", &[block(&[("classname", "info_target")])]);
+    let stats = server.level_init("second", &[block(&[("classname", "info_target")])], &[]);
     assert_eq!(stats.blocks, 1);
     assert_eq!(server.entities.len(), 1);
     assert_eq!(server.map.as_deref(), Some("second"));
@@ -323,6 +327,7 @@ fn a_block_with_no_classname_is_skipped() {
             block(&[("origin", "0 0 0")]),
             block(&[("classname", "info_target")]),
         ],
+        &[],
     );
     assert_eq!(stats.blocks, 2);
     assert_eq!(stats.matched, 1);
@@ -371,6 +376,7 @@ fn a_relay_fires_its_outputs_and_they_reach_their_target() {
                 ("max", "100"),
             ]),
         ],
+        &[],
     );
 
     assert_eq!(counter_value(&server, "count"), 0.0);
@@ -414,7 +420,7 @@ fn a_zero_delay_chain_completes_in_one_tick() {
     ));
 
     let mut server = Server::new();
-    server.level_init("test", &relays);
+    server.level_init("test", &relays, &[]);
 
     // One tick. The think fires `OnSpawn`, and the eight-deep chain drains
     // inside the same `service_events`.
@@ -451,7 +457,7 @@ fn logic_auto_fires_on_map_spawn_after_two_tenths_of_a_second() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     assert_eq!(server.entities.len(), 2);
 
     run(&mut server, 0.1);
@@ -493,7 +499,7 @@ fn a_relay_latches_until_its_slowest_output_has_gone_out() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     run(&mut server, 1.0);
     assert_eq!(
         counter_value(&server, "count"),
@@ -533,7 +539,7 @@ fn a_fast_retrigger_relay_does_not_latch() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     run(&mut server, 1.0);
     assert_eq!(counter_value(&server, "count"), 2.0);
 }
@@ -559,7 +565,7 @@ fn a_connection_with_a_fire_limit_deletes_itself() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let gate = name::find_by_name(&server.entities, "gate").next().unwrap();
 
     assert_eq!(find_named(&server, "gate").output_count("OnTrigger"), 2);
@@ -606,7 +612,7 @@ fn an_unmatched_name_falls_back_to_the_classname() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let gate = name::find_by_name(&server.entities, "gate").next().unwrap();
     server.accept_input(gate, "Trigger", Variant::Void, None, None, 0);
     run(&mut server, 0.02);
@@ -620,7 +626,7 @@ fn an_unmatched_name_falls_back_to_the_classname() {
 #[test]
 fn an_event_that_reaches_nothing_is_counted() {
     let mut server = Server::new();
-    server.level_init("test", &[block(&[("classname", "info_target")])]);
+    server.level_init("test", &[block(&[("classname", "info_target")])], &[]);
     server.queue.add(Event {
         fire_time: 0.0,
         target: Target::Name(String::from("nobody")),
@@ -706,7 +712,7 @@ fn a_think_that_does_not_rearm_runs_once() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     run(&mut server, 1.0);
 
     assert_eq!(counter_value(&server, "count"), 1.0, "OnSpawn fires once");
@@ -736,7 +742,7 @@ fn the_base_kill_input_removes_an_entity_at_the_end_of_the_tick() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     assert_eq!(server.entities.len(), 2);
 
     let gate = name::find_by_name(&server.entities, "gate").next().unwrap();
@@ -796,7 +802,7 @@ fn a_map_sets_its_own_exposure_limits() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
 
     // Before anything runs, the map is asking for nothing.
     assert_eq!(server.tonemap_settings(), TonemapSettings::default());
@@ -827,7 +833,7 @@ fn the_master_tone_mapper_is_the_last_flagged_one() {
 
     // No flags anywhere: the first wins.
     let mut server = Server::new();
-    server.level_init("t", &[controller("a", "0"), controller("b", "0")]);
+    server.level_init("t", &[controller("a", "0"), controller("b", "0")], &[]);
     assert_eq!(
         server
             .entities
@@ -838,7 +844,7 @@ fn the_master_tone_mapper_is_the_last_flagged_one() {
     );
 
     // The flagged one wins wherever it is.
-    server.level_init("t", &[controller("a", "0"), controller("b", "1")]);
+    server.level_init("t", &[controller("a", "0"), controller("b", "1")], &[]);
     assert_eq!(
         server
             .entities
@@ -847,7 +853,7 @@ fn the_master_tone_mapper_is_the_last_flagged_one() {
             .debug_name(),
         "b"
     );
-    server.level_init("t", &[controller("a", "1"), controller("b", "0")]);
+    server.level_init("t", &[controller("a", "1"), controller("b", "0")], &[]);
     assert_eq!(
         server
             .entities
@@ -857,7 +863,7 @@ fn the_master_tone_mapper_is_the_last_flagged_one() {
         "a"
     );
     // Two flagged: the last one.
-    server.level_init("t", &[controller("a", "1"), controller("b", "1")]);
+    server.level_init("t", &[controller("a", "1"), controller("b", "1")], &[]);
     assert_eq!(
         server
             .entities
@@ -868,7 +874,7 @@ fn the_master_tone_mapper_is_the_last_flagged_one() {
     );
 
     // …and no controller at all is the fallback, not the previous map's.
-    server.level_init("t", &[block(&[("classname", "info_target")])]);
+    server.level_init("t", &[block(&[("classname", "info_target")])], &[]);
     assert_eq!(server.tonemap_settings(), TonemapSettings::default());
 }
 
@@ -907,7 +913,7 @@ fn the_activator_is_forwarded_across_a_relay_chain() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let starter = name::find_by_name(&server.entities, "starter")
         .next()
         .unwrap();
@@ -939,6 +945,7 @@ fn an_input_no_class_implements_is_counted() {
             ("targetname", "count"),
             ("max", "100"),
         ])],
+        &[],
     );
     let id = name::find_by_name(&server.entities, "count")
         .next()
@@ -960,6 +967,7 @@ fn a_string_parameter_converts_to_the_declared_type() {
             ("targetname", "count"),
             ("max", "100"),
         ])],
+        &[],
     );
     let id = name::find_by_name(&server.entities, "count")
         .next()
@@ -1002,7 +1010,7 @@ fn the_schedule_does_not_depend_on_the_frame_rate() {
 
     let at_frame_rate = |fps: f32| {
         let mut server = Server::new();
-        server.level_init("test", &map);
+        server.level_init("test", &map, &[]);
         let frame = 1.0 / fps;
         let frames = (1.0 / frame).round() as u32;
         for _ in 0..frames {
@@ -1040,7 +1048,7 @@ fn a_branch_separates_setting_from_testing() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let flag = name::find_by_name(&server.entities, "flag").next().unwrap();
 
     // `SetValue` changes the value and fires nothing — 1,175 of the game's
@@ -1101,7 +1109,7 @@ fn pick_random_chooses_among_connected_outputs() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let pick = name::find_by_name(&server.entities, "pick").next().unwrap();
 
     for _ in 0..90 {
@@ -1154,7 +1162,7 @@ fn in_value_matches_a_case_by_its_string_form() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let pick = name::find_by_name(&server.entities, "pick").next().unwrap();
     let fire = |server: &mut Server, value: Variant| {
         server.accept_input(pick, "InValue", value, None, None, 0);
@@ -1191,7 +1199,7 @@ fn a_counter_fires_its_ceiling_once() {
     ];
 
     let mut server = Server::new();
-    server.level_init("test", &map);
+    server.level_init("test", &map, &[]);
     let count = name::find_by_name(&server.entities, "count")
         .next()
         .unwrap();
@@ -1205,21 +1213,728 @@ fn a_counter_fires_its_ceiling_once() {
 }
 
 // ---------------------------------------------------------------------------
+// stage 3: brush entities move
+// ---------------------------------------------------------------------------
+
+/// A brush model's bounding box, for the movers that measure themselves.
+fn model(mins: [f32; 3], maxs: [f32; 3]) -> bsp::Model {
+    bsp::Model {
+        mins,
+        maxs,
+        origin: [0.0; 3],
+        head_node: 0,
+        first_face: 0,
+        num_faces: 0,
+    }
+}
+
+/// Model 0 is the world; model 1 is a door-shaped slab **66x10x66**, so that
+/// after `CBaseDoor::Spawn`'s `vecOBB -= Vector(2,2,2)` the travel is a round
+/// 64 along X or Z and 8 along Y.
+fn door_models() -> Vec<bsp::Model> {
+    vec![
+        model([-512.0, -512.0, -512.0], [512.0, 512.0, 512.0]),
+        model([-33.0, -5.0, -33.0], [33.0, 5.0, 33.0]),
+    ]
+}
+
+fn placement(server: &Server, name: &str) -> (glam::Vec3, glam::Vec3) {
+    let entity = find_named(server, name);
+    (entity.origin, entity.angles)
+}
+
+/// Positions are compared loosely, and the reason is worth knowing:
+/// `movedir "-90 0 0"` is `AngleVectors` of a 90-degree pitch, whose cosine is
+/// 4.4e-8 rather than 0 — so a door that travels 64 units "straight up" also
+/// travels 2.8 millionths of a unit sideways. Valve's arithmetic has exactly
+/// the same residue; asserting an exact zero would be asserting something the
+/// shipped game does not do either.
+#[track_caller]
+fn close(actual: glam::Vec3, expected: glam::Vec3) {
+    assert!(
+        (actual - expected).length() < 1e-3,
+        "{actual} is not {expected}"
+    );
+}
+
+/// The headline of the stage: a door told to open travels, arrives on time,
+/// lands exactly on its destination and says so.
+#[test]
+fn a_door_opens_and_fires_its_arrival() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("origin", "0 0 0"),
+            // Straight up, 64 units of model along Z, no lip: a 64-unit
+            // travel at 64 units a second is exactly one second.
+            ("movedir", "-90 0 0"),
+            ("lip", "0"),
+            ("speed", "64"),
+            ("wait", "-1"),
+            ("OnFullyOpen", &conn("opened", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "opened"),
+            ("max", "10"),
+        ]),
+    ];
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    close(placement(&server, "door").0, glam::Vec3::ZERO);
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    // Half a second in, it is half way and has not arrived.
+    run(&mut server, 0.5);
+    let origin = placement(&server, "door").0;
+    assert!(
+        (origin.z - 32.0).abs() < 0.5,
+        "half a second is half the travel, not {origin}"
+    );
+    assert_eq!(counter_value(&server, "opened"), 0.0);
+
+    // A second in, it is there, exactly, and `OnFullyOpen` has gone out.
+    run(&mut server, 0.6);
+    close(
+        placement(&server, "door").0,
+        glam::Vec3::new(0.0, 0.0, 64.0),
+    );
+    assert_eq!(counter_value(&server, "opened"), 1.0);
+
+    // `wait -1` means it stays there and stops simulating.
+    run(&mut server, 2.0);
+    close(
+        placement(&server, "door").0,
+        glam::Vec3::new(0.0, 0.0, 64.0),
+    );
+    assert_eq!(server.thinks.len(), 0, "and it leaves the simulation list");
+}
+
+/// A `wait` that is not `-1` closes the door again — on the **arrival alarm**,
+/// with the door standing still, which is the mechanism that makes
+/// `set_move_done_time` a separate timer from the think schedule.
+#[test]
+fn a_door_with_a_wait_closes_itself_on_the_same_alarm() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            ("lip", "0"),
+            ("speed", "64"),
+            ("wait", "0.5"),
+            ("OnFullyClosed", &conn("closed", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "closed"),
+            ("max", "10"),
+        ]),
+    ];
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    // 1 s out, 0.5 s waiting, 1 s back.
+    run(&mut server, 1.2);
+    assert!(placement(&server, "door").0.z > 63.0, "open");
+    assert_eq!(counter_value(&server, "closed"), 0.0);
+
+    run(&mut server, 1.6);
+    close(placement(&server, "door").0, glam::Vec3::ZERO);
+    assert_eq!(counter_value(&server, "closed"), 1.0);
+}
+
+/// `func_door_rotating` turns instead of sliding, `distance` is the angle, and
+/// `speed` is degrees a second along the axis the spawnflags chose.
+#[test]
+fn a_rotating_door_turns_about_the_axis_its_spawnflags_name() {
+    let yaw = vec![block(&[
+        ("classname", "func_door_rotating"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("distance", "90"),
+        ("speed", "90"),
+        ("wait", "-1"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &yaw, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    assert_eq!(
+        placement(&server, "door").1,
+        glam::Vec3::new(0.0, 90.0, 0.0),
+        "yaw by default"
+    );
+
+    // `SF_DOOR_ROTATE_PITCH` (128) plus `SF_DOOR_ROTATE_BACKWARDS` (2): the
+    // pitch axis, negated. 143 of the game's rotating doors take the first.
+    let pitch = vec![block(&[
+        ("classname", "func_door_rotating"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("spawnflags", "130"),
+        ("distance", "90"),
+        ("speed", "90"),
+        ("wait", "-1"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &pitch, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(
+        placement(&server, "door").1,
+        glam::Vec3::new(-90.0, 0.0, 0.0),
+    );
+}
+
+/// `spawnpos 1` puts the door at its open position before anything runs — the
+/// 40 doors in the game that are already open when the level starts.
+#[test]
+fn a_door_can_spawn_open() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "slider"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            ("lip", "0"),
+            ("spawnpos", "1"),
+        ]),
+        block(&[
+            ("classname", "func_door_rotating"),
+            ("targetname", "turner"),
+            ("model", "*1"),
+            ("distance", "90"),
+            ("spawnpos", "1"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+
+    close(
+        placement(&server, "slider").0,
+        glam::Vec3::new(0.0, 0.0, 64.0),
+    );
+    close(
+        placement(&server, "turner").1,
+        glam::Vec3::new(0.0, 90.0, 0.0),
+    );
+    // And neither is moving.
+    assert_eq!(server.thinks.len(), 0);
+}
+
+/// A locked door refuses `Open` and takes `Close`, which is Valve's asymmetry:
+/// `InputClose` does not test `m_bLocked` and `InputOpen` does.
+#[test]
+fn a_locked_door_refuses_to_open_and_still_closes() {
+    let map = vec![block(&[
+        ("classname", "func_door"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("movedir", "-90 0 0"),
+        ("lip", "0"),
+        ("speed", "64"),
+        ("wait", "-1"),
+        ("spawnpos", "1"),
+        // `SF_DOOR_LOCKED`.
+        ("spawnflags", "2048"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let door = find_named(&server, "door").id();
+
+    server.accept_input(door, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(placement(&server, "door").0, glam::Vec3::ZERO);
+
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(placement(&server, "door").0, glam::Vec3::ZERO);
+
+    server.accept_input(door, "Unlock", Variant::Void, None, None, 0);
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(
+        placement(&server, "door").0,
+        glam::Vec3::new(0.0, 0.0, 64.0),
+    );
+}
+
+/// A `func_movelinear` with `startposition 1` spawns at the *open* end, so its
+/// closed end is computed backwards from where the mapper drew it.
+#[test]
+fn a_movelinear_measures_its_ends_from_where_it_was_drawn() {
+    let map = vec![
+        block(&[
+            ("classname", "func_movelinear"),
+            ("targetname", "piston"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            ("movedistance", "100"),
+            ("startposition", "1"),
+            ("speed", "100"),
+            ("origin", "0 0 200"),
+            ("OnFullyClosed", &conn("shut", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "shut"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let piston = find_named(&server, "piston").id();
+
+    // Drawn at 200 and one whole move-distance along, so closed is at 100.
+    close(
+        placement(&server, "piston").0,
+        glam::Vec3::new(0.0, 0.0, 200.0),
+    );
+    server.accept_input(piston, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(
+        placement(&server, "piston").0,
+        glam::Vec3::new(0.0, 0.0, 100.0),
+    );
+    assert_eq!(counter_value(&server, "shut"), 1.0);
+
+    // `SetPosition` takes a fraction of the way along.
+    server.accept_input(piston, "SetPosition", Variant::Float(0.25), None, None, 0);
+    run(&mut server, 1.1);
+    close(
+        placement(&server, "piston").0,
+        glam::Vec3::new(0.0, 0.0, 125.0),
+    );
+}
+
+/// A button goes in, fires `OnIn`, waits on the **think** schedule, comes back
+/// out and fires `OnOut` — the full cycle, and the one class here that uses a
+/// think rather than the alarm for its wait.
+#[test]
+fn a_button_presses_in_and_returns_by_itself() {
+    let map = vec![
+        block(&[
+            ("classname", "func_button"),
+            ("targetname", "button"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            ("lip", "0"),
+            ("speed", "60"),
+            ("wait", "0.5"),
+            ("OnPressed", &conn("pressed", "Add", "1", "0", "-1")),
+            ("OnIn", &conn("inside", "Add", "1", "0", "-1")),
+            ("OnOut", &conn("outside", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "pressed"),
+            ("max", "10"),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "inside"),
+            ("max", "10"),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "outside"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let button = find_named(&server, "button").id();
+
+    server.accept_input(button, "Press", Variant::Void, None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(counter_value(&server, "pressed"), 1.0, "at once");
+    assert_eq!(counter_value(&server, "inside"), 0.0, "not yet");
+
+    run(&mut server, 1.1);
+    assert_eq!(counter_value(&server, "inside"), 1.0, "arrived");
+    assert_eq!(counter_value(&server, "outside"), 0.0);
+    // > **A button with no `lip` gets a lip of 4**, not 0, so the travel is
+    // > the model's 64 less 4. `CBaseButton::Spawn` is the only one of the
+    // > three that substitutes a default here.
+    close(
+        placement(&server, "button").0,
+        glam::Vec3::new(0.0, 0.0, 60.0),
+    );
+
+    // 0.5 s of wait plus 1 s back.
+    run(&mut server, 1.6);
+    assert_eq!(counter_value(&server, "outside"), 1.0);
+    close(placement(&server, "button").0, glam::Vec3::ZERO);
+}
+
+/// 53 of the game's 64 buttons are `SF_BUTTON_DONTMOVE`, which collapses the
+/// travel to nothing — and the cycle still has to run, because
+/// `LinearMove` calls `MoveDone` itself when it is already there.
+#[test]
+fn a_button_that_does_not_move_still_completes_its_cycle() {
+    let map = vec![
+        block(&[
+            ("classname", "func_button"),
+            ("targetname", "button"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            // `SF_BUTTON_DONTMOVE`.
+            ("spawnflags", "1"),
+            ("speed", "5"),
+            ("wait", "0.1"),
+            ("OnIn", &conn("inside", "Add", "1", "0", "-1")),
+            ("OnOut", &conn("outside", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "inside"),
+            ("max", "10"),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "outside"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let button = find_named(&server, "button").id();
+
+    server.accept_input(button, "Press", Variant::Void, None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(counter_value(&server, "inside"), 1.0, "in with no travel");
+    close(placement(&server, "button").0, glam::Vec3::ZERO);
+
+    run(&mut server, 0.3);
+    assert_eq!(counter_value(&server, "outside"), 1.0, "and back out");
+}
+
+/// The empty-input `Use` reaches `m_pfnUse`, which two classes here set. A
+/// button's ignores the use type, which is what saves it from the connection
+/// serial number `InputUse` passes as one.
+#[test]
+fn a_use_with_no_input_name_presses_a_button() {
+    let map = vec![
+        block(&[
+            ("classname", "logic_relay"),
+            ("targetname", "start"),
+            // An empty input field, which `EventAction::parse` turns into
+            // `Use` — 22 shipped connections do this.
+            ("OnTrigger", &conn("button", "", "", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "func_button"),
+            ("targetname", "button"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("wait", "-1"),
+            ("OnPressed", &conn("pressed", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "pressed"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let start = find_named(&server, "start").id();
+    server.accept_input(start, "Trigger", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+    assert_eq!(counter_value(&server, "pressed"), 1.0);
+}
+
+/// `func_rotating` spins up to `maxspeed` and reports it, and `Stop` brings it
+/// back to a standstill. With no `SF_BRUSH_ACCDCC` the speed changes instantly.
+#[test]
+fn a_rotator_starts_stops_and_reports_its_speed() {
+    let map = vec![
+        block(&[
+            ("classname", "func_rotating"),
+            ("targetname", "fan"),
+            ("model", "*1"),
+            ("maxspeed", "180"),
+            ("fanfriction", "100"),
+            (
+                "OnGetSpeed",
+                &conn("speed", "SetValueNoFire", "", "0", "-1"),
+            ),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "speed"),
+            ("max", "1000"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let fan = find_named(&server, "fan").id();
+
+    server.accept_input(fan, "Start", Variant::Void, None, None, 0);
+    run(&mut server, 1.0);
+    let angles = placement(&server, "fan").1;
+    assert!(
+        (angles.y - 180.0).abs() < 4.0,
+        "a second at 180 deg/s is half a turn, not {angles}"
+    );
+
+    // `GetSpeed` reports the magnitude through an output.
+    server.accept_input(fan, "GetSpeed", Variant::Void, None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(counter_value(&server, "speed"), 180.0);
+
+    server.accept_input(fan, "Stop", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    let stopped = placement(&server, "fan").1;
+    run(&mut server, 1.0);
+    assert_eq!(placement(&server, "fan").1, stopped, "and it stays put");
+}
+
+/// `SF_BRUSH_ROTATE_START_ON` turns itself on 0.2 s in, through
+/// `SUB_CallUseToggle` — a *think* that calls `Use`, which is the only place
+/// in the port where those two meet. 18 of the game's 27 rotators.
+#[test]
+fn a_rotator_that_starts_on_needs_no_input() {
+    let map = vec![block(&[
+        ("classname", "func_rotating"),
+        ("targetname", "fan"),
+        ("model", "*1"),
+        ("maxspeed", "90"),
+        ("fanfriction", "100"),
+        // `SF_BRUSH_ROTATE_START_ON` | `SF_BRUSH_ROTATE_Z_AXIS`.
+        ("spawnflags", "5"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+
+    run(&mut server, 0.15);
+    assert_eq!(placement(&server, "fan").1, glam::Vec3::ZERO, "not yet");
+
+    run(&mut server, 1.0);
+    let angles = placement(&server, "fan").1;
+    assert!(angles.z > 45.0, "spinning about Z by now, not {angles}");
+    assert_eq!(angles.x, 0.0);
+    assert_eq!(angles.y, 0.0);
+}
+
+/// `func_brush` is `StartDisabled` and `Enable`/`Disable`, which is where
+/// `portdocs/SERVER.md` §7.4's promise lands: the effect bit and the solidity
+/// flag are what `world/` and the trace read.
+#[test]
+fn a_func_brush_switches_itself_off_and_on() {
+    use crate::server::movement::{EF_NODRAW, FSOLID_NOT_SOLID};
+
+    let map = vec![
+        block(&[
+            ("classname", "func_brush"),
+            ("targetname", "panel"),
+            ("model", "*1"),
+            ("StartDisabled", "1"),
+        ]),
+        block(&[
+            ("classname", "func_brush"),
+            ("targetname", "wall"),
+            ("model", "*1"),
+            ("Solidity", "2"),
+            ("StartDisabled", "1"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+
+    let panel = find_named(&server, "panel");
+    assert_eq!(panel.effects & EF_NODRAW, EF_NODRAW, "invisible");
+    assert_eq!(panel.solid_flags & FSOLID_NOT_SOLID, FSOLID_NOT_SOLID);
+
+    // `Solidity 2` is `BRUSHSOLID_ALWAYS`, so this one is invisible and still
+    // solid — the asymmetry `CFuncBrush::TurnOff` deliberately has.
+    let wall = find_named(&server, "wall");
+    assert_eq!(wall.effects & EF_NODRAW, EF_NODRAW);
+    assert_eq!(wall.solid_flags & FSOLID_NOT_SOLID, 0, "always solid");
+
+    let panel_id = panel.id();
+    server.accept_input(panel_id, "Enable", Variant::Void, None, None, 0);
+    let panel = find_named(&server, "panel");
+    assert_eq!(panel.effects & EF_NODRAW, 0, "visible again");
+    assert_eq!(panel.solid_flags & FSOLID_NOT_SOLID, 0);
+
+    server.accept_input(panel_id, "Toggle", Variant::Void, None, None, 0);
+    assert_eq!(find_named(&server, "panel").effects & EF_NODRAW, EF_NODRAW);
+}
+
+/// The seam `world/` and `trace/` read: a brush entity's placement is looked
+/// up by its `"*N"` model index, and that index is unique across every shipped
+/// map.
+#[test]
+fn a_brush_entity_is_found_by_its_model_index() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            ("lip", "0"),
+            ("speed", "64"),
+            ("wait", "-1"),
+        ]),
+        // A classname the port has no implementation for: no placement, so
+        // whoever asks leaves it where the lump put it.
+        block(&[("classname", "trigger_once"), ("model", "*2")]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+
+    assert_eq!(server.brush_entity_count(), 1);
+    assert!(
+        server.brush_entity(2).is_none(),
+        "trigger_once has no class"
+    );
+    assert!(server.brush_entity(0).is_none(), "model 0 is the world");
+    close(
+        server.brush_entity(1).expect("the door").origin,
+        glam::Vec3::ZERO,
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.1);
+    close(
+        server.brush_entity(1).expect("the door").origin,
+        glam::Vec3::new(0.0, 0.0, 64.0),
+    );
+}
+
+/// A door with nowhere to go arrives **inside** `LinearMove`, so its
+/// `OnFullyOpen` reaches the queue before its `OnOpen` — the reverse of the
+/// order the two lines appear in `DoorGoUp`.
+///
+/// The counter starts at 0; `OnFullyOpen` adds one and `OnOpen` doubles, so
+/// arriving first reads 2 and arriving second reads 1.
+#[test]
+fn a_zero_length_open_arrives_before_it_announces_itself() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("movedir", "-90 0 0"),
+            // The model is 64 along Z after Valve's two units, so a lip of 64
+            // leaves it nowhere to travel.
+            ("lip", "64"),
+            ("speed", "100"),
+            ("wait", "-1"),
+            ("OnFullyOpen", &conn("order", "Add", "1", "0", "-1")),
+            ("OnOpen", &conn("order", "Multiply", "2", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "order"),
+            ("max", "100"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+
+    close(placement(&server, "door").0, glam::Vec3::ZERO);
+    assert_eq!(
+        counter_value(&server, "order"),
+        2.0,
+        "OnFullyOpen must be queued before OnOpen"
+    );
+}
+
+/// Valve's, reproduced: `DoorHitTop` arms the wait with `SetMoveDoneTime(0)`,
+/// which is an alarm that can never fire, and the door is taken out of the
+/// simulation list with it. Four `func_door_rotating`s in the shipped game
+/// carry `wait 0` and stand open for ever.
+#[test]
+fn a_door_with_a_wait_of_zero_stays_open_for_ever() {
+    let map = vec![block(&[
+        ("classname", "func_door_rotating"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("distance", "90"),
+        ("speed", "90"),
+        ("wait", "0"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    run(&mut server, 1.1);
+    close(
+        placement(&server, "door").1,
+        glam::Vec3::new(0.0, 90.0, 0.0),
+    );
+    assert_eq!(server.thinks.len(), 0, "out of the simulation list");
+
+    run(&mut server, 10.0);
+    assert_eq!(
+        placement(&server, "door").1,
+        glam::Vec3::new(0.0, 90.0, 0.0),
+        "and it never closes"
+    );
+}
+
+/// The travel is the model's own size along `movedir`, less the lip, less the
+/// two units Valve subtracts for the engine's bbox expansion.
+#[test]
+fn the_travel_is_the_model_minus_the_lip_minus_two() {
+    let map = vec![block(&[
+        ("classname", "func_door"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("movedir", "0 90 0"),
+        ("lip", "3"),
+        ("speed", "100"),
+        ("wait", "-1"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 1.0);
+
+    // The slab is 10 thick along Y, less Valve's 2, less the lip of 3.
+    close(placement(&server, "door").0, glam::Vec3::new(0.0, 5.0, 0.0));
+}
+
+// ---------------------------------------------------------------------------
 // the depot
 // ---------------------------------------------------------------------------
 
-/// The 28 key names nothing consumes, across all 106 shipped maps, with how
+/// The 36 key names nothing consumes, across all 106 shipped maps, with how
 /// often each appears.
 ///
 /// This is the parse-side status in one table, and it is worth reading rather
 /// than skipping:
 ///
-/// - **17 are the map compiler's.** `_light`, `_lightHDR`, `_quadratic_attn`
+/// - **19 are the map compiler's.** `_light`, `_lightHDR`, `_quadratic_attn`
 ///   and the rest of the falloff family are read by `vbsp`/`vrad` at compile
 ///   time (`utils/vbsp/map.cpp`) and have **no run-time consumer in Valve's
 ///   engine either** — the shipped server drops them exactly as this one does.
 ///   `detailvbsp` is `vbsp`'s, `paintinmap` is read by `engine/cmodel.cpp` and
-///   `mapversion` appears nowhere in the tree at all.
+///   `mapversion` appears nowhere in the tree at all. Stage 3 added two more
+///   of them by implementing `func_brush` and the doors: `_minlight` is
+///   `utils/vrad/radial.cpp:676` and `vrad_brush_cast_shadows` is
+///   `utils/vrad/trace.cpp:727`.
 /// - **6 are mapper mistakes shipped in the game**: a `logic_relay` with a key
 ///   called `//OnTrigger`, seventeen with `_OnTrigger`, two with
 ///   `OnUnPressed`, a `light_spot` with `AddonPoints`/`NpcPoints` from a
@@ -1232,6 +1947,20 @@ fn a_counter_fires_its_ceiling_once() {
 /// - **`OnProxyRelay` (135)** is the unnumbered output the FGD shows a mapper;
 ///   Hammer's instance compiler is supposed to rewrite it into a numbered one
 ///   and these were missed. No version of the server has ever handled it.
+/// - **`inputfilter` (2,497) is declared by the FGD and consumed by nothing
+///   in the entire tree.** `base.fgd:247` gives `func_brush` an `Inputfilter`
+///   base class with an `InputFilter` choices key, and there is no
+///   `"inputfilter"` string anywhere in `legacy/` — not in `game/server/`, not
+///   in the engine, not in the tools. Hammer writes it onto every `func_brush`
+///   and nothing has ever read it. The best single example of
+///   `portdocs/SERVER.md` §1.4's "the FGD is not an oracle".
+/// - **Three more arrived with stage 3's classes and are `CBaseEntity`'s
+///   rather than missing**: `health` (682, on every door and button —
+///   `m_iHealth`, which needs a damage system), `filtername` (1, on a
+///   `func_door` that has no such key in any version of the server — the
+///   classes that do are the triggers and `filter_*`), and `message` (3, on
+///   `func_door_rotating`, which likewise has no `message` key; `func_rotating`
+///   does and its three are consumed).
 /// - The rest are genuinely not implemented yet, and all of them are small:
 ///   `vscripts` (`portdocs/SERVER.md` §9), `SunSpreadAngle`, `ambient`.
 ///
@@ -1252,6 +1981,7 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("_lighthdr", 7150),
     ("_lightscalehdr", 7150),
     ("_linear_attn", 4096),
+    ("_minlight", 169),
     ("_onmapspawn", 1),
     ("_ontrigger", 17),
     ("_quadratic_attn", 7121),
@@ -1259,13 +1989,19 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("addonpoints", 1),
     ("ambient", 2),
     ("detailvbsp", 106),
+    ("filtername", 1),
+    ("health", 682),
+    ("inputfilter", 2497),
     ("mapversion", 106),
+    ("message", 3),
     ("npcpoints", 1),
+    ("onfullyopen", 2),
     ("onproxyrelay", 135),
-    ("ontrigger", 5),
+    ("ontrigger", 6),
     ("onunpressed", 2),
     ("paintinmap", 25),
     ("sunspreadangle", 27),
+    ("vrad_brush_cast_shadows", 2456),
     ("vscripts", 1),
 ];
 
@@ -1319,10 +2055,15 @@ fn every_shipped_map_spawns_its_entities() {
     let mut maps_with_a_master = 0;
     let mut custom_max = 0;
     let mut peak_thinks = 0;
+    // Stage 3's metric: brush entities, and how many of them are somewhere
+    // other than where the entity lump put them once the map has run.
+    let mut brush_entities = 0;
+    let mut moved = 0;
+    let mut still_moving = 0;
 
     for name in &names {
         let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
-        let stats = server.level_init(name, &bsp.entities());
+        let stats = server.level_init(name, &bsp.entities(), &bsp.models);
 
         // Per map: nothing may be lost. Every block is matched or unknown, and
         // every matched entity is alive or removed itself.
@@ -1373,6 +2114,16 @@ fn every_shipped_map_spawns_its_entities() {
             *total.unhandled.entry(key.clone()).or_default() += count;
         }
 
+        // Where every brush entity starts, so that the run below can be asked
+        // whether anything actually moved.
+        brush_entities += server.brush_entity_count();
+        let placed: Vec<(usize, glam::Vec3, glam::Vec3)> = (0..bsp.models.len())
+            .filter_map(|i| {
+                let entity = server.brush_entity(i)?;
+                Some((i, entity.origin, entity.angles))
+            })
+            .collect();
+
         // …and now run it. Nothing here may panic, and the think list must not
         // grow without bound.
         let interval = server.time().interval;
@@ -1380,6 +2131,18 @@ fn every_shipped_map_spawns_its_entities() {
         for _ in 0..ticks {
             server.frame(interval);
             peak_thinks = peak_thinks.max(server.thinks.len());
+        }
+
+        for (index, origin, angles) in placed {
+            let Some(entity) = server.brush_entity(index) else {
+                continue;
+            };
+            if entity.origin != origin || entity.angles != angles {
+                moved += 1;
+            }
+            if entity.will_simulate_game_physics() {
+                still_moving += 1;
+            }
         }
 
         if server.master_tonemap.is_some() {
@@ -1432,6 +2195,11 @@ fn every_shipped_map_spawns_its_entities() {
         maps_with_a_master,
         custom_max
     );
+    println!(
+        "    {brush_entities} brush entities have a class; \
+         {moved} of them are not where the lump put them, \
+         {still_moving} are still moving"
+    );
     println!("  inputs nothing handled:");
     let mut unhandled_inputs: Vec<_> = io.unhandled.iter().collect();
     unhandled_inputs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -1449,13 +2217,14 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(total.spawned + total.removed_on_spawn, total.matched);
     assert_eq!(total.removed_on_spawn, 6_937, "unnamed lights");
 
-    // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132; the
-    // six classes stage 2 added are the difference.
-    assert_eq!(total.matched, 19_229);
-    assert_eq!(total.spawned, 12_292);
-    assert_eq!(total.outputs, 46_489);
-    assert_eq!(total.unknown.len(), 185);
-    assert_eq!(total.unknown.values().sum::<usize>(), 41_696);
+    // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
+    // stage 2 took it to 19,229 and 12,292, and stage 3's six brush classes
+    // are 3,410 more of both.
+    assert_eq!(total.matched, 22_639);
+    assert_eq!(total.spawned, 15_702);
+    assert_eq!(total.outputs, 47_541);
+    assert_eq!(total.unknown.len(), 179);
+    assert_eq!(total.unknown.values().sum::<usize>(), 38_286);
     assert_eq!(
         named_lights, 213,
         "lights that survive because they are named"
@@ -1482,6 +2251,14 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("logic_case"), Some(&84));
     assert_eq!(per_class.get("logic_timer"), Some(&151));
     assert_eq!(per_class.get("math_counter"), Some(&102));
+    // Stage 3's. `func_brush` is the third commonest classname in the game,
+    // behind `logic_relay` and `prop_dynamic`.
+    assert_eq!(per_class.get("func_brush"), Some(&2_502));
+    assert_eq!(per_class.get("func_door_rotating"), Some(&346));
+    assert_eq!(per_class.get("func_door"), Some(&275));
+    assert_eq!(per_class.get("func_movelinear"), Some(&196));
+    assert_eq!(per_class.get("func_button"), Some(&64));
+    assert_eq!(per_class.get("func_rotating"), Some(&27));
 
     // 105 of the 106 maps place a tone mapper; `sp_a5_credits` is the one that
     // does not.
@@ -1492,21 +2269,31 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(custom_max, 100);
 
     // The run side. These are what two seconds of every shipped map does.
-    assert_eq!(io.dispatched, 5_763);
-    assert_eq!(io.accepted, 2_070);
-    assert_eq!(io.thinks, 1_197);
+    assert_eq!(io.dispatched, 5_766);
+    assert_eq!(io.accepted, 2_286);
+    assert_eq!(io.thinks, 1_241);
     // Most events reach nothing because most *targets* are entities of classes
     // this port has not got — `prop_dynamic` alone is 8,072 of them. Expect
     // this number to fall as classes land.
-    assert_eq!(io.no_target, 3_700);
+    assert_eq!(io.no_target, 2_770);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
     assert_eq!(io.bad_conversion, 0, "a shipped map has a bad I/O link");
 
     // The whole set of inputs that reach an implemented class and are refused.
-    // Three of the seven are the player procedurals, which are stage 5's; the
-    // rest are `CBaseEntity`'s parenting family, which is stage 3's, and one
+    //
+    // **Nine names, and 1,078 of the 1,081 occurrences are the parenting
+    // family.** `func_brush` alone takes 883 `SetParentAttachmentMaintainOffset`
+    // in the first two seconds of the game, because a Hammer instance parents
+    // its clip brushes to a moving platform and the `logic_auto` bootstrap is
+    // what does the parenting. That family stays unimplemented on purpose and
+    // the condition is a real one: `SetParent` needs a local/abs transform
+    // pair on `EntityCore`, which this port does not have (a child's origin is
+    // the world-space one the map gave and nothing rebases it), and
+    // `SetParentAttachment*` needs `LookupAttachment` on a studio model, which
+    // would be this module's first dependency on `studio/`. Three of the
+    // remaining names are the player procedurals (stage 5's) and one is
     // `RunScriptCode` (`portdocs/SERVER.md` §9).
     let unhandled: Vec<(&str, usize)> =
         io.unhandled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -1516,6 +2303,8 @@ fn every_shipped_map_spawns_its_entities() {
             ("!player (needs a player)", 97),
             ("!player_blue (needs a player)", 37),
             ("!player_orange (needs a player)", 37),
+            ("func_brush.SetParent", 12),
+            ("func_brush.SetParentAttachmentMaintainOffset", 883),
             ("info_target.SetParent", 1),
             ("info_target.SetParentAttachment", 12),
             ("info_target.SetParentAttachmentMaintainOffset", 1),
@@ -1524,8 +2313,26 @@ fn every_shipped_map_spawns_its_entities() {
         "the set of inputs nothing handles has changed"
     );
 
+    // Stage 3, end to end: every brush entity the port has a class for, and
+    // how many of them the first two seconds of the game actually move.
+    //
+    // 67 is not a large number and it is the right one: a Portal 2 map starts
+    // with its doors shut, and what moves in the first two seconds is the
+    // handful of panels and lifts a chamber opens with. What matters is that
+    // it is not **zero** — before stage 3 nothing in any map moved at all —
+    // and that 34 of them are still in flight when the clock stops, so the
+    // simulation list is being entered and left rather than filled once.
+    assert_eq!(brush_entities, 3_410);
+    assert_eq!(moved, 67, "brush entities that left their spawn placement");
+    assert_eq!(still_moving, 34, "…and were still travelling at 2s");
+
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
+    //
+    // **Stage 3 put every moving entity in this list and the peak did not
+    // change**, which is the measurement `think.rs` said to retake: a mover is
+    // only in it while it is actually travelling, and the 43 is set by the
+    // `logic_auto` bootstrap rather than by anything that moves.
     assert_eq!(peak_thinks, 43);
 
     // The one map this port looks at most, and the headline of the whole
@@ -1536,7 +2343,7 @@ fn every_shipped_map_spawns_its_entities() {
     // asks for 5; it is `StartDisabled 1`, so honouring that key is what
     // decides which number the map gets.
     let bsp = Bsp::load(&vfs, "sp_a1_intro1").expect("the intro map parses");
-    server.level_init("sp_a1_intro1", &bsp.entities());
+    server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
     let interval = server.time().interval;
     for _ in 0..(RUN_SECONDS / interval).round() as u32 {
         server.frame(interval);

@@ -667,6 +667,26 @@ impl BrushModel {
         }
     }
 
+    /// Move the model. `UTIL_SetOrigin` plus `SetLocalAngles`, from the
+    /// entity that owns it.
+    ///
+    /// **This is what makes a door a door.** The placement used to be baked at
+    /// load, which is exactly why nothing in a map moved
+    /// (`portdocs/SERVER.md` §7.4); `src/server/` stage 3 gives brush entities
+    /// a move type and a velocity, and this is where the result lands. It is
+    /// still one transform: [`model_to_world`](BrushModel::model_to_world) and
+    /// [`local_ray`](BrushModel::local_ray) both read these two fields, so the
+    /// drawn door and the collided door cannot be in different places.
+    ///
+    /// The `angles != 0` test is `CM_TransformedBoxTrace`'s `rotated` flag and
+    /// is re-evaluated on every call rather than kept: a door that starts
+    /// unrotated and swings is rotated from its first tick onwards, and a
+    /// stale flag would trace it as though it had never turned.
+    pub fn set_placement(&mut self, origin: Vec3, angles: Vec3) {
+        self.origin = origin;
+        self.rotation = (angles != Vec3::ZERO).then(|| crate::math::angle_matrix(angles));
+    }
+
     /// `ray` expressed in this model's own frame.
     ///
     /// The first half of `CM_TransformedBoxTrace` (`engine/cmodel.cpp:3253`).

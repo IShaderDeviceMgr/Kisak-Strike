@@ -141,9 +141,10 @@ impl ClassDef {
 ///
 /// `Use` earns its place for a reason that is easy to miss: it is the input a
 /// connection gets when the mapper left the field **empty**
-/// (`cbase.cpp:150`), which 22 shipped connections do. `CBaseEntity::Use` is a
-/// null function pointer for every class here, so accepting it and doing
-/// nothing is not a stub — it is the behaviour.
+/// (`cbase.cpp:150`), which 22 shipped connections do. It dispatches
+/// [`Behaviour::use_entity`], which is `m_pfnUse` — null for every class here
+/// but `func_button` and `func_rotating`, so for the rest accepting it and
+/// doing nothing is not a stub, it is the behaviour.
 pub const BASE_INPUTS: &[InputDef] = &[
     InputDef::new("Kill", FieldType::Void),
     InputDef::new("Use", FieldType::Void),
@@ -165,7 +166,12 @@ pub fn base_input(name: &str) -> Option<FieldType> {
 ///
 /// Runs only when the class did not claim the name, which is the second and
 /// last step of what `AcceptInput`'s `baseMap` walk does here.
-pub fn base_accept_input(entity: &mut EntityCore, input: &Input<'_>, cx: &mut Context<'_>) -> bool {
+pub fn base_accept_input(
+    entity: &mut EntityCore,
+    behaviour: &mut dyn Behaviour,
+    input: &Input<'_>,
+    cx: &mut Context<'_>,
+) -> bool {
     let is = |name: &str| input.name.eq_ignore_ascii_case(name);
 
     if is("Kill") {
@@ -176,10 +182,13 @@ pub fn base_accept_input(entity: &mut EntityCore, input: &Input<'_>, cx: &mut Co
         return true;
     }
     if is("Use") {
-        // `InputUse` calls `Use()`, which dispatches `m_pfnUse` — null for
-        // every class implemented so far — and fires a `player_use` game
-        // event, for which there is no event system. Accepted and ignored;
-        // see [`BASE_INPUTS`].
+        // `InputUse` (`baseentity.cpp:4625`) calls `Use()`, which dispatches
+        // `m_pfnUse`, and then fires a `player_use` game event for which there
+        // is no event system. Two classes set a `m_pfnUse`
+        // (`func_button` and `func_rotating`) and for the rest the pointer is
+        // null, so accepting and doing nothing is the behaviour rather than a
+        // stub — see [`Behaviour::use_entity`] and [`BASE_INPUTS`].
+        behaviour.use_entity(entity, UseType::from_output_id(input.output_id), input, cx);
         return true;
     }
     for (name, output) in [
@@ -197,6 +206,48 @@ pub fn base_accept_input(entity: &mut EntityCore, input: &Input<'_>, cx: &mut Co
         }
     }
     false
+}
+
+/// `USE_TYPE` (`game/shared/shareddefs.h:581`) — what a `Use` means.
+///
+/// # It is the connection's serial number, cast
+///
+/// `CBaseEntity::InputUse` passes `(USE_TYPE)inputdata.nOutputID`
+/// (`baseentity.cpp:4627`), and `nOutputID` is the *ID stamp* of the
+/// `CEventAction` that fired — an ever-increasing counter over every
+/// connection in the map. So the use type of an I/O-driven `Use` is whatever
+/// number that connection happened to be assigned, and only the first four
+/// stamps in a level can name a real value.
+///
+/// Almost certainly a copy-paste of the value argument, and it is reproduced
+/// because it decides something: `CFuncMoveLinear::Use` returns immediately
+/// unless the type is `USE_SET`, so an I/O `Use` on a `func_movelinear` does
+/// nothing in the shipped game, and a port that "fixed" this to `USE_TOGGLE`
+/// would have eleven of them start moving that never move today. `func_button`
+/// and `func_rotating` ignore the type, which is why they work anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseType {
+    Off,
+    On,
+    Set,
+    Toggle,
+    /// Anything else the cast produced. Not a Valve value; `USE_TYPE` is a C
+    /// enum and an out-of-range cast simply compares equal to none of the
+    /// four, which is what this variant reproduces.
+    Other,
+}
+
+impl UseType {
+    /// The cast `InputUse` performs.
+    pub fn from_output_id(id: u32) -> UseType {
+        match id {
+            0 => UseType::Off,
+            1 => UseType::On,
+            2 => UseType::Set,
+            3 => UseType::Toggle,
+            _ => UseType::Other,
+        }
+    }
 }
 
 /// What a behaviour may reach outside its own entity.
@@ -322,10 +373,10 @@ pub enum SpawnResult {
 
 /// A class's own state and behaviour: everything `CBaseEntity` did not have.
 ///
-/// Five methods against the C++'s hundred virtuals, because that is what the
-/// port runs: parse keys, spawn, activate, think, take an input. `move_done`
-/// arrives with `portdocs/SERVER.md` stage 3, which is the stage that has
-/// movers.
+/// Eight methods against the C++'s hundred virtuals, because that is what the
+/// port runs: parse keys, spawn, activate, think, arrive, get used, take an
+/// input, describe yourself. `move_done` and `use_entity` arrived with
+/// `portdocs/SERVER.md` stage 3, which is the stage that has movers.
 ///
 /// Every method takes `&mut EntityCore` alongside `&mut self`, which is the
 /// whole reason [`Entity`](super::entity::Entity) is split in two — a handler
@@ -356,6 +407,33 @@ pub trait Behaviour: Any {
     /// [`EntityCore::set_next_think`] — so a recurring behaviour must re-arm
     /// itself on the way out.
     fn think(&mut self, _entity: &mut EntityCore, _cx: &mut Context<'_>) {}
+
+    /// `MoveDone()` — the arrival alarm has gone off.
+    ///
+    /// `CBaseEntity::MoveDone` dispatches `m_pfnMoveDone`, a function pointer
+    /// a mover re-points at each step of its cycle: a door hitting the top
+    /// sets it to `DoorGoDown` so the *same* alarm serves the wait. A class
+    /// keeps its own enum in place of the pointer, and one that holds a
+    /// [`Toggle`](super::movement::Toggle) calls
+    /// [`Toggle::move_done`](super::movement::Toggle::move_done) first —
+    /// that call *is* `CBaseToggle::MoveDone`, and skipping it leaves the
+    /// mover a fraction of a tick past its destination with its velocity
+    /// still set.
+    fn move_done(&mut self, _entity: &mut EntityCore, _cx: &mut Context<'_>) {}
+
+    /// `Use()` — `m_pfnUse`, dispatched by `CBaseEntity::InputUse`.
+    ///
+    /// Null for every class but two, so the default is to do nothing and that
+    /// is the behaviour rather than a stub. See [`UseType`] for why the type
+    /// argument is a connection serial number.
+    fn use_entity(
+        &mut self,
+        _entity: &mut EntityCore,
+        _use_type: UseType,
+        _input: &Input<'_>,
+        _cx: &mut Context<'_>,
+    ) {
+    }
 
     /// `AcceptInput`'s dispatch half, for the inputs this class declares.
     ///

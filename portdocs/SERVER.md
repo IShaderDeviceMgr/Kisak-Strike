@@ -639,6 +639,13 @@ and the commonest mover is not the one you would guess:
 
 `func_door_rotating` outnumbers `func_door`. Do `AngularMove` first.
 
+> **Stage 3 shipped six of those nine classnames plus `func_brush`, and the
+> count that matters is not this one.** `func_brush` does not move and is 2,502
+> entities — more than twice the whole mover census — so the six classes are
+> 3,410 entities in total. The three movers left are `func_tracktrain` (233),
+> `func_tanktrain` (20) and the two rotating buttons (3), and the trains need
+> `path_track` before they mean anything.
+
 ### 4.8 Handles, and deletion that is never immediate
 
 `CBaseHandle` packs a 14-bit slot index (`NUM_ENT_ENTRIES` = 16,384) and a 16-bit serial
@@ -891,11 +898,13 @@ Three things change relative to the C++ and each is deliberate:
 
 ### 7.4 The seams
 
-**`world/` — placement moves to the entity.** `find_brush_models`
-(`src/engine/world/mod.rs:1152`) currently resolves the entity lump itself and keeps
-`classname`, `index` and `render_mode`; the transform lives in `BrushModel`'s private
-`origin`/`rotation`, set once at load. When `server/` exists, the entity owns the
-placement and `world/` asks for it. Two things must stay true through that change:
+**`world/` — placement moves to the entity. DONE at stage 3.** `find_brush_models`
+still resolves the entity lump at load, and `Engine::frame` then overwrites each
+placement from the entity once a frame through
+`BrushModel::set_placement`. Both invariants below held. The join key turned out
+to be the `"*N"` model index, which is unique across all 106 shipped maps —
+11,635 pairs, none shared — and `world/` and `server/` still name no type of
+each other's. Two things had to stay true and did:
 
 - What is drawn and what is collided with must still come from **one** transform — the
   invariant `BrushModel::model_to_world` exists to protect. The entity's origin and
@@ -903,12 +912,19 @@ placement and `world/` asks for it. Two things must stay true through that chang
 - `BrushModel`'s placement has to become *mutable*. It is baked at load today, which is
   exactly why nothing moves. This is the smallest change that makes stage 3 possible.
 
-`StartDisabled` also comes home here. `world/` records it and does not honour it,
-correctly noting it is `server/`'s — 12,372 entities carry the key and 2,808 set it.
+`StartDisabled` also comes home here — **for `func_brush`, which is the class whose
+`Spawn` reads it.** 337 of the game's 2,502 set it and are now neither drawn nor
+collided with until something enables them. The key on other classnames is still
+unread, and those are stage 4's; 12,372 entities carry it and 2,808 set it.
 
 **`trace/` — stage 4 is the reciprocal.** `ENGINE_TRACE.md` stage 4 needs an entity list
 to enumerate; this module is it. Until then `trace` and `trace_model` are separate
-questions and combining them is the caller's job — that stays true for stages 1-3 here.
+questions and combining them is the caller's job — that stays true through stage 3. What
+stage 3 *did* give the trace is a placement that moves and one solidity bit:
+`PlacedBrushModel::solid` is `FSOLID_NOT_SOLID` cleared, set by `func_brush`
+and by nothing else, and the `trace` console command filters on it.
+`FSOLID_TRIGGER` is still nobody's, because the classes that set it are
+stage 4's.
 
 **`client/` — the player is an entity.** `Player` already has `origin`, `velocity`,
 `MoveType` and `old_buttons`. The cheapest correct joining is for the player to *be* an
@@ -1090,20 +1106,100 @@ from a think scheduled at `curtime + 0.2` in `Activate`, not from `Spawn`
 (`logicauto.cpp:82`). 998 of the game's 1,112 `logic_auto`s then remove themselves
 (spawnflag 1). Every map in the game bootstraps through this one 0.2-second delay.
 
-### Stage 3 — brush entities move
+### Stage 3 — brush entities move — **DONE**
 
 `MoveType`, `MOVETYPE_PUSH`, `LinearMove`/`AngularMove`/`MoveDone` and the
-`SetMoveDoneTime` alarm (§4.7); `BrushModel`'s placement becomes mutable and comes from
-the entity (§7.4). Classes: `func_door_rotating`, `func_door`, `func_movelinear`,
-`func_brush`, `func_button`, `func_rotating` — 1,008 of the game's 1,164 movers.
+`SetMoveDoneTime` alarm (§4.7); `BrushModel`'s placement becomes mutable and comes
+from the entity (§7.4). Classes: `func_door_rotating`, `func_door`,
+`func_movelinear`, `func_brush`, `func_button`, `func_rotating`.
 
-Deliberately **not** in this stage: pushing the player. `CPhysicsPushedEntities`
-(`physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker enumeration and
-rollback) is most of the complexity and none of the payoff. A door that moves through
-the player is a better state than a door that does not move, and the push logic wants
-`trace/` stage 4 underneath it anyway.
+Landed as `src/server/movement.rs` (`MoveType`, `ModelBounds`, `ToggleState`,
+`Toggle`, `simulate`, and Valve's `anglemod`/`DotProductAbs`/`AngleVectors`
+arithmetic) plus `src/server/classes/brush.rs` (the six classes), with a
+movement block on `EntityCore`, two new `Behaviour` methods, and `ThinkList`
+turned into the real `CSimThinkManager`. **API: `rustdocs/SERVER.md`.**
+
+Deliberately **not** in this stage, as planned: pushing the player.
+`CPhysicsPushedEntities` (`physics_main.cpp:130-1130`, ~1,000 lines of
+speculative push, blocker enumeration and rollback) is most of the complexity
+and none of the payoff, and it wants `trace/` stage 4 underneath it anyway. So
+`PerformPush` is ported with the blocker always null, which is the branch the
+shipped game takes on almost every tick; `Blocked`/`StartBlocked`/`EndBlocked`,
+`m_bDoorGroup`, `forceclosed` and the block-damage keys are parsed and unread.
 
 Ends with: test-chamber doors open.
+
+#### What it cost, and the six things worth carrying forward
+
+**The scope grew, and the reason is `func_brush`.** §4.7 counted 1,164 *movers*,
+and the six classes turn out to be 3,410 entities — because `func_brush` is
+2,502 of them and does not move. It is the third commonest classname in the game
+after `logic_relay` and `prop_dynamic`, it is `MOVETYPE_PUSH` only "so it
+doesn't get pushed by anything", and it is where `StartDisabled` finally comes
+home (§7.4): 337 of them start switched off, and until this stage `world/` drew
+every one.
+
+**1. The model index is a join key, and that is a measurement.** §7.4 asked for
+the placement to come from the entity without saying how the two sides find each
+other. A script over the depot answered it: 106 maps place **11,635
+`(map, "*N")` pairs and not one is claimed by two entities**, so `"*N"` *is* the
+identity and nothing has to carry a lump index or a hammer id around. The seam
+is `Server::brush_entity(index) -> Option<&EntityCore>` over a sorted `Vec`,
+and `engine/mod.rs` converts — neither `world/` nor `server/` names the other,
+the same arrangement `console/` and `input/` have.
+
+**2. A mover needs one thing that is not in the entity lump.**
+`CBaseDoor::Spawn` takes `CollisionProp()->OBBSize()`, which `SetModel` →
+`UTIL_SetModel` → `SetMinMaxSize` (`util.cpp:1426`) read out of the `.bsp`'s
+model lump. So `level_init` grew a third argument, `&[bsp::Model]`, and
+`EntityCore` grew a `ModelBounds`. This is the module's *second* type from
+`engine::world::bsp` and it is the same argument as the first: the engine read
+the file, so the engine hands the game what it read.
+
+**3. `CSimThinkManager` is two questions in one list, and §4.5 only saw one.**
+An entity is in it when it will think **or** when `WillSimulateGamePhysics()`,
+and a mover is stored with a tick of **zero** so that `ListCopy` hands it out
+every tick whatever its schedule says. The consequence is that
+`PhysicsRunSpecificThink`'s `thinktick > gpGlobals->tickcount` guard is
+load-bearing rather than defensive — a mover is asked to think on every tick of
+its travel and has to refuse for itself. `think.rs` said to retake its peak
+measurement once stage 3 filled the list; the answer is **still 43**, because a
+mover is only in it while it is actually travelling and a Portal 2 map starts
+with its doors shut.
+
+**4. `SetMoveDoneTime(0)` is a trap, and four shipped doors are in it.**
+`PerformPush` tests the *absolute* alarm with `> 0`, so an alarm armed for no
+delay never fires — and `WillSimulateGamePhysics` then takes the entity out of
+the simulation list, so nothing looks at it again. `CBaseDoor::DoorHitTop` arms
+the wait exactly that way, so a `func_door_rotating` with `wait 0` stands open
+for ever. Four of them ship. `CBaseButton::Spawn` cannot reach it because it
+substitutes a `wait` of 1 for a 0 — which 14 of the game's 64 buttons rely on,
+and which reads as pointless defensiveness until you have seen the door bug.
+
+**5. The `Use` input's *type* is the connection's serial number.**
+`CBaseEntity::InputUse` passes `(USE_TYPE)inputdata.nOutputID`
+(`baseentity.cpp:4627`), and `nOutputID` is the `CEventAction`'s ID stamp. It
+decides something real: `CFuncMoveLinear::Use` returns unless the type is
+`USE_SET`, so an I/O `Use` on a `func_movelinear` does nothing in the shipped
+game, while `func_button` and `func_rotating` ignore the type and work. §4.3's
+"an empty input name is `Use`" now has teeth — two classes here set `m_pfnUse`
+— so `Behaviour` gained a `use_entity` method and `base_accept_input` gained
+the behaviour as an argument.
+
+**6. The FGD's worst case so far.** `base.fgd:247` gives `func_brush` an
+`Inputfilter` base class, Hammer writes `inputfilter` onto **2,497** of them,
+and there is no `"inputfilter"` string anywhere in `legacy/` — not in
+`game/server/`, not in the engine, not in the tools. §1.4 said the FGD is a
+reference and not an oracle; this is the sharpest example of it, and it arrives
+alongside two more `vrad` keys (`_minlight`, `vrad_brush_cast_shadows`) and
+three mapper mistakes (`filtername` on a door, `message` on a
+`func_door_rotating`, `onfullyopen` on a `func_brush`).
+
+#### One deliberate naming divergence
+
+§7.1 plans the file as `move_.rs`, because `move` is a Rust keyword. It shipped
+as **`movement.rs`**: the trailing underscore is a transliteration artefact, and
+`PORTING.md` asks for the name Rust wants rather than the one the C++ forces.
 
 ### Stage 4 — triggers and touch
 
@@ -1190,10 +1286,22 @@ question into a number.
    reopens it is a handler that must *read* another entity during dispatch;
    `logic_branch_listener` is the first one in the game, and the shape to reach for
    then is the entity list minus the one entity being dispatched, not a `RefCell`.
-4. **How much of `CPhysicsPushedEntities` is really needed.** Stage 3 defers all of it.
-   Portal 2 has crushing doors and moving platforms the player rides; the condition that
-   forces the port is the first puzzle that cannot be solved without standing on
-   something that moves.
+4. **How much of `CPhysicsPushedEntities` is really needed.** Stage 3 deferred all
+   of it, as planned, and the shape it left behind is the right one: `PerformPush`
+   is ported with the blocker always null, `EntityCore::local_time` is real and
+   correct and simply never goes backwards, and the keys that feed the blocked
+   path (`forceclosed`, `dmg`, `BlockDamage`) are parsed and unread. Portal 2 has
+   crushing doors and moving platforms the player rides; the condition that forces
+   the port is the first puzzle that cannot be solved without standing on something
+   that moves, and it wants `ENGINE_TRACE.md` stage 4 first either way.
+
+   **A second, smaller question opened underneath it**: a mover that is *parented*
+   moves in the parent's frame in Valve's engine and in world space here, because
+   this port keeps no local/abs transform pair. 174 of the game's 1,164 movers name
+   a parent. The same missing pair is what keeps the `SetParent` input family
+   unimplemented, and that family is **1,078 of the 1,081 inputs the depot test
+   reports as unhandled** — so whichever of the two forces it, both are fixed at
+   once.
 5. **The 41 reconstructed classes.** §1.3. The risk is silent divergence: reconstructed
    behaviour that looks right and is not. Mark them, and lean on the FGD check (§7.3)
    for at least the interface.

@@ -651,8 +651,10 @@ which is the only thing in `client/` still blocked on another module.
 Collision is **planned in `portdocs/ENGINE_TRACE.md`** and lands as `src/engine/trace/`.
 **Stages 1-3 are done**: `CM_BoxTrace` and everything under it over the world's brushes;
 `CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
-a test chamber, all solid and, since `world/` learned to draw them, all visible; and
-`CDispCollTree` over the **displacements**, so the game's terrain is solid too. Stage 4 is
+a test chamber, all solid, all visible since `world/` learned to draw them, and **all
+moving** since `server/` stage 3 made `BrushModel`'s placement mutable and took it from
+the entity; and `CDispCollTree` over the **displacements**, so the game's terrain is
+solid too. Stage 4 is
 entities and the dispatch, stage 5 vcollide — and `spatialpartition.cpp` is not ported and
 will not be, because `parry`'s `Qbvh` replaces it when entities arrive.
 
@@ -699,7 +701,7 @@ Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own mo
 free-fly camera, bindings, UI precedence and the key-up latch). Stage 5 (controllers,
 `gilrs`) is deliberately last and is all that remains.
 
-**The game server has landed — stages 1 and 2 of `portdocs/SERVER.md`'s five.** It is
+**The game server has landed — stages 1, 2 and 3 of `portdocs/SERVER.md`'s five.** It is
 `src/server/`, the sibling the client's entry above said would follow it, and it is the
 module that turns the `.bsp`'s entity lump into an entity list and then *runs* it:
 `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's own
@@ -747,6 +749,45 @@ land before it could do anything — and **two thirds of `logic_case`'s use in P
 ignores its case values**, because `PickRandom` chooses among the cases whose *output*
 has connections rather than the ones whose *value* is set. Neither is a conclusion
 reading `game/server/` would reach.
+
+**Stage 3 is `MOVETYPE_PUSH`, and it is the first time anything in a map moves.**
+`CBaseToggle`'s two moves — set a velocity, set an arrival alarm — plus
+`PerformPush` with the blocker always null, plus six classes: `func_brush`,
+`func_door_rotating`, `func_door`, `func_movelinear`, `func_button` and
+`func_rotating`, **3,410 entities**. Doors open and shut, panels slide, buttons
+press in and come back out, fans spin up to speed. Pushing the player is
+deliberately absent (~1,000 lines of speculative push and rollback that want
+`ENGINE_TRACE.md` stage 4 underneath them), so a door moves *through* a player
+rather than shoving one.
+
+Four things it settled. **The scope of "brush entities" is not the mover
+census**: §4.7 counted 1,164 movers and the six classes are 3,410 entities,
+because `func_brush` is 2,502 of them, does not move at all, and is where
+`StartDisabled` finally comes home — 337 of them start switched off and until
+this stage `world/` drew every one. **The join between the game and the renderer
+is the model index**, and that is a measurement rather than a convention: 106
+maps place 11,635 `(map, "*N")` pairs and **not one** is claimed by two entities,
+so `BrushModel`'s placement is refreshed once a frame by index and `world/` and
+`server/` still name no type of each other's — `engine/mod.rs` converts, exactly
+as it already does between `console/` and `input/`. **`CSimThinkManager` is two
+questions in one list** and stage 2 only saw one: an entity is in it when it will
+think *or* when it is a mover with a live alarm, and a mover is stored with a
+tick of zero so that it is handed out every tick and refuses its own think —
+which makes `PhysicsRunSpecificThink`'s tick guard load-bearing rather than
+defensive. And **a mover needs one number that is not in the entity lump**: a
+door's travel is the size of its own brushes, which `SetModel` reads out of the
+`.bsp`'s model lump, so `level_init` grew a `&[bsp::Model]` argument — the
+module's second type from `engine::world::bsp`, and the same argument as the
+first.
+
+Two Valve quirks worth knowing because they are reproduced rather than tidied.
+**`SetMoveDoneTime(0)` arms an alarm that can never fire** — `PerformPush` tests
+the absolute alarm with `> 0` and `WillSimulateGamePhysics` then drops the entity
+out of the simulation list entirely, so the four `func_door_rotating`s in the
+shipped game with `wait 0` stand open for ever. And **the `Use` input's *type* is
+the connection's serial number, cast** (`InputUse` passes
+`(USE_TYPE)inputdata.nOutputID`), which is why an I/O `Use` on a
+`func_movelinear` does nothing in the shipped game and works on a `func_button`.
 
 Two things are worth carrying to the next module. **Valve's inheritance became Rust's
 composition, and the datadesc chain walk disappeared with it** — `SERVER.md` §7.3 planned
