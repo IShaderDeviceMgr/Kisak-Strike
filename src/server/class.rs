@@ -31,8 +31,9 @@
 
 use std::any::Any;
 
-use super::entity::{EntityCore, EntityId};
+use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
+use super::name;
 use super::random::RandomStream;
 use super::think::{Time, TICK_NEVER_THINK};
 
@@ -267,20 +268,37 @@ impl UseType {
 /// [`EventQueue`], and the queue is drained by one top-level loop. So firing an
 /// output is a queue append, removing an entity is a flag on the entity you
 /// already hold, and *nothing* a stage-2 handler does needs to see another
-/// entity. This context therefore does not borrow the entity list at all,
-/// which is why a handler can hold `&mut EntityCore` and this at the same time
-/// with no cell, no index juggling and no `unsafe`.
+/// entity — so through stage 3 this context did not name the entity list at
+/// all.
 ///
-/// The condition that changes it is a handler that must *read* another entity
-/// during dispatch — `logic_branch_listener` polling its branches is the first
-/// one in the game. When that arrives, the shape to reach for is the entity
-/// list minus the one entity being dispatched, not a `RefCell`.
+/// # Stage 4 is the condition, and it arrived exactly as predicted
+///
+/// Stage 2 recorded that the shape would change for "a handler that must
+/// *read* another entity during dispatch", and that the answer then was "the
+/// entity list minus the one entity being dispatched, not a `RefCell`". A
+/// trigger has to ask its `filter_*` entity whether the toucher passes, and
+/// then push or teleport that toucher — so stage 4 carries `&mut EntityList`,
+/// with the dispatched entity **lifted out of it** for the duration
+/// ([`EntityList::detach`]). There is still no cell and no `unsafe`; the
+/// borrow checker is satisfied because the two things really are disjoint.
+///
+/// The one rule that follows: **`cx.entity(self.id())` is `None` inside your
+/// own handler.** You already hold `&mut EntityCore`; asking the list for
+/// yourself would be asking for it twice.
 pub struct Context<'a> {
     /// Where the server's clock is. **Not `Scene::curtime`** — see
     /// [`think`](super::think).
     pub time: Time,
     queue: &'a mut EventQueue,
     random: &'a mut RandomStream,
+    /// Every entity but the one being dispatched — see the type's docs.
+    entities: &'a mut EntityList,
+    /// `UTIL_PlayerByIndex( 1 )`, for [`find_target`](Context::find_target).
+    player: Option<EntityId>,
+    /// Handles [`entity_mut`](Context::entity_mut) gave out, so that
+    /// `Server::dispatch` can reconcile *their* schedules too and not only the
+    /// dispatched entity's.
+    changed: Vec<EntityId>,
 }
 
 impl<'a> Context<'a> {
@@ -288,12 +306,85 @@ impl<'a> Context<'a> {
         time: Time,
         queue: &'a mut EventQueue,
         random: &'a mut RandomStream,
+        entities: &'a mut EntityList,
+        player: Option<EntityId>,
     ) -> Context<'a> {
         Context {
             time,
             queue,
             random,
+            entities,
+            player,
+            changed: Vec::new(),
         }
+    }
+
+    /// Another entity, read-only. `EHANDLE::Get()`.
+    ///
+    /// `None` for a handle that has stopped resolving **and for the entity
+    /// this handler belongs to** — see the type's docs.
+    pub fn entity(&self, id: EntityId) -> Option<&Entity> {
+        self.entities.get(id)
+    }
+
+    /// Another entity's shared state, to write. The narrow half of
+    /// [`entity`](Context::entity): a handler may move, push or flag another
+    /// entity, and may not run its code.
+    ///
+    /// Every handle handed out here is reconciled with the simulation list
+    /// after the handler returns, so a write that changes whether the other
+    /// entity needs simulating is not lost.
+    pub fn entity_mut(&mut self, id: EntityId) -> Option<&mut EntityCore> {
+        let entity = self.entities.get_mut(id)?;
+        self.changed.push(id);
+        Some(&mut entity.core)
+    }
+
+    /// `gEntList.FindEntityByName( NULL, name )` — the first match, or `None`.
+    ///
+    /// Procedural names (`!activator`, `!self`, …) are **not** resolved here:
+    /// they need the I/O context that only [`Server::deliver`](super::Server)
+    /// has. Every caller in this module is a class looking up a `targetname`
+    /// it was given as a map key, which is what `FindEntityByName`'s plain
+    /// form does.
+    pub fn find_by_name(&self, query: &str) -> Option<EntityId> {
+        name::find_by_name(self.entities, query).next()
+    }
+
+    /// `gEntList.FindEntityByName( NULL, name, pSearching, pActivator,
+    /// pCaller )` — the first match, procedural names included.
+    ///
+    /// The form a class uses for a `target` key, as opposed to
+    /// [`find_by_name`](Context::find_by_name)'s plain list search. **121 of
+    /// the game's 128 `point_teleport`s need it**, because what they target is
+    /// the literal string `!player`.
+    pub fn find_target(
+        &self,
+        query: &str,
+        searching: Option<EntityId>,
+        activator: Option<EntityId>,
+        caller: Option<EntityId>,
+    ) -> Option<EntityId> {
+        if name::is_procedural(query) {
+            return match name::find_procedural(query, searching, activator, caller, self.player) {
+                name::Procedural::Resolved(id) => id,
+                _ => None,
+            };
+        }
+        self.find_by_name(query)
+    }
+
+    /// The read-only view a filter chain runs against.
+    pub fn filters(&self) -> Filters<'_> {
+        Filters {
+            entities: self.entities,
+            depth: 0,
+        }
+    }
+
+    /// The handles [`entity_mut`](Context::entity_mut) gave out.
+    pub(super) fn take_changed(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.changed)
     }
 
     /// `gpGlobals->curtime`.
@@ -353,6 +444,78 @@ impl<'a> Context<'a> {
     /// `CEventQueue::CancelEvents( this )` — drop everything `caller` posted.
     pub(super) fn cancel_from(&mut self, caller: EntityId) -> usize {
         self.queue.cancel_from(caller)
+    }
+}
+
+/// How deep a `filter_multi` chain may go before it is called a cycle.
+///
+/// Valve has no bound: `CFilterMultiple::PassesFilterImpl` calls
+/// `PassesFilter` on each sub-filter, and a `filter_multi` naming itself
+/// recurses until the stack runs out. **No shipped map has a chain deeper than
+/// one**, so this is the same divergence — and the same reasoning — as the
+/// parent-cycle bound in `Server::spawn_hierarchy_depth`.
+const MAX_FILTER_DEPTH: u32 = 8;
+
+/// The read-only view a `filter_*` class evaluates against.
+///
+/// `CBaseFilter::PassesFilter` takes an entity and answers yes or no, and a
+/// `filter_multi` answers by asking the filters it names. That recursion is
+/// the only reason this type exists: a filter needs to reach *other* entities
+/// while every caller of it holds one already, so it gets the narrowest thing
+/// that works — the list, immutably, and a depth counter.
+///
+/// Handed out by [`Context::filters`]. Like the context it came from, it
+/// cannot see the entity currently being dispatched.
+pub struct Filters<'a> {
+    entities: &'a EntityList,
+    depth: u32,
+}
+
+impl Filters<'_> {
+    /// `pFilter->PassesFilter( pCaller, pEntity )`.
+    ///
+    /// `true` when `filter` names nothing — a trigger with no filter passes
+    /// everything, which is `(!pFilter) ? true : …` at
+    /// `triggers.cpp:420`. Also `true` past [`MAX_FILTER_DEPTH`], which is a
+    /// cycle and is reported once.
+    pub fn passes(&self, filter: EntityId, caller: &EntityCore, other: &EntityCore) -> bool {
+        if self.depth >= MAX_FILTER_DEPTH {
+            eprintln!(
+                "source-engine: server: LEVEL DESIGN ERROR: filter chain from {} is a cycle",
+                caller.debug_name()
+            );
+            return true;
+        }
+        let Some(entity) = self.entities.get(filter) else {
+            return true;
+        };
+        let deeper = Filters {
+            entities: self.entities,
+            depth: self.depth + 1,
+        };
+        entity.behaviour.passes_filter(&entity.core, other, &deeper)
+    }
+
+    /// `gEntList.FindEntityByName( NULL, name )`, restricted to filters:
+    /// `dynamic_cast<CBaseFilter *>` returning null is a *warning and no
+    /// filter* in the original, not an error.
+    ///
+    /// Used by `filter_multi`'s `Activate` as well as by every trigger's, so
+    /// it lives here rather than on either.
+    pub fn find(&self, name: &str) -> Option<EntityId> {
+        let id = name::find_by_name(self.entities, name).next()?;
+        let entity = self.entities.get(id)?;
+        match entity.behaviour.is_filter() {
+            true => Some(id),
+            false => {
+                eprintln!(
+                    "source-engine: server: tried to filter through {name}, \
+                     which is a {} and not a filter",
+                    entity.classname()
+                );
+                None
+            }
+        }
     }
 }
 
@@ -433,6 +596,68 @@ pub trait Behaviour: Any {
         _input: &Input<'_>,
         _cx: &mut Context<'_>,
     ) {
+    }
+
+    /// `StartTouch( pOther )` — something has begun touching this entity.
+    ///
+    /// Called once, when the link between the two is created, and always
+    /// followed immediately by [`touch`](Behaviour::touch) on the same tick —
+    /// which is `PhysicsStartTouch` (`physics_main_shared.cpp:940`) calling
+    /// both in a row and is why a `trigger_once` fires `OnStartTouch` and
+    /// `OnTrigger` together.
+    fn start_touch(&mut self, _entity: &mut EntityCore, _other: EntityId, _cx: &mut Context<'_>) {}
+
+    /// `Touch( pOther )` — something is touching this entity, this tick.
+    ///
+    /// Called every tick the touch persists, including the first.
+    fn touch(&mut self, _entity: &mut EntityCore, _other: EntityId, _cx: &mut Context<'_>) {}
+
+    /// `EndTouch( pOther )` — something has stopped touching this entity.
+    ///
+    /// Driven by the touch *stamp* rather than by a geometric test: a link
+    /// that was not restamped this tick is a touch that ended. See
+    /// [`touch`](super::touch).
+    fn end_touch(&mut self, _entity: &mut EntityCore, _other: EntityId, _cx: &mut Context<'_>) {}
+
+    /// `dynamic_cast<CBaseFilter *>( pEntity ) != NULL`.
+    ///
+    /// A `filtername` that names something which is not a filter is a warning
+    /// and no filter, not an error, and this is the test that decides —
+    /// `triggers.cpp:236`, `filters.cpp:147`.
+    fn is_filter(&self) -> bool {
+        false
+    }
+
+    /// `CBaseFilter::PassesFilterImpl` — does `other` match this filter's
+    /// criteria?
+    ///
+    /// **The negation is the caller's**, not this method's:
+    /// `CBaseFilter::PassesFilter` is `m_bNegated ? !Impl() : Impl()`, and a
+    /// `filter_multi` combines the *un*negated results of its children with
+    /// their own negations already applied. Each class here therefore applies
+    /// its own `Negated` at the end of its own implementation, which is what
+    /// the two-method split in the C++ buys and is the only place the split
+    /// matters.
+    ///
+    /// Only ever called on a class whose [`is_filter`](Behaviour::is_filter)
+    /// is `true`.
+    fn passes_filter(
+        &self,
+        _entity: &EntityCore,
+        _other: &EntityCore,
+        _filters: &Filters<'_>,
+    ) -> bool {
+        true
+    }
+
+    /// `CBaseEntity::IsPlayer()`.
+    ///
+    /// One class overrides it, and three things read it: `trigger_hurt`
+    /// choosing between `OnHurtPlayer` and `OnHurt`, `filter_activator_name`'s
+    /// special case for the literal string `!player`, and `trigger_teleport`
+    /// taking the eye angles rather than the entity angles.
+    fn is_player(&self) -> bool {
+        false
     }
 
     /// `AcceptInput`'s dispatch half, for the inputs this class declares.

@@ -14,6 +14,9 @@ Scope of this doc: `engine/cmodel*.cpp` (the BSP brush trace), `engine/enginetra
 Read `PORTING.md` first. `portdocs/CLIENT.md` §8 stage 4 is the consumer this is being
 built for; `rustdocs/ENGINE.md` is the API doc for the module it lands beside.
 
+Status: **stages 1-4 of 5 done.** Stage 5 (vcollide, static props, `parry`) is
+all that remains.
+
 ---
 
 ## 0. Headline decisions
@@ -772,8 +775,10 @@ misreading it, the way `bsp.rs` already refuses `LVLFLAGS_LIGHTMAP_ALPHA`.
 
 ## 8. Staged plan
 
-Five stages. **Stage 1 is the one that unblocks `client/` stage 4**, and it depends on
-nothing that is not already built.
+Five stages, **four of them done**. Stage 1 is the one that unblocked
+`client/` stage 4; stage 4 here landed with `portdocs/SERVER.md`'s, which is
+the reciprocal. Only stage 5 — vcollide and static props — is left, and it is
+where `parry` enters.
 
 ### Stage 1 — the world brush trace — **DONE** (2,093 lines, 15 tests)
 
@@ -972,11 +977,64 @@ nothing.
   The three displacement lumps went into `world/bsp.rs` beside the six collision ones,
   exactly as §7.4 said they would.
 
-### Stage 4 — entities and the dispatch (blocked on entities)
+### Stage 4 — entities and the dispatch — **DONE** (3 unit tests + 1 depot test)
 
 `ClipRayToCollideable`'s dispatch, `ClipTraceToTrace`, the filter (a Rust trait or a
 closure, not `ITraceFilter`), the world/entity fraction rescaling (§4.9), and a
 broadphase. Blocked on there being entities, which means `server/`.
+
+Landed as `Tracer::with_entities` plus `clip_trace_to_trace`, with
+`Tracer::trace` becoming `CEngineTrace::TraceRay` — the world, then every
+brush model in the chain, nearest wins, fractions rescaled onto the original
+ray. `Tracer::trace_world` is what `trace` used to be, and an empty chain (the
+default) makes the two identical, so every caller written before this stage is
+unchanged. Built alongside `portdocs/SERVER.md` stage 4, which is the
+reciprocal.
+
+#### Corrections to this plan, found while implementing
+
+**The filter is not needed, and that is a real simplification.** This section
+asks for "a Rust trait or a closure, not `ITraceFilter`". What `ITraceFilter`
+does is decide, per candidate, whether this trace should hit it — and the
+candidates arrive as a *list the caller assembles*, so the decision has already
+been made one step earlier. `with_entities( world.clip_models() )` is the
+filter, `TRACE_WORLD_ONLY` is `trace_world`, and `TRACE_ENTITIES_ONLY` has no
+caller. Collision groups come back with `vphysics/`.
+
+**The broadphase is not needed either, yet.** `spatialpartition.cpp` was
+already excluded (§5.4); what replaced it is a linear scan, because a Portal 2
+map has a few hundred brush entities (78 on `sp_a1_intro1`, 158 on
+`sp_a4_finale4`) and each is rejected by the bounding-box test at the top of
+its own BSP descent. The measurement that would change this is a frame-cost
+one, and `engine::world::bench` is where it would be taken.
+
+**The hazard is not the sweep, it is which entities are in the chain.** Making
+brush entities solid to the player is four lines; making the *right* ones solid
+is the whole problem. The map's 11,635 brush entities include 2,383
+`func_portal_bumper`s and 371 `trigger_portal_cleanser`s that a player walks
+straight through, and `src/server/` has classes for 6,302 of the 11,635 — so
+`World::clip_models` requires `PlacedBrushModel::owned` **and** `solid`, and a
+model nobody has answered for is left out rather than assumed in. The
+alternative fills every chamber with invisible walls and does it silently.
+
+**A trigger's non-solidity is `FSOLID_NOT_SOLID`, not its classname.** §4.9 and
+the stage-2 notes both said the trigger bit was missing and that the trace
+would need it; it arrives with `CBaseTrigger::InitTrigger`, which sets
+`SOLID_BSP` *and* `FSOLID_NOT_SOLID` *and* `FSOLID_TRIGGER` — the first so the
+touch query can sweep the real brushes, the second so you can walk in, the
+third so the query looks at all. `PlacedBrushModel::solid` is now
+`EntityCore::is_solid()` rather than one bit, and the `classname` filter the
+`trace` command used as a stopgap is gone.
+
+**`GetBrushesInAABB`/`GetBrushInfo` (§4.10) are still nobody's**, and stage 4
+did not bring them closer: they are Portal's, and nothing in this port places a
+portal yet.
+
+#### What is still stage 5's
+
+Static props and `.phy`/vcollide — `ClipRayToCollideable`'s first two
+branches, which are every static prop and every physics object. A hitbox test
+(`CUSTOMRAYTEST`) needs a studio model's hitbox set. Neither has a caller yet.
 
 ### Stage 5 — vcollide and static props (blocked on `.phy`, and where `parry` lands)
 

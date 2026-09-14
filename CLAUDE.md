@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 802 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 829 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -75,9 +75,15 @@ under `sv_stepsize`, jumps 45 units, and crouches under things it does not fit p
 at each other through one event queue and think on a fixed 64 Hz server tick, so a map
 bootstraps itself the way the shipped game does — **and the brush entities move**, so
 doors open and shut, panels slide, buttons press in and come back out and fans spin up.
-It is **still not a runnable game** — no triggers, no sound, no netcode, and a door
-moves *through* the player rather than shoving it — but the boot path is continuous from
-`main` to a rendered, lit, self-starting level you can walk around.
+**And the map notices you.** Triggers fire when you walk into them, filters
+decide who counts, `trigger_push` blows you across a room, `trigger_teleport`
+and `point_teleport` move you, and **doors are walls** — brush entities are in
+the player's clip chain now, so a shut door stops you and a trigger does not.
+It is **still not a runnable game** — no sound, no netcode, no damage (nothing
+has health, so a `trigger_hurt` fires its outputs and takes nothing away), and
+a door moves *through* the player rather than shoving it — but the boot path is
+continuous from `main` to a rendered, lit, self-starting level you can walk
+around and interact with.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -272,7 +278,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
   one, because the tangent is in the `.vvd` either way.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
-  lightmaps and terrain, `trace/` (stages 1-3 of 5), `input/` (stages 1-4 of 5), and
+  lightmaps and terrain, `trace/` (stages 1-4 of 5), `input/` (stages 1-4 of 5), and
   `console/` (all five stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
@@ -397,9 +403,25 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   keeps the displacement's flags and `IsDispSurface()` calls a wall terrain — 45 of 2,362
   depot traces. This port clears them where `m_bDispHit` is cleared; `rustdocs/ENGINE.md`
   gotcha 17 names the two lines to delete to get Valve's behaviour back.
+  **Stage 4 is the clip chain, and it landed with `server/` stage 4**:
+  `Tracer::trace` is `CEngineTrace::TraceRay` now — the world, then every brush
+  model a `Tracer::with_entities` was handed, nearest wins, fractions rescaled
+  onto the original ray — so a shut door is a wall and, because a trigger is
+  `FSOLID_NOT_SOLID`, a trigger is not. Two things the plan asked for turned out
+  not to be needed: **the trace filter**, because the candidates arrive as a list
+  the caller assembles and `ITraceFilter`'s decision has therefore already been
+  made one step earlier; and **the broadphase**, because a map has a few hundred
+  brush entities (78 on `sp_a1_intro1`) and each is rejected by the
+  bounding-box test at the top of its own BSP descent. What *is* the whole
+  difficulty is **which entities are in the chain**: the game's 11,635 brush
+  entities include 2,383 `func_portal_bumper`s you walk straight through and
+  this port has classes for 6,302 of them, so `World::clip_models` requires
+  `PlacedBrushModel::owned` **and** `solid` and a model the game has not
+  answered for is left *out* rather than assumed in. Defaulting the other way
+  fills every chamber with invisible walls, silently.
   Not implemented: simulation, visibility, the skybox, dynamic lights and
-  lightstyle animation. Brush entities are solid, drawn **and moved**. **Displacements
-  are solid and drawn** —
+  lightstyle animation. Brush entities are solid, drawn, **moved and collided
+  with**. **Displacements are solid and drawn** —
   `world/disp/` has landed, below.
   **`world/disp/` is the rendering half of `trace/` stage 3's lumps, and terrain now
   draws** (`portdocs/ENGINE_WORLD_DISP.md`, `rustdocs/ENGINE.md`). ~9,100 lines of C++
@@ -601,8 +623,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
-- **`src/server/` — stages 1, 2 and 3 of `portdocs/SERVER.md`'s five ported**, and with
-  them the map's **entity logic runs and its brush entities move**. Valve's `server.so` — 446,861 lines, of which the framework is
+- **`src/server/` — stages 1-4 of `portdocs/SERVER.md`'s five ported**, and with
+  them the map's **entity logic runs, its brush entities move, and it notices the
+  player**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
@@ -758,10 +781,85 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `legacy/`** — not in `game/server/`, not in the engine, not in the tools. The sharpest
   example yet of `portdocs/SERVER.md` §1.4's "the FGD is a reference, not an oracle".
 
-  Not implemented, and each is a stage: touch and triggers (4), the player as an entity
-  (5). The size of that last prize is measured: **171 of the 186 inputs in the whole game
-  that reach an implemented class and are refused are `!player`, `!player_blue` and
-  `!player_orange`.**
+  **Stage 4 is triggers and touch, and it is the first time the map responds to
+  the player.** `src/server/touch.rs` is `touchlink_t` and the four
+  `CBaseEntity::Physics*Touch*` functions; `classes/trigger.rs` is `CBaseTrigger`
+  plus `trigger_once` (1,476), `trigger_multiple` (899), `trigger_hurt` (215),
+  `trigger_push` (192) and `trigger_teleport` (110); `classes/filter.rs` is the
+  six `filter_*` classes (302) they consult; `classes/point.rs` is
+  `point_teleport` (128); and `classes/player.rs` is the player. **Twelve
+  classnames, taking the port to 34 and to 25,961 of the game's 60,925 entity
+  blocks.** On the engine side it brought `trace/` stage 4's clip chain,
+  `World::clip_models`, `World::brush_models_touching` and base velocity in
+  `client/`'s walk.
+
+  **The player had to become an entity here, not at stage 5, and that contradicts
+  the plan.** A touch is a fact about *two* entities:
+  `PassesTriggerFilters` tests `FL_CLIENT` on the toucher, `CTriggerHurt` picks
+  its output by `IsPlayer()`, `CFilterName` special-cases the literal string
+  `!player`, and **121 of the game's 128 `point_teleport`s target `!player`**.
+  So `classes::Player` is sixty lines — a box with `FL_CLIENT` set, holding no
+  `client/` type and moving under nobody's power — and the two halves exchange a
+  plain `server::PlayerState` that `Engine::frame` copies in before the ticks
+  and out after them, the same seam `world/` already had for brush placements
+  pointing the other way. Stage 5 is still most of `CBasePlayer`: the movement,
+  `noclip`'s home, health, death, the weapon, the view.
+
+  Three more findings. **§10.3's borrow question reopened exactly where stage 2
+  said it would** — "a handler that must *read* another entity during dispatch",
+  and stage 4 has three of them — **and the answer stage 2 wrote down was
+  right**: `Server::dispatch` lifts the entity it is about to run *out* of the
+  list, so `Context` can carry the rest of it. No `RefCell`, no `unsafe`, one new
+  rule (`cx.entity(self.id())` is `None` inside your own handler). **The
+  engine/game split at `SolidMoved` is worth keeping**: the engine answers "what
+  does this swept box overlap" and the game decides what it means, which here is
+  one trait (`TouchQuery`) and is what lets the whole touch system be tested with
+  no map — and two properties of the answer are Valve's and load-bearing, that it
+  sweeps the trigger's **real brushes** rather than its bounding box and that it
+  is **not** filtered to triggers, because `FSOLID_TRIGGER` is the game's live
+  state and an engine-side copy would be a frame stale. And **`trigger_hurt` has
+  complete timing and no damage**, which is the honest shape: there is no health
+  anywhere, so it fires `OnHurt`/`OnHurtPlayer` on exactly the schedule the
+  shipped game does and takes nothing away.
+
+  Twelve more rules produce a plausible wrong answer rather than an error
+  (`rustdocs/SERVER.md` gotchas 35-46), and three decide whether a trigger works
+  at all: **a trigger is `SOLID_BSP` *and* `FSOLID_NOT_SOLID` *and*
+  `FSOLID_TRIGGER`**, and reading only the bit makes every trigger a wall while
+  reading only the type makes every point entity one; **only one side of a touch
+  owes an `EndTouch`**, and it is the trigger's; and **an entity that deletes
+  itself fires no `EndTouch` of its own**, which is why none of the game's 1,476
+  `trigger_once`s ever does. Two more are worth having in hand: **a Portal 2
+  single-player `trigger_push` is twice as strong as the map says**
+  (`CTriggerPush::Activate`'s `DIRTY HACK TO FOLLOW` — the game was tuned with
+  `sv_alternateticks` on and ships with it off), and **a teleport discards the
+  swept-from point**, without which a teleport fires every trigger between the
+  two ends.
+
+  **One bug the tests could not have found, and it is worth the paragraph.**
+  `EntityCore::solid` arrived at stage 4 with a `SOLID_NONE` default and the
+  five stage-3 brush classes were never given one, so `is_solid()` was false
+  for every door in the game and `World::clip_models` came back empty — the
+  clip chain silently collided with nothing, with every unit test passing,
+  because they all build a `PlacedBrushModel` by hand. What found it was
+  loading the game and reading one number the `trace` command prints:
+  *"78 placed, **0** in the clip chain"*. **Adding a field with a `Default` is
+  the same class of change as adding an enum variant and the compiler does not
+  help**; `tests::every_brush_class_is_solid_unless_it_says_otherwise` now
+  spawns each class through `Server::level_init` and asserts on the entity.
+
+  The measurement that says it works is
+  `server::tests::every_shipped_maps_triggers_notice_the_player`: for **every one
+  of the game's 2,255 live triggers** it reloads the level, finds a point inside
+  the trigger's *actual brushes* that a 32×32×72 hull fits in, puts a player
+  there and runs two ticks through the same `ClipRayToCollideable` sweep the
+  running game uses. **2,246 notice, 1,879 dispatch something, 3 have no point a
+  standing player fits in, 6 are switched off or deleted by the map's own
+  bootstrap.**
+
+  Not implemented, and each is a stage or a subsystem: the player as a *whole*
+  entity (5), and **damage** — nothing has health, so `trigger_hurt` cannot hurt
+  and nothing can die.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -784,17 +882,24 @@ second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it**, the level shell
 is geometrically complete — world, brush entities, static props and terrain — it is
-**auto-exposed to the map's own limits**, the map's **entity logic runs**, and its
-**doors and panels move**.
+**auto-exposed to the map's own limits**, the map's **entity logic runs**, its
+**doors and panels move**, and **it notices the player**: triggers fire, filters
+decide who counts, and a shut door is a wall.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 The candidates, in the order they are worth doing:
 
-- **`server/` stage 4 — triggers and touch**, which is the first time the map responds
-  to the player. It is built alongside `trace/` stage 4 (entities in the clip chain),
-  which is the reciprocal dependency and has been blocked on this module since stage 1.
-  `trigger_once` (1,476), `trigger_multiple` (899), `trigger_hurt` (215),
-  `trigger_push` (192), `point_teleport` (128), `trigger_teleport` (110) and the
-  `filter_*` family (302) that several of them consult.
+- **`server/` stage 5 — the player as a whole entity**, which is what is left of
+  `CBasePlayer` now that stage 4 has put a box with `FL_CLIENT` in the entity
+  list: the movement moving to the server (and with it the question of what to
+  do about two clocks), `noclip`'s home, **health and death** — the deepest
+  absence in the game layer, and the reason 215 `trigger_hurt`s fire their
+  outputs and take nothing away — the weapon, and the view.
+- **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
+  is no longer in the way, so this is unblocked for the first time:
+  `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker
+  enumeration and rollback, and `EntityCore::local_time` is already the field
+  its answer goes in. The condition is the first puzzle that cannot be solved
+  without standing on something that moves.
 - **The local/abs transform pair on `EntityCore`**, which is smaller than a stage and
   unblocks two things at once: `SetParent`/`ClearParent`/`SetParentAttachment*` —
   **1,078 of the 1,081 inputs the depot test reports as unhandled** — and parented
@@ -843,10 +948,12 @@ refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the 
 - **`noclip` is registered by the game client, and it is a *server* command.** Move type
   is server state that gets networked down, so `ConCommand noclip` lives in
   `game/server/` in the original. With one process and no server it has to live
-  somewhere, and `src/client/` is where the move type is. `src/server/` now exists, but
-  the wart does not move with it: **the condition is `portdocs/SERVER.md` stage 5**,
-  where the player becomes an entity and move type becomes the server's state rather
-  than a field on `client::Player`. `portdocs/CLIENT.md` §9.2.
+  somewhere, and `src/client/` is where the move type is. `src/server/` now exists and
+  stage 4 has put a *player* in it, and the wart still does not move: the server's copy
+  of the move type is refreshed from the client every tick (`server::PlayerState`), so
+  the client is still where it is decided. **The condition is `portdocs/SERVER.md`
+  stage 5**, where the movement itself moves and the move type becomes the server's
+  state rather than a field on `client::Player`. `portdocs/CLIENT.md` §9.2.
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
   `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The

@@ -251,9 +251,22 @@ pub struct MoveData {
     /// the normal of the plane underfoot, or `None` for airborne.
     ///
     /// The entity itself is what Valve stores, and it is what conveyor and
-    /// platform velocity would come from — `server/`'s, along with
-    /// `GetBaseVelocity`.
+    /// platform velocity would come from.
     pub ground: Option<Vec3>,
+    /// `player->GetBaseVelocity()` — the velocity of whatever is carrying the
+    /// player, added for the duration of a move and taken back out.
+    ///
+    /// **Written by the *server*, not by anything here**: a `trigger_push`
+    /// sets it every tick it is pushing, and `CPlayerMove::CheckMovingGround`
+    /// turns it into real velocity the tick after the push stops. It reaches
+    /// this struct through [`PlayerState`](crate::server::PlayerState), which
+    /// `Engine::frame` copies both ways.
+    ///
+    /// The one thing done to it here is
+    /// [`start_gravity`]'s: gravity takes the vertical component and zeroes
+    /// it, so a push straight up is spent once rather than fighting gravity
+    /// for ever.
+    pub base_velocity: Vec3,
     /// `player->m_surfaceFriction`. 1.0 except after losing the ground while
     /// rising, where `CategorizePosition` drops it to 0.25.
     pub surface_friction: f32,
@@ -690,9 +703,21 @@ fn walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f3
     // something adds vertical speed on the ground.
     accelerate(mv, wishdir, wishspeed, vars.accelerate, dt);
 
+    // **Everything from here to the end of the function moves at
+    // `velocity + base_velocity`**, and every exit puts the base back out.
+    // That is why a player standing still on a conveyor is carried and still
+    // reports a velocity of zero.
+    mv.velocity += mv.base_velocity;
+
     let spd = mv.velocity.length();
     if spd < 1.0 {
+        // Valve zeroes the velocity and *then* subtracts, leaving
+        // `-base_velocity` rather than zero (`portal_gamemovement.cpp:3785`).
+        // Reproduced: with a base velocity this small the two differ by less
+        // than a unit a second, and "fixed" it would be the only exit of the
+        // seven that does not round-trip.
         mv.velocity = Vec3::ZERO;
+        mv.velocity -= mv.base_velocity;
         return;
     }
 
@@ -702,12 +727,14 @@ fn walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f3
 
     if pm.fraction == 1.0 {
         mv.origin = pm.end;
+        mv.velocity -= mv.base_velocity;
         stay_on_ground(mv, tracer, vars);
         return;
     }
 
     // Don't walk up stairs if not on ground.
     if old_ground.is_none() {
+        mv.velocity -= mv.base_velocity;
         return;
     }
 
@@ -737,6 +764,7 @@ fn walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f3
         step_move(mv, tracer, vars, dt, dest, pm);
     }
 
+    mv.velocity -= mv.base_velocity;
     stay_on_ground(mv, tracer, vars);
 }
 
@@ -761,7 +789,10 @@ fn air_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32
     }
 
     air_accelerate(mv, wishdir, wishspeed, vars.airaccelerate, dt);
+
+    mv.velocity += mv.base_velocity;
     try_player_move(mv, tracer, dt, None);
+    mv.velocity -= mv.base_velocity;
 }
 
 /// `CPortalGameMovement::Friction` (`portal_gamemovement.cpp:3356`).
@@ -822,6 +853,13 @@ fn friction(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32
 /// place at any frame rate.
 fn start_gravity(mv: &mut MoveData, vars: &MoveVars, dt: f32) {
     mv.velocity.z -= vars.gravity * 0.5 * dt;
+    // "yes, this 0.5 looks wrong, but it's not" — and the base-velocity line
+    // below it takes the *vertical* component of the push, spends it as a
+    // velocity change and clears it, so an upward `trigger_push` is a single
+    // impulse rather than a permanent anti-gravity field. The horizontal
+    // component is left alone and is added and removed around the move.
+    mv.velocity.z += mv.base_velocity.z * dt;
+    mv.base_velocity.z = 0.0;
     check_velocity(mv, vars);
 }
 
@@ -1440,6 +1478,7 @@ mod tests {
             max_speed: SV_SPEED_NORMAL,
             move_type: MoveType::Walk,
             ground: None,
+            base_velocity: Vec3::ZERO,
             surface_friction: 1.0,
             ducked: false,
             ducking: false,

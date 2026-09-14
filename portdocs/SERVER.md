@@ -4,7 +4,7 @@
 event queue, thinks, `MOVETYPE_PUSH`, and the ~200 entity classes Portal 2 actually
 places.
 
-Status: **stages 1 and 2 of 5 done** — see `src/server/` and
+Status: **stages 1-4 of 5 done** — see `src/server/` and
 [`../rustdocs/SERVER.md`](../rustdocs/SERVER.md). Written before the port, against the
 current architecture; the sections the port corrected say so inline (§4.3, §4.4, §5,
 §7.3 twice, §10.3). Read [`../PORTING.md`](../PORTING.md) first; this is the module
@@ -66,6 +66,8 @@ Siblings worth having open: [`CLIENT.md`](CLIENT.md) (the player that already ex
    and spawn (stage 1), entity I/O and thinks (stage 2 — this is where
    `env_tonemap_controller` lands and where a map's own exposure limits finally apply),
    brush-entity movement (stage 3 — doors open), triggers and touch (stage 4). §8.
+   **All four are done.** Stage 4 corrected one thing about this list: the
+   player has to be an entity for stage 4, not stage 5 — see §8.
 
 ---
 
@@ -917,20 +919,37 @@ each other's. Two things had to stay true and did:
 collided with until something enables them. The key on other classnames is still
 unread, and those are stage 4's; 12,372 entities carry it and 2,808 set it.
 
-**`trace/` — stage 4 is the reciprocal.** `ENGINE_TRACE.md` stage 4 needs an entity list
-to enumerate; this module is it. Until then `trace` and `trace_model` are separate
-questions and combining them is the caller's job — that stays true through stage 3. What
-stage 3 *did* give the trace is a placement that moves and one solidity bit:
-`PlacedBrushModel::solid` is `FSOLID_NOT_SOLID` cleared, set by `func_brush`
-and by nothing else, and the `trace` console command filters on it.
-`FSOLID_TRIGGER` is still nobody's, because the classes that set it are
-stage 4's.
+**`trace/` — stage 4 is the reciprocal, and it is DONE.** `ENGINE_TRACE.md`
+stage 4 needed an entity list to enumerate; this module is it. `Tracer::trace`
+is now `CEngineTrace::TraceRay` — the world, then the brush models a
+`Tracer::with_entities` was handed — and the list comes from
+`World::clip_models`, which is `owned && solid`.
 
-**`client/` — the player is an entity.** `Player` already has `origin`, `velocity`,
-`MoveType` and `old_buttons`. The cheapest correct joining is for the player to *be* an
-entity whose behaviour holds `client::Player`, so that `!player` resolves, triggers can
-touch it, and `noclip` can move to `src/server/` where `CLAUDE.md`'s wart says it
-belongs. Do not network anything; `update_client` keeps running on the rendered frame.
+The hazard turned out not to be the sweep. **It is that most brush entities are
+not solid and this port has classes for 6,302 of the game's 11,635**, so a
+model nobody has answered for is left *out* of the chain rather than assumed
+in — see stage 4's second finding. `FSOLID_TRIGGER` is `CBaseTrigger`'s now,
+and it is what both keeps triggers out of the clip chain and puts them into the
+touch query.
+
+**`client/` — the player is an entity. HALF-DONE at stage 4, and the half that
+landed is not the one this section describes.** The recommendation was for the
+player's *behaviour to hold* `client::Player`; what shipped is the opposite and
+is better. `classes::Player` is stateless and holds no `client/` type at all,
+and the two halves exchange a plain value — `server::PlayerState`, copied in
+before the server's ticks and out after them, the same shape `world/` already
+gets for brush placements. That keeps the movement in `client/` on the rendered
+frame, keeps this module free of `client/` types beyond the one it already had,
+and still gives `!player`, `FL_CLIENT`, `IsPlayer()` and a toucher for the
+touch link list.
+
+The round trip is unconditional in both directions and is an identity for every
+field the server did not touch, which is what makes "always copy back" safe
+rather than a fight over who owns the origin — and it is why a teleport is an
+ordinary field write rather than a message.
+
+What is left for stage 5 is `CBasePlayer` proper: the movement, `noclip`'s home
+(`CLIENT.md` §9.2), health, death, the weapon, the view.
 
 **`client/tonemap.rs` — the gap this closes.** `CLIENT_TONEMAP.md` records that
 `env_tonemap_controller` is the one measured absence in an otherwise complete tone
@@ -1201,7 +1220,7 @@ three mapper mistakes (`filtername` on a door, `message` on a
 as **`movement.rs`**: the trailing underscore is a transliteration artefact, and
 `PORTING.md` asks for the name Rust wants rather than the one the C++ forces.
 
-### Stage 4 — triggers and touch
+### Stage 4 — triggers and touch — **DONE**
 
 The touch link list, `FSOLID_TRIGGER`, `StartDisabled` honoured, and `trace/` stage 4
 (entities in the clip chain) built alongside. Classes: `trigger_once` (1,476),
@@ -1212,10 +1231,149 @@ several of them consult.
 Ends with: walking through a trigger fires its outputs. Which is to say, the map starts
 responding to the player — the first time anything in this port has.
 
+Landed as `src/server/touch.rs` (`TouchLink`, the four `Physics*Touch*`
+functions and `Teleport`), `src/server/classes/trigger.rs` (`BaseTrigger` and
+five classes), `classes/filter.rs` (six), `classes/point.rs`
+(`point_teleport`) and `classes/player.rs` — **twelve classnames, 3,322 more
+entity blocks, taking the port to 34 classnames and 25,961 of the game's
+60,925**. On the engine side: `Tracer::with_entities` and
+`ClipTraceToTrace` (`ENGINE_TRACE.md` stage 4), `World::clip_models` and
+`World::brush_models_touching`, and base velocity in `client/`'s walk.
+**API: `rustdocs/SERVER.md`.**
+
+#### The one place this plan and the code disagree, and why
+
+**The player had to become an entity here, not at stage 5.** This section and
+the next one split "triggers" from "the player as an entity", and those two
+cannot both be true of a stage that ends with "walking through a trigger fires
+its outputs": a touch is a fact about *two* entities,
+`PassesTriggerFilters` tests `FL_CLIENT` on the toucher, `CTriggerHurt` chooses
+its output by `IsPlayer()`, `CFilterName` has a special case for the literal
+string `!player`, and **121 of the game's 128 `point_teleport`s target
+`!player`**. Building the touch link list against something outside the entity
+list would have been building a different system.
+
+So `classes/player.rs` exists and is **sixty lines**: a box with `FL_CLIENT`
+set, `SOLID_BBOX`, `m_takedamage`, and `IsPlayer()`. It holds no `client/`
+type and it does not move — its position arrives once a tick as
+`server::PlayerState`, the same plain-value seam `world/` gets for brush
+placements, pointing the other way. **Stage 5 is what is left**, and it is
+still most of `CBasePlayer`: the movement itself, `noclip`'s home
+(`CLIENT.md` §9.2), health, death, the weapon and the view.
+
+#### Six findings
+
+**1. `Context` grew the entity list, in exactly the shape stage 2 predicted.**
+§10.3 was closed at stage 2 with the note that the condition to reopen it was
+"a handler that must *read* another entity during dispatch", and that the
+answer then would be "the entity list minus the one entity being dispatched,
+not a `RefCell`". Stage 4 is that condition three times over — a trigger asks
+its filter, a `trigger_push` writes the toucher's base velocity, a
+`point_teleport` moves whatever `!player` resolves to — and the answer is
+literally what was written down: `Server::dispatch` **detaches** the entity it
+is about to run out of the list, so the rest of the list is free to be
+borrowed. No cell, no `unsafe`, one new rule (`cx.entity(self.id())` is `None`
+inside your own handler).
+
+**2. The clip chain's real hazard is not geometry, it is scope.**
+`ENGINE_TRACE.md` stage 4 makes brush entities solid to the player, and the
+map's 11,635 of them are **not all solid**: 2,383 `func_portal_bumper`s and 371
+`trigger_portal_cleanser`s are things you walk through, and this port has
+classes for 6,302 of the 11,635. So `PlacedBrushModel::owned` says whether the
+game answered at all, and `World::clip_models` needs `owned && solid` —
+*collide with what the game has told us about*, rather than assume everything
+is a wall. Defaulting the other way fills every chamber with invisible walls
+and does it silently.
+
+**3. The touch stamp replaces the geometric test, and that is what makes
+`EndTouch` free.** Nothing ever asks "have these two stopped overlapping": the
+toucher bumps a counter before it re-tests, every confirmed link is written
+with the new value, and a link still carrying the old one is a touch that
+ended. It is also why a trigger being switched off empties itself on the next
+tick with no special case.
+
+**4. The engine/game split at `SolidMoved` is worth keeping, and it is what
+keeps this module GPU-free.** In the C++ the *engine* answers "what does this
+swept box overlap" and the *game* decides what that means; here that is
+`Server::frame( dt, &mut dyn TouchQuery )`, implemented in `engine/mod.rs` over
+`world/`. Two properties of the answer are load-bearing and both are Valve's:
+it is a swept box against the trigger's **real brushes** rather than its
+bounding box (`ClipRayToCollideable`, and a test chamber's triggers are L-shaped
+often enough to tell), and it is **not** filtered to triggers, because
+`FSOLID_TRIGGER` is the game's live state and an engine-side copy would be a
+frame stale.
+
+**5. `trigger_push` is twice as strong as the map says, and it is a comment in
+the source.** `CTriggerPush::Activate` doubles the speed whenever
+`maxClients == 1` and `sv_alternateticks` is off, under `DIRTY HACK TO FOLLOW`:
+Portal 2 was tuned with alternate ticks on and ships with them off on PC. Both
+conditions are constants in this port, so the doubling is unconditional. It
+also needed **base velocity** in `client/`'s walk — a push is not a velocity —
+which is one field, two add-and-subtract pairs and one conversion, and which
+`rustdocs/CLIENT.md` had listed as "needs entities".
+
+**6. `trigger_hurt` has complete timing and no damage, and that is the honest
+shape.** There is no health, no `TakeDamage` and no death, so `HurtEntity`
+fires `OnHurt`/`OnHurtPlayer` and takes nothing away — but the half-second
+think, the radiation quarter-second one, the doubling model's arithmetic and
+the parting half-dose on `EndTouch` are all there, so the outputs fire exactly
+when the shipped game fires them. Writing them out found the one shape that
+reaches that parting dose: a **radiation** trigger already has a think, so
+`Touch` does not arm the half-second one, and a quick walk through would
+otherwise be free.
+
+#### One bug the tests could not have found
+
+**`EntityCore::solid` arrived at stage 4 with a `SOLID_NONE` default, and the
+five stage-3 brush classes were never given one.** So `is_solid()` was false
+for every door in the game, `World::clip_models` came back empty, and the clip
+chain silently collided with nothing — with all 828 unit tests passing, because
+every trace test builds a `PlacedBrushModel` by hand rather than spawning an
+entity. What found it was loading the game and reading one number the `trace`
+command prints: *"78 placed, **0** in the clip chain"*.
+
+Two things to carry from that. **Adding a field with a `Default` is the same
+class of change as adding an enum variant, and the compiler does not help**:
+every existing `Spawn` silently accepted the default. And **the depot tests did
+not catch it either**, because they answer questions about the *server*'s state
+and this was a question about what `world/` did with it — which is why
+`tests::every_brush_class_is_solid_unless_it_says_otherwise` now spawns each
+class through `Server::level_init` and asserts on the entity rather than on a
+hand-built value.
+
+#### Eleven rules that produce a plausible wrong answer rather than an error
+
+`rustdocs/SERVER.md` gotchas 35-46 has them in full. The three that decide
+whether a trigger works at all: **a trigger is `SOLID_BSP` *and*
+`FSOLID_NOT_SOLID` *and* `FSOLID_TRIGGER`**, and reading only the bit makes
+every trigger a wall while reading only the type makes every point entity one;
+**only one side of a touch owes an `EndTouch`**, and it is the trigger's;
+and **an entity that deletes itself fires no `EndTouch` of its own**, which is
+why none of the game's 1,476 `trigger_once`s ever does.
+
+#### What it is measured against
+
+Two depot tests. The first spawns a player in each of the 106 maps and asserts
+the parse and run totals exactly (25,961 blocks matched, 2,255 live triggers,
+5,766 events, 48 entities thinking at the peak, a 42-name unhandled-key table).
+The second, `every_shipped_maps_triggers_notice_the_player`, is the one that
+could not be faked: per map it builds the real collision and then, **for every
+one of those 2,255 triggers**, reloads the level, finds a point inside the
+trigger's *actual brushes* that a 32×32×72 hull fits in, puts a player there
+and runs two ticks. **2,246 notice, 1,879 dispatch something, 3 have no point a
+standing player fits in and 6 are switched off or deleted by the map's own
+bootstrap.**
+
 ### Stage 5 — the player as an entity
 
 Join `client::Player` to the entity list (§7.4), move `noclip` to `src/server/`,
 resolve `!player`. Depends on stages 1-4.
+
+> **Half of this landed at stage 4 and the half that did not is the larger
+> half.** `!player` resolves, the player is in the list and triggers touch it —
+> see stage 4's first finding. What is left is `CBasePlayer` itself: the
+> movement moving to the server (and with it the question of what to do about
+> two clocks), `noclip`'s home, health and death, the weapon, and the view.
 
 ### Beyond
 
@@ -1271,13 +1429,17 @@ question into a number.
    `interval_per_tick` is not recoverable from this tree, from the map files, or from
    the depot, which ships only `vbsp`/`vvis`/`vrad`. The tree's 1/64 is CS:GO's, and
    it is `think::DEFAULT_TICK_INTERVAL`: one definition site, one line to change.
-2. **Whether the player is an entity or adjacent to one.** §7.4 recommends "is", for
-   `!player` and touch. The risk is dragging `client/`'s variable-`dt` movement into the
-   server's fixed tick — which stage 2 has now made concrete rather than hypothetical,
-   because the two clocks exist and are different. Stage 5, deliberately late.
-   The size of the prize is measured: **171 of the 186 inputs that reach an
-   implemented class and are refused are `!player`, `!player_blue` and
-   `!player_orange`.**
+2. ~~**Whether the player is an entity or adjacent to one.**~~ **Settled at
+   stage 4, and the answer is "is" — but not by holding `client::Player`.** The
+   feared risk was dragging the client's variable-`dt` movement into the
+   server's fixed tick; the shape that avoids it is a *stateless* player entity
+   whose position arrives as a plain value once a tick
+   (`server::PlayerState`), leaving the movement exactly where it was. The
+   prize was measured at 171 of 186 refused inputs and it was collected: 97 of
+   them now reach the player and are refused for a different and smaller
+   reason (`CBasePlayer::SetFogController`, and there is no fog), and 74 are
+   the co-op procedurals, which single player has no answer for in Valve
+   either.
 3. ~~**Borrow shape of `EntityMut`.**~~ **Closed at stage 2, and it was never a
    risk.** An input handler that fires an output that reaches the same entity is
    normal and legal in C++ — because `FireOutput` does not *call* anything, it
@@ -1293,7 +1455,9 @@ question into a number.
    path (`forceclosed`, `dmg`, `BlockDamage`) are parsed and unread. Portal 2 has
    crushing doors and moving platforms the player rides; the condition that forces
    the port is the first puzzle that cannot be solved without standing on something
-   that moves, and it wants `ENGINE_TRACE.md` stage 4 first either way.
+   that moves. **`ENGINE_TRACE.md` stage 4 is no longer in the way** — a door
+   is a wall to the player now — so this is the next thing in the module worth
+   doing, alongside the local/abs pair below.
 
    **A second, smaller question opened underneath it**: a mover that is *parented*
    moves in the parent's frame in Valve's engine and in world space here, because
@@ -1306,7 +1470,13 @@ question into a number.
    behaviour that looks right and is not. Mark them, and lean on the FGD check (§7.3)
    for at least the interface.
 6. **VScript.** §9.
-7. **Save/restore.** Deleted for now (§6), and Portal 2 autosaves constantly —
+7. **Damage.** New at stage 4, and it is the one absence a *player* would
+   notice: `trigger_hurt` runs Valve's whole schedule and takes nothing away,
+   because there is no health, no `CTakeDamageInfo`, no `TakeDamage` and no
+   death. 215 `trigger_hurt`s and every pit of goo in the game are affected.
+   It is `CBasePlayer` state, so it lands with stage 5 rather than before it.
+
+8. **Save/restore.** Deleted for now (§6), and Portal 2 autosaves constantly —
    `logic_autosave` (85), `trigger_autosave` (57), `player_loadsaved` (9). The condition
    that forces it is wanting to keep progress across a session, and the right shape then
    is `serde` over entity state, not a port of `ISave`/`IRestore`.

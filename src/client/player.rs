@@ -76,6 +76,16 @@ pub struct Player {
     /// Carried between commands, which is what makes `sv_noclipaccelerate`
     /// mean anything: without it every frame would start from a standstill.
     pub velocity: Vec3,
+    /// `m_vecBaseVelocity` — the velocity of whatever is carrying the player.
+    ///
+    /// **The server owns it.** A `trigger_push` writes it every tick it is
+    /// pushing and `CPlayerMove::CheckMovingGround` converts it back into
+    /// [`velocity`](Player::velocity) once the push stops; it reaches here
+    /// through `Engine::frame`'s copy of
+    /// [`PlayerState`](crate::server::PlayerState). The movement code adds it
+    /// for the duration of a move and takes it back out, which is why a player
+    /// carried along a conveyor still reports a velocity of zero.
+    pub base_velocity: Vec3,
     /// Where the view points. The angles Valve keeps in `CClientState` and
     /// this port keeps here — `portdocs/CLIENT.md` §4.7.
     pub angles: ViewAngles,
@@ -112,6 +122,7 @@ impl Player {
         Player {
             origin,
             velocity: Vec3::ZERO,
+            base_velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
             // `MOVETYPE_WALK`, which is what a player spawns as
             // (`CBasePlayer::Spawn`). Stage 4 made this reachable; before it

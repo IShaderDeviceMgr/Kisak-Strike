@@ -8,16 +8,25 @@
 //! the class unit tests, which want to watch one entity in isolation.
 
 use super::class::{Behaviour, ClassDef, Context, SpawnResult};
-use super::entity::{Entity, EntityCore};
+use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{EventQueue, FieldType, Input, Variant};
 use super::random::RandomStream;
 use super::think::{ServerClock, DEFAULT_TICK_INTERVAL};
 
 /// Everything a [`Context`] borrows, owned.
+///
+/// The list is always empty here — a class under test is held by the caller
+/// rather than inserted, which is exactly the state
+/// [`EntityList::detach`](super::entity::EntityList::detach) leaves the real
+/// server in during a dispatch. A test that needs a class to *reach* another
+/// entity (a filter, a teleport destination) goes through `Server` and a real
+/// map instead; see `tests`' stage-4 group.
 pub(super) struct Harness {
     pub queue: EventQueue,
     pub random: RandomStream,
     pub clock: ServerClock,
+    pub entities: EntityList,
+    pub player: Option<EntityId>,
 }
 
 impl Harness {
@@ -26,13 +35,33 @@ impl Harness {
             queue: EventQueue::new(),
             random: RandomStream::new(0),
             clock: ServerClock::new(DEFAULT_TICK_INTERVAL),
+            entities: EntityList::new(),
+            player: None,
         }
+    }
+
+    /// A [`Context`] over this harness. Every method below builds one the same
+    /// way; it is separate so that a test can drive a behaviour directly.
+    pub fn context(&mut self) -> Context<'_> {
+        Context::new(
+            self.clock.time(),
+            &mut self.queue,
+            &mut self.random,
+            &mut self.entities,
+            self.player,
+        )
     }
 
     /// Runs one entity's `Spawn`.
     pub fn spawn(&mut self, entity: &mut Entity) -> SpawnResult {
         let Entity { core, behaviour } = entity;
-        let mut cx = Context::new(self.clock.time(), &mut self.queue, &mut self.random);
+        let mut cx = Context::new(
+            self.clock.time(),
+            &mut self.queue,
+            &mut self.random,
+            &mut self.entities,
+            self.player,
+        );
         behaviour.spawn(core, &mut cx)
     }
 
@@ -45,7 +74,13 @@ impl Harness {
     /// handed to it out of turn does nothing rather than thinking early.
     pub fn tick(&mut self, core: &mut EntityCore, behaviour: &mut dyn Behaviour) {
         self.clock.advance();
-        let mut cx = Context::new(self.clock.time(), &mut self.queue, &mut self.random);
+        let mut cx = Context::new(
+            self.clock.time(),
+            &mut self.queue,
+            &mut self.random,
+            &mut self.entities,
+            self.player,
+        );
         super::movement::simulate(core, behaviour, &mut cx);
     }
 
@@ -65,7 +100,13 @@ impl Harness {
             FieldType::Color32 => Variant::Color32([1, 2, 3, 4]),
         };
         let Entity { core, behaviour } = &mut entity;
-        let mut cx = Context::new(self.clock.time(), &mut self.queue, &mut self.random);
+        let mut cx = Context::new(
+            self.clock.time(),
+            &mut self.queue,
+            &mut self.random,
+            &mut self.entities,
+            self.player,
+        );
         let input = Input {
             name,
             value,

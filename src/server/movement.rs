@@ -5,6 +5,12 @@
 //! and `PerformPush` (`game/server/physics_main.cpp:1700` and `:1590`), and
 //! `CBaseToggle` (`game/server/subs.cpp`, `basetoggle.h`).
 //!
+//! **`public/const.h`'s other enumerations live here too** — [`Solid`], the
+//! `FSOLID_*` bits, [`FL_CLIENT`] and [`EF_NODRAW`]. They are one header in
+//! the original and they are what say how an entity exists in the world, which
+//! is the same question a movetype answers. Everything that acts on them is
+//! either here or in [`touch`](super::touch).
+//!
 //! # A mover is four lines and an alarm
 //!
 //! `CBaseToggle::LinearMove` sets a velocity and an arrival time; the pusher
@@ -45,14 +51,27 @@ use super::class::{Behaviour, Context};
 use super::entity::EntityCore;
 use super::keyvalue::atof;
 
-/// `MOVETYPE_*` (`public/const.h:172`), reduced to the two this module has.
+/// `MOVETYPE_*` (`public/const.h:172`), reduced to the four this port reaches.
 ///
-/// Valve declares twelve. `MOVETYPE_WALK` and `MOVETYPE_NOCLIP` exist in this
-/// port as [`crate::client::MoveType`], on a player who is not an entity yet;
-/// the two enums merge when `portdocs/SERVER.md` stage 5 joins them.
-/// `MOVETYPE_VPHYSICS` waits for `rapier`, and `STEP`/`FLY`/`FLYGRAVITY` are
-/// the NPC movetypes, which serve 293 entities in the whole game
-/// (`portdocs/SERVER.md` §1.5).
+/// Valve declares twelve. `MOVETYPE_VPHYSICS` waits for `rapier`, and
+/// `STEP`/`FLY`/`FLYGRAVITY` are the NPC movetypes, which serve 293 entities
+/// in the whole game (`portdocs/SERVER.md` §1.5).
+///
+/// # Two of these are the player's, and the server does not run them
+///
+/// [`Walk`](MoveType::Walk) and [`Noclip`](MoveType::Noclip) arrived at stage
+/// 4 with the player entity, and [`simulate`] treats them exactly as it treats
+/// [`None`](MoveType::None): the player is moved by
+/// [`crate::client::Client::run_move`] on the *rendered* frame, and what the
+/// server holds is a copy refreshed once a tick
+/// (`portdocs/SERVER.md` §5 is why the two clocks differ). They are here
+/// because `trigger_push` branches on the movetype of what it is pushing and
+/// gets three different answers for the three the player can be in — a
+/// `MOVETYPE_NOCLIP` player is *not* pushed, which is real behaviour and would
+/// be lost if the player reported `MOVETYPE_NONE`.
+///
+/// [`crate::client::MoveType`] is still the client's own copy. The two merge
+/// when `portdocs/SERVER.md` stage 5 moves the movement itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoveType {
     /// `MOVETYPE_NONE`. Never moves, and is what the overwhelming majority of
@@ -63,6 +82,10 @@ pub enum MoveType {
     /// Integrates its own velocity, does not clip to the world, and pushes
     /// what is in the way — except here, where nothing is pushed yet.
     Push,
+    /// `MOVETYPE_WALK`. The player, walking. Simulated by `client/`.
+    Walk,
+    /// `MOVETYPE_NOCLIP`. The player, flying. Simulated by `client/`.
+    Noclip,
 }
 
 /// `EF_NODRAW` (`public/const.h:268`) — "don't draw entity".
@@ -75,10 +98,82 @@ pub const EF_NODRAW: u32 = 0x020;
 /// `FSOLID_NOT_SOLID` (`public/const.h:230`) — "this entity is not solid".
 ///
 /// The other half of `CFuncBrush::TurnOff`, and the first `FSOLID_*` bit the
-/// port has needed. The trigger bit that `ENGINE_TRACE.md` stage 2 wanted is
-/// `FSOLID_TRIGGER` and is stage 4's, along with the entity clip chain that
-/// would read it.
+/// port needed.
 pub const FSOLID_NOT_SOLID: u32 = 0x0004;
+
+/// `FSOLID_TRIGGER` (`public/const.h:231`) — "may be collideable but fires
+/// touch functions even when it is not collideable".
+///
+/// The bit `ENGINE_TRACE.md` stage 2 said was missing, and stage 4's whole
+/// point. **A trigger sets both this and [`FSOLID_NOT_SOLID`]**: its brushes
+/// are `CONTENTS_SOLID` in the `.bsp` and what makes walking into one possible
+/// is this pair, which is why nothing before this stage could put a brush
+/// entity in the player's clip chain without turning every trigger in the game
+/// into a wall.
+pub const FSOLID_TRIGGER: u32 = 0x0008;
+
+/// `FSOLID_VOLUME_CONTENTS` (`public/const.h:234`) — "contains volumetric
+/// contents (like water)".
+///
+/// Read by one line — `PhysicsMarkEntityAsTouched`'s `bShouldTouch` — and set
+/// by one class, `func_water_analog`, which this port does not have. Defined
+/// so that the line reads the way the C++ does.
+pub const FSOLID_VOLUME_CONTENTS: u32 = 0x0020;
+
+/// `FL_ONGROUND` (`public/const.h:116`) — "at rest / on the ground".
+///
+/// The player's, mirrored from `client::Player::ground` once a tick.
+/// `trigger_push` reads it (an upward push takes the player off the floor
+/// first) and `trigger_teleport` clears it.
+pub const FL_ONGROUND: u32 = 1 << 0;
+
+/// `FL_CLIENT` (`public/const.h:128`) — "is a player".
+///
+/// The one `m_fFlags` bit anything here sets. `PassesTriggerFilters` tests it
+/// against `SF_TRIGGER_ALLOW_CLIENTS`, which is set on 1,220 of the game's
+/// 1,476 `trigger_once`s and is what makes a trigger a trigger for the player.
+pub const FL_CLIENT: u32 = 1 << 8;
+
+/// `FL_BASEVELOCITY` (`public/const.h:153`) — "base velocity has been applied
+/// this frame".
+///
+/// Set by `trigger_push` every tick it is pushing, and cleared by the player's
+/// own move. The pair is what turns a push into momentum when the player
+/// leaves the trigger rather than into a velocity that never goes away —
+/// `CPlayerMove::CheckMovingGround` (`player_command.cpp:93`).
+pub const FL_BASEVELOCITY: u32 = 1 << 24;
+
+/// `SolidType_t` (`public/const.h:216`) — *how* an entity is solid, as opposed
+/// to the `FSOLID_*` bits, which say whether it is.
+///
+/// Four of Valve's seven. `SOLID_OBB`, `SOLID_OBB_YAW` and `SOLID_CUSTOM` are
+/// not set by any class this port has — the first is marked "not implemented
+/// yet" in `const.h` itself.
+///
+/// **The distinction that matters is only `None` versus the rest**, because
+/// that is all [`EntityCore::is_solid`](super::entity::EntityCore::is_solid)
+/// asks. The other three are kept apart because the classes genuinely choose
+/// between them and the choice is legible: a `func_door` is `SOLID_BSP` when
+/// its root parent is and `SOLID_VPHYSICS` otherwise, and a trigger is
+/// `SOLID_VPHYSICS` when it has a parent.
+///
+/// [`VPhysics`](Solid::VPhysics) collides as a brush model here, because a
+/// brush entity's `vcollide` *is* its brushes and there is no `vphysics` to
+/// ask (`ENGINE_TRACE.md` stage 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Solid {
+    /// `SOLID_NONE` — no collision model at all. Every point entity, and a
+    /// `func_button` with `SF_BUTTON_NOTSOLID`.
+    #[default]
+    None,
+    /// `SOLID_BSP` — the entity's own subtree of the map's BSP.
+    Bsp,
+    /// `SOLID_BBOX` — an axis-aligned box. The player.
+    Bbox,
+    /// `SOLID_VPHYSICS` — the model's `vcollide`. For a brush entity that is
+    /// the same brushes [`Bsp`](Solid::Bsp) names.
+    VPhysics,
+}
 
 /// The bounding box of the brush model an entity names, in the model's own
 /// frame.
@@ -351,8 +446,10 @@ pub const SF_DOOR_ROTATE_PITCH: u32 = 128;
 pub fn simulate(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &mut Context<'_>) {
     match entity.move_type {
         // `PhysicsNone` (`physics_main.cpp:1722`) — "non moving objects can
-        // only think".
-        MoveType::None => {
+        // only think". The player's two movetypes take this branch as well,
+        // because `client/` is what moves the player and the server holds a
+        // copy; see [`MoveType`].
+        MoveType::None | MoveType::Walk | MoveType::Noclip => {
             physics_run_think(entity, behaviour, cx);
         }
         MoveType::Push => physics_pusher(entity, behaviour, cx),

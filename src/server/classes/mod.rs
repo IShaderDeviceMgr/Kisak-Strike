@@ -31,8 +31,12 @@
 
 pub mod brush;
 pub mod env;
+pub mod filter;
 pub mod light;
 pub mod logic;
+pub mod player;
+pub mod point;
+pub mod trigger;
 pub mod world;
 
 use crate::server::class::{ClassDef, InputDef, InputDefs, PointEntity};
@@ -40,8 +44,14 @@ use crate::server::io::FieldType;
 
 pub use brush::{Brush, Button, Door, MoveLinear, Rotating};
 pub use env::TonemapController;
+pub use filter::{
+    FilterClass, FilterDamageType, FilterModel, FilterMulti, FilterName, FilterPlayerHeld,
+};
 pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
+pub use player::Player;
+pub use point::PointTeleport;
+pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
 
 /// Every class this port knows. `CEntityFactoryDictionary::m_Factories`.
@@ -212,6 +222,105 @@ pub(super) static CLASSES: &[ClassDef] = &[
         outputs: CASE_OUTPUTS,
         create: Case::create,
     },
+    // Stage 4: the trigger family, in census order.
+    ClassDef {
+        name: "trigger_once",
+        keys: trigger::ONCE_KEYS,
+        inputs: TRIGGER_INPUTS,
+        outputs: trigger::MULTIPLE_OUTPUTS,
+        create: TriggerMultiple::create_once,
+    },
+    ClassDef {
+        name: "trigger_multiple",
+        keys: trigger::MULTIPLE_KEYS,
+        inputs: TRIGGER_INPUTS,
+        outputs: trigger::MULTIPLE_OUTPUTS,
+        create: TriggerMultiple::create,
+    },
+    ClassDef {
+        name: "trigger_hurt",
+        keys: trigger::HURT_KEYS,
+        inputs: HURT_INPUTS,
+        outputs: trigger::HURT_OUTPUTS,
+        create: TriggerHurt::create,
+    },
+    ClassDef {
+        name: "trigger_push",
+        keys: trigger::PUSH_KEYS,
+        inputs: PUSH_INPUTS,
+        outputs: trigger::BASE_TRIGGER_OUTPUTS,
+        create: TriggerPush::create,
+    },
+    ClassDef {
+        name: "trigger_teleport",
+        keys: trigger::TELEPORT_KEYS,
+        inputs: TELEPORT_INPUTS,
+        outputs: trigger::BASE_TRIGGER_OUTPUTS,
+        create: TriggerTeleport::create,
+    },
+    // …the filters they consult…
+    ClassDef {
+        name: "filter_activator_class",
+        keys: filter::FILTER_CLASS_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterClass::create,
+    },
+    ClassDef {
+        name: "filter_activator_name",
+        keys: filter::FILTER_NAME_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterName::create,
+    },
+    ClassDef {
+        name: "filter_multi",
+        keys: filter::FILTER_MULTI_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterMulti::create,
+    },
+    ClassDef {
+        name: "filter_player_held",
+        keys: filter::BASE_FILTER_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterPlayerHeld::create,
+    },
+    ClassDef {
+        name: "filter_damage_type",
+        keys: filter::FILTER_DAMAGE_TYPE_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterDamageType::create,
+    },
+    ClassDef {
+        name: "filter_activator_model",
+        keys: filter::FILTER_MODEL_KEYS,
+        inputs: FILTER_INPUTS,
+        outputs: filter::FILTER_OUTPUTS,
+        create: FilterModel::create,
+    },
+    // …and the two entities that move somebody.
+    ClassDef {
+        name: "point_teleport",
+        keys: &[],
+        inputs: POINT_TELEPORT_INPUTS,
+        outputs: &[],
+        create: PointTeleport::create,
+    },
+    // `LINK_ENTITY_TO_CLASS( player, CPortal_Player )`. **No shipped map
+    // places one** — the player is created when a client connects, which here
+    // is `Server::spawn_player` — but the classname is registered because
+    // Valve registers it, because `filter_activator_class` compares against
+    // it, and because a map is allowed to.
+    ClassDef {
+        name: "player",
+        keys: &[],
+        inputs: &[],
+        outputs: &[],
+        create: Player::create,
+    },
     ClassDef {
         name: "info_target",
         keys: &[],
@@ -300,6 +409,12 @@ static CASE_INPUTS: InputDefs = &[
 ];
 
 // The tables the class files own, under the names [`CLASSES`] reads.
+static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
+static HURT_INPUTS: InputDefs = trigger::HURT_INPUTS;
+static PUSH_INPUTS: InputDefs = trigger::PUSH_INPUTS;
+static TELEPORT_INPUTS: InputDefs = trigger::TELEPORT_INPUTS;
+static FILTER_INPUTS: InputDefs = filter::FILTER_INPUTS;
+static POINT_TELEPORT_INPUTS: InputDefs = point::POINT_TELEPORT_INPUTS;
 static BRUSH_INPUTS: InputDefs = brush::BRUSH_INPUTS;
 static DOOR_INPUTS: InputDefs = brush::DOOR_INPUTS;
 static MOVELINEAR_INPUTS: InputDefs = brush::MOVELINEAR_INPUTS;

@@ -316,6 +316,15 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
         entity.name = Some(value.to_owned());
         return true;
     }
+    // `DEFINE_KEYFIELD( m_target, FIELD_STRING, "target" )`
+    // (`baseentity.cpp:2217`) — a `CBaseEntity` field, which is why it is here
+    // and not on the two classes that read it. Measured: `trigger_teleport`
+    // (73) and `point_teleport` (128) are the only implemented classnames in
+    // the whole game that carry the key.
+    if is("target") {
+        entity.target = Some(value.to_owned());
+        return true;
+    }
 
     // The datadesc half, for the fields [`EntityCore`] has.
     if is("parentname") {

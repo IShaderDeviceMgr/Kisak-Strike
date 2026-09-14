@@ -36,8 +36,9 @@ use glam::Vec3;
 
 use super::class::{Behaviour, ClassDef, Context};
 use super::io::{EventAction, Output, Variant};
-use super::movement::{ModelBounds, MoveType};
+use super::movement::{ModelBounds, MoveType, Solid, FSOLID_NOT_SOLID};
 use super::think::TICK_NEVER_THINK;
+use super::touch::TouchLink;
 
 /// A handle to an entity — Valve's `CBaseHandle`/`EHANDLE`.
 ///
@@ -86,6 +87,14 @@ pub struct EntityCore {
     id: EntityId,
     /// `m_iName` — the `targetname`. `None` rather than `NULL_STRING`.
     pub name: Option<String>,
+    /// `m_target` — the `target` key: the *other* entity this one points at.
+    ///
+    /// A `CBaseEntity` field (`baseentity.cpp:2217`) rather than a class's,
+    /// and read by exactly two classes here: `trigger_teleport` and
+    /// `point_teleport` both send whatever `target` names to wherever they
+    /// are. Measured: those two are the only classnames in the whole game
+    /// this port implements that carry the key at all — 73 and 128 of them.
+    pub target: Option<String>,
     /// `m_iParent` — the `parentname` key, before it is resolved.
     ///
     /// Kept alongside [`parent`](EntityCore::parent) because Valve keeps both:
@@ -178,11 +187,53 @@ pub struct EntityCore {
     /// [`raw_move_done_time`](EntityCore::raw_move_done_time), which only the
     /// pusher wants.
     move_done_time: f32,
-    /// `m_fFlags`' solidity half — the `FSOLID_*` bits, of which exactly one
-    /// is set from anywhere:
-    /// [`FSOLID_NOT_SOLID`](super::movement::FSOLID_NOT_SOLID), by
-    /// `func_brush`.
+    /// `m_vecBaseVelocity` — the velocity of whatever is carrying this entity,
+    /// added to its own for one move and then taken back out.
+    ///
+    /// Written by `trigger_push` and by nothing else here. The player's copy
+    /// lives on [`crate::client::Player`] and this one is where the server
+    /// puts what the trigger decided; `Engine::frame` carries it across, the
+    /// same way it carries a brush entity's placement the other way.
+    pub base_velocity: Vec3,
+    /// `m_takedamage != DAMAGE_NO`. Read by one line, `CTriggerHurt::HurtEntity`.
+    ///
+    /// A `bool` rather than Valve's four-valued `char`, because nothing
+    /// distinguishes `DAMAGE_EVENTS_ONLY` from `DAMAGE_YES` without a damage
+    /// system — and there is none (see [`classes::TriggerHurt`]).
+    ///
+    /// [`classes::TriggerHurt`]: super::classes::TriggerHurt
+    pub take_damage: bool,
+    /// `m_Solid` — *how* this entity is solid. See [`Solid`].
+    pub solid: Solid,
+    /// `m_fFlags`' solidity half — the `FSOLID_*` bits. Two are set from
+    /// anywhere: [`FSOLID_NOT_SOLID`], by `func_brush` and by every trigger,
+    /// and [`FSOLID_TRIGGER`](super::movement::FSOLID_TRIGGER), by every
+    /// trigger.
     pub solid_flags: u32,
+    /// `m_fFlags` — the `FL_*` bits.
+    ///
+    /// [`FL_CLIENT`](super::movement::FL_CLIENT) is the only one set at spawn;
+    /// [`FL_BASEVELOCITY`](super::movement::FL_BASEVELOCITY) is set by
+    /// `trigger_push` and cleared by the player's move.
+    pub flags: u32,
+    /// The entities this one is touching. Valve's `TOUCHLINK` data object
+    /// (`game/shared/touchlink.h`), which is a doubly-linked list hung off the
+    /// entity by name.
+    ///
+    /// **Both sides of a touch have a link**, and only one of the two carries
+    /// [`TouchLink::start_touch`] — see [`touch`](super::touch) for which and
+    /// why. A behaviour reads its own list (`CTriggerHurt::HurtAllTouchers`
+    /// is the one that does); everything that *maintains* it is
+    /// [`Server`](super::Server)'s, because a touch is a fact about two
+    /// entities.
+    pub touch_links: Vec<TouchLink>,
+    /// `touchStamp` — bumped by `SetCheckUntouch` every time this entity is
+    /// about to re-test what it is touching, so that a link left at the old
+    /// value is a touch that has ended.
+    pub(super) touch_stamp: i32,
+    /// `EFL_CHECK_UNTOUCH` — whether this entity owes the post-think pass a
+    /// stale-link sweep. Set by `SetCheckUntouch`, cleared by the sweep.
+    pub(super) check_untouch: bool,
     /// `m_nNextThinkTick` — the tick this entity's `Think` is due, or
     /// [`TICK_NEVER_THINK`].
     ///
@@ -371,6 +422,44 @@ impl EntityCore {
     }
 
     // -----------------------------------------------------------------------
+    // solidity
+    // -----------------------------------------------------------------------
+
+    /// `IsSolid()` (`public/const.h:249`) — a solid *type* and the
+    /// [`FSOLID_NOT_SOLID`] bit clear.
+    ///
+    /// > **Both halves are needed and neither is redundant.** A trigger is
+    /// > `SOLID_BSP` *and* `FSOLID_NOT_SOLID`: it has a collision model, so
+    /// > the touch query can sweep against its brushes, and it is not solid,
+    /// > so walking into one does not stop you. Reading only the type makes
+    /// > every trigger a wall; reading only the bit makes every point entity
+    /// > a wall.
+    pub fn is_solid(&self) -> bool {
+        self.solid != Solid::None && self.solid_flags & FSOLID_NOT_SOLID == 0
+    }
+
+    /// `IsSolidFlagSet`. Takes a mask and asks whether *any* of it is set,
+    /// which is what the C++'s `( m_usSolidFlags & flags ) != 0` does.
+    pub fn is_solid_flag_set(&self, flags: u32) -> bool {
+        self.solid_flags & flags != 0
+    }
+
+    /// `AddSolidFlags`.
+    pub fn add_solid_flags(&mut self, flags: u32) {
+        self.solid_flags |= flags;
+    }
+
+    /// `RemoveSolidFlags`.
+    pub fn remove_solid_flags(&mut self, flags: u32) {
+        self.solid_flags &= !flags;
+    }
+
+    /// `GetFlags() & flags`, for the `FL_*` set.
+    pub fn has_flags(&self, flags: u32) -> bool {
+        self.flags & flags != 0
+    }
+
+    // -----------------------------------------------------------------------
     // moving
     // -----------------------------------------------------------------------
 
@@ -429,7 +518,7 @@ impl EntityCore {
     /// per-tick loop. `MOVETYPE_NONE` never qualifies.
     pub fn will_simulate_game_physics(&self) -> bool {
         match self.move_type {
-            MoveType::None => false,
+            MoveType::None | MoveType::Walk | MoveType::Noclip => false,
             MoveType::Push => self.move_done_time() > 0.0,
         }
     }
@@ -520,6 +609,7 @@ impl Entity {
                 class,
                 id: EntityId::INVALID,
                 name: None,
+                target: None,
                 parent_name: None,
                 parent: None,
                 origin: Vec3::ZERO,
@@ -545,7 +635,14 @@ impl Entity {
                 speed: 0.0,
                 local_time: 0.0,
                 move_done_time: -1.0,
+                base_velocity: Vec3::ZERO,
+                take_damage: false,
+                solid: Solid::None,
                 solid_flags: 0,
+                flags: 0,
+                touch_links: Vec::new(),
+                touch_stamp: 0,
+                check_untouch: false,
                 outputs: Vec::new(),
                 unhandled: Vec::new(),
                 next_think_tick: TICK_NEVER_THINK,
@@ -642,6 +739,49 @@ impl EntityList {
     /// Whether this handle still resolves.
     pub fn is_alive(&self, id: EntityId) -> bool {
         self.get(id).is_some()
+    }
+
+    /// Lifts one entity out of the list, leaving the slot empty and the
+    /// generation alone.
+    ///
+    /// # This is the borrow seam, and it is the shape `rustdocs/SERVER.md` predicted
+    ///
+    /// Stage 2 shipped a [`Context`] that could not see the entity list at
+    /// all, and recorded that the condition for changing that was "a handler
+    /// that must *read* another entity during dispatch", with the shape to
+    /// reach for being "the entity list minus the one entity being dispatched,
+    /// not a `RefCell`". Stage 4 is that condition — a trigger has to ask its
+    /// `filter_*` entity whether the toucher passes, and then hand the toucher
+    /// a push or a teleport — and this pair is that shape, literally: the
+    /// dispatched entity is *owned by the stack frame running it*, so the rest
+    /// of the list is free to be borrowed however the handler likes.
+    ///
+    /// The consequence a caller must know is that **an entity cannot see
+    /// itself through its `Context`** for the duration of its own handler:
+    /// `cx.entity(self.id())` is `None`. Nothing wants to — it already has
+    /// `&mut EntityCore` — and a class that reached for it would be asking for
+    /// two mutable borrows of one entity, which is the bug this prevents
+    /// rather than a limitation it imposes.
+    ///
+    /// `live` is decremented so that [`len`](EntityList::len) never disagrees
+    /// with [`iter`](EntityList::iter).
+    pub(super) fn detach(&mut self, id: EntityId) -> Option<Entity> {
+        let slot = self.slots.get_mut(id.slot as usize)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        let entity = slot.entity.take()?;
+        self.live -= 1;
+        Some(entity)
+    }
+
+    /// Puts back what [`detach`](EntityList::detach) took.
+    pub(super) fn attach(&mut self, id: EntityId, entity: Entity) {
+        if let Some(slot) = self.slots.get_mut(id.slot as usize) {
+            debug_assert!(slot.entity.is_none(), "attaching over a live slot");
+            slot.entity = Some(entity);
+            self.live += 1;
+        }
     }
 
     /// `UTIL_Remove`: **marks**, and frees nothing.

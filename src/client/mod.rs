@@ -524,6 +524,17 @@ impl Client {
     /// Read-only: the player is moved by [`run_move`](Client::run_move) and by
     /// nothing else, which is what keeps a command the only thing that can
     /// change the world.
+    /// The player, to write.
+    ///
+    /// The **server**'s way in: a `trigger_push` and a `point_teleport` both
+    /// change where the player is or how fast it is going, and
+    /// `Engine::frame`'s `apply_player_state` is the one caller. Movement is
+    /// still [`run_move`](Client::run_move)'s and nothing else should reach
+    /// for this.
+    pub fn player_mut(&mut self) -> &mut Player {
+        &mut self.player
+    }
+
     pub fn player(&self) -> &Player {
         &self.player
     }
@@ -859,6 +870,7 @@ impl Client {
                 .min(self.cvars.sv_speed_normal.float()),
             move_type: self.player.move_type,
             ground: self.player.ground,
+            base_velocity: self.player.base_velocity,
             surface_friction: self.player.surface_friction,
             ducked: self.player.ducked,
             ducking: self.player.ducking,
@@ -872,6 +884,7 @@ impl Client {
         // `FinishMove` — the results go back on the player.
         self.player.origin = mv.origin;
         self.player.velocity = mv.velocity;
+        self.player.base_velocity = mv.base_velocity;
         self.player.ground = mv.ground;
         self.player.surface_friction = mv.surface_friction;
         self.player.ducked = mv.ducked;

@@ -8,16 +8,17 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stage 3 of 5.** Entities spawn, fire outputs at each other, think on a fixed tick, and the brush ones move. |
+| Status | **Stage 4 of 5.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, and **the map notices the player**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (four commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
-| Names no | `wgpu`, `winit`, `egui`, `materials`, `studio` — every test runs with no GPU |
-| Tests | 106 unit tests + one depot test over all 106 shipped maps |
+| Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace` — every test runs with no GPU |
+| Tests | 130 unit tests + two depot tests over all 106 shipped maps |
 
-**What does not exist yet**: touch and triggers (stage 4), the player as an
-entity (stage 5). Twenty-two classnames are implemented out of the 200 the
-shipped maps place, and **nothing pushes what is in its way** — a door moves
-through the player rather than shoving it (`portdocs/SERVER.md` stage 3 says
-why).
+**What does not exist yet**: the player as a *whole* entity — stage 5 —
+movement, health, death and `noclip`'s home are still `client/`'s
+([What is deliberately absent](#what-is-deliberately-absent)). Thirty-four
+classnames are implemented out of the 200 the shipped maps place, and
+**nothing pushes what is in its way**: a door moves through the player rather
+than shoving it (`portdocs/SERVER.md` stage 3 says why).
 
 ---
 
@@ -31,11 +32,18 @@ let mut server = Server::new();
 // and the model bounding boxes a mover measures itself against.
 let stats = server.level_init("sp_a1_intro1", &world.entities, &world.models);
 eprintln!("{}", stats.summary());
-// 216 of 598 entity blocks matched a class, 194 spawned (22 removed themselves),
-// 642 outputs, 382 unknown classnames, 258 unhandled keys
+// 250 of 598 entity blocks matched a class, 228 spawned (22 removed themselves),
+// 714 outputs, 348 unknown classnames, 259 unhandled keys
 
-// Once per rendered frame. Runs zero or more fixed server ticks.
-server.frame(frame_time_seconds);
+// `ClientPutInServer` — the player joins the list, so that `!player` resolves
+// and a trigger has something to notice.
+server.spawn_player(player_state);
+
+// Once per rendered frame, either side of the ticks. `query` is the engine's
+// collision half; `NoTouchQuery` is a server with nothing to walk into.
+server.set_player_state(player_state);
+server.frame(frame_time_seconds, &mut query);
+if let Some(state) = server.player_state() { /* …back onto client::Player */ }
 
 // Where every brush entity is now, by its "*N" model index — what `world/`
 // draws and what `trace/` collides with.
@@ -50,10 +58,21 @@ server.level_shutdown();
 ```
 
 In the running engine this is wired through `Scene`, so a `map` command does the
-load, `Engine::frame` does the tick **and then copies every brush entity's
-placement into `world/`** — see `Level::load`, `Engine::frame` and
-`sync_brush_models` in `src/engine/mod.rs`. Four console commands read or drive
-the result —
+load and `Engine::frame` does the rest, in this order:
+
+```text
+Engine::frame
+  server.set_player_state( player_state( client ) )   client -> the entity list
+  server.frame( dt, &mut WorldTouchQuery { world } )  0..n ticks; triggers notice
+  apply_player_state( client, server.player_state() ) …and back again
+  sync_brush_models( world, server )                  where every door is now
+  update_client( … )                                  the player moves, and is
+                                                      clipped against the doors
+```
+
+— see `Level::load`, `Engine::frame`, `player_state`, `apply_player_state`,
+`WorldTouchQuery` and `sync_brush_models` in `src/engine/mod.rs`. Four console
+commands read or drive the result —
 `report_entities`, `ent_dump <name / index / class>`,
 `ent_fire <target> [input] [value] [delay]` and `dumpeventqueue`.
 
@@ -73,11 +92,17 @@ impl Server {
         &mut self, map: &str, blocks: &[bsp::Entity], models: &[bsp::Model],
     ) -> LevelStats;
     pub fn level_shutdown(&mut self);
-    pub fn frame(&mut self, frame_time: f32) -> u32;
+    pub fn frame(&mut self, frame_time: f32, query: &mut dyn TouchQuery) -> u32;
     pub fn time(&self) -> think::Time;
     pub fn brush_entity(&self, model_index: usize) -> Option<&EntityCore>;
     pub fn brush_entity_count(&self) -> usize;
     pub fn tonemap_settings(&self) -> TonemapSettings;
+
+    // stage 4 — the player
+    pub fn spawn_player(&mut self, state: PlayerState) -> EntityId;
+    pub fn player(&self) -> Option<EntityId>;
+    pub fn set_player_state(&mut self, state: PlayerState);
+    pub fn player_state(&self) -> Option<PlayerState>;
     pub fn report_entities(&self, cx: &mut ExecContext<'_>);
     pub fn ent_dump(&self, cmd: &Command, cx: &mut ExecContext<'_>);
     pub fn ent_fire(&mut self, cmd: &Command, cx: &mut ExecContext<'_>);
@@ -103,10 +128,75 @@ every mover a zero-sized box, which is what `UTIL_SetModel` does for a missing
 model too; the unit tests pass it.
 
 `frame` takes the host's already-clamped frame time and returns how many server
-ticks it bought. **Zero is the normal answer** at a high frame rate.
+ticks it bought. **Zero is the normal answer** at a high frame rate. Its
+`query` is the engine's collision half — see
+[`TouchQuery`](#touchquery-mod-rs); pass [`NoTouchQuery`](#touchquery-mod-rs)
+when nothing can be walked into.
 
 `brush_entity` is the seam `world/` and `trace/` read, keyed by the `"*N"`
 model index — see [The brush-entity seam](#the-brush-entity-seam).
+
+`spawn_player` is `ClientPutInServer`, **not** part of `level_init`: Valve's
+entity list has no player until a client connects either, and keeping it that
+way is what lets every test here run without one. `set_player_state` and
+`player_state` are the two halves of the copy `Engine::frame` makes either
+side of the ticks — see [`PlayerState`](#playerstate-mod-rs).
+
+### `TouchQuery` (`mod.rs`)
+
+```rust
+pub trait TouchQuery {
+    fn brush_models_touching(
+        &mut self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, out: &mut Vec<usize>,
+    );
+}
+
+pub struct NoTouchQuery;   // reports nothing
+```
+
+`engine->SolidMoved` (`vengineserver_impl.cpp:2467`, `engine/world.cpp`'s
+`CTouchLinks`) — **the engine's half of a touch test**, and the reason this
+module names no collision type. The game knows which entities are triggers and
+what touching one means; the engine owns the collision data and answers "what
+does this swept box overlap". That split is not a Rust invention: the C++
+crosses a DLL boundary at exactly this line.
+
+Implemented by `engine/mod.rs`'s `WorldTouchQuery` over `world/`'s placed brush
+models. Two properties of the answer are load-bearing:
+
+- **It is a swept box against the model's real brushes**, not a bounding-box
+  overlap — Valve's enumerator ends in
+  `ClipRayToCollideable( ray, MASK_SOLID, pTrigger, &tr )`. A test chamber's
+  triggers are L- and U-shaped often enough that the two disagree.
+- **It is not filtered to triggers.** Which of them is one is
+  `FSOLID_TRIGGER`, which is *this* module's live state; an engine-side copy
+  would be a frame stale every time something was enabled. The server filters,
+  and pays one brush sweep per non-trigger brush entity per tick.
+
+### `PlayerState` (`mod.rs`)
+
+```rust
+pub struct PlayerState {
+    pub origin: Vec3,          // the FEET
+    pub angles: Vec3,          // the VIEW angles, pitch/yaw/roll
+    pub velocity: Vec3,
+    pub base_velocity: Vec3,   // what a trigger_push is adding
+    pub on_ground: bool,       // FL_ONGROUND
+    pub noclip: bool,          // MOVETYPE_NOCLIP rather than MOVETYPE_WALK
+    pub mins: Vec3,            // the collision hull, relative to origin
+    pub maxs: Vec3,
+}
+```
+
+The player, as the two halves of the port that own pieces of it agree to
+describe one. `client::Player` moves on the **rendered frame** and the server
+ticks at a fixed 64 Hz, so neither can hold the other's state; `Engine::frame`
+copies this in before the ticks and out after them.
+
+**The round trip is an identity for every field the server did not touch**,
+which is what makes an unconditional copy-back safe rather than a fight over
+who owns the origin — and it is why a teleport is an ordinary field write on
+the player entity rather than a message.
 
 ### `LevelStats` (`mod.rs`)
 
@@ -141,6 +231,7 @@ pub struct Entity {
 pub struct EntityCore {
     pub class: &'static ClassDef,
     pub name: Option<String>,          // targetname
+    pub target: Option<String>,        // the `target` key — m_target
     pub parent_name: Option<String>,
     pub parent: Option<EntityId>,
     pub origin: Vec3,
@@ -158,14 +249,22 @@ pub struct EntityCore {
     pub removed: bool,
 
     // stage 3 — the movement block
-    pub model_bounds: ModelBounds,     // the "*N" model's box, from the .bsp
-    pub move_type: MoveType,           // NONE or PUSH
+    pub model_bounds: ModelBounds,     // the collision box: the "*N" model's,
+                                       // or the player's hull
+    pub move_type: MoveType,           // NONE, PUSH, WALK or NOCLIP
     pub velocity: Vec3,                // units a second
     pub angular_velocity: Vec3,        // degrees a second
     pub speed: f32,                    // m_flSpeed, the `speed` key
     pub local_time: f32,               // this pusher's own clock
+
+    // stage 4 — solidity, touching, and being pushed
+    pub solid: Solid,                  // NONE / BSP / BBOX / VPHYSICS
     pub solid_flags: u32,              // FSOLID_*
-    /* private: id, next_think_tick, move_done_time */
+    pub flags: u32,                    // FL_*
+    pub base_velocity: Vec3,           // what a trigger_push is adding
+    pub take_damage: bool,             // m_takedamage != DAMAGE_NO
+    pub touch_links: Vec<TouchLink>,   // the TOUCHLINK list
+    /* private: id, next_think_tick, move_done_time, touch_stamp, check_untouch */
 }
 
 impl EntityCore {
@@ -174,6 +273,12 @@ impl EntityCore {
     pub fn debug_name(&self) -> &str;                 // targetname, else classname
     pub fn has_spawn_flags(&self, flags: u32) -> bool;
     pub fn remove(&mut self);                         // UTIL_Remove( this )
+
+    pub fn is_solid(&self) -> bool;                   // IsSolid(), BOTH halves
+    pub fn is_solid_flag_set(&self, flags: u32) -> bool;
+    pub fn add_solid_flags(&mut self, flags: u32);
+    pub fn remove_solid_flags(&mut self, flags: u32);
+    pub fn has_flags(&self, flags: u32) -> bool;      // the FL_* set
 
     pub fn output(&self, name: &str) -> Option<&Output>;
     pub fn output_count(&self, name: &str) -> usize;  // NumberOfElements
@@ -226,6 +331,7 @@ impl EntityList {
     pub fn is_empty(&self) -> bool;
     pub fn iter(&self) -> impl Iterator<Item = (EntityId, &Entity)>;
     pub fn clear(&mut self);
+    /* pub(super): detach / attach — the dispatch borrow seam, below */
 }
 ```
 
@@ -233,6 +339,14 @@ impl EntityList {
 entity resolves to `None` rather than to whatever took its slot. `insert` writes
 the handle back into the entity, because everything an entity does to the world
 names itself as the caller.
+
+**`detach`/`attach` are the borrow seam stage 4 needed.** `Server::dispatch`
+lifts the entity it is about to run *out* of the list and puts it back
+afterwards, so a handler can hold `&mut EntityCore` and a
+[`Context`](#classdef-behaviour-and-context-classrs) over the rest of the list
+at the same time. `len` is decremented across the gap so it never disagrees
+with `iter`, and the entity is put back on every path including a panic
+(nothing `?`s between the two).
 
 ### `ClassDef`, `Behaviour` and `Context` (`class.rs`)
 
@@ -283,6 +397,16 @@ pub trait Behaviour: Any {
         &mut self, entity: &mut EntityCore, input: &Input<'_>, cx: &mut Context<'_>,
     ) -> bool;
     fn describe(&self) -> Vec<(&'static str, String)>;   // for `ent_dump`
+
+    // stage 4
+    fn start_touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+    fn touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+    fn end_touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+    fn is_filter(&self) -> bool;                         // dynamic_cast<CBaseFilter*>
+    fn passes_filter(
+        &self, entity: &EntityCore, other: &EntityCore, filters: &Filters<'_>,
+    ) -> bool;
+    fn is_player(&self) -> bool;                         // CBaseEntity::IsPlayer
 }
 
 impl dyn Behaviour {
@@ -291,30 +415,65 @@ impl dyn Behaviour {
 
 pub struct Context<'a> {
     pub time: Time,     // curtime, tick, interval — see think.rs
-    /* private: the event queue and the random stream */
+    /* private: the queue, the random stream, the entity list, the player */
 }
 
 impl Context<'_> {
     pub fn curtime(&self) -> f32;
     pub fn random(&mut self) -> &mut RandomStream;
+
+    // stage 4 — every entity BUT the one being dispatched
+    pub fn entity(&self, id: EntityId) -> Option<&Entity>;
+    pub fn entity_mut(&mut self, id: EntityId) -> Option<&mut EntityCore>;
+    pub fn find_by_name(&self, query: &str) -> Option<EntityId>;
+    pub fn find_target(
+        &self, query: &str, searching: Option<EntityId>,
+        activator: Option<EntityId>, caller: Option<EntityId>,
+    ) -> Option<EntityId>;                               // procedurals included
+    pub fn filters(&self) -> Filters<'_>;
+}
+
+/// The read-only view a `filter_*` class evaluates against.
+pub struct Filters<'a> { /* private */ }
+impl Filters<'_> {
+    pub fn passes(&self, filter: EntityId, caller: &EntityCore, other: &EntityCore) -> bool;
+    pub fn find(&self, name: &str) -> Option<EntityId>;  // …and it must BE a filter
 }
 
 pub struct PointEntity;   // CPointEntity — no state, no behaviour
 ```
 
-All eight trait methods have defaults, so a class with no state is
+All fourteen trait methods have defaults, so a class with no state is
 `impl Behaviour for Thing {}`. `move_done` and `use_entity` are `m_pfnMoveDone`
 and `m_pfnUse`, the two function pointers `CBaseEntity` dispatches through: a
 class that has one keeps its own enum in place of the pointer and matches on
-it, because a mover re-points `SetMoveDone` at each step of its cycle.
+it, because a mover re-points `SetMoveDone` at each step of its cycle. The same
+is true of `start_touch`/`touch`/`end_touch` (`m_pfnTouch` and the two
+virtuals) — `CTriggerMultiple` really does `SetTouch( NULL )` to stop itself
+firing twice.
 
-**`Context` is small, and that is the finding.** `portdocs/SERVER.md` §7.2
-expected it to carry the entity list so a handler could "fire an output, find by
-name, remove an entity, trace", and §10.3 flagged the borrow shape as the
-module's biggest risk. It is not a risk, because **the C++ is not re-entrant
-either**: `FireOutput` appends to the queue rather than calling the target, and
-the queue is drained by one top-level loop. So a handler needs the queue, the
-clock and the RNG — and nothing else.
+**`Context` grew the entity list at stage 4, in exactly the shape stage 2
+predicted.** `portdocs/SERVER.md` §7.2 expected it to carry the list so a
+handler could "fire an output, find by name, remove an entity, trace", and
+§10.3 flagged the borrow shape as the module's biggest risk. Stages 1-3 needed
+none of it, because **the C++ is not re-entrant either**: `FireOutput` appends
+to the queue rather than calling the target, and the queue is drained by one
+top-level loop.
+
+Stage 4 is the condition stage 2 named — "a handler that must *read* another
+entity during dispatch" — and it arrived three times over: a trigger asks its
+`filter_*` entity whether the toucher passes, a `trigger_push` writes the
+toucher's base velocity, and a `point_teleport` moves whatever `!player`
+resolves to. The answer stage 2 wrote down was "the entity list minus the one
+entity being dispatched, **not** a `RefCell`", and that is literally what
+shipped: `Server::dispatch` [detaches](#entityid-and-entitylist-entityrs) the
+entity it is about to run, so the rest of the list is free to be borrowed.
+There is still no cell and no `unsafe`.
+
+> **The one rule that follows: `cx.entity(self.id())` is `None` inside your own
+> handler.** You already hold `&mut EntityCore`; asking the list for yourself
+> would be asking for it twice, which is the bug this prevents rather than a
+> limitation it imposes.
 
 ### `Variant` and `FieldType` (`io.rs`)
 
@@ -452,9 +611,19 @@ convention is inverted and lossy (gotcha 17).
 ### `movement` (`movement.rs`)
 
 ```rust
-pub enum MoveType { None, Push }        // MOVETYPE_NONE, MOVETYPE_PUSH
+/// MOVETYPE_NONE / PUSH / WALK / NOCLIP. The last two are the player's and the
+/// server does not run them — `client/` does, on the rendered frame.
+pub enum MoveType { None, Push, Walk, Noclip }
+/// SOLID_NONE / BSP / BBOX / VPHYSICS — *how* an entity is solid.
+pub enum Solid { None, Bsp, Bbox, VPhysics }
+
 pub const EF_NODRAW: u32 = 0x020;
 pub const FSOLID_NOT_SOLID: u32 = 0x0004;
+pub const FSOLID_TRIGGER: u32 = 0x0008;
+pub const FSOLID_VOLUME_CONTENTS: u32 = 0x0020;
+pub const FL_ONGROUND: u32 = 1 << 0;
+pub const FL_CLIENT: u32 = 1 << 8;
+pub const FL_BASEVELOCITY: u32 = 1 << 24;
 pub const SF_DOOR_ROTATE_ROLL: u32 = 64;
 pub const SF_DOOR_ROTATE_PITCH: u32 = 128;
 
@@ -507,6 +676,44 @@ gotcha 7.
 enumeration and rollback, and it is deliberately absent: a door moves *through*
 the player. `EntityCore::local_time` is where a future rollback would put its
 answer, and it is real and correct today — it just never goes backwards.
+
+### `touch` (`touch.rs`)
+
+```rust
+/// One entry of an entity's `TOUCHLINK` list.
+pub struct TouchLink { pub other: EntityId, pub stamp: i32, pub start_touch: bool }
+
+/// Everything `entity` is currently touching, as handles.
+pub fn touching(entity: &EntityCore) -> impl Iterator<Item = EntityId> + '_;
+
+/// `CBaseEntity::Teleport( &origin, &angles, &velocity )` — any of the three.
+pub struct Teleport {
+    pub origin: Option<Vec3>, pub angles: Option<Vec3>, pub velocity: Option<Vec3>,
+}
+impl Teleport { pub fn apply(&self, entity: &mut EntityCore); }
+
+/* pub(super) on Server: set_check_untouch, mark_entities_as_touching,
+   remove_touched_list, check_for_entity_untouch */
+```
+
+`touchlink_t` and the four `CBaseEntity::Physics*Touch*` functions. **Every
+function here takes `&mut Server`**, because a touch is a fact about *two*
+entities: both carry a link and exactly one of the two carries the flag that
+will fire an `EndTouch`. What a class gets is the three callbacks and its own
+`EntityCore::touch_links` to read.
+
+**The stamp is the mechanism, not a geometric test.** Nothing ever asks "have
+these two stopped overlapping":
+
+1. Before a toucher re-tests what it is in, `SetCheckUntouch` bumps its
+   `touch_stamp` and puts it on the sweep list.
+2. Every link the test confirms is written with the *new* stamp.
+3. After the thinks, `check_for_entity_untouch` walks the sweep list and every
+   link still carrying an old stamp is a touch that has ended.
+
+So an `EndTouch` costs nothing to detect — and a trigger that is switched off
+simply stops being reported by the query, and everything inside it leaves on
+the next tick.
 
 ### The brush-entity seam
 
@@ -588,9 +795,23 @@ pub struct MoveLinear { /* private */ }
 pub struct Button { /* private */ }
 pub struct Rotating { /* private */ }
 pub struct Brush { /* private; func_brush */ }
+// classes/trigger.rs — stage 4, and the first classes that notice the player
+pub struct BaseTrigger { /* private; held by all five */ }
+pub struct TriggerMultiple { /* private; trigger_multiple and trigger_once */ }
+pub struct TriggerHurt { /* private */ }
+pub struct TriggerPush { /* private */ }
+pub struct TriggerTeleport { /* private */ }
+// classes/filter.rs
+pub struct BaseFilter { pub negated: bool }   // held by all six
+pub struct FilterName / FilterClass / FilterModel { /* private */ }
+pub struct FilterMulti / FilterPlayerHeld / FilterDamageType { /* private */ }
+// classes/point.rs
+pub struct PointTeleport { /* private */ }
+// classes/player.rs
+pub struct Player;    // stateless; see the file for why
 ```
 
-Twenty-two classnames, **22,639 of the shipped game's 60,925 entities**:
+Thirty-four classnames, **25,961 of the shipped game's 60,925 entities**:
 
 | classname | C++ | instances |
 |---|---|---:|
@@ -613,6 +834,19 @@ Twenty-two classnames, **22,639 of the shipped game's 60,925 entities**:
 | `func_movelinear` | `CFuncMoveLinear` | 196 |
 | `func_button` | `CBaseButton` | 64 |
 | `func_rotating` | `CFuncRotating` | 27 |
+| `trigger_once` | `CTriggerOnce` | 1,476 |
+| `trigger_multiple` | `CTriggerMultiple` | 899 |
+| `trigger_hurt` | `CTriggerHurt` | 215 |
+| `filter_activator_class` | `CFilterClass` | 212 |
+| `trigger_push` | `CTriggerPush` | 192 |
+| `point_teleport` | `CPointTeleport` | 128 |
+| `trigger_teleport` | `CTriggerTeleport` | 110 |
+| `filter_activator_name` | `CFilterName` | 74 |
+| `filter_multi` | `CFilterMultiple` | 9 |
+| `filter_player_held` | `CFilterPlayerHeld` | 4 |
+| `filter_damage_type` | `FilterDamageType` | 2 |
+| `filter_activator_model` | `CFilterModel` | 1 |
+| `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
 
 ---
 
@@ -657,19 +891,30 @@ unparented (`mapentities.cpp:373`). Everything else is queued, then:
 ### The tick
 
 ```text
-Engine::frame -> Server::frame( frame_time )
+Engine::frame -> Server::frame( frame_time, query )
                    ServerClock::accumulate -> 0..n fixed ticks
                    for each tick:
                      CleanupDeleteList         anything removed outside the loop
+                     CheckMovingGround         a push that stopped becomes momentum
+                     PhysicsTouchTriggers      the player's sweep -> StartTouch/Touch
                      Physics_RunThinkFunctions think, then push, in entity order
+                     FrameUpdatePostEntityThink the stale-link sweep -> EndTouch
                      ServiceEventQueue         everything due, restart-from-head
                      CleanupDeleteList         anything a think removed
 ```
 
 `CServerGameDLL::GameFrame` (`gameinterface.cpp:1383`) with the CS:GO, Steam,
 nav-mesh and benchmarking steps removed. **The order is observable and maps
-depend on it**: an output fired during a think is dispatched later in the *same*
-tick, but an input handler cannot see a think that has not run yet.
+depend on all three of these:**
+
+- an output fired during a think is dispatched later in the *same* tick, but an
+  input handler cannot see a think that has not run yet;
+- **the player's touch test runs before the thinks**, because in the original it
+  is part of `CBasePlayer::PhysicsSimulate` and the player is entity index 1 —
+  so a `trigger_multiple`'s `OnTrigger` is queued *before* the same tick's
+  thinks rather than after them;
+- **`EndTouch` is detected between the thinks and the queue**, so an
+  `OnEndTouch` is delivered in the tick it happened rather than the next one.
 
 The middle step is `Physics_SimulateEntity` for every entity in the simulation
 list, which is [`movement::simulate`]: run the think if it is due, then, for a
@@ -689,9 +934,12 @@ whether its think is due; a think-only entity is stored with its real tick and
 filtered. That split is Valve's (`entitylist.cpp:249`) and it is what lets one
 list answer two different questions.
 
-Measured over the depot: the peak is **43 entities at once across all 106
-maps**, which is the same number stage 2 measured — a mover is only in the list
-while it is actually travelling, and a Portal 2 map starts with its doors shut.
+Measured over the depot: the peak is **48 entities at once across all 106
+maps**. Stage 2 measured 43 and stage 3 did not move it — a mover is only in
+the list while it is actually travelling, and a Portal 2 map starts with its
+doors shut. Stage 4's five come from triggers: a `trigger_multiple` holds a
+think for the whole of its `wait`, and a `trigger_once` for the tenth of a
+second before it deletes itself.
 
 ### Inheritance is composition
 
@@ -704,8 +952,9 @@ with `self.light.key_value(..)`. See gotcha 13.
 ## Invariants and gotchas
 
 Ordered by how likely each is to bite. **1-25 are stages 1 and 2; 26-34 are
-stage 3's and are about movement** — if a door is in the wrong place or at the
-wrong time, start at 26.
+stage 3's and are about movement; 35-46 are stage 4's and are about touch, the
+player, and solidity** — if a door is in the wrong place or at the wrong time
+start at 26, and if a trigger does not fire start at 35.
 
 1. **The server's `curtime` is not `Scene::curtime`.** The server's is
    `tick * interval` and moves in steps of 1/64 s; the scene's is the
@@ -927,6 +1176,96 @@ wrong time, start at 26.
     that keeps the `SetParent` family unimplemented, and 1,078 of the depot's
     1,081 unhandled inputs are that family.
 
+35. **A trigger is `SOLID_BSP` *and* `FSOLID_NOT_SOLID` *and*
+    `FSOLID_TRIGGER`, and all three are load-bearing.** The type is what lets
+    the touch query sweep against its real brushes; `FSOLID_NOT_SOLID` is what
+    lets you walk into it; `FSOLID_TRIGGER` is what makes the query look at it
+    at all. [`EntityCore::is_solid`] reads the first two together, and reading
+    only the bit would have put every trigger in the game into the player's
+    clip chain as an invisible wall.
+
+    [`EntityCore::is_solid`]: #entity-and-entitycore-entityrs
+
+36. **Every class that is meant to be solid must set `EntityCore::solid`, and
+    forgetting it is invisible.** `Solid` arrived at stage 4 and defaults to
+    `SOLID_NONE`; the five stage-3 brush classes did not set it, so
+    `is_solid()` was false for every door in the game,
+    `World::clip_models` came back empty, and **the clip chain silently
+    collided with nothing** while every unit test passed — they all build a
+    `PlacedBrushModel` by hand. Caught by loading the game and reading
+    `trace`'s "N in the clip chain"; guarded now by
+    `tests::every_brush_class_is_solid_unless_it_says_otherwise`.
+
+37. **`world/` only clips against brush models the *game* answers for.**
+    `PlacedBrushModel::owned` is false until `sync_brush_models` hears from the
+    server, and `World::clip_models` needs `owned && solid`. That is not
+    caution for its own sake: this port has classes for 6,302 of the game's
+    11,635 brush entities, and among the rest are 2,383 `func_portal_bumper`s
+    and 371 `trigger_portal_cleanser`s, **none of which is solid to a player**.
+    Defaulting the other way fills every chamber with invisible walls, quietly.
+
+38. **Only one side of a touch owes an `EndTouch`, and it is the trigger's.**
+    `PhysicsMarkEntityAsTouched`'s `bShouldTouch` ends in
+    `&& !other->IsSolidFlagSet( FSOLID_TRIGGER )`, so the trigger's link to the
+    player carries `FTOUCHLINK_START_TOUCH` and the player's link back does
+    not. `EndTouch` is therefore called on the trigger with the player and
+    never the reverse.
+
+39. **An entity that deletes itself fires no `EndTouch` of its own.**
+    `PhysicsRemoveTouchedList` calls `PhysicsNotifyOtherOfUntouch` — which
+    fires the *other* side's — and then `FreeTouchLink`, **not**
+    `PhysicsRemoveToucher`. So a `trigger_once` never fires `OnEndTouch`, and
+    the game places 1,476 of them.
+
+40. **`CTriggerHurt::HurtAllTouchers` walks the *touch-link* list, not the
+    trigger's own `m_hTouchingEntities`.** The two differ by exactly the
+    entities that failed the filters, which is why `HurtEntity` re-tests them
+    one at a time. A trigger keeps both lists and they answer different
+    questions: the link list is everything overlapping it, and
+    `m_hTouchingEntities` is everything that *passed*, which is what decides
+    `OnStartTouchAll`, `OnEndTouchAll` and `TouchTest`.
+
+41. **`InputToggle` on a trigger does not toggle `m_bDisabled`.** It flips
+    `FSOLID_TRIGGER` and leaves the flag alone (`triggers.cpp:566`), so a
+    toggled trigger and a disabled one give different answers to `TouchTest`.
+    Valve's; zero shipped connections fire `Toggle` at a trigger.
+
+42. **`CBaseTrigger::EndTouch` does not consult the filters and does not test
+    `m_bDisabled`.** Valve has two `//FIXME: Without this, triggers fire their
+    EndTouch outputs when they are disabled!` comments around the two places
+    the test was commented out, and the behaviour they describe is the shipped
+    behaviour. Reproduced, comments and all.
+
+43. **A Portal 2 single-player `trigger_push` is twice as strong as the map
+    says.** `CTriggerPush::Activate` doubles the speed whenever
+    `maxClients == 1` and `sv_alternateticks` is off, under a comment reading
+    `DIRTY HACK TO FOLLOW` — the game was tuned with alternate ticks on and
+    ships with them off on PC. Both conditions are constants here, so the
+    doubling is unconditional; dropping it makes every airlock half strength.
+    The class's own `m_flSpeed` default is **100**, not the FGD's 40.
+
+44. **A base velocity is not a velocity.** `trigger_push` writes
+    `EntityCore::base_velocity` and sets `FL_BASEVELOCITY` *every tick it is
+    pushing*; the movement adds it for the duration of a move and takes it back
+    out, so a player carried along still reports a velocity of zero. The tick
+    after the push stops, `CheckMovingGround` sees the flag clear and converts
+    the whole thing into real velocity with a `1 + frametime/2` boost. Skip
+    either half and a push either does nothing or never lets go.
+
+45. **A teleport discards the swept-from point.** The touch pass sweeps from
+    where the player was at the *last tick*, and a `trigger_teleport` moves it
+    a thousand units mid-pass — so the next tick's sweep is reset to the new
+    origin. Valve gets the same by having `CBaseEntity::Teleport` call
+    `PhysicsTouchTriggers()` with **no** previous origin. Without it a teleport
+    fires every trigger between the two ends.
+
+46. **The player entity's `angles` are its *view* angles**, where
+    `CBasePlayer` keeps `m_angAbsRotation` (yaw only) and its eye angles
+    separately. Every consumer here wants the eye —
+    `CTriggerTeleport::Touch` explicitly substitutes `EyeAngles()` for
+    `GetAbsAngles()` when the toucher is a player — so the port keeps one
+    field. Its `origin` is still the **feet**.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -943,6 +1282,9 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | A parent cycle | Recurses until the stack runs out (only self-parenting is checked) | Bounded by the entity count, reported, treated as depth 1 | No shipped map contains a cycle. |
 | `qsort` in the spawn sort | Unstable; equal-rank order is unspecified | Stable, so lump order survives within a rank | Deterministic, and it is what a level designer means by "in order". |
 | The zero-delay event chain | Unbounded; a self-triggering relay hangs the server | Bounded at 100,000 events a tick, then the queue is dropped with a warning | Four times the largest map's entire connection count. |
+| A `filter_multi` chain | Unbounded; a filter naming itself recurses until the stack runs out | Bounded at 8 deep, reported, treated as a pass | No shipped map has a chain deeper than one. |
+| `Enable`/`Disable`/`Toggle` on a trigger | Calls `PhysicsTouchTriggers()` at once, so enabling a trigger you are standing in fires `OnStartTouch` in the same tick | Fires it on the **next** tick | The touch pass is player-driven and runs at one fixed point in the tick. At most 15.6 ms late; the condition for closing it is a touch query the server can ask mid-tick. |
+| `!player_blue` / `!player_orange` | `GetGlobalTeam( … )->GetPlayer( 0 )` | Reported as "no such player" | Single player has no teams, so Valve answers null here too — this is a report line rather than a divergence, and it is 74 of the depot's unhandled procedurals. |
 
 ---
 
@@ -952,7 +1294,12 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 |---|---|
 | **Pushing what is in the way** — `CPhysicsPushedEntities`, `Blocked`/`StartBlocked`/`EndBlocked`, `m_bDoorGroup`, `forceclosed`, `dmg`/`BlockDamage` | ~1,000 lines of speculative push and rollback, and it wants `ENGINE_TRACE.md` stage 4 underneath it. A door that moves through the player is a better state than a door that does not move. The keys are parsed so they are not counted as unknown; nothing reads them. |
 | `SOLID_*` — the solidity *types* (`SOLID_BSP`, `SOLID_VPHYSICS`), and `solidbsp` | Nothing chooses between them. `EntityCore::solid_flags` carries the one bit a class sets (`FSOLID_NOT_SOLID`, by `func_brush`). |
-| Touch, `FSOLID_TRIGGER`, `StartDisabled` honoured for anything but `func_brush` | Stage 4. `func_brush`'s is honoured, because `CFuncBrush::Spawn` is what reads it. |
+| **Damage** — health, `CTakeDamageInfo`, `TakeDamage`, death, and the physics force a hurt imparts | There is no health on anything. `trigger_hurt` therefore runs the whole of Valve's *timing* — the half-second think, the radiation quarter-second one, the doubling model's arithmetic, the parting half-dose — and takes nothing away, so `OnHurt` and `OnHurtPlayer` fire exactly when the shipped game fires them. The condition is `CBasePlayer`'s state, which is stage 5's. |
+| Pushing a *physics object* — `SF_TRIGGER_ALLOW_PHYSICS`, `SF_TRIGGER_PUSH_USE_MASS`, `ApplyForceCenter` | `MOVETYPE_VPHYSICS` needs `rapier` (`ENGINE_TRACE.md` stage 5). 147 `trigger_multiple`s in the game are physics-only and correctly refuse the player. |
+| NPCs and vehicles in `PassesTriggerFilters` — the `FL_NPC` sub-tests, `IsInAVehicle` | Portal 2 has 293 NPCs of 6 classnames and no vehicles at all. The `FL_NPC` term of the disjunction is kept so the line reads like the C++; the two `IN_VEHICLES` refusals are kept because they *refuse* rather than allow, and zero shipped triggers set either flag. |
+| `filter_activator_team`, `filter_enemy`, `filter_size`, `filter_activator_mass_greater`, `filter_activator_context` | Zero placed by any shipped map. |
+| `trigger_look` (41), `trigger_playerteam` (645), `trigger_catapult` (185), `trigger_portal_cleanser` (371), `trigger_transition` (62), `trigger_autosave` (57), `trigger_ping_detector` (20) | Either reconstruction jobs with no C++ in this tree (`portdocs/SERVER.md` §1.3) or wanting a subsystem that does not exist — saves, co-op teams, the paint system. |
+| `CTriggerHurt`'s geiger counter, and `CTriggerTeleport`'s `CheckDestIfClearForPlayer` | A client-side HUD element, and `g_pGameRules->IsSpawnPointValid`. Zero shipped maps set the second. |
 | Sound — `noise1`/`noise2`/`startclosesound`/`closesound`/`StartSound`/`StopSound`/`sounds`/`message`, the lock sentences, `MovingSoundThink` | There is no sound system. The names are parsed and printed by `ent_dump`; `MovingSoundThink` is a *named think context*, which is also not ported and is the only thing in the game that wanted one. |
 | `CBaseDoor::Activate`'s movement group and `UpdateAreaPortals` | `m_bDoorGroup` is read only by `Blocked`, above; area portals are the engine's visibility system, which is not written. |
 | `CBaseDoor::DoorActivate`, `DoorTouch`, `ChainUse`, `ButtonTouch`, `ButtonResponseToTouch`, `OnTakeDamage` | The touch and damage entry points. Stage 4's and later; nothing reaches them through I/O. |
@@ -961,7 +1308,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CBaseToggle`'s `master` / `UTIL_IsMasterTriggered` | The `multisource` interlock. **No shipped Portal 2 map sets a `master` key on any of these classes.** |
 | `SF_DOOR_START_OPEN_OBSOLETE` | **No shipped map sets it.** The 40 doors that spawn open use `spawnpos 1`. |
 | `func_rot_button` (2), `momentary_rot_button` (1), `func_tracktrain` (233), `func_tanktrain` (20) | The remaining movers. `CBaseButton`'s `m_fRotating` branch is `CRotButton`'s and is therefore dead here; the trains need `path_track`. |
-| The player as an entity, `!player`, `noclip`'s home | Stage 5. 171 of the depot's 186 unhandled inputs are the three player procedurals. |
+| **The player as a whole entity** — `CBasePlayer`'s 9,940 lines: health, death, the weapon, the view, the suit, and `noclip`'s home (`portdocs/CLIENT.md` §9.2) | Stage 5. What stage 4 added is the *minimum* touch needs — a box with `FL_CLIENT` set whose position arrives as `PlayerState` — because a touch is a fact about two entities and building it against something outside the list would have been building a different system. `client::Player` still owns the movement and still runs on the rendered frame. |
+| `CBasePlayer::SetFogController` and the rest of the player's own inputs | 97 connections in the game fire `SetFogController` at `!player`, and there is no fog. It is the largest single entry in the depot's unhandled-input table now that `!player` resolves. |
 | Named think *contexts* (`m_aThinkFunctions`) | Still no class here needs two independent timers, and stage 3 is the evidence rather than the counter-example: a mover uses the think schedule **and** the arrival alarm, which are two different mechanisms with two different fields, not two contexts. The one class that genuinely wanted a context is `CBaseDoor`'s `"MovingSound"`, and there is no sound system. |
 | `IGameSystem` as a registry | One system exists (`CTonemapSystem`), so it is a method. The condition is the second system that needs a level hook. |
 | `FIELD_EHANDLE` and `FIELD_POSITION_VECTOR` | No class declares either. `FIELD_EHANDLE`'s two conversions both need the entity list, which `Variant::convert` has not got. |
@@ -979,8 +1327,9 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 **To add an entity class**, in `src/server/classes/`:
 
 1. Write the state as a struct and `impl Behaviour for` it in the right family
-   file (`logic.rs`, `light.rs`, `env.rs`, `world.rs`, `brush.rs`), with a
-   `create` returning `Box<dyn Behaviour>`.
+   file (`logic.rs`, `light.rs`, `env.rs`, `world.rs`, `brush.rs`,
+   `trigger.rs`, `filter.rs`, `point.rs`, `player.rs`), with a `create`
+   returning `Box<dyn Behaviour>`.
 2. Add a `ClassDef` to `CLASSES` in `classes/mod.rs`, listing in `keys` exactly
    the names `key_value` consumes, in `inputs` exactly the names
    `accept_input` handles **with the field type Valve declared**, and in
@@ -993,7 +1342,12 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
    A key the `Toggle` consumes (`lip`, `wait`, `distance`) still has to appear
    in *your* `ClassDef::keys`, because a contained class has no chain to be
    found through.
-5. Run `cargo test`: the two invariant tests check both declarations against the
+5. If it is a trigger, hold a `BaseTrigger` and call `spawn`, `init_trigger`,
+   `activate`, `start_touch`, `end_touch` and `accept_input` from your own —
+   the same containment rule, one class up. `InitTrigger` is what sets the
+   three solidity values gotcha 35 is about, and forgetting it makes an
+   ordinary solid brush that never notices anything.
+6. Run `cargo test`: the two invariant tests check both declarations against the
    code, and the class table is checked for duplicates and for shadowing a base
    input.
 6. Run the depot test. `EXPECTED_UNHANDLED` and the unhandled-input table will
@@ -1085,24 +1439,52 @@ case values.
 | `tests::a_rotator_that_starts_on_needs_no_input` | `SUB_CallUseToggle`, a think that calls `Use` |
 | `tests::a_func_brush_switches_itself_off_and_on` | `StartDisabled`, `EF_NODRAW`, `Solidity` |
 | `tests::a_brush_entity_is_found_by_its_model_index` | the seam `world/` and `trace/` read |
+| `tests::every_brush_class_is_solid_unless_it_says_otherwise` | gotcha 36 — the bug the running game found |
 | `engine::world::a_placement_can_be_moved_by_whoever_owns_it` | the other end of that seam |
 | `engine::world::syncing_leaves_a_placement_nobody_owns_where_it_was` | …and what it does not touch |
+| `tests::walking_into_a_trigger_fires_its_outputs` | **the stage, in one test** |
+| `tests::a_trigger_that_does_not_allow_clients_ignores_the_player` | `SF_TRIGGER_ALLOW_CLIENTS` |
+| `tests::a_trigger_once_fires_once_and_then_deletes_itself` | `m_flWait = -1` and `SUB_Remove` |
+| `tests::a_trigger_multiple_re_arms_after_its_wait` | the think schedule as a lock-out |
+| `tests::leaving_a_trigger_fires_on_end_touch` | the stamp sweep, end to end |
+| `tests::only_the_trigger_side_of_a_touch_carries_the_start_flag` | gotcha 37 |
+| `tests::a_trigger_that_deletes_itself_fires_no_end_touch` | gotcha 38 |
+| `tests::a_disabled_trigger_notices_nothing_until_it_is_enabled` | `StartDisabled` and `Enable` |
+| `tests::a_class_filter_keeps_the_player_out` | the filter 250 `trigger_multiple`s wear |
+| `tests::a_negated_filter_is_the_other_way_round` | `Negated`, and Hammer writing a label |
+| `tests::filter_multi_combines_its_children` | the handler that reads other entities |
+| `tests::point_teleport_sends_the_player_where_it_was_told` | `!player`, 121 of 128 |
+| `tests::a_landmark_teleport_carries_the_offset_across` | the elevator, and gotcha 44 |
+| `tests::a_teleport_with_no_landmark_lands_on_its_target` | the other branch |
+| `tests::a_push_is_a_base_velocity_and_then_momentum` | gotchas 42 and 43 |
+| `tests::a_noclipping_player_is_not_pushed` | `CTriggerPush::Touch`'s switch |
+| `tests::a_hurt_trigger_fires_on_hurt_player_twice_a_second` | the half-second cadence |
+| `tests::a_radiation_trigger_charges_on_the_way_out` | the one shape that reaches `EndTouch`'s dose |
+| `tests::the_player_is_an_entity_and_resolves_procedurally` | `!player`, and `Kill` at it |
+| `classes::trigger::matrix_angles_inverts_angle_matrix` | the landmark transform |
+| `engine::trace::the_clip_chain_keeps_the_nearest_of_the_world_and_the_entities` | `TraceRay`'s rescaling |
+| `engine::trace::a_tracer_with_no_entities_is_a_world_trace` | the chain is opt-in |
+| `engine::trace::a_trace_that_starts_in_the_world_ignores_the_chain` | the early return |
+| `engine::world::only_a_brush_model_the_game_answers_for_is_in_the_clip_chain` | gotcha 36 |
+| `engine::world::the_touch_query_reports_the_models_a_swept_box_meets` | `engine->SolidMoved` |
 | `tests::every_shipped_map_spawns_its_entities` | **everything, against all 106 maps** |
+| `tests::every_shipped_maps_triggers_notice_the_player` | **every trigger in the game, touched** |
 
-The depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
+Both depot tests are `--ignored` and gated on `KISAK_GAME_DIR`:
 
 ```
-KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_map_spawns -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_map -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release triggers_notice -- --ignored --nocapture
 ```
 
-It loads all 106 maps, runs **two seconds of server time on each**, and asserts
-exact totals: 60,925 blocks, 22,639 matched, 15,702 spawned, 6,937 lights
-deleted, 213 kept, 47,541 connections, 179 unimplemented classnames, the full
-36-name unhandled-key table, 5,766 events dispatched, 2,286 inputs accepted,
-1,241 thinks, 2,770 events that found no target, zero bad conversions, the
-9-name unhandled-input table, a peak of 43 entities in the simulation list at
-once, 105 maps with a master tone mapper — and that `sp_a1_intro1` ends up
-asking for an exposure ceiling of **1.5**.
+The first loads all 106 maps, spawns a player in each, runs **two seconds of
+server time**, and asserts exact totals: 60,925 blocks, 25,961 matched, 19,024
+spawned, 6,937 lights deleted, 213 kept, 53,155 connections, 167 unimplemented
+classnames, the full 42-name unhandled-key table, 5,766 events dispatched,
+2,480 inputs accepted, 1,450 thinks, 2,548 events that found no target, zero
+bad conversions, the 11-name unhandled-input table, a peak of 48 entities in
+the simulation list at once, 105 maps with a master tone mapper — and that
+`sp_a1_intro1` ends up asking for an exposure ceiling of **1.5**.
 
 Stage 3 added its own three numbers to that list, and they are the ones that
 say the stage works: **3,410 brush entities have a class, 67 of them are
@@ -1113,8 +1495,26 @@ handful of panels and lifts a chamber opens with. What matters is that before
 stage 3 the number was zero, and that the 34 mean the simulation list is being
 entered and left rather than filled once.
 
-**Where to actually see it.** No *single-player* map moves a brush entity in the
-first twenty seconds of server time — a Portal 2 chamber starts with everything
+Stage 4 added two more numbers to the first test and a second test entirely.
+**6,302 brush entities now have a class — double stage 3's — and 2,255 of them
+are live triggers two ticks into the map**: the 2,892 the maps place minus the
+637 that are `StartDisabled`, including 107 of the game's 110
+`trigger_teleport`s.
+
+`every_shipped_maps_triggers_notice_the_player` is the one that could not be
+faked. Per map it builds the real collision, and then, **for every one of
+those 2,255 triggers**, reloads the level, finds a point inside the trigger's
+*actual brushes* that a 32×32×72 hull fits in, puts a player there and runs two
+ticks through the same `ClipRayToCollideable` sweep the running game uses.
+**2,246 notice; 1,879 of them dispatch something; 3 have no point a standing
+player fits in and 6 are switched off or deleted by the map's own bootstrap
+before the second tick.** Three things fail loudly here and are invisible to
+every synthetic test: a wrong `"*N"` join, a trigger whose `FSOLID_TRIGGER`
+never got set, and a swept-box test that answers for the bounding box rather
+than the brushes.
+
+**Where to actually see the movers.** No *single-player* map moves a brush
+entity in the first twenty seconds of server time — a Portal 2 chamber starts with everything
 shut and waits for the player, which is why `sp_a1_intro1` looks identical to
 before. The **co-op** maps do, because their airlock doors and exit fans are
 started by the `logic_auto` bootstrap: `mp_coop_fan` spins `brush_fan` and opens

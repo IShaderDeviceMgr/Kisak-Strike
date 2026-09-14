@@ -99,6 +99,9 @@ impl Client {
     pub fn view(&self, width: u32, height: u32) -> ViewSetup;     // CViewRender::SetUpView
 
     pub fn player(&self) -> &Player;
+    /// The **server's** way in — see `Player::base_velocity`. `Engine::frame`'s
+    /// `apply_player_state` is the only caller.
+    pub fn player_mut(&mut self) -> &mut Player;
     pub fn tonemap(&self) -> &ToneMap;
     pub fn tonemap_mut(&mut self) -> &mut ToneMap;
 }
@@ -183,6 +186,9 @@ pub enum MoveType { Walk, Noclip }
 pub struct Player {
     pub origin: Vec3,        // the FEET
     pub velocity: Vec3,
+    /// `m_vecBaseVelocity` — what is carrying the player. **The server owns
+    /// it**; see the note below.
+    pub base_velocity: Vec3,
     pub angles: ViewAngles,
     pub move_type: MoveType,
     pub view_offset: Vec3,
@@ -199,6 +205,21 @@ impl Player {
     pub fn eye(&self) -> Vec3;                                 // origin + view_offset
 }
 ```
+
+#### `base_velocity` is written by the server and read here
+
+`src/server/` stage 4 landed `trigger_push`, and a push is not a velocity: the trigger
+sets `m_vecBaseVelocity` and `FL_BASEVELOCITY` **every tick it is pushing**, the movement
+adds it for the duration of a move and takes it back out again — so a player carried along
+a conveyor still reports a velocity of zero — and the tick *after* the push stops,
+`CPlayerMove::CheckMovingGround` converts the accumulated base velocity into real velocity
+with a `1 + frametime/2` boost. That last step is the server's; the two here are
+`walk_move`/`air_move`'s add-and-subtract and `start_gravity`'s, which spends the
+*vertical* component once and zeroes it so an upward push is an impulse rather than a
+permanent anti-gravity field.
+
+It travels both ways through `server::PlayerState`, which `Engine::frame` copies in before
+the server's ticks and out after them. **Nothing in this module writes it.**
 
 ### `movement` — `MoveData`, `MoveVars` and the move itself
 
@@ -640,13 +661,13 @@ Same ordering: most likely to bite first.
 | Water — `CheckWater`, `WaterMove`, `WaterJump`, `CheckWaterJump`, water level and type | Needs a water level, which needs `CategorizePosition`'s water probes and the leaf water data the `.bsp` reader does not load. `full_walk_move` keeps the shape of the branch and takes the not-in-water side. Portal 2's goo is a `trigger_hurt` over a water brush, so this is a *drowning* feature more than a swimming one. |
 | Ladders — `LadderMove`, `MOVETYPE_LADDER`, `OnLadder` | **Deleted, not deferred.** `CPortalGameMovement::GameHasLadders()` returns `false` (`portal_gamemovement.h:132`), so none of it is reachable in Portal 2. |
 | The duck-jump machinery — `m_bInDuckJump`, `StartUnDuckJump`, `CanUnDuckJump`, `FinishUnDuckJump`, `UpdateDuckJumpEyeOffset`, `m_nJumpTimeMsecs` | **Unreachable in Portal 2**, and by Valve's choice: `CheckJumpButton` sets `bSetDuckJump = false` over a comment reading "temp fix for camera snapping when ducking in the air ( NO DUCKJUMP for now )". Nothing sets the timer, so every branch that reads it is dead. |
-| `env_tonemap_controller` — the map's own exposure limits, rate and percentage targets | `GetTonemapSettingsFromEnvTonemapController` (`c_env_tonemap_controller.cpp:97`) copies eight floats off the entity the local player points at, and they arrive over the wire. Needs `server/` and `net/`. When they land this is **one function** plus the `g_bUseCustomAutoExposure*` branch `ToneMap::exposure_range` is missing; `portdocs/CLIENT_TONEMAP.md` §6 has what the maps actually ask for. |
+| ~~`env_tonemap_controller`~~ | **Done** — `src/server/` stage 2. `Server::tonemap_settings` produces a `TonemapSettings` and `Engine::render` hands it over once a frame. |
 | `mat_tonemap_algorithm 0` — the 31-bucket log-spaced original | Selected by matching the game directory against `{"dod", "cstrike", "lostcoast"}`, so unreachable for Portal 2, and a different bucket count *and* a different target formula. Deleted rather than deferred. |
 | `SetOverrideTonemapScale` | VScript and the commentary system call it; neither exists. `mat_force_tonemap_scale` covers it from a console. |
 | `DisplayHistogram` / `mat_show_histogram` | 200 lines of `Viewport` + `ClearBuffers` used as a bar chart. The `tonemap` command prints the same numbers. |
 | `CheckStuck`, `FixPlayerCrouchStuck`, `IsMovingPlayerStuck`, `UnblockPusher` | The unstick passes. They nudge a player out of geometry they should never have been in, and every path into that state needs entities — a door closing on you, a platform rising through you. |
 | `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | Fall damage, the landing sound and the landing animation. Needs health, sound and animation. |
-| Base velocity — conveyors, moving platforms, `GetBaseVelocity` | Entities. `SetGroundEntity`'s velocity exchange goes with it, and it is the reason Valve adds and subtracts it around every move. |
+| ~~Base velocity~~ | **Done** — `src/server/` stage 4's `trigger_push` writes it and the walk adds and subtracts it; see [`Player`](#player-and-movedata). What is still missing is the *conveyor* half: `FL_CONVEYOR` and `SetGroundEntity`'s velocity exchange, which need a ground **entity** rather than a ground plane. No Portal 2 entity sets `FL_CONVEYOR` — `CFuncMoveLinear::Spawn` has the one call commented out, with a name and a reason. |
 | `m_outWishVel`, `m_outJumpVel`, `m_outStepHeight` | Outputs for the view's step smoothing and the animation layer. Carrying fields nothing reads would be carrying fields nothing checks; `view.cpp`'s step smoothing is where `m_outStepHeight` attaches. |
 | Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint and portals. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. |
 | `player->m_surfaceFriction` from a real surface, `jumpFactor`, `maxSpeedFactor` | The physics surface-property database — `vphysics/`. Every surface reads as the default until then, and `surface_friction` still carries `CategorizePosition`'s 0.25. |

@@ -343,7 +343,7 @@ fn run(server: &mut Server, seconds: f32) {
     let interval = server.time().interval;
     let ticks = (seconds / interval).round() as u32;
     for _ in 0..ticks {
-        server.frame(interval);
+        server.frame(interval, &mut NoTouchQuery);
     }
 }
 
@@ -660,11 +660,7 @@ fn a_parameter_override_drops_the_callers_extra_delay() {
     // `FireOutput( value, activator, caller, fDelay = 0.25 )`.
     {
         let Entity { core, behaviour: _ } = &mut entity;
-        let mut cx = class::Context::new(
-            harness.clock.time(),
-            &mut harness.queue,
-            &mut harness.random,
-        );
+        let mut cx = harness.context();
         core.fire_output("OnTrigger", Variant::Void, None, None, 0.25, &mut cx);
     }
 
@@ -1014,7 +1010,7 @@ fn the_schedule_does_not_depend_on_the_frame_rate() {
         let frame = 1.0 / fps;
         let frames = (1.0 / frame).round() as u32;
         for _ in 0..frames {
-            server.frame(frame);
+            server.frame(frame, &mut NoTouchQuery);
         }
         counter_value(&server, "count")
     };
@@ -1791,8 +1787,11 @@ fn a_brush_entity_is_found_by_its_model_index() {
             ("wait", "-1"),
         ]),
         // A classname the port has no implementation for: no placement, so
-        // whoever asks leaves it where the lump put it.
-        block(&[("classname", "trigger_once"), ("model", "*2")]),
+        // whoever asks leaves it where the lump put it — and, since stage 4,
+        // leaves it out of the player's clip chain too. `func_portal_bumper`
+        // is the ninth commonest classname in the game and is exactly the
+        // reason that rule exists: 2,383 of them, none solid to a player.
+        block(&[("classname", "func_portal_bumper"), ("model", "*2")]),
     ];
     let mut server = Server::new();
     server.level_init("test", &map, &door_models());
@@ -1800,7 +1799,7 @@ fn a_brush_entity_is_found_by_its_model_index() {
     assert_eq!(server.brush_entity_count(), 1);
     assert!(
         server.brush_entity(2).is_none(),
-        "trigger_once has no class"
+        "func_portal_bumper has no class"
     );
     assert!(server.brush_entity(0).is_none(), "model 0 is the world");
     close(
@@ -1967,7 +1966,8 @@ fn the_travel_is_the_model_minus_the_lip_minus_two() {
 /// A new name appearing here is a regression; a name leaving it is progress.
 /// Either way this table changes and the change should be deliberate.
 const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
-    ("//ontrigger", 1),
+    ("//onstarttouch", 2),
+    ("//ontrigger", 2),
     ("_ambienthdr", 25),
     ("_ambientscalehdr", 25),
     ("_cone", 2470),
@@ -1983,7 +1983,7 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("_linear_attn", 4096),
     ("_minlight", 169),
     ("_onmapspawn", 1),
-    ("_ontrigger", 17),
+    ("_ontrigger", 21),
     ("_quadratic_attn", 7121),
     ("_zero_percent_distance", 4292),
     ("addonpoints", 1),
@@ -1995,14 +1995,19 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("mapversion", 106),
     ("message", 3),
     ("npcpoints", 1),
+    ("onendtouchblueplayer", 1),
+    ("onendtouchorangeplayer", 1),
     ("onfullyopen", 2),
     ("onproxyrelay", 135),
-    ("ontrigger", 6),
+    ("onstarttouchblueplayer", 1),
+    ("onstarttouchorangeplayer", 1),
+    ("ontrigger", 15),
     ("onunpressed", 2),
     ("paintinmap", 25),
+    ("skin", 1),
     ("sunspreadangle", 27),
     ("vrad_brush_cast_shadows", 2456),
-    ("vscripts", 1),
+    ("vscripts", 38),
 ];
 
 /// Every shipped map's entity lump, spawned and then **run** for two seconds
@@ -2060,6 +2065,10 @@ fn every_shipped_map_spawns_its_entities() {
     let mut brush_entities = 0;
     let mut moved = 0;
     let mut still_moving = 0;
+    // Stage 4's parse-side metric: how many of the game's brush entities are
+    // triggers this port has a class for, and therefore how much of a map is
+    // now able to notice the player.
+    let mut triggers = 0;
 
     for name in &names {
         let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
@@ -2114,6 +2123,30 @@ fn every_shipped_map_spawns_its_entities() {
             *total.unhandled.entry(key.clone()).or_default() += count;
         }
 
+        // `ClientPutInServer`. The player joins after the map's own entities,
+        // as it does in `Scene::load`, so that `!player` resolves for the
+        // 1,640 connections in the game that name it. It does not *move* here
+        // — the touch pass needs collision, which is
+        // `every_shipped_maps_triggers_notice_the_player`'s job — so what this
+        // adds is the I/O half: `point_teleport`, `Kill`, and every other
+        // input aimed at `!player`.
+        let spawn = bsp
+            .entities()
+            .iter()
+            .find(|e| e.classname() == Some("info_player_start"))
+            .and_then(|e| e.vector("origin"))
+            .unwrap_or(glam::Vec3::ZERO);
+        server.spawn_player(player_at(spawn));
+
+        for (_, entity) in server.entities.iter() {
+            if entity
+                .core
+                .is_solid_flag_set(crate::server::movement::FSOLID_TRIGGER)
+            {
+                triggers += 1;
+            }
+        }
+
         // Where every brush entity starts, so that the run below can be asked
         // whether anything actually moved.
         brush_entities += server.brush_entity_count();
@@ -2129,7 +2162,7 @@ fn every_shipped_map_spawns_its_entities() {
         let interval = server.time().interval;
         let ticks = (RUN_SECONDS / interval).round() as u32;
         for _ in 0..ticks {
-            server.frame(interval);
+            server.frame(interval, &mut NoTouchQuery);
             peak_thinks = peak_thinks.max(server.thinks.len());
         }
 
@@ -2198,7 +2231,8 @@ fn every_shipped_map_spawns_its_entities() {
     println!(
         "    {brush_entities} brush entities have a class; \
          {moved} of them are not where the lump put them, \
-         {still_moving} are still moving"
+         {still_moving} are still moving; \
+         {triggers} are live triggers"
     );
     println!("  inputs nothing handled:");
     let mut unhandled_inputs: Vec<_> = io.unhandled.iter().collect();
@@ -2218,13 +2252,14 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(total.removed_on_spawn, 6_937, "unnamed lights");
 
     // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
-    // stage 2 took it to 19,229 and 12,292, and stage 3's six brush classes
-    // are 3,410 more of both.
-    assert_eq!(total.matched, 22_639);
-    assert_eq!(total.spawned, 15_702);
-    assert_eq!(total.outputs, 47_541);
-    assert_eq!(total.unknown.len(), 179);
-    assert_eq!(total.unknown.values().sum::<usize>(), 38_286);
+    // stage 2 took it to 19,229 and 12,292, stage 3's six brush classes were
+    // 3,410 more of both, and stage 4's twelve — five triggers, six filters
+    // and `point_teleport` — are 3,322 more again.
+    assert_eq!(total.matched, 25_961);
+    assert_eq!(total.spawned, 19_024);
+    assert_eq!(total.outputs, 53_155);
+    assert_eq!(total.unknown.len(), 167);
+    assert_eq!(total.unknown.values().sum::<usize>(), 34_964);
     assert_eq!(
         named_lights, 213,
         "lights that survive because they are named"
@@ -2259,6 +2294,23 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("func_movelinear"), Some(&196));
     assert_eq!(per_class.get("func_button"), Some(&64));
     assert_eq!(per_class.get("func_rotating"), Some(&27));
+    // Stage 4's. `trigger_once` is the fifth commonest classname in the game.
+    assert_eq!(per_class.get("trigger_once"), Some(&1_476));
+    assert_eq!(per_class.get("trigger_multiple"), Some(&899));
+    assert_eq!(per_class.get("trigger_hurt"), Some(&215));
+    assert_eq!(per_class.get("trigger_push"), Some(&192));
+    assert_eq!(per_class.get("trigger_teleport"), Some(&110));
+    assert_eq!(per_class.get("point_teleport"), Some(&128));
+    assert_eq!(per_class.get("filter_activator_class"), Some(&212));
+    assert_eq!(per_class.get("filter_activator_name"), Some(&74));
+    assert_eq!(per_class.get("filter_multi"), Some(&9));
+    assert_eq!(per_class.get("filter_player_held"), Some(&4));
+    assert_eq!(per_class.get("filter_damage_type"), Some(&2));
+    assert_eq!(per_class.get("filter_activator_model"), Some(&1));
+    // …and **no `player`**: the class is registered because Valve registers
+    // it, and no shipped map places one. The 106 in the list are the ones
+    // `spawn_player` put there, counted after this loop.
+    assert_eq!(per_class.get("player"), None);
 
     // 105 of the 106 maps place a tone mapper; `sp_a5_credits` is the one that
     // does not.
@@ -2270,12 +2322,12 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The run side. These are what two seconds of every shipped map does.
     assert_eq!(io.dispatched, 5_766);
-    assert_eq!(io.accepted, 2_286);
-    assert_eq!(io.thinks, 1_241);
+    assert_eq!(io.accepted, 2_480);
+    assert_eq!(io.thinks, 1_450);
     // Most events reach nothing because most *targets* are entities of classes
     // this port has not got — `prop_dynamic` alone is 8,072 of them. Expect
     // this number to fall as classes land.
-    assert_eq!(io.no_target, 2_770);
+    assert_eq!(io.no_target, 2_548);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -2300,15 +2352,17 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(
         unhandled,
         vec![
-            ("!player (needs a player)", 97),
-            ("!player_blue (needs a player)", 37),
-            ("!player_orange (needs a player)", 37),
+            ("!player_blue (no such player)", 37),
+            ("!player_orange (no such player)", 37),
             ("func_brush.SetParent", 12),
             ("func_brush.SetParentAttachmentMaintainOffset", 883),
             ("info_target.SetParent", 1),
             ("info_target.SetParentAttachment", 12),
             ("info_target.SetParentAttachmentMaintainOffset", 1),
             ("logic_relay.RunScriptCode", 1),
+            ("player.SetFogController", 97),
+            ("trigger_hurt.SetParentAttachmentMaintainOffset", 19),
+            ("trigger_multiple.SetParentAttachmentMaintainOffset", 2),
         ],
         "the set of inputs nothing handles has changed"
     );
@@ -2322,9 +2376,21 @@ fn every_shipped_map_spawns_its_entities() {
     // it is not **zero** — before stage 3 nothing in any map moved at all —
     // and that 34 of them are still in flight when the clock stops, so the
     // simulation list is being entered and left rather than filled once.
-    assert_eq!(brush_entities, 3_410);
+    //
+    // **Stage 4 doubled the brush-entity count and moved nothing extra**, and
+    // both halves are the point: the five trigger classes are 2,892 more brush
+    // entities the game now answers for, and not one of them is a mover.
+    assert_eq!(brush_entities, 6_302);
     assert_eq!(moved, 67, "brush entities that left their spawn placement");
     assert_eq!(still_moving, 34, "…and were still travelling at 2s");
+
+    // Stage 4's own parse-side number: of those 6,302, how many are *live*
+    // triggers two ticks into the map — `FSOLID_TRIGGER` set, so the touch
+    // pass will look at them. 2,892 triggers are placed and 637 of them are
+    // `StartDisabled`, including **107 of the game's 110 `trigger_teleport`s**.
+    // `every_shipped_maps_triggers_notice_the_player` then walks a player into
+    // every one.
+    assert_eq!(triggers, 2_255);
 
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
@@ -2332,8 +2398,10 @@ fn every_shipped_map_spawns_its_entities() {
     // **Stage 3 put every moving entity in this list and the peak did not
     // change**, which is the measurement `think.rs` said to retake: a mover is
     // only in it while it is actually travelling, and the 43 is set by the
-    // `logic_auto` bootstrap rather than by anything that moves.
-    assert_eq!(peak_thinks, 43);
+    // `logic_auto` bootstrap rather than by anything that moves. Stage 4 takes
+    // it to 48 — a `trigger_multiple` holds a think for its whole `wait`, and
+    // a `trigger_once` for the tenth of a second before it deletes itself.
+    assert_eq!(peak_thinks, 48);
 
     // The one map this port looks at most, and the headline of the whole
     // stage: `sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default
@@ -2346,11 +2414,1145 @@ fn every_shipped_map_spawns_its_entities() {
     server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
     let interval = server.time().interval;
     for _ in 0..(RUN_SECONDS / interval).round() as u32 {
-        server.frame(interval);
+        server.frame(interval, &mut NoTouchQuery);
     }
     let settings = server.tonemap_settings();
     assert!(settings.use_custom_auto_exposure_max);
     assert_eq!(settings.custom_auto_exposure_max, 1.5);
     assert_eq!(settings.custom_auto_exposure_min, 1.0);
     assert_eq!(settings.rate, 0.25);
+}
+
+// ===========================================================================
+// stage 4 — touch, triggers, filters and the player
+// ===========================================================================
+
+/// A [`TouchQuery`] over axis-aligned boxes in world space.
+///
+/// The real one sweeps the toucher's hull against each brush model's own
+/// brushes (`World::brush_models_touching`, tested against a real map in
+/// `engine::world`). This is the *shape* of that answer with none of the
+/// geometry, which is what a test about the touch link list wants: the
+/// question here is what happens once two things overlap, not which two do.
+struct BoxTriggers {
+    /// `("*N" index, world-space mins, world-space maxs)`.
+    boxes: Vec<(usize, Vec3, Vec3)>,
+}
+
+impl BoxTriggers {
+    fn new(boxes: &[(usize, Vec3, Vec3)]) -> BoxTriggers {
+        BoxTriggers {
+            boxes: boxes.to_vec(),
+        }
+    }
+}
+
+impl TouchQuery for BoxTriggers {
+    fn brush_models_touching(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        out: &mut Vec<usize>,
+    ) {
+        // The swept hull's own bounds, which is a conservative stand-in for a
+        // real sweep and exact for the axis-aligned motion these tests use.
+        let sweep_min = start.min(end) + mins;
+        let sweep_max = start.max(end) + maxs;
+        for &(index, min, max) in &self.boxes {
+            let overlaps = (0..3).all(|i| sweep_min[i] <= max[i] && sweep_max[i] >= min[i]);
+            if overlaps {
+                out.push(index);
+            }
+        }
+    }
+}
+
+/// Runs `seconds` of server time with a touch query in place.
+fn run_touching(server: &mut Server, query: &mut dyn TouchQuery, seconds: f32) {
+    let interval = server.time().interval;
+    let ticks = (seconds / interval).round() as u32;
+    ticks_touching(server, query, ticks);
+}
+
+/// The same, counted in ticks — for the tests where "one tick" is the point.
+fn ticks_touching(server: &mut Server, query: &mut dyn TouchQuery, ticks: u32) {
+    let interval = server.time().interval;
+    for _ in 0..ticks {
+        server.frame(interval, query);
+    }
+}
+
+/// A player hull, standing, at `origin`.
+fn player_at(origin: Vec3) -> PlayerState {
+    PlayerState {
+        origin,
+        angles: Vec3::ZERO,
+        velocity: Vec3::ZERO,
+        base_velocity: Vec3::ZERO,
+        on_ground: true,
+        noclip: false,
+        mins: Vec3::new(-16.0, -16.0, 0.0),
+        maxs: Vec3::new(16.0, 16.0, 72.0),
+    }
+}
+
+/// The bounding box a `BoxTriggers` entry uses for model `*1` in these tests:
+/// a room-sized volume around the origin.
+fn trigger_box() -> (Vec3, Vec3) {
+    (Vec3::new(-64.0, -64.0, 0.0), Vec3::new(64.0, 64.0, 128.0))
+}
+
+/// A map with one trigger of `classname`, named `zone`, wired to a counter.
+fn trigger_map(classname: &str, output: &str, extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("classname", classname),
+        ("targetname", "zone"),
+        ("model", "*1"),
+        // `SF_TRIGGER_ALLOW_CLIENTS`, which 1,220 of the game's 1,476
+        // `trigger_once`s carry (as 4097, with Hammer's default mass bit).
+        ("spawnflags", "1"),
+    ];
+    pairs.extend_from_slice(extra);
+    let conn_value = conn("count", "Add", "1", "0", "-1");
+    let mut trigger = block(&pairs);
+    trigger.pairs.push((output.to_owned(), conn_value));
+
+    vec![
+        block(&[("classname", "worldspawn")]),
+        trigger,
+        block(&[("classname", "math_counter"), ("targetname", "count")]),
+    ]
+}
+
+/// Two models: the world, and a 128-unit cube for the trigger.
+fn trigger_models() -> Vec<bsp::Model> {
+    vec![
+        model([-512.0, -512.0, -512.0], [512.0, 512.0, 512.0]),
+        model([-64.0, -64.0, 0.0], [64.0, 64.0, 128.0]),
+    ]
+}
+
+/// The stage, in one test: the player walks into a volume and the map notices.
+#[test]
+fn walking_into_a_trigger_fires_its_outputs() {
+    let map = trigger_map("trigger_multiple", "OnStartTouch", &[("wait", "1")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+
+    // Outside: nothing.
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 0.0);
+
+    // Inside.
+    server.set_player_state(player_at(Vec3::ZERO));
+    run_touching(&mut server, &mut query, 0.1);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// `SF_TRIGGER_ALLOW_CLIENTS` is what makes a trigger notice a player, and a
+/// trigger without it notices nothing — 141 of the game's `trigger_multiple`s
+/// are physics-only in exactly this way.
+#[test]
+fn a_trigger_that_does_not_allow_clients_ignores_the_player() {
+    let mut map = trigger_map("trigger_multiple", "OnStartTouch", &[]);
+    // Spawnflag 8 alone: `SF_TRIGGER_ALLOW_PHYSICS`.
+    map[1]
+        .pairs
+        .iter_mut()
+        .find(|(k, _)| k == "spawnflags")
+        .expect("spawnflags")
+        .1 = String::from("8");
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 0.0);
+}
+
+/// `CTriggerOnce::Spawn`'s one line — `m_flWait = -1` — sends
+/// `ActivateMultiTrigger` down the branch that stops touching and schedules
+/// `SUB_Remove` 0.1 s later.
+#[test]
+fn a_trigger_once_fires_once_and_then_deletes_itself() {
+    let map = trigger_map("trigger_once", "OnTrigger", &[]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+
+    run_touching(&mut server, &mut query, 0.05);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+    assert!(server.brush_entity(1).is_some(), "still there for 0.1s");
+
+    run_touching(&mut server, &mut query, 0.5);
+    assert_eq!(counter_value(&server, "count"), 1.0, "and only once");
+    assert!(
+        server.brush_entity(1).is_none(),
+        "SUB_Remove ran a tenth of a second later"
+    );
+}
+
+/// A `trigger_multiple`'s re-trigger lock-out **is the think schedule**:
+/// `if ( GetNextThink() > gpGlobals->curtime ) return`.
+#[test]
+fn a_trigger_multiple_re_arms_after_its_wait() {
+    let map = trigger_map("trigger_multiple", "OnTrigger", &[("wait", "1")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+
+    run_touching(&mut server, &mut query, 0.9);
+    assert_eq!(counter_value(&server, "count"), 1.0, "once inside the wait");
+    run_touching(&mut server, &mut query, 0.3);
+    assert_eq!(counter_value(&server, "count"), 2.0, "and again after it");
+}
+
+/// `OnEndTouch` and `OnEndTouchAll` are driven by the touch **stamp**, not by
+/// a second geometric test: a link the tick did not restamp is a touch that
+/// ended.
+#[test]
+fn leaving_a_trigger_fires_on_end_touch() {
+    let mut map = trigger_map("trigger_multiple", "OnStartTouch", &[("wait", "1")]);
+    map[1].pairs.push((
+        String::from("OnEndTouch"),
+        conn("count", "Add", "10", "0", "-1"),
+    ));
+    map[1].pairs.push((
+        String::from("OnEndTouchAll"),
+        conn("count", "Add", "100", "0", "-1"),
+    ));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.1);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+
+    server.set_player_state(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut query, 0.1);
+    assert_eq!(
+        counter_value(&server, "count"),
+        111.0,
+        "OnEndTouch and OnEndTouchAll, in the same tick"
+    );
+}
+
+/// Only one side of a touch owes an `EndTouch`, and it is the trigger's.
+#[test]
+fn only_the_trigger_side_of_a_touch_carries_the_start_flag() {
+    let map = trigger_map("trigger_multiple", "OnStartTouch", &[]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    let player = server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.05);
+
+    let trigger = find_named(&server, "zone");
+    assert_eq!(trigger.touch_links.len(), 1);
+    assert!(
+        trigger.touch_links[0].start_touch,
+        "the trigger fired StartTouch and owes an EndTouch"
+    );
+
+    let player = server.entities.get(player).expect("the player");
+    assert_eq!(player.touch_links.len(), 1);
+    assert!(
+        !player.touch_links[0].start_touch,
+        "the other side of the link is a trigger, so the player owes nothing"
+    );
+}
+
+/// A `trigger_once` deleting itself fires **no** `OnEndTouch`, because
+/// `PhysicsRemoveTouchedList` frees its own links rather than removing them.
+#[test]
+fn a_trigger_that_deletes_itself_fires_no_end_touch() {
+    let mut map = trigger_map("trigger_once", "OnTrigger", &[]);
+    map[1].pairs.push((
+        String::from("OnEndTouch"),
+        conn("count", "Add", "10", "0", "-1"),
+    ));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.5);
+
+    assert!(server.brush_entity(1).is_none(), "it went");
+    assert_eq!(
+        counter_value(&server, "count"),
+        1.0,
+        "OnTrigger only — the OnEndTouch never fires"
+    );
+}
+
+/// `Enable`/`Disable` move `FSOLID_TRIGGER`, which is what the touch pass
+/// filters on — so a disabled trigger is simply not asked about.
+#[test]
+fn a_disabled_trigger_notices_nothing_until_it_is_enabled() {
+    let map = trigger_map(
+        "trigger_multiple",
+        "OnStartTouch",
+        &[("wait", "1"), ("StartDisabled", "1")],
+    );
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 0.0);
+
+    let zone = find_named(&server, "zone").id();
+    server.accept_input(zone, "Enable", Variant::Void, None, None, 0);
+    run_touching(&mut server, &mut query, 0.1);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// The filter that 250 of the game's `trigger_multiple`s wear: cubes only, so
+/// a player walking through does nothing.
+#[test]
+fn a_class_filter_keeps_the_player_out() {
+    let mut map = trigger_map(
+        "trigger_multiple",
+        "OnStartTouch",
+        &[("wait", "1"), ("filtername", "cubes")],
+    );
+    map.push(block(&[
+        ("classname", "filter_activator_class"),
+        ("targetname", "cubes"),
+        ("filterclass", "prop_weighted_cube"),
+        ("Negated", "Allow entities that match criteria"),
+    ]));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(
+        counter_value(&server, "count"),
+        0.0,
+        "the player is not a cube"
+    );
+}
+
+/// …and negating it lets everything *but* a cube through. Hammer writes the
+/// choices label rather than the number, and `atoi` of a label is 0 — three of
+/// the game's 74 name filters carry a literal `1` instead.
+#[test]
+fn a_negated_filter_is_the_other_way_round() {
+    let mut map = trigger_map(
+        "trigger_multiple",
+        "OnStartTouch",
+        &[("wait", "1"), ("filtername", "not_cubes")],
+    );
+    map.push(block(&[
+        ("classname", "filter_activator_class"),
+        ("targetname", "not_cubes"),
+        ("filterclass", "prop_weighted_cube"),
+        ("Negated", "1"),
+    ]));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// `filter_multi` is the one class in the game whose handler reads *other*
+/// entities while it is being dispatched — the condition `rustdocs/SERVER.md`
+/// said would change `Context`'s shape, and it did.
+#[test]
+fn filter_multi_combines_its_children() {
+    // AND( name is "!player", class is not "prop_weighted_cube" ).
+    let mut map = trigger_map(
+        "trigger_multiple",
+        "OnStartTouch",
+        &[("wait", "1"), ("filtername", "both")],
+    );
+    map.push(block(&[
+        ("classname", "filter_multi"),
+        ("targetname", "both"),
+        ("FilterType", "0"),
+        ("Filter01", "is_player"),
+        ("Filter02", "not_a_cube"),
+    ]));
+    map.push(block(&[
+        ("classname", "filter_activator_name"),
+        ("targetname", "is_player"),
+        ("filtername", "!player"),
+    ]));
+    map.push(block(&[
+        ("classname", "filter_activator_class"),
+        ("targetname", "not_a_cube"),
+        ("filterclass", "prop_weighted_cube"),
+        ("Negated", "1"),
+    ]));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 1.0, "both children pass");
+
+    // …and an OR of a passing and a failing child also passes, where an AND
+    // would not: swap one child for one that refuses everything.
+    let mut map = trigger_map(
+        "trigger_multiple",
+        "OnStartTouch",
+        &[("wait", "1"), ("filtername", "either")],
+    );
+    map.push(block(&[
+        ("classname", "filter_multi"),
+        ("targetname", "either"),
+        ("FilterType", "1"),
+        ("Filter01", "is_player"),
+        ("Filter02", "is_a_cube"),
+    ]));
+    map.push(block(&[
+        ("classname", "filter_activator_name"),
+        ("targetname", "is_player"),
+        ("filtername", "!player"),
+    ]));
+    map.push(block(&[
+        ("classname", "filter_activator_class"),
+        ("targetname", "is_a_cube"),
+        ("filterclass", "prop_weighted_cube"),
+    ]));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.2);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// **121 of the game's 128 `point_teleport`s target `!player`**, so this is
+/// the class the player entity pays for.
+#[test]
+fn point_teleport_sends_the_player_where_it_was_told() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "point_teleport"),
+            ("targetname", "go"),
+            ("target", "!player"),
+            ("origin", "512 256 64"),
+            ("angles", "0 90 0"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let go = find_named(&server, "go").id();
+    server.accept_input(go, "Teleport", Variant::Void, None, None, 0);
+
+    let state = server.player_state().expect("a player");
+    close(state.origin, Vec3::new(512.0, 256.0, 64.0));
+    close(state.angles, Vec3::new(0.0, 90.0, 0.0));
+}
+
+/// A `trigger_teleport` with a landmark carries the toucher's *offset* across
+/// rather than dropping it on the destination — which is how the elevator
+/// between chapters works, and how 37 of the game's 110 are set up.
+#[test]
+fn a_landmark_teleport_carries_the_offset_across() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_teleport"),
+            ("targetname", "zone"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("target", "there"),
+            ("landmark", "here"),
+        ]),
+        // The landmark and the destination, 1,000 units apart and both facing
+        // the same way, so the offset survives unrotated.
+        block(&[
+            ("classname", "info_target"),
+            ("targetname", "here"),
+            ("origin", "0 0 0"),
+        ]),
+        block(&[
+            ("classname", "info_target"),
+            ("targetname", "there"),
+            ("origin", "1000 0 0"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::new(10.0, 20.0, 0.0)));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    // **One tick.** A `trigger_teleport` teleports on every `Touch`, so a
+    // player left standing in one is moved every tick — which is the shipped
+    // behaviour and is why the 37 elevator teleports in the game are
+    // `StartDisabled` and fire once.
+    ticks_touching(&mut server, &mut query, 1);
+
+    let state = server.player_state().expect("a player");
+    close(state.origin, Vec3::new(1010.0, 20.0, 0.0));
+
+    // …and the next tick does not sweep the 1,000 units it just crossed: the
+    // teleport reset the swept-from point, so nothing between here and there
+    // is touched on the way.
+    ticks_touching(&mut server, &mut query, 1);
+    close(
+        server.player_state().expect("a player").origin,
+        Vec3::new(1010.0, 20.0, 0.0),
+    );
+}
+
+/// …and with no landmark the toucher lands *on* the destination.
+#[test]
+fn a_teleport_with_no_landmark_lands_on_its_target() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_teleport"),
+            ("targetname", "zone"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("target", "there"),
+        ]),
+        block(&[
+            ("classname", "info_target"),
+            ("targetname", "there"),
+            ("origin", "1000 0 0"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::new(10.0, 20.0, 0.0)));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    ticks_touching(&mut server, &mut query, 1);
+
+    // `vecPentTargetOrigin.z -= pOther->WorldAlignMins().z` for a player, and
+    // Portal 2's standing hull has `mins.z == 0`, so it is a no-op.
+    close(
+        server.player_state().expect("a player").origin,
+        Vec3::new(1000.0, 0.0, 0.0),
+    );
+}
+
+/// `trigger_push` sets a base velocity every tick it is pushing, and the tick
+/// after the player leaves, `CheckMovingGround` turns it into real velocity
+/// with a `1 + frametime/2` boost.
+#[test]
+fn a_push_is_a_base_velocity_and_then_momentum() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_push"),
+            ("targetname", "blower"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            // `AngleVectors( "0 0 0" )` is `+X`.
+            ("pushdir", "0 0 0"),
+            ("speed", "150"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.05);
+
+    // **Twice the map's number**: `CTriggerPush::Activate`'s Portal 2
+    // single-player doubling.
+    let state = server.player_state().expect("a player");
+    close(state.base_velocity, Vec3::new(300.0, 0.0, 0.0));
+    close(state.velocity, Vec3::ZERO);
+
+    // Step out. The base velocity survives one more tick — the flag from the
+    // last touch is still set when `CheckMovingGround` looks — and becomes
+    // momentum on the one after.
+    server.set_player_state(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut query, 0.05);
+    let state = server.player_state().expect("a player");
+    close(state.base_velocity, Vec3::ZERO);
+    let interval = server.time().interval;
+    close(
+        state.velocity,
+        Vec3::new(300.0 * (1.0 + interval * 0.5), 0.0, 0.0),
+    );
+}
+
+/// A noclipping player is not pushed. `CTriggerPush::Touch`'s switch has
+/// `MOVETYPE_NOCLIP` fall straight out.
+#[test]
+fn a_noclipping_player_is_not_pushed() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_push"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("pushdir", "0 0 0"),
+            ("speed", "150"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    let mut state = player_at(Vec3::ZERO);
+    state.noclip = true;
+    server.spawn_player(state);
+    server.set_player_state(state);
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 0.1);
+    close(
+        server.player_state().expect("a player").base_velocity,
+        Vec3::ZERO,
+    );
+}
+
+/// `trigger_hurt` fires its outputs on Valve's half-second cadence and takes
+/// nothing away, because there is no health — see `classes::TriggerHurt`.
+#[test]
+fn a_hurt_trigger_fires_on_hurt_player_twice_a_second() {
+    let mut map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_hurt"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("damage", "20"),
+        ]),
+        block(&[("classname", "math_counter"), ("targetname", "count")]),
+    ];
+    map[1].pairs.push((
+        String::from("OnHurtPlayer"),
+        conn("count", "Add", "1", "0", "-1"),
+    ));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    // `Touch` arms the think at `curtime`, and the touch pass runs *before*
+    // the thinks in the same tick — so the first dose lands immediately, and
+    // then one every half second.
+    run_touching(&mut server, &mut query, 1.1);
+    assert_eq!(counter_value(&server, "count"), 3.0);
+
+    // > **Walking out charges nothing extra, and that is Valve's.**
+    // > `EndTouch`'s parting half-dose is gated on the toucher not being in
+    // > `m_hurtEntities`, and that list is only cleared at the *start* of a
+    // > `HurtAllTouchers` — so anyone who has been hurt at all this cycle is
+    // > in it. With one toucher and a think that fires on the same tick as
+    // > the first touch, the branch is unreachable. See
+    // > [`a_radiation_trigger_charges_on_the_way_out`] for the shape that
+    // > does reach it.
+    //
+    // [`a_radiation_trigger_charges_on_the_way_out`]: fn@a_radiation_trigger_charges_on_the_way_out
+    server.set_player_state(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut query, 0.1);
+    assert_eq!(counter_value(&server, "count"), 3.0);
+}
+
+/// The one shape that reaches `CTriggerHurt::EndTouch`'s parting dose, and
+/// the reason it is worth having: a **radiation** trigger already has a think,
+/// so `Touch` does not arm the half-second one and a quick walk through would
+/// otherwise be free.
+///
+/// 27 of the game's 215 `trigger_hurt`s set `DMG_RADIATION`.
+#[test]
+fn a_radiation_trigger_charges_on_the_way_out() {
+    let mut map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_hurt"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            ("damage", "20"),
+            // `DMG_RADIATION`.
+            ("damagetype", "262144"),
+        ]),
+        block(&[("classname", "math_counter"), ("targetname", "count")]),
+    ];
+    map[1].pairs.push((
+        String::from("OnHurtPlayer"),
+        conn("count", "Add", "1", "0", "-1"),
+    ));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    // Long enough outside that a `RadiationThink` has run `HurtAllTouchers`
+    // against an empty trigger and cleared the hurt list.
+    run_touching(&mut server, &mut query, 1.0);
+    assert_eq!(counter_value(&server, "count"), 0.0);
+
+    // In for one tick — no immediate dose, because the think is the radiation
+    // one and is already armed.
+    server.set_player_state(player_at(Vec3::ZERO));
+    ticks_touching(&mut server, &mut query, 1);
+    assert_eq!(counter_value(&server, "count"), 0.0);
+
+    // …and out again, which is where the half-dose lands. **Two ticks**: the
+    // first still touches, because the sweep from the old origin to the new
+    // one crosses the trigger — which is the anti-tunnelling property doing
+    // its job rather than a quirk of the test.
+    server.set_player_state(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+    ticks_touching(&mut server, &mut query, 2);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// The player is in the entity list, so `!player` resolves and the 1,640
+/// connections in the game that name it reach something.
+#[test]
+fn the_player_is_an_entity_and_resolves_procedurally() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[("classname", "info_target"), ("targetname", "spot")]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    assert!(server.player().is_none(), "no client, no player");
+
+    let player = server.spawn_player(player_at(Vec3::ZERO));
+    assert_eq!(server.player(), Some(player));
+    assert!(
+        server
+            .entities
+            .get(player)
+            .expect("alive")
+            .behaviour
+            .is_player(),
+        "IsPlayer()"
+    );
+
+    // `Kill` at `!player` removes it, which two shipped connections send.
+    let spot = find_named(&server, "spot").id();
+    {
+        let time = server.time();
+        let Server {
+            entities,
+            queue,
+            random,
+            ..
+        } = &mut server;
+        let mut cx = Context::new(time, queue, random, entities, Some(player));
+        cx.post_named("!player", "Kill", Variant::Void, 0.0, None, Some(spot), 0);
+    }
+    run(&mut server, 0.1);
+    assert!(server.player().is_none(), "the handle stopped resolving");
+}
+
+/// Where a standing player's **feet** have to be for its hull to be inside
+/// brush model `index`'s actual brushes, or `None`.
+///
+/// Feet, not the box centre: `Player::origin` is the feet and the hull runs
+/// 72 units up from there, so a probe that answered in centres would place
+/// every player half a hull too high — which is exactly the mistake this
+/// comment exists to stop, and which cost thirteen thin triggers on the first
+/// run.
+///
+/// The bounding-box centre first, because for a plain box trigger — most of
+/// them — that is it in one test; then a 5×5×5 lattice inset into the box.
+/// Used only by the depot test below, to answer "where would a player have to
+/// be" without hand-annotating two thousand triggers.
+#[cfg(test)]
+fn probe_inside(
+    collision: &crate::engine::trace::CollisionBsp,
+    placed: &[crate::engine::world::PlacedBrushModel],
+    index: usize,
+    mins: Vec3,
+    maxs: Vec3,
+) -> Option<Vec3> {
+    use crate::engine::trace::{Contents, Ray};
+
+    let model = placed.iter().find(|p| p.index == index)?.model;
+    let mut tracer = collision.tracer();
+    let (hull_min, hull_max) = (Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 72.0));
+
+    let mut candidates = vec![(mins + maxs) * 0.5];
+    const STEPS: i32 = 5;
+    for i in 0..STEPS {
+        for j in 0..STEPS {
+            for k in 0..STEPS {
+                let t = |n: i32| (n as f32 + 0.5) / STEPS as f32;
+                candidates.push(mins + (maxs - mins) * Vec3::new(t(i), t(j), t(k)));
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        // The candidates are box centres, so the feet are half a hull lower.
+        .map(|centre| centre - Vec3::new(0.0, 0.0, 36.0))
+        .find(|&feet| {
+            let ray = Ray::hull(feet, feet, hull_min, hull_max);
+            let trace = tracer.trace_model(&ray, &model, Contents::MASK_SOLID);
+            trace.contents.intersects(Contents::MASK_SOLID)
+        })
+}
+
+/// **Every trigger in the shipped game, touched by a real player hull swept
+/// against its real brushes.**
+///
+/// The stage's headline measurement, and the one that could not be faked: it
+/// builds each map's collision, spawns a player, and walks it into the centre
+/// of every trigger the port has a class for — through
+/// [`World::brush_models_touching`](crate::engine::world::World::brush_models_touching),
+/// the same `ClipRayToCollideable` the running game uses — then asks whether
+/// the trigger noticed.
+///
+/// Three things fail loudly here and are invisible to every synthetic test
+/// above: a wrong `"*N"` join, a trigger whose `FSOLID_TRIGGER` never got set,
+/// and a swept-box test that answers for the model's *bounding box* rather
+/// than its brushes (a test chamber's triggers are L-shaped often enough that
+/// the two disagree).
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release triggers_notice -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_maps_triggers_notice_the_player() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
+
+    /// The engine's half of the touch query, over a map's placed brush models.
+    /// `engine/mod.rs`'s `WorldTouchQuery` without a `World` around it — the
+    /// depot test has no GPU and so cannot build one — and **the same
+    /// function body**, which is why `world/` exposes it free.
+    struct Placed<'a> {
+        collision: &'a CollisionBsp,
+        models: &'a [PlacedBrushModel],
+    }
+
+    impl TouchQuery for Placed<'_> {
+        fn brush_models_touching(
+            &mut self,
+            start: Vec3,
+            end: Vec3,
+            mins: Vec3,
+            maxs: Vec3,
+            out: &mut Vec<usize>,
+        ) {
+            crate::engine::world::brush_models_touching(
+                self.collision,
+                self.models,
+                start,
+                end,
+                mins,
+                maxs,
+                out,
+            );
+        }
+    }
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+        .expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut visited, mut noticed, mut fired) = (0usize, 0usize, 0usize);
+    // A trigger with no point a standing player fits in, and one the map's own
+    // bootstrap switched off or deleted before the second tick.
+    let (mut unreachable, mut withdrawn) = (0usize, 0usize);
+    let mut by_class: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let collision = CollisionBsp::build(&bsp);
+        let entities = bsp.entities();
+        let placed = find_brush_models(&entities, &collision);
+
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+
+        // Every trigger the port has a class for, with the world-space box of
+        // the brush model it names.
+        let mut targets: Vec<(usize, &'static str, Vec3, Vec3)> = Vec::new();
+        for (_, entity) in server.entities.iter() {
+            if !entity
+                .core
+                .is_solid_flag_set(crate::server::movement::FSOLID_TRIGGER)
+            {
+                continue;
+            }
+            let Some(index) = entity
+                .core
+                .model
+                .as_deref()
+                .and_then(|m| m.strip_prefix('*'))
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let bounds = entity.core.model_bounds;
+            targets.push((
+                index,
+                entity.classname(),
+                entity.core.origin + bounds.mins,
+                entity.core.origin + bounds.maxs,
+            ));
+        }
+
+        // Only the models the server owns go into the query — the same rule
+        // `World::clip_models` follows.
+        // …with `owned` set, which is what `sync_brush_models` does in the
+        // running engine and what the filter above reads.
+        let owned: Vec<PlacedBrushModel> = placed
+            .iter()
+            .filter(|p| server.brush_entity(p.index).is_some())
+            .cloned()
+            .map(|mut p| {
+                p.owned = true;
+                p
+            })
+            .collect();
+
+        for (index, classname, mins, maxs) in targets {
+            // **A fresh level per trigger.** Triggers overlap, and a
+            // `trigger_once` fired by standing in its neighbour deletes itself
+            // a tenth of a second later — so a shared server visits some of
+            // them after they have gone. That is correct behaviour and a
+            // useless measurement.
+            server.level_init(name, &entities, &bsp.models);
+
+            visited += 1;
+            let entry = by_class.entry(classname).or_default();
+            entry.0 += 1;
+
+            // A point inside the trigger's *brushes*, which is not the same as
+            // a point inside its bounding box: a Portal 2 trigger is often two
+            // slabs either side of a doorway, or an L around a corner, and the
+            // box centre of one of those is empty air. The probe is the same
+            // sweep the touch pass uses, aimed at this one model.
+            let Some(probe) = probe_inside(&collision, &placed, index, mins, maxs) else {
+                unreachable += 1;
+                continue;
+            };
+
+            let before = server.io.dispatched;
+            server.spawn_player(player_at(probe));
+            let mut query = Placed {
+                collision: &collision,
+                models: &owned,
+            };
+            // Two ticks, and a touch on **either** counts: a
+            // `trigger_teleport` moves the player out of itself on the first
+            // one, so its link is gone by the second.
+            let interval = server.time().interval;
+            server.frame(interval, &mut query);
+            let touched = server
+                .brush_entity(index)
+                .is_some_and(|e| !e.touch_links.is_empty());
+            server.frame(interval, &mut query);
+            let touched = touched
+                || server
+                    .brush_entity(index)
+                    .is_some_and(|e| !e.touch_links.is_empty());
+
+            if touched {
+                noticed += 1;
+                entry.1 += 1;
+            } else {
+                // The map's own bootstrap can take a trigger away before the
+                // second tick: a `logic_relay`'s `OnSpawn` fires one tick in,
+                // and a `Kill` or a `Disable` on the other end of it is
+                // ordinary level design. Distinguish that from a failure to
+                // notice.
+                match server.brush_entity(index) {
+                    // The map killed the player — two of them do, through a
+                    // `logic_relay`'s `OnSpawn` and a `point_teleport`.
+                    _ if server.player().is_none() => withdrawn += 1,
+                    None => withdrawn += 1,
+                    Some(e) if !e.is_solid_flag_set(crate::server::movement::FSOLID_TRIGGER) => {
+                        withdrawn += 1
+                    }
+                    Some(_) => println!("    MISS {name} *{index} {classname} at {probe:?}"),
+                }
+            }
+            if server.io.dispatched > before {
+                fired += 1;
+            }
+        }
+    }
+
+    println!("\n{} maps", names.len());
+    println!(
+        "  {visited} triggers visited, {noticed} noticed the player, \
+         {fired} of them fired something;\n  \
+         {unreachable} had no point a standing player fits in, \
+         {withdrawn} were switched off or deleted by the map before the second tick"
+    );
+    for (classname, (visited, noticed)) in &by_class {
+        println!("    {noticed:>5} of {visited:>5}  {classname}");
+    }
+
+    assert_eq!(names.len(), 106);
+    // Every trigger a player can physically stand in must notice one standing
+    // in it. There is no room for a partial answer: a miss is a wrong `"*N"`
+    // join, a missing `FSOLID_TRIGGER`, or a touch link that never formed.
+    assert_eq!(
+        noticed + unreachable + withdrawn,
+        visited,
+        "a trigger did not notice a player standing inside it"
+    );
+
+    // The exact census, so that a change has to be read rather than absorbed.
+    //
+    // **2,255 live triggers** is the 2,892 the maps place minus the 637 that
+    // are `StartDisabled` — 1,371 `trigger_once` of 1,476, 702
+    // `trigger_multiple` of 899, 142 `trigger_hurt` of 215, 37 `trigger_push`
+    // of 192 and 3 `trigger_teleport` of 110. **107 of the game's 110
+    // teleports start switched off**, which is what makes an elevator an
+    // elevator rather than a trap.
+    assert_eq!(visited, 2_255);
+    assert_eq!(noticed, 2_246);
+    // 1,879 of them get as far as dispatching something, which is the whole
+    // chain — geometry, `FSOLID_TRIGGER`, the touch link, `PassesTriggerFilters`
+    // and an output with a connection on it. The 367 that do not are triggers
+    // whose outputs go to entities this port has no class for, or whose filter
+    // says "cubes only".
+    assert_eq!(fired, 1_879);
+    // Three triggers in the game have no point a 32x32x72 hull fits inside.
+    assert_eq!(unreachable, 3);
+    // …and six are switched off, deleted, or take the player with them within
+    // two ticks of the map starting.
+    assert_eq!(withdrawn, 6);
+    assert!(visited > 2_000, "only {visited} triggers visited");
+}
+
+/// **Every brush class must set a solid *type*, and the ones that are solid
+/// must end up in the clip chain.**
+///
+/// This is the test the runtime found: stage 4 gave `EntityCore` a `Solid`
+/// and set it in `InitTrigger` and on the player, and the five stage-3 brush
+/// classes were left at `SOLID_NONE` — so `is_solid()` was false for every
+/// door in the game, `World::clip_models` was empty, and the clip chain
+/// silently collided with nothing. Every unit test still passed, because they
+/// all build a `PlacedBrushModel` by hand.
+#[test]
+fn every_brush_class_is_solid_unless_it_says_otherwise() {
+    /// One row of the table below: a classname, the keys to add to it, whether
+    /// it should end up with a solid *type*, and whether `is_solid()`.
+    type Case = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        bool,
+        bool,
+    );
+
+    const CASES: &[Case] = &[
+        ("func_door", &[], true, true),
+        ("func_door_rotating", &[], true, true),
+        ("func_movelinear", &[], true, true),
+        // `SF_MOVELINEAR_NOTSOLID`, which 92 of the game's 196 set: it keeps
+        // `SOLID_VPHYSICS` and adds the bit.
+        ("func_movelinear", &[("spawnflags", "8")], true, false),
+        ("func_button", &[], true, true),
+        // `SF_BUTTON_NOTSOLID` — zero of the game's 64, and **the one place
+        // anything here chooses `SOLID_NONE`**, which is why this case exists
+        // at all.
+        ("func_button", &[("spawnflags", "16384")], false, false),
+        ("func_rotating", &[], true, true),
+        // `SF_ROTATING_NOT_SOLID`, which 19 of the game's 27 set.
+        ("func_rotating", &[("spawnflags", "64")], true, false),
+        ("func_brush", &[], true, true),
+        // `Solidity` **1** is `BRUSHSOLID_NEVER`; 2 is `BRUSHSOLID_ALWAYS`.
+        ("func_brush", &[("Solidity", "1")], true, false),
+        ("func_brush", &[("Solidity", "2")], true, true),
+        // …and `StartDisabled` is `TurnOff`, which is the same bit.
+        ("func_brush", &[("StartDisabled", "1")], true, false),
+        // A trigger: `SOLID_BSP` *and* `FSOLID_NOT_SOLID`, so it has a
+        // collision model the touch query can sweep and stops nobody.
+        ("trigger_once", &[], true, false),
+        ("trigger_multiple", &[], true, false),
+        ("trigger_hurt", &[], true, false),
+        ("trigger_push", &[], true, false),
+        ("trigger_teleport", &[], true, false),
+    ];
+
+    for &(classname, extra, expect_type, expect_solid) in CASES {
+        let mut pairs: Vec<(&str, &str)> = vec![("classname", classname), ("model", "*1")];
+        pairs.extend_from_slice(extra);
+        let map = vec![block(&[("classname", "worldspawn")]), block(&pairs)];
+
+        let mut server = Server::new();
+        server.level_init("test", &map, &trigger_models());
+        let entity = server.brush_entity(1).expect("the brush entity");
+
+        assert_eq!(
+            entity.solid != crate::server::movement::Solid::None,
+            expect_type,
+            "{classname} {extra:?}: a missing solid type is invisible to \
+             `World::clip_models`, so nothing collides and nothing complains"
+        );
+        assert_eq!(
+            entity.is_solid(),
+            expect_solid,
+            "{classname} {extra:?}: is_solid()"
+        );
+        // …and a trigger is the only thing here that is *also* a trigger.
+        assert_eq!(
+            entity.is_solid_flag_set(crate::server::movement::FSOLID_TRIGGER),
+            classname.starts_with("trigger_"),
+            "{classname} {extra:?}: FSOLID_TRIGGER"
+        );
+    }
 }

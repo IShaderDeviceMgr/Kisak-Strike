@@ -6,7 +6,7 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models and props done; no visibility, no displacement rendering |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain and props done; no visibility, no 3D skybox |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
 | [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | complete — cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg`, the list commands and the `egui` dialog |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
@@ -277,7 +277,8 @@ pub struct PlacedBrushModel {
     pub model: BrushModel,   // the placement, shared with trace/
     pub render_mode: i32,    // RenderMode_t, 0 when the key is absent
     pub visible: bool,       // EF_NODRAW clear — live, from the server
-    pub solid: bool,         // FSOLID_NOT_SOLID clear — ditto
+    pub solid: bool,         // IsSolid() — ditto
+    pub owned: bool,         // …and whether the server answered at all
 }
 
 pub struct BrushModelGeometry {
@@ -296,6 +297,12 @@ pub struct Placement {
 impl World {
     /// Take every placement from whoever owns it. Once a frame.
     pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
+    /// The ones the player's trace is clipped against — `owned && solid`.
+    pub fn clip_models(&self) -> &[BrushModel];
+    /// `engine->SolidMoved` — every model a swept box meets, by "*N" index.
+    pub fn brush_models_touching(
+        &self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, out: &mut Vec<usize>,
+    );
 }
 
 pub const RENDER_NONE: i32 = 10;   // kRenderNone
@@ -366,6 +373,28 @@ shipped game set it.
 
 On `sp_a1_intro1`: **26 of 78 brush models draw**, 148 faces and 308 triangles, 117 of
 them lit. Across all 106 maps, 2,608 draw with 22,502 faces and 47,866 triangles.
+
+#### `owned` is the rule that keeps the clip chain honest
+
+Stage 4 put brush entities in the player's trace, and **the map's 11,635 of
+them are not all solid**: a `trigger_portal_cleanser` is a fizzler you walk
+through, and `func_portal_bumper` — 2,383 of them, the ninth commonest
+classname in the game — exists only to stop a portal landing on a wall.
+Whether one is solid is `FSOLID_NOT_SOLID`, which is *game* state, and
+`src/server/` has classes for 6,302 of the 11,635.
+
+So `clip_models` is `owned && solid`: **collide with what the game has told us
+about**, rather than assume everything is a wall. The alternative fills every
+Portal 2 chamber with invisible walls, and would do it silently.
+
+`brush_models_touching` is the other direction — the engine's half of the
+server's touch test (`engine->SolidMoved`, `engine/world.cpp`'s `CTouchLinks`).
+Two things it is *not*: not a bounding-box overlap (Valve's enumerator ends in
+`ClipRayToCollideable( ray, MASK_SOLID, pTrigger, &tr )`, the swept box against
+the trigger's actual brushes) and not filtered to triggers (which of them is
+one is `FSOLID_TRIGGER`, the server's live state; a copy here would be a frame
+stale every time something was enabled). It *is* filtered to `owned`, for the
+same reason `clip_models` is.
 
 ### `Batch`
 
@@ -585,7 +614,7 @@ walks on — [`rustdocs/CLIENT.md`](CLIENT.md) is its one real consumer.
 |---|---|
 | Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_disp.cpp`, `public/dispcoll_common.cpp`, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
 | Depends on | `world::bsp` (the lumps), `glam`, `crate::math`. **No GPU, no window, no I/O** |
-| Status | world brushes, brush models and displacements — no entities or props |
+| Status | world brushes, brush models, displacements **and the clip chain** — no static props, no vcollide |
 
 ### Quick start
 
@@ -743,10 +772,51 @@ impl BrushModel {
 }
 
 impl Tracer<'_> {
+    /// `CEngineTrace::TraceRay` — the world, then the clip chain.
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace;
+    /// The world's subtree alone. What `trace` is when the chain is empty.
+    pub fn trace_world(&mut self, ray: &Ray, mask: Contents) -> Trace;
     pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
+    /// Stage 4: put brush entities in the clip chain. See below.
+    pub fn with_entities(self, entities: &[BrushModel]) -> Tracer<'_>;
 }
 ```
+
+### The clip chain — `with_entities`, and who decides what is in it
+
+`CEngineTrace::TraceRay` (`engine/enginetrace.cpp:2786`) is stage 4, and it is what makes
+a door a wall. A `Tracer` starts with an empty chain, so `trace` is a world-only sweep for
+every caller that has not asked for more; `with_entities` adds the brush models, and
+`World::clip_models` is where the list comes from.
+
+**Which entities is the *game's* decision, not this module's.** Whether a brush entity is
+solid is `FSOLID_NOT_SOLID` and whether it is a trigger is `FSOLID_TRIGGER`, and both live
+in `src/server/`. `world/` carries the answer across as
+[`PlacedBrushModel::owned`](#brush-models--placedbrushmodel-and-brushmodelgeometry) and
+`solid`, and **a model nobody has answered for is left out** — this port has classes for
+6,302 of the game's 11,635 brush entities, and among the rest are 2,383
+`func_portal_bumper`s, none of which is solid to a player.
+
+Three details inside it are load-bearing:
+
+- **The world is traced first and the ray is then shortened to the hit**, so a door behind
+  a wall costs a rejected descent rather than a full sweep. The shortening recomputes the
+  end and *subtracts* to get the delta rather than scaling it — Valve's comment says
+  scaling "would miss intersections we would get by feeding these results back in to the
+  tracer".
+- **The fractions come back rescaled onto the original ray.** Inside the loop they are
+  fractions of the shortened one.
+- **A trace that starts inside the world never looks at an entity** — "inside world, no
+  need to check being inside anything else".
+
+`ClipTraceToTrace`'s merge is not "take the smaller fraction": a trace that started inside
+something has a fraction of 1 and matters anyway, and when *both* started solid the
+surviving `start`/`fraction_left_solid` is the pair from whichever left solid **later**.
+
+The chain is walked linearly — Valve's spatial partition replaced by nothing, deliberately.
+A Portal 2 map has a few hundred brush entities (78 on `sp_a1_intro1`), each rejected by a
+bounding-box test at the top of its own BSP descent, and §5 of the portdoc already records
+that `parry`'s `Qbvh` is where a broadphase comes from when one is needed.
 
 ### `BrushModel` — a door, a platform, a piston
 
@@ -773,10 +843,10 @@ its first tick onwards, and a stale flag would trace it as though it never turne
 
 **Placements, not policy.** `World::brush_models` holds *every* entity naming a `"*N"`
 model, triggers included. A `trigger_multiple`'s brushes are `CONTENTS_SOLID` in the file
-and not solid in the game; what makes the difference is `FSOLID_TRIGGER` on the entity —
-still set by nobody, because the classes that would set it are `server/` stage 4's. What
-*has* arrived is `FSOLID_NOT_SOLID` on a switched-off `func_brush`, carried as
-`PlacedBrushModel::solid`. Keep filtering on `classname` for the rest.
+and not solid in the game; what makes the difference is `FSOLID_TRIGGER` on the entity,
+which `server/` stage 4 now sets — so `PlacedBrushModel::solid` is finally the whole
+answer for a class the game knows, and `owned` says whether it knows one. **Do not filter
+on `classname`**: that was the stopgap, and `clip_models` is the rule now.
 
 `build` is infallible because [`Bsp::parse`](#worldbsp) has already checked every
 cross-lump reference the trace walks — that check is what buys the right to index without
@@ -981,6 +1051,24 @@ Ordered by how likely each is to bite.
     uses both — see the table under "Displacements" above. A patch with
     `SURF_NOHULL_COLL` is decoration; making it solid puts invisible walls in the ruins.
 
+### Three more, from stage 4's clip chain
+
+19. **`Tracer::trace` is world-only *until* someone calls `with_entities`.** Every caller
+    written before stage 4 still gets exactly what it got, because
+    `CollisionBsp::tracer()` hands out an empty chain. If a door is not stopping the
+    player, the missing call is at the `Tracer` construction site, not in the sweep.
+
+20. **A trigger must not be in the chain, and the thing that keeps it out is
+    `FSOLID_NOT_SOLID`** — set by `CBaseTrigger::InitTrigger`, carried across as
+    `Placement::solid`, filtered by `World::clip_models`. Break any link in that and every
+    trigger in the game becomes an invisible wall, which is a bug you walk into rather
+    than one you read.
+
+21. **`brush_models_touching` and `clip_models` disagree on purpose.** The first reports
+    triggers and the second excludes them; the first is asked "what is the player
+    overlapping" and the second "what stops the player". They share the `owned` filter and
+    nothing else.
+
 ### One place this is stricter than Valve
 
 `IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
@@ -994,7 +1082,9 @@ path either way.
 
 | Missing | Waits on |
 |---|---|
-| Entities, trace filters, `ClipTraceToTrace` | stage 4, and `server/` |
+| Brush entities in the clip chain, `ClipTraceToTrace`, the fraction rescaling | **done** — stage 4, above |
+| A trace *filter* (`ITraceFilter`, `TRACE_WORLD_ONLY`, collision groups) | nothing needs one: the caller chooses the chain, which is the same decision one step earlier |
+| A broadphase | nothing yet — a linear scan over a few hundred models. `parry`'s `Qbvh` at stage 5 |
 | Static props and `.phy`/vcollide | stage 5, where `parry` enters |
 | Displacement *rendering* | done — `world/disp/` |
 | `LUMP_PHYSDISP`, `CM_CreateDispPhysCollide` | `vphysics/` — the displacement's *physics* mesh, not its trace |
@@ -1144,6 +1234,14 @@ references, 904 at power 2 / 202 at 3 / 75 at 4. Of the 1,106 that a ray may hit
 starts as far out as the vertex offsets can reach, which on a deep patch is far enough to
 cross another), and 182 meet a brush on the way. If the winding convention were inverted,
 that first number would be zero — which is what the test asserts on.
+
+Stage 4's clip chain is covered by three unit tests here
+(`the_clip_chain_keeps_the_nearest_of_the_world_and_the_entities`,
+`a_tracer_with_no_entities_is_a_world_trace`,
+`a_trace_that_starts_in_the_world_ignores_the_chain`) and, end to end against all 106
+shipped maps, by `server::tests::every_shipped_maps_triggers_notice_the_player` — which
+walks a real player hull into **every one of the game's 2,255 live triggers** through the
+same sweep. See `rustdocs/SERVER.md`.
 
 ## `src/engine/input/`
 

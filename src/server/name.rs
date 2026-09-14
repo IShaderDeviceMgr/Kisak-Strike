@@ -86,9 +86,15 @@ pub enum Procedural {
     /// Resolved. May still be `None` — `!activator` with no activator is a
     /// legitimate null in Valve too.
     Resolved(Option<EntityId>),
-    /// A name this port understands but cannot answer yet: the three player
-    /// ones, which need `portdocs/SERVER.md` stage 5.
-    NeedsPlayer,
+    /// A name this port understands and cannot answer.
+    ///
+    /// Three of them, and none is a gap in this module. `!player_blue` and
+    /// `!player_orange` are `GetGlobalTeam( TEAM_BLUE/RED )->GetPlayer( 0 )`,
+    /// and **single player has no teams** — Valve answers null there too, so
+    /// this is a report line rather than a divergence. `!picker` is
+    /// `FindPickerEntity`, a designer debug aid that traces from the player's
+    /// eye; zero shipped connections use it.
+    Unavailable,
     /// Not a procedural name this engine has ever had. Valve warns and asserts.
     Unknown,
 }
@@ -100,15 +106,16 @@ pub enum Procedural {
 /// what makes `!self` mean "whoever fired this output" rather than "whoever is
 /// receiving it".
 ///
-/// `!pvsplayer` and `!picker` are not implemented and appear zero times in the
-/// shipped maps; both need a player, so they answer
-/// [`NeedsPlayer`](Procedural::NeedsPlayer) rather than
-/// [`Unknown`](Procedural::Unknown).
+/// `player` is `UTIL_PlayerByIndex( 1 )` — `Server::player`, which is `None`
+/// until the engine spawns one. Passing `None` is what a server with no client
+/// connected does, and `!player` then resolves to nothing rather than to an
+/// error.
 pub fn find_procedural(
     name: &str,
     searching: Option<EntityId>,
     activator: Option<EntityId>,
     caller: Option<EntityId>,
+    player: Option<EntityId>,
 ) -> Procedural {
     let Some(name) = name.strip_prefix('!') else {
         return Procedural::Unknown;
@@ -129,8 +136,20 @@ pub fn find_procedural(
     // and `UTIL_FindClientInPVS`. The co-op pair is behind `#ifdef PORTAL2` in
     // this tree, which is a rare case of the cstrike15 branch carrying Portal 2
     // code rather than losing it.
-    if is("player") || is("player_orange") || is("player_blue") || is("pvsplayer") || is("picker") {
-        return Procedural::NeedsPlayer;
+    // `UTIL_PlayerByIndex( 1 )` — and `UTIL_FindClientInPVS` comes to the
+    // same entity, because there is one client and it is always in its own
+    // PVS. **This is what stage 4 turned on**: 121 of the game's 128
+    // `point_teleport`s and 1,640 of its connections name `!player`, and
+    // until the player was an entity every one of them reached nothing.
+    if is("player") || is("pvsplayer") {
+        return Procedural::Resolved(player);
+    }
+    // The co-op pair is behind `#ifdef PORTAL2` in this tree, which is a rare
+    // case of the cstrike15 branch carrying Portal 2 code rather than losing
+    // it — and it is `GetGlobalTeam( … )->GetPlayer( 0 )`, which is null in
+    // single player. `!picker` needs a trace from the player's eye.
+    if is("player_orange") || is("player_blue") || is("picker") {
+        return Procedural::Unavailable;
     }
     Procedural::Unknown
 }
@@ -230,7 +249,8 @@ mod tests {
             named(&mut list, Some("activator")),
         );
 
-        let find = |name| find_procedural(name, Some(a), Some(b), Some(a));
+        let player = named(&mut list, Some("the_player"));
+        let find = |name| find_procedural(name, Some(a), Some(b), Some(a), Some(player));
         assert_eq!(find("!self"), Procedural::Resolved(Some(a)));
         assert_eq!(find("!activator"), Procedural::Resolved(Some(b)));
         assert_eq!(find("!caller"), Procedural::Resolved(Some(a)));
@@ -238,14 +258,26 @@ mod tests {
 
         // A null activator is a legitimate answer, not a gap.
         assert_eq!(
-            find_procedural("!activator", None, None, None),
+            find_procedural("!activator", None, None, None, None),
             Procedural::Resolved(None)
         );
 
-        // The player family is a gap, and says so.
-        assert_eq!(find("!player"), Procedural::NeedsPlayer);
-        assert_eq!(find("!player_blue"), Procedural::NeedsPlayer);
-        assert_eq!(find("!player_orange"), Procedural::NeedsPlayer);
+        // Stage 4: `!player` is the player, and `!pvsplayer` is the same
+        // entity because there is one client.
+        assert_eq!(find("!player"), Procedural::Resolved(Some(player)));
+        assert_eq!(find("!PLAYER"), Procedural::Resolved(Some(player)));
+        assert_eq!(find("!pvsplayer"), Procedural::Resolved(Some(player)));
+        // …and with no client connected it is a null, not an error.
+        assert_eq!(
+            find_procedural("!player", None, None, None, None),
+            Procedural::Resolved(None)
+        );
+
+        // The co-op pair has no answer in single player, and neither has the
+        // designer's picker.
+        assert_eq!(find("!player_blue"), Procedural::Unavailable);
+        assert_eq!(find("!player_orange"), Procedural::Unavailable);
+        assert_eq!(find("!picker"), Procedural::Unavailable);
 
         assert_eq!(find("!nonsense"), Procedural::Unknown);
         assert_eq!(find("plain"), Procedural::Unknown, "not procedural at all");

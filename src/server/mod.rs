@@ -74,8 +74,11 @@ pub mod movement;
 pub mod name;
 pub mod random;
 pub mod think;
+pub mod touch;
 
 use std::collections::BTreeMap;
+
+use glam::Vec3;
 
 use crate::client::tonemap::TonemapSettings;
 use crate::engine::console::{Command, ExecContext};
@@ -141,6 +144,116 @@ pub struct Server {
     /// [`Server::brush_entity`] treats as "no placement", and nothing in the
     /// game creates a brush entity at run time.
     brush_models: Vec<(usize, EntityId)>,
+    /// `CEntityTouchManager::m_updateList` — the entities that owe the
+    /// post-think pass a stale-link sweep. See [`touch`].
+    untouch_list: Vec<EntityId>,
+    /// The player, once the engine has spawned one.
+    ///
+    /// `UTIL_PlayerByIndex( 1 )`, which is what `!player` resolves to. `None`
+    /// between levels and in every test that does not need one — the entity
+    /// list has no player of its own, exactly as Valve's has none until a
+    /// client connects.
+    player: Option<EntityId>,
+    /// Where the player was when the touch pass last ran.
+    ///
+    /// The *start* of the swept box the next pass tests, which is what stops a
+    /// fast player passing through a thin trigger between two ticks —
+    /// `PhysicsTouchTriggers( &vecPrevOrigin )`. Updated by the pass and by
+    /// nothing else, so it spans however many rendered frames a tick took.
+    player_prev_origin: Vec3,
+    /// Scratch for the touch query, so that a tick does not allocate.
+    overlaps: Vec<usize>,
+}
+
+/// The engine's half of a touch test — `engine->SolidMoved`
+/// (`vengineserver_impl.cpp:2467`, `engine/world.cpp`'s `CTouchLinks`).
+///
+/// The game knows which entities are triggers and what touching one means; the
+/// *engine* owns the collision data and answers "what does this swept box
+/// overlap". Keeping that split is what lets this module name no `world/` and
+/// no `trace/` type, and it is not a Rust invention: the C++ crosses a DLL
+/// boundary at exactly this line.
+///
+/// Implemented in `engine/mod.rs` over `world/`'s placed brush models. The
+/// answers are `"*N"` **model indices**, the same join key stage 3 established
+/// for brush-entity placement, so nothing has to carry an entity handle across
+/// the boundary in either direction.
+pub trait TouchQuery {
+    /// Every placed brush model the box `mins`-`maxs`, swept from `start` to
+    /// `end`, intersects. Appends; does not clear.
+    ///
+    /// `mins`/`maxs` are relative to the box's position, so a player hull is
+    /// `(-16,-16,0)`-`(16,16,72)`.
+    ///
+    /// **It reports solid brush models too**, and that is deliberate: which of
+    /// them is a trigger is a question about `FSOLID_TRIGGER`, which is the
+    /// game's state and would be a frame stale if the engine kept a copy. The
+    /// caller filters, and the cost is one extra brush sweep per non-trigger
+    /// brush entity per tick.
+    fn brush_models_touching(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        out: &mut Vec<usize>,
+    );
+}
+
+/// The player, as the two halves of the port that own pieces of it agree to
+/// describe one.
+///
+/// # Why it is a copy in both directions
+///
+/// `client::Player` moves on the **rendered frame** and the server ticks at a
+/// fixed 64 Hz (`portdocs/SERVER.md` §5), so neither can hold the other's
+/// state. `Engine::frame` therefore copies this in before the ticks and out
+/// after them, and the round trip is an identity for every field the server
+/// did not touch — which is what makes "always copy back" safe rather than a
+/// fight over who owns the origin.
+///
+/// The fields are exactly what stage 4 reaches: what the touch query sweeps
+/// (`origin`, `mins`, `maxs`), what `PassesTriggerFilters` and
+/// `CTriggerPush::Touch` branch on (`noclip`, `on_ground`), and what a push or
+/// a teleport writes (`velocity`, `base_velocity`, `origin`, `angles`).
+///
+/// > **`angles` are the *view* angles**, where `CBasePlayer` keeps
+/// > `m_angAbsRotation` (yaw only) and its eye angles separately. Every
+/// > consumer here wants the eye — `CTriggerTeleport::Touch` explicitly
+/// > substitutes `EyeAngles()` for `GetAbsAngles()` when the toucher is a
+/// > player — so the port keeps one field and this note.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerState {
+    /// `m_vecAbsOrigin` — the **feet**, not the eye.
+    pub origin: Vec3,
+    /// The view angles, pitch/yaw/roll. See the type's docs.
+    pub angles: Vec3,
+    pub velocity: Vec3,
+    /// `m_vecBaseVelocity` — what a `trigger_push` is adding.
+    pub base_velocity: Vec3,
+    /// `FL_ONGROUND`.
+    pub on_ground: bool,
+    /// `MOVETYPE_NOCLIP` rather than `MOVETYPE_WALK`. A noclipping player is
+    /// not pushed, which is `CTriggerPush::Touch`'s switch.
+    pub noclip: bool,
+    /// The collision hull, relative to [`origin`](PlayerState::origin).
+    /// Changes when the player ducks, which is why it is here rather than a
+    /// constant.
+    pub mins: Vec3,
+    pub maxs: Vec3,
+}
+
+/// A [`TouchQuery`] that never reports anything.
+///
+/// What a server with no map loaded — or a unit test with no collision —
+/// touches. `Server::frame` takes `&mut dyn TouchQuery` rather than an
+/// `Option` because the query is asked at most once per tick and a
+/// do-nothing implementation reads better at both call sites than a `None`
+/// does.
+pub struct NoTouchQuery;
+
+impl TouchQuery for NoTouchQuery {
+    fn brush_models_touching(&mut self, _: Vec3, _: Vec3, _: Vec3, _: Vec3, _: &mut Vec<usize>) {}
 }
 
 /// What one `level_init` produced.
@@ -261,6 +374,10 @@ impl Server {
             io: IoStats::default(),
             due: Vec::new(),
             brush_models: Vec::new(),
+            untouch_list: Vec::new(),
+            player: None,
+            player_prev_origin: Vec3::ZERO,
+            overlaps: Vec::new(),
         }
     }
 
@@ -516,6 +633,10 @@ impl Server {
         self.stats = LevelStats::default();
         self.io = IoStats::default();
         self.brush_models.clear();
+        self.untouch_list.clear();
+        self.player = None;
+        self.player_prev_origin = Vec3::ZERO;
+        self.overlaps.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -530,32 +651,160 @@ impl Server {
     /// `frame_time` is the host's already-clamped frame time, so the
     /// accumulator cannot be handed a stall; see
     /// [`ServerClock::accumulate`].
-    pub fn frame(&mut self, frame_time: f32) -> u32 {
+    /// `query` is the engine's collision half — see [`TouchQuery`]. Pass
+    /// [`NoTouchQuery`] when there is no map to sweep against, which is what
+    /// every test that is not about touching does.
+    pub fn frame(&mut self, frame_time: f32, query: &mut dyn TouchQuery) -> u32 {
         if self.map.is_none() {
             return 0;
         }
         let ticks = self.clock.accumulate(frame_time);
         for _ in 0..ticks {
             self.clock.advance();
-            self.run_tick();
+            self.run_tick(query);
         }
         ticks
     }
 
     /// One server tick. `CServerGameDLL::GameFrame` (`gameinterface.cpp:1383`).
     ///
-    /// The five steps that survive, in Valve's order. The two things to know
-    /// about that order are both consequences of `ServiceEventQueue` running
-    /// **once, after every think**: an output a think fires is delivered in the
-    /// same tick, and an input handler cannot observe a think that has not run
-    /// yet.
-    fn run_tick(&mut self) {
+    /// The steps that survive, in Valve's order. Three things about that order
+    /// are observable and maps depend on all three:
+    ///
+    /// - **`ServiceEventQueue` runs once, after every think**, so an output a
+    ///   think fires is delivered in the same tick and an input handler cannot
+    ///   see a think that has not run yet.
+    /// - **The player's touch test runs before the thinks**, because in the
+    ///   original it is part of `CBasePlayer::PhysicsSimulate` and the player
+    ///   is entity index 1 — so a `trigger_multiple`'s `OnTrigger` is queued
+    ///   before the same tick's thinks rather than after them.
+    /// - **`EndTouch` is detected between the thinks and the queue**
+    ///   (`FrameUpdatePostEntityThinkAllSystems`), so an `OnEndTouch` is
+    ///   delivered in the tick it happened rather than the next one.
+    fn run_tick(&mut self, query: &mut dyn TouchQuery) {
         // Anything removed outside the loop — by a console command, say.
         self.cleanup_delete_list();
+        // `CPlayerMove::CheckMovingGround`, which in the original is the first
+        // thing the player's own simulation does.
+        self.check_moving_ground();
+        self.player_touch_triggers(query);
         self.run_think_functions();
+        self.check_for_entity_untouch();
         self.service_events();
         // Anything a think or an input removed.
         self.cleanup_delete_list();
+    }
+
+    /// `CBasePlayer::PhysicsSimulate`'s `PhysicsTouchTriggers( &vecPrevOrigin )`
+    /// (`baseentity_shared.cpp:2800`), for the one entity in this port that
+    /// moves under its own power.
+    ///
+    /// The player is `IsSolid()` and is not a trigger, so it takes the
+    /// `isSolidCheckTriggers` branch: sweep its hull from where it was to
+    /// where it is, and mark everything with `FSOLID_TRIGGER` that the sweep
+    /// meets.
+    ///
+    /// > **The sweep starts at the last *tick*'s origin, not the last frame's.**
+    /// > `player_prev_origin` is written only here, so at 200 fps and 64 Hz it
+    /// > spans the three rendered frames since the previous tick — which is
+    /// > exactly what stops a sprinting player crossing a one-unit-thick
+    /// > trigger between two ticks without ever being inside it.
+    fn player_touch_triggers(&mut self, query: &mut dyn TouchQuery) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let Some(entity) = self.entities.get(player) else {
+            // The handle stopped resolving — a `Kill` at `!player`, which two
+            // shipped connections send.
+            self.player = None;
+            return;
+        };
+        if !entity.core.is_solid() {
+            return;
+        }
+        let (origin, mins, maxs) = (
+            entity.core.origin,
+            entity.core.model_bounds.mins,
+            entity.core.model_bounds.maxs,
+        );
+        let start = std::mem::replace(&mut self.player_prev_origin, origin);
+
+        // `SetCheckUntouch( true )` — before the marks, so that this tick's
+        // stamp is what they are written with and last tick's are stale.
+        self.set_check_untouch(player);
+
+        let mut overlaps = std::mem::take(&mut self.overlaps);
+        overlaps.clear();
+        query.brush_models_touching(start, origin, mins, maxs, &mut overlaps);
+        // Taken rather than borrowed: the loop dispatches into behaviours,
+        // which reach `&mut Server` through `Context`.
+        let found = std::mem::take(&mut overlaps);
+        for index in found {
+            // `GetRequiredTriggerFlags()` for a solid non-trigger is
+            // `FSOLID_TRIGGER`, and `CTouchLinks::EnumElement` requires every
+            // bit of it. The engine reports solid brush models too — see
+            // [`TouchQuery::brush_models_touching`] — and this is the line
+            // that drops them.
+            let Some(trigger) = self.brush_entity_id(index) else {
+                continue;
+            };
+            let is_trigger = self
+                .entities
+                .get(trigger)
+                .is_some_and(|e| e.core.is_solid_flag_set(movement::FSOLID_TRIGGER));
+            if !is_trigger {
+                continue;
+            }
+            // `serverGameEnts->MarkEntitiesAsTouching( m_TouchedEntities[i], m_pEnt )`
+            // — **the trigger first**, which is what decides that the
+            // trigger's link is the one carrying `FTOUCHLINK_START_TOUCH`.
+            self.mark_entities_as_touching(trigger, player);
+        }
+        self.overlaps = overlaps;
+
+        // > **A teleport discards the swept-from point.** Something in that
+        // > loop may have moved the player — a `trigger_teleport` does it from
+        // > inside its own `Touch` — and the next tick's sweep must start
+        // > where the player *is*, not where it was before the teleport.
+        // > Valve gets this by `CBaseEntity::Teleport` calling
+        // > `PhysicsTouchTriggers()` with **no** previous origin, and without
+        // > it a teleport that lands you 1,000 units away sweeps a box the
+        // > length of the level and fires every trigger between the two.
+        if let Some(entity) = self.entities.get(player) {
+            if entity.core.origin != origin {
+                self.player_prev_origin = entity.core.origin;
+            }
+        }
+    }
+
+    /// `CPlayerMove::CheckMovingGround` (`player_command.cpp:93`) — turn a
+    /// push that has stopped into momentum.
+    ///
+    /// > **The pair of a base velocity and its flag is what makes a
+    /// > `trigger_push` let go.** While the trigger is pushing it sets both
+    /// > every tick; the tick after the player leaves, the flag is clear and
+    /// > the accumulated base velocity is added to the real velocity — with a
+    /// > `1 + frametime/2` boost, which is Valve's and is why walking out of a
+    /// > blower throws you rather than dropping you.
+    ///
+    /// The `FL_CONVEYOR` branch above it needs a ground *entity*, which this
+    /// port does not track; no Portal 2 entity sets the flag
+    /// (`CFuncMoveLinear::Spawn` has the one call commented out, with a name
+    /// and a reason).
+    fn check_moving_ground(&mut self) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let interval = self.clock.time().interval;
+        let Some(entity) = self.entities.get_mut(player) else {
+            return;
+        };
+        let core = &mut entity.core;
+        if core.flags & movement::FL_BASEVELOCITY == 0 {
+            core.velocity += (1.0 + interval * 0.5) * core.base_velocity;
+            core.base_velocity = Vec3::ZERO;
+        }
+        core.flags &= !movement::FL_BASEVELOCITY;
     }
 
     /// `Physics_RunThinkFunctions` (`physics_main.cpp:2282`).
@@ -648,7 +897,13 @@ impl Server {
                 // `FindEntityByName` short-circuits a `!name` to exactly one
                 // entity and never iterates — "avoid an infinite loop, only
                 // find one match per procedural search".
-                match name::find_procedural(query, event.caller, event.activator, event.caller) {
+                match name::find_procedural(
+                    query,
+                    event.caller,
+                    event.activator,
+                    event.caller,
+                    self.player,
+                ) {
                     Procedural::Resolved(Some(id)) => {
                         targets.push(id);
                         found = true;
@@ -656,11 +911,11 @@ impl Server {
                     // A null activator is a legitimate answer in Valve too;
                     // the event simply reaches nothing.
                     Procedural::Resolved(None) => {}
-                    Procedural::NeedsPlayer => {
+                    Procedural::Unavailable => {
                         *self
                             .io
                             .unhandled
-                            .entry(format!("{query} (needs a player)"))
+                            .entry(format!("{query} (no such player)"))
                             .or_default() += 1;
                     }
                     Procedural::Unknown => {
@@ -821,53 +1076,92 @@ impl Server {
     /// keeps [`EntityCore`] free of a back-reference to the server. Every
     /// place a schedule can change is a place that has a `Context`, and every
     /// place that has a `Context` goes through here.
+    ///
+    /// # The entity is lifted out of the list while it runs
+    ///
+    /// Stage 4 gave [`Context`] the entity list, because a trigger has to ask
+    /// its filter about the toucher and then push or teleport it. The entity
+    /// being dispatched is [`detach`](EntityList::detach)ed for the duration
+    /// and put back afterwards, which is what makes the two borrows disjoint —
+    /// see the type's docs for the one rule that follows.
+    ///
+    /// **It is put back on every path**, including the one where `f` panics:
+    /// there is no `?` between the detach and the attach.
     fn dispatch<R>(
         &mut self,
         id: EntityId,
         f: impl FnOnce(&mut EntityCore, &mut dyn Behaviour, &mut Context<'_>) -> R,
     ) -> Option<R> {
+        let time = self.clock.time();
+        let player = self.player;
         let Server {
             entities,
             queue,
             random,
-            clock,
             ..
         } = self;
-        let time = clock.time();
+        let mut entity = entities.detach(id)?;
+        let mut cx = Context::new(time, queue, random, entities, player);
+        let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
+        let changed = cx.take_changed();
+        let next_think = entity.core.next_think_tick();
+        // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
+        // `SetMoveType` both call — reconciled here for the same reason the
+        // think schedule is: every place either can change is a place that has
+        // a `Context`, and every place that has a `Context` goes through this
+        // function.
+        let simulates = entity.core.will_simulate_game_physics();
+        let removed = entity.core.removed;
+        entities.attach(id, entity);
 
-        let (result, next_think, simulates, removed) = {
-            let entity = entities.get_mut(id)?;
-            let mut cx = Context::new(time, queue, random);
-            let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
-            (
-                result,
-                entity.core.next_think_tick(),
-                // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
-                // `SetMoveType` both call — reconciled here for the same
-                // reason the think schedule is: every place either can change
-                // is a place that has a `Context`, and every place that has a
-                // `Context` goes through this function.
-                entity.core.will_simulate_game_physics(),
-                entity.core.removed,
-            )
-        };
-
-        // `SimThink_EntityChanged` (`entitylist.cpp:302`).
+        // `SimThink_EntityChanged` (`entitylist.cpp:302`), for the dispatched
+        // entity and for anything it reached through `Context::entity_mut`.
         self.thinks
             .entity_changed(id, next_think, simulates, removed);
+        for other in changed {
+            let Some(other_entity) = self.entities.get(other) else {
+                continue;
+            };
+            let (next_think, simulates, removed) = (
+                other_entity.core.next_think_tick(),
+                other_entity.core.will_simulate_game_physics(),
+                other_entity.core.removed,
+            );
+            self.thinks
+                .entity_changed(other, next_think, simulates, removed);
+        }
         Some(result)
     }
 
     /// `gEntList.CleanupDeleteList` plus the two lists that name entities.
     fn cleanup_delete_list(&mut self) -> usize {
+        // `CBaseEntity::UpdateOnRemove`'s `PhysicsRemoveTouchedList( this )`,
+        // which has to run **before** the entity is freed so that whatever it
+        // was touching gets its `EndTouch` against a handle that still
+        // resolves. Only the entities that are actually going, and only when
+        // one of them was touching something.
+        let going: Vec<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e.core.removed && !e.core.touch_links.is_empty())
+            .map(|(id, _)| id)
+            .collect();
+        for id in going {
+            self.remove_touched_list(id);
+        }
+
         let freed = self.entities.cleanup_delete_list();
         if freed > 0 {
             let entities = &self.entities;
             self.thinks.retain_alive(|id| entities.is_alive(id));
             self.queue.retain_targets(|id| entities.is_alive(id));
+            self.untouch_list.retain(|&id| entities.is_alive(id));
             // The master tone mapper may have been one of them.
             if self.master_tonemap.is_some_and(|id| !entities.is_alive(id)) {
                 self.master_tonemap = None;
+            }
+            if self.player.is_some_and(|id| !entities.is_alive(id)) {
+                self.player = None;
             }
         }
         freed
@@ -947,12 +1241,101 @@ impl Server {
     /// `trigger_*` and similar), or the entity has been removed. All three are
     /// "leave it where the lump put it".
     pub fn brush_entity(&self, index: usize) -> Option<&EntityCore> {
+        let id = self.brush_entity_id(index)?;
+        self.entities.get(id).map(|entity| &entity.core)
+    }
+
+    /// The same lookup, as a handle. What the touch pass needs, since it has
+    /// to dispatch to the entity rather than read it.
+    ///
+    /// The handle may be dead: [`brush_models`](Server::brush_models) is built
+    /// once at `level_init` and a `trigger_once` deletes itself.
+    fn brush_entity_id(&self, index: usize) -> Option<EntityId> {
         let at = self
             .brush_models
             .binary_search_by_key(&index, |&(i, _)| i)
             .ok()?;
-        let (_, id) = self.brush_models[at];
-        self.entities.get(id).map(|entity| &entity.core)
+        Some(self.brush_models[at].1)
+    }
+
+    // -----------------------------------------------------------------------
+    // the player
+    // -----------------------------------------------------------------------
+
+    /// `ClientPutInServer` — put a player in the world.
+    ///
+    /// Called by the engine when the client spawns, **not** by `level_init`:
+    /// Valve's entity list has no player until a client connects either, and
+    /// keeping it that way is what lets every test in this module run without
+    /// one. Calling it twice replaces the first.
+    pub fn spawn_player(&mut self, state: PlayerState) -> EntityId {
+        if let Some(old) = self.player.take() {
+            self.remove_touched_list(old);
+            self.entities.mark_for_deletion(old);
+            self.cleanup_delete_list();
+        }
+        let class = classes::lookup("player").expect("player is registered");
+        let id = self.entities.insert(Entity::new(class));
+        self.player = Some(id);
+        self.dispatch(id, |core, behaviour, cx| {
+            behaviour.spawn(core, cx);
+        });
+        self.set_player_state(state);
+        self.player_prev_origin = state.origin;
+        id
+    }
+
+    /// The player, if the engine has spawned one. `UTIL_PlayerByIndex( 1 )`.
+    pub fn player(&self) -> Option<EntityId> {
+        self.player
+    }
+
+    /// Copies `client/`'s idea of the player **into** the entity list.
+    ///
+    /// One half of the seam described on [`PlayerState`]; call it once per
+    /// rendered frame, before [`frame`](Server::frame).
+    pub fn set_player_state(&mut self, state: PlayerState) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let Some(entity) = self.entities.get_mut(player) else {
+            return;
+        };
+        let core = &mut entity.core;
+        core.origin = state.origin;
+        core.angles = state.angles;
+        core.velocity = state.velocity;
+        core.base_velocity = state.base_velocity;
+        core.model_bounds = ModelBounds {
+            mins: state.mins,
+            maxs: state.maxs,
+        };
+        core.move_type = match state.noclip {
+            true => movement::MoveType::Noclip,
+            false => movement::MoveType::Walk,
+        };
+        match state.on_ground {
+            true => core.flags |= movement::FL_ONGROUND,
+            false => core.flags &= !movement::FL_ONGROUND,
+        }
+    }
+
+    /// Copies the entity list's idea of the player back **out**.
+    ///
+    /// The other half. `None` when no player has been spawned.
+    pub fn player_state(&self) -> Option<PlayerState> {
+        let entity = self.entities.get(self.player?)?;
+        let core = &entity.core;
+        Some(PlayerState {
+            origin: core.origin,
+            angles: core.angles,
+            velocity: core.velocity,
+            base_velocity: core.base_velocity,
+            on_ground: core.has_flags(movement::FL_ONGROUND),
+            noclip: core.move_type == movement::MoveType::Noclip,
+            mins: core.model_bounds.mins,
+            maxs: core.model_bounds.maxs,
+        })
     }
 
     /// How many brush entities this map placed that the port has a class for.
@@ -1028,10 +1411,27 @@ impl Server {
             self.thinks.len(),
             self.io.no_target
         ));
+        let triggers = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e.core.is_solid_flag_set(movement::FSOLID_TRIGGER))
+            .count();
         cx.print(&format!(
-            "{} brush entities have a class; their placements are the server's",
+            "{} brush entities have a class; their placements are the server's, \
+             and {triggers} of them are live triggers",
             self.brush_entity_count()
         ));
+        match self.player().and_then(|id| self.entities.get(id)) {
+            Some(player) => cx.print(&format!(
+                "the player is entity #{} at ({:.0} {:.0} {:.0}), touching {}",
+                player.id().slot(),
+                player.origin.x,
+                player.origin.y,
+                player.origin.z,
+                player.touch_links.len()
+            )),
+            None => cx.print("there is no player"),
+        }
 
         print_counts(cx, "unimplemented classnames", &stats.unknown, 12);
         print_counts(cx, "keys nothing consumed", &stats.unhandled, 12);

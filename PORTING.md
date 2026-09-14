@@ -649,14 +649,27 @@ rather than `CGameMovement`. Stage 5 is prediction and waits for `net/` and `ser
 which is the only thing in `client/` still blocked on another module.
 
 Collision is **planned in `portdocs/ENGINE_TRACE.md`** and lands as `src/engine/trace/`.
-**Stages 1-3 are done**: `CM_BoxTrace` and everything under it over the world's brushes;
+**Stages 1-4 are done**: `CM_BoxTrace` and everything under it over the world's brushes;
 `CM_TransformedBoxTrace` over the brush models — doors, platforms, the moving parts of
 a test chamber, all solid, all visible since `world/` learned to draw them, and **all
 moving** since `server/` stage 3 made `BrushModel`'s placement mutable and took it from
 the entity; and `CDispCollTree` over the **displacements**, so the game's terrain is
-solid too. Stage 4 is
-entities and the dispatch, stage 5 vcollide — and `spatialpartition.cpp` is not ported and
-will not be, because `parry`'s `Qbvh` replaces it when entities arrive.
+solid too. **Stage 4 is the clip chain**, landed with `server/` stage 4 below:
+`Tracer::trace` is `CEngineTrace::TraceRay` now — the world, then every brush
+model the *game* says is solid — so a shut door is a wall. Two things about it
+were not in the plan. **The filter is not needed**, because the candidates
+arrive as a list the caller assembles and `ITraceFilter`'s decision has
+therefore already been made one step earlier; and **the broadphase is not
+needed either**, because a map has a few hundred brush entities and each is
+rejected by the bounding-box test at the top of its own BSP descent. What *is*
+needed, and is the whole difficulty, is deciding which entities are in the
+chain at all: the map's 11,635 brush entities include 2,383
+`func_portal_bumper`s you walk through, so a model the game has not answered
+for is left **out** rather than assumed in.
+
+Stage 5 is vcollide and static props — and `spatialpartition.cpp` is not ported
+and will not be, because `parry`'s `Qbvh` replaces it if a broadphase is ever
+measured to be worth having.
 
 Stage 3 also answered the one open question this file's crate policy had left hanging:
 **`parry` was reconsidered for displacements on its merits, as `ENGINE_TRACE.md` §5.5 said
@@ -701,7 +714,7 @@ Input is **planned in `portdocs/ENGINE_INPUT.md`**, which lands it as its own mo
 free-fly camera, bindings, UI precedence and the key-up latch). Stage 5 (controllers,
 `gilrs`) is deliberately last and is all that remains.
 
-**The game server has landed — stages 1, 2 and 3 of `portdocs/SERVER.md`'s five.** It is
+**The game server has landed — stages 1-4 of `portdocs/SERVER.md`'s five.** It is
 `src/server/`, the sibling the client's entry above said would follow it, and it is the
 module that turns the `.bsp`'s entity lump into an entity list and then *runs* it:
 `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's own
@@ -788,6 +801,57 @@ shipped game with `wait 0` stand open for ever. And **the `Use` input's *type* i
 the connection's serial number, cast** (`InputUse` passes
 `(USE_TYPE)inputdata.nOutputID`), which is why an I/O `Use` on a
 `func_movelinear` does nothing in the shipped game and works on a `func_button`.
+
+**Stage 4 is triggers and touch, and it is the first time the map responds to
+the player.** `touchlink_t` and the four `CBaseEntity::Physics*Touch*`
+functions, `CBaseTrigger` and five trigger classes, the six `filter_*` classes
+they consult, `point_teleport`, and — on the engine side — `trace/` stage 4's
+clip chain, `World::clip_models`, `World::brush_models_touching` and base
+velocity in `client/`'s walk. Twelve classnames, taking the port to 34 and to
+**25,961 of the game's 60,925 entity blocks**. Every one of the game's 2,255
+live triggers has been walked into by a real player hull swept against its real
+brushes, and 2,246 of them notice.
+
+Four things it settled, and the first contradicts this file's own plan.
+**The player had to become an entity at stage 4, not stage 5.** A touch is a
+fact about two entities; `PassesTriggerFilters` tests `FL_CLIENT` on the
+toucher, and 121 of the game's 128 `point_teleport`s target `!player`. So a
+sixty-line `classes::Player` exists — a box with `FL_CLIENT` set, holding no
+`client/` type and moving under nobody's power — and the two halves exchange a
+plain `PlayerState` copied in before the server's ticks and out after them, the
+same shape `world/` already had for brush placements. Stage 5 is still most of
+`CBasePlayer`.
+
+**§10.3's borrow question reopened exactly where stage 2 said it would, and the
+answer stage 2 wrote down was right.** The condition was "a handler that must
+*read* another entity during dispatch"; stage 4 has three, and the shape is
+"the entity list minus the one entity being dispatched, not a `RefCell`" —
+`Server::dispatch` lifts the entity out of the list while it runs it. No cell,
+no `unsafe`.
+
+**The engine/game split at `SolidMoved` is worth keeping.** In the C++ the
+engine answers "what does this swept box overlap" and the game decides what
+that means; here that is one trait, `TouchQuery`, and it is what lets the whole
+touch system be tested with no map. Two properties of the answer are Valve's
+and are load-bearing: it is a swept box against the trigger's **real brushes**
+rather than its bounding box, and it is **not** filtered to triggers, because
+`FSOLID_TRIGGER` is the game's live state and an engine-side copy would be a
+frame stale.
+
+**And one bug the tests could not have found.** `EntityCore::solid` arrived
+with a `SOLID_NONE` default and the stage-3 brush classes were never given
+one, so `is_solid()` was false for every door in the game and the clip chain
+silently collided with nothing — with the whole suite passing, because every
+trace test builds its placement by hand. Loading the game and reading the
+`trace` command's "N in the clip chain" is what found it. **Adding a field
+with a `Default` is the same class of change as adding an enum variant, and
+the compiler does not help.**
+
+**And the deepest absence is now damage.** `trigger_hurt` runs Valve's whole
+schedule — the half-second think, the radiation quarter-second one, the
+doubling model, the parting half-dose — and takes nothing away, because there
+is no health anywhere. Its outputs fire exactly when the shipped game fires
+them; the player simply does not die.
 
 Two things are worth carrying to the next module. **Valve's inheritance became Rust's
 composition, and the datadesc chain walk disappeared with it** — `SERVER.md` §7.3 planned

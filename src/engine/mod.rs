@@ -62,7 +62,7 @@ use crate::materials::{
     Material, MaterialCache, MaterialPreview, PostProcess, RenderContext, CLEAR_COLOR,
 };
 use crate::server::think::ServerClock;
-use crate::server::Server;
+use crate::server::{self, Server};
 
 use self::trace::{disp_surf, Contents, Ray};
 use console::{
@@ -612,7 +612,30 @@ impl<'a> Engine<'a> {
         // **Before `update_client`**, because Valve's order is
         // `SV_Frame` then `CL_Move`: an entity that moved this tick has moved
         // before the player is asked where it is standing.
-        self.scene.server.frame(seconds);
+        //
+        // The player goes in first and comes back out afterwards. Both halves
+        // are unconditional and the round trip is an identity for anything the
+        // server did not touch — `crate::server::PlayerState` says why that is
+        // the shape rather than a one-way push with a change flag.
+        let Scene {
+            server,
+            client,
+            world,
+            ..
+        } = &mut self.scene;
+        server.set_player_state(player_state(client));
+        match world.as_ref() {
+            // The engine's half of the touch test borrows the world for the
+            // whole call, because `frame` may run several ticks and each of
+            // them asks. The fields are named separately so that the borrow of
+            // `scene.world` and the one of `scene.server` stay disjoint —
+            // `portdocs/CLIENT.md` §6.4's rule, again.
+            Some(world) => server.frame(seconds, &mut WorldTouchQuery { world }),
+            None => server.frame(seconds, &mut crate::server::NoTouchQuery),
+        };
+        if let Some(state) = server.player_state() {
+            apply_player_state(client, state);
+        }
 
         // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
         // it — **after the ticks and before anything reads it**, so the player
@@ -694,7 +717,16 @@ impl<'a> Engine<'a> {
         // borrow all of `Scene` and the next line would not compile. Same
         // shape as the destructuring `Engine::frame` already does for the
         // command target (`portdocs/CLIENT.md` §6.4).
-        let mut tracer = self.scene.world.as_ref().map(|w| w.collision.tracer());
+        // **The clip chain is stage 4's**, and the two borrows of `w` are
+        // both shared, so they nest: `collision` gives the world's BSP and
+        // `clip_models` the brush entities the game has said are solid — which
+        // is what makes a shut door a wall and, because a trigger is
+        // `FSOLID_NOT_SOLID`, leaves every trigger in the map walk-through.
+        let mut tracer = self
+            .scene
+            .world
+            .as_ref()
+            .map(|w| w.collision.tracer().with_entities(w.clip_models()));
         self.scene
             .client
             .run_move(&command, seconds, tracer.as_mut());
@@ -856,7 +888,7 @@ impl<'a> Engine<'a> {
 /// entity the port has a class for, so this is a few dozen lookups a frame on
 /// a real map: 26 on `sp_a1_intro1`.
 fn sync_brush_models(world: &mut World, server: &Server) {
-    use crate::server::movement::{EF_NODRAW, FSOLID_NOT_SOLID};
+    use crate::server::movement::EF_NODRAW;
 
     world.sync_brush_models(|index| {
         let entity = server.brush_entity(index)?;
@@ -864,9 +896,78 @@ fn sync_brush_models(world: &mut World, server: &Server) {
             origin: entity.origin,
             angles: entity.angles,
             visible: entity.effects & EF_NODRAW == 0,
-            solid: entity.solid_flags & FSOLID_NOT_SOLID == 0,
+            // `IsSolid()` rather than the `FSOLID_NOT_SOLID` bit alone, which
+            // is what stage 4 changed: a trigger is `SOLID_BSP` *and* not
+            // solid, and a `func_button` with `SF_BUTTON_NOTSOLID` is
+            // `SOLID_NONE`. Reading only the bit would have put every trigger
+            // in the game into the player's clip chain as a wall.
+            solid: entity.is_solid(),
         })
     });
+}
+
+/// `client::Player` as the server's copy of it. See
+/// [`PlayerState`](crate::server::PlayerState) for why the copy exists.
+fn player_state(client: &Client) -> server::PlayerState {
+    let player = client.player();
+    server::PlayerState {
+        origin: player.origin,
+        // The **view** angles, which for the player entity are its angles —
+        // `PlayerState`'s docs say why there is one field and not two. Roll is
+        // zero because `ViewAngles` has no roll: the port has no view punch
+        // and no vehicles.
+        angles: glam::Vec3::new(player.angles.pitch, player.angles.yaw, 0.0),
+        velocity: player.velocity,
+        base_velocity: player.base_velocity,
+        on_ground: player.ground.is_some(),
+        noclip: player.move_type == crate::client::MoveType::Noclip,
+        mins: crate::client::movement::player_mins(player.ducked),
+        maxs: crate::client::movement::player_maxs(player.ducked),
+    }
+}
+
+/// …and back, once the server's ticks have had their say.
+///
+/// **Every field round-trips unchanged unless the server moved it**, which is
+/// what makes an unconditional copy-back safe: the state went in at the top of
+/// the same `Engine::frame`, nothing but a `trigger_push` or a teleport writes
+/// it, and the player has not moved in between.
+fn apply_player_state(client: &mut Client, state: server::PlayerState) {
+    let player = client.player_mut();
+    player.origin = state.origin;
+    player.velocity = state.velocity;
+    player.base_velocity = state.base_velocity;
+    player.angles.pitch = state.angles.x;
+    player.angles.yaw = state.angles.y;
+    // `SetGroundEntity( NULL )` is the only direction the server writes this:
+    // it can take the player off the floor (a push, a teleport) and never puts
+    // it back, because the ground *plane* is `client/`'s to find.
+    if !state.on_ground {
+        player.ground = None;
+    }
+}
+
+/// The engine's half of the server's touch test — `engine->SolidMoved`.
+///
+/// A struct rather than a closure because it holds the world across a whole
+/// `Server::frame`, which may run several ticks; see
+/// [`TouchQuery`](crate::server::TouchQuery).
+struct WorldTouchQuery<'a> {
+    world: &'a World,
+}
+
+impl server::TouchQuery for WorldTouchQuery<'_> {
+    fn brush_models_touching(
+        &mut self,
+        start: glam::Vec3,
+        end: glam::Vec3,
+        mins: glam::Vec3,
+        maxs: glam::Vec3,
+        out: &mut Vec<usize>,
+    ) {
+        self.world
+            .brush_models_touching(start, end, mins, maxs, out);
+    }
 }
 
 fn mouse_look_after(current: bool, events: &[input::Event]) -> bool {
@@ -947,6 +1048,12 @@ impl Level for Scene<'_> {
             eprintln!("source-engine: world: skybox {sky} (not drawn yet)");
         }
         eprintln!("source-engine: server: {}", entities.summary());
+
+        // `ClientPutInServer` — the player joins the entity list, so that
+        // `!player` resolves and a trigger has something to notice. It happens
+        // *after* `level_init`, because the map's own entities have to exist
+        // before the client connects to them, which is Valve's order too.
+        self.server.spawn_player(player_state(&self.client));
 
         // A `Spawn` may already have moved something: 40 of the game's doors
         // carry `spawnpos 1` and stand open from the first frame, and 337
@@ -1248,23 +1355,20 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
     trace_brush_models(world, &ray, from, cx);
 }
 
-/// The same ray, against every brush model the map places —
-/// `portdocs/ENGINE_TRACE.md` stage 2's acceptance test.
+/// The same ray, against the brush models the map places —
+/// `portdocs/ENGINE_TRACE.md` stage 2's acceptance test, extended by stage 4.
 ///
-/// `CEngineTrace::TraceRay` would shorten the ray to the world hit first and
-/// then let the spatial partition decide which entities are worth asking
-/// (`enginetrace.cpp:2870`). Both halves of that are stage 4's and neither
-/// exists, so this asks all of them at full length and keeps the nearest,
-/// which is the same answer more slowly — `ClipTraceToTrace` keeps the minimum
-/// fraction and enumeration order is not observable.
+/// Two lines, and the difference between them is the stage-4 story. The first
+/// is the **clip chain**: [`World::clip_models`], the models the game says are
+/// solid, which is what the player's own trace is swept against. The second is
+/// everything else the ray passes through — the triggers — which is what the
+/// player would *walk into* and which is worth seeing precisely because it is
+/// not in the first.
 ///
-/// **Only `FSOLID_NOT_SOLID` is filtered**, which since `server/` stage 3 is a
-/// real answer for `func_brush` and nothing else. A `trigger_multiple`'s
-/// brushes are `CONTENTS_SOLID` in the file and are not solid in the game, and
-/// what makes the difference is `FSOLID_TRIGGER` — set by a class this port
-/// has not got, and read by an entity clip chain that is `ENGINE_TRACE.md`
-/// stage 4's. So the classname is still printed and the judgement is still
-/// left to the reader.
+/// It asks each model at full length rather than shortening the ray to the
+/// world hit first, which `CEngineTrace::TraceRay` does
+/// (`enginetrace.cpp:2870`): a console command wants the whole list, not the
+/// nearest.
 fn trace_brush_models(world: &World, ray: &Ray, from: glam::Vec3, cx: &mut ExecContext<'_>) {
     if world.brush_models.is_empty() {
         cx.print("  brush models: the map places none");
@@ -1272,41 +1376,51 @@ fn trace_brush_models(world: &World, ray: &Ray, from: glam::Vec3, cx: &mut ExecC
     }
 
     let mut tracer = world.collision.tracer();
-    let nearest = world
-        .brush_models
-        .iter()
-        // What the *game* says, which since `server/` stage 3 is a real
-        // answer for `func_brush`: a switched-off one is neither drawn nor
-        // collided with. It is still not the whole solidity question — see
-        // [`PlacedBrushModel::solid`].
-        .filter(|placed| placed.solid)
-        .map(|placed| {
-            (
-                placed,
-                tracer.trace_model(ray, &placed.model, Contents::MASK_PLAYERSOLID),
-            )
-        })
-        .filter(|(_, hit)| hit.did_hit())
-        // `f32` is not `Ord`, and a NaN fraction would be a bug worth seeing
-        // rather than a panic: `total_cmp` orders it last instead.
-        .min_by(|(_, a), (_, b)| a.fraction.total_cmp(&b.fraction));
+    let hits = |tracer: &mut crate::engine::trace::Tracer<'_>,
+                solid: bool|
+     -> Option<(usize, String, crate::engine::trace::Trace)> {
+        world
+            .brush_models
+            .iter()
+            // What the *game* says. `owned` is whether it said anything at
+            // all — see [`PlacedBrushModel::owned`] for why a model nobody has
+            // answered for is in neither list.
+            .filter(|placed| placed.owned && placed.solid == solid)
+            .map(|placed| {
+                (
+                    placed.index,
+                    placed.classname.clone(),
+                    tracer.trace_model(ray, &placed.model, Contents::MASK_PLAYERSOLID),
+                )
+            })
+            .filter(|(.., hit)| hit.did_hit())
+            // `f32` is not `Ord`, and a NaN fraction would be a bug worth
+            // seeing rather than a panic: `total_cmp` orders it last instead.
+            .min_by(|(.., a), (.., b)| a.fraction.total_cmp(&b.fraction))
+    };
 
     let v = |v: glam::Vec3| format!("({:.1} {:.1} {:.1})", v.x, v.y, v.z);
-    match nearest {
-        Some((placed, hit)) => cx.print(&format!(
-            "  brush models: {} placed; nearest is *{} \"{}\" at {:.2} units, \
-             surface \"{}\", normal {}",
+    let clip = world.clip_models().len();
+    match hits(&mut tracer, true) {
+        Some((index, classname, hit)) => cx.print(&format!(
+            "  brush models: {} placed, {clip} in the clip chain; nearest solid is \
+             *{index} \"{classname}\" at {:.2} units, surface \"{}\", normal {}",
             world.brush_models.len(),
-            placed.index,
-            placed.classname,
             (hit.end - from).length(),
             world.collision.surface_name(hit.surface),
             v(hit.normal),
         )),
         None => cx.print(&format!(
-            "  brush models: {} placed, none in the way",
+            "  brush models: {} placed, {clip} in the clip chain, none of them in the way",
             world.brush_models.len()
         )),
+    }
+    if let Some((index, classname, hit)) = hits(&mut tracer, false) {
+        cx.print(&format!(
+            "  …and a non-solid one first: *{index} \"{classname}\" at {:.2} units \
+             — a trigger, walked through",
+            (hit.end - from).length(),
+        ));
     }
 }
 

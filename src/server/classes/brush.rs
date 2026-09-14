@@ -48,7 +48,8 @@ use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::{atof, atoi};
 use crate::server::movement::{
-    anglemod, dot_product_abs, move_dir, MoveType, Toggle, ToggleState, EF_NODRAW, FSOLID_NOT_SOLID,
+    anglemod, dot_product_abs, move_dir, MoveType, Solid, Toggle, ToggleState, EF_NODRAW,
+    FSOLID_NOT_SOLID,
 };
 
 // ---------------------------------------------------------------------------
@@ -410,6 +411,15 @@ impl Behaviour for Door {
         // `AngleVectors( angMoveDir, &m_vecMoveDir )`.
         self.move_dir = move_dir(self.move_dir);
 
+        // `if ( GetMoveParent() && GetRootMoveParent()->GetSolid() == SOLID_BSP )`
+        // (`doors.cpp:231`). This port has no *root* parent walk — a parent is
+        // a handle and nothing rebases through it — so a parented door takes
+        // the `SOLID_VPHYSICS` branch, which for a brush entity is the same
+        // brushes either way. 87 of the game's 621 doors name a parent.
+        entity.solid = match entity.parent.is_some() {
+            true => Solid::VPhysics,
+            false => Solid::Bsp,
+        };
         entity.move_type = MoveType::Push;
         // "Don't allow zero or negative speeds" is `CFuncMoveLinear`'s wording;
         // a door's is `if (m_flSpeed == 0) m_flSpeed = 100`.
@@ -566,7 +576,7 @@ fn rotate_aabb(angles: Vec3, mins: Vec3, maxs: Vec3) -> Vec3 {
 // ---------------------------------------------------------------------------
 
 /// `SF_MOVELINEAR_NOTSOLID` (`func_movelinear.cpp:21`) — 92 of the game's 196.
-const _SF_MOVELINEAR_NOTSOLID: u32 = 8;
+const SF_MOVELINEAR_NOTSOLID: u32 = 8;
 
 /// `CFuncMoveLinear` (`game/server/func_movelinear.cpp`) — 196 entities: the
 /// pistons, the monitor covers and the lift doors.
@@ -665,6 +675,12 @@ impl Behaviour for MoveLinear {
     fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
         self.move_dir = move_dir(self.move_dir);
         entity.move_type = MoveType::Push;
+        // `SetSolid( SOLID_VPHYSICS )` (`func_movelinear.cpp:111`), and 92 of
+        // the game's 196 then take it back out again.
+        entity.solid = Solid::VPhysics;
+        if entity.has_spawn_flags(SF_MOVELINEAR_NOTSOLID) {
+            entity.solid_flags |= FSOLID_NOT_SOLID;
+        }
 
         if entity.speed <= 0.0 {
             entity.speed = 100.0;
@@ -798,6 +814,11 @@ const SF_BUTTON_DONTMOVE: u32 = 1;
 const SF_BUTTON_TOGGLE: u32 = 32;
 /// `SF_BUTTON_LOCKED` — 13.
 const SF_BUTTON_LOCKED: u32 = 2048;
+/// `SF_BUTTON_NOTSOLID` (`buttons.cpp:33`) — **zero of the game's 64 set it**,
+/// which is why `CBaseButton::Spawn`'s `SOLID_NONE` branch is unreachable in
+/// Portal 2. Ported because it is the one place a class chooses `SOLID_NONE`
+/// and the choice is otherwise invisible.
+const SF_BUTTON_NOTSOLID: u32 = 16384;
 
 /// `CBaseButton::BUTTON_CODE` (`buttons.h`) — which of the three inputs asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1015,6 +1036,16 @@ impl Behaviour for Button {
     fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
         self.move_dir = move_dir(self.move_dir);
         entity.move_type = MoveType::Push;
+        // `SF_BUTTON_NOTSOLID` sets **both** `SOLID_NONE` and
+        // `FSOLID_NOT_SOLID` (`buttons.cpp:397`), which is belt and braces:
+        // either alone would do.
+        match entity.has_spawn_flags(SF_BUTTON_NOTSOLID) {
+            true => {
+                entity.solid = Solid::None;
+                entity.solid_flags |= FSOLID_NOT_SOLID;
+            }
+            false => entity.solid = Solid::Bsp,
+        }
 
         if entity.speed == 0.0 {
             entity.speed = 40.0;
@@ -1156,6 +1187,10 @@ const SF_BRUSH_ROTATE_BACKWARDS: u32 = 2;
 const SF_BRUSH_ROTATE_Z_AXIS: u32 = 4;
 /// `SF_BRUSH_ROTATE_X_AXIS` — 7.
 const SF_BRUSH_ROTATE_X_AXIS: u32 = 8;
+/// `SF_ROTATING_NOT_SOLID` (`bmodels.cpp:21`) — "some special rotating objects
+/// are not solid". **19 of the game's 27 `func_rotating`s**, which is most of
+/// them: the fake volumetric light cones spin and are walked through.
+const SF_ROTATING_NOT_SOLID: u32 = 64;
 /// `SF_BRUSH_ACCDCC` (`bmodels.cpp:19`) — 8. Spin up and down rather than
 /// snapping to speed.
 const SF_BRUSH_ACCDCC: u32 = 16;
@@ -1493,6 +1528,14 @@ impl Behaviour for Rotating {
             self.move_ang = -self.move_ang;
         }
 
+        // "Some rotating objects like fake volumetric lights will not be
+        // solid" (`bmodels.cpp:677`). The `Remove` branch is the *else*, and
+        // it is there because `CFuncRotating` can be re-spawned.
+        entity.solid = Solid::VPhysics;
+        match entity.has_spawn_flags(SF_ROTATING_NOT_SOLID) {
+            true => entity.solid_flags |= FSOLID_NOT_SOLID,
+            false => entity.solid_flags &= !FSOLID_NOT_SOLID,
+        }
         entity.move_type = MoveType::Push;
 
         // "Did level designer forget to assign a maximum speed?"
@@ -1774,6 +1817,7 @@ impl Behaviour for Brush {
     /// `CFuncBrush::Spawn` (`modelentities.cpp:42`).
     fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
         entity.move_type = MoveType::Push;
+        entity.solid = Solid::VPhysics;
 
         if self.solidity == BRUSHSOLID_NEVER {
             entity.solid_flags |= FSOLID_NOT_SOLID;
@@ -1786,6 +1830,14 @@ impl Behaviour for Brush {
         // > plus `StartDisabled` leaves the brush solid and invisible.
         if self.disabled {
             self.turn_off(entity);
+        }
+
+        // "Slam the object back to solid - if we really want it to be solid."
+        // The last line of `CFuncBrush::Spawn`, and it runs *after* `TurnOff`,
+        // so `solidbsp` on a `StartDisabled` brush restores the solid type and
+        // leaves `FSOLID_NOT_SOLID` set. 5 of the game's 2,502 set it.
+        if self.solid_bsp {
+            entity.solid = Solid::Bsp;
         }
 
         SpawnResult::Ok

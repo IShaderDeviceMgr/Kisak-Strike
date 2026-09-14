@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
-use crate::engine::trace::{BrushModel, CollisionBsp};
+use crate::engine::trace::{BrushModel, CollisionBsp, Contents, Ray};
 use crate::filesystem::mount::pak::PakMount;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
@@ -235,6 +235,10 @@ pub struct World {
     ///
     /// [`classname`]: PlacedBrushModel::classname
     pub brush_models: Vec<PlacedBrushModel>,
+    /// The solid ones among them, as the player's clip chain wants them —
+    /// see [`clip_models`](World::clip_models). Rebuilt by
+    /// [`sync_brush_models`](World::sync_brush_models).
+    clip_models: Vec<BrushModel>,
     /// The drawable ones among them, with their geometry.
     ///
     /// Shorter than [`brush_models`](World::brush_models) — most brush entities
@@ -465,6 +469,10 @@ impl World {
             lightmaps,
             models: bsp.models.clone(),
             brush_models,
+            // Empty until the first `sync_brush_models`, which `Scene::load`
+            // runs before the world is handed over: nothing is in the clip
+            // chain until the game has said what is solid.
+            clip_models: Vec::new(),
             brush_model_geometry,
             collision,
             props,
@@ -514,6 +522,65 @@ impl World {
     /// split `engine/mod.rs` already makes between `console/` and `input/`.
     pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>) {
         sync_placements(&mut self.brush_models, placement);
+        rebuild_clip_models(&self.brush_models, &mut self.clip_models);
+    }
+
+    /// Every brush model the player's trace should be clipped against —
+    /// `ENGINE_TRACE.md` stage 4's half of the clip chain.
+    ///
+    /// **The game decides what is in it**, through
+    /// [`PlacedBrushModel::owned`] and [`PlacedBrushModel::solid`]; see the
+    /// first of those for why the default is to leave a model out. A trigger
+    /// is excluded automatically, because `InitTrigger` sets
+    /// `FSOLID_NOT_SOLID`.
+    ///
+    /// Hand it to
+    /// [`Tracer::with_entities`](crate::engine::trace::Tracer::with_entities).
+    /// It is a *slice* rather than an iterator because a `Tracer` holds it for
+    /// its whole lifetime and a movement command traces through one a dozen
+    /// times; [`sync_brush_models`](World::sync_brush_models) rebuilds it once
+    /// a frame, which on the largest shipped map is a few hundred `Copy`s.
+    pub fn clip_models(&self) -> &[BrushModel] {
+        &self.clip_models
+    }
+
+    /// `engine->SolidMoved` (`engine/world.cpp`'s `CTouchLinks`) — every brush
+    /// model the swept box `mins`-`maxs` meets on its way from `start` to
+    /// `end`, by `"*N"` model index.
+    ///
+    /// The engine's half of the touch test, and the reason `src/server/` can
+    /// run triggers without naming a collision type. Two things it is not:
+    ///
+    /// - **Not a bounding-box overlap.** Valve's enumerator ends in
+    ///   `ClipRayToCollideable( ray, MASK_SOLID, pTrigger, &tr )` and takes
+    ///   the hit only if `tr.contents & MASK_SOLID` — the swept box against
+    ///   the trigger's *actual brushes*. A test chamber's triggers are L- and
+    ///   U-shaped often enough that the difference is visible.
+    /// - **Not filtered to triggers.** Which of these is a trigger is
+    ///   `FSOLID_TRIGGER`, which is the server's live state; keeping a copy
+    ///   here would be a frame stale every time something was enabled. The
+    ///   server filters, and pays one brush sweep per non-trigger brush entity
+    ///   per tick for the privilege — `sp_a1_intro1` has 78 brush models in
+    ///   total.
+    ///
+    /// Appends to `out`; does not clear it.
+    pub fn brush_models_touching(
+        &self,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        out: &mut Vec<usize>,
+    ) {
+        brush_models_touching(
+            &self.collision,
+            &self.brush_models,
+            start,
+            end,
+            mins,
+            maxs,
+            out,
+        );
     }
 
     /// Records every brush entity's batches, each under its own transform.
@@ -1159,6 +1226,28 @@ pub struct PlacedBrushModel {
     /// `ENGINE_TRACE.md` stage 4's along with the entity clip chain that would
     /// read it. So `true` here means "nothing has said otherwise", not "solid".
     pub solid: bool,
+    /// Whether the game server has a class for the entity that owns this
+    /// model, and is therefore answering for it.
+    ///
+    /// # This is what keeps the clip chain honest
+    ///
+    /// `ENGINE_TRACE.md` stage 4 puts brush entities in the player's trace,
+    /// and the map's 11,635 of them are **not** all solid: a
+    /// `trigger_portal_cleanser` is a fizzler you walk through, and
+    /// `func_portal_bumper` — 2,383 of them, the ninth commonest classname in
+    /// the game — exists only to stop a portal landing on a wall. Whether one
+    /// is solid is `FSOLID_NOT_SOLID`, which is *game* state, and this port
+    /// has classes for 6,302 of the 11,635.
+    ///
+    /// So [`clip_models`](World::clip_models) yields only the ones
+    /// where this is `true` **and** [`solid`](PlacedBrushModel::solid) is:
+    /// "collide with what the game has told us about" rather than "assume
+    /// everything is a wall". The alternative fills every Portal 2 chamber
+    /// with invisible walls, and would do it silently.
+    ///
+    /// `false` until [`sync_brush_models`](World::sync_brush_models) hears
+    /// otherwise.
+    pub owned: bool,
 }
 
 /// Where a brush entity is, and whether it counts — the answer
@@ -1270,6 +1359,7 @@ pub(crate) fn find_brush_models(
                 // for the classnames it implements.
                 visible: true,
                 solid: true,
+                owned: false,
             })
         })
         .collect()
@@ -1279,6 +1369,50 @@ pub(crate) fn find_brush_models(
 ///
 /// Separate so that a test can run the real thing: a [`World`] cannot be built
 /// without a GPU and this has nothing to do with one.
+/// Refills the clip chain from the placements — see
+/// [`PlacedBrushModel::owned`] for the rule and why it is a refusal by
+/// default.
+fn rebuild_clip_models(models: &[PlacedBrushModel], out: &mut Vec<BrushModel>) {
+    out.clear();
+    out.extend(
+        models
+            .iter()
+            .filter(|placed| placed.owned && placed.solid)
+            .map(|placed| placed.model),
+    );
+}
+
+/// [`World::brush_models_touching`]'s body, over the two things it needs.
+///
+/// Free rather than a method so that the depot test — which has no GPU and so
+/// cannot build a [`World`] — sweeps the same code the running game does
+/// rather than a copy of it.
+pub(crate) fn brush_models_touching(
+    collision: &CollisionBsp,
+    models: &[PlacedBrushModel],
+    start: Vec3,
+    end: Vec3,
+    mins: Vec3,
+    maxs: Vec3,
+    out: &mut Vec<usize>,
+) {
+    let ray = Ray::hull(start, end, mins, maxs);
+    let mut tracer = collision.tracer();
+    for placed in models {
+        if !placed.owned {
+            continue;
+        }
+        let trace = tracer.trace_model(&ray, &placed.model, Contents::MASK_SOLID);
+        // `if ( !(tr.contents & MASK_SOLID) ) return ITERATION_CONTINUE;` —
+        // and `contents` is left at `CONTENTS_EMPTY` by a clean miss, so this
+        // one test covers both "missed" and "hit something the mask does not
+        // want".
+        if trace.contents.intersects(Contents::MASK_SOLID) {
+            out.push(placed.index);
+        }
+    }
+}
+
 fn sync_placements(
     models: &mut [PlacedBrushModel],
     placement: impl Fn(usize) -> Option<Placement>,
@@ -1290,6 +1424,7 @@ fn sync_placements(
         placed.model.set_placement(p.origin, p.angles);
         placed.visible = p.visible;
         placed.solid = p.solid;
+        placed.owned = true;
     }
 }
 
@@ -1851,6 +1986,104 @@ mod tests {
         });
         assert!((at(&placed[0]) - Vec3::new(0.0, 0.0, 99.0)).length() < 1e-4);
         assert!(!placed[0].visible && !placed[0].solid);
+    }
+
+    /// **The clip chain is opt-in, and that is what stops 5,333 brush entities
+    /// this port has no class for becoming invisible walls** — `ENGINE_TRACE.md`
+    /// stage 4's one real hazard. See [`PlacedBrushModel::owned`].
+    #[test]
+    fn only_a_brush_model_the_game_answers_for_is_in_the_clip_chain() {
+        let bsp = with_brush_model(1, "\"origin\" \"0 0 0\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let mut placed = find_brush_models(&bsp.entities(), &collision);
+        let mut clip = Vec::new();
+
+        // Nobody has said anything yet — `func_portal_bumper`'s case, and the
+        // case of every brush entity between now and the classes that own it.
+        rebuild_clip_models(&placed, &mut clip);
+        assert!(clip.is_empty(), "unowned is not solid");
+
+        // A `func_door`: owned and solid.
+        let say = |solid| {
+            move |index: usize| {
+                (index == 1).then_some(Placement {
+                    origin: Vec3::ZERO,
+                    angles: Vec3::ZERO,
+                    visible: true,
+                    solid,
+                })
+            }
+        };
+        sync_placements(&mut placed, say(true));
+        rebuild_clip_models(&placed, &mut clip);
+        assert_eq!(clip.len(), 1, "a door is a wall");
+
+        // A trigger: owned, and `InitTrigger` said `FSOLID_NOT_SOLID`.
+        sync_placements(&mut placed, say(false));
+        rebuild_clip_models(&placed, &mut clip);
+        assert!(clip.is_empty(), "a trigger is walked through");
+    }
+
+    /// `engine->SolidMoved` — the swept box against the model's **own
+    /// brushes**, and only against the ones the game answers for.
+    ///
+    /// The fixture gives model 1 a real 200-unit cube of its own so that the
+    /// answer is a brush test rather than a bounding-box one, which is the
+    /// difference `World::brush_models_touching` exists to preserve.
+    #[test]
+    fn the_touch_query_reports_the_models_a_swept_box_meets() {
+        use crate::engine::trace::fixture::Fixture;
+        use crate::engine::trace::Contents;
+
+        let mut fixture = Fixture::default();
+        let volume = fixture.add_box(
+            Vec3::splat(-100.0),
+            Vec3::splat(100.0),
+            Contents::SOLID,
+            true,
+        );
+        let collision = fixture.world_and_model(&[], &[volume]);
+
+        let mut placed = vec![PlacedBrushModel {
+            classname: String::from("trigger_once"),
+            index: 1,
+            model: collision
+                .brush_model(1, Vec3::ZERO, Vec3::ZERO)
+                .expect("model 1"),
+            render_mode: 0,
+            visible: true,
+            solid: true,
+            owned: false,
+        }];
+
+        let (mins, maxs) = (Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 72.0));
+        let inside = Vec3::new(0.0, 0.0, -36.0);
+        let mut out = Vec::new();
+
+        // Unowned: invisible to the query, exactly as it is to the clip chain.
+        brush_models_touching(&collision, &placed, inside, inside, mins, maxs, &mut out);
+        assert!(out.is_empty(), "the game has not claimed it");
+
+        // A trigger — non-solid, and still reported: **which of these is a
+        // trigger is the server's question, not this one's.**
+        placed[0].owned = true;
+        placed[0].solid = false;
+        out.clear();
+        brush_models_touching(&collision, &placed, inside, inside, mins, maxs, &mut out);
+        assert_eq!(out, vec![1]);
+
+        // Well outside, and not swept through it.
+        let away = Vec3::new(0.0, 0.0, 4096.0);
+        out.clear();
+        brush_models_touching(&collision, &placed, away, away, mins, maxs, &mut out);
+        assert!(out.is_empty());
+
+        // …but swept *from* outside *to* inside, it is met on the way — which
+        // is what stops a fast player crossing a thin trigger between two
+        // ticks without ever being reported inside it.
+        out.clear();
+        brush_models_touching(&collision, &placed, away, inside, mins, maxs, &mut out);
+        assert_eq!(out, vec![1]);
     }
 
     /// The placement comes from the entity, not from the model lump, and the

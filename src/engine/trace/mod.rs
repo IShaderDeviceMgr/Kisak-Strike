@@ -223,6 +223,11 @@ impl Work<'_> {
 pub struct Tracer<'a> {
     bsp: &'a CollisionBsp,
     visits: Visits,
+    /// The brush entities in the clip chain — see
+    /// [`with_entities`](Tracer::with_entities). Empty by default, which is
+    /// what makes [`trace`](Tracer::trace) a world-only sweep for every caller
+    /// that has not asked for more.
+    entities: &'a [BrushModel],
 }
 
 impl<'a> Tracer<'a> {
@@ -230,20 +235,54 @@ impl<'a> Tracer<'a> {
         Tracer {
             bsp,
             visits: Visits::new(bsp.brushes.len(), bsp.disps.len()),
+            entities: &[],
         }
     }
 
-    /// Sweeps `ray` through the world, stopping at the first thing matching
-    /// `mask`.
+    /// Puts brush entities in the clip chain — `ENGINE_TRACE.md` stage 4, and
+    /// the thing that makes a door a wall.
     ///
-    /// `CM_BoxTrace` against head node 0, which is what
-    /// `CEngineTrace::TraceRay` passes for the world
-    /// (`engine/enginetrace.cpp:2838`). **Brush models are not included** —
-    /// a door is not part of the world's subtree, and hitting one is
-    /// [`trace_model`](Tracer::trace_model)'s question. Nothing yet combines
-    /// the two; that is `ClipRayToCollideable`'s job and it arrives with
-    /// entities (`portdocs/ENGINE_TRACE.md` stage 4).
+    /// **Which entities is the game's decision, not this module's.** Whether a
+    /// brush entity is solid is `FSOLID_NOT_SOLID`, whether it is a trigger is
+    /// `FSOLID_TRIGGER`, and both live in `src/server/`; `world/`'s
+    /// [`clip_models`](crate::engine::world::World::clip_models) is where the
+    /// answer arrives. Handing over an empty slice — the default — is a
+    /// world-only trace, which is what every caller before this stage wanted
+    /// and still gets.
+    ///
+    /// The list is walked linearly. That is Valve's spatial partition replaced
+    /// by nothing, deliberately: a Portal 2 map has a few hundred brush
+    /// entities (78 on `sp_a1_intro1`), each rejected by a bounding-box test
+    /// at the top of its own BSP descent, and `ENGINE_TRACE.md` §5 already
+    /// records that `parry`'s `Qbvh` is where a broadphase comes from when one
+    /// is needed.
+    pub fn with_entities(mut self, entities: &'a [BrushModel]) -> Tracer<'a> {
+        self.entities = entities;
+        self
+    }
+
+    /// Sweeps `ray` through the world and everything in the clip chain,
+    /// stopping at the nearest thing matching `mask`.
+    ///
+    /// `CEngineTrace::TraceRay` (`engine/enginetrace.cpp:2786`). With no
+    /// entities — the default, and every caller before stage 4 — it is
+    /// `CM_BoxTrace` against head node 0 and nothing else; with entities it is
+    /// that, followed by [`trace_model`](Tracer::trace_model) against each in
+    /// turn. See [`with_entities`](Tracer::with_entities) for who decides
+    /// which.
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace {
+        match self.entities.is_empty() {
+            true => self.trace_world(ray, mask),
+            false => self.trace_chain(ray, mask),
+        }
+    }
+
+    /// The world's subtree alone — `CM_BoxTrace( ray, 0, mask, … )`.
+    ///
+    /// **Brush models are not included**: a door is not part of the world's
+    /// subtree, and hitting one is [`trace_model`](Tracer::trace_model)'s
+    /// question. [`trace`](Tracer::trace) is what combines the two.
+    pub fn trace_world(&mut self, ray: &Ray, mask: Contents) -> Trace {
         let mut trace = self.box_trace(ray, 0, mask);
         compute_trace_endpoints(ray, &mut trace);
         fix_up_hull_start(ray, &mut trace);
@@ -285,6 +324,72 @@ impl<'a> Tracer<'a> {
         // actually handed over.
         compute_trace_endpoints(ray, &mut trace);
         fix_up_hull_start(ray, &mut trace);
+        trace
+    }
+
+    /// [`trace`](Tracer::trace)'s entity half.
+    ///
+    /// # Three details, and each of them is load-bearing
+    ///
+    /// - **The world is traced first and the ray is then shortened to the
+    ///   hit**, so a door behind a wall costs a rejected descent rather than a
+    ///   full sweep. The shortening recomputes the end and *subtracts* to get
+    ///   the delta rather than scaling it — Valve's comment says why: it makes
+    ///   the shortened ray quantise exactly the way `endpos` does, and scaling
+    ///   instead "would miss intersections we would get by feeding these
+    ///   results back in to the tracer".
+    /// - **The fractions come back rescaled onto the original ray.** Inside
+    ///   the loop they are fractions of the shortened one; the last two lines
+    ///   put them back, which is why `fraction` means the same thing here as
+    ///   it does for a world-only trace.
+    /// - **A trace that starts inside the world never looks at an entity.**
+    ///   `if ( pTrace->startsolid ) return;` — "inside world, no need to check
+    ///   being inside anything else".
+    ///
+    /// The static props and `vphysics` halves of `ClipRayToCollideable` are
+    /// stage 5's; for a brush model the whole of it is `ClipRayToBSP`, which
+    /// is [`trace_model`](Tracer::trace_model).
+    fn trace_chain(&mut self, ray: &Ray, mask: Contents) -> Trace {
+        let mut trace = self.trace_world(ray, mask);
+        if trace.start_solid {
+            return trace;
+        }
+
+        let world_fraction = trace.fraction;
+        let mut world_fraction_left_solid = world_fraction;
+        let mut entity_ray = *ray;
+
+        if trace.fraction == 0.0 {
+            entity_ray.delta = Vec3::ZERO;
+            entity_ray.is_swept = false;
+            world_fraction_left_solid = trace.fraction_left_solid;
+            trace.fraction_left_solid = 1.0;
+            trace.fraction = 1.0;
+        } else {
+            let end = entity_ray.start + trace.fraction * entity_ray.delta;
+            entity_ray.delta = end - entity_ray.start;
+            entity_ray.is_swept = entity_ray.delta.length_squared() != 0.0;
+            trace.fraction_left_solid /= trace.fraction;
+            trace.fraction = 1.0;
+        }
+
+        for i in 0..self.entities.len() {
+            let model = self.entities[i];
+            let clip = self.trace_model(&entity_ray, &model, mask);
+            clip_trace_to_trace(&clip, &mut trace);
+            if trace.all_solid {
+                break;
+            }
+        }
+
+        trace.fraction *= world_fraction;
+        trace.fraction_left_solid *= world_fraction_left_solid;
+
+        // "Make sure no fractionleftsolid can be used with box sweeps."
+        if !ray.is_ray {
+            trace.start = ray.origin();
+            trace.fraction_left_solid = 0.0;
+        }
         trace
     }
 
@@ -640,6 +745,45 @@ fn compute_trace_endpoints(ray: &Ray, trace: &mut Trace) {
         trace.end = start;
     }
     trace.start = start + ray.delta * trace.fraction_left_solid;
+}
+
+/// `CEngineTrace::ClipTraceToTrace` (`engine/enginetrace.cpp:1524`) — keep
+/// whichever of the two hits is nearer, and merge the start-solid state.
+///
+/// > **The merge is not "take the smaller fraction".** A trace that started
+/// > inside something has a fraction of 1 and matters anyway, and when *both*
+/// > started solid the surviving `start`/`fraction_left_solid` is the pair
+/// > from whichever left solid **later** — because the point the sweep is
+/// > really starting from is the last one that was still inside anything. Get
+/// > that backwards and a player standing in a doorway is teleported to the
+/// > near edge of the door instead of the far one.
+fn clip_trace_to_trace(clip: &Trace, final_trace: &mut Trace) -> bool {
+    if clip.all_solid || clip.start_solid || clip.fraction < final_trace.fraction {
+        if final_trace.start_solid {
+            let fraction_left_solid = final_trace.fraction_left_solid;
+            let start = final_trace.start;
+
+            *final_trace = *clip;
+            final_trace.start_solid = true;
+
+            if fraction_left_solid > clip.fraction_left_solid {
+                final_trace.fraction_left_solid = fraction_left_solid;
+                final_trace.start = start;
+            }
+        } else {
+            *final_trace = *clip;
+        }
+        return true;
+    }
+
+    if clip.start_solid {
+        final_trace.start_solid = true;
+        if clip.fraction_left_solid > final_trace.fraction_left_solid {
+            final_trace.fraction_left_solid = clip.fraction_left_solid;
+            final_trace.start = clip.start;
+        }
+    }
+    false
 }
 
 impl CollisionBsp {
@@ -1395,6 +1539,90 @@ mod tests {
                 local.delta,
             );
         }
+    }
+
+    // ---- Stage 4: the clip chain -----------------------------------------
+
+    /// `trace` with entities is the world *and* the brush models, nearest
+    /// wins — and the fraction it reports is against the original ray, not
+    /// against the shortened one the entities were swept with.
+    #[test]
+    fn the_clip_chain_keeps_the_nearest_of_the_world_and_the_entities() {
+        let world = world_and_model();
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(500.0, 0.0, 0.0));
+        let near = world
+            .brush_model(1, Vec3::ZERO, Vec3::ZERO)
+            .expect("model 1");
+        // The same model, pushed past the world's wall.
+        let far = world
+            .brush_model(1, Vec3::new(300.0, 0.0, 0.0), Vec3::ZERO)
+            .expect("model 1");
+
+        // Nothing in the chain: the world's wall at 300.
+        let hit = world.tracer().trace(&ray, Contents::MASK_SOLID);
+        assert!((hit.end.x - (300.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+
+        // A model in front of it wins…
+        let chain = [near];
+        let hit = world
+            .tracer()
+            .with_entities(&chain)
+            .trace(&ray, Contents::MASK_SOLID);
+        assert!((hit.end.x - (100.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+        // …and the fraction is against the whole 500-unit ray, which is the
+        // rescaling at the end of `TraceRay`.
+        assert!((hit.fraction - (100.0 - DIST_EPSILON) / 500.0).abs() < 1e-4);
+
+        // A model *behind* it does not, and — the point of shortening the ray
+        // — is not even reached.
+        let chain = [far];
+        let hit = world
+            .tracer()
+            .with_entities(&chain)
+            .trace(&ray, Contents::MASK_SOLID);
+        assert!((hit.end.x - (300.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+
+        // Both: the nearest of the three.
+        let chain = [far, near];
+        let hit = world
+            .tracer()
+            .with_entities(&chain)
+            .trace(&ray, Contents::MASK_SOLID);
+        assert!((hit.end.x - (100.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+    }
+
+    /// The clip chain is opt-in: `collision.tracer()` is world-only, which is
+    /// what every caller before stage 4 asked for and still gets.
+    #[test]
+    fn a_tracer_with_no_entities_is_a_world_trace() {
+        let world = world_and_model();
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(500.0, 0.0, 0.0));
+        let plain = world.tracer().trace(&ray, Contents::MASK_SOLID);
+        let world_only = world.tracer().trace_world(&ray, Contents::MASK_SOLID);
+        assert_eq!(plain, world_only);
+    }
+
+    /// A trace that begins inside the world never looks at an entity —
+    /// "inside world, no need to check being inside anything else".
+    #[test]
+    fn a_trace_that_starts_in_the_world_ignores_the_chain() {
+        let world = world_and_model();
+        let near = world
+            .brush_model(1, Vec3::ZERO, Vec3::ZERO)
+            .expect("model 1");
+        // Start inside the world's wall.
+        let ray = Ray::line(Vec3::new(350.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        let chain = [near];
+        let hit = world
+            .tracer()
+            .with_entities(&chain)
+            .trace(&ray, Contents::MASK_SOLID);
+        assert!(hit.start_solid);
+        assert_eq!(
+            hit,
+            world.tracer().trace_world(&ray, Contents::MASK_SOLID),
+            "the world's answer, returned before the chain was walked"
+        );
     }
 
     /// Every shipped map's brush entities, resolved and swept against for
