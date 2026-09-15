@@ -2049,6 +2049,37 @@ Ordered by how likely each is to bite.
     reflects, so `refract.wgsl` does the same thing and says so at the line. Passing
     `-in.world_view_vector` is the physically intended vector.
 
+39. **There are two `$envmaptint` gamma decodes and they are not interchangeable.**
+    `shader::gamma_to_linear_param` is `GammaToLinear` — a 256-entry table, so the input
+    quantizes to `round( x * 255 ) / 255`, anything at or above 0.95 becomes exactly 1,
+    and anything above 1 passes through un-decoded. `Refract` takes that one, through
+    `SetPixelShaderConstantGammaToLinear`.
+    `shader::gamma_to_linear_full_range_param` is `GammaToLinearFullRange` — the plain
+    `pow( x, 2.2 )`, no table, no clamping of any kind. **`VertexLitGeneric` takes that
+    one**, through `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`
+    (`commandbuilder.h:564`), and the difference is deliberate in the original: the helper
+    used to read `GetLinearVecValue` and a signed comment at `:571` says the clamp was
+    removed so a tint could be "over-driven beyond 0-1 range". `models/sabotage/glass01`
+    is the shipped material that tells them apart outright, with `$envmaptint "[5 5 5]"` —
+    **34.5** under the full-range decode and **5** under the table. It is not reachable
+    yet, because its `$envmap` is `env_cubemap`; on the 57 materials that *do* reflect the
+    two decodes agree to within 4.4%, except the five writing `[0.01 0.01 0.01]`, where the
+    table's quantization to `3/255` lands 43% brighter. So picking the wrong one here is a
+    slow error, not an obvious one — which is why the two functions carry each other's
+    names in their doc comments.
+
+40. **A `$envmaptint` is much darker decoded than it looks, and that is the point.** Every
+    one of the 57 `VertexLitGeneric` materials in Portal 2 with a resolvable `$envmap`
+    writes a tint and every one of them is dark — `[0.05 0.05 0.05]` on 20 of them, which
+    is **0.0014** linear, a factor of 36. Five materials write `[0.01 0.01 0.01]`, which is
+    4.0e-5: content asking for no reflection at all rather than a faint one. A reflection
+    that looks plausibly bright is the symptom of this decode being skipped.
+
+41. **`$selfillumtint` and `$detailtint` sit in the same uniform block and are *not*
+    decoded.** Only `$envmaptint` is, because only it multiplies an already-linear cubemap
+    sample; Valve hands the other two to the shader as authored. Decoding them for
+    symmetry would darken every self-illuminated and detail-textured model in the game.
+
 ## Deliberate divergences from Valve's behavior
 
 Each of these changes what the engine does, and each names the thing that reverses it.
@@ -2091,7 +2122,6 @@ Each of these changes what the engine does, and each names the thing that revers
 | `$lightwarptexture`, `$rimlight` and self-illum fresnel are ignored | each belongs to the `Phong` path or needs a texture kind not yet loaded; all three are declared-and-unread rather than silently accepted, since the params table omits what it does not honour | — |
 | **The frame-buffer copy is taken once a frame, not once per refractor** | on PC Valve calls `UpdateRefractTexture` before *each* refracting renderable in the back-to-front translucent list (`viewrender.cpp:6195`), so glass behind glass sees the nearer pane's result. One copy is one full-screen blit and one extra pass; a copy per refractor is a pass per refractor. Overlapping refractors here show the scene behind both rather than through each other, and nothing in Portal 2's single-player maps stacks two in one view | call `RenderContext::update_refract_texture` between draws rather than before them |
 | **A refracting prop is split per *batch*, where Valve splits per renderable** | Valve sorts whole renderables into the opaque and translucent lists, so a prop with one refracting material among several draws entirely in the translucent pass. Mixing is the normal case and not the corner one: of the 66 models in the depot wearing a frame-buffer-refracting material, **60 also wear something else** — every `props_destruction/glass_*` pane is a refracting sheet plus an opaque `glass_fracture_*_inner` edge. The per-batch split is the one that is right without a depth sort, which this port does not have | `PropModels::record`, once translucency sorting exists |
-| `Refract`'s `$refracttint`/`$envmaptint` are gamma-decoded and `VertexLitGeneric`'s `$envmaptint` is not | **this one is a gap rather than a decision.** `Refract` decodes through `SetPixelShaderConstantGammaToLinear` — a 256-entry table that clamps anything at or above 0.95 to 1 — and `shader::gamma_to_linear_param` is that, faithfully. `VertexLitGeneric` decodes through `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`, which is the plain `pow( x, 2.2 )` with no table and no clamp, and `vertex_lit_uniforms` does not decode at all — so every reflective prop in the game has an envmap tint that is too bright. Fixing it changes 1,108 materials and belongs in its own change | `shader::vertex_lit_uniforms`, applying `GammaToLinearFullRange` to `$envmaptint` |
 | `Refract` is drawn with `VertexLayout::Model` even for a brush surface | Valve declares two vertex formats and picks on `$model`. 29 of the game's 37 materials set it and all eight that do not are under `materials/particle/`, drawn by the unported particle system; **no brush face or displacement in the shipped game names this shader** | `ShaderKind::vertex_layout`, plus a tangent on a `SimpleVertex` when particles land |
 | `Refract`'s secondary normal map, `$masked`, `$magnifyenable` and `$vertexcolormodulate` are not implemented | **zero** Portal 2 materials set any of them, and the secondary-normal path is broken where Valve implements it: it binds `$normalmap2` to sampler 1 and then samples sampler 3 with the second coordinate set (`refract_ps2x.fxc:143`). `$masked` additionally wants a blend mode `BlendMode` does not have | `REFRACT_PARAMS`, and a `BlendMode::MaskedRefract` |
 | `$time` and `$fresnelreflection` are not declared on `Refract` at all | both are dead in Valve's shader: `$time` reaches a register no `.fxc` reads, and `$fresnelreflection` is never written to one — `refract.cpp` and its helper each carry the comment *"FIXME: doesn't support Fresnel!"* | — |
@@ -2160,6 +2190,11 @@ resolves to the error material — measured against the mounted game by
 - **A float scene target** — `HDR_TYPE_FLOAT`. It would change what the histogram means,
   because nothing would clip at 1.0 any more and the 98th percentile would move, so it is
   the tone mapper's tuning constants as well as a format. §10.
+- **`mat_specular` and `mat_fullbright`.** Both envmap-tint helpers in `commandbuilder.h`
+  have an `else` branch that replaces the tint with black when `g_pConfig->bShowSpecular`
+  is 0 or `g_pConfig->nFullbright` is 2 — how Source turns every reflection in the game
+  off at once. Neither cvar is registered here, so the taken branch is always the one
+  their defaults select. Reversing this is two cvars and a zero in `vertex_lit_uniforms`.
 - **Material proxies.** `IMaterialProxy` and the `CreateInterface`-registered factory. The
   concept survives as a per-frame hook over the vars; the factory does not.
 - **`$frame` animation.** Read but not acted on — `TextureCache` loads frame 0 (see the
@@ -2293,10 +2328,10 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 
 ## Test coverage
 
-203 tests, in three groups: 156 pure logic, 46 end-to-end on a GPU, and one depot-gated
+205 tests, in three groups: 158 pure logic, 46 end-to-end on a GPU, and one depot-gated
 census.
 
-**Pure logic, no GPU** (156) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (158) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
@@ -2304,7 +2339,7 @@ census.
 | `vtf` (18) | every version 7.0-7.5, the seventh cubemap face, partial mip chains, the thumbnail, flag masking, and each way a file can be malformed |
 | `vmt` (17) | the type sniffing, conditional keys, flags-are-not-vars, fallback blocks, and patch expansion against a real temp-directory `Vfs` |
 | `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
-| `shader` (37) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule — plus `VertexLitGeneric`'s parameter resolution: `WantsPhongShader`'s truth table, `env_cubemap`, the shader-supplied defaults that `param_value` does not give, the three envmap masks resolving against each other, and the alpha-test suppression when base alpha is spoken for. `Refract` adds thirteen: the base-texture-versus-frame-buffer fork, `$localrefract` deciding whether a copy is needed at all, `$bluramount`'s integer truncation, the integer aspect fixup at three shapes, the gamma table's `>= 0.95` clamp, the blend decision coming from the normal map and only without an `$envmap`, the envmap's sRGB asymmetry against `VertexLitGeneric`'s, and the parameter table promising nothing it does not implement |
+| `shader` (39) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule — plus `VertexLitGeneric`'s parameter resolution: `WantsPhongShader`'s truth table, `env_cubemap`, the shader-supplied defaults that `param_value` does not give, the three envmap masks resolving against each other, and the alpha-test suppression when base alpha is spoken for. `Refract` adds thirteen: the base-texture-versus-frame-buffer fork, `$localrefract` deciding whether a copy is needed at all, `$bluramount`'s integer truncation, the integer aspect fixup at three shapes, the gamma table's `>= 0.95` clamp, the blend decision coming from the normal map and only without an `$envmap`, the envmap's sRGB asymmetry against `VertexLitGeneric`'s, and the parameter table promising nothing it does not implement. Two more pin the `$envmaptint` decode: that the full-range and table conversions disagree at both ends (the table's `>= 0.95` clamp, and `> 1` passing through where the full-range one raises 5 to 34.5), and that `$envmaptint` reaches `VertexLitUniforms` linear while `$selfillumtint`, `$detailtint` and `$envmapcontrast` in the same block do not |
 | `var` (12) | the value grammar and every coercion between the arms, plus the flag-name table against the bit constants |
 | `texture` (7) | the `.vtf` flags -> sampler policy, and `NormalizeTextureName` — extensions stripped except `.hdr`, and only in the last path component |
 | `uniforms` (10) | the uniform block sizes WGSL expects — `RefractUniforms` is guarded in `shader` instead, beside the struct — including `ModelLighting`'s hand-written tail padding, where Rust's alignment for an array of `[f32; 4]` is 4 and WGSL's is 16 — the no-fog packing, the row-major/column-major conversion in both directions, and the light type's two-`w`-component encoding |
@@ -2345,12 +2380,19 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --igno
      18 WorldVertexTransition  (1 pipelines)
     608 <the error material>
 51 pipelines for the whole set
+345 materials define $envmaptint
 ```
 
 So **2,947 of the mounted game's 3,555 materials draw with a real shader**, and the whole
 set needs 51 pipelines — which is the standing answer to
 `portdocs/MATERIALSYSTEM.md` §10's "how many variants actually survive". The assertions
 are floors rather than exact counts, so mounting the language DLCs does not fail the test.
+
+The `$envmaptint` line is a second job the same walk does, and it is an *assertion* rather
+than a census: none of those 345 materials may write a negative component, because
+`gamma_to_linear_full_range_param` reproduces Valve's un-guarded `pow` and would turn one
+into a NaN in a uniform buffer. It is what makes reproducing that exactly safe, and it
+fails with the offending material names if a mounted DLC ever adds one.
 
 The 608 that fall back are dominated by six unported shaders — `SpriteCard` (143),
 `DecalModulate` (101), `Water` (59), `SubRect` (57), `Sprite` (35) and `UnlitTwoTexture`

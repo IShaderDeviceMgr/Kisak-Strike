@@ -1781,7 +1781,13 @@ pub struct VertexLitUniforms {
     pub detail_transform: [[f32; 4]; 2],
     /// `$selfillumtint` in `rgb`, `$selfillummaskscale` in `w`.
     pub selfillum_tint: [f32; 4],
-    /// `$envmaptint` in `rgb`, `$envmapcontrast` in `w`.
+    /// `$envmaptint` in `rgb`, **gamma-decoded on the CPU** by
+    /// [`gamma_to_linear_full_range_param`], and `$envmapcontrast` in `w`.
+    ///
+    /// The decode belongs here rather than in the shader because that is where
+    /// Valve does it — the constant is written already-linear by
+    /// `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` and the pixel shader
+    /// only multiplies (`vertexlit_and_unlit_generic_ps2x.fxc:697`).
     pub envmap_tint: [f32; 4],
     /// `$envmapsaturation` in `x`, `$envmapfresnel` in `y`, and
     /// `$detailtint`'s luminance-neutral counterpart is elsewhere: `z` and `w`
@@ -1937,7 +1943,14 @@ pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms {
     // (`:139`, `:145`, `:158`), which is *not* what their declared `Color` type
     // would give them.
     let selfillum_tint = init_vec(vmt, "$selfillumtint", [1.0, 1.0, 1.0, 0.0]);
-    let envmap_tint = init_vec(vmt, "$envmaptint", [1.0, 1.0, 1.0, 0.0]);
+    // **`$envmaptint` is decoded and the other two are not**, which is Valve's
+    // asymmetry rather than an oversight here: the reflection is multiplied
+    // into an already-linear cubemap sample, so the tint has to be linear, and
+    // `$selfillumtint`/`$detailtint` are handed to the shader as written. See
+    // [`gamma_to_linear_full_range_param`] for why it is that decode and not
+    // the table one every other tint in this module uses.
+    let envmap_tint =
+        gamma_to_linear_full_range_param(init_vec(vmt, "$envmaptint", [1.0, 1.0, 1.0, 0.0]));
     let detail_tint = init_vec(vmt, "$detailtint", [1.0, 1.0, 1.0, 0.0]);
 
     // `$envmapfresnelminmaxexp` and `$basealphaenvmapmaskminmaxexp` are both
@@ -2230,12 +2243,9 @@ pub fn refract_uniforms(vmt: &Vmt, textures: ResolvedTextures) -> RefractUniform
 ///   `round( x * 255 ) / 255` first.
 ///
 /// Note what does *not* use this: `VertexLitGeneric`'s `$envmaptint`, which
-/// Valve decodes with `GammaToLinearFullRange` — the plain power, no table, no
-/// clamp — through `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`
-/// (`public/shaderlib/commandbuilder.h:564`), and which
-/// [`vertex_lit_uniforms`] does not decode at all. That is a live gap in that
-/// shader rather than a decision, and fixing it changes every reflective prop
-/// in the game, so it is recorded here and left for its own change.
+/// takes the *other* decode — [`gamma_to_linear_full_range_param`]. The two are
+/// different functions reached through different helpers, and
+/// `models/sabotage/glass01` is the shipped material that tells them apart.
 fn gamma_to_linear_param(gamma: [f32; 4]) -> [f32; 4] {
     let convert = |value: f32| {
         if value > 1.0 {
@@ -2249,6 +2259,74 @@ fn gamma_to_linear_param(gamma: [f32; 4]) -> [f32; 4] {
         }
         ((value * 255.0).round() / 255.0).powf(2.2)
     };
+    [
+        convert(gamma[0]),
+        convert(gamma[1]),
+        convert(gamma[2]),
+        gamma[3],
+    ]
+}
+
+/// `GammaToLinearFullRange` applied to a colour parameter's `rgb`, leaving `w`
+/// alone: the plain `pow( x, 2.2 )`, with no table and no clamping of any kind.
+///
+/// This is `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`
+/// (`public/shaderlib/commandbuilder.h:564`), which is how **`VertexLitGeneric`
+/// and only `VertexLitGeneric`** gets its `$envmaptint` to the pixel shader
+/// (`vertexlitgeneric_dx9_helper.cpp:1474`). `GammaToLinearFullRange` itself is
+/// `mathlib/color_conversion.cpp:266` and is two lines long.
+///
+/// **It is not [`gamma_to_linear_param`]**, and the difference is deliberate in
+/// the original rather than incidental. The command-builder helper used to read
+/// `GetLinearVecValue` — the 256-entry table, with the `>= 0.95` clamp to 1 —
+/// and there is a signed comment at `:571` saying why it was changed:
+///
+/// ```text
+/// //this->Param( tintVar)->GetLinearVecValue( color, 3 );
+/// // (wills) converted this line to the following so that envmaptint can be
+/// // over-driven beyond 0-1 range
+/// ```
+///
+/// So the clamp was removed *on purpose*, to let a material push a reflection
+/// past white. `models/sabotage/glass01` is the one material in Portal 2 that
+/// exercises it, with `$envmaptint "[5 5 5]"`: this decode makes that 34.5,
+/// where [`gamma_to_linear_param`]'s `> 1` passthrough would leave it 5. It is
+/// not reachable yet — that material's `$envmap` is `env_cubemap`, so
+/// [`envmap_name`] refuses it and the reflection is off — but it becomes the
+/// difference between the two functions the moment per-instance cubemaps land.
+///
+/// Three further consequences of "no clamping of any kind", all measured
+/// against the shipped game rather than assumed:
+///
+/// - **Nothing is passed through.** A value just under 1 is decoded like any
+///   other, so `[0.95 0.95 0.95]` is 0.893 here and exactly 1 under the table.
+/// - **A dark tint collapses much harder than it looks.** Every one of the 57
+///   `VertexLitGeneric` materials in Portal 2 with a resolvable `$envmap`
+///   writes a tint, and every one of them is dark: `[0.05 0.05 0.05]` on 20 of
+///   them becomes **0.0014**, a factor of 36, and `[0.01 0.01 0.01]` on five
+///   more becomes 4.0e-5 — a factor of 251 — which is Valve asking for no reflection at all
+///   rather than for a faint one.
+/// - **A negative component is a NaN**, because `powf` has no domain guard and
+///   neither does C's `pow`. Reproduced rather than clamped, because the two
+///   agree exactly and no shipped material reaches it: of the 345 `.vmt` files
+///   in the game that define `$envmaptint`, none has a negative component (the
+///   census in `material.rs` counts them).
+///
+/// **`LightmappedGeneric` deliberately does not get this**, and that asymmetry
+/// is Valve's: `lightmappedgeneric_dx9_helper.cpp:901` calls the *other*
+/// command-builder overload (`commandbuilder.h:552`), which sends the tint to
+/// the shader in gamma space with no decode at all. 135 shipped materials are
+/// affected by that and will be when this module's `$envmap` support reaches
+/// the world path — so the symmetrical-looking "fix" of calling this from
+/// `lightmapped_uniforms` would be a divergence, not a correction.
+///
+/// **Not ported, and the reason both helpers have an `else` branch**: the tint
+/// is replaced by black when `mat_specular` is 0 or `mat_fullbright` is 2
+/// (`g_pConfig->bShowSpecular`, `g_pConfig->nFullbright`), which is how Source
+/// turns every reflection in the game off at once. Neither cvar exists in this
+/// port; both default to the branch taken here.
+fn gamma_to_linear_full_range_param(gamma: [f32; 4]) -> [f32; 4] {
+    let convert = |value: f32| value.powf(2.2);
     [
         convert(gamma[0]),
         convert(gamma[1]),
@@ -3331,6 +3409,75 @@ mod tests {
         assert!((uniforms.refract_tint[0] - (235.0f32 / 255.0).powf(2.2)).abs() < 1e-4);
         assert_eq!(uniforms.refract_tint[1], 1.0);
         assert_eq!(uniforms.refract_tint[2], 1.0);
+    }
+
+    /// The *other* decode — `GammaToLinearFullRange`, which is what
+    /// `VertexLitGeneric`'s `$envmaptint` takes, and the two are not
+    /// interchangeable.
+    #[test]
+    fn the_envmap_tint_takes_the_full_range_decode_and_not_the_table_one() {
+        let full = gamma_to_linear_full_range_param([0.4, 0.96, 5.0, 0.25]);
+        let table = gamma_to_linear_param([0.4, 0.96, 5.0, 0.25]);
+
+        // They agree below the table's clamp, because both are `pow( x, 2.2 )`
+        // there and 0.4 survives the quantization to `round( x * 255 ) / 255`.
+        assert!((full[0] - 0.4f32.powf(2.2)).abs() < 1e-6, "{full:?}");
+        assert!((full[0] - table[0]).abs() < 1e-4);
+
+        // And disagree at both ends. `>= 0.95` is white under the table and an
+        // ordinary decode here...
+        assert_eq!(table[1], 1.0);
+        assert!((full[1] - 0.96f32.powf(2.2)).abs() < 1e-6, "{full:?}");
+        assert!(full[1] < 0.92, "not clamped to white: {}", full[1]);
+
+        // ...and `> 1` passes through the table un-decoded where this really
+        // does raise it to the power, which is `(wills)`'s over-driven tint.
+        // `models/sabotage/glass01` writes `[5 5 5]`, the one material in
+        // Portal 2 that tells the two functions apart.
+        assert_eq!(table[2], 5.0);
+        assert!((full[2] - 34.4932).abs() < 1e-3, "{full:?}");
+
+        // `w` is `$envmapcontrast` in this port's packing, and neither
+        // function touches it.
+        assert_eq!(full[3], 0.25);
+
+        // No domain guard, the same as C's `pow` — so a negative component is
+        // a NaN rather than the table's 0. No shipped material reaches it.
+        assert!(gamma_to_linear_full_range_param([-1.0; 4])[0].is_nan());
+        assert_eq!(gamma_to_linear_param([-1.0; 4])[0], 0.0);
+    }
+
+    #[test]
+    fn a_vertex_lit_envmap_tint_reaches_the_shader_linear() {
+        // `[0.05 0.05 0.05]` is what twenty of the game's 57 reflective
+        // `VertexLitGeneric` materials write, and it is a factor of 36 darker
+        // decoded than not — which is the whole visible effect of this.
+        let uniforms = vertex_lit_uniforms(&model_vmt(
+            r#""$envmap" "metal/x" "$envmaptint" "[.05 .05 .05]""#,
+        ));
+        let expected = 0.05f32.powf(2.2);
+        assert!(
+            (uniforms.envmap_tint[0] - expected).abs() < 1e-6,
+            "{uniforms:?}"
+        );
+        assert!((expected - 0.0013732).abs() < 1e-6);
+        assert_eq!(uniforms.envmap_tint[..3], [uniforms.envmap_tint[0]; 3]);
+
+        // `$envmapcontrast` shares the register and is not a colour.
+        let uniforms =
+            vertex_lit_uniforms(&model_vmt(r#""$envmap" "metal/x" "$envmapcontrast" ".5""#));
+        assert_eq!(uniforms.envmap_tint[3], 0.5, "not decoded");
+        // An undefined tint is `SetVecValue( 1, 1, 1 )`, and white decodes to
+        // white, so every material that leaves it alone is unaffected.
+        assert_eq!(uniforms.envmap_tint[..3], [1.0, 1.0, 1.0]);
+
+        // The neighbouring tints in the same block deliberately do *not*
+        // decode: Valve hands both to the shader as written.
+        let uniforms = vertex_lit_uniforms(&model_vmt(
+            r#""$selfillumtint" "[.5 .5 .5]" "$detailtint" "[.5 .5 .5]""#,
+        ));
+        assert_eq!(uniforms.selfillum_tint[..3], [0.5, 0.5, 0.5]);
+        assert_eq!(uniforms.detail_tint[..3], [0.5, 0.5, 0.5]);
     }
 
     #[test]

@@ -702,6 +702,14 @@ mod tests {
             std::collections::BTreeMap::new();
         let mut unported = 0u32;
         let mut pipelines = std::collections::HashSet::new();
+        // `$envmaptint`, which `vertex_lit_uniforms` decodes with
+        // `GammaToLinearFullRange`. That decode is a bare `powf( 2.2 )` with no
+        // domain guard — the same as C's `pow`, which is the point — so a
+        // negative component would reach a uniform as a NaN. Counted here
+        // because the claim that makes reproducing Valve exactly safe is a
+        // claim about *content*: nothing in the shipped game writes one.
+        let mut envmap_tints = 0u32;
+        let mut negative_envmap_tints = Vec::<String>::new();
 
         // Validation errors arrive through the uncaptured-error handler rather
         // than as a `Result`, so they are latched and asserted at the end.
@@ -719,6 +727,16 @@ mod tests {
             samples: 1,
         };
         for name in &names {
+            if let Ok(vmt) = Vmt::load(&vfs, name) {
+                if let Some(tint) = vmt.var("$envmaptint") {
+                    envmap_tints += 1;
+                    let value = tint.as_vec4();
+                    if value[..3].iter().any(|component| *component < 0.0) {
+                        negative_envmap_tints.push(format!("{name} {:?}", &value[..3]));
+                    }
+                }
+            }
+
             let material = materials.load(&vfs, name);
             if Arc::ptr_eq(&material, &error) {
                 // Either a shader this port has not written, or a `.vmt` that
@@ -746,6 +764,14 @@ mod tests {
         }
         println!("  {unported:5} <the error material>");
         println!("{} pipelines for the whole set", pipelines.len());
+        println!("{envmap_tints} materials define $envmaptint");
+
+        assert!(
+            negative_envmap_tints.is_empty(),
+            "a negative $envmaptint reaches `gamma_to_linear_full_range_param`'s \
+             un-guarded `powf` as a NaN — either clamp it there or explain these:\n{}",
+            negative_envmap_tints.join("\n")
+        );
 
         let failures = failures.lock().unwrap();
         assert!(

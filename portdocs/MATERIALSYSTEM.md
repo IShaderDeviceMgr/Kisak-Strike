@@ -863,6 +863,21 @@ milestone the project has.
      reflects depends on where it is standing. 78 materials say it. They bind a 1x1 black
      cube until the `.bsp`'s pak lump is mounted, at which point this becomes
      render-context state alongside the lightmap page.
+   - **`$envmaptint` takes a different gamma decode from every other tint in the
+     module**, and this was got wrong first time round. The model path reaches
+     `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` (`commandbuilder.h:564`), which
+     is `GammaToLinearFullRange` — plain `pow( x, 2.2 )`, no table and no clamping — while
+     `Refract`'s tints reach `SetPixelShaderConstantGammaToLinear`, which is the 256-entry
+     `GammaToLinear` with its `>= 0.95` clamp and its `> 1` passthrough. The clamp's
+     absence is signed and deliberate: the helper used to call `GetLinearVecValue` and the
+     comment at `:571` says it was changed "so that envmaptint can be over-driven beyond
+     0-1 range". The third variant matters just as much — **`LightmappedGeneric` calls the
+     overload with no decode at all** (`commandbuilder.h:552`, from
+     `lightmappedgeneric_dx9_helper.cpp:901`), so the correct behaviour for the world path
+     is to send the tint through in gamma space, and making the two shaders agree would be
+     a divergence. Measured: 345 shipped `.vmt` files write `$envmaptint`, 185 of them
+     `VertexLitGeneric`, and the 57 with a resolvable `$envmap` are **all** dark enough
+     that skipping the decode is visible — `[0.05 0.05 0.05]` is 0.0014 linear.
    - **Two CS:GO-shaped defaults were found in this shader and both are reversed**, which
      is `PORTING.md`'s standing warning arriving in a specific place. `bHalfLambert` is
      hard-coded `false` over a commented-out read of the material flag, "not compatible

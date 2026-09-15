@@ -65,7 +65,13 @@ struct VertexLitUniforms {
     detail_transform: array<vec4<f32>, 2>,
     // $selfillumtint in rgb, $selfillummaskscale in w.
     selfillum_tint: vec4<f32>,
-    // $envmaptint in rgb, $envmapcontrast in w.
+    // $envmaptint in rgb, $envmapcontrast in w. The rgb arrives **linear**:
+    // the CPU decoded it with GammaToLinearFullRange, exactly as
+    // SetEnvMapTintPixelShaderDynamicStateGammaToLinear does, so this is a
+    // plain multiply into an already-linear cubemap sample and must not be
+    // decoded again here. `g_EnvmapTint_SPF` in the original
+    // (`vertexlit_and_unlit_generic_ps2x.fxc:130`), whose `.a` is the
+    // single-pass-flashlight factor rather than $envmapcontrast.
     envmap_tint: vec4<f32>,
     // $envmapsaturation, $envmapfresnel, fresnel scale, fresnel bias.
     envmap_params: vec4<f32>,

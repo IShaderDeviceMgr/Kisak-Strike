@@ -243,7 +243,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   **`Refract` is the first of §7.8's remaining set and has landed** (below); the rest of it
   and stages 7-8 (paint maps, GPU morph) are not started.
 
-  Five things about it that a reader will otherwise rediscover the hard way:
+  Six things about it that a reader will otherwise rediscover the hard way:
   **a `.vmt` naming `VertexLitGeneric` does not always reach it** — `WantsPhongShader`
   sends 317 of the 1,108 to `DrawPhong_DX9`, a separate §7.8 shader that is not ported, so
   they draw without specular and say so once at load; **group 3 is now "where this
@@ -254,7 +254,19 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   baked vertex light at all**, which is Valve's asymmetry and not an omission; and
   **`$envmap "env_cubemap"` names no file** — it is a request for the render instance's
   local cubemap, so those 78 materials reflect a black cube; the pak lump is mounted now,
-  but the per-instance cubemap lookup that would resolve them is not written. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
+  but the per-instance cubemap lookup that would resolve them is not written; and
+  **`$envmaptint` is gamma-decoded on the CPU, with `GammaToLinearFullRange` and not the
+  table** — `pow( x, 2.2 )` flat, where every other tint in the module takes
+  `GammaToLinear`'s 256-entry table with its `>= 0.95` clamp and its `> 1` passthrough.
+  That is `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` and it is
+  `VertexLitGeneric`'s alone: `LightmappedGeneric` calls the *other* overload and sends
+  its tint through in gamma space, which is Valve's asymmetry and not a bug to fix. It
+  matters because **every one of the 57 materials in the game with a resolvable `$envmap`
+  writes a dark tint** — `[0.05 0.05 0.05]` on twenty of them, which is 0.0014 linear, a
+  factor of 36, and `[0.01 0.01 0.01]` on five more, which is 4.0e-5 and means "no
+  reflection" rather than "a faint one". Skipping the decode does not error; it makes
+  every reflective prop in the game shine. 57 of the 106 maps place a static prop wearing
+  one. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
   hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
   `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
   Portal 2 has neither.
