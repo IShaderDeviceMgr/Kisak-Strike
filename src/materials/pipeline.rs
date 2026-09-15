@@ -23,13 +23,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::shader::{
-    LightingBinding, ShaderKind, BINDING_BASE2_SAMPLER, BINDING_BASE2_TEXTURE,
-    BINDING_BASE_SAMPLER, BINDING_BASE_TEXTURE, BINDING_BLEND_MODULATE_SAMPLER,
-    BINDING_BLEND_MODULATE_TEXTURE, BINDING_BUMP2_SAMPLER, BINDING_BUMP2_TEXTURE,
-    BINDING_BUMP_SAMPLER, BINDING_BUMP_TEXTURE, BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE,
-    BINDING_ENVMAP_MASK_SAMPLER, BINDING_ENVMAP_MASK_TEXTURE, BINDING_ENVMAP_SAMPLER,
-    BINDING_ENVMAP_TEXTURE, BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE,
-    BINDING_MATERIAL_UNIFORMS, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
+    ContextBinding, ShaderKind, BINDING_BASE2_SAMPLER, BINDING_BASE2_TEXTURE, BINDING_BASE_SAMPLER,
+    BINDING_BASE_TEXTURE, BINDING_BLEND_MODULATE_SAMPLER, BINDING_BLEND_MODULATE_TEXTURE,
+    BINDING_BUMP2_SAMPLER, BINDING_BUMP2_TEXTURE, BINDING_BUMP_SAMPLER, BINDING_BUMP_TEXTURE,
+    BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE, BINDING_ENVMAP_MASK_SAMPLER,
+    BINDING_ENVMAP_MASK_TEXTURE, BINDING_ENVMAP_SAMPLER, BINDING_ENVMAP_TEXTURE,
+    BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE, BINDING_MATERIAL_UNIFORMS,
+    BINDING_REFRACT_SOURCE_SAMPLER, BINDING_REFRACT_SOURCE_TEXTURE, BINDING_REFRACT_TINT_SAMPLER,
+    BINDING_REFRACT_TINT_TEXTURE, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
 };
 
 /// Fixed pipeline state, as a material asks for it.
@@ -225,8 +226,10 @@ pub struct BindLayouts {
     unlit_material: wgpu::BindGroupLayout,
     lightmapped_material: wgpu::BindGroupLayout,
     vertex_lit_material: wgpu::BindGroupLayout,
+    refract_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
     model_lighting: wgpu::BindGroupLayout,
+    frame_buffer_copy: wgpu::BindGroupLayout,
 }
 
 impl BindLayouts {
@@ -330,6 +333,33 @@ impl BindLayouts {
                     ],
                 },
             ),
+            refract_material: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("material: Refract"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: BINDING_MATERIAL_UNIFORMS,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // `$basetexture` here is the image being warped, not the
+                    // surface's colour — see `shaders/refract.wgsl`.
+                    texture_entry(BINDING_BASE_TEXTURE),
+                    sampler_entry(BINDING_BASE_SAMPLER),
+                    // `$normalmap`, at the bump binding because that is what it
+                    // is.
+                    texture_entry(BINDING_BUMP_TEXTURE),
+                    sampler_entry(BINDING_BUMP_SAMPLER),
+                    cube_texture_entry(BINDING_ENVMAP_TEXTURE),
+                    sampler_entry(BINDING_ENVMAP_SAMPLER),
+                    texture_entry(BINDING_REFRACT_TINT_TEXTURE),
+                    sampler_entry(BINDING_REFRACT_TINT_SAMPLER),
+                ],
+            }),
             lightmap: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("lightmap page"),
                 entries: &[
@@ -338,6 +368,18 @@ impl BindLayouts {
                 ],
             }),
             model_lighting: uniform_layout(device, "model lighting"),
+            // Structurally identical to `lightmap` and deliberately its own
+            // object: group 3's *meaning* is per shader
+            // (`shader::ContextBinding`), and a shared layout would make the
+            // next reader wonder whether a refractor could be handed a lightmap
+            // page by mistake.
+            frame_buffer_copy: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("frame buffer copy"),
+                entries: &[
+                    texture_entry(BINDING_REFRACT_SOURCE_TEXTURE),
+                    sampler_entry(BINDING_REFRACT_SOURCE_SAMPLER),
+                ],
+            }),
         }
     }
 
@@ -362,6 +404,7 @@ impl BindLayouts {
                 &self.lightmapped_material
             }
             ShaderKind::VertexLitGeneric => &self.vertex_lit_material,
+            ShaderKind::Refract => &self.refract_material,
         }
     }
 
@@ -385,11 +428,22 @@ impl BindLayouts {
         &self.model_lighting
     }
 
+    /// Group 3, for the shaders that read a copy of the scene: a texture and
+    /// its sampler.
+    ///
+    /// `SetFrameBufferCopyTexture`'s destination. Filled by
+    /// [`RenderContext::update_refract_texture`](super::context::RenderContext::update_refract_texture),
+    /// which is also what builds the bind group against this.
+    pub fn frame_buffer_copy(&self) -> &wgpu::BindGroupLayout {
+        &self.frame_buffer_copy
+    }
+
     /// Group 3's layout for a shader, or `None` if it declares no group 3.
-    fn lighting(&self, shader: ShaderKind) -> Option<&wgpu::BindGroupLayout> {
-        match shader.lighting_binding()? {
-            LightingBinding::LightmapPage => Some(&self.lightmap),
-            LightingBinding::ModelLighting => Some(&self.model_lighting),
+    fn context(&self, shader: ShaderKind) -> Option<&wgpu::BindGroupLayout> {
+        match shader.context_binding()? {
+            ContextBinding::LightmapPage => Some(&self.lightmap),
+            ContextBinding::ModelLighting => Some(&self.model_lighting),
+            ContextBinding::FrameBufferCopy => Some(&self.frame_buffer_copy),
         }
     }
 }
@@ -505,17 +559,18 @@ impl PipelineCache {
                 })
         });
 
-        // Group 3 exists only for the shaders whose lighting comes from
-        // somewhere — a lightmap page, or a model's ambient cube and lights. A
-        // pipeline layout is per shader, so declaring it unconditionally would
-        // oblige every draw of every shader to bind something there.
+        // Group 3 exists only for the shaders that read a piece of
+        // render-context state — a lightmap page, a model's ambient cube and
+        // lights, or a copy of the scene. A pipeline layout is per shader, so
+        // declaring it unconditionally would oblige every draw of every shader
+        // to bind something there.
         let mut groups = vec![
             Some(&self.layouts.frame),
             Some(self.layouts.material(key.shader)),
             Some(&self.layouts.draw),
         ];
-        if let Some(lighting) = self.layouts.lighting(key.shader) {
-            groups.push(Some(lighting));
+        if let Some(context) = self.layouts.context(key.shader) {
+            groups.push(Some(context));
         }
         let layout = self
             .device
@@ -750,6 +805,7 @@ mod tests {
             ShaderKind::LightmappedGeneric,
             ShaderKind::WorldVertexTransition,
             ShaderKind::VertexLitGeneric,
+            ShaderKind::Refract,
         ] {
             // Both blend modes and both target formats, so the state axes that
             // do change the pipeline are exercised rather than just the module.

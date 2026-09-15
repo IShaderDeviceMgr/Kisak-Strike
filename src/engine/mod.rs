@@ -821,6 +821,31 @@ impl<'a> Engine<'a> {
             );
             world.draw(&mut pass);
         }
+
+        // `UpdateRefractTexture` and `DrawTranslucentRenderables`, in that
+        // order and in that relationship: a refracting material reads a *copy*
+        // of the scene, so the pass that drew the scene has to have ended
+        // before the copy is taken, and the copy has to have been taken before
+        // the pass that samples it opens. Skipped entirely on a map with
+        // nothing that refracts, which is 35 of the game's 106.
+        if world.needs_frame_buffer_copy() {
+            {
+                let scene = post.scene(frame.size());
+                context.update_refract_texture(frame, scene);
+            }
+            let scene = post.scene(frame.size());
+            let mut pass = context.target_pass(
+                frame,
+                materials.pipelines(),
+                scene,
+                &camera,
+                // **`Keep`, not `Clear`.** This pass draws on top of the scene
+                // the first one left, against the depth buffer it left.
+                Load::Keep,
+            );
+            world.draw_refracting(&mut pass);
+        }
+
         post.resolve(frame, measure);
     }
 

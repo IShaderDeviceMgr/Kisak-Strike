@@ -428,7 +428,10 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
   `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
   search paths.
-- **`src/materials/` — stages 1-4 of 8 ported; `src/engine/window/` with it.**
+- **`src/materials/` — stages 1-6 of 8 ported, plus the first shader of §7.8's
+  remainder; `src/engine/window/` with it.** The four paragraphs below cover stages 1-4;
+  stage 5 onwards is the bullet after this one. `portdocs/MATERIALSYSTEM.md` §9 and
+  `rustdocs/MATERIALS.md` are current where this entry is not.
 
   *Stage 1, the `wgpu`/`winit` groundwork this file calls for below:* `Renderer` owns the
   `wgpu` instance/adapter/device/queue/surface and exposes one frame boundary
@@ -485,7 +488,7 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   ahead of the whole command buffer and a rewritten uniform would reach every draw in the
   frame. Not yet: MSAA, stencil, exclusive fullscreen modes, `mat_picmip`, and texture
   streaming.
-- **`materialsystem` stage 5 (lightmaps) — done; stages 6-8 documented, not started.**
+- **`materialsystem` stages 5 and 6 — done; stages 7-8 documented, not started.**
   A faithful `CImagePacker` port, `Rgba16Float` atlas pages holding linear radiance, the
   `ColorRGBExp32` decode and the bumped-lightmap correction, and `LightmappedGeneric` in
   WGSL — flat and radiosity-normal-mapped. A draw batch is now a (material, lightmap page)
@@ -499,6 +502,22 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   still open is only the *float target*, i.e. `HDR_TYPE_FLOAT`; the port's 8-bit sRGB
   frame buffer written pre-exposed is `HDR_TYPE_INTEGER`'s, and that is what the tone
   mapper was ported against.
+
+  **Stage 6 is `VertexLitGeneric` and is done**, and with it static props draw lit —
+  `ModelVertex`, the ambient cube and four local lights, and a second shape for bind
+  group 3. All 1,108 of Portal 2's `VertexLitGeneric` materials build a pipeline, in 15
+  of them. **`Refract` is the first of §7.8's remaining set and is also done**: 37
+  materials, 7 pipelines, and the structural change it needed rather than the shader —
+  `ContextBinding::FrameBufferCopy` is a *third* group-3 shape,
+  `RenderContext::update_refract_texture` is `UpdateRefractTexture` plus
+  `SetFrameBufferCopyTexture`, and because a `wgpu` pass cannot sample its own attachment
+  the engine now draws the opaque scene, copies it, and draws the refractors into a
+  second pass — which is Valve's own opaque/`UpdateRefractTexture`/translucent ordering
+  made explicit. That is stage 4's "nesting becomes sequencing" answer being needed for
+  the first time. Across the mounted game **2,947 of 3,555 materials now draw with a real
+  shader, in 51 pipelines**, measured by a depot-gated census
+  (`materials::material::tests::every_shipped_material_of_a_ported_shader_builds_a_pipeline`).
+
   `portdocs/MATERIALSYSTEM.md`: inventory,
   the shadow/dynamic two-phase model and how it maps onto `wgpu` pipelines, the shader
   (`.vcs`/`.fxc`) problem, Portal 2 paint maps, and a staged plan. **This module *is* the

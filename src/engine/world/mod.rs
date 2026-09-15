@@ -501,6 +501,45 @@ impl World {
         self.prop_models.draw(pass, &self.props);
     }
 
+    /// Whether this map has anything that reads the frame it is drawn into,
+    /// and so needs
+    /// [`RenderContext::update_refract_texture`][update] and a second pass.
+    ///
+    /// Asked once a frame; the answer is fixed at load. Measured over the
+    /// depot: **71 of Portal 2's 106 maps answer yes**, so the second pass is
+    /// the common case rather than the exception. On `sp_a1_intro1` it is one
+    /// model — `models/props_lab/glass_observation_2.mdl`, the container's
+    /// observation window — and across the game it is almost always one of the
+    /// three `props_lab/glass_observation_*` panes plus whichever
+    /// `props_destruction/glass_*` sheet the chamber breaks.
+    ///
+    /// [update]: crate::materials::context::RenderContext::update_refract_texture
+    pub fn needs_frame_buffer_copy(&self) -> bool {
+        self.prop_models.refracts()
+    }
+
+    /// Records what [`draw`](World::draw) held back: the geometry whose
+    /// material samples a copy of the scene.
+    ///
+    /// Call in a second pass against the same target, with
+    /// [`Load::Keep`](crate::materials::context::Load::Keep), **after**
+    /// [`RenderContext::update_refract_texture`][update] has taken the copy.
+    /// Draws nothing when [`needs_frame_buffer_copy`](World::needs_frame_buffer_copy)
+    /// is false, so a caller may always call it and skip only the copy.
+    ///
+    /// This is `CRendering3dView::DrawTranslucentRenderables`' place in the
+    /// frame, reduced to the one thing in it this port has: **only static
+    /// props**. World brush faces and brush entities are not offered here
+    /// because no brush face in the shipped game wears a refracting material —
+    /// all 29 of the game's `$model 1` `Refract` materials are on models — and
+    /// the other inhabitants of Valve's translucent list (particles, sprites,
+    /// the water surface) are not ported.
+    ///
+    /// [update]: crate::materials::context::RenderContext::update_refract_texture
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>) {
+        self.prop_models.draw_refracting(pass, &self.props);
+    }
+
     /// Takes every brush entity's placement from whoever owns it — the game
     /// server — and writes it into the one transform the draw and the trace
     /// both read.

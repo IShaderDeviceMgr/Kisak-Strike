@@ -422,11 +422,16 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            // `COPY_SRC` so a test — and later `CopyRenderTargetToTexture` and
-            // `ReadPixels` — can get the result back off the GPU.
+            // `COPY_SRC` so a test — and `CopyRenderTargetToTexture` and
+            // `ReadPixels` — can get the result back off the GPU, and
+            // `COPY_DST` because `CopyRenderTargetToTextureEx` needs a render
+            // target it can copy *into*: that is what the frame-buffer copy a
+            // refracting material reads is
+            // (`RenderContext::update_refract_texture`).
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

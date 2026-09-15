@@ -140,5 +140,70 @@ mod tests {
             world.prop_models.draw(pass, &world.props)
         });
         run("everything", &|pass| world.draw(pass));
+        drop(run);
+
+        // The refracting half, which is a *second* pass with a full-screen copy
+        // in front of it — so it cannot be measured through `run` above, which
+        // records one pass. Reported separately for the same reason
+        // `engine::exposure` reports the tone mapper's two passes separately:
+        // the question is what the frame-buffer copy and the extra pass cost
+        // against the draw they sit around.
+        if !world.needs_frame_buffer_copy() {
+            println!("  {:<16} nothing refracts on this map", "refractors");
+            return;
+        }
+        let refract_frame = |context: &mut RenderContext, materials: &mut MaterialCache| {
+            context.begin_frame();
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = context.offscreen_pass(
+                    &mut encoder,
+                    materials.pipelines(),
+                    &target,
+                    &camera,
+                    Load::Clear(wgpu::Color::BLACK),
+                );
+                world.draw(&mut pass);
+            }
+            context.record_refract_texture(&mut encoder, &target);
+            {
+                let mut pass = context.offscreen_pass(
+                    &mut encoder,
+                    materials.pipelines(),
+                    &target,
+                    &camera,
+                    Load::Keep,
+                );
+                world.draw_refracting(&mut pass);
+            }
+            queue.submit([encoder.finish()]);
+        };
+        refract_frame(&mut context, &mut materials);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("idle");
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            refract_frame(&mut context, &mut materials);
+        }
+        let recorded = start.elapsed();
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("idle");
+        let total = start.elapsed();
+        println!(
+            "  {:<16} {:>7.2} ms/frame CPU  ({:>6.2} ms with GPU wait, \
+             {:>5.0} fps ceiling from CPU alone)",
+            "+ refractors",
+            recorded.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+            total.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+            f64::from(FRAMES) / recorded.as_secs_f64(),
+        );
     }
 }

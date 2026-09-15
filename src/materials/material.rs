@@ -33,7 +33,7 @@ use crate::filesystem::{keyvalues, Vfs};
 
 use super::error::VmtError;
 use super::pipeline::{BindLayouts, PipelineCache, RenderState};
-use super::shader::{self, Lighting, ShaderKind, TextureDimension};
+use super::shader::{self, Lighting, ResolvedTextures, ShaderKind, TextureDimension, TextureFacts};
 use super::texture::{Texture, TextureCache};
 use super::var::MaterialFlags;
 use super::vmt::Vmt;
@@ -64,6 +64,19 @@ pub struct Material {
     /// (`gl_matsysiface.cpp:216`) asks the second only after the first said
     /// yes. See [`Lighting`].
     pub lighting: Lighting,
+
+    /// Whether drawing this material needs a readable copy of the scene so
+    /// far, taken before the draw.
+    ///
+    /// `MATERIAL_VAR2_NEEDS_POWER_OF_TWO_FRAME_BUFFER_TEXTURE`, which reaches
+    /// the renderer as `ERENDERFLAGS_NEEDS_POWER_OF_TWO_FB` and is what makes
+    /// `CRendering3dView::DrawTranslucentRenderables` call
+    /// `UpdateRefractTexture` (`game/client/viewrender.cpp:6195`). Here it is
+    /// what sorts a static prop's batches into the two passes
+    /// [`World::draw`](crate::engine::world::World::draw) and
+    /// [`World::draw_refracting`](crate::engine::world::World::draw_refracting)
+    /// record. See [`shader::needs_frame_buffer_copy`].
+    pub needs_frame_buffer_copy: bool,
 
     /// Kept so the views the bind group holds stay alive.
     #[allow(dead_code)]
@@ -140,6 +153,14 @@ impl Material {
             textures.push((request, texture));
         }
 
+        // Resolved before the uniform block, because `Refract` needs the base
+        // texture's *dimensions* to fill it and every shader needs the shadow
+        // phase's answers below.
+        let resolved = ResolvedTextures {
+            base: find_texture(&textures, "$basetexture"),
+            normal_map: find_texture(&textures, "$normalmap"),
+        };
+
         let uniforms = match shader {
             ShaderKind::UnlitGeneric => {
                 let block = shader::unlit_uniforms(vmt);
@@ -151,6 +172,10 @@ impl Material {
             }
             ShaderKind::VertexLitGeneric => {
                 let block = shader::vertex_lit_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
+            ShaderKind::Refract => {
+                let block = shader::refract_uniforms(vmt, resolved);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
         };
@@ -175,23 +200,34 @@ impl Material {
             entries: &entries,
         });
 
-        let base_texture = textures
-            .iter()
-            .find(|(request, _)| request.param == "$basetexture")
-            .map(|(_, texture)| texture.as_ref());
-
         Some(Material {
             name: name.to_owned(),
             shader,
             flags: vmt.flags,
-            state: shader::render_state(shader, vmt, base_texture),
+            state: shader::render_state(shader, vmt, resolved),
             modulation: shader::modulation_color(shader, vmt),
             lighting: shader::lighting(shader, vmt),
+            needs_frame_buffer_copy: shader::needs_frame_buffer_copy(shader, vmt),
             textures: textures.into_iter().map(|(_, texture)| texture).collect(),
             uniforms,
             bind_group,
         })
     }
+}
+
+/// The texture a parameter resolved to, for the shadow phase.
+///
+/// `None` when the shader did not ask for that parameter at all — a
+/// `LightmappedGeneric` material has no `$normalmap` request — which reads as
+/// "opaque", the same answer the white texture and the checkerboard give.
+fn find_texture(
+    textures: &[(shader::TextureRequest, Arc<Texture>)],
+    param: &str,
+) -> Option<TextureFacts> {
+    textures
+        .iter()
+        .find(|(request, _)| request.param == param)
+        .map(|(_, texture)| TextureFacts::of(texture))
 }
 
 /// The two standard textures [`Material::new`] substitutes, and the reason they
@@ -569,5 +605,171 @@ mod tests {
             Some("error")
         );
         assert!(vmt.flags.contains(MaterialFlags::MODEL));
+    }
+
+    /// Every `.vmt` in the shipped game loads, resolves to a real shader or to
+    /// the error material on purpose, and builds a pipeline.
+    ///
+    /// The measurement `portdocs/MATERIALSYSTEM.md` §7.8 asks for — "verify
+    /// against a real Portal 2 map's material list before committing" — run
+    /// over the whole game rather than one map, and the thing that says a newly
+    /// ported shader is actually finished. It prints a census by shader name,
+    /// so a run is also the answer to "how much of the game does this port
+    /// draw".
+    ///
+    /// Ignored by default and gated on `KISAK_GAME_DIR`, like the `studio/`,
+    /// `world/` and `server/` depot tests. It needs a GPU, because building a
+    /// pipeline is the half of this that has teeth:
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
+    fn every_shipped_material_of_a_ported_shader_builds_a_pipeline() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        if !adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+        {
+            eprintln!("skipping: adapter has no BC texture support");
+            return;
+        }
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("skipping: no usable device");
+            return;
+        };
+
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        // Every `.vmt` under `materials/`, depth first. `Vfs::list` merges the
+        // mounts, so this is the same set `FindFirst`/`FindNext` would walk.
+        //
+        // The names collected are **relative to `materials/`**, because that is
+        // what `MaterialCache::load` takes: `Vmt::load` adds the directory and
+        // the extension back on, the way `FindMaterial` does.
+        let mut names = Vec::new();
+        let mut directories = vec![String::new()];
+        while let Some(directory) = directories.pop() {
+            let listing = if directory.is_empty() {
+                String::from("materials")
+            } else {
+                format!("materials/{directory}")
+            };
+            let Ok(entries) = vfs.list(&listing) else {
+                continue;
+            };
+            for entry in entries {
+                let path = if directory.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{directory}/{}", entry.name)
+                };
+                if entry.is_dir {
+                    directories.push(path);
+                } else if path.to_ascii_lowercase().ends_with(".vmt") {
+                    names.push(normalize_name(&path));
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        assert!(
+            names.len() > 3000,
+            "only {} materials found — is KISAK_GAME_DIR a Portal 2 install?",
+            names.len()
+        );
+
+        let mut materials = MaterialCache::new(&device, &queue);
+        let error = materials.error_material();
+        let mut census: std::collections::BTreeMap<&'static str, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        let mut unported = 0u32;
+        let mut pipelines = std::collections::HashSet::new();
+
+        // Validation errors arrive through the uncaptured-error handler rather
+        // than as a `Result`, so they are latched and asserted at the end.
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        device.on_uncaptured_error({
+            let failures = std::sync::Arc::clone(&failures);
+            std::sync::Arc::new(move |error: wgpu::Error| {
+                failures.lock().unwrap().push(error.to_string())
+            })
+        });
+
+        let target = crate::materials::pipeline::TargetFormat {
+            color: wgpu::TextureFormat::Bgra8UnormSrgb,
+            depth: Some(crate::materials::target::DEPTH_FORMAT),
+            samples: 1,
+        };
+        for name in &names {
+            let material = materials.load(&vfs, name);
+            if Arc::ptr_eq(&material, &error) {
+                // Either a shader this port has not written, or a `.vmt` that
+                // does not resolve. Both are expected and both are counted
+                // rather than asserted on: `MaterialCache::load` cannot fail.
+                unported += 1;
+                continue;
+            }
+            let entry = census.entry(material.shader.name()).or_default();
+            entry.0 += 1;
+            let key = crate::materials::pipeline::PipelineKey {
+                shader: material.shader,
+                state: material.state,
+                target,
+            };
+            if pipelines.insert(key) {
+                entry.1 += 1;
+            }
+            materials.pipelines().get(&key);
+        }
+
+        println!("{} .vmt files under materials/", names.len());
+        for (shader, (loaded, variants)) in &census {
+            println!("  {loaded:5} {shader}  ({variants} pipelines)");
+        }
+        println!("  {unported:5} <the error material>");
+        println!("{} pipelines for the whole set", pipelines.len());
+
+        let failures = failures.lock().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} pipeline(s) failed validation:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+
+        // The deliverable for each ported shader, as a floor rather than an
+        // exact count so that a depot with the language DLCs mounted does not
+        // fail. The `Refract` figure is stage 6's breadth work: 37 materials in
+        // the game name it and every one of them has to draw.
+        let at_least = |shader: &str, count: u32| {
+            let (loaded, _) = census.get(shader).copied().unwrap_or_default();
+            assert!(
+                loaded >= count,
+                "{shader}: {loaded} materials loaded, expected at least {count}"
+            );
+        };
+        at_least("VertexLitGeneric", 1108);
+        at_least("LightmappedGeneric", 800);
+        at_least("UnlitGeneric", 928);
+        at_least("WorldVertexTransition", 18);
+        at_least("Refract", 37);
     }
 }

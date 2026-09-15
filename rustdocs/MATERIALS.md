@@ -14,10 +14,10 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | | |
 |---|---|
 | Module | `crate::materials` |
-| Lines | ~17,400 Rust including tests, plus ~1,500 of WGSL |
-| Tests | 190 (`cargo test materials`) — 38 of them run on a real GPU |
+| Lines | ~18,900 Rust including tests, plus ~1,900 of WGSL |
+| Tests | 203 (`cargo test materials`) — 46 of them run on a real GPU, one of which builds a pipeline for every shader; plus one depot-gated census over the whole game |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, and the scene target + luminance histogram the tone mapper measures. Stage 6's remaining shaders and stages 7-8 not started |
+| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
 
 ```
 src/materials/
@@ -43,6 +43,7 @@ src/materials/
   shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
   shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
+  shaders/refract.wgsl             glass: a screen-space warp of a copy of the scene
   shaders/blit.wgsl                one texture onto another, full screen
   shaders/histogram.wgsl           a compute pass that bins a frame's pixels by luminance
   error.rs         RendererError, VtfError, VmtError, TextureError
@@ -685,23 +686,40 @@ pub enum ShaderKind {
     LightmappedGeneric,
     WorldVertexTransition,   // the same shader as LightmappedGeneric
     VertexLitGeneric,
+    Refract,
 }
 
 pub fn from_name(name: &str) -> Option<ShaderKind>;
 pub fn name(self) -> &'static str;
 pub fn vertex_layout(self) -> VertexLayout;
-pub fn lighting_binding(self) -> Option<LightingBinding>;   // what group 3 holds
+pub fn context_binding(self) -> Option<ContextBinding>;   // what group 3 holds
 pub fn params(self) -> impl Iterator<Item = &'static ShaderParam>;
 pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Four names, three implementations. `UnlitGeneric` is sprites, tool textures and anything
+Five names, four implementations. `UnlitGeneric` is sprites, tool textures and anything
 whose colour is entirely in its texture; `LightmappedGeneric` is world brush surfaces — 62
 of `sp_a1_intro1`'s 66 world materials — and multiplies a base texture by a baked lightmap,
 flat or radiosity-normal-mapped; `VertexLitGeneric` is models, and is the largest shader in
 the shipped game — 1,108 of Portal 2's 3,431 materials name it, including 1,012 of the
-1,096 under `materials/models/`.
+1,096 under `materials/models/`; `Refract` is glass, 37 materials, 29 of them on models.
+
+**`Refract` is structurally unlike the other four, and that is the thing to know about it.**
+It has no lighting at all — no lightmap, no ambient cube, no diffuse term — and what it
+returns is mostly a *resample of a copy of the scene*, offset by a normal map. So it needs
+two things none of the others do: a readable copy of the frame buffer, which arrives in
+group 3 as `ContextBinding::FrameBufferCopy` and is filled by
+[`RenderContext::update_refract_texture`](#the-frame-buffer-copy); and a **second pass**,
+because a render pass cannot sample its own colour attachment. The engine's half of that is
+[`World::draw_refracting`](ENGINE.md).
+
+Its `$basetexture` **is not a surface texture** — it is an alternative image to warp, bound
+to the sampler the frame-buffer copy would otherwise occupy. Valve's fork is one `if`
+(`refract_dx9_helper.cpp:273`), and it is why the six `$localrefract` glass materials in the
+game need no copy of the frame at all: they warp their own 128x512 gradient instead.
+`shader::needs_frame_buffer_copy` is the question and `$localrefract` is the whole of the
+answer; `Material::needs_frame_buffer_copy` is where it lands.
 
 **`WorldVertexTransition` *is* `LightmappedGeneric`**, under the name content uses when it
 means "two base textures blended by the vertex alpha". `worldvertextransition.cpp` is 222
@@ -709,7 +727,7 @@ lines, of which ~190 are a parameter table and the remaining three forward to
 `InitParamsLightmappedGeneric_DX9`, `InitLightmappedGeneric_DX9` and
 `DrawLightmappedGeneric_DX9` — the same helper, the same `.fxc`, the same vertex format,
 and `lightmappedgeneric_dx9.cpp` declares `$basetexture2`/`$bumpmap2`/
-`$blendmodulatetexture`/`$ssbump` itself. So `wgsl`, `vertex_layout`, `lighting_binding`,
+`$blendmodulatetexture`/`$ssbump` itself. So `wgsl`, `vertex_layout`, `context_binding`,
 the uniform block and the bind group layout are all *shared*, and the variant exists only
 because Valve kept it as a separate `IShader`
 (`DEFINE_FALLBACK_SHADER( WorldVertexTransition, WorldVertexTransition_DX9 )`) and because
@@ -742,13 +760,33 @@ Free functions alongside it, all of them the shadow or dynamic phase for one mat
 ```rust
 pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest>;
 pub fn param_value(kind: ShaderKind, vmt: &Vmt, name: &str) -> Option<MaterialVar>;
-pub fn render_state(kind: ShaderKind, vmt: &Vmt, base: Option<&Texture>) -> RenderState;
+pub fn render_state(kind: ShaderKind, vmt: &Vmt, textures: ResolvedTextures) -> RenderState;
 pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4];
 pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting;
+pub fn needs_frame_buffer_copy(kind: ShaderKind, vmt: &Vmt) -> bool;
 pub fn unlit_uniforms(vmt: &Vmt) -> UnlitUniforms;
-pub fn lightmapped_uniforms(vmt: &Vmt) -> LightmappedUniforms;
+pub fn lightmapped_uniforms(kind: ShaderKind, vmt: &Vmt) -> LightmappedUniforms;
 pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms;
+pub fn refract_uniforms(vmt: &Vmt, textures: ResolvedTextures) -> RefractUniforms;
+
+/// What the shadow phase asks a texture that is already loaded.
+pub struct TextureFacts { pub width: u32, pub height: u32, pub translucent: bool }
+impl TextureFacts { pub fn of(texture: &Texture) -> TextureFacts; }
+
+#[derive(Default)]
+pub struct ResolvedTextures {
+    pub base: Option<TextureFacts>,        // $basetexture
+    pub normal_map: Option<TextureFacts>,  // $normalmap — Refract's
+}
 ```
+
+`render_state` and `refract_uniforms` take facts about the resolved textures rather than the
+textures themselves, and the reason is testability: a [`Texture`](#texture) cannot exist
+without a `wgpu::Device`, and the shadow phase only ever asks a texture two questions
+(`TextureIsTranslucent`, and `GetActualWidth`/`GetActualHeight` for `Refract`'s aspect
+fixup). **Different shaders ask about different textures** — everything through the shared
+`UnlitGeneric`/`VertexLitGeneric` helper asks about `$basetexture`, `Refract` asks about
+`$normalmap` — which is why this is a struct with two fields and not one argument.
 
 <a id="wants_phong"></a>
 
@@ -843,13 +881,13 @@ Valve's register map is really a *frequency* map, and that frequency is the bind
 | 0 | `FrameUniforms` | once a frame | VS `c2`, `c8..c11`, `c16`; PS `c29`, `c30`, `c32` |
 | 1 | the shader's own block, plus its textures and samplers | once a material | the shader-specific block |
 | 2 | `DrawUniforms` | once a draw | VS `c4..c7`, `c47` |
-| 3 | *where this shader's lighting comes from* — see below | once a batch, or once a model | PS `s1` (`TEXTURE_LIGHTMAP`); VS `c21..c26` + `c27..c46` |
+| 3 | *the render-context state this shader reads* — see below | once a batch, once a model, or once a pass | PS `s1` (`TEXTURE_LIGHTMAP`), PS `s2` (`TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0`); VS `c21..c26` + `c27..c46` |
 
-**Group 3 is the shader's lighting**, not skinning as stage 4 reserved it for, and it has
-two shapes:
+**Group 3 is whichever piece of render-context state the shader reads**, not skinning as
+stage 4 reserved it for. It has three shapes:
 
 ```rust
-pub enum LightingBinding { LightmapPage, ModelLighting }
+pub enum ContextBinding { LightmapPage, ModelLighting, FrameBufferCopy }
 ```
 
 | Shader | Group 3 | Set by | Rate |
@@ -857,12 +895,24 @@ pub enum LightingBinding { LightmapPage, ModelLighting }
 | `UnlitGeneric` | nothing — no group 3 is declared | — | — |
 | `LightmappedGeneric` | a lightmap atlas page: texture + sampler | `Pass::bind_lightmap_page` | per batch |
 | `VertexLitGeneric` | `ModelLighting`: ambient cube + 4 lights, dynamic offset | `Pass::set_model_lighting` | per model instance |
+| `Refract` | a readable copy of the scene: texture + sampler | `RenderContext::update_refract_texture` | per pass |
 
-Both are things Valve also kept out of the material: `BindLightmapPage` and
-`PI_SetVertexShaderAmbientLightCube` are render-context state that neither the material nor
-the draw call owns. A pipeline layout is per shader, so declaring group 3 everywhere would
-oblige every draw of every shader to bind something there; a shader that reads neither
-declares no group 3 at all. Skinning takes the next free group when `studiorender` lands.
+All three are things Valve also kept out of the material: `BindLightmapPage`,
+`PI_SetVertexShaderAmbientLightCube` and `SetFrameBufferCopyTexture` are render-context
+state that neither the material nor the draw call owns. A pipeline layout is per shader, so
+declaring group 3 everywhere would oblige every draw of every shader to bind something
+there; a shader that reads none of it declares no group 3 at all. Skinning takes the next
+free group when `studiorender` lands.
+
+**It was called `LightingBinding` until `Refract` landed**, because the first two shapes
+were both lighting. Nothing else about it changed, and a copy of the frame buffer sits in
+the same slot for the same reason the other two do.
+
+The three layouts are `BindLayouts::lightmap()`, `::model_lighting()` and
+`::frame_buffer_copy()`. The first and the third are *structurally identical* — a
+filterable 2D texture at binding 0 and a filtering sampler at binding 1 — and are
+deliberately separate objects, because group 3's meaning is per shader and a shared layout
+would invite the question of whether a refractor could be handed a lightmap page.
 
 Group 1's *layout* is the shader's, which is the one thing that genuinely differs between
 shaders; groups 0 and 2 are shared, which is what makes them worth being groups.
@@ -1231,12 +1281,65 @@ pub fn target_pass<'a>(&'a mut self, frame: &'a mut Frame<'_>, pipelines: &'a mu
 pub fn offscreen_pass<'a>(&'a mut self, encoder: &'a mut wgpu::CommandEncoder,
                           pipelines: &'a mut PipelineCache, target: &RenderTarget,
                           camera: &Camera, load: Load) -> Pass<'a>;
+
+pub fn update_refract_texture(&mut self, frame: &mut Frame<'_>, source: &RenderTarget);
+pub fn record_refract_texture(&mut self, encoder: &mut wgpu::CommandEncoder,
+                              source: &RenderTarget);
 ```
 
 `pass` draws to the swap-chain image and the renderer's depth buffer; `target_pass` to an
 offscreen `RenderTarget` using the frame's encoder; `offscreen_pass` to one with an
 encoder the caller supplies and submits, for rendering that is not part of a presented
 frame.
+
+<a id="the-frame-buffer-copy"></a>
+
+#### `update_refract_texture` — the frame-buffer copy
+
+`UpdateRefractTexture` (`game/client/view_scene.h:40`), which is a
+`CopyRenderTargetToTextureEx` followed by a `SetFrameBufferCopyTexture` — the copy and the
+binding, because they are the same act. It takes a readable copy of `source` and points
+every subsequently-opened pass's group 3 at it, for the shaders whose
+`ContextBinding` is `FrameBufferCopy` (today, `Refract`).
+
+**It must be called between passes, and that is the whole reason it exists.** A render pass
+cannot sample its own colour attachment, so the sequence is:
+
+```rust
+{
+    let scene = post.scene(frame.size());
+    let mut pass = context.target_pass(frame, materials.pipelines(), scene, &camera,
+                                       Load::Clear(CLEAR_COLOR));
+    world.draw(&mut pass);                      // the opaque scene
+}                                               // <- the pass must end here
+if world.needs_frame_buffer_copy() {
+    {
+        let scene = post.scene(frame.size());
+        context.update_refract_texture(frame, scene);
+    }
+    let scene = post.scene(frame.size());
+    let mut pass = context.target_pass(frame, materials.pipelines(), scene, &camera,
+                                       Load::Keep);   // Keep, not Clear
+    world.draw_refracting(&mut pass);
+}
+post.resolve(frame, measure);
+```
+
+That is Valve's structure too — the opaque list, then `UpdateRefractTexture`, then the
+translucent list — it just never had to say so, because D3D9 allowed a shader to read the
+frame buffer it was writing and simply gave undefined results.
+
+Three things about it:
+
+- **A pass already open does not see it**, the same way
+  [`set_exposure`](#rendercontext) does not: group 3's bind group is cloned into the
+  `Pass` when the pass opens.
+- **Before the first call there is one opaque black texel bound**, not nothing. A
+  refracting draw in a context that never calls this — the `-vmt` preview, a test —
+  reads black where the scene would be, which is visibly wrong rather than a validation
+  error.
+- **It is called once a frame, not once per refractor**, which is a deliberate divergence
+  — see the table below.
 
 `pipelines` is passed in rather than owned because `MaterialCache` owns the
 `PipelineCache` and needs it to build materials. The two `&mut` borrows are of different
@@ -1908,6 +2011,43 @@ Ordered by how likely each is to bite.
     identity a caller could compare against, so the bind group cannot be invalidated
     automatically. `PostProcess::scene` does both halves, which is why nothing outside
     this module has to remember.
+33. **`Refract`'s `$basetexture` is not a surface texture, and reading it as one draws a
+    picture.** It is an alternative *image to warp*, bound to the sampler the frame-buffer
+    copy would otherwise occupy — `BindTexture( SHADER_SAMPLER2, ..., m_nBaseTexture )`
+    against `BindStandardTexture( SHADER_SAMPLER2, ..., TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0 )`
+    (`refract_dx9_helper.cpp:273`). The seven materials that set it are 128x128 and 128x512
+    gradients, so treating one as an albedo gives glass a plausible greyish tint instead of
+    a refraction. `RefractFlags::BASE_TEXTURE` is the fork.
+34. **`Refract` decides its blending from the `$normalmap`, and only when there is no
+    `$envmap`.** `SetDefaultBlendingShadowState( m_nNormalMap, false )` inside
+    `if ( params[NORMALMAP]->IsTexture() && !bHasEnvmap )`, and the `false` skips the whole
+    `$selfillum`/`$basealphaenvmapmask`/`$translucent` reconciliation that
+    `$basetexture`'s answer goes through. Measured: **all 29 of the game's `$model 1`
+    `Refract` materials name an `$envmap`**, so every piece of refracting glass in Portal 2
+    draws with *no blending at all* — the refraction it shows is the copy of the frame it
+    sampled, not a blend with the frame it is writing. Its alpha *write mask*, separately,
+    is computed from the base texture's blend type, which is never applied. Both are
+    Valve's; `refract_render_state` is where they live.
+35. **`$bluramount` is declared an integer and content writes fractions into it.** Sixteen
+    shipped materials say `".3"` and two say `".25"`, and `GetIntValue()` truncates all of
+    them to 0. 11 of the 37 actually get the blur. Reading the parameter as a float turns
+    the four-tap kernel on for 29 materials that Valve draws sharp.
+36. **`Refract`'s "aspect fixup" is an integer division and is usually not 1.**
+    `float( nHeight / nWidth )` with both operands `int`
+    (`refract_dx9_helper.cpp:283`): `glass/refract_light_color` is 128x512, so five glass
+    materials get **4**, and a wider-than-tall source would get **0** and lose the local
+    refraction's horizontal offset entirely. Only the `$localrefract` branch reads it.
+37. **`Refract` applies no exposure**, and that is not an omission. `FinalOutput` is
+    called with `TONEMAP_SCALE_NONE`, because what the shader mostly returns is a resample
+    of a frame that has *already* been exposed — multiplying again would square it. The
+    environment map is the one term that has not been, and Valve leaves it unscaled too.
+38. **`Refract`'s environment map reflects along a tangent-space vector, and that is
+    reproduced rather than fixed.** `refract_ps2x.fxc:338` passes
+    `i.vTangentVertToEyeVector` into `CalcReflectionVectorUnnormalized` beside a
+    *world-space* normal, where `vertexlitgeneric` passes the world-space eye vector. It is
+    a bug in the shipped shader and it decides what every pane of glass in Portal 2
+    reflects, so `refract.wgsl` does the same thing and says so at the line. Passing
+    `-in.world_view_vector` is the physically intended vector.
 
 ## Deliberate divergences from Valve's behavior
 
@@ -1949,15 +2089,21 @@ Each of these changes what the engine does, and each names the thing that revers
 | An **opaque** material writes its base texture's alpha to the frame, where Valve writes 1 | `g_EyePos_BaseTextureTranslucency.w` is `TextureIsTranslucent( BASETEXTURE, true )` — 1 for a `$translucent` or `$alphatest` material, 0 for an opaque one — and the shader lerps the base alpha in by it. Blending and the alpha-test `discard` are unaffected, because both cases have `w` of 1; only the frame's alpha channel differs, and the underwater fog pass that reads it is not ported. Shared with `UnlitGeneric`, which reaches the same Valve source file | thread the resolved base texture into `*_uniforms` and add a flag |
 | `$seamless_scale` draws with ordinary planar mapping | seamless mapping is a triplanar projection of `worldPos * scale` blended by the squared world normal, and a `WorldVertex` carries no normal. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` maps and none in `sp_a1_intro1` | a second `VertexLayout` for `LightmappedGeneric` with a normal in it |
 | `$lightwarptexture`, `$rimlight` and self-illum fresnel are ignored | each belongs to the `Phong` path or needs a texture kind not yet loaded; all three are declared-and-unread rather than silently accepted, since the params table omits what it does not honour | — |
+| **The frame-buffer copy is taken once a frame, not once per refractor** | on PC Valve calls `UpdateRefractTexture` before *each* refracting renderable in the back-to-front translucent list (`viewrender.cpp:6195`), so glass behind glass sees the nearer pane's result. One copy is one full-screen blit and one extra pass; a copy per refractor is a pass per refractor. Overlapping refractors here show the scene behind both rather than through each other, and nothing in Portal 2's single-player maps stacks two in one view | call `RenderContext::update_refract_texture` between draws rather than before them |
+| **A refracting prop is split per *batch*, where Valve splits per renderable** | Valve sorts whole renderables into the opaque and translucent lists, so a prop with one refracting material among several draws entirely in the translucent pass. Mixing is the normal case and not the corner one: of the 66 models in the depot wearing a frame-buffer-refracting material, **60 also wear something else** — every `props_destruction/glass_*` pane is a refracting sheet plus an opaque `glass_fracture_*_inner` edge. The per-batch split is the one that is right without a depth sort, which this port does not have | `PropModels::record`, once translucency sorting exists |
+| `Refract`'s `$refracttint`/`$envmaptint` are gamma-decoded and `VertexLitGeneric`'s `$envmaptint` is not | **this one is a gap rather than a decision.** `Refract` decodes through `SetPixelShaderConstantGammaToLinear` — a 256-entry table that clamps anything at or above 0.95 to 1 — and `shader::gamma_to_linear_param` is that, faithfully. `VertexLitGeneric` decodes through `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`, which is the plain `pow( x, 2.2 )` with no table and no clamp, and `vertex_lit_uniforms` does not decode at all — so every reflective prop in the game has an envmap tint that is too bright. Fixing it changes 1,108 materials and belongs in its own change | `shader::vertex_lit_uniforms`, applying `GammaToLinearFullRange` to `$envmaptint` |
+| `Refract` is drawn with `VertexLayout::Model` even for a brush surface | Valve declares two vertex formats and picks on `$model`. 29 of the game's 37 materials set it and all eight that do not are under `materials/particle/`, drawn by the unported particle system; **no brush face or displacement in the shipped game names this shader** | `ShaderKind::vertex_layout`, plus a tangent on a `SimpleVertex` when particles land |
+| `Refract`'s secondary normal map, `$masked`, `$magnifyenable` and `$vertexcolormodulate` are not implemented | **zero** Portal 2 materials set any of them, and the secondary-normal path is broken where Valve implements it: it binds `$normalmap2` to sampler 1 and then samples sampler 3 with the second coordinate set (`refract_ps2x.fxc:143`). `$masked` additionally wants a blend mode `BlendMode` does not have | `REFRACT_PARAMS`, and a `BlendMode::MaskedRefract` |
+| `$time` and `$fresnelreflection` are not declared on `Refract` at all | both are dead in Valve's shader: `$time` reaches a register no `.fxc` reads, and `$fresnelreflection` is never written to one — `refract.cpp` and its helper each carry the comment *"FIXME: doesn't support Fresnel!"* | — |
 
 ## Not implemented
 
-Stage 6 is `VertexLitGeneric` and is done; the rest of §7.8's shader set, paint maps and
-GPU morph (stages 7-8) are not. The shader set is three implementations under four names,
-so a `.vmt` naming any of the other 160-odd still resolves to the error material —
-measured against Portal 2, those cover 2,836 of its 3,431 materials plus the 16 that name
-`WorldVertexTransition`. Also deliberately absent, and listed so
-nobody looks for them:
+Stage 6 is `VertexLitGeneric` and is done; `Refract` is the first of §7.8's remaining
+shader set, and paint maps and GPU morph (stages 7-8) are not started. The set is four
+implementations under five names, so a `.vmt` naming any of the other 160-odd still
+resolves to the error material — measured against the mounted game by
+[`every_shipped_material_of_a_ported_shader_builds_a_pipeline`](#test-coverage), that is
+**608 of 3,555**. Also deliberately absent, and listed so nobody looks for them:
 
 - **Everything `LightmappedGeneric` can do past a base texture, a bump map, a lightmap and
   the two-layer blend.** `$detail`, `$envmap`/`$envmapmask`, **`$seamless_scale`**,
@@ -2147,9 +2293,10 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 
 ## Test coverage
 
-189 tests, in two groups.
+203 tests, in three groups: 156 pure logic, 46 end-to-end on a GPU, and one depot-gated
+census.
 
-**Pure logic, no GPU** (145) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (156) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
@@ -2157,15 +2304,15 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 | `vtf` (18) | every version 7.0-7.5, the seventh cubemap face, partial mip chains, the thumbnail, flag masking, and each way a file can be malformed |
 | `vmt` (17) | the type sniffing, conditional keys, flags-are-not-vars, fallback blocks, and patch expansion against a real temp-directory `Vfs` |
 | `image_format` (15) | the size arithmetic that decides where every mip level starts in a file, and every CPU format conversion, channel by channel |
-| `shader` (24) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule — plus `VertexLitGeneric`'s parameter resolution: `WantsPhongShader`'s truth table, `env_cubemap`, the shader-supplied defaults that `param_value` does not give, the three envmap masks resolving against each other, and the alpha-test suppression when base alpha is spoken for |
+| `shader` (37) | the shadow phase — every flag that maps onto pipeline state, the blend evaluation, the alpha-test reference, the texture transform, and the sRGB rule — plus `VertexLitGeneric`'s parameter resolution: `WantsPhongShader`'s truth table, `env_cubemap`, the shader-supplied defaults that `param_value` does not give, the three envmap masks resolving against each other, and the alpha-test suppression when base alpha is spoken for. `Refract` adds thirteen: the base-texture-versus-frame-buffer fork, `$localrefract` deciding whether a copy is needed at all, `$bluramount`'s integer truncation, the integer aspect fixup at three shapes, the gamma table's `>= 0.95` clamp, the blend decision coming from the normal map and only without an `$envmap`, the envmap's sRGB asymmetry against `VertexLitGeneric`'s, and the parameter table promising nothing it does not implement |
 | `var` (12) | the value grammar and every coercion between the arms, plus the flag-name table against the bit constants |
 | `texture` (7) | the `.vtf` flags -> sampler policy, and `NormalizeTextureName` — extensions stripped except `.hdr`, and only in the last path component |
-| `uniforms` (10) | the uniform block sizes WGSL expects — including `ModelLighting`'s hand-written tail padding, where Rust's alignment for an array of `[f32; 4]` is 4 and WGSL's is 16 — the no-fog packing, the row-major/column-major conversion in both directions, and the light type's two-`w`-component encoding |
+| `uniforms` (10) | the uniform block sizes WGSL expects — `RefractUniforms` is guarded in `shader` instead, beside the struct — including `ModelLighting`'s hand-written tail padding, where Rust's alignment for an array of `[f32; 4]` is 4 and WGSL's is 16 — the no-fog packing, the row-major/column-major conversion in both directions, and the light type's two-`w`-component encoding |
 | `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout |
 | `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
 | `mesh` (6) | the vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
-| `histogram` (5, of 13) | `Region::centered` against `mat_exposure_center_region_x`/`_y`, including the border truncation that matches Valve's float-to-int conversion and the floor that stops a rectangle collapsing to nothing; and the `Params` block size WGSL declares |
+| `histogram` (5, of 12) | `Region::centered` against `mat_exposure_center_region_x`/`_y`, including the border truncation that matches Valve's float-to-int conversion and the floor that stops a rectangle collapsing to nothing; and the `Params` block size WGSL declares |
 
 The `vtf` tests build files with an in-memory writer that can produce *archaic* and
 *malformed* ones deliberately — a 7.1 cubemap with its spheremap face, a 7.4 cubemap
@@ -2180,8 +2327,39 @@ module path apart, and its `near`/`far` are distances along `-z` rather than `z`
 first time round — the GPU depth test is what caught it, and this is the cheap check that
 keeps it caught.
 
-**End to end, on a real GPU** (44 — 30 in `preview.rs`, 7 in `histogram.rs`, 5 in
-`post.rs`, and one each in `pipeline.rs` and `ui.rs`) — a `.vmt` and a `.vtf`, through the
+**Against the real game** (1, `#[ignore]`d and gated on `KISAK_GAME_DIR`) —
+`every_shipped_material_of_a_ported_shader_builds_a_pipeline` walks every `.vmt` in the
+mounted game, loads it through the real `MaterialCache`, and asks the real `PipelineCache`
+for a pipeline, with `on_uncaptured_error` latching any validation failure. It is what says
+a newly ported shader is *finished*, and running it prints the census:
+
+```
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --ignored --nocapture
+```
+```
+3555 .vmt files under materials/
+    801 LightmappedGeneric  (9 pipelines)
+     37 Refract  (7 pipelines)
+    956 UnlitGeneric  (19 pipelines)
+   1135 VertexLitGeneric  (15 pipelines)
+     18 WorldVertexTransition  (1 pipelines)
+    608 <the error material>
+51 pipelines for the whole set
+```
+
+So **2,947 of the mounted game's 3,555 materials draw with a real shader**, and the whole
+set needs 51 pipelines — which is the standing answer to
+`portdocs/MATERIALSYSTEM.md` §10's "how many variants actually survive". The assertions
+are floors rather than exact counts, so mounting the language DLCs does not fail the test.
+
+The 608 that fall back are dominated by six unported shaders — `SpriteCard` (143),
+`DecalModulate` (101), `Water` (59), `SubRect` (57), `Sprite` (35) and `UnlitTwoTexture`
+(23) — with a long tail behind them (`SolidEnergy` 14, `Wireframe` 12, `Modulate` 8,
+`Portal`/`Portal_Refract` 14, `ScreenSpace_General` 7, `Sky` 6) and, at the end, a handful
+of `.vmt` files that name a texture or an `include` the depot does not contain.
+
+**End to end, on a real GPU** (46 — 31 in `preview.rs`, 7 in `histogram.rs`, 5 in
+`post.rs`, 2 in `ui.rs` and 1 in `pipeline.rs`) — a `.vmt` and a `.vtf`, through the
 material system, onto the GPU, through real WGSL, and back to the CPU by rendering to an
 offscreen `RenderTarget` and reading the pixels back. Each skips rather than fails on a
 machine with no usable adapter:

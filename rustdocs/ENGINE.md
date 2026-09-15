@@ -66,13 +66,13 @@ RedrawRequested  -> Engine::frame(now)         -> None: too early, return and wa
                                                -> Some(Continue): carry on
                  -> apply_capture()            -> the cursor grab follows the engine
                  -> Renderer::begin_frame()    -> None: back off SKIP_RETRY
-                 -> Engine::render(&mut frame) -> the world
+                 -> Engine::render(&mut frame) -> the world, then the refractors
                  -> Context::run_ui(|| Engine::run_ui())
                  -> UiRenderer::draw(&mut frame, …)  -> the console, over the top
                  -> Frame::present()
 ```
 
-Five orderings in there are load-bearing:
+Eight orderings in there are load-bearing:
 
 1. **`Engine::frame` runs before the surface is acquired.** A frame the clock refuses
    costs no acquisition, and a frame that loads a map does not hold a swap-chain image
@@ -90,7 +90,13 @@ Five orderings in there are load-bearing:
    makes `wait 1` mean "next frame"; running the console per window event would tick it at
    the display's rate instead.
 6. **Nothing sleeps.** See [Pacing](#pacing-is-split-in-two).
-7. **The UI is built and drawn inside the acquired frame**, after the world. `egui`'s
+7. **A refracting draw is a second pass with a copy between it and the first.**
+   `World::draw` records the opaque scene, that pass *ends*,
+   `RenderContext::update_refract_texture` copies the scene target, and a second
+   `Load::Keep` pass records `World::draw_refracting`. The middle step is why the first
+   pass has to end: a pass cannot sample its own attachment. Skipped entirely when
+   `World::needs_frame_buffer_copy` is false.
+8. **The UI is built and drawn inside the acquired frame**, after the world. `egui`'s
    `TexturesDelta` must be applied by whoever built it (`epaint` asserts on drop that it
    was), so a pass built for a frame that then found no swap-chain image would leave an
    upload owed to nobody. A skipped frame therefore skips `egui` entirely and its events
@@ -210,8 +216,8 @@ A loaded map and the geometry it draws.
 | | |
 |---|---|
 | Module | `crate::engine::world` |
-| Lines | ~2,900 including tests |
-| Tests | 60 (`cargo test engine::world`), plus two depot-gated |
+| Lines | ~7,200 including tests |
+| Tests | 64 (`cargo test engine::world`), plus four depot-gated |
 | Dependencies | `bytemuck`, `glam`, `crate::filesystem`, `crate::materials` |
 
 ### `World`
@@ -220,6 +226,8 @@ A loaded map and the geometry it draws.
 pub fn load(vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device, name: &str)
     -> Result<World, WorldError>;
 pub fn draw(&self, pass: &mut Pass<'_>);
+pub fn needs_frame_buffer_copy(&self) -> bool;
+pub fn draw_refracting(&self, pass: &mut Pass<'_>);
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 pub fn center(&self) -> Vec3;
 pub fn summary(&self) -> String;
@@ -254,6 +262,38 @@ world's go under an identity model matrix — world geometry is already in world
 and each brush entity's go under its own placement. **Terrain is in the world's batches**:
 a displacement is world geometry with a different way of generating its vertices, not a
 separate pass. See [`world::disp`](#worlddisp--the-terrain).
+
+**`draw` deliberately holds back the geometry that has to read the frame it is drawn
+into**, and `draw_refracting` is the rest of it. Today that means the static props wearing
+a `Refract` material with no `$basetexture` of its own — glass that warps the scene behind
+it. A render pass cannot sample its own colour attachment, so the caller has to sequence
+three things:
+
+```rust
+{ let mut pass = …; world.draw(&mut pass); }          // the opaque scene; the pass ends
+if world.needs_frame_buffer_copy() {
+    context.update_refract_texture(frame, scene);       // UpdateRefractTexture
+    let mut pass = … Load::Keep …;                      // Keep, not Clear
+    world.draw_refracting(&mut pass);
+}
+```
+
+`Engine::render` is that, and `MATERIALS.md`'s
+[frame-buffer copy](MATERIALS.md#the-frame-buffer-copy) is the other half. It is Valve's
+own ordering — the opaque list, `UpdateRefractTexture`, then the translucent list
+(`viewrender.cpp:6195`) — made explicit because `wgpu` enforces what D3D9 left undefined.
+
+**`needs_frame_buffer_copy` is asked once a frame and fixed at load**, so a map with
+nothing that refracts pays neither the copy nor the pass. Measured over the depot:
+**71 of the game's 106 maps answer yes**; on `sp_a1_intro1` it is one model, the
+container's observation window. `draw_refracting` is safe to call either way — it draws
+nothing when the answer is no.
+
+**Only static props are offered there**, not world faces or brush entities, and that is a
+measurement rather than a simplification: all 29 of the game's `$model 1` `Refract`
+materials are on models, and **no brush face or displacement in the shipped game names
+that shader**. The other inhabitants of Valve's translucent list — particles, sprites,
+the water surface — are not ported.
 
 `models` is the `.bsp`'s model lump kept for somebody else: the *server* needs it, because
 a `func_door` computes how far it slides from the size of its own brushes and that number

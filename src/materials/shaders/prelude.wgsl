@@ -14,7 +14,7 @@
 // basis is here (`BUMP_BASIS`) but its *sampling* is `LightmappedGeneric`'s,
 // and the ambient cube and local lights are `VertexLitGeneric`'s outright.
 // Anything that reads a bind group belongs to the shader that declares it,
-// and group 3 is declared per shader -- see `shader::LightingBinding`.
+// and group 3 is declared per shader -- see `shader::ContextBinding`.
 //
 // Two conventions are set here and inherited by everything later, and both
 // produce a plausible-looking wrong picture rather than an error when broken:
@@ -256,6 +256,37 @@ fn vec3_tangent_to_world(
     return tangent_vector.x * world_tangent
         + tangent_vector.y * world_binormal
         + tangent_vector.z * world_normal;
+}
+
+// `Vec3WorldToTangent` (`common_fxc.h:506`), and the `Normalized` form next to
+// it. The inverse of `vec3_tangent_to_world` above, and cheap for the same
+// reason: the basis is orthonormal, so the inverse is three dots rather than a
+// matrix inverse.
+fn vec3_world_to_tangent(
+    world_vector: vec3<f32>,
+    world_normal: vec3<f32>,
+    world_tangent: vec3<f32>,
+    world_binormal: vec3<f32>,
+) -> vec3<f32> {
+    return vec3<f32>(
+        dot(world_vector, world_tangent),
+        dot(world_vector, world_binormal),
+        dot(world_vector, world_normal),
+    );
+}
+
+fn vec3_world_to_tangent_normalized(
+    world_vector: vec3<f32>,
+    world_normal: vec3<f32>,
+    world_tangent: vec3<f32>,
+    world_binormal: vec3<f32>,
+) -> vec3<f32> {
+    return normalize(vec3_world_to_tangent(
+        world_vector,
+        world_normal,
+        world_tangent,
+        world_binormal,
+    ));
 }
 
 // `CalcReflectionVectorUnnormalized` (`common_fxc.h:127`).

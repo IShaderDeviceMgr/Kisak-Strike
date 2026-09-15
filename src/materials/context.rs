@@ -74,7 +74,7 @@ use super::material::Material;
 use super::mesh::{DynamicBuffers, IndexSlice, VertexSlice};
 use super::pipeline::{PipelineCache, PipelineKey, RenderState, TargetFormat};
 use super::renderer::Frame;
-use super::shader::LightingBinding;
+use super::shader::ContextBinding;
 use super::target::{RenderTarget, CLEAR_DEPTH};
 use super::uniforms::{self, DrawUniforms, FrameUniforms, ModelLighting};
 
@@ -272,6 +272,9 @@ pub struct RenderContext {
     /// rather than a `wgpu` validation error, and the white page is what the
     /// engine binds for exactly that case anyway.
     white_lightmap: WhiteLightmap,
+    /// Group 3 for the shaders that read a copy of the scene, and the copy
+    /// itself. See [`RenderContext::update_refract_texture`].
+    refract: RefractSource,
 }
 
 /// The one-texel white page and the bind group over it.
@@ -279,6 +282,31 @@ struct WhiteLightmap {
     /// Held so the view the bind group refers to stays alive.
     #[allow(dead_code)]
     texture: super::texture::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// `TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0`: the readable copy of the scene, the
+/// bind group over whichever texture that currently is, and the layout to
+/// build the next one against.
+///
+/// Two states rather than an `Option`, because a draw must always have
+/// something to bind: before the first
+/// [`update_refract_texture`](RenderContext::update_refract_texture) — and for
+/// a context that never calls it, like the `-vmt` preview — `bind_group` names
+/// `black`, one opaque black texel. A refracting material then reads black
+/// where the scene would be, which is the same thing Valve's
+/// `INVALID_SHADERAPI_TEXTURE_HANDLE` amounts to once the driver has
+/// substituted its own default, and is visibly wrong rather than a validation
+/// error.
+struct RefractSource {
+    layout: wgpu::BindGroupLayout,
+    /// Held so the fallback bind group's view stays alive.
+    #[allow(dead_code)]
+    black: super::texture::Texture,
+    /// The copy itself, allocated on first use and reallocated when the scene
+    /// target changes size.
+    target: Option<RenderTarget>,
+    /// Over `target` once there is one, over `black` until then.
     bind_group: wgpu::BindGroup,
 }
 
@@ -295,6 +323,7 @@ impl RenderContext {
         let layouts = pipelines.layouts();
         RenderContext {
             white_lightmap: white_lightmap(device, queue, layouts),
+            refract: refract_source(device, queue, layouts),
             frames: UniformArena::new(
                 device,
                 "frame uniforms",
@@ -362,6 +391,97 @@ impl RenderContext {
         self.draws.begin_frame(&self.device, &self.queue);
         self.lights.begin_frame(&self.device, &self.queue);
         self.dynamic.begin_frame(&self.device);
+    }
+
+    /// Takes a readable copy of a render target, for the shaders that sample
+    /// the scene they are being drawn into.
+    ///
+    /// `UpdateRefractTexture` (`game/client/view_scene.h:40`) — a
+    /// `CopyRenderTargetToTextureEx` into the power-of-two frame-buffer
+    /// texture, followed by `SetFrameBufferCopyTexture` pointing
+    /// `TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0` at it. Both halves are here,
+    /// because the copy and the binding are the same act.
+    ///
+    /// # It must be between passes, and that is the whole reason it exists
+    ///
+    /// A render pass cannot sample its own colour attachment. So the sequence
+    /// is: draw the opaque scene into the target, **end that pass**, call this,
+    /// open a second pass against the same target with [`Load::Keep`], and draw
+    /// the refracting geometry into it. Valve's structure is the same — the
+    /// opaque list, then `UpdateRefractTexture`, then the translucent list —
+    /// it just did not have to say so, because D3D9 let a shader read the frame
+    /// buffer it was writing and simply gave undefined results.
+    ///
+    /// The copy is allocated on first use and reallocated when `source`
+    /// changes size, in the source's exact format. Passes opened **after** this
+    /// call see it; one already open does not, the same way
+    /// [`set_exposure`](RenderContext::set_exposure) does not.
+    ///
+    /// # Once a frame, not once a refractor
+    ///
+    /// **The one deliberate divergence in this function.** On PC Valve calls
+    /// `UpdateRefractTexture` once per refracting renderable, back to front
+    /// (`viewrender.cpp:6195`), so a pane of glass behind another pane sees the
+    /// first one's result. Here it is called once and every refractor in the
+    /// frame reads the same copy, which means overlapping refractors show the
+    /// scene behind *both* of them rather than through each other. The reason
+    /// is cost: one copy is one full-screen blit and one extra pass, and a copy
+    /// per refractor is a pass per refractor. Nothing in Portal 2's
+    /// single-player maps stacks two refracting props in one view; the
+    /// condition to revisit is finding a place that does, and the fix is to
+    /// call this between draws rather than before them.
+    pub fn update_refract_texture(&mut self, frame: &mut Frame<'_>, source: &RenderTarget) {
+        let (encoder, _, _) = frame.parts();
+        self.record_refract_texture(encoder, source);
+    }
+
+    /// [`update_refract_texture`](RenderContext::update_refract_texture)
+    /// against an encoder rather than a [`Frame`].
+    ///
+    /// Public for the same reason
+    /// [`offscreen_pass`](RenderContext::offscreen_pass) is: a `Frame` needs a
+    /// swap chain and a swap chain needs a window, so this is the only way the
+    /// copy can be driven by a screenshot, a benchmark or a test.
+    pub fn record_refract_texture(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &RenderTarget,
+    ) {
+        let size = source.size();
+        let format = source.format().color;
+        let stale = match &self.refract.target {
+            Some(target) => target.size() != size || target.format().color != format,
+            None => true,
+        };
+        if stale {
+            let target = RenderTarget::new(
+                &self.device,
+                "_rt_FullFrameFB",
+                size.0,
+                size.1,
+                format,
+                // No depth: nothing draws into this, it is only ever copied
+                // into and sampled.
+                false,
+            );
+            self.refract.bind_group = frame_buffer_copy_group(
+                &self.device,
+                &self.refract.layout,
+                target.texture().view(),
+                target.texture().sampler(),
+            );
+            self.refract.target = Some(target);
+        }
+        let target = self.refract.target.as_ref().expect("just allocated");
+        encoder.copy_texture_to_texture(
+            source.color_texture().as_image_copy(),
+            target.color_texture().as_image_copy(),
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Opens a pass against the swap-chain image and the renderer's depth
@@ -519,6 +639,7 @@ impl RenderContext {
             target,
             overrides: StateOverride::default(),
             white_lightmap: self.white_lightmap.bind_group.clone(),
+            refract_source: self.refract.bind_group.clone(),
             lightmap: None,
             static_light: None,
             bound: BoundState::default(),
@@ -572,6 +693,63 @@ fn white_lightmap(
     }
 }
 
+/// Builds [`RenderContext::refract`]: the layout to rebuild against, and one
+/// opaque black texel to bind until there is a real copy of the scene.
+fn refract_source(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layouts: &super::pipeline::BindLayouts,
+) -> RefractSource {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("frame buffer copy (none)"),
+        ..wgpu::SamplerDescriptor::default()
+    });
+    let black = super::texture::Texture::from_pixels(
+        device,
+        queue,
+        "frame buffer copy (none)",
+        1,
+        1,
+        // The scene target's format is the back buffer's, which is sRGB; this
+        // one is only ever read as "black", so the encoding does not matter and
+        // a format every backend has does.
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        &[0, 0, 0, 255],
+        sampler,
+    );
+    let layout = layouts.frame_buffer_copy().clone();
+    let bind_group = frame_buffer_copy_group(device, &layout, black.view(), black.sampler());
+    RefractSource {
+        layout,
+        black,
+        target: None,
+        bind_group,
+    }
+}
+
+/// Group 3 over one texture, for the shaders that read a copy of the scene.
+fn frame_buffer_copy_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frame buffer copy"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: super::shader::BINDING_REFRACT_SOURCE_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: super::shader::BINDING_REFRACT_SOURCE_SAMPLER,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
 /// One open render pass: a target, a camera, and the draws recorded into it.
 ///
 /// Ends when dropped. Everything Valve stacked is either a field here (set for
@@ -600,6 +778,11 @@ pub struct Pass<'a> {
     /// The fallback for a lit draw with no page bound. Cloned for the same
     /// reason `frame_bind_group` is.
     white_lightmap: wgpu::BindGroup,
+    /// Group 3 for a refracting draw: the copy of the scene as it stood when
+    /// [`RenderContext::update_refract_texture`] was last called. Fixed for
+    /// the whole pass, because the copy is — a pass cannot read the target it
+    /// is writing, so a refresh means a new pass.
+    refract_source: wgpu::BindGroup,
     /// The page [`bind_lightmap_page`](Pass::bind_lightmap_page) last named.
     lightmap: Option<wgpu::BindGroup>,
     /// The baked static light slot 1 binds. See
@@ -640,8 +823,9 @@ struct BoundState {
     frame: Option<(wgpu::BindGroup, u32)>,
     /// Group 1 — the material's textures and constants.
     material: Option<wgpu::BindGroup>,
-    /// Group 3 — a lightmap page or a model's lighting block, with its offset.
-    lighting: Option<(wgpu::BindGroup, u32)>,
+    /// Group 3 — whichever piece of render-context state the last draw's
+    /// shader read, with its dynamic offset (0 for the two that have none).
+    context: Option<(wgpu::BindGroup, u32)>,
     vertices: Option<(wgpu::Buffer, u64, u32)>,
     /// Slot 1, the static-light stream.
     static_light: Option<(wgpu::Buffer, u64, u32)>,
@@ -921,23 +1105,30 @@ impl Pass<'_> {
         self.pass
             .set_bind_group(2, self.draws.bind_group(), &[offset]);
 
-        match material.shader.lighting_binding() {
+        match material.shader.context_binding() {
             None => {}
-            Some(LightingBinding::LightmapPage) => {
+            Some(ContextBinding::LightmapPage) => {
                 let page = self.lightmap.as_ref().unwrap_or(&self.white_lightmap);
-                if self.bound.lighting.as_ref().map(|(g, _)| g) != Some(page) {
+                if self.bound.context.as_ref().map(|(g, _)| g) != Some(page) {
                     self.pass.set_bind_group(3, page, &[]);
-                    self.bound.lighting = Some((page.clone(), 0));
+                    self.bound.context = Some((page.clone(), 0));
                 }
             }
             // Read after any `set_model_lighting` in this pass, because a push
             // that grew the arena replaced the bind group this names.
-            Some(LightingBinding::ModelLighting) => {
+            Some(ContextBinding::ModelLighting) => {
                 let group = self.lights.bind_group();
                 let wanted = (group, self.lighting_offset);
-                if self.bound.lighting.as_ref().map(|(g, o)| (g, *o)) != Some(wanted) {
+                if self.bound.context.as_ref().map(|(g, o)| (g, *o)) != Some(wanted) {
                     self.pass.set_bind_group(3, group, &[self.lighting_offset]);
-                    self.bound.lighting = Some((group.clone(), self.lighting_offset));
+                    self.bound.context = Some((group.clone(), self.lighting_offset));
+                }
+            }
+            Some(ContextBinding::FrameBufferCopy) => {
+                let group = &self.refract_source;
+                if self.bound.context.as_ref().map(|(g, _)| g) != Some(group) {
+                    self.pass.set_bind_group(3, group, &[]);
+                    self.bound.context = Some((group.clone(), 0));
                 }
             }
         }

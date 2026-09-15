@@ -42,12 +42,14 @@
 //! - [`MaterialPreview`] draws one material on a cube. That is a
 //!   *verification* path, not a scene graph; see its docs.
 //!
-//! - Group 3 is *where a shader's lighting comes from*, and there are two
-//!   answers ([`LightingBinding`](shader::LightingBinding)): a lightmap atlas
-//!   page for a brush surface, and
+//! - Group 3 is *whichever piece of render-context state a shader reads*, and
+//!   there are three answers ([`ContextBinding`](shader::ContextBinding)): a
+//!   lightmap atlas page for a brush surface,
 //!   [`ModelLighting`](uniforms::ModelLighting) — an ambient cube plus up to
-//!   four local lights — for a model. A shader that reads neither declares no
-//!   group 3 at all.
+//!   four local lights — for a model, and a readable **copy of the scene** for
+//!   a refracting surface, filled by
+//!   [`RenderContext::update_refract_texture`](context::RenderContext::update_refract_texture).
+//!   A shader that reads none of it declares no group 3 at all.
 //!
 //! - [`lightmap`] packs a map's baked light samples into atlas pages:
 //!   [`ImagePacker`](lightmap::ImagePacker) is `CImagePacker`,

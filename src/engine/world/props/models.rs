@@ -142,6 +142,10 @@ pub struct PropModels {
     /// [`ModelLighting::static_light`] 0, so the shader does not read it at
     /// all; it exists to satisfy the vertex layout, not to be sampled.
     unlit: Option<VertexBuffer>,
+    /// Whether any batch of any model wears a material that needs a readable
+    /// copy of the scene. Computed at load because the answer is asked once a
+    /// frame and cannot change: see [`PropModels::refracts`].
+    refracts: bool,
     pub stats: PropModelStats,
 }
 
@@ -317,6 +321,13 @@ impl PropModels {
             .max()
             .unwrap_or(0);
 
+        let refracts = models.iter().flatten().any(|model| {
+            model
+                .batches
+                .iter()
+                .any(|batch| batch.material.needs_frame_buffer_copy)
+        });
+
         PropModels {
             light: (!light.is_empty())
                 .then(|| VertexBuffer::new(device, "static prop lighting", &light)),
@@ -330,6 +341,7 @@ impl PropModels {
             light_ranges,
             models,
             instances,
+            refracts,
             stats,
         }
     }
@@ -343,22 +355,81 @@ impl PropModels {
         self.models.iter().all(Option::is_none)
     }
 
-    /// Records every instance of every model into an open pass.
+    /// Whether any of these models refracts, and therefore whether a copy of
+    /// the frame buffer has to be taken before
+    /// [`draw_refracting`](PropModels::draw_refracting) is called.
+    ///
+    /// `ERENDERFLAGS_NEEDS_POWER_OF_TWO_FB` gathered over a map's props, once
+    /// at load. `sp_a1_intro1` answers `true` for exactly one of its 136
+    /// models — `models/props_lab/glass_observation_2.mdl`, whose
+    /// `models/props_lab/glasswindow_observation` has no `$basetexture` of its
+    /// own to warp — and 71 of the game's 106 maps answer `true` for
+    /// something.
+    pub fn refracts(&self) -> bool {
+        self.refracts
+    }
+
+    /// Records every instance of every model into an open pass, except the
+    /// batches that need a copy of the frame buffer.
     ///
     /// Instances are walked **model-major**: every prop that shares a model is
     /// drawn before the next model's, so the vertex and index buffers and each
     /// material's pipeline are bound once per model rather than once per prop.
     /// That is `CStaticPropMgr::DrawStaticProps`' grouping and the reason the
     /// dictionary exists.
+    pub fn draw(&self, pass: &mut Pass<'_>, props: &Props) {
+        self.record(pass, props, false);
+    }
+
+    /// The batches [`draw`](PropModels::draw) left out: the ones whose material
+    /// reads the scene behind it.
+    ///
+    /// Call after [`RenderContext::update_refract_texture`][update], in a
+    /// second pass against the same target. Draws nothing if
+    /// [`refracts`](PropModels::refracts) is false.
+    ///
+    /// **The split is per *batch*, not per prop, and that is a divergence
+    /// rather than a refinement.** `CRendering3dView` sorts whole
+    /// *renderables* into the opaque and translucent lists, so a prop with one
+    /// refracting material among several is drawn entirely in the translucent
+    /// pass — its opaque parts included. Splitting per batch leaves those in
+    /// the opaque pass, where they depth-test against the world without being
+    /// sorted.
+    ///
+    /// It matters, because mixing is the **normal** case and not the corner
+    /// one: of the 66 models in the depot that wear a frame-buffer-refracting
+    /// material, **60 also wear something else** — every
+    /// `props_destruction/glass_*` pane is a refracting sheet plus an opaque
+    /// `glass_fracture_*_inner` edge, and `props_bts/vactube_*_neurotoxin` is
+    /// glass over an opaque pipe. Six do not, and one of those six is
+    /// `props_lab/glass_observation_2.mdl`, the only such model
+    /// `sp_a1_intro1` places as a static prop.
+    ///
+    /// The per-batch split is the one that is right without a depth sort, which
+    /// this port does not have; the condition to revisit it is translucency
+    /// sorting landing, at which point a whole-renderable split becomes
+    /// expressible and the choice can be made on looks rather than on what is
+    /// available.
+    ///
+    /// [update]: crate::materials::context::RenderContext::update_refract_texture
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, props: &Props) {
+        if !self.refracts {
+            return;
+        }
+        self.record(pass, props, true);
+    }
+
+    /// The body both entry points share. `refracting` selects which half of
+    /// each model's batches to record.
     ///
     /// # Lighting
     ///
-    /// One flat ambient cube for the whole scene, set once. **Deliberately
-    /// wrong**: the per-prop `.vhv` bake is stage 4 and the leaf ambient cube
-    /// is stage 5, and until those land every prop is lit identically. The
-    /// point of stage 3 is that the props are in the right places wearing the
-    /// right materials, which a flat cube does not obscure.
-    pub fn draw(&self, pass: &mut Pass<'_>, props: &Props) {
+    /// One lighting slot per instance, taken up front — see the comment inside.
+    /// A refracting draw does not read one (`Refract` binds a copy of the scene
+    /// in group 3, not lighting), so the second call's slots are wasted; that
+    /// is a few hundred bytes of arena on the one map in the game that has any,
+    /// against threading a flag through the loop.
+    fn record(&self, pass: &mut Pass<'_>, props: &Props, refracting: bool) {
         if self.is_empty() {
             return;
         }
@@ -409,6 +480,9 @@ impl PropModels {
                 .as_ref()
                 .map(|buffer| buffer.range(0, model.vertex_count as u32));
             for batch in &model.batches {
+                if batch.material.needs_frame_buffer_copy != refracting {
+                    continue;
+                }
                 let indices = model.indices.range(batch.first_index, batch.index_count);
                 for &i in instances {
                     let prop = &props.instances[i];

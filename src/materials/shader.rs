@@ -112,7 +112,7 @@ pub enum ShaderKind {
     /// — and because [`name`](ShaderKind::name) should say what the `.vmt` said.
     /// Everything else about it delegates: same
     /// [`wgsl`](ShaderKind::wgsl), same [`vertex_layout`](ShaderKind::vertex_layout),
-    /// same [`lighting_binding`](ShaderKind::lighting_binding), same uniforms.
+    /// same [`context_binding`](ShaderKind::context_binding), same uniforms.
     WorldVertexTransition,
 
     /// Models: props, characters, gibs and debris. A base texture lit by an
@@ -135,29 +135,55 @@ pub enum ShaderKind {
     /// `portdocs/MATERIALSYSTEM.md` §7.8 that is not ported: they draw here
     /// without their specular. See [`wants_phong`].
     VertexLitGeneric,
+
+    /// Glass, and anything else that warps what is behind it: the screen-space
+    /// refraction shader. 37 of Portal 2's materials name it, 29 of them under
+    /// `materials/models/`.
+    ///
+    /// `stdshaders/refract.cpp` through `refract_dx9_helper.cpp`,
+    /// `Refract_vs20.fxc` and `refract_ps2x.fxc`.
+    ///
+    /// **It is the first shader in this port that reads the frame it is being
+    /// drawn into**, through a copy —
+    /// [`ContextBinding::FrameBufferCopy`] — and that is what makes it
+    /// structurally different from the four above rather than merely another
+    /// set of textures. See
+    /// [`needs_frame_buffer_copy`] for which materials actually want the copy
+    /// and which supply their own `$basetexture` instead.
+    Refract,
 }
 
 /// What a shader binds in group 3, if anything.
 ///
-/// Group 3 is "where this shader's lighting comes from", and the two answers
-/// so far are the two ways Source lights a surface: a page of the baked
-/// lightmap atlas for brushes, an ambient cube plus local lights for models.
-/// A pipeline layout is per shader, so a shader that reads neither declares no
-/// group 3 at all and its draws bind nothing there.
+/// Group 3 is **whichever piece of render-context state this shader reads** —
+/// state that belongs to neither the material nor the draw call, and that
+/// Valve likewise set on `IMatRenderContext` rather than on either
+/// (`BindLightmapPage`, `PI_SetVertexShaderAmbientLightCube`,
+/// `SetFrameBufferCopyTexture`). A pipeline layout is per shader, so a shader
+/// that reads none of it declares no group 3 at all and its draws bind nothing
+/// there.
+///
+/// The first two shapes were both *lighting* — a page of the baked lightmap
+/// atlas for brushes, an ambient cube plus local lights for models — which is
+/// why this was called `LightingBinding` until `Refract` arrived wanting a
+/// copy of the frame buffer in the same slot for the same reason.
 ///
 /// Groups 0, 1 and 2 are frequency groups shared by every shader
-/// ([`uniforms`](super::uniforms)); this one is the exception, and it is an
-/// exception Valve had too — `BindLightmapPage` and
-/// `PI_SetVertexShaderAmbientLightCube` are both render-context state that
-/// neither the material nor the draw call owns.
+/// ([`uniforms`](super::uniforms)); this one is the exception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LightingBinding {
+pub enum ContextBinding {
     /// A lightmap atlas page: a texture and its sampler.
     /// [`Pass::bind_lightmap_page`](super::context::Pass::bind_lightmap_page).
     LightmapPage,
     /// [`ModelLighting`](super::uniforms::ModelLighting), bound with a dynamic
     /// offset. [`Pass::set_model_lighting`](super::context::Pass::set_model_lighting).
     ModelLighting,
+    /// A readable copy of the scene drawn so far: a texture and its sampler.
+    /// `TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0`, pointed at by
+    /// `IMatRenderContext::SetFrameBufferCopyTexture`
+    /// (`cmatrendercontext.cpp:456`) and filled by
+    /// [`RenderContext::update_refract_texture`](super::context::RenderContext::update_refract_texture).
+    FrameBufferCopy,
 }
 
 impl ShaderKind {
@@ -183,6 +209,7 @@ impl ShaderKind {
                 Some(ShaderKind::WorldVertexTransition)
             }
             n if n.eq_ignore_ascii_case("VertexLitGeneric") => Some(ShaderKind::VertexLitGeneric),
+            n if n.eq_ignore_ascii_case("Refract") => Some(ShaderKind::Refract),
             _ => None,
         }
     }
@@ -194,6 +221,7 @@ impl ShaderKind {
             ShaderKind::LightmappedGeneric => "LightmappedGeneric",
             ShaderKind::WorldVertexTransition => "WorldVertexTransition",
             ShaderKind::VertexLitGeneric => "VertexLitGeneric",
+            ShaderKind::Refract => "Refract",
         }
     }
 
@@ -242,6 +270,20 @@ impl ShaderKind {
             // VERTEX_COLOR_STREAM_1, 1, {2}, userDataSize )`
             // (`vertexlitgeneric_dx9_helper.cpp:895`).
             ShaderKind::VertexLitGeneric => VertexLayout::Model,
+            // `Refract` genuinely declares two formats and the axis is
+            // `$model`: `VERTEX_POSITION | VERTEX_NORMAL` plus either
+            // `userDataSize = 4` (a model, the tangent in user data) or
+            // `VERTEX_TANGENT_S | VERTEX_TANGENT_T` (a brush surface)
+            // (`refract_dx9_helper.cpp:196`). **Pinned to the model form on a
+            // measurement**: 29 of the game's 37 `Refract` materials set
+            // `$model 1`, and all eight that do not are under
+            // `materials/particle/` — drawn by the particle system, which is
+            // not ported. **No brush face and no displacement in the shipped
+            // game names this shader**, so the world form has no content to
+            // draw. The day particles land, this is where the second layout
+            // arrives, and it will want a tangent on a `SimpleVertex` rather
+            // than the world one.
+            ShaderKind::Refract => VertexLayout::Model,
         }
     }
 
@@ -264,6 +306,7 @@ impl ShaderKind {
                 (LIGHTMAPPED_GENERIC_PARAMS, WORLD_VERTEX_TRANSITION_PARAMS)
             }
             ShaderKind::VertexLitGeneric => (VERTEX_LIT_GENERIC_PARAMS, &[]),
+            ShaderKind::Refract => (REFRACT_PARAMS, &[]),
         };
         STANDARD_PARAMS.iter().chain(own).chain(extra)
     }
@@ -278,14 +321,17 @@ impl ShaderKind {
     /// `IMatRenderContext::BindLightmapPage` applied to every shader whether it
     /// read one or not, and `PI_SetVertexShaderAmbientLightCube` was emitted
     /// only by the shaders that wanted it; here both decide a pipeline layout,
-    /// so both have to be answerable per shader. See [`LightingBinding`].
-    pub fn lighting_binding(self) -> Option<LightingBinding> {
+    /// so both have to be answerable per shader. See [`ContextBinding`].
+    pub fn context_binding(self) -> Option<ContextBinding> {
         match self {
             ShaderKind::UnlitGeneric => None,
             ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
-                Some(LightingBinding::LightmapPage)
+                Some(ContextBinding::LightmapPage)
             }
-            ShaderKind::VertexLitGeneric => Some(LightingBinding::ModelLighting),
+            ShaderKind::VertexLitGeneric => Some(ContextBinding::ModelLighting),
+            // Not lighting: `Refract` has none. What it reads out of the
+            // render context is the frame it is being drawn into.
+            ShaderKind::Refract => Some(ContextBinding::FrameBufferCopy),
         }
     }
 
@@ -308,6 +354,7 @@ impl ShaderKind {
                 include_str!("shaders/lightmappedgeneric.wgsl")
             }
             ShaderKind::VertexLitGeneric => include_str!("shaders/vertexlitgeneric.wgsl"),
+            ShaderKind::Refract => include_str!("shaders/refract.wgsl"),
         };
         format!("{}\n{}", include_str!("shaders/prelude.wgsl"), body)
     }
@@ -789,6 +836,133 @@ const VERTEX_LIT_GENERIC_PARAMS: &[ShaderParam] = &[
     },
 ];
 
+/// `Refract`'s own parameters (`stdshaders/refract.cpp:20`), restricted to the
+/// ones this port reads.
+///
+/// The declaration there has 31. Thirteen are left out rather than
+/// declared-and-ignored, because a table entry is a promise that setting the
+/// parameter does something — and each of the thirteen is either dead in the
+/// original or has no content in Portal 2 to verify against:
+///
+/// - **`$time` and `$fresnelreflection` are dead in Valve's own shader.**
+///   `$time` reaches `g_c5.w` and `SHADER_SPECIFIC_CONST_5`, and neither
+///   `refract_ps2x.fxc` nor `Refract_vs20.fxc` reads the register it lands in.
+///   `$fresnelreflection` is not written to any register at all — the file
+///   carries *"FIXME: doesn't support Fresnel!"* twice, once in `refract.cpp`
+///   and once in the helper, and the note is accurate.
+/// - **`$normalmap2`, `$bumpframe2` and `$bumptransform2`** drive the
+///   `SECONDARY_NORMAL` combo, which **no material in Portal 2 turns on** — and
+///   which is broken where it is implemented: the shader binds `$normalmap2` to
+///   sampler 1 and then samples *sampler 3*, the first normal map, with the
+///   second set of coordinates (`refract_ps2x.fxc:143`).
+/// - **`$masked`** needs a blend mode (`ONE_MINUS_SRC_ALPHA`, `SRC_ALPHA`) that
+///   [`BlendMode`] does not have, for **zero** materials.
+/// - **`$magnifyenable`, `$magnifycenter`, `$magnifyscale`** — zero materials.
+/// - **`$noviewportfixup` and `$mirroraboutviewportedges`** are split-screen
+///   console code: the viewport fixup is inside `#if defined( _X360 ) ||
+///   defined( _PS3 )` in the vertex shader and `bMirrorAboutViewportEdges` is
+///   `IsX360() && ...` in the helper, so both are false on this port's only
+///   platform.
+/// - **`$refracttintextureframe` and `$envmapframe`** are animated-texture
+///   frame indices, which the texture path does not select between yet — the
+///   same gap `$frame` and `$bumpframe` sit in.
+///
+/// `$color` and `$alpha` are `SHADER_PARAM_OVERRIDE`n here to say *"unused"*,
+/// and they are: the shader never reads `cModulationColor`. `$alpha` is still
+/// read by the shadow phase, because `IsAlphaModulating` is what it always was.
+const REFRACT_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$refractamount",
+        kind: ParamKind::Float,
+        declared_default: "2",
+        help: "",
+    },
+    ShaderParam {
+        name: "$refracttint",
+        kind: ParamKind::Color,
+        declared_default: "[1 1 1]",
+        help: "refraction tint",
+    },
+    ShaderParam {
+        name: "$normalmap",
+        kind: ParamKind::Texture,
+        declared_default: "models/shadertest/shader1_normal",
+        help: "normal map",
+    },
+    ShaderParam {
+        name: "$bumpframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $normalmap",
+    },
+    ShaderParam {
+        name: "$bumptransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "$normalmap texcoord transform",
+    },
+    ShaderParam {
+        name: "$bluramount",
+        kind: ParamKind::Integer,
+        declared_default: "1",
+        help: "0, 1, or 2 for how much blur you want",
+    },
+    ShaderParam {
+        name: "$fadeoutonsilhouette",
+        kind: ParamKind::Bool,
+        declared_default: "1",
+        help: "0 for no fade out on silhouette, 1 for fade out on sillhouette",
+    },
+    ShaderParam {
+        name: "$envmap",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/shadertest_env",
+        help: "envmap",
+    },
+    ShaderParam {
+        name: "$envmaptint",
+        kind: ParamKind::Color,
+        declared_default: "[1 1 1]",
+        help: "envmap tint",
+    },
+    ShaderParam {
+        name: "$envmapcontrast",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "contrast 0 == normal 1 == color*color",
+    },
+    ShaderParam {
+        name: "$envmapsaturation",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "saturation 0 == greyscale 1 == normal",
+    },
+    ShaderParam {
+        name: "$refracttinttexture",
+        kind: ParamKind::Texture,
+        declared_default: "models/shadertest/shield",
+        help: "",
+    },
+    ShaderParam {
+        name: "$nowritez",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "0 == write z, 1 = no write z",
+    },
+    ShaderParam {
+        name: "$localrefract",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "",
+    },
+    ShaderParam {
+        name: "$localrefractdepth",
+        kind: ParamKind::Float,
+        declared_default: "0",
+        help: "",
+    },
+];
+
 /// The value of a parameter, or the default an undefined one takes.
 ///
 /// `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:838`) in one
@@ -871,6 +1045,12 @@ pub const BINDING_BUMP2_SAMPLER: u32 = 16;
 pub const BINDING_BLEND_MODULATE_TEXTURE: u32 = 17;
 pub const BINDING_BLEND_MODULATE_SAMPLER: u32 = 18;
 
+/// `Refract`'s `$refracttinttexture` — `RefractTintSampler`, sampler 5
+/// (`refract_ps2x.fxc:47`). A tint *per texel* of the surface rather than the
+/// single `$refracttint` colour, which is how a pane of glass gets dirt on it.
+pub const BINDING_REFRACT_TINT_TEXTURE: u32 = 19;
+pub const BINDING_REFRACT_TINT_SAMPLER: u32 = 20;
+
 /// Where the lightmap page is bound, in group **3**.
 ///
 /// Not in the material's group, and that is structural rather than a
@@ -884,6 +1064,22 @@ pub const BINDING_BLEND_MODULATE_SAMPLER: u32 = 18;
 /// a fourth bind group, which group 3 is free for until skinning lands.
 pub const BINDING_LIGHTMAP_TEXTURE: u32 = 0;
 pub const BINDING_LIGHTMAP_SAMPLER: u32 = 1;
+
+/// Where the readable copy of the scene is bound, also in group **3**.
+///
+/// The same two binding numbers as the lightmap page, and not a clash: group 3
+/// has a *different layout per [`ContextBinding`]*, and a pipeline only ever
+/// declares one of them. `RefractSampler`, sampler 2 in the original
+/// (`refract_ps2x.fxc:38`), fed by
+/// `BindStandardTexture( SHADER_SAMPLER2, ..., TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0 )`
+/// (`refract_dx9_helper.cpp:287`).
+///
+/// **Only reached when the material defines no `$basetexture`.** A `Refract`
+/// material that names one binds *that* as the image to warp — see
+/// [`RefractFlags::BASE_TEXTURE`] — which is the whole reason six of Portal 2's
+/// `$localrefract` glass materials need no frame-buffer copy at all.
+pub const BINDING_REFRACT_SOURCE_TEXTURE: u32 = 0;
+pub const BINDING_REFRACT_SOURCE_SAMPLER: u32 = 1;
 
 /// A texture a material of this kind needs, and how to read it.
 #[derive(Debug, Clone, Copy)]
@@ -1090,6 +1286,79 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
                 dimension: TextureDimension::Cube,
             },
         ],
+        // `InitRefract_DX9` (`refract_dx9_helper.cpp:99`), which is four
+        // `Load*` calls with their flags spelled out. Two of them differ from
+        // the shader above in a way worth noticing:
+        //
+        // - **`$envmap` is `TEXTUREFLAGS_SRGB` unconditionally** here, where
+        //   `VertexLitGeneric` makes it conditional on `GetHDRType()`. The
+        //   shadow phase agrees — `EnableSRGBRead( SHADER_SAMPLER4, true )`
+        //   with no branch (`:172`) — so a `Refract` cube map is colour and a
+        //   `VertexLitGeneric` one, in an HDR game, is not. Valve's asymmetry,
+        //   and reproducing it is free.
+        // - **`$refracttinttexture` is colour**, unlike every other mask-shaped
+        //   texture in the set: it is multiplied straight into the refracted
+        //   image (`2.0 * g_RefractTint * tex2D(...).rgb`), so it wants the
+        //   sRGB decode the artist authored it against.
+        ShaderKind::Refract => vec![
+            // **The image being warped, when the material supplies its own.**
+            // `BindTexture( SHADER_SAMPLER2, SRGBREAD, m_nBaseTexture, m_nFrame )`
+            // (`refract_dx9_helper.cpp:275`) — the *same sampler* the
+            // frame-buffer copy would otherwise occupy.
+            TextureRequest {
+                param: "$basetexture",
+                binding: BINDING_BASE_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            // `LoadBumpMap`. This is the whole shader: its `xy` is the
+            // screen-space offset and its `a` scales it.
+            TextureRequest {
+                param: "$normalmap",
+                binding: BINDING_BUMP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$refracttinttexture",
+                binding: BINDING_REFRACT_TINT_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$envmap",
+                binding: BINDING_ENVMAP_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::Cube,
+            },
+        ],
+    }
+}
+
+/// Whether a material wants a readable copy of the scene drawn so far.
+///
+/// `MATERIAL_VAR2_NEEDS_POWER_OF_TWO_FRAME_BUFFER_TEXTURE`, which
+/// `InitParamsRefract_DX9` sets — together with `MATERIAL_VAR_TRANSLUCENT` —
+/// for every `Refract` material **except** the `$localrefract` ones
+/// (`refract_dx9_helper.cpp:88`, over the comment *"Local refract doesn't need
+/// a copy of the frame buffer and doesn't require the translucent flag"*).
+///
+/// It reaches the renderer as `ERENDERFLAGS_NEEDS_POWER_OF_TWO_FB`, which is
+/// what makes `CRendering3dView::DrawTranslucentRenderables` call
+/// `UpdateRefractTexture()` before drawing a renderable
+/// (`game/client/viewrender.cpp:6195`). Here it decides the same thing one
+/// step coarser — see
+/// [`World::draw_refracting`](crate::engine::world::World::draw_refracting).
+///
+/// Measured: **6 of Portal 2's 37 `Refract` materials set `$localrefract`**, and
+/// all six of those also supply a `$basetexture` for the shader to warp
+/// instead. So the answer is never "wants no copy and reads one anyway".
+pub fn needs_frame_buffer_copy(kind: ShaderKind, vmt: &Vmt) -> bool {
+    match kind {
+        ShaderKind::Refract => {
+            !param_value(kind, vmt, "$localrefract").is_some_and(|var| var.as_bool())
+        }
+        _ => false,
     }
 }
 
@@ -1301,7 +1570,11 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         // `MATERIAL_VAR2_LIGHTING_VERTEX_LIT` (`vertexlitgeneric_dx9_helper.cpp:202`),
         // which `RegisterLightmappedSurface` treats as "no lightmap": a model
         // carries its baked light in its vertices, not in the atlas.
-        ShaderKind::UnlitGeneric | ShaderKind::VertexLitGeneric => Lighting::None,
+        // `Refract` sets neither lighting flag — it is not lit at all, and its
+        // colour comes from the frame behind it plus an environment map.
+        ShaderKind::UnlitGeneric | ShaderKind::VertexLitGeneric | ShaderKind::Refract => {
+            Lighting::None
+        }
         ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -1722,6 +1995,268 @@ pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms {
     }
 }
 
+/// Flags in [`RefractUniforms::flags`]. Bucket 2 of `Refract`'s combo split —
+/// see [`refract_uniforms`] for the whole bucketing.
+#[allow(dead_code)]
+pub struct RefractFlags;
+
+impl RefractFlags {
+    /// `SHADER_FOGMODE_DISABLED`. Set by `$nofog`; `DefaultFog()` otherwise.
+    pub const NO_FOG: u32 = 1 << 0;
+    /// **The material supplies the image to warp itself**, as `$basetexture`,
+    /// rather than reading the frame-buffer copy in group 3. Valve's
+    /// `if ( params[BASETEXTURE]->IsTexture() )` at
+    /// `refract_dx9_helper.cpp:273`, which picks between
+    /// `BindTexture( SHADER_SAMPLER2, ..., m_nBaseTexture )` and
+    /// `BindStandardTexture( SHADER_SAMPLER2, ..., TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0 )`
+    /// — one sampler, two sources. 7 of the game's 37 materials take the first
+    /// branch. See [`needs_frame_buffer_copy`].
+    pub const BASE_TEXTURE: u32 = 1 << 1;
+    /// `CUBEMAP`: the material has a usable `$envmap`.
+    pub const ENVMAP: u32 = 1 << 2;
+    /// `REFRACTTINTTEXTURE`: `$refracttinttexture` tints the refraction per
+    /// texel instead of `$refracttint` tinting it uniformly.
+    pub const REFRACT_TINT_TEXTURE: u32 = 1 << 3;
+    /// `BLUR`, which is an `0..1` axis rather than a count — see
+    /// [`refract_uniforms`] on why `$bluramount 2` is unreachable. Takes the
+    /// four-tap polyphase kernel that stands in for a 3x3 box blur.
+    pub const BLUR: u32 = 1 << 4;
+    /// `FADEOUTONSILHOUETTE`: the warp fades out where the surface turns away
+    /// from the eye, leaving the unwarped image at the silhouette.
+    pub const FADE_OUT_ON_SILHOUETTE: u32 = 1 << 5;
+    /// `LOCALREFRACT`: refract *within* the material's own texture instead of
+    /// across the screen. **Replaces the result the blur path computed**
+    /// rather than adding to it — see [`refract_uniforms`].
+    pub const LOCAL_REFRACT: u32 = 1 << 6;
+}
+
+/// `Refract`'s material block — group 1, binding 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RefractUniforms {
+    /// `$bumptransform`, two rows dotted against `(u, v, 0, 1)` —
+    /// `cBumpTexCoordTransform[0..1]`, VS `SHADER_SPECIFIC_CONST_1`. It is the
+    /// *only* texture transform this shader has: `$basetexture`,
+    /// `$refracttinttexture` and the local-refract lookups all use the same
+    /// coordinate (`refract_ps2x.fxc:151,283`), because the base texture here
+    /// is an image being warped rather than a surface texture.
+    pub bump_transform: [[f32; 4]; 2],
+    /// `g_RefractTint`, PS `c1`, **gamma-decoded on the CPU** — see
+    /// [`gamma_to_linear_param`]. `w` is unused.
+    pub refract_tint: [f32; 4],
+    /// `g_EnvmapTint` (PS `c0`, also gamma-decoded) in `rgb`, and
+    /// `g_EnvmapContrast` (PS `c2`) in `w`.
+    pub envmap_tint: [f32; 4],
+    /// The four loose scalars, in the order the original's registers hold
+    /// them: `g_RefractScale` (`$refractamount`, PS `c5.x`),
+    /// `g_EnvmapSaturation` (PS `c3`), `g_vRefractTextureAspectFixup.x`
+    /// (PS `c7.x`) and `g_flRefractDepth` (`$localrefractdepth`, PS `c7.z`).
+    pub refract_params: [f32; 4],
+    /// [`RefractFlags`].
+    pub flags: u32,
+    pub _padding: [u32; 3],
+}
+
+/// Builds the material block for a `Refract` `.vmt`.
+///
+/// # The combo bucketing
+///
+/// `portdocs/MATERIALSYSTEM.md` §7.3 asks for every `STATIC`/`DYNAMIC` axis to
+/// be sorted into one of three buckets and the result written down. `Refract`
+/// declares 2 vertex axes and 13 pixel axes across `Refract_vs20.fxc` and
+/// `refract_ps2x.fxc`:
+///
+/// **Bucket 1 — pinned, axis deleted.** `SKINNING` and `COMPRESSED_VERTS` (no
+/// skinning yet, and `ModelVertex` is unpacked); `MODEL`, pinned to 1 —
+/// see [`ShaderKind::vertex_layout`]; `SHADER_SRGB_READ`, which is
+/// `IsOSX() && ( FakeSRGBWrite() || !CanDoSRGBReadFromRTs() )`, both false for
+/// `wgpu`; `MIRRORABOUTVIEWPORTEDGES`, guarded by `IsX360()`;
+/// `WRITE_DEPTH_TO_DESTALPHA` and `D_NVIDIA_STEREO`, neither of which has a
+/// counterpart here; and four axes pinned **on a content measurement** rather
+/// than on a capability — `SECONDARY_NORMAL`, `MASKED`, `MAGNIFY` and
+/// `COLORMODULATE`, which **no Portal 2 material turns on**. The last of those
+/// is the only one worth a second look: `$vertexcolormodulate` is set by eight
+/// materials, all of them under `materials/particle/`, and a particle is not a
+/// static prop — the vertex colour a `ModelVertex` carries is `vrad`'s baked
+/// light, not a modulation, so reading it here would tint glass by the lighting
+/// of whatever mesh it was welded to.
+///
+/// **Bucket 2 — a uniform branch**, all of it in [`RefractFlags`]: `CUBEMAP`,
+/// `REFRACTTINTTEXTURE`, `LOCALREFRACT`, `FADEOUTONSILHOUETTE`, `BLUR`, the
+/// fog mode, and the base-texture-versus-frame-buffer choice that was not a
+/// combo at all but a `BindTexture`/`BindStandardTexture` fork.
+///
+/// **Bucket 3 — a real pipeline variant.** Everything in [`RenderState`]; see
+/// [`render_state`], which has its own arm for this shader because `Refract`
+/// decides blending from the **normal map** rather than from the base texture.
+///
+/// # `$bluramount` is a 0-or-1 axis, and the reason is an integer cast
+///
+/// `BLUR` is declared `"0..1"`, the helper clamps to `MAXBLUR` of 1, and the
+/// `BLUR > 1` branch in the pixel shader is therefore unreachable. What decides
+/// which side a material lands on is that `$bluramount` is declared
+/// `SHADER_PARAM_TYPE_INTEGER` and read with `GetIntValue()`, which
+/// **truncates**: the 16 Portal 2 materials that write `$bluramount ".3"` and
+/// the two that write `".25"` all mean 0. Measured over the game: 11 materials
+/// get the blur, 26 do not.
+///
+/// # `$localrefract` overwrites the blur, it does not blend with it
+///
+/// `refract_ps2x.fxc`'s `#if ( LOCALREFRACT )` block assigns `vResult.rgb`
+/// outright (`:295`), after the `BLUR` block above it has already assigned it.
+/// So a material with both — and all six `$localrefract` materials in the game
+/// set `$bluramount 1` — computes the four-tap blur and throws it away. That is
+/// Valve's, it is what the six shipped glass materials look like, and the
+/// branch order here is the same so that they keep looking like it.
+pub fn refract_uniforms(vmt: &Vmt, textures: ResolvedTextures) -> RefractUniforms {
+    let kind = ShaderKind::Refract;
+    let value = |name| param_value(kind, vmt, name);
+    let defined = |name| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+
+    let bump = value("$bumptransform")
+        .map(|var| var.as_matrix())
+        .unwrap_or(super::var::IDENTITY);
+
+    let has_envmap = envmap_name(vmt).is_some();
+
+    let mut flags = 0;
+    if vmt.flags.contains(MaterialFlags::NOFOG) {
+        flags |= RefractFlags::NO_FOG;
+    }
+    if defined("$basetexture") {
+        flags |= RefractFlags::BASE_TEXTURE;
+    }
+    if has_envmap {
+        flags |= RefractFlags::ENVMAP;
+    }
+    if defined("$refracttinttexture") {
+        flags |= RefractFlags::REFRACT_TINT_TEXTURE;
+    }
+    // `GetIntValue()`, clamped to `MAXBLUR` — see the note above on why this is
+    // a flag and not a number.
+    if value("$bluramount").is_some_and(|var| var.as_i32() >= 1) {
+        flags |= RefractFlags::BLUR;
+    }
+    if value("$fadeoutonsilhouette").is_some_and(|var| var.as_bool()) {
+        flags |= RefractFlags::FADE_OUT_ON_SILHOUETTE;
+    }
+    if value("$localrefract").is_some_and(|var| var.as_bool()) {
+        flags |= RefractFlags::LOCAL_REFRACT;
+    }
+
+    // `float c7[4] = { float(nHeight / nWidth), 1.0f, ... }`
+    // (`refract_dx9_helper.cpp:283`) — and `nHeight` and `nWidth` are `int`s,
+    // so **that division is integer division** and the "aspect fixup" is a
+    // whole number. It is not a rounding slip that happens to be harmless:
+    // `glass/refract_light_color` is 128x512, so the five glass materials that
+    // name it get 4, while `glass/refract_light_color_container` is square and
+    // gets 1 — and a *wider*-than-tall source would get **0** and lose the
+    // local refraction's horizontal offset entirely. Reproduced, because it is
+    // what the shipped glass looks like.
+    //
+    // Taken from the resolved `$basetexture` rather than from the frame-buffer
+    // copy, which is the other thing the original measures here. The two agree
+    // wherever the number is read: `g_vRefractTextureAspectFixup` is used only
+    // by the `LOCALREFRACT` branch, and all six `$localrefract` materials in
+    // the game define a `$basetexture`. A `$localrefract` material without one
+    // would want this per *frame*, from the window size.
+    let aspect_fixup = textures
+        .base
+        .map(|facts| (facts.height / facts.width.max(1)) as f32)
+        .unwrap_or(1.0);
+
+    // `SetPixelShaderConstantGammaToLinear( 0, ENVMAPTINT )` and `( 1,
+    // REFRACTTINT )` (`refract_dx9_helper.cpp:334`). Both are decoded on the
+    // CPU, unlike `LightmappedGeneric`'s tints, so the shader receives linear
+    // numbers and multiplies them into an already-linear texture sample.
+    let envmap_tint = gamma_to_linear_param(init_vec(vmt, "$envmaptint", [1.0, 1.0, 1.0, 0.0]));
+    let refract_tint = gamma_to_linear_param(init_vec(vmt, "$refracttint", [1.0, 1.0, 1.0, 0.0]));
+
+    RefractUniforms {
+        bump_transform: [bump[0], bump[1]],
+        refract_tint,
+        envmap_tint: [
+            envmap_tint[0],
+            envmap_tint[1],
+            envmap_tint[2],
+            // `InitParamsRefract_DX9` writes 0 for an undefined
+            // `$envmapcontrast` and 1 for an undefined `$envmapsaturation`,
+            // which is the `SHADER_INIT_PARAMS` mechanism rather than the
+            // type's — hence `init_float` and not `param_value`.
+            init_float(vmt, "$envmapcontrast", 0.0),
+        ],
+        refract_params: [
+            // `$refractamount` has no `SHADER_INIT_PARAMS` default, so an
+            // undefined one really is 0 and the material does not warp — which
+            // is why this is `param_value` (the type default, also 0) rather
+            // than `init_float`. Every one of the game's 37 materials sets it,
+            // one of them only through a conditional key:
+            // `hud/camera_viewfinder_ul` writes `!sonyps3?$refractamount` and
+            // would read 0 if `Vmt` did not resolve those.
+            value("$refractamount")
+                .map(|var| var.as_f32())
+                .unwrap_or(0.0),
+            init_float(vmt, "$envmapsaturation", 1.0),
+            aspect_fixup,
+            // 0.05 in `InitParamsRefract_DX9`, against the declared default of
+            // 0 — the two disagree and the code wins.
+            init_float(vmt, "$localrefractdepth", 0.05),
+        ],
+        flags,
+        _padding: [0; 3],
+    }
+}
+
+/// `GammaToLinear` applied to a colour parameter's `rgb`, leaving `w` alone.
+///
+/// `CBaseVSShader::SetPixelShaderConstantGammaToLinear` (`BaseVSShader.cpp:138`)
+/// and the mathlib function under it (`mathlib/color_conversion.cpp:276`). It
+/// is not simply `pow( x, 2.2 )`, and all three of the differences are
+/// load-bearing for a shipped Portal 2 material:
+///
+/// - **A component above 1 is passed through untouched**, which is the shader
+///   helper's own `val > 1.0f ? val : GammaToLinear( val )`. That is what lets
+///   content over-drive a tint past white.
+/// - **A component at or above 0.95 becomes exactly 1.** `$refracttint
+///   "{235 247 247}"` on sixteen `props_destruction` glass materials is
+///   `[0.922 0.969 0.969]`, so two of its three channels clamp to 1 and only
+///   the red is decoded — the tint the glass actually shows is
+///   `[0.835 1 1]`, not `[0.835 0.933 0.933]`.
+/// - **It is a 256-entry lookup table**, so the input is quantized to
+///   `round( x * 255 ) / 255` first.
+///
+/// Note what does *not* use this: `VertexLitGeneric`'s `$envmaptint`, which
+/// Valve decodes with `GammaToLinearFullRange` — the plain power, no table, no
+/// clamp — through `SetEnvMapTintPixelShaderDynamicStateGammaToLinear`
+/// (`public/shaderlib/commandbuilder.h:564`), and which
+/// [`vertex_lit_uniforms`] does not decode at all. That is a live gap in that
+/// shader rather than a decision, and fixing it changes every reflective prop
+/// in the game, so it is recorded here and left for its own change.
+fn gamma_to_linear_param(gamma: [f32; 4]) -> [f32; 4] {
+    let convert = |value: f32| {
+        if value > 1.0 {
+            return value;
+        }
+        if value < 0.0 {
+            return 0.0;
+        }
+        if value >= 0.95 {
+            return 1.0;
+        }
+        ((value * 255.0).round() / 255.0).powf(2.2)
+    };
+    [
+        convert(gamma[0]),
+        convert(gamma[1]),
+        convert(gamma[2]),
+        gamma[3],
+    ]
+}
+
 /// The `.vtf` a `$envmap` names, if it names one this port can load.
 ///
 /// **`env_cubemap` is not a texture name**, and that is the finding this
@@ -1790,6 +2325,55 @@ pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4] {
     ]
 }
 
+/// The two things the shadow phase asks a texture that is already loaded.
+///
+/// Not the texture itself, deliberately: what `TextureIsTranslucent` and
+/// `GetActualWidth`/`GetActualHeight` want is two facts, and taking them as
+/// facts is what keeps this module's tests runnable without a GPU — a
+/// [`Texture`] cannot exist without a `wgpu::Device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureFacts {
+    /// `ITexture::GetActualWidth`.
+    pub width: u32,
+    /// `ITexture::GetActualHeight`.
+    pub height: u32,
+    /// `ITexture::IsTranslucent` — whether the `.vtf` claims an alpha channel.
+    pub translucent: bool,
+}
+
+impl TextureFacts {
+    pub fn of(texture: &Texture) -> TextureFacts {
+        TextureFacts {
+            width: texture.width,
+            height: texture.height,
+            translucent: texture.is_translucent(),
+        }
+    }
+}
+
+/// The textures the shadow phase has to have already resolved.
+///
+/// The shadow phase cannot decide blending from the `.vmt` alone — Valve's
+/// `TextureIsTranslucent` asks a loaded `ITexture` whether it has an alpha
+/// channel — so [`render_state`] takes the answers as a parameter. It is a
+/// struct with two fields rather than one, because **different shaders ask
+/// about different textures**: everything derived from the shared
+/// `UnlitGeneric`/`VertexLitGeneric` helper asks about `$basetexture`, and
+/// `Refract` asks about `$normalmap`.
+///
+/// [`Material::new`](super::material::Material::new) fills whichever fields
+/// the shader's [`texture_requests`] produced; a field left `None` reads as
+/// "opaque", which is the same answer the standard white texture and the error
+/// checkerboard give, since neither is created with an alpha flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolvedTextures {
+    /// `$basetexture`.
+    pub base: Option<TextureFacts>,
+    /// `$normalmap` — `Refract`'s, and the one whose alpha decides its
+    /// blending.
+    pub normal_map: Option<TextureFacts>,
+}
+
 /// The shadow phase: the pipeline state a material asks for.
 ///
 /// Two layers of the original, in order:
@@ -1813,7 +2397,7 @@ pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4] {
 /// `$alpha` alone, because there is no render context to override it yet; when
 /// there is, this becomes an argument and [`RenderState`] stays exactly as it
 /// is — the pipeline cache already keys on it.
-pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>) -> RenderState {
+pub fn render_state(kind: ShaderKind, vmt: &Vmt, textures: ResolvedTextures) -> RenderState {
     let flags = vmt.flags;
     let mut state = RenderState::default();
 
@@ -1842,12 +2426,18 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
     // wireframe material draws solid. The debug shaders that wanted this
     // (`debugwireframe`, `wireframe.cpp`) are not in §7.8's target set.
 
+    // `Refract` diverges from here on, so it returns rather than falling
+    // through: see [`refract_render_state`].
+    if kind == ShaderKind::Refract {
+        return refract_render_state(vmt, textures, state);
+    }
+
     // --- EvaluateBlendRequirements ---------------------------------------
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
     let alpha_modulating = param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
     let translucent = alpha_modulating
         || flags.contains(MaterialFlags::VERTEXALPHA)
-        || (base_texture_is_translucent(vmt, base_texture) && !alpha_test);
+        || (base_texture_is_translucent(vmt, textures.base) && !alpha_test);
 
     state.blend = if flags.contains(MaterialFlags::ADDITIVE) {
         if translucent {
@@ -1906,6 +2496,97 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
     state
 }
 
+/// `Refract`'s half of the shadow phase, after
+/// `SetInitialShadowState` has run.
+///
+/// `DrawRefract_DX9`'s `SHADOW_STATE` block (`refract_dx9_helper.cpp:141`).
+/// Three things in it are unlike every other shader in the set, and the first
+/// two are why this is a separate function rather than two more `if`s in
+/// [`render_state`]:
+///
+/// 1. **Blending is decided from the `$normalmap`, not the `$basetexture`** —
+///    `SetDefaultBlendingShadowState( info.m_nNormalMap, false )` — because
+///    the base texture here is an image being warped rather than the surface's
+///    own colour. And the `isBaseTexture` argument being `false` matters: it
+///    skips the whole `$selfillum`/`$basealphaenvmapmask`/`$translucent`
+///    reconciliation that [`base_texture_is_translucent`] does and asks the
+///    `.vtf` directly.
+/// 2. **It is only decided at all when the material has no `$envmap`**, so a
+///    reflective refractor gets `SetInitialShadowState`'s blending — which is
+///    *none*. Measured: **all 29 of the game's `$model 1` `Refract` materials
+///    name an `$envmap`**, so every piece of refracting glass in Portal 2
+///    draws opaque and the refraction it shows is the copy of the frame it
+///    sampled, not a blend with the frame it is writing. The ten that would
+///    blend are the `materials/particle/` warps, and the particle system is
+///    not ported.
+/// 3. **`EnableAlphaWrites( bFullyOpaque )` reads a blend type that was never
+///    applied.** `bFullyOpaque` comes from
+///    `EvaluateBlendRequirements( BASETEXTURE, true )` (`:136`) — the *base*
+///    texture, the test point 1 just said this shader does not use for
+///    blending — and is then narrowed by `$masked` and by whether the normal
+///    map is translucent. So the alpha write mask and the blend mode are
+///    computed from two different textures. Valve's, and reproduced: it is a
+///    write mask, and the only thing that reads the frame's alpha channel is
+///    the underwater pass, which is not ported.
+fn refract_render_state(
+    vmt: &Vmt,
+    textures: ResolvedTextures,
+    mut state: RenderState,
+) -> RenderState {
+    let kind = ShaderKind::Refract;
+    let flags = vmt.flags;
+    let defined = |name| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+
+    // `EnableDepthWrites( bWriteZ )`, where `bWriteZ` is `$nowritez == 0`.
+    // Zero of the game's 37 materials set it; it is one line and honest to
+    // read, so the parameter table can keep promising it does something.
+    if param_value(kind, vmt, "$nowritez").is_some_and(|var| var.as_bool()) {
+        state.depth_write = false;
+    }
+
+    // `TextureIsTranslucent( m_nNormalMap, false )` — the `.vtf`'s own answer,
+    // nothing else. Measured: `glass/refract_light_normal` is DXT1 with no
+    // alpha flag, so the six glass materials in `sp_a1_intro1` are *not*
+    // translucent by this test even though they are glass.
+    let normal_map_is_translucent = textures.normal_map.is_some_and(|facts| facts.translucent);
+    let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
+    let alpha_modulating = param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
+
+    if defined("$normalmap") && envmap_name(vmt).is_none() {
+        let translucent = alpha_modulating
+            || flags.contains(MaterialFlags::VERTEXALPHA)
+            || (normal_map_is_translucent && !alpha_test);
+        state.blend = if flags.contains(MaterialFlags::ADDITIVE) {
+            if translucent {
+                BlendMode::BlendAdd
+            } else {
+                BlendMode::Add
+            }
+        } else if translucent {
+            BlendMode::Blend
+        } else {
+            BlendMode::None
+        };
+        // `EnableAlphaBlending` turns depth writes off as well as blending on.
+        if state.blend != BlendMode::None {
+            state.depth_write = false;
+        }
+    }
+
+    // `bFullyOpaque`: the blend type the *base* texture would have asked for,
+    // narrowed twice. `$masked` is bucket 1 and therefore always false here.
+    let base_blend_translucent = alpha_modulating
+        || flags.contains(MaterialFlags::VERTEXALPHA)
+        || (base_texture_is_translucent(vmt, textures.base) && !alpha_test);
+    state.write_alpha = !base_blend_translucent && !alpha_test && !normal_map_is_translucent;
+
+    state
+}
+
 /// `CBaseShader::TextureIsTranslucent( BASETEXTURE, true )`
 /// (`shaderlib/BaseShader.cpp:605`).
 ///
@@ -1913,7 +2594,7 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, base_texture: Option<&Texture>)
 /// is *shared*, and three flags claim it for something other than translucency.
 /// If any of them does, the material is opaque no matter what the `.vtf`
 /// contains.
-fn base_texture_is_translucent(vmt: &Vmt, base_texture: Option<&Texture>) -> bool {
+fn base_texture_is_translucent(vmt: &Vmt, base_texture: Option<TextureFacts>) -> bool {
     // The original's first test is `GetType() == MATERIAL_VAR_TYPE_TEXTURE` —
     // "did the `.vmt` actually name one" — which has no counterpart here
     // because a material always ends up with *something* bound. It needs none:
@@ -1938,7 +2619,7 @@ fn base_texture_is_translucent(vmt: &Vmt, base_texture: Option<&Texture>) -> boo
     if !flags.contains(MaterialFlags::TRANSLUCENT) && !flags.contains(MaterialFlags::ALPHATEST) {
         return false;
     }
-    texture.is_translucent()
+    texture.translucent
 }
 
 #[cfg(test)]
@@ -1951,6 +2632,30 @@ mod tests {
         let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
         Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
     }
+
+    fn refract_vmt(body: &str) -> Vmt {
+        let text = format!("\"Refract\" {{ {body} }}");
+        let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
+        Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
+    }
+
+    /// `glass/container_window_warm`, the material three of `sp_a1_intro1`'s
+    /// static props wear, verbatim from the shipped file minus its `<dx90`
+    /// fallback block.
+    const CONTAINER_WINDOW_WARM: &str = r#"
+        "$model" "1"
+        "$refractamount" ".025"
+        "$bluramount" "1"
+        "$REFRACTTINT" "[1.0 .89 .81]"
+        "$normalmap" "glass/refract_light_normal"
+        "$localrefract" "1"
+        "$localrefractdepth" "0.025"
+        "$basetexture" "glass/refract_light_color_container"
+        "$envmap" "env_cubemap"
+        "$envmapcontrast" "0"
+        "$envmapsaturation" "[1 1 1]"
+        "$envmaptint" "[.4 .4 .4]"
+    "#;
 
     #[test]
     fn shader_names_resolve_case_insensitively() {
@@ -2043,7 +2748,11 @@ mod tests {
 
     #[test]
     fn the_default_state_is_opaque_depth_tested_and_culled() {
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(""), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(""),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.blend, BlendMode::None);
         assert!(state.depth_test && state.depth_write);
         assert_eq!(state.depth_func, DepthFunc::NearerOrEqual);
@@ -2056,16 +2765,32 @@ mod tests {
 
     #[test]
     fn flags_map_onto_fixed_pipeline_state() {
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$ignorez" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$ignorez" "1""#),
+            ResolvedTextures::default(),
+        );
         assert!(!state.depth_test && !state.depth_write);
 
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$nocull" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$nocull" "1""#),
+            ResolvedTextures::default(),
+        );
         assert!(!state.cull);
 
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$znearer" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$znearer" "1""#),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.depth_func, DepthFunc::Nearer);
 
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$decal" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$decal" "1""#),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.depth_bias, DepthBias::Decal);
         assert!(!state.depth_write, "a decal must not write depth");
     }
@@ -2074,25 +2799,37 @@ mod tests {
     fn alpha_modulation_alone_makes_a_material_translucent() {
         // No texture, no $translucent — just an alpha below one, which is what
         // `EvaluateBlendRequirements` checks first.
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$alpha" "0.5""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$alpha" "0.5""#),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.blend, BlendMode::Blend);
         assert!(!state.depth_write, "blending turns depth writes off");
         assert!(!state.write_alpha);
 
         // And exactly one is opaque.
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$alpha" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$alpha" "1""#),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.blend, BlendMode::None);
     }
 
     #[test]
     fn additive_and_multiply_pick_their_blend_modes() {
-        let state = render_state(ShaderKind::UnlitGeneric, &vmt(r#""$additive" "1""#), None);
+        let state = render_state(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$additive" "1""#),
+            ResolvedTextures::default(),
+        );
         assert_eq!(state.blend, BlendMode::Add);
 
         let state = render_state(
             ShaderKind::UnlitGeneric,
             &vmt(r#""$additive" "1" "$alpha" "0.5""#),
-            None,
+            ResolvedTextures::default(),
         );
         assert_eq!(state.blend, BlendMode::BlendAdd);
 
@@ -2100,7 +2837,7 @@ mod tests {
         let state = render_state(
             ShaderKind::UnlitGeneric,
             &vmt(r#""$multiply" "1" "$additive" "1""#),
-            None,
+            ResolvedTextures::default(),
         );
         assert_eq!(state.blend, BlendMode::Multiply);
         assert!(!state.depth_write);
@@ -2115,7 +2852,7 @@ mod tests {
         let state = render_state(
             ShaderKind::UnlitGeneric,
             &vmt(r#""$multiply" "1" "$alpha" "0.5""#),
-            None,
+            ResolvedTextures::default(),
         );
         assert_eq!(state.blend, BlendMode::Multiply);
         assert!(!state.write_alpha);
@@ -2126,7 +2863,7 @@ mod tests {
         let state = render_state(
             ShaderKind::UnlitGeneric,
             &vmt(r#""$translucent" "0" "$alphatest" "1""#),
-            None,
+            ResolvedTextures::default(),
         );
         assert_eq!(state.blend, BlendMode::None, "alpha test is not blending");
         assert!(
@@ -2369,13 +3106,13 @@ mod tests {
             (ShaderKind::UnlitGeneric, &unlit),
             (ShaderKind::VertexLitGeneric, &model),
         ] {
-            let state = render_state(kind, &parse(text, "m.vmt"), None);
+            let state = render_state(kind, &parse(text, "m.vmt"), ResolvedTextures::default());
             assert_eq!(state.blend, BlendMode::Multiply, "{}", kind.name());
         }
         let state = render_state(
             ShaderKind::LightmappedGeneric,
             &parse(&world, "w.vmt"),
-            None,
+            ResolvedTextures::default(),
         );
         assert_eq!(
             state.blend,
@@ -2444,13 +3181,339 @@ mod tests {
             Lighting::None
         );
         assert_eq!(
-            ShaderKind::VertexLitGeneric.lighting_binding(),
-            Some(LightingBinding::ModelLighting)
+            ShaderKind::VertexLitGeneric.context_binding(),
+            Some(ContextBinding::ModelLighting)
         );
         assert_eq!(
-            ShaderKind::LightmappedGeneric.lighting_binding(),
-            Some(LightingBinding::LightmapPage)
+            ShaderKind::LightmappedGeneric.context_binding(),
+            Some(ContextBinding::LightmapPage)
         );
-        assert_eq!(ShaderKind::UnlitGeneric.lighting_binding(), None);
+        assert_eq!(ShaderKind::UnlitGeneric.context_binding(), None);
+    }
+
+    #[test]
+    fn refract_is_a_shader_name_and_its_fallback_is_not() {
+        assert_eq!(ShaderKind::from_name("refract"), Some(ShaderKind::Refract));
+        assert_eq!(ShaderKind::from_name("Refract"), Some(ShaderKind::Refract));
+        // `DEFINE_FALLBACK_SHADER( Refract, Refract_DX90 )` — the fallback
+        // mechanism is deleted, so the name it selected is not a shader.
+        assert_eq!(ShaderKind::from_name("Refract_DX90"), None);
+        // Two separate §7.8 entries that are not this one.
+        assert_eq!(ShaderKind::from_name("Portal_Refract"), None);
+        assert_eq!(ShaderKind::from_name("EyeRefract"), None);
+    }
+
+    #[test]
+    fn refract_reads_the_frame_buffer_and_binds_no_lighting() {
+        let kind = ShaderKind::Refract;
+        // Group 3 is the copy of the scene, *not* a lighting shape: this
+        // shader has no diffuse term at all.
+        assert_eq!(
+            kind.context_binding(),
+            Some(ContextBinding::FrameBufferCopy)
+        );
+        assert_eq!(lighting(kind, &refract_vmt("")), Lighting::None);
+        assert!(!lighting(kind, &refract_vmt("")).needs_lightmap());
+        // A model layout, pinned: see `ShaderKind::vertex_layout`.
+        assert_eq!(kind.vertex_layout(), VertexLayout::Model);
+    }
+
+    #[test]
+    fn a_local_refract_material_needs_no_copy_of_the_frame_buffer() {
+        let kind = ShaderKind::Refract;
+        // `InitParamsRefract_DX9`: `$localrefract` is the whole test, and it
+        // is the one thing that decides which of the engine's two passes a
+        // refractor is drawn in.
+        assert!(!needs_frame_buffer_copy(
+            kind,
+            &refract_vmt(CONTAINER_WINDOW_WARM)
+        ));
+        assert!(needs_frame_buffer_copy(
+            kind,
+            &refract_vmt(r#""$normalmap" "n" "$envmap" "env_cubemap""#)
+        ));
+        // Nothing else in the set ever wants one.
+        assert!(!needs_frame_buffer_copy(
+            ShaderKind::VertexLitGeneric,
+            &vmt("")
+        ));
+        assert!(!needs_frame_buffer_copy(
+            ShaderKind::LightmappedGeneric,
+            &vmt("")
+        ));
+    }
+
+    #[test]
+    fn a_refract_material_with_a_base_texture_warps_that_instead() {
+        let uniforms = refract_uniforms(
+            &refract_vmt(CONTAINER_WINDOW_WARM),
+            ResolvedTextures::default(),
+        );
+        assert_ne!(
+            uniforms.flags & RefractFlags::BASE_TEXTURE,
+            0,
+            "the shader must sample group 1, not the frame-buffer copy"
+        );
+        // Without one, the flag is off and group 3 is the source.
+        let uniforms = refract_uniforms(
+            &refract_vmt(r#""$normalmap" "n""#),
+            ResolvedTextures::default(),
+        );
+        assert_eq!(uniforms.flags & RefractFlags::BASE_TEXTURE, 0);
+    }
+
+    #[test]
+    fn bluramount_is_an_integer_so_a_fraction_means_no_blur() {
+        let blur = |body: &str| {
+            refract_uniforms(&refract_vmt(body), ResolvedTextures::default()).flags
+                & RefractFlags::BLUR
+                != 0
+        };
+        // The 16 `props_destruction` glass materials that write ".3", and the
+        // two that write ".25", all mean 0 — `GetIntValue()` truncates.
+        assert!(!blur(r#""$bluramount" ".3""#));
+        assert!(!blur(r#""$bluramount" ".25""#));
+        assert!(!blur(r#""$bluramount" ".5""#));
+        assert!(!blur(r#""$bluramount" "0""#));
+        assert!(!blur(""), "InitParams writes 0 for an undefined one");
+        assert!(blur(r#""$bluramount" "1""#));
+        // `MAXBLUR` is 1, so the `BLUR > 1` branch of the pixel shader is
+        // unreachable and 2 is the same pipeline as 1.
+        assert!(blur(r#""$bluramount" "2""#));
+    }
+
+    #[test]
+    fn the_local_refract_aspect_fixup_is_integer_division() {
+        // `float( nHeight / nWidth )` with both operands `int`
+        // (`refract_dx9_helper.cpp:283`). `glass/refract_light_color` is
+        // 128x512 in the shipped game, so five glass materials get 4 — not
+        // 0.25, and not 4.0-by-accident.
+        let fixup = |width: u32, height: u32| {
+            refract_uniforms(
+                &refract_vmt(CONTAINER_WINDOW_WARM),
+                ResolvedTextures {
+                    base: Some(TextureFacts {
+                        width,
+                        height,
+                        translucent: true,
+                    }),
+                    normal_map: None,
+                },
+            )
+            .refract_params[2]
+        };
+        assert_eq!(fixup(128, 512), 4.0, "glass/refract_light_color");
+        assert_eq!(fixup(128, 128), 1.0, "glass/refract_light_color_container");
+        // The case that loses the horizontal offset entirely. No shipped
+        // `$localrefract` material is wider than it is tall; this pins the
+        // behaviour so nobody "fixes" the cast.
+        assert_eq!(fixup(512, 128), 0.0, "a wider-than-tall source truncates");
+    }
+
+    #[test]
+    fn a_colour_parameter_is_gamma_decoded_the_way_the_shader_helper_decodes_it() {
+        // `val > 1 ? val : GammaToLinear( val )`, and `GammaToLinear` is a
+        // 256-entry table that returns 1 for anything at or above 0.95.
+        let decoded = gamma_to_linear_param([0.4, 0.96, 1.5, 0.25]);
+        assert!((decoded[0] - 0.4f32.powf(2.2)).abs() < 1e-4, "{decoded:?}");
+        assert_eq!(decoded[1], 1.0, "0.95 and up clamps to white");
+        assert_eq!(decoded[2], 1.5, "above 1 passes through, un-decoded");
+        assert_eq!(decoded[3], 0.25, "w is left alone");
+        assert_eq!(gamma_to_linear_param([-1.0; 4])[0], 0.0);
+
+        // `$refracttint "{235 247 247}"`, which sixteen shipped materials
+        // write: braces divide by 255, and then two of the three channels are
+        // over the clamp.
+        let uniforms = refract_uniforms(
+            &refract_vmt(r#""$refracttint" "{235 247 247}""#),
+            ResolvedTextures::default(),
+        );
+        assert!((uniforms.refract_tint[0] - (235.0f32 / 255.0).powf(2.2)).abs() < 1e-4);
+        assert_eq!(uniforms.refract_tint[1], 1.0);
+        assert_eq!(uniforms.refract_tint[2], 1.0);
+    }
+
+    #[test]
+    fn refract_takes_its_defaults_from_init_params_and_not_from_the_type() {
+        // `InitParamsRefract_DX9` writes real values for four of these, and
+        // `$localrefractdepth`'s differs from the declared default of 0.
+        let uniforms = refract_uniforms(&refract_vmt(""), ResolvedTextures::default());
+        assert_eq!(uniforms.envmap_tint[..3], [1.0, 1.0, 1.0], "white");
+        assert_eq!(uniforms.envmap_tint[3], 0.0, "$envmapcontrast");
+        assert_eq!(uniforms.refract_params[1], 1.0, "$envmapsaturation");
+        assert_eq!(uniforms.refract_params[3], 0.05, "$localrefractdepth");
+        // And one that has no `SHADER_INIT_PARAMS` default, so 0 is right.
+        assert_eq!(uniforms.refract_params[0], 0.0, "$refractamount");
+    }
+
+    #[test]
+    fn refract_blends_from_its_normal_map_and_only_without_an_envmap() {
+        let normal = |translucent| {
+            Some(TextureFacts {
+                width: 128,
+                height: 512,
+                translucent,
+            })
+        };
+
+        // `SetDefaultBlendingShadowState( m_nNormalMap, false )` is guarded by
+        // `!bHasEnvmap`. Every `$model 1` material in the game has an envmap,
+        // so every piece of glass in Portal 2 draws with no blending at all.
+        let state = render_state(
+            ShaderKind::Refract,
+            &refract_vmt(r#""$normalmap" "n" "$envmap" "metal/foo""#),
+            ResolvedTextures {
+                base: None,
+                normal_map: normal(true),
+            },
+        );
+        assert_eq!(
+            state.blend,
+            BlendMode::None,
+            "an envmap suppresses the blending decision entirely"
+        );
+        assert!(state.depth_write);
+
+        // Without one, a normal map with an alpha channel blends.
+        let state = render_state(
+            ShaderKind::Refract,
+            &refract_vmt(r#""$normalmap" "n""#),
+            ResolvedTextures {
+                base: None,
+                normal_map: normal(true),
+            },
+        );
+        assert_eq!(state.blend, BlendMode::Blend);
+        assert!(
+            !state.depth_write,
+            "EnableAlphaBlending turns these off too"
+        );
+        assert!(!state.write_alpha, "a translucent normal map is not opaque");
+
+        // And one without an alpha channel does not — which is the shipped
+        // case: `glass/refract_light_normal` is DXT1.
+        let state = render_state(
+            ShaderKind::Refract,
+            &refract_vmt(r#""$normalmap" "n""#),
+            ResolvedTextures {
+                base: None,
+                normal_map: normal(false),
+            },
+        );
+        assert_eq!(state.blend, BlendMode::None);
+        assert!(state.write_alpha);
+    }
+
+    #[test]
+    fn refract_writes_z_unless_the_material_says_not_to() {
+        let state = |body: &str| {
+            render_state(
+                ShaderKind::Refract,
+                &refract_vmt(body),
+                ResolvedTextures::default(),
+            )
+        };
+        assert!(state(r#""$normalmap" "n""#).depth_write);
+        assert!(!state(r#""$normalmap" "n" "$nowritez" "1""#).depth_write);
+        // `SetInitialShadowState` still applies to this shader.
+        assert!(!state(r#""$nocull" "1""#).cull);
+        assert!(!state(r#""$ignorez" "1""#).depth_test);
+    }
+
+    #[test]
+    fn refract_declares_the_textures_it_samples_and_no_others() {
+        let requests = texture_requests(ShaderKind::Refract, &refract_vmt(""));
+        let by_param = |param: &str| requests.iter().find(|r| r.param == param).copied();
+
+        // The image to warp is sRGB colour; the normal map is data.
+        assert_eq!(
+            by_param("$basetexture").map(|r| r.color_space),
+            Some(ColorSpace::Srgb)
+        );
+        assert_eq!(
+            by_param("$normalmap").map(|r| r.color_space),
+            Some(ColorSpace::Linear)
+        );
+        // The refract tint texture is multiplied into the image, so it is
+        // colour — unlike every other mask-shaped texture in the set.
+        assert_eq!(
+            by_param("$refracttinttexture").map(|r| r.color_space),
+            Some(ColorSpace::Srgb)
+        );
+        // **sRGB, unconditionally**, where `VertexLitGeneric`'s is linear
+        // because Portal 2 ships HDR. Valve's asymmetry:
+        // `LoadCubeMap( m_nEnvmap, TEXTUREFLAGS_SRGB | ANISOTROPIC_OVERRIDE )`
+        // against `GetHDRType() == HDR_TYPE_NONE ? TEXTURE_FLAGS_SRGB : 0`.
+        let envmap = by_param("$envmap").expect("an envmap request");
+        assert_eq!(envmap.color_space, ColorSpace::Srgb);
+        assert_eq!(envmap.dimension, TextureDimension::Cube);
+        let vertex_lit = texture_requests(ShaderKind::VertexLitGeneric, &vmt(""));
+        assert_eq!(
+            vertex_lit
+                .iter()
+                .find(|r| r.param == "$envmap")
+                .map(|r| r.color_space),
+            Some(ColorSpace::Linear)
+        );
+
+        // `$normalmap` shares the bump binding, because that is what it is.
+        assert_eq!(
+            by_param("$normalmap").map(|r| r.binding),
+            Some(BINDING_BUMP_TEXTURE)
+        );
+        // Nothing this shader does not read.
+        assert!(by_param("$bumpmap").is_none());
+        assert!(by_param("$detail").is_none());
+        assert!(by_param("$envmapmask").is_none());
+    }
+
+    #[test]
+    fn the_refract_parameter_table_promises_only_what_is_implemented() {
+        let kind = ShaderKind::Refract;
+        for name in [
+            "$refractamount",
+            "$refracttint",
+            "$normalmap",
+            "$bumptransform",
+            "$bluramount",
+            "$fadeoutonsilhouette",
+            "$envmap",
+            "$envmaptint",
+            "$envmapcontrast",
+            "$envmapsaturation",
+            "$refracttinttexture",
+            "$nowritez",
+            "$localrefract",
+            "$localrefractdepth",
+            // From `STANDARD_PARAMS`, and `$basetexture` is load-bearing here.
+            "$basetexture",
+            "$alpha",
+        ] {
+            assert!(kind.param(name).is_some(), "{name}");
+        }
+        // Dead in Valve's own shader, or pinned on a content measurement —
+        // see `REFRACT_PARAMS`. A table entry is a promise.
+        for name in [
+            "$time",
+            "$fresnelreflection",
+            "$normalmap2",
+            "$bumptransform2",
+            "$masked",
+            "$magnifyenable",
+            "$magnifyscale",
+            "$noviewportfixup",
+            "$mirroraboutviewportedges",
+            "$vertexcolormodulate",
+        ] {
+            assert!(kind.param(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_refract_uniform_block_is_the_size_wgsl_expects() {
+        // Two transform rows, three vectors, and a flag word padded out by
+        // hand — WGSL rounds the struct up to 16 and Rust does not.
+        assert_eq!(size_of::<RefractUniforms>(), 2 * 16 + 3 * 16 + 16);
+        assert_eq!(size_of::<RefractUniforms>() % 16, 0);
     }
 }

@@ -103,8 +103,15 @@ resolving, 4,857 surfaces with real baked lighting over 13 atlas pages, and **1,
 props from 136 models** on top of that. **Its terrain draws too** — 11 displacements,
 1,408 triangles — which is the last of the big absences in the level shell. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
 now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO.md`
-stage 4); 3 of its 76 materials still do not, and they name shaders this port has not
-ported — `SolidEnergy` (the fizzler field), `Refract` and `Black`. **26 of its 78 brush
+stage 4); 3 of its 76 world materials still do not. Two name shaders this port has not
+ported — `SolidEnergy` (the fizzler field) and `Black` (`tools/toolsblack_noportal_skybox`)
+— and the third is a **missing file**: `models/props_trainstation/trainstation_clock_glass001`,
+which exists in none of `portal2`, `portal2_dlc1` or `portal2_dlc2`, so the map ships a
+dangling reference. (An earlier draft of this file named `Refract` as the third. That was
+wrong: nothing in the map's world materials names it. `Refract` *is* in the map, on three
+static props, and it is ported now — so the container's observation window and its two
+light covers refract instead of drawing as checkerboards, and that window is why the map
+takes the second, frame-buffer-copy pass.) **26 of its 78 brush
 entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
 triangles, each under the placement its entity gives it. **The scene is auto-exposed**: it is drawn into an
 offscreen target, a compute pass bins its pixels by luminance, and a port of
@@ -182,7 +189,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   not implemented and that is a measurement: all 64,428 pak entries in Portal 2's 106 maps
   are stored. Async and `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-6 of 8 ported.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-6 of 8 ported, plus the first shader of §7.8's remainder.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
@@ -232,8 +239,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `R_StudioSetupLighting` in this tree**; earlier drafts of this file named one) — a
   second shape for bind group 3, and the cubemap half of the texture path. **All 1,108 of
   those materials load and build a pipeline against the real game**; the whole set needs
-  15 pipelines, which answers §10's "how many variants survive" with a measurement. The
-  rest of §7.8's shader set and stages 7-8 (paint maps, GPU morph) are not started.
+  15 pipelines, which answers §10's "how many variants survive" with a measurement.
+  **`Refract` is the first of §7.8's remaining set and has landed** (below); the rest of it
+  and stages 7-8 (paint maps, GPU morph) are not started.
 
   Five things about it that a reader will otherwise rediscover the hard way:
   **a `.vmt` naming `VertexLitGeneric` does not always reach it** — `WantsPhongShader`
@@ -267,7 +275,61 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   as returning it, so a frame that returns early strands a staging buffer and the exposure
   silently stops adapting for ever.
 
-  §10's "how are variants expressed" question is **closed**: four shader names in, none
+  **`Refract` has landed too, and it is the first of §7.8's *remaining* shader set** — the
+  screen-space refraction shader, which is what every pane of glass in Portal 2 wears. 37
+  materials name it, 29 of them on models, and **all 37 load and build a pipeline** (7 of
+  them). Landed as `ShaderKind::Refract`, `shaders/refract.wgsl`, `shader::RefractUniforms`
+  and a **third shape for bind group 3** — `ContextBinding::FrameBufferCopy`, which is why
+  `ShaderKind::lighting_binding` is now `context_binding`: group 3 was "where this shader's
+  lighting comes from" and is now "whichever piece of render-context state this shader
+  reads", because a copy of the frame buffer belongs in the same slot for the same reason
+  a lightmap page does.
+
+  **It is the first shader in the port that reads the frame it is being drawn into**, and
+  that cost a structural change rather than a shader. `RenderContext::update_refract_texture`
+  is `UpdateRefractTexture` plus `SetFrameBufferCopyTexture` — a `copy_texture_to_texture`
+  off the scene target and the group-3 bind group over the copy — and because a render pass
+  cannot sample its own attachment, `Engine::render` now runs **two passes**: the opaque
+  scene, the copy, then `World::draw_refracting` under `Load::Keep`. That is Valve's own
+  opaque-list / `UpdateRefractTexture` / translucent-list ordering, made explicit because
+  `wgpu` enforces what D3D9 left undefined. 71 of the game's 106 maps need the second pass;
+  the other 35 pay neither it nor the copy.
+
+  Five things about it a reader will otherwise rediscover the hard way.
+  **A `Refract` material's `$basetexture` is not a surface texture** — it is an alternative
+  *image to warp*, bound to the sampler the frame-buffer copy would occupy, and
+  `$localrefract` is what says a material has one; six of the 37 take that branch and need
+  no copy of the frame at all, including five of the six in `sp_a1_intro1`. **It has no
+  lighting**, so `lighting()` is `None` and group 3 is free for the frame copy. **Its
+  blending comes from the `$normalmap` and only when there is no `$envmap`** — and all 29
+  `$model 1` materials have an envmap, so every piece of glass in the game draws *opaque*,
+  showing the copy it sampled rather than blending with the frame it is writing.
+  **`$bluramount` is declared an integer and content writes fractions into it** (sixteen
+  materials say `".3"`), so `GetIntValue()`'s truncation is what decides whether the blur
+  runs — 26 of the 37 get none. And **the "aspect fixup" is an integer division**:
+  `float( nHeight / nWidth )` with both operands `int`, so `glass/refract_light_color`
+  being 128x512 makes it **4** for five glass materials, and a wider-than-tall source
+  would make it 0.
+  **One Valve bug is reproduced deliberately**: `refract_ps2x.fxc:338` reflects the
+  environment map along a *tangent-space* eye vector beside a world-space normal, which is
+  what decides what every pane of glass in the game reflects; the line is marked in the
+  WGSL.
+  Four of the pixel shader's static axes are pinned off **on a content measurement rather
+  than a capability** — `SECONDARY_NORMAL`, `MASKED`, `MAGNIFY` and `COLORMODULATE`, which
+  no Portal 2 material sets — and the first of those is broken in the original anyway
+  (it binds sampler 1 and samples sampler 3).
+
+  **`Refract` also brought the census that says a shader is finished**:
+  `materials::material::tests::every_shipped_material_of_a_ported_shader_builds_a_pipeline`
+  is depot-gated (`KISAK_GAME_DIR`), walks every `.vmt` in the mounted game, loads it
+  through the real `MaterialCache` and asks the real `PipelineCache` for a pipeline with
+  `on_uncaptured_error` latching any validation failure. Running it prints the whole
+  picture: **2,947 of the mounted game's 3,555 materials draw with a real shader, in 51
+  pipelines** — 1,135 `VertexLitGeneric`, 956 `UnlitGeneric`, 801 `LightmappedGeneric`,
+  37 `Refract`, 18 `WorldVertexTransition`, and 608 on the error material. That is the
+  standing answer to §10's "how many variants actually survive".
+
+  §10's "how are variants expressed" question is **closed**: five shader names in, none
   needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
   module with a uniform branch, and `WorldVertexTransition` is a second *name* on
   `LightmappedGeneric`'s module rather than a variant of it — so the prelude is prepended
@@ -291,6 +353,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks, packs each
   surface's baked light into the material system's lightmap atlas, and groups faces into
   per-(material, page) batches at load — which is exactly what Valve's *sort ID* was.
+  **`World::draw` is now two calls and not one**: `draw` records the opaque scene and
+  `draw_refracting` records the geometry whose material samples a copy of it, with
+  `RenderContext::update_refract_texture` between them and the first pass *ended* — a
+  render pass cannot read its own attachment. `needs_frame_buffer_copy` says whether the
+  second pass is needed at all, and 71 of the game's 106 maps say yes. The split is per
+  *batch* rather than per prop, which diverges from Valve on purpose: 60 of the 66 models
+  in the game that wear a refracting material also wear an opaque one, and without a
+  translucency sort the opaque half belongs in the opaque pass.
   **Brush entities draw**, which closed the one place this port had collision ahead of
   rendering: model 0 is the world and models 1.. are the doors, panels and platforms, each
   built by the *same* face-grouping and lightmap-packing path and drawn with the entity's
@@ -874,7 +944,11 @@ to an occluded window and `sample` only ever shows a main thread parked in `mach
 `sp_a1_intro1` records a whole frame in **about 1 ms** (release) / 6.6 ms (debug); it was
 12.7 ms when static props first drew, and `portdocs/STUDIO.md` §11.8 has what the three
 causes were. Terrain did not move that number: it added 2 batches and 1,408 triangles to a
-frame whose cost is 1,080 prop draws. Run the three sub-benchmarks on their own — back to back they share thermal
+frame whose cost is 1,080 prop draws. **`Refract` did move it, and it is the copy rather
+than the draw**: the whole frame goes from **1.19 ms to 1.41 ms** on `sp_a1_intro1`, for
+one full-screen `copy_texture_to_texture` and one extra pass recording a single prop —
+which is why `needs_frame_buffer_copy` gates both and 35 of the game's 106 maps pay
+neither. Run the four sub-benchmarks on their own — back to back they share thermal
 state and read 2x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the

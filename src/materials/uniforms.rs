@@ -419,7 +419,7 @@ impl Light {
 /// for `LightmappedGeneric`, this for `VertexLitGeneric`. A pipeline layout is
 /// per shader, so a shader that reads neither declares no group 3 at all —
 /// which is what keeps the cost off the shaders that do not want it. See
-/// [`ShaderKind::lighting_binding`](super::shader::ShaderKind::lighting_binding).
+/// [`ShaderKind::context_binding`](super::shader::ShaderKind::context_binding).
 ///
 /// # Set once per model, not once per draw
 ///

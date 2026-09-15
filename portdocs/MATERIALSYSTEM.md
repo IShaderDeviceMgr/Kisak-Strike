@@ -6,12 +6,14 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stages 1-6 of §9 done** — `wgpu`/`winit` bring-up (a cleared window), the
+**Status: stages 1-6 of §9 done, plus the first of §7.8's remaining shader set** —
+`wgpu`/`winit` bring-up (a cleared window), the
 texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), the material path
 (`.vmt` → `Material` → `UnlitGeneric` in WGSL), meshes plus the render context (typed
 vertex buffers, static and dynamic geometry, render targets, and a depth buffer),
-lightmaps with `LightmappedGeneric`, and `VertexLitGeneric` with the model lighting
-constants under it. Stage 6's remaining shaders and stages 7-8 are not started. The
+lightmaps with `LightmappedGeneric`, `VertexLitGeneric` with the model lighting
+constants under it, and **`Refract`** with the frame-buffer copy under *it*. Stages 7-8
+and the rest of §7.8's set are not started. The
 implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
@@ -551,7 +553,7 @@ from shipped content.
 | `VertexLitGeneric` (+ `_dx9_helper`) | Props and characters |
 | `UnlitGeneric` | Sprites, UI-in-world, tool textures |
 | `WorldVertexTransition` | Blended world materials |
-| `Refract`, `Water` | Water, glass, refractive surfaces |
+| `Refract`, `Water` | Water, glass, refractive surfaces. **`Refract` done** — 37 materials |
 | `Portal`, `Portal_Refract` | **Portal-specific** — the portal surfaces themselves |
 | `LightmappedPaint`, `PaintBlob` | **Portal 2 paint/gel** (§8) |
 | `Blob` | Portal 2 gel blobs |
@@ -887,11 +889,61 @@ milestone the project has.
    cascaded shadow maps, `$lightwarptexture`, `$rimlight`, self-illum fresnel, wrinkle
    maps, tree sway, `$decaltexture`, `$tintmask`, seamless mapping, distance alpha, and
    skinning and morphing — plus the rest of §7.8's shader set.
+
+   **`Refract` is the first of that remaining set, and it is done** —
+   `ShaderKind::Refract`, `shaders/refract.wgsl`, `shader::RefractUniforms`, a *third*
+   shape for bind group 3, and `RenderContext::update_refract_texture`. **Deliverable met:**
+   all **37** of Portal 2's `Refract` materials load and build a pipeline, and the whole
+   set needs **7**. It also brought the depot-gated census that says so —
+   `material::tests::every_shipped_material_of_a_ported_shader_builds_a_pipeline`, which
+   walks every `.vmt` in the mounted game and is what "this shader is finished" now means:
+   **2,947 of 3,555 materials draw with a real shader, in 51 pipelines**.
+
+   Four things about it that reshape what the plan assumed:
+
+   - **§7.8 grouped it with `Water` and that grouping is misleading.** It is not a water
+     shader with the water turned off: it is a *screen-space resample*, and 37 of the
+     game's materials name it against `Water`'s 59. What the two share is the need for a
+     readable copy of the frame, which is the part that generalizes.
+   - **It is the first shader that reads the frame it is drawn into, and that cost a
+     structural change rather than a shader.** `ContextBinding::FrameBufferCopy` is a third
+     group-3 shape, `RenderContext::update_refract_texture` is `UpdateRefractTexture` plus
+     `SetFrameBufferCopyTexture`, and the engine grew a **second pass** — a render pass
+     cannot sample its own attachment, so `World::draw` and `World::draw_refracting` are
+     two calls with the copy between them. That is Valve's own opaque-list /
+     `UpdateRefractTexture` / translucent-list ordering, made explicit because `wgpu`
+     enforces what D3D9 left undefined. **§10's render-target question was answered in
+     stage 4 with "sequencing replaces nesting", and this is the first place the answer
+     was actually needed.**
+   - **A `Refract` material's `$basetexture` is not a surface texture.** It is an
+     alternative image to warp, bound to the sampler the frame-buffer copy would occupy,
+     and `$localrefract` is what says a material has one. Six of the 37 take that branch
+     and therefore need no copy at all — including five of the six in `sp_a1_intro1` —
+     which is why "does this map need a second pass" is a per-material question
+     (`shader::needs_frame_buffer_copy`) and not a per-shader one.
+   - **The bucketing came out almost entirely bucket 1, on content rather than on
+     capability.** Four of the pixel shader's thirteen static axes — `SECONDARY_NORMAL`,
+     `MASKED`, `MAGNIFY`, `COLORMODULATE` — are pinned *off* because **no Portal 2
+     material turns them on**, and one of those four is broken in the original anyway
+     (`SECONDARY_NORMAL` binds sampler 1 and samples sampler 3). That is §7.8's "verify
+     against shipped content before committing" earning its place a second time: reading
+     the `.fxc` alone would have produced four features with no content and one with a bug.
+
+   Two findings worth carrying forward. **`$bluramount` is declared an integer and content
+   writes fractions into it** — sixteen materials say `".3"` — so `GetIntValue()`'s
+   truncation is what decides whether the blur runs, and 26 of the 37 get no blur.
+   And **the shipped shader reflects its environment map along a *tangent-space* vector**
+   (`refract_ps2x.fxc:338` hands `i.vTangentVertToEyeVector` to a function whose other
+   argument is a world-space normal), which is a bug that decides what every pane of glass
+   in the game reflects; it is reproduced, with the line marked.
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–6 are done, `VertexLitGeneric` being the whole of stage 6 so far. The rest of
-§7.8's shader set is a breadth move gated on nothing; the next thing *models* need is not
+Stages 1–6 are done, `VertexLitGeneric` and `Refract` being the whole of stage 6 so far.
+The rest of §7.8's shader set is a breadth move gated on nothing — and `Refract` is
+evidence for that rather than against it: the shader itself was small, and what it
+actually needed was the frame-buffer copy, which is one method on `RenderContext` and is
+now there for `Water` and `Portal_Refract` too. The next thing *models* need is not
 in this module at all, but in `studiorender` — a `.mdl`/`.vvd`/`.vtx` reader — and in the
 engine's `sprp` game lump and `engine/lightcache.cpp`'s lighting reconstruction
 (`LightcacheGetStatic` / `Mod_LeafAmbientColorAtPos` — **not** `R_StudioSetupLighting`,
