@@ -77,7 +77,7 @@ winit = "0.30.13"
 # length: glam::Mat4 is column-major and multiplies on the left, so it *is* this
 # port's convention rather than a thing to convert out of. Valve's row-major
 # VMatrix is what needs converting, and `uniforms::from_row_major` is where.
-glam = "0.33.6"
+glam = "0.33.7"
 # The UI. Replaces vgui2 (`vgui2/vgui_controls/`, and `consoledialog.cpp` in
 # particular), RocketUI and ScaleformUI at once -- ../PORTING.md's
 # "Replacements, all decided". Arrives with the dev console
@@ -110,13 +110,13 @@ glam = "0.33.6"
 # `egui-wgpu`'s defaults add `wgpu/webgl`, which is dead weight in a native
 # binary. `clipboard`, `wayland` and `x11` are kept because Linux is the
 # primary target and all three are load-bearing there.
-egui = "0.36.1"
-egui-winit = { version = "0.36.1", default-features = false, features = [
+egui = "0.36.2"
+egui-winit = { version = "0.36.2", default-features = false, features = [
     "clipboard",
     "wayland",
     "x11",
 ] }
-egui-wgpu = { version = "0.36.1", default-features = false, features = [
+egui-wgpu = { version = "0.36.2", default-features = false, features = [
     # `wgpu/metal`, under a name that says what it is for. macOS is a supported
     # target and this is the fix for a live-resize artifact there.
     "macos-window-resize-jitter-fix",
