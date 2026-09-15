@@ -1841,6 +1841,356 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Phong
+    // ---------------------------------------------------------------------
+    // Same reasoning as the block above: these are the only place
+    // `shaders/phong.wgsl` is compiled against real pixels, and the specular
+    // term is the whole reason the shader exists — so it is pinned against a
+    // number worked out by hand rather than against "brighter than before".
+
+    /// The normal that puts the half-angle exactly on the surface normal, for
+    /// the light and camera the tests below use.
+    ///
+    /// `Camera::screen`'s eye is the origin and the quad sits at `z = 0`, so
+    /// at the quad's middle the eye vector is `normalize( -0.5, -0.5, 0 )`.
+    /// With a light far away along `+z` the light vector is `(0, 0, 1)`, and
+    /// `H = normalize( V + L )` is this. Setting the vertex normal to it makes
+    /// `N·H` one and `pow( N·H, k )` one for every exponent, which is what
+    /// takes the exponent out of the arithmetic.
+    const PEAK_NORMAL: [f32; 3] = [-0.5, -0.5, std::f32::consts::FRAC_1_SQRT_2];
+
+    /// Lighting with one white-ish point light 100 units along `+z` and no
+    /// ambient, no baked stream, and a constant attenuation of 1.
+    ///
+    /// The distance is what makes the light *directional* in practice — the
+    /// light vector is within a ten-thousandth of `(0, 0, 1)` everywhere on
+    /// the quad — while the `(1, 0, 0)` attenuation keeps it unattenuated, so
+    /// the only thing varying across the surface is the eye vector.
+    fn phong_lighting(color: [f32; 3]) -> ModelLighting {
+        let mut lighting = dark_lighting();
+        lighting.lights[0] = Light::point(color, [0.5, 0.5, 100.0], [1.0, 0.0, 0.0]);
+        lighting.count = 1;
+        lighting
+    }
+
+    /// A `Phong` material — which is a `VertexLitGeneric` `.vmt` that asks for
+    /// `$phong`, because no `.vmt` can name the shader (`ShaderKind::resolve`).
+    ///
+    /// `$phongfresnelranges "[1 1 1]"` in every caller that wants a number:
+    /// the default `[0 0.5 1]` is the identity on the traditional fresnel, and
+    /// `(1 - N·V)²` at this geometry is 0.0858, which would scale the highlight
+    /// down by twelve and make every expected value a fresnel calculation too.
+    fn phong_material(h: &Harness, body: &str, base: Arc<Texture>) -> Material {
+        let material = shader_material(
+            &h.device,
+            &h.queue,
+            &h.pipelines,
+            "VertexLitGeneric",
+            &format!(r#""$phong" "1" "$basemapalphaphongmask" "1" {body}"#),
+            base,
+        );
+        assert_eq!(
+            material.shader,
+            crate::materials::shader::ShaderKind::Phong,
+            "the fixture has to actually reach Phong"
+        );
+        material
+    }
+
+    /// Draws one quad with the given normal under `lighting` and returns the
+    /// middle pixel.
+    fn phong_pixel(
+        h: &mut Harness,
+        material: &Material,
+        lighting: &ModelLighting,
+        normal: [f32; 3],
+    ) -> [u8; 4] {
+        let (vertices, light, indices) = model_quad(normal, [0.0; 4]);
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(material, &v, &i, Mat4::IDENTITY);
+        });
+        centre(&pixels)
+    }
+
+    #[test]
+    fn the_specular_highlight_is_blinn_phong_masked_by_a_softened_n_dot_l() {
+        // `SpecularAndRimTerms` (`common_vertexlitgeneric_dx9.h:145`), pinned
+        // against arithmetic done by hand, because three of its four factors
+        // are easy to drop and none of them errors when dropped.
+        //
+        // With `N = H` (see `PEAK_NORMAL`) and the light far along `+z`:
+        //
+        //   N·H = 1                   -> pow( N·H, k ) = 1 for any exponent
+        //   N·L = 1/sqrt(2) = 0.70711 -> pow( N·L, 0.5 ) = 0.84090  <- the mask
+        //   fresnel ranges [1 1 1]    -> 1
+        //   $phongboost default       -> 1
+        //   spec mask (base alpha 1)  -> 1
+        //
+        // so the specular is 0.84090 times the light colour. The diffuse on
+        // top of it is `DiffuseTerm` with half-Lambert **on** — Phong's
+        // default, see `shader::phong_uniforms` — which is
+        // `(0.70711*0.5 + 0.5)² = 0.72855`. Total 1.56945.
+        let mut h = harness!(false);
+        let lighting = phong_lighting([0.5, 0.25, 0.125]);
+        let white = h.texture([255, 255, 255, 255]);
+        let lit = phong_material(&h, r#""$phongfresnelranges" "[1 1 1]""#, white.clone());
+
+        let got = phong_pixel(&mut h, &lit, &lighting, PEAK_NORMAL);
+        // 1.56945 * (0.5, 0.25, 0.125) * 255, and the three channels differ so
+        // that a swapped one fails rather than agreeing by accident.
+        for (channel, expected) in [200u8, 100, 50].into_iter().enumerate() {
+            let difference = i32::from(got[channel]) - i32::from(expected);
+            assert!(
+                difference.abs() <= 3,
+                "channel {channel}: got {}, expected about {expected} \
+                 (specular 0.84090 + diffuse 0.72855, times the light colour)",
+                got[channel]
+            );
+        }
+
+        // Turn the specular off through `$phongboost` and the diffuse half is
+        // what is left: 0.72855 * 0.5 * 255 = 92.9.
+        let matte = phong_material(
+            &h,
+            r#""$phongfresnelranges" "[1 1 1]" "$phongboost" "0""#,
+            white,
+        );
+        let matte_pixel = phong_pixel(&mut h, &matte, &lighting, PEAK_NORMAL);
+        assert!(
+            (i32::from(matte_pixel[0]) - 93).abs() <= 3,
+            "diffuse alone should be about 93, got {}",
+            matte_pixel[0]
+        );
+        assert!(
+            got[0] > matte_pixel[0] + 100,
+            "the highlight is most of the lit value here"
+        );
+    }
+
+    /// A normal ten degrees off [`PEAK_NORMAL`], written out rather than
+    /// rotated: `N·H` drops to 0.9857 and `N·L` to 0.5774, and both of those
+    /// numbers are wanted in the arithmetic below.
+    const OFF_PEAK_NORMAL: [f32; 3] = [-0.57735027, -0.57735027, 0.57735027];
+
+    /// A `Phong` material whose albedo is **black** and whose base alpha is 1.
+    ///
+    /// Which isolates the specular exactly: the diffuse term is multiplied by
+    /// the albedo and the specular is not (`phong_ps20b.fxc:882`), so a black
+    /// base texture with an opaque alpha leaves a phong mask of 1 and a
+    /// diffuse contribution of 0. Every specular test below uses it, because
+    /// the alternative is asserting on a sum of two terms that move together.
+    fn specular_only_material(h: &Harness, body: &str) -> Material {
+        phong_material(
+            h,
+            &format!(r#""$phongfresnelranges" "[1 1 1]" {body}"#),
+            h.texture([0, 0, 0, 255]),
+        )
+    }
+
+    #[test]
+    fn the_exponent_narrows_the_highlight_without_moving_its_peak() {
+        // `pow( N·H, fSpecExp )` is 1 at the peak whatever the exponent and
+        // falls off faster away from it — which is the only thing the exponent
+        // does, and is why a material can raise it without re-tuning
+        // `$phongboost`.
+        //
+        // At `OFF_PEAK_NORMAL`, `N·H` is 0.9857 and the softening mask
+        // `pow( N·L, 0.5 )` is 0.7599, so with a white light and the default
+        // boost the expected values are
+        //
+        //   exponent 5:   0.9857^5   * 0.7599 = 0.7069  -> 180
+        //   exponent 100: 0.9857^100 * 0.7599 = 0.1799  ->  46
+        //
+        // against a peak of 0.8409 -> 214.
+        let mut h = harness!(false);
+        let lighting = phong_lighting([1.0, 1.0, 1.0]);
+        let soft = specular_only_material(&h, r#""$phongexponent" "5""#);
+        let sharp = specular_only_material(&h, r#""$phongexponent" "100""#);
+
+        let soft_peak = i32::from(phong_pixel(&mut h, &soft, &lighting, PEAK_NORMAL)[0]);
+        let sharp_peak = i32::from(phong_pixel(&mut h, &sharp, &lighting, PEAK_NORMAL)[0]);
+        assert!(
+            (soft_peak - 214).abs() <= 3 && (sharp_peak - 214).abs() <= 3,
+            "the peak is `pow( 1, k )` either way, about 214: \
+             {soft_peak} against {sharp_peak}"
+        );
+
+        let soft_off = i32::from(phong_pixel(&mut h, &soft, &lighting, OFF_PEAK_NORMAL)[0]);
+        let sharp_off = i32::from(phong_pixel(&mut h, &sharp, &lighting, OFF_PEAK_NORMAL)[0]);
+        assert!(
+            (soft_off - 180).abs() <= 4,
+            "exponent 5 ten degrees off peak should be about 180, got {soft_off}"
+        );
+        assert!(
+            (sharp_off - 46).abs() <= 4,
+            "exponent 100 ten degrees off peak should be about 46, got {sharp_off}"
+        );
+    }
+
+    #[test]
+    fn the_boost_and_the_tint_scale_the_highlight_and_not_the_diffuse() {
+        // `vSpecularTint = g_SpecularBoost * g_SpecularTint.rgb`, applied to
+        // the specular alone. `$phongboost` runs to 8 in shipped content, which
+        // is why it is a multiplier on a term that is already at most 1.
+        let mut h = harness!(false);
+        let lighting = phong_lighting([1.0, 1.0, 1.0]);
+
+        let half = specular_only_material(&h, r#""$phongboost" "0.5""#);
+        let quarter = specular_only_material(&h, r#""$phongboost" "0.25""#);
+        let got_half = i32::from(phong_pixel(&mut h, &half, &lighting, PEAK_NORMAL)[0]);
+        let got_quarter = i32::from(phong_pixel(&mut h, &quarter, &lighting, PEAK_NORMAL)[0]);
+        // 0.8409 * 0.5 -> 107, and * 0.25 -> 54.
+        assert!((got_half - 107).abs() <= 3, "got {got_half}");
+        assert!((got_quarter - 54).abs() <= 3, "got {got_quarter}");
+
+        // `$phongtint` is a colour on the highlight, which is how a gold
+        // surface gets a gold highlight off a white light. Sixteen materials
+        // set one.
+        let tinted = specular_only_material(&h, r#""$phongtint" "[1 0.5 0]""#);
+        let got = phong_pixel(&mut h, &tinted, &lighting, PEAK_NORMAL);
+        assert!((i32::from(got[0]) - 214).abs() <= 3, "got {got:?}");
+        assert!((i32::from(got[1]) - 107).abs() <= 3, "got {got:?}");
+        assert_eq!(got[2], 0, "and nothing in the channel the tint zeroed");
+    }
+
+    #[test]
+    fn the_phong_mask_comes_from_base_alpha_or_the_normal_maps_alpha() {
+        // `fSpecMask = lerp( normalTexel.a, baseColor.a, g_fBaseMapAlphaPhongMask )`
+        // — two sources, one `lerp`, and `$basemapalphaphongmask` is the
+        // switch. 117 of the game's 317 Phong materials set it, and **all 110
+        // of the unbumped ones reach the shader through it**, so this is the
+        // majority path rather than a variant.
+        let mut h = harness!(false);
+        let lighting = phong_lighting([1.0, 1.0, 1.0]);
+        let ranges = r#""$phongfresnelranges" "[1 1 1]" "$phongboost" "0.4""#;
+
+        // Base alpha at half: the highlight halves and the diffuse does not.
+        let opaque = phong_material(&h, ranges, h.texture([255, 255, 255, 255]));
+        let masked = phong_material(&h, ranges, h.texture([255, 255, 255, 128]));
+        let full = i32::from(phong_pixel(&mut h, &opaque, &lighting, PEAK_NORMAL)[0]);
+        let half = i32::from(phong_pixel(&mut h, &masked, &lighting, PEAK_NORMAL)[0]);
+        // Diffuse 0.72855 + specular 0.84090 * 0.4 = 1.06491 -> 272, clipped
+        // to 255; with the mask at 128/255 the specular halves to 0.16818 and
+        // the total is 0.89673 -> 229.
+        assert_eq!(full, 255, "the unmasked highlight clips");
+        assert!(
+            (half - 229).abs() <= 3,
+            "half the mask should be about 229, got {half}"
+        );
+
+        // Without `$basemapalphaphongmask` the same material reads the normal
+        // map's alpha instead — and with no `$bumpmap` at all that is the flat
+        // normal's 1, so the mask is off and base alpha stops mattering.
+        let unmasked = shader_material(
+            &h.device,
+            &h.queue,
+            &h.pipelines,
+            "VertexLitGeneric",
+            &format!(r#""$phong" "1" "$bumpmap" "test" {ranges}"#),
+            h.texture([255, 255, 255, 128]),
+        );
+        // The base texture here doubles as the "normal map", so its alpha of
+        // 128 is what the mask reads — which is the point: the *same* 128
+        // reaches the highlight down a different path.
+        let through_normal = i32::from(phong_pixel(&mut h, &unmasked, &lighting, PEAK_NORMAL)[0]);
+        assert!(
+            (through_normal - half).abs() <= 6,
+            "the two mask sources should agree on the same value: \
+             {through_normal} against {half}"
+        );
+    }
+
+    #[test]
+    fn a_phong_model_takes_no_baked_vertex_light() {
+        // The same asymmetry `a_bumped_model_takes_no_baked_vertex_light`
+        // pins, and for the same reason one step further: Phong is *always* a
+        // per-pixel shader, so `phong_ps20b.fxc:643` passes
+        // `staticLightingColor = 0, bStaticLight = false`. It is worth its own
+        // test because Phong reaches it with no `$bumpmap` — 110 of the game's
+        // 317 — where `VertexLitGeneric` would have read the stream.
+        let mut h = harness!(false);
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        let white = h.texture([255, 255, 255, 255]);
+
+        let (vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        let unbumped_lit = h.model_material("");
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&unbumped_lit, &v, &i, Mat4::IDENTITY);
+        });
+        assert_eq!(
+            centre(&pixels)[0],
+            255,
+            "the same material without $phong reads the baked stream"
+        );
+
+        let phong = phong_material(&h, "", white);
+        assert_eq!(
+            phong_pixel(&mut h, &phong, &lighting, [0.0, 0.0, 1.0])[0],
+            0,
+            "and with $phong it does not — a Phong prop's diffuse is the \
+             ambient cube and the local lights, nothing else"
+        );
+    }
+
+    #[test]
+    fn the_rim_light_survives_with_no_local_light_at_all() {
+        // The last term of `phong_ps20b.fxc`'s rim block, and the only part of
+        // this shader that reads the ambient cube through the *eye* vector:
+        //
+        //     specularLighting += fRimFresnel * fRimMask * g_fRimBoost
+        //                       * PixelShaderAmbientLight( vEyeDir, cAmbientCube )
+        //                       * saturate( dot( N, float3( 0, 0, 1 ) ) );
+        //
+        // With no lights the rest of the shader is black, so whatever is left
+        // is this — which is what keeps a rim on a model standing in ambient
+        // light. The `saturate( dot( N, +Z ) )` gate is Valve's way of keeping
+        // it off the undersides of things, and is what the second half here
+        // pins.
+        // Black albedo again, so the ambient cube's ordinary diffuse
+        // contribution — which *is* multiplied by the albedo — drops out and
+        // what is left is the rim term alone.
+        let mut h = harness!(false);
+        let mut lighting = dark_lighting();
+        lighting.ambient_light = 1;
+        lighting.ambient_cube = [[1.0, 1.0, 1.0, 0.0]; AMBIENT_CUBE_FACES];
+
+        let plain = specular_only_material(&h, "");
+        let rimmed = specular_only_material(&h, r#""$rimlight" "1" "$rimlightboost" "0.25""#);
+
+        // A `+z` normal is edge-on to the eye here, which makes `(1 - N·V)⁴`
+        // one while `dot( N, +Z )` stays one. With a white cube the eye-vector
+        // lookup is 1 too, so the whole term is the boost: 0.25 -> 64.
+        let normal = [0.0, 0.0, 1.0];
+        let without = i32::from(phong_pixel(&mut h, &plain, &lighting, normal)[0]);
+        let with = i32::from(phong_pixel(&mut h, &rimmed, &lighting, normal)[0]);
+        assert_eq!(without, 0, "no lights and a black albedo is black");
+        assert!(
+            (with - 64).abs() <= 3,
+            "the rim adds the ambient cube back, about 64: got {with}"
+        );
+
+        // Turn the normal to point down and the `dot( N, +Z )` gate closes,
+        // so the rim contributes nothing even though the fresnel is unchanged.
+        let down = [0.0, 0.0, -1.0];
+        assert_eq!(
+            phong_pixel(&mut h, &rimmed, &lighting, down)[0],
+            0,
+            "a downward-facing normal gets no rim"
+        );
+    }
+
     /// A draw that returns to a material used earlier in the pass gets that
     /// material back.
     ///

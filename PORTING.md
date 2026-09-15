@@ -428,7 +428,7 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   **Trap recorded in `portdocs/FILESYSTEM.md`:** KeyValues' `$WIN32` resolves to
   `IsPC()`, so `[$WIN32]` is *true* on POSIX; reading it as "is Windows" silently drops
   search paths.
-- **`src/materials/` — stages 1-6 of 8 ported, plus the first shader of §7.8's
+- **`src/materials/` — stages 1-6 of 8 ported, plus the first two shaders of §7.8's
   remainder; `src/engine/window/` with it.** The four paragraphs below cover stages 1-4;
   stage 5 onwards is the bullet after this one. `portdocs/MATERIALSYSTEM.md` §9 and
   `rustdocs/MATERIALS.md` are current where this entry is not.
@@ -505,8 +505,16 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
 
   **Stage 6 is `VertexLitGeneric` and is done**, and with it static props draw lit —
   `ModelVertex`, the ambient cube and four local lights, and a second shape for bind
-  group 3. All 1,108 of Portal 2's `VertexLitGeneric` materials build a pipeline, in 15
-  of them. **`Refract` is the first of §7.8's remaining set and is also done**: 37
+  group 3. All 1,135 of the mounted game's `VertexLitGeneric` materials build a pipeline:
+  818 here in 14 of them, and **317 in `Phong`**, which is the same declaration reached
+  through `WantsPhongShader` and is the first shader in the port that **no `.vmt` names**
+  — `ShaderKind::resolve` is the redirect and `from_name` deliberately cannot answer it.
+  `Phong` is 7 pipelines, 104 of the game's 106 maps place a static prop wearing one, and
+  it brought a third CS:GO-shaped default to reverse (half-Lambert is forced *on* in
+  Portal 2's Phong, switched by `$phongdisablehalflambert`, and the `$halflambert` flag
+  does nothing there) plus a third `$envmaptint` behaviour to leave alone (no decode at
+  all, against `VertexLitGeneric`'s full-range one and `Refract`'s table).
+  **`Refract` is the first of §7.8's remaining set and is also done**: 37
   materials, 7 pipelines, and the structural change it needed rather than the shader —
   `ContextBinding::FrameBufferCopy` is a *third* group-3 shape,
   `RenderContext::update_refract_texture` is `UpdateRefractTexture` plus
@@ -515,7 +523,7 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   second pass — which is Valve's own opaque/`UpdateRefractTexture`/translucent ordering
   made explicit. That is stage 4's "nesting becomes sequencing" answer being needed for
   the first time. Across the mounted game **2,947 of 3,555 materials now draw with a real
-  shader, in 51 pipelines**, measured by a depot-gated census
+  shader, in 57 pipelines**, measured by a depot-gated census
   (`materials::material::tests::every_shipped_material_of_a_ported_shader_builds_a_pipeline`).
 
   `portdocs/MATERIALSYSTEM.md`: inventory,

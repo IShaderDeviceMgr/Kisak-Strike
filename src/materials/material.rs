@@ -118,7 +118,11 @@ impl Material {
         fallback: &TextureFallbacks,
         mut resolve: impl FnMut(&str, super::ColorSpace, TextureDimension) -> Arc<Texture>,
     ) -> Option<Material> {
-        let shader = ShaderKind::from_name(&vmt.shader)?;
+        // **`resolve`, not `from_name`.** A `.vmt` that names
+        // `VertexLitGeneric` and asks for `$phong` is drawn by `Phong`, which
+        // is a different WGSL module, a different bind group layout and a
+        // different parameter table — see `ShaderKind::resolve`.
+        let shader = ShaderKind::resolve(vmt)?;
 
         let mut textures = Vec::new();
         let mut entries = Vec::new();
@@ -172,6 +176,10 @@ impl Material {
             }
             ShaderKind::VertexLitGeneric => {
                 let block = shader::vertex_lit_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
+            ShaderKind::Phong => {
+                let block = shader::phong_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
             ShaderKind::Refract => {
@@ -468,18 +476,6 @@ impl MaterialCache {
             error: textures.error_texture(),
             black_cube: textures.black_cube_texture(),
         };
-
-        // Said once, at load, because it is otherwise invisible: a fifth of
-        // Portal 2's models name a shader that this port draws with the wrong
-        // one. See `shader::wants_phong`.
-        if ShaderKind::from_name(&vmt.shader) == Some(ShaderKind::VertexLitGeneric)
-            && shader::wants_phong(&vmt)
-        {
-            eprintln!(
-                "source-engine: materials: {name}: $phong asks for the Phong shader, \
-                 which is not ported; drawing as VertexLitGeneric without specular"
-            );
-        }
 
         Material::new(
             device,
@@ -783,8 +779,9 @@ mod tests {
 
         // The deliverable for each ported shader, as a floor rather than an
         // exact count so that a depot with the language DLCs mounted does not
-        // fail. The `Refract` figure is stage 6's breadth work: 37 materials in
-        // the game name it and every one of them has to draw.
+        // fail. The `Refract` and `Phong` figures are stage 6's breadth work:
+        // 37 and 317 materials in the game draw with them, and every one has
+        // to build a pipeline.
         let at_least = |shader: &str, count: u32| {
             let (loaded, _) = census.get(shader).copied().unwrap_or_default();
             assert!(
@@ -792,7 +789,14 @@ mod tests {
                 "{shader}: {loaded} materials loaded, expected at least {count}"
             );
         };
-        at_least("VertexLitGeneric", 1108);
+        // **`VertexLitGeneric` and `Phong` are one number split in two.**
+        // 1,135 `.vmt` files name `VertexLitGeneric` and `WantsPhongShader`
+        // sends 317 of them to `Phong` (`shader::wants_phong`), so the two
+        // floors together are what the single 1,108 floor used to be — and if
+        // the redirect ever stopped firing, the first of these would rise and
+        // the second would fail.
+        at_least("VertexLitGeneric", 818);
+        at_least("Phong", 317);
         at_least("LightmappedGeneric", 800);
         at_least("UnlitGeneric", 928);
         at_least("WorldVertexTransition", 18);

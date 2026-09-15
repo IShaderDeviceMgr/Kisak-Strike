@@ -8,13 +8,22 @@
 //
 //   skinning + morph (`SkinPosition`, `ApplyMorph`)  -> with studiorender
 //   flashlight + shadow filtering                    -> with the flashlight
-//   parallax, lightwarp, phong, rim lighting         -> with the Phong shader
+//   parallax, wrinkle maps, decals                   -> with the features
 //
 // Two things that could live here and deliberately do not: the bumped-lightmap
 // basis is here (`BUMP_BASIS`) but its *sampling* is `LightmappedGeneric`'s,
-// and the ambient cube and local lights are `VertexLitGeneric`'s outright.
+// and the ambient cube and local lights are in `shaders/modellighting.wgsl`.
 // Anything that reads a bind group belongs to the shader that declares it,
-// and group 3 is declared per shader -- see `shader::ContextBinding`.
+// and group 3 is declared per shader -- see `shader::ContextBinding`. That
+// second file is the narrower case of the same rule: it is prepended only for
+// the two shaders whose group 3 agrees, `VertexLitGeneric` and `Phong`.
+//
+// `common_vertexlitgeneric_dx9.h`'s lighting core is split the same way. The
+// pieces both model shaders evaluate identically — `PixelShaderAmbientLight`
+// and the attenuation — are in `modellighting.wgsl`; the diffuse, specular and
+// rim terms are each in the shader that uses them, because `DiffuseTerm` and
+// `CosineTermInternal` are two different functions and unifying them would
+// silently reshade every prop in the game.
 //
 // Two conventions are set here and inherited by everything later, and both
 // produce a plausible-looking wrong picture rather than an error when broken:

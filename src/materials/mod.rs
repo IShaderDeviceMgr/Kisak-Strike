@@ -24,10 +24,12 @@
 //! - [`Vmt`](vmt::Vmt) reads `.vmt` files, [`MaterialVar`](var::MaterialVar)
 //!   holds what they say, and [`MaterialCache`] turns a material name into a
 //!   [`Material`] — or into the error material, likewise.
-//! - [`ShaderKind`](shader::ShaderKind) is the shader set, three deep so far:
-//!   `UnlitGeneric`, `LightmappedGeneric` and `VertexLitGeneric`, written in
-//!   WGSL against the constant ABI in [`uniforms`] and compiled through the
-//!   cache in [`pipeline`].
+//! - [`ShaderKind`](shader::ShaderKind) is the shader set, six deep so far:
+//!   `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`,
+//!   `VertexLitGeneric`, `Phong` and `Refract`, written in WGSL against the
+//!   constant ABI in [`uniforms`] and compiled through the cache in
+//!   [`pipeline`]. **Five of those six are names a `.vmt` writes**; `Phong` is
+//!   not one, and `ShaderKind::resolve` is what finds it.
 //! - [`mesh`] is geometry: [`SimpleVertex`](mesh::SimpleVertex) and the
 //!   [`VertexLayout`](mesh::VertexLayout) a shader declares,
 //!   [`VertexBuffer`](mesh::VertexBuffer)/[`IndexBuffer`](mesh::IndexBuffer)
@@ -59,9 +61,9 @@
 //!   [`Pass::bind_lightmap_page`](context::Pass::bind_lightmap_page) rather
 //!   than living in a material.
 //!
-//! Stage 6 is `VertexLitGeneric`, which is done. The rest of §7.8's shader set
-//! (`Phong`, `WorldVertexTransition`, water, portals, sprites) and stages 7-8
-//! (paint maps, GPU morph) are not started.
+//! Stage 6 is `VertexLitGeneric`, which is done, and `Refract` and `Phong` are
+//! the first two of §7.8's remaining set. The rest of it (water, portals,
+//! sprites, paint) and stages 7-8 (paint maps, GPU morph) are not started.
 
 pub mod context;
 pub mod error;

@@ -9,7 +9,9 @@
 //
 // Prepended by `shaders/prelude.wgsl`, which declares groups 0 and 2,
 // `ModelVertexInput`, the colour-space and detail helpers, and the fog and
-// output helpers.
+// output helpers, and then by `shaders/modellighting.wgsl`, which declares
+// group 3 — the ambient cube and the four local lights — and is shared with
+// `Phong`.
 //
 // ---------------------------------------------------------------------------
 // Two files, one module
@@ -45,11 +47,13 @@
 // tint, contrast, saturation, fresnel and three mask sources,
 // `$blendtintbybasealpha`, colour modulation, alpha testing and fog.
 //
-// Not here, each deferred with the feature it belongs to: `$phong` and
-// everything under it (a separate shader — see `shader::wants_phong`), the
-// flashlight, cascaded shadow maps, `$lightwarptexture`, `$rimlight`,
-// self-illum fresnel, wrinkle maps, tree sway, `$decaltexture`, `$tintmask`,
-// seamless mapping, distance alpha, and skinning and morphing.
+// Not here: `$phong` and everything under it, which is **`shaders/phong.wgsl`**
+// — a material that asks for it never reaches this file at all
+// (`shader::wants_phong`, `ShaderKind::resolve`). Also deferred, each with the
+// feature it belongs to: the flashlight, cascaded shadow maps, self-illum
+// fresnel, wrinkle maps, tree sway, `$decaltexture`, `$tintmask`, seamless
+// mapping, distance alpha, and skinning and morphing. `$lightwarptexture` and
+// `$rimlight` are `Phong`'s and are implemented there.
 
 // ---------------------------------------------------------------------------
 // Group 1: the material
@@ -118,101 +122,12 @@ const FLAG_BLEND_TINT_BY_BASE_ALPHA: u32 = 4096u;
 @group(1) @binding(12) var envmap_sampler: sampler;
 
 // ---------------------------------------------------------------------------
-// Group 3: the lighting this instance is drawn under
+// This shader's half of the lighting core
 // ---------------------------------------------------------------------------
-// Mirrors `uniforms::ModelLighting`. Not part of the material and not part of
-// the draw: it is per model *instance*, which is what
-// `R_StudioSetupLighting` computes once and every mesh of that model then
-// shares. `Pass::set_model_lighting` is the setter.
-
-struct Light {
-    // rgb, and w = 1 for a directional light.
-    color: vec4<f32>,
-    // xyz, and w = 1 for a spot light.
-    direction: vec4<f32>,
-    position: vec4<f32>,
-    // falloff, thetaDot, phiDot, 1/(thetaDot - phiDot).
-    spot: vec4<f32>,
-    // constant, linear, quadratic.
-    attenuation: vec4<f32>,
-}
-
-struct ModelLighting {
-    // +x, -x, +y, -y, +z, -z, in linear space.
-    ambient_cube: array<vec4<f32>, 6>,
-    lights: array<Light, 4>,
-    count: u32,
-    static_light: u32,
-    ambient_light: u32,
-    pad0: u32,
-}
-
-@group(3) @binding(0) var<uniform> lighting: ModelLighting;
-
-// ---------------------------------------------------------------------------
-// The lighting core
-// ---------------------------------------------------------------------------
-// `common_vertexlitgeneric_dx9.h` and the lighting half of `common_vs_fxc.h`.
-// These live here rather than in the prelude because they read group 3, which
-// only this shader declares.
-
-// `PixelShaderAmbientLight` (`common_vertexlitgeneric_dx9.h:38`).
-//
-// Valve has two spellings of this — a vertex one that indexes the cube array
-// dynamically and a pixel one that does not — and they compute the same thing.
-// The pixel form is used for both here because WGSL cannot dynamically index a
-// value array, and because "the same thing" is not an approximation: the six
-// products are the same six products.
-//
-// The cube is stored `+x, -x, +y, -y, +z, -z`, so `is_negative` picks the odd
-// slot. Swapping a pair lights a model from the wrong side, which reads as a
-// level built wrong rather than as a shader bug.
-fn ambient_light(world_normal: vec3<f32>) -> vec3<f32> {
-    if lighting.ambient_light == 0u {
-        return vec3<f32>(0.0);
-    }
-    let n_squared = world_normal * world_normal;
-    let is_negative = vec3<f32>(world_normal < vec3<f32>(0.0)) * n_squared;
-    let is_positive = n_squared - is_negative;
-
-    return is_positive.x * lighting.ambient_cube[0].rgb
-        + is_negative.x * lighting.ambient_cube[1].rgb
-        + is_positive.y * lighting.ambient_cube[2].rgb
-        + is_negative.y * lighting.ambient_cube[3].rgb
-        + is_positive.z * lighting.ambient_cube[4].rgb
-        + is_negative.z * lighting.ambient_cube[5].rgb;
-}
-
-// `VertexAttenInternal` (`common_vs_fxc.h:733`).
-//
-// Three terms folded together with two `mix`es rather than branches, which is
-// Valve's shape and worth keeping: the light *type* is not a uniform here
-// either, it is the `w` of two of the light's own vectors, so a branch would
-// be per light rather than per draw.
-//
-//   distance: 1 / (a0 + a1*d + a2*d²)   -- `dst()` builds (1, d, d²)
-//   spot:     saturate( pow( max( 1e-4, (cos - phiDot) * ooDot ), falloff ) )
-//   select:   mix( dist, dist * spot, dir.w ) then mix( that, 1, color.w )
-//
-// The second `mix` is what makes a directional light unattenuated.
-fn light_attenuation(light: Light, world_pos: vec3<f32>) -> f32 {
-    var light_dir = light.position.xyz - world_pos;
-    let dist_squared = dot(light_dir, light_dir);
-    let one_over_dist = inverseSqrt(max(dist_squared, 1e-12));
-    light_dir = light_dir * one_over_dist;
-
-    // `dst( distSquared, ooDist ).xyz` is (1, d, d²).
-    let dist = vec3<f32>(1.0, dist_squared * one_over_dist, dist_squared);
-    let distance_atten = 1.0 / max(dot(light.attenuation.xyz, dist), 1e-6);
-
-    let cos_theta = dot(light.direction.xyz, -light_dir);
-    var spot_atten = (cos_theta - light.spot.z) * light.spot.w;
-    spot_atten = pow(max(1e-4, spot_atten), light.spot.x);
-    spot_atten = saturate(spot_atten);
-
-    let atten = mix(distance_atten, distance_atten * spot_atten, light.direction.w);
-    return mix(atten, 1.0, light.color.w);
-}
+// `shaders/modellighting.wgsl` declares group 3 and the two terms `Phong`
+// evaluates identically — the ambient cube and the attenuation. What is here
+// is the *diffuse* term, which the two shaders genuinely disagree about, and
+// the per-vertex accumulation built on it.
 
 // `CosineTermInternal` (`common_vs_fxc.h:781`), minus one CS:GO line.
 //
@@ -227,25 +142,7 @@ fn light_attenuation(light: Light, world_pos: vec3<f32>) -> f32 {
 // so the plain saturated dot is what stays. The same line appears in
 // `DiffuseTerm` (`common_vertexlitgeneric_dx9.h:99`) and is dropped there too.
 fn cosine_term(light: Light, world_normal: vec3<f32>, world_pos: vec3<f32>, half_lambert: bool) -> f32 {
-    // `normalize`, guarded. The reference writes a plain
-    // `normalize( cLightInfo[i].pos.xyz - worldPos )`, which is a NaN when a
-    // light sits exactly on the vertex being lit — and `mix` propagates it
-    // even on the branch that discards the result, so one degenerate vertex
-    // turns a whole surface into garbage rather than a black spot.
-    //
-    // Valve never hits it by construction, twice over: a real light has a real
-    // position, and `CompilePixelShaderLocalLights` (`shaderapidx8.cpp:8434`)
-    // even converts a *directional* light into a point light 10,000 units away
-    // so that this expression stays well-defined. The `max` is cheaper than
-    // relying on that and is the same answer everywhere else.
-    let to_light = light.position.xyz - world_pos;
-    let point_dir = to_light * inverseSqrt(max(dot(to_light, to_light), 1e-12));
-    // A directional light's direction is in the struct; a point or spot
-    // light's is derived. `color.w` selects, and the negation is Valve's:
-    // `cLightInfo.dir` points the way the light shines.
-    let light_dir = mix(point_dir, -light.direction.xyz, light.color.w);
-
-    let n_dot_l = dot(world_normal, light_dir);
+    let n_dot_l = dot(world_normal, light_direction(light, world_pos));
     if half_lambert {
         let scaled = n_dot_l * 0.5 + 0.5;
         return scaled * scaled;

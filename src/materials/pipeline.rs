@@ -28,7 +28,9 @@ use super::shader::{
     BINDING_BUMP2_SAMPLER, BINDING_BUMP2_TEXTURE, BINDING_BUMP_SAMPLER, BINDING_BUMP_TEXTURE,
     BINDING_DETAIL_SAMPLER, BINDING_DETAIL_TEXTURE, BINDING_ENVMAP_MASK_SAMPLER,
     BINDING_ENVMAP_MASK_TEXTURE, BINDING_ENVMAP_SAMPLER, BINDING_ENVMAP_TEXTURE,
-    BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE, BINDING_MATERIAL_UNIFORMS,
+    BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE, BINDING_LIGHTWARP_SAMPLER,
+    BINDING_LIGHTWARP_TEXTURE, BINDING_MATERIAL_UNIFORMS, BINDING_PHONGWARP_SAMPLER,
+    BINDING_PHONGWARP_TEXTURE, BINDING_PHONG_EXPONENT_SAMPLER, BINDING_PHONG_EXPONENT_TEXTURE,
     BINDING_REFRACT_SOURCE_SAMPLER, BINDING_REFRACT_SOURCE_TEXTURE, BINDING_REFRACT_TINT_SAMPLER,
     BINDING_REFRACT_TINT_TEXTURE, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
 };
@@ -226,6 +228,7 @@ pub struct BindLayouts {
     unlit_material: wgpu::BindGroupLayout,
     lightmapped_material: wgpu::BindGroupLayout,
     vertex_lit_material: wgpu::BindGroupLayout,
+    phong_material: wgpu::BindGroupLayout,
     refract_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
     model_lighting: wgpu::BindGroupLayout,
@@ -333,6 +336,41 @@ impl BindLayouts {
                     ],
                 },
             ),
+            phong_material: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("material: Phong"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: BINDING_MATERIAL_UNIFORMS,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    texture_entry(BINDING_BASE_TEXTURE),
+                    sampler_entry(BINDING_BASE_SAMPLER),
+                    texture_entry(BINDING_BUMP_TEXTURE),
+                    sampler_entry(BINDING_BUMP_SAMPLER),
+                    texture_entry(BINDING_DETAIL_TEXTURE),
+                    sampler_entry(BINDING_DETAIL_SAMPLER),
+                    texture_entry(BINDING_SELFILLUM_MASK_TEXTURE),
+                    sampler_entry(BINDING_SELFILLUM_MASK_SAMPLER),
+                    // No envmap *mask* entry, unlike `VertexLitGeneric`: this
+                    // shader has no such sampler, and its reflection is masked
+                    // by base alpha or the normal map's alpha instead.
+                    cube_texture_entry(BINDING_ENVMAP_TEXTURE),
+                    sampler_entry(BINDING_ENVMAP_SAMPLER),
+                    // The three this shader alone reads.
+                    texture_entry(BINDING_PHONG_EXPONENT_TEXTURE),
+                    sampler_entry(BINDING_PHONG_EXPONENT_SAMPLER),
+                    texture_entry(BINDING_LIGHTWARP_TEXTURE),
+                    sampler_entry(BINDING_LIGHTWARP_SAMPLER),
+                    texture_entry(BINDING_PHONGWARP_TEXTURE),
+                    sampler_entry(BINDING_PHONGWARP_SAMPLER),
+                ],
+            }),
             refract_material: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("material: Refract"),
                 entries: &[
@@ -404,6 +442,10 @@ impl BindLayouts {
                 &self.lightmapped_material
             }
             ShaderKind::VertexLitGeneric => &self.vertex_lit_material,
+            // A separate layout rather than `VertexLitGeneric`'s with three
+            // entries added: `Phong` drops the envmap mask and adds the
+            // exponent map and the two warps, so the two sets are not nested.
+            ShaderKind::Phong => &self.phong_material,
             ShaderKind::Refract => &self.refract_material,
         }
     }
@@ -805,6 +847,7 @@ mod tests {
             ShaderKind::LightmappedGeneric,
             ShaderKind::WorldVertexTransition,
             ShaderKind::VertexLitGeneric,
+            ShaderKind::Phong,
             ShaderKind::Refract,
         ] {
             // Both blend modes and both target formats, so the state axes that

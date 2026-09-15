@@ -65,12 +65,21 @@ use super::texture::Texture;
 use super::var::{MaterialFlags, MaterialVar};
 use super::vmt::Vmt;
 
-/// A shader a `.vmt` can name.
+/// A shader that draws — one WGSL module, one group-1 layout, one parameter
+/// table.
 ///
 /// Replaces `CShaderSystem::FindShader`'s dictionary
 /// (`shadersystem.cpp:1290`), which looked a name up in a `CUtlDict` populated
 /// by whichever `shaderapi.so` had been `dlopen`ed. There is no registration
 /// step here and no way to fail to be registered.
+///
+/// **Not quite "a shader a `.vmt` can name", and the gap is real in the
+/// original too.** Five of these are names content writes;
+/// [`Phong`](ShaderKind::Phong) is not a name at all, because
+/// `DrawVertexLitGeneric_DX9` redirects to it after the name lookup has
+/// already happened. [`from_name`](ShaderKind::from_name) answers the first
+/// question and [`resolve`](ShaderKind::resolve) answers "what draws this",
+/// which is the one almost every caller means.
 // `clippy::enum_variant_names`: every variant ends in `Generic`, and all three
 // names are content surface area — a `.vmt`'s outermost key is matched against
 // them (`ShaderKind::from_name`), so renaming one to satisfy a lint would
@@ -130,16 +139,43 @@ pub enum ShaderKind {
     /// shader.** `DrawVertexLitGeneric_DX9` (`vertexlitgeneric_dx9_helper.cpp:2346`)
     /// opens by handing the material to `DrawPhong_DX9` when `WantsPhongShader`
     /// says so — `$phong 1` plus any of a `$bumpmap`, a `$lightwarptexture` or
-    /// `$basemapalphaphongmask 1`. That is 307 of Portal 2's 1,108
-    /// `VertexLitGeneric` materials, and `Phong` is a separate entry in
-    /// `portdocs/MATERIALSYSTEM.md` §7.8 that is not ported: they draw here
-    /// without their specular. See [`wants_phong`].
+    /// `$basemapalphaphongmask`. That is **317 of the 1,135** materials that
+    /// name this shader, and they are [`ShaderKind::Phong`]'s. The redirect is
+    /// [`resolve`](ShaderKind::resolve) and the predicate is [`wants_phong`],
+    /// so anything holding a `.vmt` and asking "which shader is this" must
+    /// call the first of those rather than
+    /// [`from_name`](ShaderKind::from_name).
     VertexLitGeneric,
 
     /// Glass, and anything else that warps what is behind it: the screen-space
     /// refraction shader. 37 of Portal 2's materials name it, 29 of them under
     /// `materials/models/`.
     ///
+    /// Models with a specular highlight: the shader a fifth of Portal 2's
+    /// models really draw with. **317 of the 1,135 materials that name
+    /// `VertexLitGeneric` reach this instead**, 301 of them under
+    /// `materials/models/`, and 104 of the game's 106 maps place a static prop
+    /// wearing one.
+    ///
+    /// `stdshaders/phong_dx9_helper.cpp`, `phong_vs20.fxc` and
+    /// `phong_ps20b.fxc`.
+    ///
+    /// **No `.vmt` names it, and that is the one structural thing to know.**
+    /// There is no `SHADER( Phong )` anywhere in `stdshaders/` and no
+    /// `DEFINE_FALLBACK_SHADER` for it: the helper is reached only from
+    /// `DrawVertexLitGeneric_DX9`, which consults `WantsPhongShader` before
+    /// doing anything else (`vertexlitgeneric_dx9_helper.cpp:2346`). So
+    /// [`from_name`](ShaderKind::from_name) does **not** answer this variant —
+    /// [`resolve`](ShaderKind::resolve) does, and that is the function a
+    /// caller with a `.vmt` in hand wants. See [`wants_phong`] for the
+    /// predicate and [`phong_uniforms`] for the whole combo bucketing.
+    ///
+    /// It shares [`VertexLitGeneric`](ShaderKind::VertexLitGeneric)'s vertex
+    /// layout, its group 3 ([`ContextBinding::ModelLighting`], declared from
+    /// the shared `shaders/modellighting.wgsl`) and its parameter table, and
+    /// differs from it in what the pixel shader does with them.
+    Phong,
+
     /// `stdshaders/refract.cpp` through `refract_dx9_helper.cpp`,
     /// `Refract_vs20.fxc` and `refract_ps2x.fxc`.
     ///
@@ -199,6 +235,10 @@ impl ShaderKind {
     /// were fallback shaders selected by `IShader::GetFallbackShader` against a
     /// `dxlevel`, and `portdocs/MATERIALSYSTEM.md` §4.1 deletes that mechanism
     /// with the hardware variety that motivated it.
+    ///
+    /// **[`ShaderKind::Phong`] is deliberately not answerable here**, because
+    /// no `.vmt` names it: it is not an `IShader` in the original either. Use
+    /// [`resolve`](ShaderKind::resolve) when the whole `.vmt` is in hand.
     pub fn from_name(name: &str) -> Option<ShaderKind> {
         match name {
             n if n.eq_ignore_ascii_case("UnlitGeneric") => Some(ShaderKind::UnlitGeneric),
@@ -214,13 +254,43 @@ impl ShaderKind {
         }
     }
 
-    /// The name content writes, in its canonical spelling.
+    /// Which shader actually draws a `.vmt` — the name it wrote, then the one
+    /// redirect the original makes on top of it.
+    ///
+    /// `CShaderSystem` resolved a material to an `IShader` by name and stopped
+    /// there; `DrawVertexLitGeneric_DX9` then hands the material to
+    /// `DrawPhong_DX9` when `WantsPhongShader` says so
+    /// (`vertexlitgeneric_dx9_helper.cpp:2346`), which is a second dispatch one
+    /// layer down. Here both layers are this function, because a `ShaderKind`
+    /// is what picks the WGSL module, the bind group layout and the parameter
+    /// table, and a Phong material needs all three of Phong's.
+    ///
+    /// **Call this rather than [`from_name`](ShaderKind::from_name) wherever a
+    /// `.vmt` is available.** `from_name` answers "what did the content say",
+    /// which is what a diagnostic wants; this answers "what will draw it",
+    /// which is what everything else wants.
+    pub fn resolve(vmt: &Vmt) -> Option<ShaderKind> {
+        let kind = ShaderKind::from_name(&vmt.shader)?;
+        if kind == ShaderKind::VertexLitGeneric && wants_phong(vmt) {
+            return Some(ShaderKind::Phong);
+        }
+        Some(kind)
+    }
+
+    /// The shader's name, in the spelling the original gives it.
+    ///
+    /// For every variant but one this is also the name content writes.
+    /// [`Phong`](ShaderKind::Phong) is the exception — no `.vmt` can name it
+    /// — and it still answers `"Phong"`, because what this feeds is
+    /// diagnostics, pipeline labels and the depot census, all of which want to
+    /// say which shader is running rather than which one was asked for.
     pub fn name(self) -> &'static str {
         match self {
             ShaderKind::UnlitGeneric => "UnlitGeneric",
             ShaderKind::LightmappedGeneric => "LightmappedGeneric",
             ShaderKind::WorldVertexTransition => "WorldVertexTransition",
             ShaderKind::VertexLitGeneric => "VertexLitGeneric",
+            ShaderKind::Phong => "Phong",
             ShaderKind::Refract => "Refract",
         }
     }
@@ -269,7 +339,14 @@ impl ShaderKind {
             // `VertexShaderVertexFormat( VERTEX_POSITION | VERTEX_NORMAL |
             // VERTEX_COLOR_STREAM_1, 1, {2}, userDataSize )`
             // (`vertexlitgeneric_dx9_helper.cpp:895`).
-            ShaderKind::VertexLitGeneric => VertexLayout::Model,
+            //
+            // `Phong` asks for the same thing and has no second form at all:
+            // *"We always specify we're using user data, therefore we always
+            // need tangent spaces"* (`phong_dx9_helper.cpp:95`), so
+            // `userDataSize` is an unconditional 4 where `VertexLitGeneric`
+            // makes it conditional on `$bumpmap`. This port answers one layout
+            // for both, which for `Phong` is not even a simplification.
+            ShaderKind::VertexLitGeneric | ShaderKind::Phong => VertexLayout::Model,
             // `Refract` genuinely declares two formats and the axis is
             // `$model`: `VERTEX_POSITION | VERTEX_NORMAL` plus either
             // `userDataSize = 4` (a model, the tangent in user data) or
@@ -306,6 +383,10 @@ impl ShaderKind {
                 (LIGHTMAPPED_GENERIC_PARAMS, WORLD_VERTEX_TRANSITION_PARAMS)
             }
             ShaderKind::VertexLitGeneric => (VERTEX_LIT_GENERIC_PARAMS, &[]),
+            // The same declaration plus `PHONG_PARAMS` — see that table for
+            // why the split exists where Valve's `BEGIN_SHADER_PARAMS` block
+            // has none.
+            ShaderKind::Phong => (VERTEX_LIT_GENERIC_PARAMS, PHONG_PARAMS),
             ShaderKind::Refract => (REFRACT_PARAMS, &[]),
         };
         STANDARD_PARAMS.iter().chain(own).chain(extra)
@@ -328,7 +409,7 @@ impl ShaderKind {
             ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
                 Some(ContextBinding::LightmapPage)
             }
-            ShaderKind::VertexLitGeneric => Some(ContextBinding::ModelLighting),
+            ShaderKind::VertexLitGeneric | ShaderKind::Phong => Some(ContextBinding::ModelLighting),
             // Not lighting: `Refract` has none. What it reads out of the
             // render context is the frame it is being drawn into.
             ShaderKind::Refract => Some(ContextBinding::FrameBufferCopy),
@@ -354,9 +435,24 @@ impl ShaderKind {
                 include_str!("shaders/lightmappedgeneric.wgsl")
             }
             ShaderKind::VertexLitGeneric => include_str!("shaders/vertexlitgeneric.wgsl"),
+            ShaderKind::Phong => include_str!("shaders/phong.wgsl"),
             ShaderKind::Refract => include_str!("shaders/refract.wgsl"),
         };
-        format!("{}\n{}", include_str!("shaders/prelude.wgsl"), body)
+        // A second shared fragment, narrower than the prelude: group 3's
+        // *layout* is per shader, so a `@group(3)` declaration cannot live in
+        // something every shader includes — but it can be shared by the
+        // shaders that agree, and `VertexLitGeneric` and `Phong` do. See
+        // `shaders/modellighting.wgsl`.
+        let lighting = match self.context_binding() {
+            Some(ContextBinding::ModelLighting) => include_str!("shaders/modellighting.wgsl"),
+            _ => "",
+        };
+        format!(
+            "{}\n{}\n{}",
+            include_str!("shaders/prelude.wgsl"),
+            lighting,
+            body
+        )
     }
 }
 
@@ -646,10 +742,12 @@ const WORLD_VERTEX_TRANSITION_PARAMS: &[ShaderParam] = &[
 /// passes, which are three whole extra shaders drawn over the top of this one
 /// (`emissive_scroll_blended_pass_helper.cpp` and friends) and are HL2/Alien
 /// Swarm content, not Portal 2's. **Other shaders**: everything `$phong` pulls
-/// in, which reaches `phong_dx9_helper.cpp` instead — see
-/// [`wants_phong`]. **Features not ported**: wrinkle maps, tree sway, decal
-/// textures, tint masks, displacement, distance alpha, seamless mapping,
-/// self-illum fresnel, the flashlight and cascaded shadow maps.
+/// in, which reaches `phong_dx9_helper.cpp` instead — those are
+/// [`PHONG_PARAMS`], declared for [`ShaderKind::Phong`] and not for this one,
+/// because on a non-phong material they do nothing. **Features not ported**:
+/// wrinkle maps, tree sway, decal textures, tint masks, displacement, distance
+/// alpha, seamless mapping, self-illum fresnel, the flashlight and cascaded
+/// shadow maps.
 ///
 /// They are left out rather than declared-and-ignored, because a table that
 /// lists a parameter is a promise that setting it does something.
@@ -833,6 +931,128 @@ const VERTEX_LIT_GENERIC_PARAMS: &[ShaderParam] = &[
         kind: ParamKind::Integer,
         declared_default: "0",
         help: "disables sRGB conversion of the colour texture read",
+    },
+];
+
+/// `Phong`'s parameters *beyond* [`VERTEX_LIT_GENERIC_PARAMS`].
+///
+/// **Valve's declaration does not have this split, and the split is
+/// deliberate.** `vertexlitgeneric_dx9.cpp`'s `BEGIN_SHADER_PARAMS` block
+/// declares `$phongboost` and everything below whether or not a material ends
+/// up at `phong_dx9_helper.cpp`, because there is only one `IShader` and it
+/// owns the whole table. This module's rule is stricter: a table entry is a
+/// promise that setting the parameter does something, and on a
+/// `VertexLitGeneric` material that does *not* reach Phong, none of these does
+/// anything at all. So they are chained only for [`ShaderKind::Phong`],
+/// exactly as [`WORLD_VERTEX_TRANSITION_PARAMS`] is chained only for that
+/// name.
+///
+/// The three *dispatch* parameters stay in the shared table, because
+/// [`wants_phong`] reads them through `ShaderKind::VertexLitGeneric` before
+/// there is a `Phong` to read them through: `$phong`,
+/// `$basemapalphaphongmask` and `$lightwarptexture`.
+///
+/// Not declared, because the shader does not read them and nothing should
+/// imply otherwise: `$forcephong` (`mat_phong` has no video-options page here,
+/// so the outer test in `WantsPhongShader` is always true and forcing is
+/// redundant), `$ambientocclusion` (Source Filmmaker only), `$rimmask`'s
+/// companions `$compress`/`$stretch`/`$bumpcompress`/`$bumpstretch` (wrinkle
+/// maps, no Portal 2 content), `$decaltexture`/`$decalblendmode` and
+/// `$tintmasktexture` (likewise none), `$selfillumfresnel` and its min/max/exp
+/// (a commented-out body and a CS:GO team-ID glow), and `$displacementmap`.
+const PHONG_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$phongexponent",
+        kind: ParamKind::Float,
+        declared_default: "5.0",
+        help: "Phong exponent for local specular lights",
+    },
+    ShaderParam {
+        name: "$phongexponenttexture",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/BaseTexture",
+        help: "Phong Exponent map",
+    },
+    ShaderParam {
+        name: "$phongtint",
+        kind: ParamKind::Vec3,
+        declared_default: "5.0",
+        help: "Phong tint for local specular lights",
+    },
+    ShaderParam {
+        name: "$phongalbedotint",
+        kind: ParamKind::Bool,
+        declared_default: "1.0",
+        help: "Apply tint by albedo (controlled by spec exponent texture",
+    },
+    ShaderParam {
+        name: "$phongalbedoboost",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "Phong albedo overbrightening factor (specular mask channel \
+               should be authored to account for this)",
+    },
+    ShaderParam {
+        name: "$phongboost",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "Phong overbrightening factor (specular mask channel should be \
+               authored to account for this)",
+    },
+    ShaderParam {
+        name: "$phongfresnelranges",
+        kind: ParamKind::Vec3,
+        declared_default: "[0  0.5  1]",
+        help: "Parameters for remapping fresnel output",
+    },
+    ShaderParam {
+        name: "$phongwarptexture",
+        kind: ParamKind::Texture,
+        declared_default: "shadertest/BaseTexture",
+        help: "warp the specular term",
+    },
+    ShaderParam {
+        name: "$phongdisablehalflambert",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "Disable half lambert for phong",
+    },
+    ShaderParam {
+        name: "$basemapluminancephongmask",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "indicates that the base luminance should be used to mask phong",
+    },
+    ShaderParam {
+        name: "$invertphongmask",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "invert the phong mask (0=full phong, 1=no phong)",
+    },
+    ShaderParam {
+        name: "$rimlight",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "enables rim lighting",
+    },
+    ShaderParam {
+        name: "$rimlightexponent",
+        kind: ParamKind::Float,
+        declared_default: "4.0",
+        help: "Exponent for rim lights",
+    },
+    ShaderParam {
+        name: "$rimlightboost",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "Boost for rim lights",
+    },
+    ShaderParam {
+        name: "$rimmask",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "Indicates whether or not to use alpha channel of exponent \
+               texture to mask the rim term",
     },
 ];
 
@@ -1051,6 +1271,33 @@ pub const BINDING_BLEND_MODULATE_SAMPLER: u32 = 18;
 pub const BINDING_REFRACT_TINT_TEXTURE: u32 = 19;
 pub const BINDING_REFRACT_TINT_SAMPLER: u32 = 20;
 
+/// `Phong`'s three extra samplers.
+///
+/// Valve's numbering for them is 7, 2 and 1 (`phong_ps20b.fxc:194`, `:192`,
+/// `:191`) — scattered, because the sampler map at the top of
+/// `phong_dx9_helper.cpp` was filled in over years and the low slots went to
+/// the flashlight and the normalization cubemap. There is no reason to
+/// reproduce the scatter, so they continue this module's flat numbering.
+///
+/// `$phongexponenttexture` carries three unrelated things in three channels:
+/// `r` is the specular exponent, `g` scales the albedo tint, and `a` masks the
+/// rim term. An undefined one binds the standard white texture
+/// (`phong_dx9_helper.cpp:668`), which gives exponent 1, a full albedo tint
+/// and an unmasked rim — so the sampler needs no feature flag and the shader
+/// reads it unconditionally, as the original does.
+pub const BINDING_PHONG_EXPONENT_TEXTURE: u32 = 21;
+pub const BINDING_PHONG_EXPONENT_SAMPLER: u32 = 22;
+/// `$lightwarptexture`, `DiffuseWarpSampler`: a 1D ramp indexed by the scalar
+/// diffuse term, which is how a character gets subsurface-looking falloff.
+/// Bound as a 2D texture and sampled at `v = 0.5`, because the `.vtf` is 2D
+/// and `tex1D` read the same single row.
+pub const BINDING_LIGHTWARP_TEXTURE: u32 = 23;
+pub const BINDING_LIGHTWARP_SAMPLER: u32 = 24;
+/// `$phongwarptexture`, `SpecularWarpSampler`: a 2D table indexed by
+/// `((N·H)^k, fresnel)`, for iridescence. One Portal 2 material has one.
+pub const BINDING_PHONGWARP_TEXTURE: u32 = 25;
+pub const BINDING_PHONGWARP_SAMPLER: u32 = 26;
+
 /// Where the lightmap page is bound, in group **3**.
 ///
 /// Not in the material's group, and that is structural rather than a
@@ -1125,15 +1372,19 @@ impl TextureDimension {
 ///
 /// `WantsPhongShaderInternal` (`vertexlitgeneric_dx9_helper.cpp:70`), which
 /// `DrawVertexLitGeneric_DX9` consults before doing anything else and which
-/// sends 307 of Portal 2's 1,108 `VertexLitGeneric` materials to
+/// sends **317 of the game's 1,135** `VertexLitGeneric` materials to
 /// `DrawPhong_DX9` instead. `mat_phong` defaults to 1 and there is no video
 /// options page here, so `WantsPhongShader`'s outer `mat_phong` test is taken
-/// as true and `$forcephong` is redundant.
+/// as true and `$forcephong` is redundant — one material sets it.
 ///
-/// **`Phong` is not ported**, so this does not change which code draws the
-/// material — it draws here, without specular. What it *is* for is saying so
-/// once, at load, instead of leaving a fifth of the game's models quietly
-/// wrong with nothing recording why.
+/// This is the predicate; [`ShaderKind::resolve`] is the redirect built on it,
+/// and is what callers should use.
+///
+/// Measured, because the three branches are not equally used: **all 110 of the
+/// unbumped materials arrive through `$basemapalphaphongmask`**, and not one
+/// reaches Phong through `$lightwarptexture` alone — every material with a
+/// light warp also has a bump map or the alpha mask. So the middle branch
+/// below has no shipped content and is kept because the reference has it.
 pub fn wants_phong(vmt: &Vmt) -> bool {
     let kind = ShaderKind::VertexLitGeneric;
     let defined = |name| {
@@ -1284,6 +1535,75 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
                 binding: BINDING_ENVMAP_TEXTURE,
                 color_space: ColorSpace::Linear,
                 dimension: TextureDimension::Cube,
+            },
+        ],
+        // `InitPhong_DX9` (`phong_dx9_helper.cpp:132`), which is the same
+        // shape as the shader above — one `LoadTexture` per feature with its
+        // sRGB flag spelled out — and differs from it in three places:
+        //
+        // - **there is no `$envmapmask`**: this shader has no envmap-mask
+        //   sampler at all, so the reflection's mask is base alpha or the
+        //   normal map's alpha and nothing else. One Portal 2 material sets
+        //   the parameter and gets nothing.
+        // - **three textures it alone reads** — the specular exponent map, the
+        //   diffuse (light) warp and the specular (phong) warp — all three
+        //   loaded with no flag (`:174`, `:180`, `:186`), so all three are
+        //   data rather than colour. The exponent map is the clearest case:
+        //   its `r` is an exponent in the range 1..150.
+        // - `$selfillummask` and `$bumpmap` are unchanged, and `$envmap` takes
+        //   the same `GetHDRType()` branch, so it is linear in an HDR game.
+        ShaderKind::Phong => vec![
+            TextureRequest {
+                param: "$basetexture",
+                binding: BINDING_BASE_TEXTURE,
+                color_space: base_texture_color_space(kind, vmt),
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$bumpmap",
+                binding: BINDING_BUMP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$detail",
+                binding: BINDING_DETAIL_TEXTURE,
+                color_space: if is_srgb_detail_texture(detail_blend_mode(vmt)) {
+                    ColorSpace::Srgb
+                } else {
+                    ColorSpace::Linear
+                },
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$selfillummask",
+                binding: BINDING_SELFILLUM_MASK_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$envmap",
+                binding: BINDING_ENVMAP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::Cube,
+            },
+            TextureRequest {
+                param: "$phongexponenttexture",
+                binding: BINDING_PHONG_EXPONENT_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$lightwarptexture",
+                binding: BINDING_LIGHTWARP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$phongwarptexture",
+                binding: BINDING_PHONGWARP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
             },
         ],
         // `InitRefract_DX9` (`refract_dx9_helper.cpp:99`), which is four
@@ -1572,9 +1892,10 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         // carries its baked light in its vertices, not in the atlas.
         // `Refract` sets neither lighting flag — it is not lit at all, and its
         // colour comes from the frame behind it plus an environment map.
-        ShaderKind::UnlitGeneric | ShaderKind::VertexLitGeneric | ShaderKind::Refract => {
-            Lighting::None
-        }
+        ShaderKind::UnlitGeneric
+        | ShaderKind::VertexLitGeneric
+        | ShaderKind::Phong
+        | ShaderKind::Refract => Lighting::None,
         ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -2008,6 +2329,411 @@ pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms {
     }
 }
 
+/// Flags in [`PhongUniforms::flags`]. Bucket 2 of `Phong`'s combo split — see
+/// [`phong_uniforms`] for the whole bucketing.
+#[allow(dead_code)]
+pub struct PhongFlags;
+
+impl PhongFlags {
+    /// Alpha testing, fixed-function state in D3D9.
+    ///
+    /// **Not reconciled against the other users of base alpha, unlike
+    /// [`VertexLitFlags::ALPHA_TEST`]**, and that is Valve's:
+    /// `InitVertexLitGeneric_DX9` returns into `InitPhong_DX9` at `:361`, well
+    /// before the *"Don't alpha test if the alpha channel is used for other
+    /// purposes"* clear at `:419`. So a Phong material alpha-tests even when
+    /// `$selfillum` has claimed base alpha. One of the game's 317 sets
+    /// `$alphatest`.
+    pub const ALPHA_TEST: u32 = 1 << 0;
+    /// `SHADER_FOGMODE_DISABLED`. Set by `$nofog`.
+    pub const NO_FOG: u32 = 1 << 1;
+    /// The material has a `$bumpmap`.
+    ///
+    /// **Not a lighting-path switch here.** The original samples the normal
+    /// map unconditionally and binds `TEXTURE_NORMALMAP_FLAT` when there is
+    /// none (`phong_dx9_helper.cpp:678`), so this only chooses between a
+    /// texture fetch and the constant `(0, 0, 1)` that a flat normal map
+    /// decodes to. 110 of the 317 are unbumped.
+    pub const BUMPMAP: u32 = 1 << 2;
+    /// `CUBEMAP`: the material has a usable `$envmap`. 123 set the parameter,
+    /// but 92 of those say `env_cubemap`, which names no file — see
+    /// [`envmap_name`].
+    pub const ENVMAP: u32 = 1 << 3;
+    /// `SELFILLUM`: part of the albedo is emitted rather than lit.
+    pub const SELFILLUM: u32 = 1 << 4;
+    /// A `$selfillummask` texture is bound, so the mask comes from it rather
+    /// than from base alpha. Also the `w` of
+    /// [`PhongUniforms::shader_controls2`], because the shader needs it as a
+    /// number in the alpha arithmetic as well as as a branch.
+    pub const SELFILLUM_MASK: u32 = 1 << 5;
+    /// `DETAILTEXTURE`: a `$detail` texture is bound.
+    pub const DETAIL: u32 = 1 << 6;
+    /// `RIMLIGHT`: `$rimlight`, which also needs `$phong` — and `r_rimlight`,
+    /// a cheat cvar that defaults on and is not ported.
+    pub const RIMLIGHT: u32 = 1 << 7;
+    /// `LIGHTWARPTEXTURE`: `$lightwarptexture` replaces the scalar diffuse
+    /// term with a 1D ramp lookup, and suppresses the half-Lambert square.
+    pub const LIGHTWARP: u32 = 1 << 8;
+    /// `PHONGWARPTEXTURE`: `$phongwarptexture` warps the specular term by
+    /// `((N·H)^k, fresnel)`, and takes the fresnel multiply away from the
+    /// specular result.
+    pub const PHONGWARP: u32 = 1 << 9;
+    /// `PHONG_HALFLAMBERT`, **on by default** — the reverse of
+    /// [`VertexLitFlags::HALF_LAMBERT`], which is off unless `$halflambert`
+    /// says otherwise. See [`phong_uniforms`].
+    pub const HALF_LAMBERT: u32 = 1 << 10;
+}
+
+/// `Phong`'s material block — group 1, binding 0.
+///
+/// The four-component packings are Valve's own constant registers rather than
+/// a convenience here, and two of them are facts worth keeping: the rim
+/// exponent really does live in the `w` of the specular tint, and the detail
+/// blend factor really does share a slot with `$phongalbedoboost`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct PhongUniforms {
+    /// `$basetexturetransform`, two rows dotted against `(u, v, 0, 1)`.
+    pub base_texture_transform: [[f32; 4]; 2],
+    /// `$bumptransform`, `cBumpTexCoordTransform`.
+    pub bump_transform: [[f32; 4]; 2],
+    /// `cDetailTexCoordTransform`: `$detailtexturetransform` scaled by
+    /// `$detailscale`.
+    pub detail_transform: [[f32; 4]; 2],
+    /// `g_SelfIllumTint_and_DetailBlendFactorOrPhongAlbedoBoost`.
+    /// `$selfillumtint` in `rgb`; `w` is `$detailblendfactor` when the material
+    /// has a `$detail` and `$phongalbedoboost` when it does not
+    /// (`phong_dx9_helper.cpp:610`). **One register, two meanings** — the
+    /// reference's own variable name says so, and the pixel shader has two
+    /// spellings of the albedo-tint branch for exactly this reason. Free on
+    /// content: no Portal 2 material sets `$phongalbedoboost`.
+    pub selfillum_tint: [f32; 4],
+    /// `g_vPsConst2`. `$envmaptint` in `rgb` — **in gamma space, undecoded** —
+    /// and `w` set when the envmap mask is the normal map's alpha rather than
+    /// base alpha.
+    ///
+    /// The gamma space is the point. `DrawPhong_DX9` builds this constant with
+    /// a plain `GetVecValue` (`:800`), where `DrawVertexLitGeneric_DX9` reaches
+    /// `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` and `Refract`
+    /// reaches the 256-entry table — three shaders, three answers. See
+    /// [`gamma_to_linear_full_range_param`], and do not "fix" the asymmetry:
+    /// `[0.05 0.05 0.05]` decoded is 0.0014, a factor of 36.
+    pub envmap_tint: [f32; 4],
+    /// `g_FresnelSpecParams`: `$phongfresnelranges` in `xyz`, `$phongboost` in
+    /// `w`.
+    pub fresnel_spec: [f32; 4],
+    /// `g_SpecularRimParams`: `$phongtint` in `xyz` — or `x` negative, meaning
+    /// "tint with the albedo" — and the rim exponent in `w`.
+    pub specular_rim: [f32; 4],
+    /// `g_ShaderControls`, four unrelated `lerp` weights in one register:
+    /// `x` = `$basemapalphaphongmask`, `y` unused, `z` = the inverse of
+    /// `$blendtintbybasealpha` (and **-1** under `$notint`), `w` =
+    /// `$invertphongmask`.
+    pub shader_controls: [f32; 4],
+    /// `g_ShaderControls2`: `x` = `$envmapfresnel`, `y` =
+    /// `$basemapluminancephongmask`, `z` = `$phongexponent` (**0 meaning "read
+    /// the exponent map"**), `w` = 1 when a `$selfillummask` is bound.
+    pub shader_controls2: [f32; 4],
+    /// `x` = the rim mask control, `y` = `$rimlightboost`.
+    ///
+    /// Valve splits these across two *repurposed flashlight registers* on the
+    /// PC path — `PSREG_FLASHLIGHT_ATTENUATION.x` and
+    /// `PSREG_FLASHLIGHT_POSITION_RIM_BOOST.w`, with a comment on each saying
+    /// it is overridden — and packs them into `PSREG_RIMPARAMS` on console,
+    /// where the single-pass flashlight needs its own registers back. This is
+    /// the console packing, because there is no flashlight here to take
+    /// registers from.
+    pub rim_params: [f32; 4],
+    /// `$alphatestreference`, or the fixed-function default of 0.7.
+    pub alpha_test_reference: f32,
+    /// `$detailblendmode`, one of [`detail_blend`]'s values.
+    pub detail_blend_mode: i32,
+    /// [`PhongFlags`].
+    pub flags: u32,
+    pub _padding: u32,
+}
+
+/// Builds `Phong`'s material block for a `.vmt`.
+///
+/// # The combo bucketing
+///
+/// `phong_ps20b.fxc` declares 19 static and 8 dynamic axes and **not one
+/// survives as a pipeline variant**, so this shader is a single pipeline shape
+/// and its variety comes from [`render_state`] alone. The full table is in
+/// `portdocs/MATERIALSYSTEM.md` §9's stage 6; the short form is that eleven
+/// axes are pinned by the platform or by an unported feature (`SFM`, the
+/// flashlight and its two shadow axes, `UBERLIGHT`, the four CSM axes,
+/// `SHADER_SRGB_READ`, `WORLD_NORMAL`, the two dest-alpha axes), four are
+/// pinned **on a content measurement** (`WRINKLEMAP`, `DECAL_BLEND_MODE`,
+/// `TINTMASKTEXTURE`, `SELFILLUMFRESNEL`), and the rest are the flags above
+/// plus `$detailblendmode` and `NUM_LIGHTS`.
+///
+/// # Three CS:GO-shaped defaults, and the third is reversed here
+///
+/// `PORTING.md`'s standing warning about the `cstrike15` base arrives in this
+/// shader for the third time. The first two were found in `VertexLitGeneric`
+/// and are already reversed there: `bHalfLambert` hard-coded `false`, and
+/// `SoftenCosineTerm`. The third is **`bPhongHalfLambert`**
+/// (`phong_dx9_helper.cpp:479`):
+///
+/// ```text
+/// //bool bPhongHalfLambert = false; IS_PARAM_DEFINED( info.m_nPhongDisableHalfLambert ) ? (params[...]->GetIntValue() == 0) : true;
+/// // Disabling half-lambert for CSGO (not 'compatible' with CSM's - fixes bad shadow aliasing on viewmodels in particular).
+/// bool bPhongHalfLambert = false;
+/// ```
+///
+/// — and the parameter's own declaration says what the commented-out line
+/// means: *"Half lambert has always been forced on in phong, so the only safe
+/// way to allow artists to disable half lambert is to create this param that
+/// disables the default behavior of forcing half lambert on."* So Portal 2's
+/// Phong is half-Lambert **on**, and `$phongdisablehalflambert 1` is the only
+/// way off.
+///
+/// **The content proves it rather than the comment.** 26 of the 317 materials
+/// write the parameter and **20 of them write `1`**, which would be a no-op
+/// against an off-by-default. And note it is *not* the `$halflambert` material
+/// flag, which this shader never reads — 25 of the 317 set that flag and get
+/// nothing from it.
+///
+/// # Parameters content sets that this shader ignores
+///
+/// Each is Valve's, and each is worth knowing because the numbers are not
+/// small: `$envmapcontrast` (51 materials), `$envmapsaturation` (24),
+/// `$envmapmask` (1 — there is no envmap-mask sampler at all),
+/// `$basealphaenvmapmask` (18 — base alpha is this shader's envmap mask
+/// whether the flag is set or not, so it changes nothing),
+/// `$selfillummaskscale`, `$halflambert` (25), `$multiply` (0) and
+/// `$detailtint` (0).
+pub fn phong_uniforms(vmt: &Vmt) -> PhongUniforms {
+    let kind = ShaderKind::Phong;
+    let value = |name| param_value(kind, vmt, name);
+    let transform = |name| {
+        value(name)
+            .map(|var| var.as_matrix())
+            .unwrap_or(super::var::IDENTITY)
+    };
+    let defined = |name| {
+        vmt.var(name)
+            .and_then(|var| var.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    let float = |name, default| init_float(vmt, name, default);
+    // `params[X]->GetIntValue() != 0`, false for a parameter nobody set —
+    // which is what `InitParamsPhong_DX9`'s `InitIntParam( X, params, 0 )`
+    // leaves behind.
+    let boolean = |name| value(name).is_some_and(|var| var.as_bool());
+    // The shader wants these as `lerp` weights, which is how a shader model
+    // with no branches spelled a boolean.
+    let one_if = |condition: bool| if condition { 1.0f32 } else { 0.0 };
+
+    let base = transform("$basetexturetransform");
+    let bump = transform("$bumptransform");
+    let detail_scale = float("$detailscale", 4.0);
+    let detail = transform("$detailtexturetransform");
+    let detail = [
+        [
+            detail[0][0] * detail_scale,
+            detail[0][1] * detail_scale,
+            detail[0][2] * detail_scale,
+            detail[0][3] * detail_scale,
+        ],
+        [
+            detail[1][0] * detail_scale,
+            detail[1][1] * detail_scale,
+            detail[1][2] * detail_scale,
+            detail[1][3] * detail_scale,
+        ],
+    ];
+
+    // `ComputePhongShaderInfo` (`phong_dx9_helper.cpp:269`).
+    let has_bump = defined("$bumpmap");
+    let has_envmap = envmap_name(vmt).is_some();
+    let has_detail = defined("$detail");
+    let has_exponent_texture = defined("$phongexponenttexture");
+    let has_lightwarp = defined("$lightwarptexture");
+    let has_phongwarp = defined("$phongwarptexture");
+    // `r_rimlight` is a cheat cvar defaulting to 1 and is not registered here,
+    // so it is taken as on. `m_bHasPhong` is true by construction: a material
+    // only reaches this shader through `wants_phong`.
+    let has_rim = boolean("$rimlight");
+    // Same reading as `vertex_lit_uniforms`: `InitPhong_DX9:157` clears
+    // `MATERIAL_VAR_SELFILLUM` when the base texture has no alpha to hold the
+    // mask, and the texture is not available here, so the flag is taken at face
+    // value — fully emissive rather than subtly wrong.
+    let has_selfillum = vmt.flags.contains(MaterialFlags::SELFILLUM);
+    let has_selfillum_mask = has_selfillum && defined("$selfillummask");
+
+    let mut flags = 0;
+    if vmt.flags.contains(MaterialFlags::ALPHATEST) {
+        flags |= PhongFlags::ALPHA_TEST;
+    }
+    if vmt.flags.contains(MaterialFlags::NOFOG) {
+        flags |= PhongFlags::NO_FOG;
+    }
+    if has_bump {
+        flags |= PhongFlags::BUMPMAP;
+    }
+    if has_envmap {
+        flags |= PhongFlags::ENVMAP;
+    }
+    if has_selfillum {
+        flags |= PhongFlags::SELFILLUM;
+    }
+    if has_selfillum_mask {
+        flags |= PhongFlags::SELFILLUM_MASK;
+    }
+    if has_detail {
+        flags |= PhongFlags::DETAIL;
+    }
+    if has_rim {
+        flags |= PhongFlags::RIMLIGHT;
+    }
+    if has_lightwarp {
+        flags |= PhongFlags::LIGHTWARP;
+    }
+    if has_phongwarp {
+        flags |= PhongFlags::PHONGWARP;
+    }
+    // On unless the material opts out — see this function's header.
+    if !boolean("$phongdisablehalflambert") {
+        flags |= PhongFlags::HALF_LAMBERT;
+    }
+
+    // `float vSpecularTint[4] = {1, 1, 1, 4}` (`:820`), whose `w` is the rim
+    // exponent's default. `$phongtint` overwrites `xyz` only.
+    let mut specular_tint = match value("$phongtint") {
+        Some(var) => {
+            let tint = var.as_vec4();
+            [tint[0], tint[1], tint[2], 4.0]
+        }
+        None => [1.0, 1.0, 1.0, 4.0],
+    };
+    if has_rim {
+        if let Some(var) = value("$rimlightexponent") {
+            // "Make sure this is at least 1". Seven distinct values ship and
+            // three of them — 0.2, 0.5 and 0.8, on 19 materials — are below
+            // it, so this clamp is load-bearing rather than defensive.
+            specular_tint[3] = var.as_f32().max(1.0);
+        }
+    }
+    // "If it's all zeros, there was no constant tint in the vmt" — and what
+    // happens next depends on whether there is a map to tint *from*.
+    // `bHasPhongTintMap` is `$phongexponenttexture` **and** `$phongalbedotint`,
+    // and `-1` in `x` is the flag the pixel shader tests.
+    //
+    // Measured: four materials write `$phongtint "[0 0 0]"` — the four
+    // `paint/bridge_paint_*` — and **none of them has an exponent texture**, so
+    // every one takes the white substitution and the shader's albedo-tint
+    // branch is unreachable on shipped content. It is ported anyway, because
+    // pinning it off would be a divergence to explain rather than a saving.
+    if specular_tint[..3].iter().all(|channel| *channel == 0.0) {
+        if has_exponent_texture && boolean("$phongalbedotint") {
+            specular_tint[0] = -1.0;
+        } else {
+            specular_tint[0] = 1.0;
+            specular_tint[1] = 1.0;
+            specular_tint[2] = 1.0;
+        }
+    }
+
+    // `float vFresnelRanges_SpecBoost[4] = {0, 0.5, 1, 1}` (`:821`).
+    let ranges = match value("$phongfresnelranges") {
+        Some(var) => var.as_vec4(),
+        None => [0.0, 0.5, 1.0, 0.0],
+    };
+
+    // One register, two meanings — see [`PhongUniforms::selfillum_tint`].
+    let blend_factor_or_albedo_boost = if has_detail {
+        float("$detailblendfactor", 1.0)
+    } else {
+        float("$phongalbedoboost", 1.0)
+    };
+    let selfillum_tint = init_vec(vmt, "$selfillumtint", [1.0, 1.0, 1.0, 0.0]);
+    // **Undecoded**, unlike `VertexLitGeneric`'s. See
+    // [`PhongUniforms::envmap_tint`].
+    let envmap_tint = init_vec(vmt, "$envmaptint", [1.0, 1.0, 1.0, 0.0]);
+
+    PhongUniforms {
+        base_texture_transform: [base[0], base[1]],
+        bump_transform: [bump[0], bump[1]],
+        detail_transform: detail,
+        selfillum_tint: [
+            selfillum_tint[0],
+            selfillum_tint[1],
+            selfillum_tint[2],
+            blend_factor_or_albedo_boost,
+        ],
+        envmap_tint: [
+            envmap_tint[0],
+            envmap_tint[1],
+            envmap_tint[2],
+            one_if(vmt.flags.contains(MaterialFlags::NORMALMAPALPHAENVMAPMASK)),
+        ],
+        fresnel_spec: [ranges[0], ranges[1], ranges[2], float("$phongboost", 1.0)],
+        specular_rim: specular_tint,
+        shader_controls: [
+            one_if(boolean("$basemapalphaphongmask")),
+            0.0,
+            // `bNoTint ? -1.0f : ( 1.0f - fBlendTintByBaseAlpha )` (`:768`).
+            // The saturate in the shader turns -1 into "no modulation at all",
+            // 0 into "base alpha decides" and 1 into "all of it".
+            if boolean("$notint") {
+                -1.0
+            } else {
+                1.0 - one_if(boolean("$blendtintbybasealpha"))
+            },
+            one_if(boolean("$invertphongmask")),
+        ],
+        shader_controls2: [
+            // Written only when there is an envmap to apply it to, which is
+            // the reference's own guard (`:920`).
+            if has_envmap {
+                float("$envmapfresnel", 0.0)
+            } else {
+                0.0
+            },
+            one_if(boolean("$basemapluminancephongmask")),
+            // **Zero is a sentinel, not a value**: it tells the shader to read
+            // the exponent out of `$phongexponenttexture`'s red channel
+            // instead. 71 of the 317 materials have an exponent texture and no
+            // `$phongexponent`, so that is the live path rather than a
+            // fallback. `$phongexponent 0` in a `.vmt` would mean the same
+            // thing, which is Valve's overloading and not this port's.
+            value("$phongexponent")
+                .map(|var| var.as_f32())
+                .unwrap_or(0.0),
+            one_if(has_selfillum_mask),
+        ],
+        rim_params: [
+            // `bHasRimMaskMap ? params[$rimmask]->GetFloatValue() : 0`, and
+            // `bHasRimMaskMap` needs the exponent texture as well as the flag,
+            // because the mask lives in that texture's alpha. **No Portal 2
+            // material sets `$rimmask`**, so this is 0 throughout the shipped
+            // game and `fRimMask` is 1.
+            if has_exponent_texture && has_rim && boolean("$rimmask") {
+                float("$rimmask", 0.0)
+            } else {
+                0.0
+            },
+            if has_rim {
+                float("$rimlightboost", 1.0)
+            } else {
+                1.0
+            },
+            0.0,
+            0.0,
+        ],
+        alpha_test_reference: alpha_test_reference(kind, vmt),
+        detail_blend_mode: if has_detail {
+            detail_blend_mode(vmt)
+        } else {
+            detail_blend::NONE
+        },
+        flags,
+        _padding: 0,
+    }
+}
+
 /// Flags in [`RefractUniforms::flags`]. Bucket 2 of `Refract`'s combo split —
 /// see [`refract_uniforms`] for the whole bucketing.
 #[allow(dead_code)]
@@ -2382,11 +3108,31 @@ pub fn envmap_name(vmt: &Vmt) -> Option<&str> {
 /// leaving it gamma for the pixel path, which cannot both be right. It defaults
 /// to white, and no Portal 2 content found so far sets it.
 ///
-/// **The value stays in gamma space**, which is Valve's behaviour and looks
-/// wrong until you follow it through: the texture sample is linear (the
-/// hardware decoded it), and this multiplies it un-linearized. Content was
-/// authored against that, so `$color "[.5 .5 .5]"` has to keep meaning what it
-/// meant in 2011 rather than what it should have meant.
+/// # The value stays in gamma space, and for the pixel shaders that is a gap
+///
+/// **This is a known divergence, found while porting [`Phong`](ShaderKind::Phong)
+/// and deliberately left for its own change**, because fixing it moves every
+/// tinted model in the game and wants its own verification.
+///
+/// Valve writes the modulation into *two* registers with *two* different
+/// transforms. `cModulationColor` (VS `c47`) is gamma, which is what this
+/// returns. `g_DiffuseModulation` (PS `c1`) depends on which
+/// `PI_SetModulationPixelShaderDynamicState*` a shader emits, and the live
+/// handler for the one the model shaders emit is
+/// `GammaToLinearExtendedSIMD( color2 * instanceModulation )`
+/// (`shaderapidx8.cpp:8664`, under `USE_OLD_GAMMA == false`) — so **the pixel
+/// shader's copy is linear**. `VertexLitGeneric` reaches it whenever
+/// `bSRGBWrite` (`vertexlitgeneric_dx9_helper.cpp:654`, and this port's frame
+/// buffer is sRGB), and `Phong` reaches it unconditionally
+/// (`phong_dx9_helper.cpp:626`). `LightmappedGeneric` emits the *gamma*
+/// variant (`lightmappedgeneric_dx9_helper.cpp:830`), so the asymmetry is
+/// three-way again and this value is right for the world path.
+///
+/// A previous reading of `ApplyColor2Factor` (`BaseShader.cpp:731`) concluded
+/// the two could not both be right; they can, because they are two registers.
+/// Reversing it is one call to [`gamma_to_linear_param`]-shaped arithmetic
+/// applied only for the model shaders, plus a check of what
+/// `$color`/`$color2`/`$alpha` content expects.
 pub fn modulation_color(kind: ShaderKind, vmt: &Vmt) -> [f32; 4] {
     let value = |name| param_value(kind, vmt, name);
     let color = value("$color").map(|var| var.as_vec4()).unwrap_or([1.0; 4]);
@@ -2562,9 +3308,16 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, textures: ResolvedTextures) -> 
     // blending in Valve's engine too. Content does not set it on world
     // surfaces; reproducing the gap costs nothing and diverging from it would
     // be a silent change to how a wall blends.
+    //
+    // **`Phong` is excluded for the same reason and it is a different gap.**
+    // `DrawPhong_DX9`'s shadow block has no `MATERIAL_VAR_MULTIPLY` case at
+    // all, so a material that reaches Phong loses `$multiply` even though the
+    // shader it named would have honoured it. Measured: **none of the game's
+    // 317 Phong materials sets it**, so the gap is invisible on shipped
+    // content.
     if !matches!(
         kind,
-        ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition
+        ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition | ShaderKind::Phong
     ) && flags.contains(MaterialFlags::MULTIPLY)
     {
         state.blend = BlendMode::Multiply;
@@ -2757,9 +3510,12 @@ mod tests {
         assert_eq!(ShaderKind::from_name("UnlitGeneric_dx9"), None);
         assert_eq!(ShaderKind::from_name("LightmappedGeneric_dx9"), None);
         assert_eq!(ShaderKind::from_name("VertexLitGeneric_dx9"), None);
-        // Phong is a real Valve shader name and is deliberately not ported:
-        // the materials that want it reach `VertexLitGeneric` instead. See
-        // `wants_phong`.
+        // **`Phong` is not a shader name at all.** There is no
+        // `SHADER( Phong )` in `stdshaders/` and no `DEFINE_FALLBACK_SHADER`
+        // for it; the materials that draw with it name `VertexLitGeneric` and
+        // are redirected by `WantsPhongShader`. So this stays `None` and
+        // `ShaderKind::resolve` is the thing that answers `Phong` — see
+        // `a_phong_material_resolves_to_phong_and_is_not_nameable`.
         assert_eq!(ShaderKind::from_name("Phong"), None);
     }
 
@@ -2999,6 +3755,9 @@ mod tests {
         // Three 2x4 transforms, five vec4s, then four words.
         assert_eq!(size_of::<VertexLitUniforms>(), 3 * 32 + 5 * 16 + 16);
         assert_eq!(size_of::<VertexLitUniforms>() % 16, 0);
+        // Three 2x4 transforms, seven vec4s, then four words.
+        assert_eq!(size_of::<PhongUniforms>(), 3 * 32 + 7 * 16 + 16);
+        assert_eq!(size_of::<PhongUniforms>() % 16, 0);
     }
 
     // ---------------------------------------------------------------------
@@ -3013,10 +3772,10 @@ mod tests {
     }
 
     #[test]
-    fn phong_materials_are_recognised_but_not_ported() {
+    fn a_phong_material_resolves_to_phong_and_is_not_nameable() {
         // `WantsPhongShaderInternal` (`vertexlitgeneric_dx9_helper.cpp:70`),
         // which decides whether a `VertexLitGeneric` `.vmt` is really drawn by
-        // `Phong` — 307 of Portal 2's 1,108 of them.
+        // `Phong` — 317 of the game's 1,135 of them.
 
         // `$phong` alone is not enough: there has to be a mask to use.
         assert!(!wants_phong(&model_vmt(r#""$phong" "1""#)));
@@ -3039,6 +3798,344 @@ mod tests {
         // And without `$phong` nothing else matters.
         assert!(!wants_phong(&model_vmt(r#""$bumpmap" "x""#)));
         assert!(!wants_phong(&model_vmt(r#""$phong" "0" "$bumpmap" "x""#)));
+
+        // `resolve` is the redirect built on the predicate, and it is the only
+        // way to reach `ShaderKind::Phong`: no `.vmt` names it, and
+        // `from_name` says so (`unknown_shader_names_do_not_resolve`).
+        let phong = model_vmt(r#""$phong" "1" "$bumpmap" "x""#);
+        assert_eq!(ShaderKind::resolve(&phong), Some(ShaderKind::Phong));
+        assert_eq!(
+            ShaderKind::from_name(&phong.shader),
+            Some(ShaderKind::VertexLitGeneric),
+            "the name the content wrote is unchanged"
+        );
+        let plain = model_vmt(r#""$bumpmap" "x""#);
+        assert_eq!(
+            ShaderKind::resolve(&plain),
+            Some(ShaderKind::VertexLitGeneric)
+        );
+        // The redirect is `VertexLitGeneric`'s alone. `$phong` on a world
+        // material reaches `DrawLightmappedGeneric_DX9`, which has its own
+        // unported phong path and no dispatch.
+        let world = {
+            let text = r#""LightmappedGeneric" { "$phong" "1" "$bumpmap" "x" }"#;
+            let document = keyvalues::parse("test.vmt", text).expect("valid keyvalues");
+            Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
+        };
+        assert_eq!(
+            ShaderKind::resolve(&world),
+            Some(ShaderKind::LightmappedGeneric)
+        );
+    }
+
+    fn phong_vmt(body: &str) -> Vmt {
+        let text = format!(r#""VertexLitGeneric" {{ "$phong" "1" "$bumpmap" "b" {body} }}"#);
+        let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
+        let vmt = Vmt::from_keyvalues("test.vmt", &document).expect("a shader block");
+        assert_eq!(
+            ShaderKind::resolve(&vmt),
+            Some(ShaderKind::Phong),
+            "the fixture has to actually reach Phong"
+        );
+        vmt
+    }
+
+    #[test]
+    fn phong_declares_its_own_parameters_and_shares_the_dispatch_ones() {
+        // Valve has one `BEGIN_SHADER_PARAMS` block for both shaders; this
+        // module splits it, because a table entry is a promise that setting
+        // the parameter does something and on a non-phong material it does
+        // not. See `PHONG_PARAMS`.
+        let declared = |kind: ShaderKind, name: &str| kind.param(name).is_some();
+
+        for name in ["$phongboost", "$phongexponent", "$rimlight", "$rimmask"] {
+            assert!(declared(ShaderKind::Phong, name), "Phong declares {name}");
+            assert!(
+                !declared(ShaderKind::VertexLitGeneric, name),
+                "VertexLitGeneric does not declare {name}"
+            );
+        }
+        // The three dispatch parameters are the exception: `wants_phong` reads
+        // them through `VertexLitGeneric` before there is a `Phong` to read
+        // them through, so both tables carry them.
+        for name in ["$phong", "$basemapalphaphongmask", "$lightwarptexture"] {
+            assert!(declared(ShaderKind::Phong, name), "Phong declares {name}");
+            assert!(
+                declared(ShaderKind::VertexLitGeneric, name),
+                "VertexLitGeneric declares {name}"
+            );
+        }
+        // And everything the shared table has is still reachable from Phong,
+        // because Valve's declaration is one block.
+        for name in [
+            "$basetexture",
+            "$bumpmap",
+            "$detail",
+            "$envmap",
+            "$selfillummask",
+        ] {
+            assert!(declared(ShaderKind::Phong, name), "Phong declares {name}");
+        }
+    }
+
+    #[test]
+    fn phong_half_lambert_is_on_unless_the_material_opts_out() {
+        // The third CS:GO-shaped default, and the sharpest: `bPhongHalfLambert`
+        // is hard-coded `false` over a commented-out read of
+        // `$phongdisablehalflambert`, and the parameter's own declaration says
+        // half-Lambert "has always been forced on in phong". 26 shipped
+        // materials write it and 20 write `1`, which would be a no-op against
+        // an off-by-default.
+        let half_lambert =
+            |body: &str| phong_uniforms(&phong_vmt(body)).flags & PhongFlags::HALF_LAMBERT != 0;
+        assert!(half_lambert(""), "on by default");
+        assert!(!half_lambert(r#""$phongdisablehalflambert" "1""#));
+        assert!(half_lambert(r#""$phongdisablehalflambert" "0""#));
+        // **Not the `$halflambert` material flag**, which is what
+        // `VertexLitGeneric` reads and which this shader never looks at. 25 of
+        // the 317 set it and get nothing.
+        assert!(half_lambert(r#""$halflambert" "1""#));
+        assert_eq!(
+            vertex_lit_uniforms(&model_vmt(r#""$halflambert" "1""#)).flags
+                & VertexLitFlags::HALF_LAMBERT,
+            VertexLitFlags::HALF_LAMBERT,
+            "the flag still means something to the other shader"
+        );
+    }
+
+    #[test]
+    fn the_phong_envmap_tint_is_not_gamma_decoded() {
+        // Three shaders, three answers, and this is the third.
+        // `DrawPhong_DX9:800` reads `$envmaptint` with a plain `GetVecValue`;
+        // `DrawVertexLitGeneric_DX9` runs it through `GammaToLinearFullRange`
+        // and `Refract` through the 256-entry table. Decoding it here would
+        // darken every Phong reflection in the game by up to a factor of 36.
+        let body = r#""$envmap" "metal/e" "$envmaptint" "[0.05 0.05 0.05]""#;
+        let phong = phong_uniforms(&phong_vmt(body));
+        assert_eq!(&phong.envmap_tint[..3], &[0.05, 0.05, 0.05]);
+
+        let lit = vertex_lit_uniforms(&model_vmt(body));
+        assert!(
+            (lit.envmap_tint[0] - 0.0013732).abs() < 1e-6,
+            "the other shader decodes: {}",
+            lit.envmap_tint[0]
+        );
+    }
+
+    #[test]
+    fn the_phong_exponent_falls_back_to_the_map_through_a_zero_sentinel() {
+        // "If the exponent passed in as a constant is zero, use the value from
+        // the map as the exponent" (`phong_ps20b.fxc:700`). 71 of the 317
+        // materials have an exponent texture and no `$phongexponent`, so the
+        // sentinel is the live path rather than a fallback.
+        let exponent = |body: &str| phong_uniforms(&phong_vmt(body)).shader_controls2[2];
+        assert_eq!(exponent(""), 0.0, "unset means read the map");
+        assert_eq!(exponent(r#""$phongexponent" "50""#), 50.0);
+        // Valve's own overloading, reproduced: an explicit zero is the
+        // sentinel too.
+        assert_eq!(exponent(r#""$phongexponent" "0""#), 0.0);
+    }
+
+    #[test]
+    fn the_specular_tint_defaults_and_the_albedo_path_needs_a_map() {
+        // `float vSpecularTint[4] = {1, 1, 1, 4}`, whose `w` is the rim
+        // exponent's default. A zero tint means "there was no constant tint in
+        // the vmt", and what happens next depends on whether there is an
+        // exponent map to tint *from*.
+        let tint = |body: &str| phong_uniforms(&phong_vmt(body)).specular_rim;
+
+        assert_eq!(tint(""), [1.0, 1.0, 1.0, 4.0]);
+        assert_eq!(
+            tint(r#""$phongtint" "[0.85 0.85 1]""#),
+            [0.85, 0.85, 1.0, 4.0]
+        );
+        // A zero tint with nothing to read falls back to white.
+        assert_eq!(
+            tint(r#""$phongtint" "[0 0 0]""#),
+            [1.0, 1.0, 1.0, 4.0],
+            "all four shipped zero-tint materials take this branch"
+        );
+        // With an exponent map *and* `$phongalbedotint`, `x` becomes the -1
+        // sentinel that switches the shader to tinting with the albedo. No
+        // Portal 2 material does both.
+        assert_eq!(
+            tint(r#""$phongtint" "[0 0 0]" "$phongexponenttexture" "e" "$phongalbedotint" "1""#)[0],
+            -1.0
+        );
+        // `$phongalbedotint` without a map is not enough — the map is where
+        // the per-texel tint amount lives.
+        assert_eq!(
+            tint(r#""$phongtint" "[0 0 0]" "$phongalbedotint" "1""#),
+            [1.0, 1.0, 1.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn the_rim_exponent_shares_a_register_and_is_clamped_to_one() {
+        // `vSpecularTint[3] = MAX( $rimlightexponent, 1.0f )`, and only when
+        // rim lighting is actually on. Three of the seven shipped values are
+        // below 1 — 0.2 on seventeen materials — so the clamp decides what
+        // nineteen of them look like.
+        let w = |body: &str| phong_uniforms(&phong_vmt(body)).specular_rim[3];
+        assert_eq!(w(r#""$rimlight" "1" "$rimlightexponent" "20""#), 20.0);
+        assert_eq!(w(r#""$rimlight" "1" "$rimlightexponent" "0.2""#), 1.0);
+        // Without `$rimlight` the parameter is inert and the default stands.
+        // 54 materials set an exponent and only 39 set `$rimlight`.
+        assert_eq!(w(r#""$rimlightexponent" "20""#), 4.0);
+        // `$rimlight 0.8` is *off*, because the test is `GetIntValue() != 0`
+        // and that truncates. One shipped material writes it.
+        assert_eq!(w(r#""$rimlight" "0.8" "$rimlightexponent" "20""#), 4.0);
+        assert_eq!(
+            phong_uniforms(&phong_vmt(r#""$rimlight" "0.8""#)).flags & PhongFlags::RIMLIGHT,
+            0
+        );
+    }
+
+    #[test]
+    fn one_register_is_the_detail_blend_factor_or_the_albedo_boost() {
+        // `flBlendFactorOrPhongAlbedoBoost` (`phong_dx9_helper.cpp:610`): a
+        // material with a `$detail` cannot also have a `$phongalbedoboost`,
+        // because they are the same float. Free on content — nothing in
+        // Portal 2 sets the boost.
+        let w = |body: &str| phong_uniforms(&phong_vmt(body)).selfillum_tint[3];
+        assert_eq!(w(r#""$phongalbedoboost" "3""#), 3.0);
+        assert_eq!(w(r#""$detail" "d" "$detailblendfactor" "0.5""#), 0.5);
+        assert_eq!(
+            w(r#""$detail" "d" "$phongalbedoboost" "3""#),
+            1.0,
+            "the detail blend factor wins and defaults to 1"
+        );
+    }
+
+    #[test]
+    fn the_modulation_control_has_three_states() {
+        // `bNoTint ? -1 : ( 1 - $blendtintbybasealpha )`, which the shader
+        // reads as `saturate( baseColor.a + control )`: 1 applies all of
+        // `$color`, 0 lets base alpha decide, and -1 applies none of it.
+        let z = |body: &str| phong_uniforms(&phong_vmt(body)).shader_controls[2];
+        assert_eq!(z(""), 1.0);
+        assert_eq!(z(r#""$blendtintbybasealpha" "1""#), 0.0);
+        assert_eq!(z(r#""$notint" "1""#), -1.0);
+        // `$notint` wins outright, which is the order of the C ternary.
+        assert_eq!(z(r#""$notint" "1" "$blendtintbybasealpha" "1""#), -1.0);
+    }
+
+    #[test]
+    fn the_rim_mask_needs_the_exponent_map_as_well_as_the_flag() {
+        // The mask lives in the exponent texture's alpha, so `bHasRimMaskMap`
+        // requires all three of the map, `$rimlight` and `$rimmask`. **No
+        // Portal 2 material sets `$rimmask`**, so this is 0 across the shipped
+        // game and the shader's `fRimMask` is 1.
+        let x = |body: &str| phong_uniforms(&phong_vmt(body)).rim_params[0];
+        assert_eq!(x(r#""$rimlight" "1" "$rimmask" "1""#), 0.0, "no map");
+        assert_eq!(
+            x(r#""$rimlight" "1" "$rimmask" "1" "$phongexponenttexture" "e""#),
+            1.0
+        );
+        assert_eq!(
+            x(r#""$rimmask" "1" "$phongexponenttexture" "e""#),
+            0.0,
+            "no rim light"
+        );
+    }
+
+    #[test]
+    fn phong_does_not_reconcile_alpha_testing_against_base_alpha() {
+        // `InitVertexLitGeneric_DX9` returns into `InitPhong_DX9` at `:361`,
+        // well before the *"Don't alpha test if the alpha channel is used for
+        // other purposes"* clear at `:419` — so where `VertexLitGeneric` drops
+        // `$alphatest` for a `$selfillum` material, `Phong` keeps it. Valve's
+        // asymmetry; one of the 317 sets `$alphatest`.
+        let body = r#""$alphatest" "1" "$selfillum" "1""#;
+        assert_eq!(
+            phong_uniforms(&phong_vmt(body)).flags & PhongFlags::ALPHA_TEST,
+            PhongFlags::ALPHA_TEST
+        );
+        assert_eq!(
+            vertex_lit_uniforms(&model_vmt(body)).flags & VertexLitFlags::ALPHA_TEST,
+            0,
+            "the other shader gives it up"
+        );
+    }
+
+    #[test]
+    fn the_phong_envmap_mask_is_base_alpha_unless_the_normal_map_is_asked_for() {
+        // `fEnvMapMask = lerp( baseColor.a, fSpecMask, g_bHasNormalMapAlphaEnvmapMask )`
+        // (`phong_ps20b.fxc:672`) — **no `$basealphaenvmapmask` test on the
+        // false side**, unlike `VertexLitGeneric`, where base-alpha masking
+        // has to be requested. So the flag this `w` carries is the only choice
+        // the material gets, and `$basealphaenvmapmask` is inert: 18 of the
+        // 317 set it and it changes nothing.
+        let w = |body: &str| phong_uniforms(&phong_vmt(body)).envmap_tint[3];
+        assert_eq!(w(r#""$envmap" "metal/e""#), 0.0, "base alpha by default");
+        assert_eq!(
+            w(r#""$envmap" "metal/e" "$basealphaenvmapmask" "1""#),
+            0.0,
+            "which is what the flag would have asked for anyway"
+        );
+        assert_eq!(
+            w(r#""$envmap" "metal/e" "$normalmapalphaenvmapmask" "1""#),
+            1.0
+        );
+        // `$envmapmask` is not even bound, so there is no third source.
+        assert!(!texture_requests(ShaderKind::Phong, &phong_vmt(""))
+            .iter()
+            .any(|request| request.param == "$envmapmask"));
+    }
+
+    #[test]
+    fn env_cubemap_turns_the_phong_reflection_off_too() {
+        // 92 of the 123 Phong materials with an `$envmap` say `env_cubemap`,
+        // which names no file — the cubemap would arrive per draw from the
+        // render instance, and that lookup is not written. So `CUBEMAP` is off
+        // for them and 31 materials reflect.
+        let flag = |body: &str| phong_uniforms(&phong_vmt(body)).flags & PhongFlags::ENVMAP;
+        assert_eq!(flag(r#""$envmap" "env_cubemap""#), 0);
+        assert_eq!(
+            flag(r#""$envmap" "metal/black_wall_envmap_002a""#),
+            PhongFlags::ENVMAP
+        );
+    }
+
+    #[test]
+    fn phong_binds_three_textures_the_other_model_shader_does_not() {
+        let params = |kind: ShaderKind, vmt: &Vmt| {
+            texture_requests(kind, vmt)
+                .into_iter()
+                .map(|request| request.param)
+                .collect::<Vec<_>>()
+        };
+        let phong = params(ShaderKind::Phong, &phong_vmt(""));
+        for name in [
+            "$phongexponenttexture",
+            "$lightwarptexture",
+            "$phongwarptexture",
+        ] {
+            assert!(phong.contains(&name), "Phong binds {name}");
+        }
+        // And **not** `$envmapmask`: there is no such sampler in
+        // `phong_ps20b.fxc`, so the reflection's mask is base alpha or the
+        // normal map's alpha. One shipped material sets the parameter and gets
+        // nothing.
+        assert!(!phong.contains(&"$envmapmask"));
+
+        let lit = params(ShaderKind::VertexLitGeneric, &model_vmt(""));
+        assert!(lit.contains(&"$envmapmask"));
+        assert!(!lit.contains(&"$phongexponenttexture"));
+
+        // All three of Phong's extras are *data*, not colour: Valve loads each
+        // with no `TEXTUREFLAGS_SRGB`. The exponent map is the clearest case —
+        // its red channel is an exponent in the range 1..150.
+        for request in texture_requests(ShaderKind::Phong, &phong_vmt("")) {
+            if request.param.contains("warp") || request.param.contains("exponent") {
+                assert_eq!(
+                    request.color_space,
+                    ColorSpace::Linear,
+                    "{} is data",
+                    request.param
+                );
+            }
+        }
     }
 
     #[test]
@@ -3170,7 +4267,10 @@ mod tests {
     fn multiply_reaches_every_shader_that_uses_the_shared_helper() {
         // `$multiply` is handled at the end of `vertexlitgeneric_dx9_helper`'s
         // shadow block, which `UnlitGeneric` *and* `VertexLitGeneric` reach and
-        // `LightmappedGeneric` does not.
+        // `LightmappedGeneric` does not — nor does `Phong`, whose own shadow
+        // block has no `MATERIAL_VAR_MULTIPLY` case, so a material that asks
+        // for both `$phong` and `$multiply` loses the second. None of the
+        // game's 317 Phong materials does.
         let body = r#""$multiply" "1""#;
         let unlit = format!(r#""UnlitGeneric" {{ {body} }}"#);
         let model = format!(r#""VertexLitGeneric" {{ {body} }}"#);
@@ -3196,6 +4296,17 @@ mod tests {
             state.blend,
             BlendMode::None,
             "a world surface ignores $multiply in Valve's engine too"
+        );
+        let phong = format!(r#""VertexLitGeneric" {{ "$phong" "1" "$bumpmap" "b" {body} }}"#);
+        let state = render_state(
+            ShaderKind::Phong,
+            &parse(&phong, "p.vmt"),
+            ResolvedTextures::default(),
+        );
+        assert_eq!(
+            state.blend,
+            BlendMode::None,
+            "and so does a phong model, for a different missing case"
         );
     }
 

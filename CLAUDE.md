@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 829 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 863 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -189,7 +189,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   not implemented and that is a measurement: all 64,428 pak entries in Portal 2's 106 maps
   are stored. Async and `sv_pure` are deferred. **API: `rustdocs/FILESYSTEM.md`** (read this before calling it);
   porting decisions and the C++ inventory: `portdocs/FILESYSTEM.md`.
-- **`src/materials/` — stages 1-6 of 8 ported, plus the first shader of §7.8's remainder.** `Renderer` owns `wgpu`'s
+- **`src/materials/` — stages 1-6 of 8 ported, plus the first two shaders of §7.8's remainder.** `Renderer` owns `wgpu`'s
   instance/adapter/device/queue/surface and exposes one frame boundary
   (`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
   deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
@@ -231,22 +231,24 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `materials/` only because `Frame::parts` is `pub(super)` and opening a pass belongs on
   this side of that boundary.
   **Stage 6 is `VertexLitGeneric`, and it is done** — the shader every model wears, and
-  the largest in the shipped game: 1,108 of Portal 2's 3,431 materials name it, 1,012 of
-  them under `materials/models/`. Landed as `ShaderKind::VertexLitGeneric` with
+  the largest in the shipped game: 1,135 of the mounted game's 3,555 materials name it,
+  1,012 of them under `materials/models/`. Landed as `ShaderKind::VertexLitGeneric` with
   `shaders/vertexlitgeneric.wgsl`, `mesh::ModelVertex`, `uniforms::{Light, ModelLighting}`
   — the ambient cube and up to four local lights that `engine/lightcache.cpp`'s
   `LightcacheGetStatic`/`Mod_LeafAmbientColorAtPos` fill (**there is no
   `R_StudioSetupLighting` in this tree**; earlier drafts of this file named one) — a
-  second shape for bind group 3, and the cubemap half of the texture path. **All 1,108 of
-  those materials load and build a pipeline against the real game**; the whole set needs
-  15 pipelines, which answers §10's "how many variants survive" with a measurement.
-  **`Refract` is the first of §7.8's remaining set and has landed** (below); the rest of it
-  and stages 7-8 (paint maps, GPU morph) are not started.
+  second shape for bind group 3, and the cubemap half of the texture path. **Every one of
+  those materials loads and builds a pipeline against the real game** — 818 here in 14
+  pipelines and the other 317 in `Phong`'s 7 — which answers §10's "how many variants
+  survive" with a measurement.
+  **`Refract` and `Phong` are the first two of §7.8's remaining set and have landed**
+  (below); the rest of it and stages 7-8 (paint maps, GPU morph) are not started.
 
   Six things about it that a reader will otherwise rediscover the hard way:
   **a `.vmt` naming `VertexLitGeneric` does not always reach it** — `WantsPhongShader`
-  sends 317 of the 1,108 to `DrawPhong_DX9`, a separate §7.8 shader that is not ported, so
-  they draw without specular and say so once at load; **group 3 is now "where this
+  sends 317 of the 1,135 to `DrawPhong_DX9`, which **is ported now** (below), so the
+  resolution from a `.vmt` to a shader is `ShaderKind::resolve` and not
+  `ShaderKind::from_name`; **group 3 is now "where this
   shader's lighting comes from"**, a lightmap page for brushes or a `ModelLighting` block
   for models, so `reads_lightmap()` became `lighting_binding()`; **the unbumped path
   lights per vertex and the bumped path per pixel**, because they are two files in the
@@ -269,7 +271,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   one. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
   hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
   `SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
-  Portal 2 has neither.
+  Portal 2 has neither. (`Phong` brought a third of the same kind — see below.)
 
   **`post.rs` and `histogram.rs` landed with the tone mapper, and they close half of §10's
   HDR question.** `PostProcess` is `_rt_FullFrameFB` plus the final pass of
@@ -336,21 +338,71 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   is depot-gated (`KISAK_GAME_DIR`), walks every `.vmt` in the mounted game, loads it
   through the real `MaterialCache` and asks the real `PipelineCache` for a pipeline with
   `on_uncaptured_error` latching any validation failure. Running it prints the whole
-  picture: **2,947 of the mounted game's 3,555 materials draw with a real shader, in 51
-  pipelines** — 1,135 `VertexLitGeneric`, 956 `UnlitGeneric`, 801 `LightmappedGeneric`,
-  37 `Refract`, 18 `WorldVertexTransition`, and 608 on the error material. That is the
-  standing answer to §10's "how many variants actually survive".
+  picture: **2,947 of the mounted game's 3,555 materials draw with a real shader, in 57
+  pipelines** — 956 `UnlitGeneric`, 818 `VertexLitGeneric`, 801 `LightmappedGeneric`,
+  317 `Phong`, 37 `Refract`, 18 `WorldVertexTransition`, and 608 on the error material.
+  That is the standing answer to §10's "how many variants actually survive".
 
-  §10's "how are variants expressed" question is **closed**: five shader names in, none
+  **`Phong` has landed too, and it is the second of §7.8's *remaining* set** — the model
+  shader with a specular highlight, and **the first shader in the port that no `.vmt`
+  names**. There is no `SHADER( Phong )` in `stdshaders/` at all:
+  `phong_dx9_helper.cpp` is reached only from `DrawVertexLitGeneric_DX9`, which hands the
+  material over when `WantsPhongShader` says so — so `ShaderKind::from_name( "Phong" )`
+  is `None` and the redirect lives in a new **`ShaderKind::resolve( vmt )`**, which is
+  what `Material::new` calls and what anything holding a `.vmt` should call.
+  **317 materials reach it**, 301 under `materials/models/`, all 317 build a pipeline,
+  and the whole set needs 7. **104 of the game's 106 maps place a static prop wearing
+  one**, including 11 in `sp_a1_intro1` and 20 in `sp_a3_portal_intro` — so unlike the
+  `$envmaptint` fix this one is visible on the default map.
+
+  Six things about it that read as bugs until you check the reference.
+  **Half-Lambert is on by default and `$halflambert` does nothing** — the switch is
+  `$phongdisablehalflambert`, and this is the **third** CS:GO-shaped default of the kind
+  above: `bPhongHalfLambert` is hard-coded `false` over a commented-out read of the
+  parameter, whose own declaration says half-Lambert "has always been forced on in
+  phong". The content settles it: 26 of the 317 write the parameter and **20 write `1`**,
+  a no-op against an off-by-default.
+  **`$envmaptint` is *not* gamma-decoded here**, which makes three shaders with three
+  answers — `VertexLitGeneric` uses `GammaToLinearFullRange`, `Refract` the 256-entry
+  table, `Phong` and `LightmappedGeneric` none — so making them agree would be a
+  divergence and a factor of 36.
+  **A Phong model gets no baked vertex light**, because it is always a per-pixel shader
+  (`bStaticLight = false`); the CS:GO `STATICLIGHT3` work exists because of it. The
+  consequence today is visible: `world::props` supplies an ambient cube and *zero* local
+  lights, so a Phong prop is lit by its cube and **has no highlight at all** until
+  `LightcacheGetStatic`'s local-light half lands.
+  **The envmap mask is base alpha whether the material asked or not**, so
+  `$basealphaenvmapmask` is inert and `$envmapmask` is not even sampled.
+  **`$phongexponent` unset is a sentinel**, not a default: zero means "read the exponent
+  from `$phongexponenttexture`'s red channel", remapped onto 1..150, and 71 of the 317
+  take that path.
+  And **one register is the detail blend factor *or* `$phongalbedoboost`** — Valve's own
+  name for it is `flBlendFactorOrPhongAlbedoBoost`.
+  Pinned off on *content* rather than capability: wrinkle maps, `$decaltexture`,
+  `$tintmasktexture` and `$rimmask`, none of which any Portal 2 material sets.
+  **Also found here and deliberately left alone**: the pixel shaders' modulation colour
+  should be *linear* for the two model shaders and gamma for the world one
+  (`shaderapidx8.cpp:8664`), and `modulation_color` returns gamma for all of them. It
+  moves every tinted model, so it wants its own change; 48 materials set
+  `$color`/`$color2`, 8 of them on a model shader.
+
+  §10's "how are variants expressed" question is **closed**: six shaders in, none
   needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
-  module with a uniform branch, and `WorldVertexTransition` is a second *name* on
-  `LightmappedGeneric`'s module rather than a variant of it — so the prelude is prepended
-  by string concatenation and `naga_oil`, `override` constants and a build-time
-  preprocessor are all declined on evidence.
+  module with a uniform branch, `WorldVertexTransition` is a second *name* on
+  `LightmappedGeneric`'s module rather than a variant of it, and `Phong`'s nineteen
+  static axes produced none at all — so the prelude is prepended by string concatenation
+  and `naga_oil`, `override` constants and a build-time preprocessor are all declined on
+  evidence. **`Phong` did add one degree of freedom without changing the mechanism**: it
+  shares `VertexLitGeneric`'s group 3, so the `@group(3)` declaration and the two
+  lighting terms both shaders compute identically moved into
+  `shaders/modellighting.wgsl`, prepended for exactly the shaders whose
+  `ContextBinding` is `ModelLighting`. The *diffuse* term deliberately did not move —
+  `DiffuseTerm` and `CosineTermInternal` are two different functions in the original.
   **`LightmappedGeneric` was expected to force the second vertex layout and did not**
   (bumped and unbumped share one, because the bumped diffuse path never leaves tangent
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
-  one, because the tangent is in the `.vvd` either way.
+  one, because the tangent is in the `.vvd` either way — and `Phong` asks for the tangent
+  unconditionally, so for its 317 one layout is not even a simplification.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
   lightmaps and terrain, `trace/` (stages 1-4 of 5), `input/` (stages 1-4 of 5), and
   `console/` (all five stages, complete)**
@@ -993,6 +1045,14 @@ The candidates, in the order they are worth doing:
   frame (174 of the game's 1,164 movers name a parent). The attachment forms also want
   `LookupAttachment` on a studio model, which would be `server/`'s first dependency on
   `studio/`.
+- **The local lights on a static prop** — `LightcacheGetStatic`'s other half, which
+  `world::props::lighting_for` currently answers with `count: 0`. It has just become the
+  most *visible* thing missing from the model path: `Phong` is ported and its specular
+  term needs a light to exist, so **the 96 phong materials a static prop wears have no
+  highlight until this lands**, and a Phong prop is lit by its ambient cube alone (it
+  reads no baked vertex light, which is Valve's). `uniforms::Light` and the whole group-3
+  block are already built and tested for it; what is missing is the light cache's
+  per-position light list.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale.

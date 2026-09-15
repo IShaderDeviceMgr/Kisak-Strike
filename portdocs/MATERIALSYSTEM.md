@@ -6,14 +6,15 @@ Porting design doc for `materialsystem/` (plus `togl/`, `public/materialsystem/`
 Read [`../PORTING.md`](../PORTING.md) first. Paths here are relative to the original
 tree; prefix them with `legacy/` to open them.
 
-**Status: stages 1-6 of §9 done, plus the first of §7.8's remaining shader set** —
+**Status: stages 1-6 of §9 done, plus the first two of §7.8's remaining shader set** —
 `wgpu`/`winit` bring-up (a cleared window), the
 texture path (`.vtf` → `wgpu::Texture`, with the error checkerboard), the material path
 (`.vmt` → `Material` → `UnlitGeneric` in WGSL), meshes plus the render context (typed
 vertex buffers, static and dynamic geometry, render targets, and a depth buffer),
 lightmaps with `LightmappedGeneric`, `VertexLitGeneric` with the model lighting
-constants under it, and **`Refract`** with the frame-buffer copy under *it*. Stages 7-8
-and the rest of §7.8's set are not started. The
+constants under it, **`Refract`** with the frame-buffer copy under *it*, and
+**`Phong`** — the specular model shader, which no `.vmt` names and 317 of them
+reach anyway. Stages 7-8 and the rest of §7.8's set are not started. The
 implemented API is documented in
 [`../rustdocs/MATERIALS.md`](../rustdocs/MATERIALS.md); read that before calling into
 `src/materials/`, and this document before extending it.
@@ -559,7 +560,7 @@ from shipped content.
 | `Blob` | Portal 2 gel blobs |
 | `Engine_Post` | Post-processing / tonemap / color correction |
 | `Sprite`, `SpriteCard` | Particles |
-| `EyeRefract`, `Phong` | Characters (GLaDOS, Wheatley, turrets) |
+| `EyeRefract`, `Phong` | Characters (GLaDOS, Wheatley, turrets). **`Phong` done** — 317 materials, and it is props as much as characters |
 | `Cloak`, `VortWarp` | Effects — evaluate whether Portal 2 uses them |
 
 Explicitly out: `character.cpp`, `customcharacter.cpp`, `customweapon_dx9*`,
@@ -951,14 +952,168 @@ milestone the project has.
    (`refract_ps2x.fxc:338` hands `i.vTangentVertToEyeVector` to a function whose other
    argument is a world-space normal), which is a bug that decides what every pane of glass
    in the game reflects; it is reproduced, with the line marked.
+
+   **`Phong` is the second of that remaining set, and it is done** —
+   `ShaderKind::Phong`, `shaders/phong.wgsl`, `shader::PhongUniforms`, and a
+   *fifth* group-1 layout. **Deliverable met:** all **317** of the materials that
+   reach it load and build a pipeline, in **7** of them, and the census reads
+   2,947 materials in **57** pipelines against the previous 2,947 in 51 — the
+   material total does not move, because every one of the 317 was already loading
+   as `VertexLitGeneric` (which drops from 1,135 in 15 pipelines to 818 in 14).
+   What moves is what they draw as, and **104 of the game's 106 maps place a
+   static prop wearing one**.
+
+   **It is the first shader in the port that no `.vmt` names**, and that is the
+   structural fact the stage turned on. There is no `SHADER( Phong )` anywhere in
+   `stdshaders/` and no `DEFINE_FALLBACK_SHADER` for it: `phong_dx9_helper.cpp` is
+   reached only from `DrawVertexLitGeneric_DX9`, which consults
+   `WantsPhongShader` before doing anything else (`:2346`). So
+   `ShaderKind::from_name( "Phong" )` is `None` — deliberately, and pinned by a
+   test — and the redirect lives in a new `ShaderKind::resolve( vmt )` that
+   `Material::new` calls in `from_name`'s place. `WorldVertexTransition` was two
+   *names* on one module; this is one name on two modules, and the enum stays "one
+   variant per WGSL module plus bind group layout plus parameter table" either
+   way.
+
+   ### The bucketing (§7.3, §7.7 step 3)
+
+   `phong_ps20b.fxc` declares **19 static and 8 dynamic axes**. Not one of them
+   survives as a pipeline variant, so `Phong` is a single pipeline shape and its
+   seven pipelines are all `RenderState` — blend, cull, depth — exactly as for the
+   other five shaders.
+
+   | Axis | Range | Bucket | Disposition |
+   |---|---|---|---|
+   | `SFM` | 0..0 `[ps20b][PC]` | 1 | Source Filmmaker. Already pinned by Valve on this profile; also the only thing that enables the screen-space AO sampler, tessellation and `UBERLIGHT` |
+   | `CUBEMAP` | 0..1 | 2 | `PhongFlags::ENVMAP` — 123 materials |
+   | `SELFILLUM` | 0..1 | 2 | `PhongFlags::SELFILLUM` — 85 |
+   | `SELFILLUMFRESNEL` | 0..1 | 1 | **pinned off.** The pre-tonemap body is commented out in the file and what is left is the CS:GO team-ID glow, which reads `cl_teamid_min`/`max` and a material proxy. 4 materials set `$selfillumfresnel` and get the `SELFILLUM` path |
+   | `FLASHLIGHT`, `FLASHLIGHTDEPTHFILTERMODE`, `FLASHLIGHTSHADOWS` | 0..1, 0..3, 0..1 | 1 | the flashlight is not ported |
+   | `LIGHTWARPTEXTURE` | 0..1 | 2 | `PhongFlags::LIGHTWARP` — 12 |
+   | `PHONGWARPTEXTURE` | 0..1 | 2 | `PhongFlags::PHONGWARP` — **1** |
+   | `WRINKLEMAP` | 0..1 | 1 | **pinned off on content**: no Portal 2 material sets `$compress`/`$stretch` |
+   | `DETAILTEXTURE` | 0..1 | 2 | `PhongFlags::DETAIL` — 25 |
+   | `DETAIL_BLEND_MODE` | 0..7 | 2 | a uniform `i32` and the prelude's `texture_combine`, as `VertexLitGeneric` already does |
+   | `RIMLIGHT` | 0..1 | 2 | `PhongFlags::RIMLIGHT` — 39 |
+   | `DECAL_BLEND_MODE` | 0..2 | 1 | **pinned to 2, "no decal", on content**: no Portal 2 material sets `$decaltexture` |
+   | `TINTMASKTEXTURE` | 0..0 `[ps20b]` | 1 | already pinned by Valve here, and no content either |
+   | `SHADER_SRGB_READ`, `WORLD_NORMAL` | 0..0 `[PC]` | 1 | already pinned by Valve: an X360 sRGB emulation and a G-buffer normal output |
+   | `CASCADED_SHADOW_MAPPING`, `CSM_MODE`, `CASCADE_SIZE`, `CSM_VIEWMODELQUALITY` | | 1 | CSM is not ported, and Portal 2 has none |
+   | `PHONG_HALFLAMBERT` | 0..0 | **2** | **the CS:GO pin is reversed** — see below |
+   | `NUM_LIGHTS` | 0..4 | 2 | `lighting.count`, the loop `VertexLitGeneric` already runs |
+   | `WRITEWATERFOGTODESTALPHA`, `WRITE_DEPTH_TO_DESTALPHA` | | 1 | the underwater pass is not ported, and Valve disabled the second for CS:GO |
+   | `UBERLIGHT` | 0..1 `[ps30]` | 1 | SFM only |
+   | `STATICLIGHT3` | 0..1 | 1 | **pinned off** — three baked light streams behind `r_staticlight_streams 3`, a CS:GO addition. `VertexLitGeneric` pinned the same axis, and the `.vhv` path `studio/` reads is one stream |
+
+   ### Decisions the later stages inherit
+
+   - **The concatenation mechanism grew a piece narrower than "everything", and
+     §10's variant question stays closed.** `Phong` and `VertexLitGeneric`
+     declare the *same* group 3, and group 3's layout is per shader — so the
+     `@group(3)` declaration and the two lighting terms both shaders evaluate
+     identically moved into `shaders/modellighting.wgsl`, which `ShaderKind::wgsl`
+     prepends for exactly the shaders whose `ContextBinding` is `ModelLighting`.
+     That is still string concatenation and still no preprocessor; what it adds
+     is that a fragment can be scoped to a *subset* of the set. The diffuse term
+     deliberately did **not** move: `DiffuseTerm` and `CosineTermInternal` are two
+     different functions in the original and unifying them would silently reshade
+     every prop in the game.
+   - **A third CS:GO-shaped default, and the sharpest one yet.**
+     `phong_dx9_helper.cpp:479` reads
+     ```
+     //bool bPhongHalfLambert = false; IS_PARAM_DEFINED( info.m_nPhongDisableHalfLambert ) ? (params[...]->GetIntValue() == 0) : true;
+     // Disabling half-lambert for CSGO (not 'compatible' with CSM's ...)
+     bool bPhongHalfLambert = false;
+     ```
+     over a `SHADER_PARAM` whose own comment is *"Half lambert has always been
+     forced on in phong, so the only safe way to allow artists to disable half
+     lambert is to create this param that disables the default behavior of forcing
+     half lambert on."* So Portal 2's Phong is half-Lambert **on**, and
+     `$phongdisablehalflambert 1` is the only way off — and it is *not* the
+     `$halflambert` flag `VertexLitGeneric` reads, which Phong ignores entirely.
+     **The content proves it**: 26 of the 317 write the parameter and **20 of them
+     write `1`**, which is a no-op against an off-by-default. 25 also set the
+     `$halflambert` flag, which does nothing here.
+   - **`$envmaptint` is *not* gamma-decoded here, and that makes three different
+     answers in three shaders.** `DrawPhong_DX9` builds the constant by hand —
+     `params[info.m_nEnvmapTint]->GetVecValue( vEnvMapTint_MaskControl, 3 )`
+     (`:800`) — with no decode at all, where `DrawVertexLitGeneric_DX9` reaches
+     `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` and `Refract` reaches the
+     256-entry table. 104 of the 317 set it. Applying `VertexLitGeneric`'s decode
+     here would be a divergence, and a large one: `[0.05 0.05 0.05]` is 0.0014
+     linear, a factor of 36.
+   - **The envmap mask is base alpha whether the material asked for it or not.**
+     `fEnvMapMask = lerp( baseColor.a, fSpecMask, g_bHasNormalMapAlphaEnvmapMask )`
+     (`phong_ps20b.fxc:672`) — there is no `$basealphaenvmapmask` test on the
+     false side, so a Phong material with an `$envmap` and no
+     `$normalmapalphaenvmapmask` masks its reflection by base alpha
+     unconditionally. `$basealphaenvmapmask` is therefore *inert* in this shader
+     (18 of the 317 set it), and so is `$envmapmask` — Phong has no envmap-mask
+     sampler at all (1 material sets one).
+   - **`$envmapcontrast` and `$envmapsaturation` are inert too**, which is worth
+     writing down because 51 and 24 materials respectively set them: Phong's pixel
+     shader reads neither. Nor `$selfillummaskscale` — the self-illum mask is a
+     hard `lerp` on "is a mask texture bound", not a scaled one.
+   - **Phong gets no baked vertex light**, the same asymmetry
+     `VertexLitGeneric`'s bumped path has and for the same reason: it is always a
+     per-pixel shader, so `PixelShaderDoLighting` is called with
+     `staticLightingColor = 0, bStaticLight = false` (`:643`). The CS:GO
+     `STATICLIGHT3` work exists precisely because of this — *"for phong, to start
+     with we'll try only baking indirect light from vrad - so that we don't lose
+     the ability to acquire phong highlights from map lights"*
+     (`phong_vs20.fxc:194`) — which is the evidence that the pre-CS:GO behaviour
+     was no baked light at all. **Consequence for this port, and it is visible:**
+     `world::props` supplies an ambient cube and *zero* local lights, so a Phong
+     prop is lit by the ambient cube alone and has no specular highlight until the
+     local-light half of `LightcacheGetStatic` lands. 39 of the 96 Phong materials
+     a static prop wears are unbumped and so lose a per-vertex bake they have
+     today; the other 57 already draw without one.
+   - **The parameter table is split where Valve's declaration is not.**
+     `vertexlitgeneric_dx9.cpp` declares `$phongboost` and the rest whether or not
+     a material reaches Phong, but this module's rule is that a table entry is a
+     promise that setting the parameter does something — and on a non-phong
+     `VertexLitGeneric` material it does nothing. So `PHONG_PARAMS` is a second
+     slice, chained only for `ShaderKind::Phong`, exactly as
+     `WORLD_VERTEX_TRANSITION_PARAMS` is chained only for that name. The three
+     *dispatch* parameters (`$phong`, `$basemapalphaphongmask`,
+     `$lightwarptexture`) stay in `VERTEX_LIT_GENERIC_PARAMS`, because
+     `wants_phong` reads them through it.
+   - **`$multiply` and the alpha-test reconciliation are both absent here, and
+     both are Valve's.** `DrawPhong_DX9`'s shadow block has no
+     `MATERIAL_VAR_MULTIPLY` case, and `InitVertexLitGeneric_DX9` returns into
+     `InitPhong_DX9` *before* the *"Don't alpha test if the alpha channel is used
+     for other purposes"* clear at `:419` — so a Phong material alpha-tests even
+     when `$selfillum` has claimed base alpha. Measured: 0 of the 317 set
+     `$multiply` and 1 sets `$alphatest`, so both gaps are invisible on shipped
+     content and reproducing them costs nothing.
+   - **One branch of the shader is unreachable on shipped content and is ported
+     anyway.** `if ( g_SpecularTint.r < 0 )` tints the specular with the albedo,
+     and the CPU writes that `-1` only when `$phongtint` is exactly `[0 0 0]`
+     *and* there is a `$phongexponenttexture` for `$phongalbedotint` to read
+     (`:855`). Four materials write the zero tint — the four
+     `paint/bridge_paint_*` — and **none of them has an exponent texture**, so
+     Valve substitutes white and the branch never runs. It is six lines of WGSL
+     and pinning it off would be a divergence to document, so it is implemented
+     and the census records that nothing reaches it.
+   - **`$phongalbedoboost` shares a register with `$detailblendfactor`** —
+     `flBlendFactorOrPhongAlbedoBoost` (`:610`), one `float` that is the detail
+     blend factor when the material has a `$detail` and the albedo boost
+     otherwise. A material with both cannot have both, and the pixel shader's
+     albedo-tint branch even has two spellings for that reason. Free on content:
+     **no Portal 2 material sets `$phongalbedoboost`.**
 7. **Paint maps** (§8), color correction, occlusion queries, post-processing.
 8. **Deferred:** GPU morph (`morph.cpp`), headless/null path, anything left in §5.4.
 
-Stages 1–6 are done, `VertexLitGeneric` and `Refract` being the whole of stage 6 so far.
+Stages 1–6 are done, `VertexLitGeneric`, `Refract` and `Phong` being the whole of
+stage 6 so far.
 The rest of §7.8's shader set is a breadth move gated on nothing — and `Refract` is
 evidence for that rather than against it: the shader itself was small, and what it
 actually needed was the frame-buffer copy, which is one method on `RenderContext` and is
-now there for `Water` and `Portal_Refract` too. The next thing *models* need is not
+now there for `Water` and `Portal_Refract` too. **`Phong` is the counter-example worth
+noting**: it needed no new render-context state at all, only a second WGSL module over
+group 3's existing shape — so what it cost was reading the reference carefully, and
+three of the things it turned up (the half-Lambert default, the undecoded envmap tint,
+the missing baked vertex light) would each have been a silently wrong picture. The next thing *models* need is not
 in this module at all, but in `studiorender` — a `.mdl`/`.vvd`/`.vtx` reader — and in the
 engine's `sprp` game lump and `engine/lightcache.cpp`'s lighting reconstruction
 (`LightcacheGetStatic` / `Mod_LeafAmbientColorAtPos` — **not** `R_StudioSetupLighting`,
@@ -999,12 +1154,22 @@ which this tree does not have), which is what fills the
   point, or a loop whose trip count must be a compile-time constant. The flashlight's
   shadow-filter modes (`FLASHLIGHTDEPTHFILTERMODE`, four filter kernels) are the first
   plausible candidate in §7.8's remaining set.
+
+  **`Phong` update, six shaders in: still closed, and the mechanism grew one degree of
+  freedom without changing.** Two shaders now declare the *same* group 3, so
+  `ShaderKind::wgsl` concatenates three pieces rather than two — the prelude, then
+  `shaders/modellighting.wgsl` for the shaders whose `ContextBinding` is
+  `ModelLighting`, then the body. That is a shared fragment scoped to a *subset* of the
+  set, which is the thing `naga_oil` would have been for, and it is eleven lines of
+  `match`. `Phong` itself produced **no** textual variant from nineteen static axes.
 - ~~**How many pipeline variants actually survive?**~~ **Answered, by measurement.**
-  §7.3 predicted single digits per shader. Loading **all 1,108** of Portal 2's
-  `VertexLitGeneric` materials through the real `MaterialCache` and asking for one
-  pipeline each produces **15** — a low double digit against the whole game's model
-  material set, for one target format. No on-disk warm cache is needed and the plan needs
-  no stage for one. (Earlier updates, kept because they say what the count is *of*:
+  §7.3 predicted single digits per shader. Loading **all 3,555** of the mounted game's
+  materials through the real `MaterialCache` and asking for one pipeline each produces
+  **57** across six shaders, for one target format: 19 `UnlitGeneric`, 14
+  `VertexLitGeneric`, 9 `LightmappedGeneric`, 7 `Phong`, 7 `Refract`, 1
+  `WorldVertexTransition`. The prediction holds shader by shader — single digits
+  everywhere except the two largest sets — and no on-disk warm cache is needed, so the
+  plan needs no stage for one. (Earlier updates, kept because they say what the count is *of*:
   `UnlitGeneric`'s `RenderState` has 2 × 2 × 2 × 2 × 5 × 2 × 2 reachable combinations on
   paper and content asks for far fewer; stage 4 put the target format in the key, so the
   count is per-shader-per-target.)
