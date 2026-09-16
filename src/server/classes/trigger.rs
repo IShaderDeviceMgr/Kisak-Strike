@@ -37,13 +37,14 @@
 //!
 //! # What none of them does
 //!
-//! **Damage.** There is no health, no `TakeDamage` and no death, so
-//! [`TriggerHurt`] runs the whole of Valve's timing — the half-second think,
-//! the forgiveness doubling, the half-damage on the way out — and takes
-//! nothing away. Its outputs fire on exactly the schedule the shipped game
-//! fires them on, which is what 9 of the game's connections ask for.
+//! **Damage was the headline absence here through stage 4 and is not any
+//! more.** [`TriggerHurt`] ran the whole of Valve's timing — the half-second
+//! think, the forgiveness doubling, the half-damage on the way out — and took
+//! nothing away, because nothing had health. `portdocs/SERVER.md` stage 5
+//! added [`damage`](crate::server::damage), and **138 of the game's 215
+//! `trigger_hurt`s now kill a player standing in one**.
 //!
-//! Also absent, and each measured: NPCs (`SF_TRIGGER_ALLOW_NPCS` serves 293
+//! Absent, and each measured: NPCs (`SF_TRIGGER_ALLOW_NPCS` serves 293
 //! entities in the whole game), vehicles (Portal 2 has none), physics objects
 //! (`ENGINE_TRACE.md` stage 5), and `trigger_look`/`trigger_playerteam`/
 //! `trigger_catapult`/`trigger_portal_cleanser`, which are either
@@ -53,6 +54,7 @@
 use glam::{Mat3, Vec3};
 
 use crate::server::class::{Behaviour, Context, InputDef, InputDefs, SpawnResult, NEVER_THINK};
+use crate::server::damage::{DamageInfo, DMG_RADIATION};
 use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::{atof, atoi, string_to_vector};
@@ -117,11 +119,6 @@ const FSOLID_TRIGGER_TOUCH_DEBRIS: u32 = 0x0200;
 /// that [`BaseTrigger::passes_trigger_filters`] reads the way the C++ does
 /// rather than quietly dropping a term of the disjunction.
 const FL_NPC: u32 = 1 << 14;
-
-/// `DMG_RADIATION` (`public/shareddefs.h`) — the one damage bit that changes
-/// how a `trigger_hurt` *thinks* rather than what it does. 27 of the game's
-/// 215 set it.
-const DMG_RADIATION: i32 = 1 << 18;
 
 // ---------------------------------------------------------------------------
 // CBaseTrigger
@@ -728,20 +725,32 @@ enum HurtThink {
     Radiation,
 }
 
-/// `CTriggerHurt` (`triggers.h:161`) — 215 entities, and the one class in this
-/// stage whose *effect* is missing while its *timing* is complete.
+/// `CTriggerHurt` (`triggers.h:161`) — 215 entities, and since stage 5 the
+/// thing that kills you.
 ///
-/// # There is no damage, and that is the whole of what is absent
+/// # It is what closes the deepest absence in the game layer
 ///
-/// `HurtEntity` in the original computes a damage position, guesses a physics
-/// force, and calls `pOther->TakeDamage( info )`. This port has no health, no
-/// `CTakeDamageInfo`, no force and no death, so that middle step is gone. What
-/// is not gone is everything around it: the `m_takedamage` gate, the filter
-/// re-test, the choice between `OnHurtPlayer` and `OnHurt`, the half-second
-/// think cadence, the half-damage on the way out, and the doubling model's
-/// arithmetic on `m_flDamage`. A map's `OnHurtPlayer` therefore fires exactly
-/// when the shipped game fires it — 5 connections in the game do — and the
-/// player does not die.
+/// Through stage 4 this class had complete *timing* and no *effect*: the
+/// `m_takedamage` gate, the filter re-test, the choice between `OnHurtPlayer`
+/// and `OnHurt`, the half-second think cadence, the half-damage on the way
+/// out and the doubling model's arithmetic on `m_flDamage` were all here, and
+/// `pOther->TakeDamage( info )` was a comment. Stage 5 is the damage system
+/// that line needed.
+///
+/// What the shipped maps do with it, measured: **215 triggers across 66 of the
+/// 106 maps**, dealing between 10 and 1,000,000 points a second against 100
+/// health. The commonest damage types are `DMG_CRUSH` (71), none at all (55),
+/// `DMG_FALL` (34) and `DMG_RADIATION` (27) — the last being the goo, and the
+/// only bit this class branches on.
+///
+/// Still absent, and each with a reason rather than a stub: the damage
+/// *position* (`CalcNearestPoint` on the victim's collision box) and
+/// `GuessDamageForce`, which exist only to aim a physics impulse that needs
+/// `rapier` — so neither is computed and neither is a field of
+/// [`DamageInfo`](crate::server::damage::DamageInfo) — and `TakeHealth` for a
+/// **negative** `damage` key, which no shipped trigger has: every one of the
+/// 215 writes a value between 10 and 1,000,000, so the healing branch is
+/// unreachable from map data.
 pub struct TriggerHurt {
     base: BaseTrigger,
     /// `m_flDamage`, per second. The doubling model multiplies it in place,
@@ -822,15 +831,24 @@ impl TriggerHurt {
         Box::<TriggerHurt>::default()
     }
 
-    /// `CTriggerHurt::HurtEntity` (`triggers.cpp:764`), minus the damage.
+    /// `CTriggerHurt::HurtEntity` (`triggers.cpp:764`).
     ///
     /// Returns whether anything was hurt, which is what stops
     /// [`HurtThink`](HurtThink::Hurt) rescheduling itself once the trigger is
     /// empty.
+    ///
+    /// > **The outputs fire whether or not the damage lands**, and that is
+    /// > Valve's: `TakeDamage` returns `void`, so `HurtEntity` cannot see a
+    /// > refusal and fires `OnHurt`/`OnHurtPlayer` regardless. A player in
+    /// > `god` mode standing in goo therefore keeps firing `OnHurtPlayer`
+    /// > every half second, for ever, and the map's logic runs — which is what
+    /// > makes the cheat usable in a scripted chamber rather than a way to
+    /// > wedge one.
     fn hurt_entity(
         &mut self,
         entity: &mut EntityCore,
         other: EntityId,
+        damage: f32,
         cx: &mut Context<'_>,
     ) -> bool {
         let Some(other_entity) = cx.entity(other) else {
@@ -840,13 +858,24 @@ impl TriggerHurt {
             other_entity.core.take_damage,
             other_entity.behaviour.is_player(),
         );
-        if !takes_damage || !self.base.passes_trigger_filters(entity, other, cx) {
+        if !takes_damage.takes_damage() || !self.base.passes_trigger_filters(entity, other, cx) {
             return false;
         }
 
-        // …`TakeDamage` would go here.
-
+        // `CTakeDamageInfo info( this, this, damage, m_bitsDamageInflict )` —
+        // the trigger is both inflictor and attacker, which is what makes
+        // `CBaseEntity::OnTakeDamage`'s impulse branch unreachable: it demands
+        // `!info.GetAttacker()->IsSolidFlagSet( FSOLID_TRIGGER )`.
+        //
+        // **The negative-damage branch is not here.** `damage < 0` is
+        // `TakeHealth`, and no shipped `trigger_hurt` writes a negative
+        // `damage` key, so reproducing it would be a branch nothing can enter.
         let me = entity.id();
+        cx.take_damage(
+            other,
+            DamageInfo::new(Some(me), Some(me), damage, self.damage_type),
+        );
+
         let output = match is_player {
             true => "OnHurtPlayer",
             false => "OnHurt",
@@ -870,10 +899,15 @@ impl TriggerHurt {
         self.last_damage_time = cx.curtime();
         self.hurt_entities.clear();
 
+        // `float fldmg = m_flDamage * dt` — `m_flDamage` is per *second* and
+        // the caller's `dt` is the cadence, so a `damage 500` trigger deals
+        // 250 every half-second `HurtThink`.
+        let dose = self.damage * dt;
+
         let touchers: Vec<EntityId> = touch::touching(entity).collect();
         let mut hurt_count = 0;
         for other in touchers {
-            if self.hurt_entity(entity, other, cx) {
+            if self.hurt_entity(entity, other, dose, cx) {
                 hurt_count += 1;
             }
         }
@@ -892,11 +926,6 @@ impl TriggerHurt {
             }
         }
 
-        // `float fldmg = m_flDamage * dt` is computed at the top of the C++
-        // and passed to `HurtEntity`; with no damage applied it is dead, and
-        // `dt` survives only as this note. It is `0.5` from `HurtThink` and
-        // the real elapsed time from `RadiationThink`.
-        let _ = dt;
         hurt_count
     }
 }
@@ -1000,7 +1029,11 @@ impl Behaviour for TriggerHurt {
         if self.base.passes_trigger_filters(entity, other, cx)
             && !self.hurt_entities.contains(&other)
         {
-            self.hurt_entity(entity, other, cx);
+            // `HurtEntity( pOther, m_flDamage * 0.5f )` — half a second's
+            // worth, whatever the cadence was, so a fast walk through a slime
+            // pit is not free.
+            let dose = self.damage * 0.5;
+            self.hurt_entity(entity, other, dose, cx);
         }
         self.base.end_touch(entity, other, cx);
     }
@@ -1022,7 +1055,16 @@ impl Behaviour for TriggerHurt {
         let mut out = self.base.describe();
         out.push(("damage", self.damage.to_string()));
         out.push(("damagecap", self.damage_cap.to_string()));
-        out.push(("damagetype", self.damage_type.to_string()));
+        // By name as well as by number: a mapper writes `262144` and means
+        // `RADIATION`, and only one of those is readable in a console.
+        out.push((
+            "damagetype",
+            format!(
+                "{} ({})",
+                self.damage_type,
+                crate::server::damage::damage_type_string(self.damage_type)
+            ),
+        ));
         out.push(("think", format!("{:?}", self.think)));
         out
     }
@@ -1198,7 +1240,10 @@ impl Behaviour for TriggerPush {
             // difference between `noclip` being a debug tool and `noclip`
             // being subject to the level's fans.
             MoveType::None | MoveType::Push | MoveType::Noclip => {}
-            MoveType::Walk => {
+            // `default:` in the C++ switch, which is why a *dead* player is
+            // blown around by a fan: `MOVETYPE_FLYGRAVITY` names no case, so
+            // it lands here with `MOVETYPE_WALK`.
+            MoveType::Walk | MoveType::FlyGravity => {
                 let mut push = self.push_speed * dir;
                 if flags & FL_BASEVELOCITY != 0 {
                     push += base_velocity;

@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::client::player::{VEC_HULL_MAX, VEC_HULL_MIN};
-use crate::client::{tonemap, Client, MoveType, BUTTONS};
+use crate::client::{tonemap, Client, BUTTONS};
 use crate::cmdline::CommandLine;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::{Camera, Load};
@@ -226,11 +226,17 @@ impl<'a> Engine<'a> {
             CommandSpec::new("toggleconsole", "Show/hide the console."),
             CommandSpec::new("showconsole", "Show the console."),
             CommandSpec::new("hideconsole", "Hide the console."),
-            // The game client's. `noclip` is a *server* command in the
-            // original (`game/server/`), because move type is server state
-            // that gets networked down; with no server it lives on the client
-            // and moves when there is one (`portdocs/CLIENT.md` §9.2).
+            // The game server's player commands (`game/server/client.cpp`),
+            // all `FCVAR_CHEAT` there — a flag `ENGINE_CONSOLE.md` §4.6
+            // deletes. `noclip` used to be the client's, because move type had
+            // nowhere else to live; `portdocs/SERVER.md` stage 5 gave it one.
             CommandSpec::new("noclip", "Toggle. Player becomes non-solid and flies."),
+            CommandSpec::new("god", "Toggle. Player becomes invulnerable."),
+            CommandSpec::new("kill", "Kills the player with generic damage."),
+            // **This port's own.** Valve's `hurtme` is `#ifdef _DEBUG`; with
+            // `trigger_hurt` the only damage source in the shipped maps, the
+            // alternative to this is walking into goo to test arithmetic.
+            CommandSpec::new("hurtme", "Usage: hurtme [damage] — hurt the player."),
             CommandSpec::new("impulse", "Issue an impulse command."),
             // **This port's, not Valve's.** The C++ has no `trace` command:
             // its equivalents are `debugrayenable` and the trace counter,
@@ -637,6 +643,16 @@ impl<'a> Engine<'a> {
             apply_player_state(client, state);
         }
 
+        // `engine->ServerCommand( "reload\n" )` — the game asking for the
+        // level to start again, which is what a dead player gets three seconds
+        // after dying and what `player_loadsaved` does. **Queued rather than
+        // done**, exactly like the `map` command: the host state machine loads
+        // it on the next frame and goes through `GameShutdown` on the way, so
+        // a respawn takes the same path as a fresh `map`.
+        if let Some(map) = self.scene.server.take_level_restart() {
+            self.host.request_new_game(&map);
+        }
+
         // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
         // it — **after the ticks and before anything reads it**, so the player
         // is traced against the doors where they are now and the renderer
@@ -970,9 +986,29 @@ fn player_state(client: &Client) -> server::PlayerState {
         velocity: player.velocity,
         base_velocity: player.base_velocity,
         on_ground: player.ground.is_some(),
-        noclip: player.move_type == crate::client::MoveType::Noclip,
         mins: crate::client::movement::player_mins(player.ducked),
         maxs: crate::client::movement::player_maxs(player.ducked),
+        // **The four fields the server owns are filled in anyway, and
+        // `Server::set_player_state` ignores all four.** That is deliberate:
+        // the struct is one vocabulary rather than two, and a round trip that
+        // *reads* as an identity is easier to reason about than one with holes
+        // in it. `PlayerState`'s docs say which four and why. Three of them
+        // are the client's own mirror of what the server last said; the
+        // fourth, `life_state`, is the only one the client does not carry at
+        // all, so it is the default and means nothing on the way in.
+        move_type: match player.move_type {
+            crate::client::MoveType::Walk => server::movement::MoveType::Walk,
+            crate::client::MoveType::Noclip => server::movement::MoveType::Noclip,
+            crate::client::MoveType::FlyGravity => server::movement::MoveType::FlyGravity,
+        },
+        health: player.health,
+        life_state: crate::server::damage::LifeState::Alive,
+        flags: match player.frozen {
+            true => server::movement::FL_FROZEN,
+            false => 0,
+        },
+        // The one field that is purely the client's.
+        buttons: client.buttons_bits(),
     }
 }
 
@@ -995,6 +1031,19 @@ fn apply_player_state(client: &mut Client, state: server::PlayerState) {
     if !state.on_ground {
         player.ground = None;
     }
+    // The four the server owns, coming back. **This is the half of the seam
+    // that stage 5 added**: before it, every field went out and came back
+    // unchanged, and `noclip` lived on the client because nothing could tell
+    // it otherwise.
+    player.move_type = match state.move_type {
+        server::movement::MoveType::Noclip => crate::client::MoveType::Noclip,
+        server::movement::MoveType::FlyGravity => crate::client::MoveType::FlyGravity,
+        // `MOVETYPE_NONE` and `MOVETYPE_PUSH` are an entity's and no player is
+        // ever in one; walking is what a player that is not flying does.
+        _ => crate::client::MoveType::Walk,
+    };
+    player.health = state.health;
+    player.frozen = state.flags & server::movement::FL_FROZEN != 0;
 }
 
 /// The engine's half of the server's touch test — `engine->SolidMoved`.
@@ -1515,11 +1564,31 @@ impl CommandTarget for EngineCommands<'_> {
             },
             // `CON_COMMAND_F( quit, "Exit the engine.", FCVAR_NONE )`
             // (`engine/host_cmd.cpp:2750`).
-            // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )`.
-            "noclip" => match self.client.toggle_noclip() {
-                MoveType::Noclip => cx.print("noclip ON"),
-                MoveType::Walk => cx.print("noclip OFF"),
+            // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )` — **a server command
+            // since `portdocs/SERVER.md` stage 5**, which is where the move
+            // type went. `god` and `kill` are its neighbours in
+            // `game/server/client.cpp` and arrived with it.
+            "noclip" => match self.server.toggle_noclip() {
+                Some(true) => cx.print("noclip ON"),
+                Some(false) => cx.print("noclip OFF"),
+                None => cx.print("noclip: no player"),
             },
+            "god" => match self.server.toggle_god() {
+                Some(true) => cx.print("godmode ON"),
+                Some(false) => cx.print("godmode OFF"),
+                None => cx.print("god: no player"),
+            },
+            "kill" => {
+                if !self.server.kill_player() {
+                    cx.print("kill: already dead, or too soon after the last one");
+                }
+            }
+            "hurtme" => {
+                let amount = cmd.arg(1).map_or(10.0, crate::server::keyvalue::atof);
+                if !self.server.hurt_player(amount, crate::server::damage::DMG_GENERIC) {
+                    cx.print("hurtme: no player, or the damage was refused");
+                }
+            }
             // `IN_Impulse` (`game/client/in_main.cpp:757`). Latched onto the
             // next command and cleared; nothing consumes impulses yet.
             "impulse" => match cmd.arg(1).and_then(|arg| arg.trim().parse().ok()) {
@@ -2194,4 +2263,64 @@ mod tests {
             ]
         );
     }
+    /// **The stage-5 seam, both ways, without a GPU.** `Engine::frame` copies
+    /// the player into the entity list before the server's ticks and back out
+    /// after them, and stage 5 made four of the fields travel in one direction
+    /// only — so the property to pin is not "it round-trips" but "it round-trips
+    /// *except* where the server owns it".
+    ///
+    /// This is the join `rustdocs/SERVER.md` gotcha 57 warns about: a
+    /// server-owned field that the client writes back is undone a fraction of a
+    /// frame after it is set, which reads as `noclip` not working rather than
+    /// as a bug in either module.
+    #[test]
+    fn the_player_state_seam_carries_the_servers_four_fields_one_way() {
+        use crate::client::MoveType;
+        use crate::server::movement;
+
+        let mut console = crate::engine::console::Console::detached();
+        let mut client = Client::new(&mut console);
+        client.spawn(glam::Vec3::new(10.0, 20.0, 30.0), 0.0, 90.0);
+
+        let mut server = server::Server::new();
+        server.level_init("test", &[], &[]);
+        server.spawn_player(player_state(&client));
+
+        // Everything the client owns arrives.
+        let state = server.player_state().expect("a player");
+        assert_eq!(state.origin, glam::Vec3::new(10.0, 20.0, 30.0));
+        assert_eq!(state.angles.y, 90.0);
+
+        // …and the four the server owns come back with the *server's* values,
+        // not the ones that went in. `Player::spawn` set these; the client's
+        // copy said nothing about health at all.
+        assert_eq!(state.health, 100);
+        assert_eq!(state.life_state, crate::server::damage::LifeState::Alive);
+        assert_eq!(state.move_type, movement::MoveType::Walk);
+
+        // The command a console would run, and the field it writes.
+        assert_eq!(server.toggle_noclip(), Some(true));
+        // A whole frame of `Engine::frame`'s copy, in both directions.
+        server.set_player_state(player_state(&client));
+        apply_player_state(&mut client, server.player_state().expect("a player"));
+        assert_eq!(
+            client.player().move_type,
+            MoveType::Noclip,
+            "noclip reached the client"
+        );
+
+        // …and again, which is the step that would undo it if
+        // `set_player_state` wrote the move type.
+        server.set_player_state(player_state(&client));
+        apply_player_state(&mut client, server.player_state().expect("a player"));
+        assert_eq!(client.player().move_type, MoveType::Noclip, "and stayed");
+
+        // Death travels the same way: the client learns it is dead from the
+        // health, which is what `CGameMovement::IsDead` asks about.
+        assert!(server.kill_player());
+        apply_player_state(&mut client, server.player_state().expect("a player"));
+        assert_eq!(client.player().health, 0);
+        assert_eq!(client.player().move_type, MoveType::FlyGravity);
+    }
+
 }

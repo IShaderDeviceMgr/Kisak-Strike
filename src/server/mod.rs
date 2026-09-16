@@ -67,6 +67,7 @@
 
 pub mod class;
 pub mod classes;
+pub mod damage;
 pub mod entity;
 pub mod io;
 pub mod keyvalue;
@@ -86,6 +87,7 @@ use crate::engine::console::{Command, ExecContext};
 use crate::engine::world::bsp;
 
 use class::{base_accept_input, Behaviour, Context, SpawnResult};
+use damage::{DamageInfo, Damaged, LifeState};
 use entity::{Entity, EntityCore, EntityId, EntityList};
 use io::{Event, EventQueue, FieldType, Input, IoStats, Target, Variant};
 use movement::ModelBounds;
@@ -155,6 +157,10 @@ pub struct Server {
     /// list has no player of its own, exactly as Valve's has none until a
     /// client connects.
     player: Option<EntityId>,
+    /// Whether the player's hull was the crouched one at the end of the last
+    /// tick — the falling edge of it is `CPortal_Player::UnDuck()`. See
+    /// [`Server::player_pre_think`].
+    player_was_ducked: bool,
     /// Where the player was when the touch pass last ran.
     ///
     /// The *start* of the swept box the next pass tests, which is what stops a
@@ -187,6 +193,18 @@ pub struct Server {
     /// Whether [`Server::level_init`] is between its spawn pass and its
     /// activate pass, which is what makes the field above meaningful.
     level_loading: bool,
+    /// Damage [`Context::take_damage`] queued and that has not been applied
+    /// yet — `TakeDamage`, deferred by one dispatch. See
+    /// [`Server::flush_damage`].
+    pending_damage: Vec<(EntityId, DamageInfo)>,
+    /// Re-entrancy guard for [`Server::flush_damage`], the twin of
+    /// [`spawning`](Server::spawning).
+    damaging: bool,
+    /// The map [`Context::reload_level`] asked for, until the engine takes it.
+    ///
+    /// `engine->ServerCommand( "reload\n" )` in one process and with no
+    /// saves — see [`Server::take_level_restart`].
+    level_restart: Option<String>,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -236,16 +254,33 @@ pub trait TouchQuery {
 /// did not touch — which is what makes "always copy back" safe rather than a
 /// fight over who owns the origin.
 ///
-/// The fields are exactly what stage 4 reaches: what the touch query sweeps
+/// The fields are what stages 4 and 5 reach: what the touch query sweeps
 /// (`origin`, `mins`, `maxs`), what `PassesTriggerFilters` and
-/// `CTriggerPush::Touch` branch on (`noclip`, `on_ground`), and what a push or
-/// a teleport writes (`velocity`, `base_velocity`, `origin`, `angles`).
+/// `CTriggerPush::Touch` branch on (`move_type`, `on_ground`), what a push or
+/// a teleport writes (`velocity`, `base_velocity`, `origin`, `angles`), and
+/// what damage and death change (`health`, `life_state`, `move_type`,
+/// `flags`).
 ///
 /// > **`angles` are the *view* angles**, where `CBasePlayer` keeps
 /// > `m_angAbsRotation` (yaw only) and its eye angles separately. Every
 /// > consumer here wants the eye — `CTriggerTeleport::Touch` explicitly
 /// > substitutes `EyeAngles()` for `GetAbsAngles()` when the toucher is a
 /// > player — so the port keeps one field and this note.
+///
+/// # Not every field goes both ways, and stage 5 is where that started
+///
+/// Through stage 4 the round trip was an identity for everything the server
+/// did not touch, and *every* field went in and came out. Stage 5 gives the
+/// server sole ownership of four of them —
+/// [`move_type`](PlayerState::move_type), [`health`](PlayerState::health),
+/// [`life_state`](PlayerState::life_state) and
+/// [`flags`](PlayerState::flags) — because `noclip`, damage and death are all
+/// server decisions in the original and all three would be lost if the client
+/// wrote them back. [`Server::set_player_state`] ignores what arrives in
+/// those four; [`Server::player_state`] fills them in.
+///
+/// [`buttons`](PlayerState::buttons) is the mirror image and the only field
+/// that is **purely** the client's: the server reads it and never writes it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlayerState {
     /// `m_vecAbsOrigin` — the **feet**, not the eye.
@@ -257,14 +292,45 @@ pub struct PlayerState {
     pub base_velocity: Vec3,
     /// `FL_ONGROUND`.
     pub on_ground: bool,
-    /// `MOVETYPE_NOCLIP` rather than `MOVETYPE_WALK`. A noclipping player is
-    /// not pushed, which is `CTriggerPush::Touch`'s switch.
-    pub noclip: bool,
+    /// `m_MoveType` — **the server's**, since stage 5.
+    ///
+    /// `noclip` is a `game/server/` command in the original because move type
+    /// is server state that gets networked down (`portdocs/CLIENT.md` §9.2),
+    /// and `CBasePlayer::Event_Killed` writes `MOVETYPE_FLYGRAVITY` into it,
+    /// so the client cannot own it and then be told it died. The client reads
+    /// this and runs whichever move it names.
+    pub move_type: movement::MoveType,
     /// The collision hull, relative to [`origin`](PlayerState::origin).
     /// Changes when the player ducks, which is why it is here rather than a
     /// constant.
     pub mins: Vec3,
     pub maxs: Vec3,
+    /// `m_iHealth` — **the server's**.
+    ///
+    /// The client reads it for one thing and it is not a HUD:
+    /// `CGameMovement::IsDead` is `m_iHealth <= 0` and decides whether the
+    /// movement takes any input at all.
+    pub health: i32,
+    /// `m_lifeState` — **the server's**.
+    pub life_state: LifeState,
+    /// The `FL_*` bits — **the server's**, since stage 5, for the two that
+    /// matter to the movement: `FL_FROZEN` and `FL_ONGROUND`.
+    ///
+    /// > **`FL_ONGROUND` is the one field that goes both ways**, and it has
+    /// > to: the client finds the ground plane and the server takes the player
+    /// > off it (a push, a teleport). [`on_ground`](PlayerState::on_ground)
+    /// > carries it and this does not — the bit is masked out of `flags` in
+    /// > both directions so that the two can never disagree.
+    pub flags: u32,
+    /// `m_nButtons` — **the client's**, read by the server and never written.
+    ///
+    /// `IN_*`, as raw bits, because `ButtonBits` is a `client/` type and this
+    /// struct is the one place the two halves are allowed to agree on a number
+    /// rather than on a type. Read by `PlayerDeathThink`, which waits for
+    /// every button to come up and then for any to go down, and by
+    /// `logic_playerproxy`, which fires `OnJump` and `OnDuck` on the press
+    /// edge.
+    pub buttons: u32,
 }
 
 /// One entity's studio model, as the renderer needs to see it.
@@ -441,6 +507,7 @@ impl Server {
             brush_models: Vec::new(),
             untouch_list: Vec::new(),
             player: None,
+            player_was_ducked: false,
             player_prev_origin: Vec3::ZERO,
             overlaps: Vec::new(),
             obb_overlaps: Vec::new(),
@@ -448,6 +515,9 @@ impl Server {
             spawning: false,
             created_while_loading: Vec::new(),
             level_loading: false,
+            pending_damage: Vec::new(),
+            damaging: false,
+            level_restart: None,
         }
     }
 
@@ -593,6 +663,15 @@ impl Server {
         for &id in ordered.iter().chain(created.iter()) {
             self.dispatch(id, |core, behaviour, cx| {
                 if !core.removed {
+                    // `CBaseEntity::Activate`'s own body, which is two lines
+                    // and one of them is this (`baseentity.cpp:1782`). It runs
+                    // *before* the class's, exactly as `BaseClass::Activate()`
+                    // at the top of an override does — and it has to be here
+                    // rather than at spawn, because the filter it names may
+                    // not have existed yet.
+                    if let Some(name) = core.damage_filter_name.clone() {
+                        core.damage_filter = cx.find_by_name(&name);
+                    }
                     behaviour.activate(core, cx);
                 }
             });
@@ -715,7 +794,11 @@ impl Server {
         self.brush_models.clear();
         self.untouch_list.clear();
         self.player = None;
+        self.player_was_ducked = false;
         self.player_prev_origin = Vec3::ZERO;
+        self.pending_damage.clear();
+        // **Not `level_restart`**: the whole point of it is to survive
+        // `level_shutdown`, because the shutdown is what it asked for.
         self.overlaps.clear();
         self.obb_overlaps.clear();
         self.pending_spawn.clear();
@@ -771,12 +854,84 @@ impl Server {
         // `CPlayerMove::CheckMovingGround`, which in the original is the first
         // thing the player's own simulation does.
         self.check_moving_ground();
+        // `CBasePlayer::PreThink` — which is **not** a think: it is called
+        // once per usercmd from `CPlayerMove::RunCommand`, before the movement
+        // and before `PhysicsSimulate`. The think schedule cannot express
+        // "every tick, first", so it is a step of the tick like the two
+        // either side of it.
+        self.player_pre_think();
         self.player_touch_triggers(query);
         self.run_think_functions();
         self.check_for_entity_untouch();
         self.service_events();
         // Anything a think or an input removed.
         self.cleanup_delete_list();
+    }
+
+    /// `CPortal_Player::PreThink` (`portal_player.cpp:1855`), reduced to the
+    /// three lines that reach a map.
+    ///
+    /// All three are `FirePlayerProxyOutput` calls, and the proxy is found the
+    /// way `CBasePlayer::GetPlayerProxy` finds it — `FindEntityByClassname`,
+    /// first match. 9 entities in the game and no map has two. Valve caches
+    /// the handle and this does not; see the body.
+    ///
+    /// > **The duck events are not symmetric in the original and are not here
+    /// > either.** `OnJump` and `OnDuck` fire off `m_afButtonPressed`, which is
+    /// > the *button*; `OnUnDuck` fires from `CPortal_Player::UnDuck()`
+    /// > (`portal_player_shared.cpp:4710`), which the movement calls when the
+    /// > hull has actually grown back. So a duck that is refused — standing
+    /// > under something too low to un-crouch — fires `OnDuck` and no
+    /// > `OnUnDuck` until it succeeds.
+    ///
+    /// What is left out of `PreThink`, and each needs a subsystem: the air
+    /// control decay and the tractor-beam gravity (paint), `Jump()` itself
+    /// (the client's), `ZoomIn`/`ZoomOut`, and `playtest_random_death` — a
+    /// cvar that kills the player every 30 to 120 seconds, which is exactly
+    /// the kind of thing not to port by accident.
+    fn player_pre_think(&mut self) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let Some(entity) = self.entities.get(player) else {
+            return;
+        };
+        let Some(class) = entity.behaviour.downcast_ref::<classes::Player>() else {
+            return;
+        };
+        let pressed = class.pressed_buttons();
+        let ducked = entity.core.model_bounds.maxs.z <= classes::DUCK_HULL_HEIGHT;
+        let unducked = self.player_was_ducked && !ducked;
+        self.player_was_ducked = ducked;
+
+        // `GetPlayerProxy()` — `FindEntityByClassname( NULL,
+        // "logic_playerproxy" )`, resolved every tick rather than cached,
+        // because a cache would have to be invalidated and the scan is over a
+        // list a map has at most one match in.
+        let Some(proxy) = self
+            .entities
+            .iter()
+            .find(|(_, e)| e.core.class.name == "logic_playerproxy")
+            .map(|(id, _)| id)
+        else {
+            return;
+        };
+
+        for (fires, output) in [
+            (pressed & classes::IN_JUMP != 0, "OnJump"),
+            (pressed & classes::IN_DUCK != 0, "OnDuck"),
+            (unducked, "OnUnDuck"),
+        ] {
+            if !fires {
+                continue;
+            }
+            // `FirePlayerProxyOutput( name, variant_t(), this, this )` — the
+            // *player* is both activator and caller, not the proxy, which is
+            // what makes `!activator` in the chain resolve to the player.
+            self.dispatch(proxy, |core, _behaviour, cx| {
+                core.fire_output(output, Variant::Void, Some(player), Some(player), 0.0, cx);
+            });
+        }
     }
 
     /// `CBasePlayer::PhysicsSimulate`'s `PhysicsTouchTriggers( &vecPrevOrigin )`
@@ -1260,6 +1415,8 @@ impl Server {
         let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
         let changed = cx.take_changed();
         let created = cx.take_created();
+        let damage = cx.take_damage_queue();
+        let reload = cx.take_reload_level();
         let next_think = entity.core.next_think_tick();
         // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
         // `SetMoveType` both call — reconciled here for the same reason the
@@ -1294,7 +1451,68 @@ impl Server {
         self.pending_spawn.extend(created);
         self.flush_created();
 
+        // `pOther->TakeDamage( info )`, which in the C++ the hurter calls
+        // itself part-way through its own think. It happens here instead and
+        // for exactly the reason the spawn above does — see
+        // [`Context::take_damage`] — and it is *after* the spawn flush,
+        // because an entity created by this handler is one the damage could
+        // legitimately be aimed at.
+        self.pending_damage.extend(damage);
+        self.flush_damage();
+
+        if reload {
+            self.level_restart = self.map.clone();
+        }
+
         Some(result)
+    }
+
+    /// Applies whatever [`Context::take_damage`] queued, and whatever the
+    /// resulting `OnTakeDamage`s queued in turn.
+    ///
+    /// Same shape and same guard as [`flush_created`](Server::flush_created):
+    /// the re-entry from a nested `dispatch` returns immediately, so a chain
+    /// of damage unwinds as a loop at the outermost frame rather than as a
+    /// stack.
+    fn flush_damage(&mut self) {
+        if self.damaging {
+            return;
+        }
+        self.damaging = true;
+        // A `trigger_hurt` deals at most one dose per victim per think and
+        // nothing in the port deals damage from inside `OnTakeDamage`, so
+        // anything past this is a class that hurts whatever hurts it.
+        const LIMIT: usize = 4096;
+        let mut applied = 0;
+        while !self.pending_damage.is_empty() {
+            for (target, info) in std::mem::take(&mut self.pending_damage) {
+                self.apply_damage(target, &info);
+                applied += 1;
+            }
+            if applied > LIMIT {
+                eprintln!(
+                    "source-engine: server: LEVEL DESIGN ERROR: more than {LIMIT} points of \
+                     damage dealt in one dispatch; dropping the rest"
+                );
+                self.pending_damage.clear();
+                break;
+            }
+        }
+        self.damaging = false;
+    }
+
+    /// One queued hit: `OnTakeDamage` on the victim.
+    fn apply_damage(&mut self, target: EntityId, info: &DamageInfo) {
+        self.dispatch(target, |core, behaviour, cx| {
+            // `CBaseEntity::IsMarkedForDeletion` — an entity removed between
+            // the queue and the flush is not there to be hurt. Valve gets this
+            // for free from the handle going null a frame later; here the
+            // entity is still in the list until `CleanupDeleteList`.
+            if core.removed {
+                return;
+            }
+            behaviour.on_take_damage(core, info, cx);
+        });
     }
 
     /// Spawns whatever [`Context::create_entity`] made, and whatever *those*
@@ -1526,6 +1744,12 @@ impl Server {
     ///
     /// One half of the seam described on [`PlayerState`]; call it once per
     /// rendered frame, before [`frame`](Server::frame).
+    ///
+    /// **Four fields arrive and are ignored** — `move_type`, `health`,
+    /// `life_state` and `flags` — because since stage 5 the server owns them.
+    /// They are in the struct so that the client can *read* them; writing them
+    /// here would undo every `noclip`, every hit and every death on the next
+    /// rendered frame.
     pub fn set_player_state(&mut self, state: PlayerState) {
         let Some(player) = self.player else {
             return;
@@ -1542,13 +1766,25 @@ impl Server {
             mins: state.mins,
             maxs: state.maxs,
         };
-        core.move_type = match state.noclip {
-            true => movement::MoveType::Noclip,
-            false => movement::MoveType::Walk,
-        };
         match state.on_ground {
             true => core.flags |= movement::FL_ONGROUND,
             false => core.flags &= !movement::FL_ONGROUND,
+        }
+        // `CBasePlayer::UpdateButtonState` (`player.cpp:4030`), which the
+        // original runs once per usercmd — that is, once per tick — from
+        // `CPlayerMove::SetupMove`. It runs once per *rendered frame* here,
+        // which is the one place the two clocks show: a tick sees whatever the
+        // last frame before it sampled.
+        //
+        // > **A press and release inside one tick is lost**, and that is
+        // > Valve's too rather than this port's: a shipped server sees one
+        // > usercmd per tick and computes the same edge from it. What differs
+        // > is only *which* sample within the tick, and the answer here is
+        // > "the most recent one", where Valve's client would have merged the
+        // > frames into the command.
+        let player_class = entity.behaviour.downcast_mut::<classes::Player>();
+        if let Some(player_class) = player_class {
+            player_class.update_button_state(state.buttons);
         }
     }
 
@@ -1564,10 +1800,103 @@ impl Server {
             velocity: core.velocity,
             base_velocity: core.base_velocity,
             on_ground: core.has_flags(movement::FL_ONGROUND),
-            noclip: core.move_type == movement::MoveType::Noclip,
+            move_type: core.move_type,
             mins: core.model_bounds.mins,
             maxs: core.model_bounds.maxs,
+            health: core.health,
+            life_state: core.life_state,
+            // `FL_ONGROUND` is masked out on the way past — see the field's
+            // docs for why it travels in `on_ground` and nowhere else.
+            flags: core.flags & !movement::FL_ONGROUND,
+            // Read-only from the server's side: whatever came in last.
+            buttons: entity
+                .behaviour
+                .downcast_ref::<classes::Player>()
+                .map_or(0, classes::Player::buttons),
         })
+    }
+
+    /// `CON_COMMAND_F( noclip, "Toggle. Player becomes non-solid and flies.",
+    /// FCVAR_CHEAT )` — and it is a `game/server/` command again.
+    ///
+    /// > **This is `portdocs/CLIENT.md` §9.2's wart, closed.** `noclip` lived
+    /// > in `src/client/` from stage 1 because move type had nowhere else to
+    /// > be; the condition recorded for moving it was "stage 5, where the move
+    /// > type becomes the server's state rather than a field on
+    /// > `client::Player`". That is this.
+    ///
+    /// Returns whether the player is now noclipping, or `None` if there is no
+    /// player to ask.
+    pub fn toggle_noclip(&mut self) -> Option<bool> {
+        let entity = self.entities.get_mut(self.player?)?;
+        // `CC_Noclip_f` flips between `MOVETYPE_NOCLIP` and `MOVETYPE_WALK`
+        // and knows about no third state, so a dead player who noclips comes
+        // back as a *walking* corpse. Reproduced: the alternative is to invent
+        // a rule Valve does not have, and `kill` followed by `noclip` is a
+        // sequence a developer types.
+        entity.core.move_type = match entity.core.move_type {
+            movement::MoveType::Noclip => movement::MoveType::Walk,
+            _ => movement::MoveType::Noclip,
+        };
+        Some(entity.core.move_type == movement::MoveType::Noclip)
+    }
+
+    /// `CC_God_f` (`client.cpp:1334`) — `ToggleFlag( FL_GODMODE )`.
+    ///
+    /// Returns whether god mode is now on, or `None` with no player.
+    pub fn toggle_god(&mut self) -> Option<bool> {
+        let entity = self.entities.get_mut(self.player?)?;
+        entity.core.flags ^= movement::FL_GODMODE;
+        Some(entity.core.has_flags(movement::FL_GODMODE))
+    }
+
+    /// `ClientKill` (`client.cpp:56`) → `CBasePlayer::CommitSuicide`.
+    ///
+    /// Returns whether the player died. `false` for one already dead, or
+    /// inside the five-second suicide cooldown.
+    pub fn kill_player(&mut self) -> bool {
+        let Some(player) = self.player else {
+            return false;
+        };
+        self.dispatch(player, |core, behaviour, cx| {
+            match behaviour.downcast_mut::<classes::Player>() {
+                Some(class) => class.commit_suicide(core, cx, false),
+                None => false,
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Hurt the player by hand. **This port's, not Valve's** — the nearest
+    /// thing in the original is `hurtme`, which is `#ifdef _DEBUG` only.
+    ///
+    /// It is here because damage has exactly one source in the shipped maps
+    /// (`trigger_hurt`), and a source you have to walk into is not a way to
+    /// test the arithmetic.
+    pub fn hurt_player(&mut self, amount: f32, damage_type: i32) -> bool {
+        let Some(player) = self.player else {
+            return false;
+        };
+        let info = DamageInfo::new(Some(player), Some(player), amount, damage_type);
+        self.dispatch(player, |core, behaviour, cx| {
+            behaviour.on_take_damage(core, &info, cx)
+        })
+        .is_some_and(|result| result != Damaged::Refused)
+    }
+
+    /// The map the game has asked the engine to start again, taken once.
+    ///
+    /// `engine->ServerCommand( "reload\n" )`, which in a game with saves
+    /// restores the last one and here restarts the level — see
+    /// [`Context::reload_level`](class::Context::reload_level). Two things ask
+    /// for it: a dead player, three seconds after dying, and
+    /// `player_loadsaved`'s `LoadThink`.
+    ///
+    /// **Read once per rendered frame by `Engine::frame`**, which turns it
+    /// into `Host::request_new_game` — so nothing in this module names the
+    /// host state machine, the same way nothing in it names `wgpu`.
+    pub fn take_level_restart(&mut self) -> Option<String> {
+        self.level_restart.take()
     }
 
     /// How many brush entities this map placed that the port has a class for.
@@ -1721,6 +2050,28 @@ impl Server {
             if entity.effects != 0 {
                 cx.print(&format!("  effects: {:#x}", entity.effects));
             }
+            // The damage block. Printed only when something can take damage,
+            // because 60,000 of the game's 60,925 entities are
+            // `DAMAGE_NO`/0/0 and a line saying so on every one of them is
+            // noise.
+            if entity.take_damage.takes_damage() || entity.health != 0 {
+                cx.print(&format!(
+                    "  health: {}/{} ({:?}, {:?})",
+                    entity.health, entity.max_health, entity.take_damage, entity.life_state
+                ));
+            }
+            if let Some(filter) = &entity.damage_filter_name {
+                cx.print(&format!(
+                    "  damagefilter: {filter} ({})",
+                    match entity.damage_filter {
+                        Some(_) => "resolved",
+                        None => "NOT FOUND",
+                    }
+                ));
+            }
+            if entity.flags != 0 {
+                cx.print(&format!("  flags: {:#x}", entity.flags));
+            }
             let next_think = entity.next_think_tick();
             if next_think != think::TICK_NEVER_THINK {
                 cx.print(&format!(
@@ -1757,9 +2108,11 @@ impl Server {
     /// The one way to drive entity I/O by hand, and the reason it is worth the
     /// thirty lines: everything in this module is invisible without it.
     ///
-    /// Valve's version passes the issuing player as both activator and caller;
-    /// there is no player entity until stage 5, so both are null — which means
-    /// an `!activator` in whatever it sets off will resolve to nothing.
+    /// Valve's version passes the issuing player as both activator and caller.
+    /// This one passes the player as **activator** since stage 5 — so
+    /// `ent_fire <trigger> StartTouch` and anything resolving `!activator`
+    /// reach the player — and leaves the caller null, because the console is
+    /// not an entity and `!caller` has nothing to be.
     ///
     /// **The delay is `atoi`, not `atof`**, in Valve's implementation, so
     /// `ent_fire x Trigger "" 0.5` fires immediately. Reproduced.
@@ -1785,7 +2138,7 @@ impl Server {
             target: Target::Name(target.to_owned()),
             input: input.to_owned(),
             value,
-            activator: None,
+            activator: self.player,
             caller: None,
             output_id: 0,
         });

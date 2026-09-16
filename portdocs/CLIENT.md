@@ -793,13 +793,19 @@ up. Those are ported in the world-`+Z` form.
    exactly what `rustdocs/`'s "verify signatures against the source" rule exists to
    catch, and the other nineteen cvars in §8 are still transcribed rather than checked.
    **Check each one against `legacy/` as stage 1 registers it.**
-2. **`noclip` is a server command in Valve, and there is no server.** `ConCommand noclip`
-   lives in `game/server/`, because move type is server state that gets networked down.
-   With one process and no server, stage 1 has to put it somewhere; putting it on the
-   client is a divergence that stage 4 or `server/` will have to undo. **Recommendation:**
-   register it in `client/`, flag it in `rustdocs/CLIENT.md` as owned by `server/`, and
-   move it when `server/` exists — the same shape as the `gameinfo.txt` and `CommandLine`
-   warts, which is a pattern this project already handles well.
+2. **~~`noclip` is a server command in Valve, and there is no server.~~ — **RESOLVED** by
+   `portdocs/SERVER.md` stage 5.** `ConCommand noclip` lives in `game/server/`, because
+   move type is server state that gets networked down. Stage 1 put it on the client and
+   flagged it here; the recommendation was to move it "when `server/` exists", and the
+   condition the wart actually recorded was sharper — **when the move type becomes the
+   server's state rather than a field on `client::Player`**. That is `server/` stage 5:
+   `Server::toggle_noclip` is the command, `PlayerState::move_type` carries the answer
+   *to* the client, and `Client::toggle_noclip` is deleted. `god`, `kill` and `hurtme`
+   arrived alongside it, because they are its neighbours in `game/server/client.cpp`.
+
+   The general shape held exactly as predicted — register it where it can work, name the
+   owner in `rustdocs/`, move it when the owner exists — and it is now the third wart
+   this project has closed that way, after `gameinfo.txt` and `CommandLine`.
 3. **Does `client/` own the render view, or does `engine/`?** Stage 2 says the client
    produces a `ViewSetup` and the engine converts it. The alternative — the client holding
    a `materials::Camera` — makes `client/` depend on `materials/`, which is a dependency
@@ -818,7 +824,18 @@ up. Those are ported in the world-`+Z` form.
    (`UpdatePortalEyeInterpolation`) and flags `m_bEyePositionIsTransformedByPortal`. A
    stage-2 `ViewSetup` that computes the eye inline, rather than asking the player for it,
    closes that seam. Ask the player.
-7. **Is prediction ever actually needed for single-player Portal 2?** A listen server has
+7. **~~Does the movement move to the server?~~ — answered by `server/` stage 5, and the
+   answer is no.** `portdocs/SERVER.md` stage 5 lists "the movement moving to the server
+   (and with it the question of what to do about two clocks)". §5 of that document
+   already contained the argument: `CPlayerMove::RunCommand` runs the movement on the
+   fixed tick and `CPrediction` re-runs *the same `CGameMovement` code* on the client, so
+   a one-process port with no `net/` already has the client half. Moving it would buy a
+   64 Hz camera with no interpolation and nothing else. What stage 5 moved instead is the
+   **authority** — the move type, the health and the life state — which is the part that
+   was actually wrong. This question and question 8 are the same question and should be
+   answered together when `net/` is designed.
+
+8. **Is prediction ever actually needed for single-player Portal 2?** A listen server has
    no latency, and `CL_Move`'s `IsLoopback()` branch already skips most of the send path.
    It may be that the whole of stage 5 reduces to "run the command against the local
    server's player". Worth answering *before* `net/` is designed, because the answer

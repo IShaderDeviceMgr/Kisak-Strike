@@ -86,6 +86,11 @@ pub enum MoveType {
     Walk,
     /// `MOVETYPE_NOCLIP`. The player, flying. Simulated by `client/`.
     Noclip,
+    /// `MOVETYPE_FLYGRAVITY`. The player, **dead** — `CBasePlayer::Event_Killed`
+    /// sets it and nothing sets it back except a respawn. Gravity and a single
+    /// swept move with no clip-and-retry; `CGameMovement::FullTossMove`, and
+    /// also simulated by `client/`.
+    FlyGravity,
 }
 
 /// `EF_NODRAW` (`public/const.h:268`) — "don't draw entity".
@@ -142,6 +147,29 @@ pub const FL_CLIENT: u32 = 1 << 8;
 /// leaves the trigger rather than into a velocity that never goes away —
 /// `CPlayerMove::CheckMovingGround` (`player_command.cpp:93`).
 pub const FL_BASEVELOCITY: u32 = 1 << 24;
+
+/// `FL_FROZEN` (`public/const.h:126`) — "Player is frozen for 3rd person
+/// camera".
+///
+/// Set by `CRevertSaved::InputReload` and read by
+/// `CPortalGameMovement::CheckParameters`, which zeroes the whole move. Those
+/// two are the entire live path in this port, and they are 11 shipped
+/// connections at 9 `player_loadsaved` entities.
+pub const FL_FROZEN: u32 = 1 << 6;
+
+/// `FL_GODMODE` (`public/const.h:140`) — the `god` command.
+///
+/// Read by two lines, and they are not the same line:
+/// `CBasePlayer::OnTakeDamage` refuses the hit outright, and
+/// `CBaseCombatCharacter::OnTakeDamage_Alive` refuses it again for everything
+/// that is not a player. Only the first is reachable here.
+pub const FL_GODMODE: u32 = 1 << 15;
+
+/// `FL_NOTARGET` (`public/const.h:141`). Set alongside [`FL_FROZEN`] by
+/// `CRevertSaved::InputReload` and read by the AI, which is not ported —
+/// carried so that the flag word an `ent_dump` prints is the one the shipped
+/// game would print.
+pub const FL_NOTARGET: u32 = 1 << 16;
 
 /// `SolidType_t` (`public/const.h:216`) — *how* an entity is solid, as opposed
 /// to the `FSOLID_*` bits, which say whether it is.
@@ -459,10 +487,12 @@ pub const SF_DOOR_ROTATE_PITCH: u32 = 128;
 pub fn simulate(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &mut Context<'_>) {
     match entity.move_type {
         // `PhysicsNone` (`physics_main.cpp:1722`) — "non moving objects can
-        // only think". The player's two movetypes take this branch as well,
+        // only think". The player's three movetypes take this branch as well,
         // because `client/` is what moves the player and the server holds a
-        // copy; see [`MoveType`].
-        MoveType::None | MoveType::Walk | MoveType::Noclip => {
+        // copy; see [`MoveType`]. That includes `MOVETYPE_FLYGRAVITY`, which
+        // is the dead player — and it is what makes `PlayerDeathThink` run at
+        // all, since a think is the only thing this branch does.
+        MoveType::None | MoveType::Walk | MoveType::Noclip | MoveType::FlyGravity => {
             physics_run_think(entity, behaviour, cx);
         }
         MoveType::Push => physics_pusher(entity, behaviour, cx),

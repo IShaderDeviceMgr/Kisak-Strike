@@ -31,6 +31,7 @@
 
 use std::any::Any;
 
+use super::damage::{self, Damaged, DamageInfo, DamageMode, LifeState};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
 use super::name;
@@ -133,12 +134,18 @@ impl ClassDef {
 /// `CBaseEntity`'s own inputs — the ones every class has (`baseentity.cpp:2370`).
 ///
 /// **Not all of them: the ones a shipped Portal 2 map fires at a class this
-/// port implements.** Valve declares 30; the rest either need a subsystem that
-/// does not exist (`SetDamageFilter`, `DispatchResponse`, `RunScriptCode`) or
-/// belong to a later stage (`SetParent` and the parenting family are stage 3's,
-/// `Alpha`/`Color`/`DisableDraw` are the renderer's). Each absence is a
-/// measurement: the depot test's `EXPECTED_UNHANDLED_INPUTS` table lists every
-/// input name in the game that reaches an implemented class and is refused.
+/// port implements, plus one it does not.** Valve declares 30; the rest either
+/// need a subsystem that does not exist (`DispatchResponse`, `RunScriptCode`)
+/// or need a piece of `EntityCore` that is not written yet (`SetParent` and
+/// the parenting family want a local/abs transform pair; `Alpha`, `Color` and
+/// `DisableDraw` are the renderer's). Each absence is a measurement: the depot
+/// test's expected-unhandled table lists every input name in the game that
+/// reaches an implemented class and is refused.
+///
+/// `SetDamageFilter` is the "one it does not": **no shipped connection fires
+/// it**, and it is here because `portdocs/SERVER.md` stage 5 gave the port a
+/// `m_hDamageFilter` for it to re-point, and a filter nothing can re-point is
+/// a worse shape than one nothing re-points.
 ///
 /// `Use` earns its place for a reason that is easy to miss: it is the input a
 /// connection gets when the mapper left the field **empty**
@@ -149,6 +156,9 @@ impl ClassDef {
 pub const BASE_INPUTS: &[InputDef] = &[
     InputDef::new("Kill", FieldType::Void),
     InputDef::new("Use", FieldType::Void),
+    // `DEFINE_INPUTFUNC( FIELD_STRING, "SetDamageFilter", InputSetDamageFilter )`
+    // (`baseentity.cpp:2388`) — see the note above.
+    InputDef::new("SetDamageFilter", FieldType::String),
     InputDef::new("FireUser1", FieldType::String),
     InputDef::new("FireUser2", FieldType::String),
     InputDef::new("FireUser3", FieldType::String),
@@ -180,6 +190,18 @@ pub fn base_accept_input(
         // never-delete-a-player branch both need entities this port has not
         // got; what is left is the `UTIL_Remove`.
         entity.remove();
+        return true;
+    }
+    if is("SetDamageFilter") {
+        // `InputSetDamageFilter` (`baseentity.cpp:4689`) — re-point the
+        // filter, resolving the new name immediately. An empty string clears
+        // it, which is Valve's `NULL_STRING` branch.
+        let name = input.value.to_string();
+        entity.damage_filter_name = (!name.is_empty()).then(|| name.clone());
+        entity.damage_filter = match name.is_empty() {
+            true => None,
+            false => cx.find_by_name(&name),
+        };
         return true;
     }
     if is("Use") {
@@ -302,6 +324,11 @@ pub struct Context<'a> {
     /// What [`create_entity`](Context::create_entity) made, in creation order,
     /// waiting for its `Spawn`.
     created: Vec<EntityId>,
+    /// What [`take_damage`](Context::take_damage) queued, in the order it was
+    /// dealt, waiting to be applied.
+    damage: Vec<(EntityId, DamageInfo)>,
+    /// Whether [`reload_level`](Context::reload_level) was called.
+    reload_level: bool,
 }
 
 impl<'a> Context<'a> {
@@ -320,6 +347,8 @@ impl<'a> Context<'a> {
             player,
             changed: Vec::new(),
             created: Vec::new(),
+            damage: Vec::new(),
+            reload_level: false,
         }
     }
 
@@ -372,6 +401,53 @@ impl<'a> Context<'a> {
         let entity = self.entities.get_mut(id)?;
         self.changed.push(id);
         entity.behaviour.downcast_mut::<T>()
+    }
+
+    /// `pOther->TakeDamage( info )` (`baseentity.cpp:1893`) — hurt another
+    /// entity.
+    ///
+    /// **Queued, not immediate**, for the reason
+    /// [`create_entity`](Context::create_entity) is: applying damage means
+    /// running the *victim's* `OnTakeDamage` and possibly its `Event_Killed`,
+    /// and `Server::dispatch` has lifted the caller out of the entity list so
+    /// nothing can dispatch into it. `Server::dispatch` applies the queue on
+    /// the way out, inside the same tick — see [`damage`](super::damage) for
+    /// why that costs nothing observable.
+    ///
+    /// The two gates Valve checks *before* `OnTakeDamage` are checked here,
+    /// synchronously, because a caller branches on the answer:
+    /// `PassesDamageFilter` and the victim's `m_takedamage`. The two it checks
+    /// that this port has not got are `g_pGameRules->AllowDamage` (there are
+    /// no game rules) and `PhysIsInCallback` (there is no `vphysics`), and the
+    /// damage *scaling* pair `GetAttackDamageScale`/`GetReceivedDamageScale`
+    /// are both `#if ENABLE_DAMAGE_MODIFIERS`, which no shipping branch
+    /// defines.
+    ///
+    /// Returns whether the damage was queued, which is what a caller that
+    /// counts victims wants.
+    pub fn take_damage(&mut self, target: EntityId, info: DamageInfo) -> bool {
+        let Some(entity) = self.entities.get(target) else {
+            return false;
+        };
+        if !entity.core.take_damage.takes_damage() {
+            return false;
+        }
+        // `CBaseEntity::PassesDamageFilter` — the victim's own filter, not the
+        // trigger's. 27 entities in the game name one and none of them is a
+        // class this port has.
+        if let Some(filter) = entity.core.damage_filter {
+            let Some(filter_entity) = self.entities.get(filter) else {
+                return false;
+            };
+            if !filter_entity
+                .behaviour
+                .passes_damage_filter(&filter_entity.core, &info, self)
+            {
+                return false;
+            }
+        }
+        self.damage.push((target, info));
+        true
     }
 
     /// Another entity, read-only. `EHANDLE::Get()`.
@@ -446,6 +522,43 @@ impl<'a> Context<'a> {
     /// creation order, for `Server::dispatch` to spawn.
     pub(super) fn take_created(&mut self) -> Vec<EntityId> {
         std::mem::take(&mut self.created)
+    }
+
+    /// The damage [`take_damage`](Context::take_damage) queued, for
+    /// `Server::dispatch` to apply.
+    pub(super) fn take_damage_queue(&mut self) -> Vec<(EntityId, DamageInfo)> {
+        std::mem::take(&mut self.damage)
+    }
+
+    /// `engine->ServerCommand( "reload\n" )` — start this level again.
+    ///
+    /// Valve's single-player `respawn()` (`cs_client.cpp:188`) and
+    /// `CRevertSaved::LoadThink` both reload the **last save**. This port has
+    /// no save/restore (`portdocs/SERVER.md` §6 defers it as `serde` over the
+    /// entity state rather than a port of `ISave`/`IRestore`), so the nearest
+    /// honest thing is to start the map again — which is what a save at the
+    /// chamber entrance would have done anyway, since Portal 2 autosaves on
+    /// entry.
+    ///
+    /// Harvested by `Server::dispatch` and answered by
+    /// `Server::take_level_restart`, so that nothing in this module names the
+    /// host state machine.
+    pub fn reload_level(&mut self) {
+        self.reload_level = true;
+    }
+
+    /// Whether [`reload_level`](Context::reload_level) was called.
+    pub(super) fn take_reload_level(&mut self) -> bool {
+        std::mem::take(&mut self.reload_level)
+    }
+
+    /// `UTIL_GetLocalPlayer()`/`AI_GetSinglePlayer()` — the one player, if the
+    /// engine has put one in the world.
+    ///
+    /// `None` inside the player's *own* handler, for the same reason
+    /// [`entity`](Context::entity) is: it has been lifted out of the list.
+    pub fn player(&self) -> Option<EntityId> {
+        self.player.filter(|id| self.entities.get(*id).is_some())
     }
 
     /// `gpGlobals->curtime`.
@@ -711,12 +824,94 @@ pub trait Behaviour: Any {
         true
     }
 
-    /// `CBaseEntity::IsPlayer()`.
+    /// `CBaseEntity::PassesDamageFilter` (`baseentity.cpp:3566`) — does this
+    /// *filter* allow the damage in `info`?
     ///
-    /// One class overrides it, and three things read it: `trigger_hurt`
-    /// choosing between `OnHurtPlayer` and `OnHurt`, `filter_activator_name`'s
-    /// special case for the literal string `!player`, and `trigger_teleport`
-    /// taking the eye angles rather than the entity angles.
+    /// A second question on the same six classes [`passes_filter`] answers the
+    /// first for, and the reason `CBaseFilter` has two virtuals rather than
+    /// one. The default is `CBaseFilter::PassesDamageFilterImpl`'s: ask the
+    /// activator question about the damage's *attacker*. One class overrides
+    /// it — `filter_damage_type`, whose activator answer is
+    /// `ASSERT( false ); return true;` and whose real test is this.
+    ///
+    /// **The negation is this method's**, unlike [`passes_filter`]'s, because
+    /// `CBaseFilter::PassesDamageFilter` applies `m_bNegated` around the impl
+    /// and nothing combines damage filters the way `filter_multi` combines
+    /// activator ones.
+    ///
+    /// [`passes_filter`]: Behaviour::passes_filter
+    fn passes_damage_filter(
+        &self,
+        entity: &EntityCore,
+        info: &DamageInfo,
+        cx: &Context<'_>,
+    ) -> bool {
+        // `PassesFilterImpl( NULL, info.GetAttacker() )`, plus the negation
+        // the caller would otherwise owe. A null attacker cannot be asked
+        // about, and `PassesFilterImpl` on a null entity is a crash in the
+        // original; refusing is the only defined answer.
+        let Some(attacker) = info.attacker.and_then(|id| cx.entity(id)) else {
+            return false;
+        };
+        self.passes_filter(entity, &attacker.core, &cx.filters())
+    }
+
+    /// `OnTakeDamage` — the whole ladder, as one method.
+    ///
+    /// Called on the **victim**, with the victim detached from the entity list
+    /// the way any other dispatch is, so a class may kill itself from inside
+    /// it. The default is `CBaseEntity::OnTakeDamage` (`baseentity.cpp:1826`)
+    /// reduced to what exists: the health arithmetic, and `Event_Killed` at
+    /// zero.
+    ///
+    /// Overridden by one class — the player, which scales the damage, checks
+    /// `FL_GODMODE` and refuses to be hurt twice.
+    ///
+    /// What is gone from the default, and each is measured rather than
+    /// forgotten: `VPhysicsTakeDamage` (needs `rapier`), the impulse a
+    /// `MOVETYPE_WALK` victim takes from its inflictor (**unreachable from
+    /// here anyway** — the only damage source in the port is a `trigger_hurt`,
+    /// and the branch requires `!info.GetAttacker()->IsSolidFlagSet(
+    /// FSOLID_TRIGGER )`), and `g_vecAttackDir`, a file-scope global read by
+    /// glass and decals.
+    fn on_take_damage(
+        &mut self,
+        entity: &mut EntityCore,
+        info: &DamageInfo,
+        cx: &mut Context<'_>,
+    ) -> Damaged {
+        let result = damage::take_damage(
+            entity.take_damage,
+            &mut entity.health,
+            &mut entity.damage_accumulator,
+            info,
+        );
+        if result == Damaged::Killed {
+            self.event_killed(entity, info, cx);
+        }
+        result
+    }
+
+    /// `Event_Killed` (`baseentity.cpp:2061`) — "character killed (only fired
+    /// once)".
+    ///
+    /// The default is `CBaseEntity`'s three lines: stop taking damage, become
+    /// `LIFE_DEAD`, delete yourself. `info.GetAttacker()->Event_KilledOther(
+    /// this, info )` is **not** here — it is a virtual on the *attacker*,
+    /// nothing in the port overrides it (Valve's implementations are game
+    /// stats and NPC bookkeeping), and dispatching into another entity from
+    /// inside a handler is what [`Context::create_entity`] exists to avoid.
+    fn event_killed(
+        &mut self,
+        entity: &mut EntityCore,
+        _info: &DamageInfo,
+        _cx: &mut Context<'_>,
+    ) {
+        entity.take_damage = DamageMode::No;
+        entity.life_state = LifeState::Dead;
+        entity.remove();
+    }
+
     /// What this entity's studio model is doing, if it draws one.
     ///
     /// `None` — the default — for the 35 classes that draw no model or whose
@@ -732,6 +927,14 @@ pub trait Behaviour: Any {
         None
     }
 
+    /// `CBaseEntity::IsPlayer()`.
+    ///
+    /// One class overrides it, and four things read it: `trigger_hurt`
+    /// choosing between `OnHurtPlayer` and `OnHurt`, `filter_activator_name`'s
+    /// special case for the literal string `!player`, `trigger_teleport`
+    /// taking the eye angles rather than the entity angles, and — from stage 5
+    /// — `Server::take_damage` deciding whether a kill needs the level
+    /// reloaded.
     fn is_player(&self) -> bool {
         false
     }

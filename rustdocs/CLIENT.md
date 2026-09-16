@@ -10,9 +10,9 @@ Porting plan and the C++ inventory: [`portdocs/CLIENT.md`](../portdocs/CLIENT.md
 | Module | `crate::client`, with `client::{button, movement, player, tonemap, usercmd, view}` |
 | Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, `FullNoClipMove`/`FullWalkMove` from `game/shared/gamemovement.cpp` (via `portal_gamemovement.cpp`), and `CTonemapSystem` from `viewpostprocess.cpp` |
 | Lines | ~5,500 including tests |
-| Tests | 99 (`cargo test client::`) |
+| Tests | 107 (`cargo test client::`) |
 | Dependencies | `std`, `glam`, and `crate::engine::console` for cvar handles. **Not `winit`, not `egui`, not `wgpu`, not `crate::engine::input`** |
-| Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8), plus the tone mapper (`portdocs/CLIENT_TONEMAP.md`). Stage 5 waits for `net/` |
+| Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8), plus the tone mapper (`portdocs/CLIENT_TONEMAP.md`) and the dead player that `server/` stage 5 brought. `client/` stage 5 waits for `net/` |
 
 ## This is not `src/engine/client/`
 
@@ -181,7 +181,12 @@ pub const VEC_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 72.0);
 pub const VEC_DUCK_HULL_MIN: Vec3 = Vec3::new(-16.0, -16.0, 0.0);
 pub const VEC_DUCK_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 36.0);
 
-pub enum MoveType { Walk, Noclip }
+/// `VEC_DEAD_VIEWHEIGHT` — **14, not the multiplayer table's 60**. Portal 2
+/// single player is `CPortalGameRules : CHalfLife2`, which overrides no view
+/// vectors, so it gets `g_DefaultViewVectors` like every other constant here.
+pub const VEC_DEAD_VIEWHEIGHT: Vec3 = Vec3::new(0.0, 0.0, 14.0);
+
+pub enum MoveType { Walk, Noclip, FlyGravity }
 
 pub struct Player {
     pub origin: Vec3,        // the FEET
@@ -190,7 +195,13 @@ pub struct Player {
     /// it**; see the note below.
     pub base_velocity: Vec3,
     pub angles: ViewAngles,
+    /// **The server owns this too, since `server/` stage 5** — `noclip` is a
+    /// `game/server/` command and `Event_Killed` writes `MOVETYPE_FLYGRAVITY`.
     pub move_type: MoveType,
+    /// `m_iHealth` — the server's. Read for one thing: `IsDead()`.
+    pub health: i32,
+    /// `GetFlags() & FL_FROZEN` — the server's. `player_loadsaved` sets it.
+    pub frozen: bool,
     pub view_offset: Vec3,
     pub ground: Option<Vec3>,      // the normal underfoot, None when airborne
     pub surface_friction: f32,
@@ -220,6 +231,39 @@ permanent anti-gravity field.
 
 It travels both ways through `server::PlayerState`, which `Engine::frame` copies in before
 the server's ticks and out after them. **Nothing in this module writes it.**
+
+#### `move_type`, `health` and `frozen` are the server's, and they only come *in*
+
+`server/` stage 5 gave the server authority over three more fields. `noclip` is a
+`game/server/` command in the original because the move type is server state that gets
+networked down; `CBasePlayer::Event_Killed` writes `MOVETYPE_FLYGRAVITY` and the health
+that got it there; `CRevertSaved::InputReload` sets `FL_FROZEN`. All three arrive through
+`Engine::frame`'s `apply_player_state` and **nothing in this module writes any of them** —
+`Client::toggle_noclip` is gone, and `Server::toggle_noclip` is what the console command
+reaches now.
+
+What this module does with them is one function each: `player_move` dispatches on the move
+type, and `check_parameters` reads the other two.
+
+#### The dead player
+
+`MoveType::FlyGravity` is `CGameMovement::FullTossMove` — gravity, one swept move, and a
+stop. There is no clip-and-retry and no stair stepping, which is what makes a corpse feel
+like a dropped object rather than like a player, and `PerformFlyCollisionResolution` zeroes
+the velocity outright when it lands because a player's move-collide is
+`MOVECOLLIDE_DEFAULT` rather than `MOVECOLLIDE_FLY_BOUNCE`.
+
+`check_parameters` is where being dead and being frozen are read, and they are **two
+separate `if`s that happen to overlap**:
+
+- `FL_FROZEN || FL_ONTRAIN || IsDead()` zeroes `forwardmove`/`sidemove`/`upmove` — and
+  nothing else, so a corpse that was falling keeps falling.
+- `IsDead()` alone pins `mv.angles` to the previous command's (the `old_angles`
+  argument), and writes `VEC_DEAD_VIEWHEIGHT` into the view offset.
+
+**`IsDead()` is `m_iHealth <= 0`** (`gamemovement.cpp:1091`), not the life state — see
+`rustdocs/SERVER.md` gotcha 53 for why the two differ and why the *health* is what crosses
+the seam.
 
 ### `movement` — `MoveData`, `MoveVars` and the move itself
 
@@ -611,6 +655,46 @@ Same ordering: most likely to bite first.
   `rustdocs/ENGINE.md`'s trace gotcha 1, and every one of this module's ~14 traces goes
   through `trace_player_bbox`, which is the only place that pairing is written down.
 
+### Dying's own, added by `server/` stage 5
+
+- **`move_type`, `health` and `frozen` come *in* and never go out.** They are the
+  server's. Writing one here is undone by `apply_player_state` a fraction of a frame
+  later, which reads as `noclip` not working rather than as a bug in this module.
+  `Client::toggle_noclip` no longer exists; `Server::toggle_noclip` is what the console
+  command reaches.
+
+- **`IsDead()` is `m_iHealth <= 0`, not the life state.** They disagree for exactly one
+  server dispatch, and `PlayerState` carries the health for this reason. Asking the life
+  state instead leaves a corpse that can still walk for one frame.
+
+- **`check_parameters` takes the *previous* command's angles**, which
+  `Client::create_move` captures at its very top — before `adjust_angles` has moved them.
+  Taking `self.player.angles` at `run_move` time instead gives the *current* angles and
+  the dead-player pin becomes a no-op you cannot see.
+
+- **The pin does not stick, and that is Valve's.** `CheckParameters` writes
+  `mv->m_vecAngles`, and `CPlayerMove::FinishMove`'s
+  `player->SetLocalAngles( move->m_vecAngles )` is **commented out**
+  (`player_command.cpp:232`). So a dead Portal 2 player really can still turn the camera;
+  what stops them looking at anything is the three-second fade to black. The pin changes
+  the movement *basis* for that command and nothing else — and `run_move` deliberately
+  does not copy `mv.angles` back for the same reason.
+
+- **The dead view offset is written twice per command, and the second one is the
+  load-bearing one.** `check_parameters` writes it before `Duck()` runs, and `player_move`
+  writes it again after — because `Duck()` interpolates the eye and would otherwise lift
+  it back out of the corpse over 400 ms if the player died mid-crouch.
+
+- **`VEC_DEAD_VIEWHEIGHT` is 14, not 60.** The 60 is `portal_mp_gamerules.cpp`'s
+  multiplayer table, annotated "previously 14". Single-player Portal 2 gets
+  `g_DefaultViewVectors`, like every other view constant in this module.
+
+- **There is no fall damage, and that is a measurement rather than a gap.**
+  `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal`
+  (`portal_gamerules.h:61`). Nothing in Portal 2 can be killed by landing, whatever the
+  height — which is why 34 of the game's `trigger_hurt`s carry `DMG_FALL`: the pit does
+  the killing, not the fall.
+
 ### The tone mapper's own
 
 14. **The histogram measures an already-exposed frame, so `measured` produces a
@@ -666,7 +750,7 @@ Same ordering: most likely to bite first.
 | `SetOverrideTonemapScale` | VScript and the commentary system call it; neither exists. `mat_force_tonemap_scale` covers it from a console. |
 | `DisplayHistogram` / `mat_show_histogram` | 200 lines of `Viewport` + `ClearBuffers` used as a bar chart. The `tonemap` command prints the same numbers. |
 | `CheckStuck`, `FixPlayerCrouchStuck`, `IsMovingPlayerStuck`, `UnblockPusher` | The unstick passes. They nudge a player out of geometry they should never have been in, and every path into that state needs entities — a door closing on you, a platform rising through you. |
-| `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | Fall damage, the landing sound and the landing animation. Needs health, sound and animation. |
+| `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | The landing sound and the landing animation need sound and animation. **Fall damage is neither deferred nor missing: Portal has none.** `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules agree in words. |
 | ~~Base velocity~~ | **Done** — `src/server/` stage 4's `trigger_push` writes it and the walk adds and subtracts it; see [`Player`](#player-and-movedata). What is still missing is the *conveyor* half: `FL_CONVEYOR` and `SetGroundEntity`'s velocity exchange, which need a ground **entity** rather than a ground plane. No Portal 2 entity sets `FL_CONVEYOR` — `CFuncMoveLinear::Spawn` has the one call commented out, with a name and a reason. |
 | `m_outWishVel`, `m_outJumpVel`, `m_outStepHeight` | Outputs for the view's step smoothing and the animation layer. Carrying fields nothing reads would be carrying fields nothing checks; `view.cpp`'s step smoothing is where `m_outStepHeight` attaches. |
 | Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint and portals. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. |
@@ -676,6 +760,8 @@ Same ordering: most likely to bite first.
 | `fovViewmodel`, `zNearViewmodel`, the ortho box, custom view/projection matrices, depth of field, motion blur | A viewmodel, portals, monitors and post-processing. `ViewSetup` carries eight fields where `CViewSetup` carries fifty. |
 | `r_nearz` | `#ifdef _DEBUG` in the original. |
 | Prediction, `MULTIPLAYER_BACKUP`, `CVerifiedUserCmd`, the command ring | Stage 5. Needs `net/` and `server/`. Keep `run_move`'s shape and it wraps rather than rewrites. |
+| **The movement moving to the server** | `portdocs/SERVER.md` stage 5 lists it and stage 5 deliberately did not do it. `CPlayerMove::RunCommand` runs on the fixed tick and `CPrediction` re-runs *this same code* on the client, so a one-process port with no `net/` already has the client half; moving it would buy a 64 Hz camera and nothing else. What stage 5 moved is the **authority** — the move type, the health, the life state — and that is the part that was actually wrong. |
+| `player_speedmod`'s `SetLaggedMovementValue` and `DisableButtons` | Two more `PlayerState` fields and a multiplier on this module's `dt`, for the four `player_speedmod`s in the game. Ordinary follow-on work. |
 | `UserCmd::random_seed` | It is `MD5_PseudoRandom(command_number) & 0x7fffffff`, and its only purpose is making two ends draw the same "random" numbers. A value that is not Valve's MD5 would look like it worked. Left 0 until there are two ends. |
 | The wire encoding (`ReadUsercmd`/`WriteUsercmd`) | `net/`'s. The format is **not pinned yet** — per `PORTING.md` it becomes ours once both ends are Rust, and both ends will be. |
 | `m_customaccel` 1-4, `m_mousespeed`, `m_mouseaccel1/2` | Per-user feel tuning with no default behaviour; the last three are Windows `SPI_SETMOUSE` overrides, inert on POSIX. |
@@ -779,3 +865,14 @@ player fits under.
 | `a_negative_force_cvar_means_no_override` | gotcha 20 — including that zero *is* an override |
 | `engine::tests::the_tone_mapper_s_buckets_fit_the_histogram_shader` | the one thing `client/` and `materials/` must agree on while naming none of each other's types |
 | `engine::exposure::exposure_settles_on_a_real_map` (depot-gated) | the whole loop against real content: `sp_a1_intro1` drawn, measured and corrected for 120 frames, with the histogram printed |
+
+Added by `server/` stage 5:
+
+| Test | Guards |
+|---|---|
+| `movement::a_dead_player_falls_under_gravity_and_stops_on_the_floor` | `FullTossMove` and `PerformFlyCollisionResolution` |
+| `movement::a_dead_player_cannot_walk` | `CheckParameters`' `IsDead()` branch |
+| `movement::a_frozen_player_cannot_walk_and_is_still_alive` | the same branch reached by `FL_FROZEN` instead, and that the two are distinct states |
+| `movement::the_dead_view_drops_to_the_floor_and_duck_does_not_lift_it_back` | `VEC_DEAD_VIEWHEIGHT`, and the write order against `Duck()` |
+| `movement::a_dead_players_movement_basis_is_the_previous_commands` | the `m_vecOldAngles` pin, and that a live player is unaffected |
+| `server::tests::noclip_is_the_servers_and_survives_the_round_trip` | that the move type only travels one way |

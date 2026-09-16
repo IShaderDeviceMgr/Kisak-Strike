@@ -353,6 +353,28 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
         return true;
     }
 
+    // The damage block — `CBaseEntity`'s, at `baseentity.cpp:2260`. All three
+    // arrive with `portdocs/SERVER.md` stage 5.
+    //
+    // > **`health` is the 682-entity key the depot test used to count as
+    // > unhandled**, and every one of them writes `0`. Consuming it here does
+    // > not make a door shootable — a class has to set `m_takedamage` for
+    // > that, and `CBaseDoor::Spawn` only does so above zero — it makes the
+    // > key *read*, which is the difference between "not implemented" and
+    // > "implemented and the maps ask for nothing".
+    if is("health") {
+        entity.health = atoi(value);
+        return true;
+    }
+    if is("max_health") {
+        entity.max_health = atoi(value);
+        return true;
+    }
+    if is("damagefilter") {
+        entity.damage_filter_name = Some(value.to_owned());
+        return true;
+    }
+
     false
 }
 

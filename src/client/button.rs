@@ -45,6 +45,16 @@ impl ButtonBits {
     pub const WALK: ButtonBits = ButtonBits(1 << 18);
     pub const ZOOM: ButtonBits = ButtonBits(1 << 19);
 
+    /// The raw `IN_*` mask.
+    ///
+    /// One caller: `Engine::frame`, filling
+    /// [`PlayerState::buttons`](crate::server::PlayerState::buttons). The
+    /// server needs the number rather than the type, because it names no
+    /// `client/` type.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
     pub const fn contains(self, other: ButtonBits) -> bool {
         self.0 & other.0 == other.0
     }

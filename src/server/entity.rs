@@ -35,6 +35,7 @@ use std::ops::{Deref, DerefMut};
 use glam::Vec3;
 
 use super::class::{Behaviour, ClassDef, Context};
+use super::damage::{DamageMode, LifeState};
 use super::io::{EventAction, Output, Variant};
 use super::movement::{ModelBounds, MoveType, Solid, FSOLID_NOT_SOLID};
 use super::think::TICK_NEVER_THINK;
@@ -195,14 +196,39 @@ pub struct EntityCore {
     /// puts what the trigger decided; `Engine::frame` carries it across, the
     /// same way it carries a brush entity's placement the other way.
     pub base_velocity: Vec3,
-    /// `m_takedamage != DAMAGE_NO`. Read by one line, `CTriggerHurt::HurtEntity`.
+    /// `m_takedamage` — how this entity answers `TakeDamage`. See
+    /// [`DamageMode`].
+    pub take_damage: DamageMode,
+    /// `m_iHealth`.
     ///
-    /// A `bool` rather than Valve's four-valued `char`, because nothing
-    /// distinguishes `DAMAGE_EVENTS_ONLY` from `DAMAGE_YES` without a damage
-    /// system — and there is none (see [`classes::TriggerHurt`]).
-    ///
-    /// [`classes::TriggerHurt`]: super::classes::TriggerHurt
-    pub take_damage: bool,
+    /// A `CBaseEntity` field, and a *map key* (`health`,
+    /// `baseentity.cpp:2261`) — which is why it is here rather than on the
+    /// player. 682 of the game's entities carry the key and **every one of
+    /// them writes `0`**: 346 `func_door_rotating`, 272 `func_door` and 64
+    /// `func_button`, the three ported classes whose `Spawn` would make them
+    /// shootable at a positive value. So the shootable-door path is dead in
+    /// Portal 2 — measured, not assumed.
+    pub health: i32,
+    /// `m_iMaxHealth` — the ceiling [`take_health`](super::damage::take_health)
+    /// refuses to go past. The `max_health` key, which **no shipped Portal 2
+    /// entity carries**; `CBasePlayer::Spawn` sets it from `m_iHealth`.
+    pub max_health: i32,
+    /// `m_lifeState`.
+    pub life_state: LifeState,
+    /// `m_flDamageAccumulator` — the fraction of a point of damage carried
+    /// between hits. See [`take_damage`](super::damage::take_damage) for why
+    /// dropping it makes a repeating `trigger_hurt` weaker than the map asked
+    /// for.
+    pub damage_accumulator: f32,
+    /// `m_iszDamageFilterName` — the `damagefilter` key
+    /// (`baseentity.cpp:2266`). 27 entities in the game carry it, all of them
+    /// props this port has no class for.
+    pub damage_filter_name: Option<String>,
+    /// `m_hDamageFilter`, resolved from
+    /// [`damage_filter_name`](EntityCore::damage_filter_name) by
+    /// `CBaseEntity::Activate` (`baseentity.cpp:1782`) and by the
+    /// `SetDamageFilter` input.
+    pub damage_filter: Option<EntityId>,
     /// `m_Solid` — *how* this entity is solid. See [`Solid`].
     pub solid: Solid,
     /// `m_fFlags`' solidity half — the `FSOLID_*` bits. Two are set from
@@ -460,6 +486,22 @@ impl EntityCore {
     }
 
     // -----------------------------------------------------------------------
+    // damage
+    // -----------------------------------------------------------------------
+
+    /// `CBaseEntity::IsAlive` (`baseentity.h`).
+    ///
+    /// > **It is the *life state*, not the health.** An entity is still alive
+    /// > at zero health for the window between the subtraction and
+    /// > `Event_Killed`, and `CGameMovement::IsDead` asks the *other* question
+    /// > — `m_iHealth <= 0` (`gamemovement.cpp:1091`). The two disagree for
+    /// > exactly that window, which is why the client is handed the health and
+    /// > not this.
+    pub fn is_alive(&self) -> bool {
+        self.life_state == LifeState::Alive
+    }
+
+    // -----------------------------------------------------------------------
     // moving
     // -----------------------------------------------------------------------
 
@@ -518,7 +560,7 @@ impl EntityCore {
     /// per-tick loop. `MOVETYPE_NONE` never qualifies.
     pub fn will_simulate_game_physics(&self) -> bool {
         match self.move_type {
-            MoveType::None | MoveType::Walk | MoveType::Noclip => false,
+            MoveType::None | MoveType::Walk | MoveType::Noclip | MoveType::FlyGravity => false,
             MoveType::Push => self.move_done_time() > 0.0,
         }
     }
@@ -636,7 +678,13 @@ impl Entity {
                 local_time: 0.0,
                 move_done_time: -1.0,
                 base_velocity: Vec3::ZERO,
-                take_damage: false,
+                take_damage: DamageMode::No,
+                health: 0,
+                max_health: 0,
+                life_state: LifeState::Alive,
+                damage_accumulator: 0.0,
+                damage_filter_name: None,
+                damage_filter: None,
                 solid: Solid::None,
                 solid_flags: 0,
                 flags: 0,

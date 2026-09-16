@@ -20,11 +20,11 @@ use super::{ButtonBits, ViewAngles};
 /// `VEC_VIEW` (`game/shared/shareddefs.h:76`, via
 /// `g_DefaultViewVectors`, `game/shared/gamerules.cpp:38`): the eye, standing.
 ///
-/// The rest of that table, for when ducking and hulls arrive at stage 4:
-/// `VEC_DUCK_VIEW` `(0,0,28)`, `VEC_HULL_MIN` `(-16,-16,0)`, `VEC_HULL_MAX`
-/// `(16,16,72)`, `VEC_DUCK_HULL_MAX` `(16,16,36)`, `VEC_DEAD_VIEWHEIGHT`
-/// `(0,0,14)`. They are quoted rather than declared because a constant nothing
-/// reads is a constant nothing checks.
+/// The rest of that table is declared below it, one constant at a time as
+/// something came to read it: the hulls and `VEC_DUCK_VIEW` with ducking at
+/// stage 4, and [`VEC_DEAD_VIEWHEIGHT`] with death at `server/` stage 5.
+/// `VEC_OBS_HULL_MIN`/`MAX` are still only quoted — `(±10,±10,±10)` — because
+/// there is no observer mode.
 pub const VEC_VIEW: Vec3 = Vec3::new(0.0, 0.0, 64.0);
 
 /// `VEC_HULL_MIN`/`VEC_HULL_MAX` — the standing player's collision box,
@@ -49,12 +49,29 @@ pub const VEC_DUCK_HULL_MAX: Vec3 = Vec3::new(16.0, 16.0, 36.0);
 /// which is 28 rather than half of 64.
 pub const VEC_DUCK_VIEW: Vec3 = Vec3::new(0.0, 0.0, 28.0);
 
-/// `MOVETYPE_*` (`public/const.h`), reduced to the two that mean anything yet.
+/// `VEC_DEAD_VIEWHEIGHT` (`gamerules.cpp:51`) — the eye of a corpse.
 ///
-/// The other seven — `NONE`, `ISOMETRIC`, `WALK`, `STEP`, `FLY`, `FLYGRAVITY`,
-/// `VPHYSICS`, `PUSH`, `OBSERVER`, `CUSTOM` — arrive with the entity system,
-/// and `OBSERVER` in particular shares `FullNoClipMove` with this one
-/// (`gamemovement.cpp:2442`, at `sv_specspeed`).
+/// > **14, not 60.** The 60 in `portal_mp_gamerules.cpp:183` is the
+/// > *multiplayer* table, annotated "previously 14"; Portal 2 single player is
+/// > `CPortalGameRules : CHalfLife2`, which overrides no view vectors, so it
+/// > gets `g_DefaultViewVectors` — the same table this file's other five
+/// > constants come from. The camera drops fifty units when you die, which is
+/// > the whole visible signature of a death in this port.
+pub const VEC_DEAD_VIEWHEIGHT: Vec3 = Vec3::new(0.0, 0.0, 14.0);
+
+/// `MOVETYPE_*` (`public/const.h`), reduced to the three a player can be in.
+///
+/// The rest — `NONE`, `ISOMETRIC`, `STEP`, `FLY`, `VPHYSICS`, `PUSH`,
+/// `OBSERVER`, `CUSTOM` — are either an entity's (`PUSH` is every door, and is
+/// [`server::movement::MoveType`](crate::server::movement::MoveType)'s) or
+/// need a subsystem that does not exist. `OBSERVER` in particular shares
+/// `FullNoClipMove` with `NOCLIP` (`gamemovement.cpp:2442`, at `sv_specspeed`).
+///
+/// > **This enum and the server's are deliberately separate types**, and the
+/// > overlap is two names. `client::MoveType` is what the *movement* switches
+/// > on; `server::movement::MoveType` is what the *simulation* switches on, and
+/// > it has `Push` where this has `FlyGravity`. `Engine::frame` converts, which
+/// > is the one place the two vocabularies meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveType {
     /// `MOVETYPE_WALK`: gravity, friction, collision, stairs, jumping and
@@ -66,6 +83,14 @@ pub enum MoveType {
     /// ground. The one movement mode that is complete without `trace/`, which
     /// is why it is where the port starts (`portdocs/CLIENT.md` §4.5).
     Noclip,
+    /// `MOVETYPE_FLYGRAVITY`: **the dead player**.
+    ///
+    /// `CBasePlayer::Event_Killed` sets it and only a respawn clears it, so
+    /// this is the one move type that is not chosen by the person playing.
+    /// `CGameMovement::FullTossMove` — gravity and one swept move, with no
+    /// clip-and-retry and no stair stepping. The corpse slides down a slope,
+    /// stops when it lands, and is still blown about by a `trigger_push`.
+    FlyGravity,
 }
 
 /// The local player.
@@ -90,6 +115,20 @@ pub struct Player {
     /// this port keeps here — `portdocs/CLIENT.md` §4.7.
     pub angles: ViewAngles,
     pub move_type: MoveType,
+    /// `m_iHealth` — **the server's**, refreshed once a rendered frame through
+    /// [`PlayerState`](crate::server::PlayerState).
+    ///
+    /// The movement reads it for exactly one thing and it is not a HUD:
+    /// `CGameMovement::IsDead()` is `m_iHealth <= 0` (`gamemovement.cpp:1091`),
+    /// and a dead player takes no input, cannot turn, and has its eye at
+    /// [`VEC_DEAD_VIEWHEIGHT`].
+    pub health: i32,
+    /// `GetFlags() & FL_FROZEN` — **the server's**, likewise.
+    ///
+    /// `CRevertSaved::InputReload` is the only thing in this port that sets
+    /// it: 11 shipped connections, at the nine `player_loadsaved` entities that
+    /// are Portal 2's *other* way of dying.
+    pub frozen: bool,
     /// The eye's offset from [`origin`](Player::origin): [`VEC_VIEW`]
     /// standing, [`VEC_DUCK_VIEW`] crouched, and interpolated between the two
     /// through a duck transition.
@@ -129,6 +168,16 @@ impl Player {
             // the player spawned in `MOVETYPE_NOCLIP`, because walking had no
             // ground to stand on.
             move_type: MoveType::Walk,
+            // `CBasePlayer::SharedSpawn`'s `m_iHealth = 100`
+            // (`baseplayer_shared.cpp:2415`). Written as a literal rather than
+            // taken from `server::classes::PLAYER_HEALTH`, because `client/`
+            // naming a `server/` constant would be the first code dependency
+            // between the two — everything else they share crosses as a
+            // `PlayerState`. What matters here is only that a client with no
+            // server, which is every unit test in this module, is *alive*:
+            // `CGameMovement::IsDead` is what would otherwise stop it moving.
+            health: 100,
+            frozen: false,
             view_offset: VEC_VIEW,
             ground: None,
             surface_friction: 1.0,

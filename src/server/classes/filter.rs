@@ -40,6 +40,7 @@
 //! `filter_activator_name`s carry a literal `1`.
 
 use crate::server::class::{Behaviour, Context, Filters, InputDef, InputDefs};
+use crate::server::damage::{DamageInfo, DMG_DIRECT};
 use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::atoi;
@@ -365,8 +366,37 @@ impl Behaviour for FilterDamageType {
         true
     }
 
+    /// `ASSERT( false ); return true;` (`filters.cpp:428`) — **as an
+    /// *activator* filter this class always passes**, and it is not a
+    /// simplification: `FilterDamageType::PassesFilterImpl` is an assert.
+    /// Both of the game's two carry `Negated` = allow, so both pass
+    /// everything, which is what the shipped game does.
     fn passes_filter(&self, _entity: &EntityCore, _other: &EntityCore, _f: &Filters<'_>) -> bool {
         self.base.negate(true)
+    }
+
+    /// `FilterDamageType::PassesDamageFilterImpl` (`filters.cpp:432`) — the
+    /// real test, and the reason the class exists.
+    ///
+    /// > **`==`, not `&`.** The damage type must match *exactly* once
+    /// > `DMG_DIRECT` is masked off, so a filter for `DMG_BURN` refuses
+    /// > `DMG_BURN|DMG_SLOWBURN`. That is Valve's and it is the sort of thing
+    /// > a port "fixes" into a bitmask test without noticing.
+    ///
+    /// Reachable since `portdocs/SERVER.md` stage 5 gave the port a
+    /// `m_hDamageFilter` to hang it off; before that the method existed and
+    /// nothing could call it. The game's two are on `sp_a2_bts4`
+    /// (`DMG_BURN`) and `sp_a4_finale3` (`DMG_SONIC`), and **neither is named
+    /// by any entity's `damagefilter` key** — both are connected to nothing at
+    /// all, which is a mapper leaving scaffolding in.
+    fn passes_damage_filter(
+        &self,
+        _entity: &EntityCore,
+        info: &DamageInfo,
+        _cx: &Context<'_>,
+    ) -> bool {
+        self.base
+            .negate((info.damage_type & !DMG_DIRECT) == self.damage_type)
     }
 
     fn accept_input(

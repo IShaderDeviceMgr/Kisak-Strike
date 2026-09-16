@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 863 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 907 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -82,11 +82,14 @@ the player's clip chain now, so a shut door stops you and a trigger does not.
 **Standing on a floor button presses it** — and **you can see it happen**: the
 button's model draws and its plate animates down under you, which is the first
 studio *animation* and the first entity-placed model in the port.
-It is **still not a runnable game** — no sound, no netcode, no damage (nothing
-has health, so a `trigger_hurt` fires its outputs and takes nothing away), and
+**And the map can kill you.** The player has health, a `trigger_hurt` takes it
+away at the rate the map asked for, and at zero the body drops, the camera
+falls to fourteen units off the floor, and three seconds later the level starts
+again — which is what single-player Portal 2 does, minus the save.
+It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it — but the boot path is
 continuous from `main` to a rendered, lit, self-starting level you can walk
-around and interact with.
+around, interact with and die in.
 
 To see it work you need a directory containing a mod directory with a `gameinfo.txt`:
 
@@ -623,7 +626,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   and facing is decided after the flip). In file order a map draws as an empty clear
   colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
   fixing it in `PipelineCache` instead.
-- **`src/client/` — the game client, stages 1-4 of 5 ported** (`portdocs/CLIENT.md`,
+- **`src/client/` — the game client, stages 1-4 of 5 ported, plus the dead
+  player `server/` stage 5 brought** (`portdocs/CLIENT.md`,
   **`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
   tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
   **It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
@@ -661,10 +665,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   form is what is ported. Stage 4 also **found a live stage-1 bug**: a Portal 2 player's
   max speed is `min(sv_maxspeed, MaxSpeed())` = **175**, not `sv_maxspeed`'s 320, so noclip
   had been flying at 1600 where the shipped game flies at 875. Not ported and documented:
-  water, base velocity, the unstick passes, fall damage — and **ladders and the duck-jump
-  state machine are deleted rather than deferred**, because `GameHasLadders()` is `false`
-  for Portal and `CheckJumpButton` sets `bSetDuckJump = false` over a Valve FIXME, making
-  every branch that reads them unreachable.
+  water, base velocity, the unstick passes — and **ladders, the duck-jump state
+  machine and fall damage are deleted rather than deferred**, because
+  `GameHasLadders()` is `false` for Portal, `CheckJumpButton` sets
+  `bSetDuckJump = false` over a Valve FIXME, and
+  `CPortalGameRules::FlPlayerFallDamage` is
+  `{ return 0.0f; } //no fall damage in portal` — so every branch that reads
+  them is unreachable and **nothing in Portal 2 can be killed by landing,
+  whatever the height**.
   Seven rules that produce a plausible wrong answer rather than an error:
   **`ViewSetup::fov` is horizontal and already width-ratio scaled**, so anything reading
   `default_fov` for a projection is reintroducing that bug; **`set_sample_time` must be
@@ -686,6 +694,33 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
   before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
   test is only ever reachable from the air.
+
+  **The dead player landed with `server/` stage 5**, which is the one piece of
+  movement this module gained after stage 4. `MoveType::FlyGravity` is
+  `CGameMovement::FullTossMove` — gravity, one swept move and a stop, with no
+  clip-and-retry and no stair stepping, which is what makes a corpse feel like
+  a dropped object — and `check_parameters` grew the two `if`s that read the
+  server's state. They overlap and are **not** the same test:
+  `FL_FROZEN || IsDead()` zeroes the three move axes and nothing else, so a
+  corpse that was falling keeps falling, while `IsDead()` *alone* pins the
+  movement basis to the previous command's angles and drops the eye to
+  `VEC_DEAD_VIEWHEIGHT`.
+  Five rules there produce a plausible wrong answer rather than an error, and
+  the first two are the ones that decide whether death looks right.
+  **`IsDead()` is `m_iHealth <= 0`, not the life state** — they disagree for
+  exactly one server dispatch, which is why `PlayerState` carries the health.
+  **The dead view offset is written twice a command and the second one is
+  load-bearing**, because `Duck()` runs between them and would otherwise lift
+  the eye back out of the corpse over 400 ms.
+  **`VEC_DEAD_VIEWHEIGHT` is 14, not 60** — the 60 is the *multiplayer* table,
+  annotated "previously 14", and single-player Portal 2 overrides no view
+  vectors. **The angle pin does not stick**, and that is Valve's:
+  `CPlayerMove::FinishMove`'s `SetLocalAngles` line is commented out, so a dead
+  Portal 2 player really can still turn the camera and what stops them looking
+  at anything is the fade. And **`check_parameters` needs the *previous*
+  command's angles**, captured at the top of `create_move` before
+  `adjust_angles` has moved them — taking them at `run_move` time gives the
+  current ones and the pin becomes a no-op you cannot see.
 
   **`client/tonemap.rs` landed alongside the five stages rather than inside them**
   (`portdocs/CLIENT_TONEMAP.md`, and it is `viewpostprocess.cpp`'s `CTonemapSystem`, not
@@ -764,9 +799,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
-- **`src/server/` — stages 1-4 of `portdocs/SERVER.md`'s five ported, plus
+- **`src/server/` — all five stages of `portdocs/SERVER.md` ported, plus
   `prop_floor_button`**, and with them the map's **entity logic runs, its brush
-  entities move, it notices the player, and a pad you stand on presses**. Valve's `server.so` — 446,861 lines, of which the framework is
+  entities move, it notices the player, a pad you stand on presses — and the
+  player can be hurt, and can die**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
@@ -958,10 +994,11 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   no map — and two properties of the answer are Valve's and load-bearing, that it
   sweeps the trigger's **real brushes** rather than its bounding box and that it
   is **not** filtered to triggers, because `FSOLID_TRIGGER` is the game's live
-  state and an engine-side copy would be a frame stale. And **`trigger_hurt` has
-  complete timing and no damage**, which is the honest shape: there is no health
-  anywhere, so it fires `OnHurt`/`OnHurtPlayer` on exactly the schedule the
-  shipped game does and takes nothing away.
+  state and an engine-side copy would be a frame stale. And **`trigger_hurt` arrived with
+  complete timing and no damage**, which was the honest shape for a stage with
+  no health anywhere: it fired `OnHurt`/`OnHurtPlayer` on exactly the schedule
+  the shipped game does and took nothing away. Stage 5 supplied the missing
+  line.
 
   Twelve more rules produce a plausible wrong answer rather than an error
   (`rustdocs/SERVER.md` gotchas 35-46), and three decide whether a trigger works
@@ -1116,9 +1153,118 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   an `env_texturetoggle`, which is not ported, so there the chain runs and
   nothing moves.
 
-  Not implemented, and each is a stage or a subsystem: the player as a *whole*
-  entity (5), and **damage** — nothing has health, so `trigger_hurt` cannot hurt
-  and nothing can die.
+  **Stage 5 is the player as a whole entity, and its headline is that
+  `trigger_hurt` kills.** `src/server/damage.rs` is `CTakeDamageInfo`, the
+  `DMG_*` table, `m_takedamage`, `m_lifeState` and the health arithmetic;
+  `classes/player.rs` is `CBasePlayer`'s damage and death path plus
+  `logic_playerproxy` (9) and `player_loadsaved` (9). **38 classnames, 26,044
+  of the game's 60,925 entity blocks** — continuing the count the stages above
+  use, which is every class registered bar `player`; **36 of them are among the
+  200 classnames the shipped maps actually place**, the other two being
+  `trigger_portal_button` (created by a `prop_floor_button`) and `light_glspot`
+  (registered because Valve registers it). `noclip` moved here from `src/client/`
+  and brought `god`, `kill` and `hurtme` with it — they are its neighbours in
+  `game/server/client.cpp` — and `client/` gained the dead player's movement:
+  `MOVETYPE_FLYGRAVITY`, `FullTossMove`, and an eye that drops from 64 units to
+  14.
+
+  The measurement is
+  `server::tests::every_shipped_trigger_hurt_kills_the_player_standing_in_it`:
+  for **every one of the game's 215 `trigger_hurt`s** it reloads the level,
+  finds a point inside the trigger's actual brushes that a 32×32×72 hull fits
+  in, puts a player there and runs sixteen seconds without moving it. **138
+  kill**, the fastest on the first tick and the slowest after 9.78 seconds —
+  the one `damage 10` trigger in the game — and all 138 reach `RespawnPlayer`
+  and ask the engine for the level back. The other 77 are each accounted for:
+  72 are never touched (73 carry `StartDisabled 1`), 4 are touched and refused
+  (no `SF_TRIGGER_ALLOW_CLIENTS`, or a filter), and 1 has nowhere to stand.
+
+  **The two-clocks question is answered and the answer is no.** The plan lists
+  "the movement moving to the server"; §5 of the same document already contains
+  the argument against it — `CPlayerMove::RunCommand` runs the movement on the
+  fixed tick and `CPrediction` re-runs *the same code* on the client, so a
+  one-process port with no `net/` already has the client half, and moving it
+  would buy a 64 Hz camera with no interpolation and nothing else. **What was
+  wrong was the *authority*.** Four fields of `PlayerState` became the server's
+  — `move_type`, `health`, `life_state` and `flags` — and `set_player_state`
+  now ignores what arrives in them, which is what makes `noclip`, damage and
+  death possible at all: each is a value the client would otherwise overwrite
+  on the next rendered frame.
+
+  Six findings. **Damage had to be deferred by one dispatch**, and the shape
+  was already in the module: `Context::take_damage` queues exactly the way
+  `create_entity` queues a spawn and `EntityCore::remove` queues a deletion,
+  because applying damage runs the *victim's* virtuals and the hurter has been
+  lifted out of the entity list. It costs no tick, and the two gates a caller
+  branches on are still evaluated synchronously — three deferral mechanisms now
+  share one shape.
+  **`logic_playerproxy` is the payoff and all of it is on the default map**:
+  nine in the game, and **every one of the five output connections in the
+  entire game is on `sp_a1_intro1`** — three `OnJump`, one `OnDuck`, one
+  `OnUnDuck` — so jumping there now fires three relays. Two things about it are
+  measurements rather than omissions: every input it has in Portal 2 is a
+  portal-gun or grab-controller input (`RequestPlayerHealth`/`SetPlayerHealth`
+  are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`), so the class accepts
+  **none** and its `PlayerHealth` output cannot fire at all — and **`PlayerDied`
+  is declared and fired by nothing** anywhere in the tree; the one textual hit
+  is a Squirrel function name.
+  **Portal 2 has two ways of dying and only one is damage**: `player_loadsaved`
+  is what happens when you fall into the abyss in `sp_a3_portal_intro`, where
+  there is no `trigger_hurt` at all — the map freezes the player, fades the
+  screen and reloads. Nine entities, 11 `Reload` connections, seven named some
+  variation of `fade_to_death`.
+  **Fall damage is deleted rather than deferred, and the tree says so in
+  words**: `CPortalGameRules::FlPlayerFallDamage` is
+  `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`).
+  Nothing in Portal 2 can be killed by landing, which is exactly why 34 of the
+  215 `trigger_hurt`s carry `DMG_FALL` — the pit does the killing and the
+  damage type is a label.
+  **The `health` key is carried by 682 entities and every one writes `0`** —
+  346 `func_door_rotating`, 272 `func_door`, 64 `func_button`, the three ported
+  classes whose `Spawn` makes them shootable above zero — so the whole
+  shootable-brush path is dead in Portal 2 and the key leaves the depot test's
+  unhandled table by being *consumed* rather than by being implemented.
+  And **one number in the damage path is not recoverable**:
+  `CPortal_Player::OnTakeDamage` multiplies every hit by `sk_dmg_take_scale1`,
+  which is declared `extern` here, defined in an `hl2_gamerules.cpp` this tree
+  does not contain, and set by no `.cfg` and no VPK in the depot. It is 1, with
+  one definition site — and it barely matters, because the weakest
+  `trigger_hurt` in the game deals 10 a second against 100 health and 202 of
+  the 215 deal 100 or more, so any scale between about 0.1 and 10 kills the
+  player in the same place.
+
+  Eight more rules produce a plausible wrong answer rather than an error
+  (`rustdocs/SERVER.md` gotchas 52-59), and three decide whether anything dies:
+  **`Context::take_damage` aimed at yourself is silently dropped**, because the
+  dispatched entity is not in the list the queue resolves against — hurting
+  yourself calls `self.on_take_damage` directly, which is what the C++
+  compiles to anyway; **`EntityCore::is_alive` is the life state and
+  `CGameMovement::IsDead` is the health**, and they disagree for exactly the one
+  dispatch between the subtraction and `Event_Killed`, which is why
+  `PlayerState` carries the health; and **`m_flDamage` is per second and a dose
+  is per think** (`m_flDamage * dt`, `dt` 0.5), so dealing the key's value per
+  dose doubles the lethality of every `trigger_hurt` in the game.
+
+  **One behaviour that reads as a bug and is Valve's:** a `trigger_hurt` keeps
+  firing `OnHurtPlayer` at a corpse, every half second until the level reloads —
+  six more times. The dead player going `FSOLID_NOT_SOLID` only stops the
+  *player* testing triggers and a stationary trigger never re-tests its own, so
+  the link survives; `m_takedamage` stays `DAMAGE_YES`, because
+  `CBaseCombatCharacter::Event_Killed` does **not** chain to
+  `CBaseEntity::Event_Killed`; and `TakeDamage` returns `void`, so `HurtEntity`
+  cannot see the refusal. It is bounded, and it is also why `god` mode leaves a
+  scripted chamber usable rather than wedged.
+
+  **`sp_a1_intro1` places no `trigger_hurt` at all**, so the default map cannot
+  kill you — `sp_a1_intro5` is the nearest that can, and is already the map to
+  load for the floor button. What `sp_a1_intro1` does have is the
+  `logic_playerproxy`.
+
+  Not implemented, and each is a class or a subsystem: the weapon
+  (`weapon_portalgun`, 3 placed, and it needs the portal system), the armour
+  (Portal has none), drowning, the HEV suit, and everything else that can hurt
+  you — turrets, crushers, `prop_physics`. `trigger_hurt` is the whole damage
+  surface the shipped maps reach.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -1146,18 +1292,15 @@ second is A/B/A, not A/B.
 Next: **the boot path is complete as far as one player can take it**, the level shell
 is geometrically complete — world, brush entities, static props and terrain — it is
 **auto-exposed to the map's own limits**, the map's **entity logic runs**, its
-**doors and panels move**, and **it notices the player**: triggers fire, filters
-decide who counts, a shut door is a wall, and a floor button presses when you
-stand on it.
+**doors and panels move**, **it notices the player**, and **it can kill them**:
+triggers fire, filters decide who counts, a shut door is a wall, a floor button
+presses when you stand on it, and a `trigger_hurt` takes your health and
+restarts the level when it runs out.
+**`portdocs/SERVER.md` is finished** — all five stages — so the game layer's
+next steps are individual classes and subsystems rather than a staged plan.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 The candidates, in the order they are worth doing:
 
-- **`server/` stage 5 — the player as a whole entity**, which is what is left of
-  `CBasePlayer` now that stage 4 has put a box with `FL_CLIENT` in the entity
-  list: the movement moving to the server (and with it the question of what to
-  do about two clocks), `noclip`'s home, **health and death** — the deepest
-  absence in the game layer, and the reason 215 `trigger_hurt`s fire their
-  outputs and take nothing away — the weapon, and the view.
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
   `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker
@@ -1210,6 +1353,18 @@ could not rise. Stage 4 made walking real, which makes jump and duck buttons; a 
 player now flies up the way the shipped game does it, by looking up and holding forward.
 `bind SPACE +moveup` brings the axis back.
 
+**Resolved:** **`noclip` used to be registered by the game client and it is a *server*
+command.** Move type is server state that gets networked down, so `ConCommand noclip`
+lives in `game/server/` in the original; with one process and no server it had to live
+somewhere, and `src/client/` was where the move type was. The condition this wart
+recorded was exact — "`portdocs/SERVER.md` stage 5, where the move type becomes the
+server's state rather than a field on `client::Player`" — and that is what happened.
+`Server::toggle_noclip` is the command, `PlayerState::move_type` carries the answer back
+*to* the client, and `Client::toggle_noclip` is deleted. `god`, `kill` and `hurtme` came
+with it, because they are its neighbours in `game/server/client.cpp`. The other half of
+the prediction — "where the movement itself moves" — deliberately did **not** happen; see
+`portdocs/SERVER.md` stage 5 for why.
+
 **Resolved:** `CommandLine` used to live in `src/launcher/` and be read from
 `src/engine/window/`, to be moved "when a third subsystem needs it". `console/` was that
 third subsystem — `stuffcmds` and the `+<cvar>` default seeding both read it — so it now
@@ -1217,15 +1372,6 @@ lives at `src/cmdline.rs`. The move also fixed a real divergence: `CCommandLine:
 refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the port's
 `value()` did not, which would have had `-window` swallow `+map`.
 
-- **`noclip` is registered by the game client, and it is a *server* command.** Move type
-  is server state that gets networked down, so `ConCommand noclip` lives in
-  `game/server/` in the original. With one process and no server it has to live
-  somewhere, and `src/client/` is where the move type is. `src/server/` now exists and
-  stage 4 has put a *player* in it, and the wart still does not move: the server's copy
-  of the move type is refreshed from the client every tick (`server::PlayerState`), so
-  the client is still where it is decided. **The condition is `portdocs/SERVER.md`
-  stage 5**, where the movement itself moves and the move type becomes the server's
-  state rather than a field on `client::Player`. `portdocs/CLIENT.md` §9.2.
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and
   `Vfs::mount_game` reads it again to build the search paths. A few kilobytes, once. The

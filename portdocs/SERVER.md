@@ -948,8 +948,19 @@ field the server did not touch, which is what makes "always copy back" safe
 rather than a fight over who owns the origin — and it is why a teleport is an
 ordinary field write rather than a message.
 
-What is left for stage 5 is `CBasePlayer` proper: the movement, `noclip`'s home
-(`CLIENT.md` §9.2), health, death, the weapon, the view.
+**Stage 5 finished it, and the direction of four fields flipped.**
+`move_type`, `health`, `life_state` and `flags` are the server's now —
+`Server::set_player_state` ignores what arrives in them and
+`Server::player_state` fills them in — because `noclip`, damage and death are
+all values the server writes and the client would otherwise overwrite on the
+next rendered frame. `buttons` goes the other way and only the other way.
+
+**The movement deliberately did not move**, and §5's argument is why: the
+client runs the same `CGameMovement` code in the original too, and calls it
+prediction. See stage 5.
+
+What is still not here: the weapon (`weapon_portalgun`, and it needs the portal
+system), the armour, drowning and the suit.
 
 **`client/tonemap.rs` — the gap this closes.** `CLIENT_TONEMAP.md` records that
 `env_tonemap_controller` is the one measured absence in an otherwise complete tone
@@ -1364,7 +1375,7 @@ and runs two ticks. **2,246 notice, 1,879 dispatch something, 3 have no point a
 standing player fits in and 6 are switched off or deleted by the map's own
 bootstrap.**
 
-### Stage 5 — the player as an entity
+### Stage 5 — the player as an entity — **DONE**
 
 Join `client::Player` to the entity list (§7.4), move `noclip` to `src/server/`,
 resolve `!player`. Depends on stages 1-4.
@@ -1375,11 +1386,175 @@ resolve `!player`. Depends on stages 1-4.
 > movement moving to the server (and with it the question of what to do about
 > two clocks), `noclip`'s home, health and death, the weapon, and the view.
 
+**What landed.** `src/server/damage.rs` is `CTakeDamageInfo`, the `DMG_*` table,
+`m_takedamage`, `m_lifeState` and the health arithmetic;
+`src/server/classes/player.rs` is `CBasePlayer`'s damage and death path plus two
+new classes; and `client/` gained the dead player's movement. Four console
+commands — `noclip`, `god`, `kill` and `hurtme` — are the server's now.
+**38 classnames, 26,044 of the game's 60,925 entity blocks** — the count the
+stages above use, which is every class registered bar `player`; 36 of them are
+among the 200 the shipped maps actually place.
+
+The headline is that **`trigger_hurt` kills**: 138 of the game's 215 kill a
+player who stands in one, the other 77 are each accounted for, and every death
+reaches `RespawnPlayer` and asks the engine for the level back three seconds
+later. That closes what `CLAUDE.md` called "the deepest absence in the game
+layer".
+
+#### The two-clocks question is answered, and the answer is no
+
+The plan lists "the movement moving to the server" and frames it as a question.
+**It should not move, and §5 of this document already contains the argument.**
+`CPlayerMove::RunCommand` runs the movement on the fixed tick and
+`CPrediction::RunCommand` re-runs *the same `CGameMovement` code* on the client
+at the client's rate — so a port with one process and no `net/` already has the
+client half. Moving it would cost the smoothness of the view (a 64 Hz camera
+with no interpolation) and buy nothing that exists yet.
+
+**What was actually wrong was the *authority*, not the integration.** Four
+fields on `PlayerState` became the server's — `move_type`, `health`,
+`life_state` and `flags` — and `Server::set_player_state` now ignores what
+arrives in them. That is the whole of what "the player is a server entity"
+means without `net/`, and it is what makes `noclip`, damage and death possible
+at all: each of the three is a value the server writes and the client would
+otherwise overwrite on the next rendered frame.
+
+Revisit when `net/` exists, which is also when prediction becomes a real thing
+rather than a name for "the client runs the movement".
+
+#### Six findings
+
+**1. Damage had to be deferred, and the shape was already in the module.**
+`CTriggerHurt::HurtEntity` calls `pOther->TakeDamage( info )` mid-think, which
+is re-entrancy this module does not have: `Server::dispatch` has lifted the
+hurter out of the entity list, and applying damage means running the *victim's*
+virtuals. `Context::take_damage` therefore **queues**, exactly the way
+`Context::create_entity` queues a spawn and `EntityCore::remove` queues a
+deletion, and `Server::dispatch` flushes it on the way out. It costs no tick —
+the flush is inside the same dispatch — and the two gates a caller branches on
+(`m_takedamage`, `PassesDamageFilter`) are evaluated synchronously *before* the
+queue, so `HurtEntity` still returns the right answer to `HurtAllTouchers` and
+the half-second cadence is unchanged. Three deferral mechanisms now share one
+shape; a fourth would be a sign that `dispatch` wants a general one.
+
+**2. `logic_playerproxy` is the payoff, and all of it is on the default map.**
+Nine in the game across eight maps, and **every one of the five output
+connections in the entire game is on `sp_a1_intro1`**: three `OnJump`, one
+`OnDuck`, one `OnUnDuck`. So the first visible consequence of the player being
+a whole entity is on the map this port loads by default. Two things about the
+class are measurements rather than omissions: **every input it has in Portal 2
+is a portal-gun or grab-controller input** (`RequestPlayerHealth` and
+`SetPlayerHealth` are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`), so it
+accepts none — which also means its `PlayerHealth` output **cannot fire in
+Portal 2 at all** — and **`PlayerDied` is declared and fired by nothing**
+anywhere in the tree. The one textual hit for it is a *Squirrel* function name.
+
+**3. Portal 2 has two ways of dying and only one is damage.**
+`player_loadsaved` is nine entities across eight maps, seven of them named some
+variation of `fade_to_death`, with 11 `Reload` connections. It is what happens
+when you fall into the abyss in `sp_a3_portal_intro`: there is no `trigger_hurt`
+down there, so nothing takes any health — the map freezes the player
+(`FL_FROZEN|FL_NOTARGET`), fades the screen and reloads. Porting it costs sixty
+lines and it is a third of the game's death paths.
+
+**4. Fall damage is deleted, not deferred, and the tree says so in words.**
+`CPortalGameRules::FlPlayerFallDamage` is
+`{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`) and the
+multiplayer rules repeat it as "No fall damage in Portal!". Nothing in Portal 2
+can be killed by landing, whatever the height — which is exactly why **34 of
+the game's 215 `trigger_hurt`s carry `DMG_FALL`**: the pit does the killing,
+and the damage type is a label.
+
+**5. The `health` key is read by 682 entities and every one writes `0`.**
+346 `func_door_rotating`, 272 `func_door` and 64 `func_button` — the three
+ported classes whose `Spawn` makes them shootable at a positive value. So the
+whole shootable-brush path is dead in Portal 2, the 682-entry `health` line
+leaves the depot test's unhandled table by being *consumed* rather than by
+being implemented, and `CBaseDoor::OnTakeDamage` stays out of scope with a
+number behind it.
+
+**6. One number in the damage path is not recoverable.**
+`CPortal_Player::OnTakeDamage` multiplies **every** hit by
+`sk_dmg_take_scale1.GetFloat()` (`portal_player.cpp:3607`). The cvar is declared
+`extern` there and **defined nowhere in this tree** — it belongs to
+`hl2_gamerules.cpp`, which `CPortalGameRules` derives from and which the
+cstrike15 tree does not contain — and the shipped depot sets it in no `.cfg`
+and no VPK. `skill_portal2.cfg` says at the top that it was merged from HL2's
+and ep2's "with unknown convars removed", and this is one of the removed. It is
+1 here, one definition site, one line to change. It barely matters and it is
+worth knowing why: the weakest `trigger_hurt` in the game deals 10 a second
+against 100 health and 202 of the 215 deal 100 or more, so any scale between
+about 0.1 and 10 kills the player in the same place.
+
+#### Eight rules that produce a plausible wrong answer rather than an error
+
+`rustdocs/SERVER.md` gotchas 52-59 in full. The three that decide whether
+anything dies at all:
+
+- **`Context::take_damage` aimed at yourself is silently dropped**, because the
+  dispatched entity is not in the list the queue resolves against. Hurting
+  yourself calls `self.on_take_damage` directly — which is what the C++'s
+  `TakeDamage` on `this` compiles to anyway.
+- **`EntityCore::is_alive` is the life state and `CGameMovement::IsDead` is the
+  health**, and they disagree for exactly the one dispatch between the
+  subtraction and `Event_Killed`. `PlayerState` carries the health for this
+  reason; carrying the life state instead leaves a corpse that can walk for one
+  frame.
+- **`m_flDamage` is per second and a dose is per think** — `m_flDamage * dt`,
+  with `dt` 0.5 from `HurtThink`. Dealing the key's value per dose doubles the
+  lethality of every `trigger_hurt` in the game.
+
+#### One behaviour that reads as a bug and is Valve's
+
+**A `trigger_hurt` keeps firing `OnHurtPlayer` at a corpse**, every half second
+until the level reloads — six more times. Three things that look like they
+would stop it do not: the dead player going `FSOLID_NOT_SOLID` only stops the
+*player* testing triggers (`PhysicsTouchTriggers` returns early) and a
+stationary `MOVETYPE_NONE` trigger never re-tests its own, so the touch link
+survives; `m_takedamage` stays `DAMAGE_YES`, because
+`CBaseCombatCharacter::Event_Killed` does **not** chain to
+`CBaseEntity::Event_Killed`, which is the one that would clear it; and
+`TakeDamage` returns `void`, so `HurtEntity` cannot see the refusal. It is
+bounded, it is what the shipped game does, and it is also why `god` mode leaves
+a scripted chamber usable rather than wedged.
+
+#### What it is measured against
+
+`server::tests::every_shipped_trigger_hurt_kills_the_player_standing_in_it`, the
+sibling of stage 4's trigger test and the same shape: per map it builds the real
+collision and then, **for every one of the game's 215 `trigger_hurt`s**,
+reloads the level, finds a point inside the trigger's *actual brushes* that a
+32×32×72 hull fits in, puts a player there and runs sixteen seconds of server
+time without moving it.
+
+**138 kill the player**, the fastest on the first tick and the slowest after
+9.78 seconds — which is the one `damage 10` trigger in the game working exactly
+as its arithmetic says — and **all 138 reach `RespawnPlayer`**. The other 77 are
+each accounted for: **72 are never touched** (73 carry `StartDisabled 1`, and
+one of those is switched on by its own map's bootstrap and then refuses),
+**4 are touched and refuse** (`PassesTriggerFilters` — five in the game carry no
+`SF_TRIGGER_ALLOW_CLIENTS` and one names an `npc_bullseye` filter), and **1 has
+no point a standing player fits in**.
+
 ### Beyond
 
-`prop_dynamic` (8,072 placed) needs `studio/` stage 6 and animation. `prop_physics` and
-`func_physbox` need `rapier`. The 41 reconstructed Portal 2 classes (§1.3) need the
-paint and portal systems. Each gets its own portdoc.
+**The five stages are done, so what follows is individual classes and
+subsystems rather than a staged plan.** In the order they are worth doing:
+
+- **`CPhysicsPushedEntities` — a door that shoves the player.** ~1,000 lines of
+  speculative push, blocker enumeration and rollback (`physics_main.cpp:130`),
+  and `EntityCore::local_time` is already the field its answer goes in. It is
+  the first puzzle that cannot be solved without standing on something that
+  moves, and it is also what would make a `func_door` able to *crush*, which is
+  the damage type 71 of the game's `trigger_hurt`s are labelled with.
+- **The local/abs transform pair on `EntityCore`**, which unblocks
+  `SetParent`/`ClearParent`/`SetParentAttachment*` — **1,078 of the depot
+  test's 1,102 unhandled inputs** — and parented movers.
+- **`player_speedmod`** (4 placed): `SetLaggedMovementValue` and
+  `DisableButtons`, two more `PlayerState` fields. Small.
+- `prop_dynamic` (8,072 placed) needs `studio/` stage 6 and skin families.
+  `prop_physics` and `func_physbox` need `rapier`. The 41 reconstructed Portal 2
+  classes (§1.3) need the paint and portal systems. Each gets its own portdoc.
 
 ---
 
@@ -1440,6 +1615,12 @@ question into a number.
    reason (`CBasePlayer::SetFogController`, and there is no fog), and 74 are
    the co-op procedurals, which single player has no answer for in Valve
    either.
+
+   **Stage 5 kept that shape and added exactly one thing to it.** The player
+   entity is no longer *stateless* — it holds the button mask, the death time
+   and the suicide cooldown — but the movement still never crossed: what
+   changed is which side *owns* four of the fields, not which side integrates
+   them. The feared risk never materialised.
 3. ~~**Borrow shape of `EntityMut`.**~~ **Closed at stage 2, and it was never a
    risk.** An input handler that fires an output that reaches the same entity is
    normal and legal in C++ — because `FireOutput` does not *call* anything, it
@@ -1470,11 +1651,14 @@ question into a number.
    behaviour that looks right and is not. Mark them, and lean on the FGD check (§7.3)
    for at least the interface.
 6. **VScript.** §9.
-7. **Damage.** New at stage 4, and it is the one absence a *player* would
-   notice: `trigger_hurt` runs Valve's whole schedule and takes nothing away,
-   because there is no health, no `CTakeDamageInfo`, no `TakeDamage` and no
-   death. 215 `trigger_hurt`s and every pit of goo in the game are affected.
-   It is `CBasePlayer` state, so it lands with stage 5 rather than before it.
+7. ~~**Damage.**~~ **Closed at stage 5**, as predicted — it was "the one absence
+   a *player* would notice", and it was `CBasePlayer` state, so it landed with
+   the stage that made the player a whole entity. `src/server/damage.rs` is
+   `CTakeDamageInfo`, `m_takedamage`, `m_lifeState` and the arithmetic, and 138
+   of the game's 215 `trigger_hurt`s now kill a player standing in one. What is
+   left of the *subject* is the physics force a hurt imparts (needs `rapier`)
+   and every other damage source in the game — turrets, crushers,
+   `prop_physics` — each of which is a class rather than this.
 
 8. **Save/restore.** Deleted for now (§6), and Portal 2 autosaves constantly —
    `logic_autosave` (85), `trigger_autosave` (57), `player_loadsaved` (9). The condition

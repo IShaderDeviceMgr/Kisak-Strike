@@ -152,6 +152,19 @@ pub struct Client {
     /// exposure controller is game code, and only the *measurement* of the
     /// frame it exposes belongs to the material system.
     tonemap: ToneMap,
+    /// `mv->m_vecOldAngles` — where the view pointed on the *previous*
+    /// command, captured at the top of [`create_move`](Client::create_move)
+    /// because that is the last moment it is still the view.
+    ///
+    /// One reader: `CheckParameters` pins a dead player's movement basis to it.
+    old_view_angles: ViewAngles,
+    /// `m_nButtons` as the last command carried it.
+    ///
+    /// Kept because [`Buttons::bits`] is **destructive** — it consumes the
+    /// fractional `KeyState`s — so the server cannot be handed a freshly
+    /// computed mask without stealing this frame's movement from the command.
+    /// See [`create_move`](Client::create_move)'s note on read order.
+    last_buttons: ButtonBits,
 }
 
 impl Client {
@@ -402,6 +415,8 @@ impl Client {
             impulse: 0,
             keyboard_sample_time: 0.0,
             tonemap: ToneMap::new(console),
+            old_view_angles: ViewAngles::new(0.0, 0.0),
+            last_buttons: ButtonBits::NONE,
         }
     }
 
@@ -472,25 +487,17 @@ impl Client {
         self.tonemap.reset(1.0);
     }
 
+    /// `m_nButtons` as the last command carried it, for the server's copy of
+    /// the player. See [`last_buttons`](Client::last_buttons).
+    pub fn buttons_bits(&self) -> u32 {
+        self.last_buttons.bits()
+    }
+
     /// `impulse <n>` (`in_main.cpp:757`). Latched until the next command.
     pub fn set_impulse(&mut self, impulse: u8) {
         self.impulse = impulse;
     }
 
-    /// Flips between [`MoveType::Noclip`] and [`MoveType::Walk`], returning
-    /// what it flipped to.
-    ///
-    /// **`noclip` is a server command in Valve** (`game/server/`), because move
-    /// type is server state that gets networked down. With one process and no
-    /// server it has to live somewhere; it lives here and moves to `server/`
-    /// when there is one — `portdocs/CLIENT.md` §9.2.
-    pub fn toggle_noclip(&mut self) -> MoveType {
-        self.player.move_type = match self.player.move_type {
-            MoveType::Noclip => MoveType::Walk,
-            MoveType::Walk => MoveType::Noclip,
-        };
-        self.player.move_type
-    }
 
     /// `CViewRender::SetUpView` (`game/client/view.cpp:668`) plus the field-of-
     /// view scaling `CViewRender::Render` applies straight afterwards
@@ -628,6 +635,12 @@ impl Client {
         self.tick_count += 1;
         let mut cmd = UserCmd::new(self.command_number, self.tick_count);
 
+        // `g_pMoveData->m_vecOldAngles = player->pl.v_angle` immediately before
+        // `player->pl.v_angle = ucmd->viewangles` (`player_command.cpp:408`) —
+        // the previous command's view, captured here because this is the last
+        // moment it still *is* the view.
+        self.old_view_angles = self.player.angles;
+
         self.adjust_angles(dt);
         self.compute_side_move(&mut cmd);
         self.compute_upward_move(&mut cmd);
@@ -636,6 +649,7 @@ impl Client {
 
         cmd.impulse = std::mem::take(&mut self.impulse);
         cmd.buttons = self.buttons.bits(true);
+        self.last_buttons = cmd.buttons;
         // Last, because `mouse_move` has just turned the view.
         cmd.viewangles = self.player.angles;
         cmd
@@ -869,6 +883,8 @@ impl Client {
                 .float()
                 .min(self.cvars.sv_speed_normal.float()),
             move_type: self.player.move_type,
+            health: self.player.health,
+            frozen: self.player.frozen,
             ground: self.player.ground,
             base_velocity: self.player.base_velocity,
             surface_friction: self.player.surface_friction,
@@ -879,7 +895,7 @@ impl Client {
             speed_cropped: false,
         };
 
-        movement::player_move(&mut mv, tracer, &self.move_vars(), dt);
+        movement::player_move(&mut mv, tracer, &self.move_vars(), dt, self.old_view_angles);
 
         // `FinishMove` — the results go back on the player.
         self.player.origin = mv.origin;
@@ -892,6 +908,17 @@ impl Client {
         self.player.duck_time_msecs = mv.duck_time_msecs;
         self.player.view_offset = mv.view_offset;
         self.player.old_buttons = mv.old_buttons;
+        // **The angles deliberately do not come back.** `CheckParameters` pins
+        // `mv->m_vecAngles` to the previous command's when `IsDead()`, and
+        // `CPlayerMove::FinishMove` does *not* write them anywhere — the
+        // `player->SetLocalAngles( move->m_vecAngles )` line is commented out
+        // in the original (`player_command.cpp:232`). So the pin changes the
+        // movement *basis* for that command and nothing else, and a dead
+        // Portal 2 player really can still turn the camera; what stops them
+        // looking at anything is the three-second fade to black.
+        //
+        // Reproduced rather than dropped because the basis is only moot while
+        // the move is also zeroed, and those are two separate `if`s.
     }
 
     /// The `sv_*` movement variables, read from the cvars once per command.
@@ -1009,7 +1036,9 @@ mod tests {
     fn a_tap_barely_overcomes_noclip_friction_and_clears_it_with_no_acceleration() {
         let mut console = Console::detached();
         let mut client = Client::new(&mut console);
-        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
+        // `noclip` is a `server/` command since `portdocs/SERVER.md` stage 5;
+        // what reaches the client is the move type, through `PlayerState`.
+        client.player_mut().move_type = MoveType::Noclip;
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
         let cmd = frame(&mut client, (0.0, 0.0));
@@ -1044,7 +1073,9 @@ mod tests {
         let mut client = client();
         // A player spawns walking (stage 4), and these tests have no map to
         // walk on — so this one asks for the movetype it is about.
-        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
+        // `noclip` is a `server/` command since `portdocs/SERVER.md` stage 5;
+        // what reaches the client is the move type, through `PlayerState`.
+        client.player_mut().move_type = MoveType::Noclip;
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
@@ -1114,7 +1145,9 @@ mod tests {
     #[test]
     fn spawning_drops_the_last_levels_momentum() {
         let mut client = client();
-        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
+        // `noclip` is a `server/` command since `portdocs/SERVER.md` stage 5;
+        // what reaches the client is the move type, through `PlayerState`.
+        client.player_mut().move_type = MoveType::Noclip;
         hold(&mut client, &["forward"]);
         for _ in 0..10 {
             let cmd = frame(&mut client, (0.0, 0.0));
@@ -1232,7 +1265,9 @@ mod tests {
         }
         assert_eq!(client.player.origin, Vec3::ZERO);
 
-        assert_eq!(client.toggle_noclip(), MoveType::Noclip);
+        // `noclip` is a `server/` command since `portdocs/SERVER.md` stage 5;
+        // what reaches the client is the move type, through `PlayerState`.
+        client.player_mut().move_type = MoveType::Noclip;
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
             client.run_move(&cmd, 1.0 / 60.0, None);

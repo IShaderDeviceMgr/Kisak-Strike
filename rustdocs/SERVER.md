@@ -8,18 +8,25 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stage 4 of 5, plus `prop_floor_button`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, **the map notices the player** — and **a pad you stand on presses**. |
-| Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (four commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
-| Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace` — every test runs with no GPU |
-| Tests | 143 unit tests + three depot tests over all 106 shipped maps |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses — and **the player can be hurt, and die**. |
+| Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
+| Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
+| Tests | 159 unit tests + four depot tests over all 106 shipped maps |
 
-**What does not exist yet**: the player as a *whole* entity — stage 5 —
-movement, health, death and `noclip`'s home are still `client/`'s
-([What is deliberately absent](#what-is-deliberately-absent)). Thirty-five of
-the 200 classnames the shipped maps place are implemented, plus one that no map
-places, and
-**nothing pushes what is in its way**: a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why).
+**What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
+`m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
+`CBasePlayer`, `noclip`'s move from `client/` to here, `logic_playerproxy` and
+`player_loadsaved`, and the `god`/`kill`/`hurtme` commands. **`trigger_hurt`
+kills**: 138 of the game's 215 kill a player standing in them, and the other 77
+are switched off, admit no clients or have nowhere to stand.
+
+**What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
+it needs the portal system), the armour, drowning, and
+**nothing pushes what is in its way** — a door moves through the player rather
+than shoving it (`portdocs/SERVER.md` stage 3 says why). **36 of the 200
+classnames the shipped maps place are implemented**, out of 39 registered — the
+other three (`player`, `trigger_portal_button`, `light_glspot`) are placed by
+no map ([What is deliberately absent](#what-is-deliberately-absent)).
 
 ---
 
@@ -105,6 +112,14 @@ impl Server {
     pub fn player(&self) -> Option<EntityId>;
     pub fn set_player_state(&mut self, state: PlayerState);
     pub fn player_state(&self) -> Option<PlayerState>;
+
+    // stage 5 — the player's commands, and the level restart
+    pub fn toggle_noclip(&mut self) -> Option<bool>;   // the `noclip` command
+    pub fn toggle_god(&mut self) -> Option<bool>;      // the `god` command
+    pub fn kill_player(&mut self) -> bool;             // the `kill` command
+    pub fn hurt_player(&mut self, amount: f32, damage_type: i32) -> bool;
+    pub fn take_level_restart(&mut self) -> Option<String>;
+
     pub fn report_entities(&self, cx: &mut ExecContext<'_>);
     pub fn ent_dump(&self, cmd: &Command, cx: &mut ExecContext<'_>);
     pub fn ent_fire(&mut self, cmd: &Command, cx: &mut ExecContext<'_>);
@@ -144,6 +159,22 @@ way is what lets every test here run without one. `set_player_state` and
 `player_state` are the two halves of the copy `Engine::frame` makes either
 side of the ticks — see [`PlayerState`](#playerstate-mod-rs).
 
+The four commands are `game/server/client.cpp`'s, all `FCVAR_CHEAT` there.
+**`noclip` is one of them again**: it lived in `src/client/` from `client/`
+stage 1 because the move type had nowhere else to be, and `portdocs/CLIENT.md`
+§9.2 recorded the condition for moving it as "stage 5, where the move type
+becomes the server's state". `hurtme` is this port's own — Valve's is
+`#ifdef _DEBUG` — and exists because `trigger_hurt` is the only damage source
+in the shipped maps, so without it the only way to test the arithmetic is to
+walk into goo.
+
+`take_level_restart` is `engine->ServerCommand( "reload\n" )`, which is what
+single-player `respawn()` and `CRevertSaved::LoadThink` both end in. With no
+save/restore the nearest honest thing is to start the map again, and
+`Engine::frame` reads this once a frame and turns it into
+`Host::request_new_game` — so nothing in this module names the host state
+machine.
+
 ### `TouchQuery` (`mod.rs`)
 
 ```rust
@@ -179,14 +210,21 @@ models. Two properties of the answer are load-bearing:
 
 ```rust
 pub struct PlayerState {
+    // The client's, written by the server where it says so.
     pub origin: Vec3,          // the FEET
     pub angles: Vec3,          // the VIEW angles, pitch/yaw/roll
     pub velocity: Vec3,
     pub base_velocity: Vec3,   // what a trigger_push is adding
-    pub on_ground: bool,       // FL_ONGROUND
-    pub noclip: bool,          // MOVETYPE_NOCLIP rather than MOVETYPE_WALK
+    pub on_ground: bool,       // FL_ONGROUND — and the only two-way flag
     pub mins: Vec3,            // the collision hull, relative to origin
     pub maxs: Vec3,
+    // The SERVER's, since stage 5. `set_player_state` ignores these.
+    pub move_type: movement::MoveType,
+    pub health: i32,
+    pub life_state: LifeState,
+    pub flags: u32,            // FL_FROZEN; FL_ONGROUND is masked out
+    // The CLIENT's, and never written by the server.
+    pub buttons: u32,          // IN_*, as a raw mask
 }
 ```
 
@@ -195,10 +233,19 @@ describe one. `client::Player` moves on the **rendered frame** and the server
 ticks at a fixed 64 Hz, so neither can hold the other's state; `Engine::frame`
 copies this in before the ticks and out after them.
 
-**The round trip is an identity for every field the server did not touch**,
-which is what makes an unconditional copy-back safe rather than a fight over
-who owns the origin — and it is why a teleport is an ordinary field write on
-the player entity rather than a message.
+**Through stage 4 the round trip was an identity for every field the server did
+not touch**, and every field went both ways. **Stage 5 broke that on purpose**
+for four of them — `move_type`, `health`, `life_state` and `flags` — because
+`noclip`, damage and death are server decisions in the original and all three
+would be undone by the client's copy arriving on the next rendered frame.
+`Server::set_player_state` ignores what arrives in those four and
+`Server::player_state` fills them in; `Engine::frame`'s `apply_player_state`
+writes them onto `client::Player`.
+
+`buttons` is the mirror image: the server reads it (`PlayerDeathThink` waits
+for buttons, `logic_playerproxy` fires on the press edge) and never writes it.
+**A press and release inside one server tick is lost**, which is Valve's too —
+a shipped server sees one usercmd per tick and computes the same edge from it.
 
 ### `ModelEntityState` (`mod.rs`)
 
@@ -252,8 +299,8 @@ pub struct LevelStats {
 impl LevelStats { pub fn summary(&self) -> String; }
 ```
 
-The parse-side progress metric. Across all 106 maps it is 26,026 of 60,925
-blocks matched, 65 created and 19,154 spawned.
+The parse-side progress metric. Across all 106 maps it is 26,044 of 60,925
+blocks matched, 65 created and 19,172 spawned.
 
 `created` is the term that makes `spawned + removed_on_spawn` differ from
 `matched`: entities that were never in the entity lump, made by another
@@ -304,8 +351,16 @@ pub struct EntityCore {
     pub solid_flags: u32,              // FSOLID_*
     pub flags: u32,                    // FL_*
     pub base_velocity: Vec3,           // what a trigger_push is adding
-    pub take_damage: bool,             // m_takedamage != DAMAGE_NO
     pub touch_links: Vec<TouchLink>,   // the TOUCHLINK list
+
+    // stage 5 — damage
+    pub take_damage: DamageMode,       // No / EventsOnly / Yes
+    pub health: i32,                   // the `health` key — 682 carry it, all 0
+    pub max_health: i32,               // the `max_health` key — none carry it
+    pub life_state: LifeState,         // Alive / Dying / Dead
+    pub damage_accumulator: f32,       // the fraction of a point carried over
+    pub damage_filter_name: Option<String>,  // the `damagefilter` key
+    pub damage_filter: Option<EntityId>,     // …resolved by Activate
     /* private: id, next_think_tick, move_done_time, touch_stamp, check_untouch */
 }
 
@@ -321,6 +376,7 @@ impl EntityCore {
     pub fn add_solid_flags(&mut self, flags: u32);
     pub fn remove_solid_flags(&mut self, flags: u32);
     pub fn has_flags(&self, flags: u32) -> bool;      // the FL_* set
+    pub fn is_alive(&self) -> bool;                   // the LIFE STATE, not health
 
     pub fn output(&self, name: &str) -> Option<&Output>;
     pub fn output_count(&self, name: &str) -> usize;  // NumberOfElements
@@ -450,6 +506,17 @@ pub trait Behaviour: Any {
     ) -> bool;
     fn is_player(&self) -> bool;                         // CBaseEntity::IsPlayer
     fn model_state(&self) -> Option<ModelState>;         // CBaseAnimating's, networked
+
+    // stage 5 — damage
+    fn on_take_damage(
+        &mut self, entity: &mut EntityCore, info: &DamageInfo, cx: &mut Context<'_>,
+    ) -> Damaged;
+    fn event_killed(
+        &mut self, entity: &mut EntityCore, info: &DamageInfo, cx: &mut Context<'_>,
+    );
+    fn passes_damage_filter(
+        &self, entity: &EntityCore, info: &DamageInfo, cx: &Context<'_>,
+    ) -> bool;
 }
 
 /// `m_nSequence` / `m_flAnimTime` / `m_nSkin`, as much of `CBaseAnimating` as
@@ -482,6 +549,11 @@ impl Context<'_> {
         activator: Option<EntityId>, caller: Option<EntityId>,
     ) -> Option<EntityId>;                               // procedurals included
     pub fn filters(&self) -> Filters<'_>;
+
+    // stage 5
+    pub fn player(&self) -> Option<EntityId>;            // UTIL_GetLocalPlayer
+    pub fn take_damage(&mut self, target: EntityId, info: DamageInfo) -> bool;
+    pub fn reload_level(&mut self);                      // ServerCommand("reload")
 }
 
 /// The read-only view a `filter_*` class evaluates against.
@@ -494,7 +566,7 @@ impl Filters<'_> {
 pub struct PointEntity;   // CPointEntity — no state, no behaviour
 ```
 
-All fourteen trait methods have defaults, so a class with no state is
+All seventeen trait methods have defaults, so a class with no state is
 `impl Behaviour for Thing {}`. `move_done` and `use_entity` are `m_pfnMoveDone`
 and `m_pfnUse`, the two function pointers `CBaseEntity` dispatches through: a
 class that has one keeps its own enum in place of the pointer and matches on
@@ -627,8 +699,8 @@ pub struct IoStats {
 ```
 
 The run-side progress metric, the way `LevelStats` is the parse-side one. Two
-seconds of every shipped map is 5,763 events dispatched, 2,070 inputs accepted,
-1,197 thinks, 3,700 events that reached nothing and **zero** bad conversions.
+seconds of every shipped map is 5,766 events dispatched, 2,480 inputs accepted,
+1,450 thinks, 2,548 events that reached nothing and **zero** bad conversions.
 
 ### `Time`, `ServerClock` and `ThinkList` (`think.rs`)
 
@@ -680,6 +752,78 @@ impl RandomStream {
 for a crate because two pieces of its behaviour are load-bearing and would be
 silently lost: `int` **rejects rather than taking a modulus**, and the seed
 convention is inverted and lossy (gotcha 17).
+
+### `damage` (`damage.rs`)
+
+```rust
+// The DMG_* table (shareddefs.h:455) — all thirty, because map data writes
+// the numbers and `damage_type_string` names every one.
+pub const DMG_GENERIC: i32 = 0;
+pub const DMG_CRUSH: i32 = 1 << 0;      // 71 trigger_hurts — the commonest
+pub const DMG_FALL: i32 = 1 << 5;       // 34 — and nothing here ever GENERATES it
+pub const DMG_RADIATION: i32 = 1 << 18; // 27 — the goo, and the one bit a class
+                                        //      branches on
+pub const DMG_DIRECT: i32 = 1 << 28;    // the bit FilterDamageType masks off
+/* …and the other twenty-five */
+
+pub enum DamageMode { No, EventsOnly, Yes }      // m_takedamage
+impl DamageMode { pub fn takes_damage(self) -> bool; }
+
+pub enum LifeState { Alive, Dying, Dead }        // m_lifeState — three of Valve's four
+
+pub struct DamageInfo {                           // CTakeDamageInfo, 4 of 16 fields
+    pub inflictor: Option<EntityId>,
+    pub attacker: Option<EntityId>,
+    pub damage: f32,
+    pub damage_type: i32,
+}
+impl DamageInfo {
+    pub fn new(
+        inflictor: Option<EntityId>, attacker: Option<EntityId>,
+        damage: f32, damage_type: i32,
+    ) -> DamageInfo;
+    pub fn scale(&mut self, factor: f32);
+}
+
+pub enum Damaged { Refused, Survived, Killed }
+
+pub fn take_damage(
+    mode: DamageMode, health: &mut i32, accumulator: &mut f32, info: &DamageInfo,
+) -> Damaged;
+pub fn take_health(
+    mode: DamageMode, health: &mut i32, max_health: i32, amount: f32,
+) -> i32;
+pub fn damage_type_string(bits: i32) -> String;
+```
+
+`CTakeDamageInfo` and the `TakeDamage` → `OnTakeDamage` → `Event_Killed`
+ladder. **Valve's ladder is five overrides deep for a player** —
+`CPortal_Player::OnTakeDamage` → `CBasePlayer::OnTakeDamage` →
+`CBaseCombatCharacter::OnTakeDamage` → `CPortal_Player::OnTakeDamage_Alive` →
+`CBaseCombatCharacter::OnTakeDamage_Alive` → `CBaseEntity::OnTakeDamage` — and
+the `_Alive`/`_Dying`/`_Dead` split exists only so that
+`CBaseCombatCharacter` can dispatch on `m_lifeState` in one place. There is no
+inheritance here, so [`Behaviour::on_take_damage`] is **one** method and
+`take_damage` is the shared arithmetic it calls.
+
+[`Behaviour::on_take_damage`]: #classdef-behaviour-and-context-classrs
+
+**Damage is deferred by one dispatch.** `Context::take_damage` queues, exactly
+the way `Context::create_entity` queues a spawn and `EntityCore::remove` queues
+a deletion, and `Server::dispatch` applies it the moment the current handler
+returns — because applying damage means running the *victim's* virtuals and the
+caller has been lifted out of the entity list. It costs no tick, and the two
+gates a caller branches on (`m_takedamage` and `PassesDamageFilter`) are
+checked synchronously before the queue, so `CTriggerHurt::HurtEntity` still
+returns the right answer to `HurtAllTouchers`.
+
+**There is exactly one damage source in the port, and it is the one the maps
+use.** 215 `trigger_hurt`s across 66 of the 106 maps, dealing between 10 and
+1,000,000 points a second against 100 health — 138 of them kill a player who
+stands in one. Everything else in Portal 2 that can hurt you is a class this
+port has not got (turrets, crushers, `prop_physics`), and the game's *other*
+way of dying takes no health at all: `player_loadsaved` freezes the player,
+fades the screen and reloads.
 
 ### `movement` (`movement.rs`)
 
@@ -1075,9 +1219,11 @@ with `self.light.key_value(..)`. See gotcha 13.
 Ordered by how likely each is to bite. **1-25 are stages 1 and 2; 26-34 are
 stage 3's and are about movement; 35-46 are stage 4's and are about touch, the
 player, and solidity; 47-51 came with `prop_floor_button` and are about
-entities that make other entities** — if a door is in the wrong place or at the
-wrong time start at 26, if a trigger does not fire start at 35, and if
-something an entity built is not there start at 47.
+entities that make other entities; 52-59 are stage 5's and are about damage,
+death and the move type** — if a door is in the wrong place or at the wrong
+time start at 26, if a trigger does not fire start at 35, if something an
+entity built is not there start at 47, and if something will not die start at
+52.
 
 1. **The server's `curtime` is not `Scene::curtime`.** The server's is
    `tick * interval` and moves in steps of 1/64 s; the scene's is the
@@ -1431,6 +1577,72 @@ something an entity built is not there start at 47.
     observable is the ordering against other zero-delay events and one extra
     row in `IoStats::dispatched`.
 
+52. **`Context::take_damage` is queued, and a self-aimed one is silently
+    dropped.** It resolves the target through the entity list, and the entity
+    currently being dispatched is *not in it* (gotcha 36) — so
+    `cx.take_damage(entity.id(), …)` inside your own handler hurts nobody and
+    returns `false`. Hurting yourself does not need the queue at all: you hold
+    `&mut EntityCore` and `&mut self` already, so call `self.on_take_damage`
+    directly, which is what `CBasePlayer::InputSetHealth` compiles to in the
+    C++ anyway.
+
+53. **`EntityCore::is_alive` is the *life state* and `IsDead()` is the
+    *health*, and they disagree.** `CBaseEntity::IsAlive` is
+    `m_lifeState == LIFE_ALIVE`; `CGameMovement::IsDead` is `m_iHealth <= 0`
+    (`gamemovement.cpp:1091`). The window between them is the single dispatch
+    in which `on_take_damage` has subtracted the last point and `event_killed`
+    has not run yet. That is why `PlayerState` carries the **health** across
+    to `client/` and not the life state: the movement asks the health
+    question, and answering it with the life state leaves a corpse that can
+    still walk for one frame.
+
+54. **`trigger_hurt` fires its outputs whether or not the damage lands**, and
+    it keeps firing them at a corpse. Three things that look like they would
+    stop it do not: the dead player going `FSOLID_NOT_SOLID` only stops the
+    *player* testing triggers, and a stationary `MOVETYPE_NONE` trigger never
+    re-tests its own, so the touch link survives; `m_takedamage` stays
+    `DAMAGE_YES`, because `CBaseCombatCharacter::Event_Killed` does **not**
+    chain to `CBaseEntity::Event_Killed`, which is the one that would clear it;
+    and `TakeDamage` returns `void`, so `HurtEntity` cannot see a refusal. The
+    consequence is bounded and is Valve's: for the three seconds between dying
+    and the reload, a map's `OnHurtPlayer` chain runs six more times. It is
+    also why `god` mode does not wedge a scripted chamber.
+
+55. **`m_flDamage` is per second and a dose is per *think*.** A `trigger_hurt`
+    deals `m_flDamage * dt`, where `dt` is 0.5 for the half-second `HurtThink`
+    and the real elapsed time for `RadiationThink`. Dealing the key's value
+    per dose doubles the lethality of every `trigger_hurt` in the game.
+
+56. **The fractional damage accumulator is not decoration.** `take_damage`
+    keeps the fraction of a point in `EntityCore::damage_accumulator` and pays
+    it out when it reaches one, so five hits of 2.5 take 12 points and not 10.
+    Drop it and every repeating damage source is weaker than the map asked
+    for; a hit smaller than a whole point becomes free rather than
+    accumulating, which is `Damaged::Refused` on the first two of three.
+
+57. **Four `PlayerState` fields do not round-trip, on purpose.**
+    `move_type`, `health`, `life_state` and `flags` are the server's since
+    stage 5 and `set_player_state` ignores what arrives in them. If you add a
+    field, decide which way it goes and say so on the field — a server-owned
+    field that the client writes back is undone a fraction of a frame after it
+    is set, which looks like `noclip` not working rather than like a bug in
+    this file.
+
+58. **`FL_ONGROUND` travels in `PlayerState::on_ground` and is masked out of
+    `PlayerState::flags`.** It is the one flag that goes both ways — the
+    client finds the ground plane and the server takes the player off it — so
+    carrying it in both fields would let the two disagree.
+
+59. **`sk_dmg_take_scale1` is 1 because the number does not exist.** Every hit
+    a Portal 2 player takes is multiplied by it (`portal_player.cpp:3607`), the
+    cvar is declared `extern` here and defined in an `hl2_gamerules.cpp` this
+    tree does not contain, and the shipped depot sets it in no `.cfg` and no
+    VPK. One definition site (`classes::player::SK_DMG_TAKE_SCALE`), one line
+    to change if it is ever recovered. It barely matters: the weakest
+    `trigger_hurt` in the game deals 10 a second against 100 health and 202 of
+    the 215 deal 100 or more, so any scale between about 0.1 and 10 kills the
+    player in the same place.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -1452,6 +1664,11 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CPropFloorButton::CreateTriggers`' `SetParent` | Parents the trigger to the button, so a button on a platform carries it | Places the trigger at the button's absolute origin and angles | The same missing local/abs pair as gotcha 34. **Not one of the game's 65 `prop_floor_button`s has a `parentname`**, and none is a mover, so there is nothing for the transform to do. |
 | `CPropFloorButton::UpdateOnRemove` | `UTIL_Remove( m_hButtonTrigger )` | The trigger outlives a killed button | There is no removal hook on `Behaviour`, and **no connection in any shipped map fires `Kill` at a floor button**. An orphan does nothing: its owner handle stops resolving, so its filter refuses everything. |
 | A creator's `DispatchSpawn` | Called by the creator, part-way through its own `Spawn` | Queued, run the moment the creator's handler returns | Gotcha 47. |
+| `pOther->TakeDamage( info )` | A direct call, part-way through the hurter's think | Queued, applied the moment the hurter's handler returns | Same reason and same shape as the row above: applying damage runs the *victim's* virtuals, and the hurter has been lifted out of the list. Gotcha 52. |
+| `respawn()` in single player | `engine->ServerCommand( "reload\n" )` — restores the last **save** | `Context::reload_level`, which restarts the map | There is no save/restore (`portdocs/SERVER.md` §6 defers it as `serde` over the entity state). For a Portal 2 chamber the two are usually the same place, because the game autosaves on entry. |
+| `UTIL_ScreenFade` on death and on `player_loadsaved` | Fades the screen to black over three seconds | Nothing is drawn; the *timer* it is drawn over is kept exactly | A screen fade is a user message to a HUD that does not exist. The respawn still happens at `m_flDeathTime + 3` and the reload still at `loadtime`. |
+| `CBasePlayer::PreThink`'s proxy outputs | Called from `CPlayerMove::RunCommand`, once per usercmd | A step of `Server::run_tick`, before the touch pass | The think schedule cannot express "every tick, first". Same place in the order, same once-per-tick cadence. |
+| `logic_playerproxy`'s inputs | Twenty declared across three `#ifdef` families | **None** | Every input the class has in Portal 2 is a portal-gun or grab-controller input, and `RequestPlayerHealth`/`SetPlayerHealth` are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`. Accepting none is the shape rather than a gap — and it is why the `PlayerHealth` output cannot fire in Portal 2 at all. |
 | Entities created *by* a spawn | Bounded only by the stack | Bounded at 4,096 per dispatch, then dropped with a warning | Same shape as the zero-delay event chain's bound. The most any map creates is four. |
 | `Enable`/`Disable`/`Toggle` on a trigger | Calls `PhysicsTouchTriggers()` at once, so enabling a trigger you are standing in fires `OnStartTouch` in the same tick | Fires it on the **next** tick | The touch pass is player-driven and runs at one fixed point in the tick. At most 15.6 ms late; the condition for closing it is a touch query the server can ask mid-tick. |
 | `!player_blue` / `!player_orange` | `GetGlobalTeam( … )->GetPlayer( 0 )` | Reported as "no such player" | Single player has no teams, so Valve answers null here too — this is a report line rather than a divergence, and it is 74 of the depot's unhandled procedurals. |
@@ -1464,7 +1681,13 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 |---|---|
 | **Pushing what is in the way** — `CPhysicsPushedEntities`, `Blocked`/`StartBlocked`/`EndBlocked`, `m_bDoorGroup`, `forceclosed`, `dmg`/`BlockDamage` | ~1,000 lines of speculative push and rollback, and it wants `ENGINE_TRACE.md` stage 4 underneath it. A door that moves through the player is a better state than a door that does not move. The keys are parsed so they are not counted as unknown; nothing reads them. |
 | `SOLID_*` — `SOLID_BSP` versus `SOLID_VPHYSICS`, and `solidbsp` | Nothing chooses between *those two*: for a brush entity they are the same brushes. `SOLID_OBB` is different and is now real — it decides that a shape is answered by `obb` rather than by the engine (gotcha 48). |
-| **Damage** — health, `CTakeDamageInfo`, `TakeDamage`, death, and the physics force a hurt imparts | There is no health on anything. `trigger_hurt` therefore runs the whole of Valve's *timing* — the half-second think, the radiation quarter-second one, the doubling model's arithmetic, the parting half-dose — and takes nothing away, so `OnHurt` and `OnHurtPlayer` fire exactly when the shipped game fires them. The condition is `CBasePlayer`'s state, which is stage 5's. |
+| The **physics force** a hurt imparts — `GuessDamageForce`, `VPhysicsTakeDamage`, `CBaseEntity::OnTakeDamage`'s impulse | The damage itself landed at stage 5; the force needs `rapier`. `DamageInfo` carries neither the force nor the position, because a field nothing reads is a field nothing checks — and the impulse branch is unreachable anyway: it demands `!info.GetAttacker()->IsSolidFlagSet( FSOLID_TRIGGER )` and the only attacker in the port is a `trigger_hurt`. |
+| Everything else that can hurt you — turrets (`npc_portal_turret_floor`), crushers (`CPhysicsPushedEntities`), `prop_physics` | Each is a class or a subsystem that is not ported. `trigger_hurt` is the whole damage surface the shipped maps reach. |
+| The **armour** — `m_ArmorValue`, `ARMOR_RATIO`, `ARMOR_BONUS`, `old_armor` | Portal has no armour and no item that gives any, so the block in `CBasePlayer::OnTakeDamage` is thirty lines of arithmetic on a value that is always zero. |
+| Drowning, the HEV suit's `SetSuitUpdate` voice lines, `m_DmgTake`/`m_bitsHUDDamage`, the geiger counter | A HUD, a sound system and a suit, none of which exist. |
+| **Fall damage** | Not deferred — **deleted**, and it is a measurement: `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules agree in words. Nothing in Portal 2 can be killed by landing, whatever the height, which is why 34 of the game's `trigger_hurt`s carry `DMG_FALL`: the pit does the killing, not the fall. |
+| `LIFE_RESPAWNABLE` and the wait-for-a-button respawn (`PORTAL_RESPAWN_DELAY`) | Multiplayer's. `sp_fade_and_force_respawn` defaults to 1, so single-player Portal 2 fades for three seconds and reloads without waiting, and the branch underneath is unreachable. |
+| `player_speedmod` (4 placed) — `SetLaggedMovementValue`, `DisableButtons` | Two more `PlayerState` fields and a multiplier on the movement's `dt`, for four entities on three maps (`e1912`, `sp_a3_00`, `sp_a4_finale4`). Ordinary follow-on work rather than a subsystem. |
 | Pushing a *physics object* — `SF_TRIGGER_ALLOW_PHYSICS`, `SF_TRIGGER_PUSH_USE_MASS`, `ApplyForceCenter` | `MOVETYPE_VPHYSICS` needs `rapier` (`ENGINE_TRACE.md` stage 5). 147 `trigger_multiple`s in the game are physics-only and correctly refuse the player. |
 | NPCs and vehicles in `PassesTriggerFilters` — the `FL_NPC` sub-tests, `IsInAVehicle` | Portal 2 has 293 NPCs of 6 classnames and no vehicles at all. The `FL_NPC` term of the disjunction is kept so the line reads like the C++; the two `IN_VEHICLES` refusals are kept because they *refuse* rather than allow, and zero shipped triggers set either flag. |
 | `filter_activator_team`, `filter_enemy`, `filter_size`, `filter_activator_mass_greater`, `filter_activator_context` | Zero placed by any shipped map. |
@@ -1472,7 +1695,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CTriggerHurt`'s geiger counter, and `CTriggerTeleport`'s `CheckDestIfClearForPlayer` | A client-side HUD element, and `g_pGameRules->IsSpawnPointValid`. Zero shipped maps set the second. |
 | Sound — `noise1`/`noise2`/`startclosesound`/`closesound`/`StartSound`/`StopSound`/`sounds`/`message`, the lock sentences, `MovingSoundThink` | There is no sound system. The names are parsed and printed by `ent_dump`; `MovingSoundThink` is a *named think context*, which is also not ported and is the only thing in the game that wanted one. |
 | `CBaseDoor::Activate`'s movement group and `UpdateAreaPortals` | `m_bDoorGroup` is read only by `Blocked`, above; area portals are the engine's visibility system, which is not written. |
-| `CBaseDoor::DoorActivate`, `DoorTouch`, `ChainUse`, `ButtonTouch`, `ButtonResponseToTouch`, `OnTakeDamage` | The touch and damage entry points. Stage 4's and later; nothing reaches them through I/O. |
+| `CBaseDoor::DoorActivate`, `DoorTouch`, `ChainUse`, `ButtonTouch`, `ButtonResponseToTouch`, `OnTakeDamage` | The touch and damage entry points. Nothing reaches them through I/O — and the damage one is now a *measurement*: `CBaseDoor::Spawn` and `CBaseButton::Spawn` only set `m_takedamage = DAMAGE_YES` when `health > 0`, and **all 682 `health` keys in the shipped game are `0`**, so no door or button in Portal 2 is shootable. |
 | Which way a rotating door swings away from you (`DoorGoUp`'s 40-line cross product) | It needs the activator's position, and the activator is a player in every case that reaches it. Without one Valve's `sign` stays `1.0`, which is the branch every door in Portal 2 takes because every door in Portal 2 is opened by I/O. |
 | `func_door`'s `SetToggleState` input | Declared `FIELD_FLOAT` and read with `value.Int()` (`doors.cpp:495`), which `variant_t` answers with **zero** for a float — so in the shipped game it always means `TS_AT_TOP`. Zero shipped connections fire it. |
 | `CBaseToggle`'s `master` / `UTIL_IsMasterTriggered` | The `multisource` interlock. **No shipped Portal 2 map sets a `master` key on any of these classes.** |
@@ -1482,8 +1705,9 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls, and `prop_weighted_cube` is not ported — so in this port they would be furniture that nothing can ever press. The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | All of it needs `prop_weighted_cube`, which needs `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
-| **The player as a whole entity** — `CBasePlayer`'s 9,940 lines: health, death, the weapon, the view, the suit, and `noclip`'s home (`portdocs/CLIENT.md` §9.2) | Stage 5. What stage 4 added is the *minimum* touch needs — a box with `FL_CLIENT` set whose position arrives as `PlayerState` — because a touch is a fact about two entities and building it against something outside the list would have been building a different system. `client::Player` still owns the movement and still runs on the rendered frame. |
-| `CBasePlayer::SetFogController` and the rest of the player's own inputs | 97 connections in the game fire `SetFogController` at `!player`, and there is no fog. It is the largest single entry in the depot's unhandled-input table now that `!player` resolves. |
+| **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
+| **The movement, still** — `CGameMovement` on the server, `CPlayerMove::RunCommand` | Stage 5 moved the *authority* (the move type, the health, the life state) and deliberately left the *integration* in `client/` on the rendered frame. §5 of the porting doc is the argument: `CPrediction` re-runs the same movement code on the client, so a one-process port with no `net/` already has the client half and would gain nothing but a 64 Hz camera by moving it. Revisit when `net/` exists. |
+| `CBasePlayer::SetFogController` and `SetHUDVisibility` | 97 connections in the game fire `SetFogController` at `!player`, and there is no fog or HUD. `SetHealth`, the player's third input, **is** implemented. |
 | Named think *contexts* (`m_aThinkFunctions`) | Still no class here needs two independent timers, and stage 3 is the evidence rather than the counter-example: a mover uses the think schedule **and** the arrival alarm, which are two different mechanisms with two different fields, not two contexts. The one class that genuinely wanted a context is `CBaseDoor`'s `"MovingSound"`, and there is no sound system. |
 | `IGameSystem` as a registry | One system exists (`CTonemapSystem`), so it is a method. The condition is the second system that needs a level hook. |
 | `FIELD_EHANDLE` and `FIELD_POSITION_VECTOR` | No class declares either. `FIELD_EHANDLE`'s two conversions both need the entity list, which `Variant::convert` has not got. |
@@ -1607,6 +1831,21 @@ case values.
 | `movement::movedir_is_angles_read_as_a_forward_vector` | gotcha 33 |
 | `movement::anglemod_folds_through_sixteen_bits` | the quantised fold `func_rotating` needs |
 | `classes::brush::a_rotated_box_is_measured_by_its_projection` | `RotateAABB`, and the transpose that hides at 0° and 90° |
+| `damage::fractional_damage_accumulates_rather_than_truncating` | gotcha 56 |
+| `damage::damage_under_one_point_is_refused_until_the_accumulator_fills` | gotcha 56's other half |
+| `damage::events_only_runs_the_handlers_and_leaves_health_alone` | `DAMAGE_EVENTS_ONLY`, which no map reaches |
+| `damage::health_is_restored_up_to_the_maximum_and_no_further` | `TakeHealth`'s asymmetric `DAMAGE_YES` gate |
+| `damage::the_weakest_shipped_trigger_hurt_takes_twenty_doses_to_kill` | the slowest death in the game |
+| `tests::a_lethal_trigger_kills_the_player_and_asks_for_the_level_back` | **the whole of stage 5, end to end** |
+| `tests::god_mode_refuses_the_damage_and_the_outputs_still_fire` | gotcha 54 |
+| `tests::a_damage_filter_on_the_victim_refuses_the_damage` | `PassesDamageFilter`, and `FilterDamageType`'s `==` |
+| `tests::noclip_is_the_servers_and_survives_the_round_trip` | gotcha 57 |
+| `tests::jumping_and_ducking_reach_the_player_proxy` | `logic_playerproxy`, and the press *edge* |
+| `tests::player_loadsaved_freezes_the_player_and_restarts_the_level` | Portal 2's other way of dying |
+| `tests::the_kill_command_kills_once_and_then_refuses` | `CommitSuicide`'s cooldown |
+| `tests::the_health_key_is_read_and_the_shipped_value_makes_nothing_damageable` | the 682 `health` keys |
+| `client::movement::a_dead_player_falls_under_gravity_and_stops_on_the_floor` | `FullTossMove` (`rustdocs/CLIENT.md`) |
+| `client::movement::the_dead_view_drops_to_the_floor_and_duck_does_not_lift_it_back` | `VEC_DEAD_VIEWHEIGHT`, and the write order against `Duck()` |
 | `think::a_moving_entity_is_due_every_tick` | the simulation list's two questions |
 | `tests::a_door_opens_and_fires_its_arrival` | the stage, in miniature |
 | `tests::a_door_with_a_wait_closes_itself_on_the_same_alarm` | gotcha 26, end to end |
@@ -1739,3 +1978,33 @@ started by the `logic_auto` bootstrap: `mp_coop_fan` spins `brush_fan` and opens
 `security_3_door_left`/`_right`, `mp_coop_lobby_2` slides eleven
 `func_movelinear` screen panels, and every `mp_coop_paint_*` map opens an
 airlock. Those are the maps to load when changing this code.
+
+**`every_shipped_trigger_hurt_kills_the_player_standing_in_it` is stage 5's
+depot test**, and the sibling of the trigger one above. Per map it builds the
+real collision, and then for each of the game's 215 `trigger_hurt`s it reloads
+the level, finds a point inside the trigger's *actual brushes* that a 32×32×72
+hull fits in, puts a player there and runs sixteen seconds of server time
+without moving it. **138 kill the player**; the fastest kills on the first tick
+and the slowest takes 9.78 seconds, which is the one `damage 10` trigger in the
+game working exactly as its arithmetic says. All 138 deaths reach
+`RespawnPlayer` and ask the engine for the level back, three seconds later.
+
+The other 77 are each accounted for and none of them is a failure: **72 are
+never touched** (73 of the 215 carry `StartDisabled 1`, and a disabled trigger
+is `FSOLID_NOT_SOLID` without `FSOLID_TRIGGER`, so nothing can touch it until
+the map sends an `Enable`; one of the 73 is switched on by its own map's
+bootstrap inside the sixteen seconds and then refuses for the next reason),
+**4 are touched and refuse** (`PassesTriggerFilters` — five in the game carry no
+`SF_TRIGGER_ALLOW_CLIENTS`, and one names an `npc_bullseye` filter), and **1 has
+no point a standing player fits in**.
+
+**Where to actually see a death.** **`sp_a1_intro1` places no `trigger_hurt`
+at all**, so the default map cannot kill you. The nearest one that can is
+**`sp_a1_intro5`** — which is already the map to load for the floor button —
+and 23 of the 106 single-player maps have at least one that is switched on. Or
+type `kill`, which takes the same path from `Event_Killed` onwards.
+
+**What `sp_a1_intro1` does have is the `logic_playerproxy`**, and it is the
+only map in the game whose proxy is connected to anything: jumping fires three
+relays and ducking fires two. That is the stage-5 behaviour to watch on the
+default map.

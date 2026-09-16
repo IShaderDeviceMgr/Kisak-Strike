@@ -1990,7 +1990,6 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("ambient", 2),
     ("detailvbsp", 106),
     ("filtername", 1),
-    ("health", 682),
     ("inputfilter", 2497),
     ("mapversion", 106),
     ("message", 3),
@@ -2260,12 +2259,16 @@ fn every_shipped_map_spawns_its_entities() {
     // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
     // stage 2 took it to 19,229 and 12,292, stage 3's six brush classes were
     // 3,410 more of both, stage 4's twelve — five triggers, six filters and
-    // `point_teleport` — are 3,322 more again, and `prop_floor_button` is 65.
-    assert_eq!(total.matched, 26_026);
-    assert_eq!(total.spawned, 19_154);
-    assert_eq!(total.outputs, 53_382);
-    assert_eq!(total.unknown.len(), 166);
-    assert_eq!(total.unknown.values().sum::<usize>(), 34_899);
+    // `point_teleport` — are 3,322 more again, `prop_floor_button` is 65, and
+    // stage 5's two — `logic_playerproxy` and `player_loadsaved` — are 9 each.
+    assert_eq!(total.matched, 26_044);
+    assert_eq!(total.spawned, 19_172);
+    // +5 over stage 4: the five `logic_playerproxy` connections in the whole
+    // game, all of them on `sp_a1_intro1`, are outputs now rather than keys on
+    // a block with no class.
+    assert_eq!(total.outputs, 53_387);
+    assert_eq!(total.unknown.len(), 164);
+    assert_eq!(total.unknown.values().sum::<usize>(), 34_881);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -2317,6 +2320,11 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("filter_multi"), Some(&9));
     assert_eq!(per_class.get("filter_player_held"), Some(&4));
     assert_eq!(per_class.get("filter_damage_type"), Some(&2));
+    // Stage 5's. Nine of each, and **all five of the game's
+    // `logic_playerproxy` output connections are on `sp_a1_intro1`** — the map
+    // this port loads by default.
+    assert_eq!(per_class.get("logic_playerproxy"), Some(&9));
+    assert_eq!(per_class.get("player_loadsaved"), Some(&9));
     assert_eq!(per_class.get("filter_activator_model"), Some(&1));
     // Portal 2's own, and the pair that proves runtime entity creation works
     // against real map data: 65 buttons in 47 of the 106 maps, and 65
@@ -2514,7 +2522,11 @@ fn player_at(origin: Vec3) -> PlayerState {
         velocity: Vec3::ZERO,
         base_velocity: Vec3::ZERO,
         on_ground: true,
-        noclip: false,
+        move_type: crate::server::movement::MoveType::Walk,
+        health: 100,
+        life_state: Default::default(),
+        flags: 0,
+        buttons: 0,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),
     }
@@ -3057,10 +3069,13 @@ fn a_noclipping_player_is_not_pushed() {
     ];
     let mut server = Server::new();
     server.level_init("test", &map, &trigger_models());
-    let mut state = player_at(Vec3::ZERO);
-    state.noclip = true;
+    let state = player_at(Vec3::ZERO);
     server.spawn_player(state);
     server.set_player_state(state);
+    // **`noclip` is the server's since stage 5**, so this is the command and
+    // not a field on the state that arrives: `set_player_state` deliberately
+    // ignores the move type it is handed.
+    assert_eq!(server.toggle_noclip(), Some(true));
 
     let (mins, maxs) = trigger_box();
     let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
@@ -3071,8 +3086,9 @@ fn a_noclipping_player_is_not_pushed() {
     );
 }
 
-/// `trigger_hurt` fires its outputs on Valve's half-second cadence and takes
-/// nothing away, because there is no health — see `classes::TriggerHurt`.
+/// `trigger_hurt` fires its outputs on Valve's half-second cadence — and
+/// since `portdocs/SERVER.md` stage 5 it also takes health away, `m_flDamage`
+/// per **second** rather than per dose.
 #[test]
 fn a_hurt_trigger_fires_on_hurt_player_twice_a_second() {
     let mut map = vec![
@@ -3101,6 +3117,10 @@ fn a_hurt_trigger_fires_on_hurt_player_twice_a_second() {
     // then one every half second.
     run_touching(&mut server, &mut query, 1.1);
     assert_eq!(counter_value(&server, "count"), 3.0);
+    // `damage 20` is 20 a second, dealt every half second, so each of the
+    // three doses is **10** and not 20. Getting that wrong doubles the
+    // lethality of every `trigger_hurt` in the game.
+    assert_eq!(player_health(&server), 70);
 
     // > **Walking out charges nothing extra, and that is Valve's.**
     // > `EndTouch`'s parting half-dose is gated on the toucher not being in
@@ -3258,6 +3278,38 @@ fn probe_inside(
         })
 }
 
+/// The engine's half of the touch query, over a map's placed brush models.
+///
+/// `engine/mod.rs`'s `WorldTouchQuery` without a `World` around it — a depot
+/// test has no GPU and so cannot build one — and **the same function body**,
+/// which is why `world/` exposes it free. Shared by the two depot tests that
+/// need a player to touch things.
+struct Placed<'a> {
+    collision: &'a crate::engine::trace::CollisionBsp,
+    models: &'a [crate::engine::world::PlacedBrushModel],
+}
+
+impl TouchQuery for Placed<'_> {
+    fn brush_models_touching(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        out: &mut Vec<usize>,
+    ) {
+        crate::engine::world::brush_models_touching(
+            self.collision,
+            self.models,
+            start,
+            end,
+            mins,
+            maxs,
+            out,
+        );
+    }
+}
+
 /// **Every trigger in the shipped game, touched by a real player hull swept
 /// against its real brushes.**
 ///
@@ -3282,36 +3334,6 @@ fn probe_inside(
 fn every_shipped_maps_triggers_notice_the_player() {
     use crate::engine::trace::CollisionBsp;
     use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
-
-    /// The engine's half of the touch query, over a map's placed brush models.
-    /// `engine/mod.rs`'s `WorldTouchQuery` without a `World` around it — the
-    /// depot test has no GPU and so cannot build one — and **the same
-    /// function body**, which is why `world/` exposes it free.
-    struct Placed<'a> {
-        collision: &'a CollisionBsp,
-        models: &'a [PlacedBrushModel],
-    }
-
-    impl TouchQuery for Placed<'_> {
-        fn brush_models_touching(
-            &mut self,
-            start: Vec3,
-            end: Vec3,
-            mins: Vec3,
-            maxs: Vec3,
-            out: &mut Vec<usize>,
-        ) {
-            crate::engine::world::brush_models_touching(
-                self.collision,
-                self.models,
-                start,
-                end,
-                mins,
-                maxs,
-                out,
-            );
-        }
-    }
 
     let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
         panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
@@ -3992,4 +4014,596 @@ fn the_thing_standing_on_the_pad_is_the_activator() {
     );
     // …and the button still fired its ordinary output, with itself as caller.
     assert_eq!(counter_value(&server, "down"), 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// stage 5: the player as an entity — health, death, and the move type
+// ---------------------------------------------------------------------------
+
+/// The player's health, for the tests below.
+fn player_health(server: &Server) -> i32 {
+    server
+        .entities
+        .get(server.player().expect("a player"))
+        .expect("alive")
+        .core
+        .health
+}
+
+/// The player's life state.
+fn player_life_state(server: &Server) -> crate::server::damage::LifeState {
+    server
+        .entities
+        .get(server.player().expect("a player"))
+        .expect("alive")
+        .core
+        .life_state
+}
+
+/// A map with one lethal `trigger_hurt` over the origin, wired to a counter.
+fn lethal_hurt_map() -> Vec<bsp::Entity> {
+    let mut map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "trigger_hurt"),
+            ("model", "*1"),
+            ("spawnflags", "1"),
+            // The commonest lethal value in the shipped game: 53 of the 215
+            // write exactly this.
+            ("damage", "500"),
+            // `DMG_FALL`, which 34 of them write — the goo and the pits.
+            ("damagetype", "32"),
+        ]),
+        block(&[("classname", "math_counter"), ("targetname", "count")]),
+    ];
+    map[1].pairs.push((
+        String::from("OnHurtPlayer"),
+        conn("count", "Add", "1", "0", "-1"),
+    ));
+    map
+}
+
+/// **The headline of the stage**: a `trigger_hurt` kills, and the map that
+/// held the corpse asks the engine to start again.
+///
+/// The whole chain in one test — `HurtEntity` → `Context::take_damage` →
+/// `Server::flush_damage` → `CPortal_Player::OnTakeDamage` → `Event_Killed` →
+/// `Event_Dying` → `PlayerDeathThink` → `RespawnPlayer` → the level restart —
+/// with the timings the shipped game has at every step.
+#[test]
+fn a_lethal_trigger_kills_the_player_and_asks_for_the_level_back() {
+    let mut server = Server::new();
+    server.level_init("test", &lethal_hurt_map(), &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+    assert_eq!(player_health(&server), 100);
+    assert_eq!(player_life_state(&server), LifeState::Alive);
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+
+    // One tick is enough: `Touch` arms the think at `curtime` and the touch
+    // pass runs before the thinks, so the first dose of 250 lands immediately.
+    ticks_touching(&mut server, &mut query, 1);
+    assert_eq!(counter_value(&server, "count"), 1.0);
+    assert!(player_health(&server) <= 0, "500 a second kills at once");
+    assert_eq!(player_life_state(&server), LifeState::Dying);
+
+    // `Event_Killed`'s three observable acts.
+    let state = server.player_state().expect("still in the list");
+    assert_eq!(
+        state.move_type,
+        crate::server::movement::MoveType::FlyGravity,
+        "the corpse falls"
+    );
+    assert!(!state.on_ground, "SetGroundEntity( NULL )");
+    assert!(
+        !server
+            .entities
+            .get(server.player().expect("a player"))
+            .expect("alive")
+            .core
+            .is_solid(),
+        "a corpse is walked through — FSOLID_NOT_SOLID"
+    );
+
+    // > **The trigger keeps firing `OnHurtPlayer` at the corpse, and that is
+    // > Valve's.** Three things that each look like they would stop it do not:
+    // > the player going `FSOLID_NOT_SOLID` only stops the *player* testing
+    // > triggers (`PhysicsTouchTriggers` returns early), and a stationary
+    // > `MOVETYPE_NONE` trigger never re-tests its own touches, so the touch
+    // > *link* survives; `m_takedamage` stays `DAMAGE_YES`, because
+    // > `CBaseCombatCharacter::Event_Killed` does **not** chain to
+    // > `CBaseEntity::Event_Killed`, which is the one that would clear it; and
+    // > `HurtEntity` fires its output before it knows whether the damage
+    // > landed, because `TakeDamage` returns `void`.
+    // >
+    // > So for the three seconds between dying and the reload, a map's
+    // > `OnHurtPlayer` chain runs six more times. It is bounded, it is what
+    // > the shipped game does, and a port that "fixed" it would run a
+    // > different amount of map logic than the game.
+    let health = player_health(&server);
+    run_touching(&mut server, &mut query, 2.0);
+    assert_eq!(counter_value(&server, "count"), 5.0, "1 + 2 seconds of them");
+    assert_eq!(player_health(&server), health, "and takes nothing more");
+
+    // `sp_fade_and_force_respawn` is 1: three seconds after the death, the
+    // level is asked for again. Not before.
+    assert!(server.take_level_restart().is_none(), "not yet");
+    run_touching(&mut server, &mut query, 1.2);
+    assert_eq!(
+        server.take_level_restart().as_deref(),
+        Some("test"),
+        "RespawnPlayer -> respawn() -> reload"
+    );
+    assert!(
+        server.take_level_restart().is_none(),
+        "taken once, not once a tick"
+    );
+}
+
+/// `god` refuses the damage — **and the outputs still fire**, because
+/// `TakeDamage` returns `void` and `HurtEntity` cannot see a refusal.
+///
+/// That is Valve's, and it is what makes the cheat usable in a scripted
+/// chamber rather than a way to wedge one.
+#[test]
+fn god_mode_refuses_the_damage_and_the_outputs_still_fire() {
+    let mut server = Server::new();
+    server.level_init("test", &lethal_hurt_map(), &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+    assert_eq!(server.toggle_god(), Some(true));
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 1.1);
+
+    assert_eq!(player_health(&server), 100, "FL_GODMODE");
+    assert_eq!(player_life_state(&server), LifeState::Alive);
+    assert_eq!(counter_value(&server, "count"), 3.0, "OnHurtPlayer still");
+
+    // …and off again. Half a second, because the half-second `HurtThink` is
+    // already armed and the next dose is due whenever it is due.
+    assert_eq!(server.toggle_god(), Some(false));
+    run_touching(&mut server, &mut query, 0.6);
+    assert!(player_health(&server) <= 0, "and off again");
+}
+
+/// `kill` — `CBasePlayer::CommitSuicide`, and its five-second cooldown.
+#[test]
+fn the_kill_command_kills_once_and_then_refuses() {
+    let mut server = Server::new();
+    server.level_init("test", &lethal_hurt_map(), &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    assert!(server.kill_player());
+    assert_eq!(player_health(&server), 0, "set, not subtracted");
+    assert_eq!(player_life_state(&server), LifeState::Dying);
+    // Already dead, so `IsAlive()` refuses before the cooldown is even read.
+    assert!(!server.kill_player());
+}
+
+/// `hurtme` and the fractional accumulator, end to end: five hits of 2.5 take
+/// 13 points, not 10.
+#[test]
+fn fractional_damage_accumulates_across_calls() {
+    let mut server = Server::new();
+    server.level_init("test", &lethal_hurt_map(), &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    for _ in 0..5 {
+        assert!(server.hurt_player(2.5, crate::server::damage::DMG_GENERIC));
+    }
+    // 2, 3, 2, 3, 2 — the accumulator pays out on the second hit and the
+    // fourth, so five hits of 2.5 are 12 points and not 10.
+    assert_eq!(player_health(&server), 88);
+}
+
+/// A `damagefilter` on the victim refuses the damage before it is queued.
+///
+/// Two things this pins. The **`==`** in `FilterDamageType`: a filter for
+/// `DMG_BURN` refuses `DMG_FALL`, which is what the trigger deals, so the
+/// damage never lands. And the *outputs still fire*, for the same reason god
+/// mode's do.
+#[test]
+fn a_damage_filter_on_the_victim_refuses_the_damage() {
+    let mut map = lethal_hurt_map();
+    map.push(block(&[
+        ("classname", "filter_damage_type"),
+        ("targetname", "only_burns"),
+        // `DMG_BURN`, which is not what the trigger deals.
+        ("damagetype", "8"),
+    ]));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::ZERO));
+    // The player is not in the `.bsp`, so its filter is set the way the one
+    // input that can set one does.
+    let player = server.player().expect("a player");
+    server.dispatch(player, |core, _behaviour, cx| {
+        core.damage_filter = cx.find_by_name("only_burns");
+    });
+    assert!(server
+        .entities
+        .get(player)
+        .expect("alive")
+        .core
+        .damage_filter
+        .is_some());
+
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    run_touching(&mut server, &mut query, 1.1);
+
+    assert_eq!(player_health(&server), 100, "DMG_FALL is not DMG_BURN");
+    assert_eq!(counter_value(&server, "count"), 3.0);
+}
+
+/// `noclip` is a **server** command again — `portdocs/CLIENT.md` §9.2's wart,
+/// closed — and `Server::set_player_state` must not undo it.
+#[test]
+fn noclip_is_the_servers_and_survives_the_round_trip() {
+    let mut server = Server::new();
+    server.level_init("test", &lethal_hurt_map(), &trigger_models());
+    let state = player_at(Vec3::ZERO);
+    server.spawn_player(state);
+
+    assert_eq!(server.toggle_noclip(), Some(true));
+    // The client's copy arriving at the top of the next rendered frame still
+    // says `MOVETYPE_WALK`, because the client has not been told yet. If
+    // `set_player_state` wrote the move type, this line would turn noclip off
+    // a fraction of a frame after it was turned on.
+    server.set_player_state(state);
+    assert_eq!(
+        server.player_state().expect("a player").move_type,
+        crate::server::movement::MoveType::Noclip
+    );
+    assert_eq!(server.toggle_noclip(), Some(false));
+}
+
+/// Jumping and ducking fire `logic_playerproxy`'s outputs.
+///
+/// **Every one of the five proxy output connections in the shipped game is on
+/// `sp_a1_intro1`**, which is the map this port loads by default: three
+/// `OnJump` and one each of `OnDuck` and `OnUnDuck`.
+#[test]
+fn jumping_and_ducking_reach_the_player_proxy() {
+    let mut map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "logic_playerproxy"),
+            ("targetname", "playerproxy"),
+        ]),
+        block(&[("classname", "math_counter"), ("targetname", "jumps")]),
+        block(&[("classname", "math_counter"), ("targetname", "ducks")]),
+        block(&[("classname", "math_counter"), ("targetname", "unducks")]),
+    ];
+    map[1].pairs.push((
+        String::from("OnJump"),
+        conn("jumps", "Add", "1", "0", "-1"),
+    ));
+    map[1].pairs.push((
+        String::from("OnDuck"),
+        conn("ducks", "Add", "1", "0", "-1"),
+    ));
+    map[1].pairs.push((
+        String::from("OnUnDuck"),
+        conn("unducks", "Add", "1", "0", "-1"),
+    ));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    let mut state = player_at(Vec3::ZERO);
+    server.spawn_player(state);
+
+    let mut query = crate::server::NoTouchQuery;
+    let interval = server.time().interval;
+
+    // Holding jump fires **once**, on the press edge — `m_afButtonPressed`,
+    // not `m_nButtons`. A held key that re-fired every tick would send 64
+    // relays a second.
+    state.buttons = crate::server::classes::IN_JUMP;
+    for _ in 0..4 {
+        server.set_player_state(state);
+        server.frame(interval, &mut query);
+    }
+    assert_eq!(counter_value(&server, "jumps"), 1.0);
+
+    // Release and press again: a second jump.
+    state.buttons = 0;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    state.buttons = crate::server::classes::IN_JUMP;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    assert_eq!(counter_value(&server, "jumps"), 2.0);
+
+    // Ducking is the button; *un*ducking is the **hull**, because
+    // `CPortal_Player::UnDuck` is called when the box grows back rather than
+    // when the key comes up.
+    state.buttons = crate::server::classes::IN_DUCK;
+    state.maxs.z = 36.0;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    assert_eq!(counter_value(&server, "ducks"), 1.0);
+    assert_eq!(counter_value(&server, "unducks"), 0.0);
+
+    // Key still down, hull back up — which is what happens at the end of a
+    // toggled crouch. `OnUnDuck` fires and `OnDuck` does not fire again.
+    state.maxs.z = 72.0;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    assert_eq!(counter_value(&server, "unducks"), 1.0);
+    assert_eq!(counter_value(&server, "ducks"), 1.0);
+}
+
+/// `player_loadsaved` — Portal 2's *other* way of dying: nine entities, 11
+/// `Reload` connections, mostly named `fade_to_death`.
+///
+/// It takes no health at all. It freezes the player and reloads.
+#[test]
+fn player_loadsaved_freezes_the_player_and_restarts_the_level() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "player_loadsaved"),
+            ("targetname", "fade_to_death"),
+            // The value seven of the nine shipped ones carry.
+            ("loadtime", "2.5"),
+            ("holdtime", "100"),
+            ("duration", ".5"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    server.spawn_player(player_at(Vec3::ZERO));
+
+    let mut query = crate::server::NoTouchQuery;
+    server.queue.add(Event {
+        fire_time: 0.0,
+        target: Target::Name(String::from("fade_to_death")),
+        input: String::from("Reload"),
+        value: Variant::Void,
+        activator: None,
+        caller: None,
+        output_id: 0,
+    });
+    server.frame(server.time().interval, &mut query);
+
+    assert_eq!(player_health(&server), 100, "it is not damage");
+    assert!(
+        server.player_state().expect("a player").flags & crate::server::movement::FL_FROZEN != 0,
+        "\"Adrian: Setting this flag so we can't move or save a game.\""
+    );
+    assert!(server.take_level_restart().is_none(), "not for 2.5 seconds");
+
+    run_touching(&mut server, &mut query, 2.6);
+    assert_eq!(server.take_level_restart().as_deref(), Some("test"));
+}
+
+/// The `health` key is consumed rather than counted as unhandled — 682 of the
+/// game's entities carry it and **every one writes `0`**, which is why no
+/// shipped door or button is shootable.
+#[test]
+fn the_health_key_is_read_and_the_shipped_value_makes_nothing_damageable() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("health", "0"),
+        ]),
+    ];
+    let mut server = Server::new();
+    let stats = server.level_init("test", &map, &trigger_models());
+    assert!(!stats.unhandled.contains_key("health"));
+
+    let door = find_named(&server, "door");
+    assert_eq!(door.core.health, 0);
+    assert!(
+        !door.core.take_damage.takes_damage(),
+        "CBaseDoor::Spawn only sets DAMAGE_YES above zero"
+    );
+}
+
+/// **Every `trigger_hurt` in the shipped game, against a player standing in
+/// it** — the measurement that says `portdocs/SERVER.md` stage 5 works.
+///
+/// The sibling of [`every_shipped_maps_triggers_notice_the_player`], and the
+/// same shape: per map it builds the real collision, and then for each
+/// `trigger_hurt` it reloads the level, finds a point inside the trigger's
+/// *actual brushes* that a 32×32×72 hull fits in, puts a player there and runs
+/// the clock until the player dies or sixteen seconds pass.
+///
+/// Sixteen seconds is chosen rather than guessed. The weakest `damage` key in
+/// the game is 10, dealt every half second against 100 health, so the slowest
+/// possible death is ten seconds and change — and the level restart it asks
+/// for comes three seconds after that.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release trigger_hurt_kills -- --ignored --nocapture
+/// ```
+///
+/// [`every_shipped_maps_triggers_notice_the_player`]: fn@every_shipped_maps_triggers_notice_the_player
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_trigger_hurt_kills_the_player_standing_in_it() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
+
+    /// How long to stand in each trigger. See the docs.
+    const SECONDS: f32 = 16.0;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+        .expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let mut visited = 0usize;
+    let mut killed = 0usize;
+    // No point inside the brushes a standing hull fits in.
+    let mut unreachable = 0usize;
+    // `StartDisabled 1` — 73 of the game's 215 carry it, and a disabled
+    // trigger is `FSOLID_NOT_SOLID` without `FSOLID_TRIGGER`, so nothing ever
+    // touches it. The map switches them on with an `Enable`.
+    let mut disabled = 0usize;
+    // Touched, and the trigger refused to hurt what touched it —
+    // `PassesTriggerFilters`. Five of the game's `trigger_hurt`s do not carry
+    // `SF_TRIGGER_ALLOW_CLIENTS`, and one has a `filtername` that names an
+    // `npc_bullseye`.
+    let mut refused = 0usize;
+    // How long each death took, in seconds of server time.
+    let mut times: Vec<f32> = Vec::new();
+    let mut restarts = 0usize;
+
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let collision = CollisionBsp::build(&bsp);
+        let entities = bsp.entities();
+        let placed = find_brush_models(&entities, &collision);
+
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+
+        let mut targets: Vec<(usize, Vec3, Vec3)> = Vec::new();
+        for (_, entity) in server.entities.iter() {
+            if entity.classname() != "trigger_hurt" {
+                continue;
+            }
+            let Some(index) = entity
+                .core
+                .model
+                .as_deref()
+                .and_then(|m| m.strip_prefix('*'))
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let bounds = entity.core.model_bounds;
+            targets.push((
+                index,
+                entity.core.origin + bounds.mins,
+                entity.core.origin + bounds.maxs,
+            ));
+        }
+
+        let owned: Vec<PlacedBrushModel> = placed
+            .iter()
+            .filter(|p| server.brush_entity(p.index).is_some())
+            .cloned()
+            .map(|mut p| {
+                p.owned = true;
+                p
+            })
+            .collect();
+
+        for (index, mins, maxs) in targets {
+            // A fresh level per trigger, for the same reason the sibling test
+            // does it: a map's own bootstrap can change what is there.
+            server.level_init(name, &entities, &bsp.models);
+            visited += 1;
+
+            let Some(probe) = probe_inside(&collision, &placed, index, mins, maxs) else {
+                unreachable += 1;
+                continue;
+            };
+
+            server.spawn_player(player_at(probe));
+            let mut query = Placed {
+                collision: &collision,
+                models: &owned,
+            };
+            let interval = server.time().interval;
+            let ticks = (SECONDS / interval).round() as u32;
+            let mut died_at = None;
+            let mut touched = false;
+            for tick in 0..ticks {
+                server.frame(interval, &mut query);
+                // **The player never moves.** A standing hull is put inside
+                // the trigger and left there, so anything that happens is the
+                // trigger's doing.
+                touched = touched
+                    || server
+                        .brush_entity(index)
+                        .is_some_and(|e| !e.touch_links.is_empty());
+                if died_at.is_none()
+                    && server
+                        .player_state()
+                        .is_some_and(|s| s.life_state != LifeState::Alive)
+                {
+                    died_at = Some(tick as f32 * interval);
+                }
+            }
+            if server.take_level_restart().is_some() {
+                restarts += 1;
+            }
+            match died_at {
+                Some(at) => {
+                    killed += 1;
+                    times.push(at);
+                }
+                None if !touched => disabled += 1,
+                None => refused += 1,
+            }
+        }
+    }
+
+    times.sort_by(f32::total_cmp);
+    println!("\n{} maps", names.len());
+    println!(
+        "  {visited} trigger_hurts visited, {killed} killed the player;\n  \
+         {disabled} were never touched (StartDisabled), \
+         {refused} touched and refused (spawnflags or a filter), \
+         {unreachable} had no point a standing player fits in"
+    );
+    if let (Some(first), Some(last)) = (times.first(), times.last()) {
+        let median = times[times.len() / 2];
+        println!("  time to die: {first:.2}s fastest, {median:.2}s median, {last:.2}s slowest");
+    }
+    println!("  {restarts} of the deaths asked the engine for the level back");
+
+    assert_eq!(names.len(), 106);
+    assert_eq!(visited, 215, "the game places 215 trigger_hurts");
+    // **Nothing is unexplained.** Every trigger a standing player fits inside,
+    // that is switched on, and that admits clients, must kill them — the
+    // weakest damage value in the game is 10 a second and nothing heals.
+    assert_eq!(
+        killed + disabled + refused + unreachable,
+        visited,
+        "a trigger_hurt failed to kill a player standing in it for {SECONDS}s"
+    );
+    // 138 of the game's 215 `trigger_hurt`s kill a player who stands in them,
+    // and every one of the other 77 is accounted for:
+    //
+    // - **72 are never touched.** 73 of the 215 carry `StartDisabled 1` — a
+    //   disabled trigger is `FSOLID_NOT_SOLID` *without* `FSOLID_TRIGGER`, so
+    //   nothing can touch it until the map sends it an `Enable`. (72 rather
+    //   than 73 because one of them is switched on by its own map's bootstrap
+    //   within the sixteen seconds, and then refuses for the next reason.)
+    // - **4 are touched and refuse**, which is `PassesTriggerFilters`: five of
+    //   the game's `trigger_hurt`s do not carry `SF_TRIGGER_ALLOW_CLIENTS`
+    //   (spawnflags 4098 and 5128), and one names a `filtername` that resolves
+    //   to an `npc_bullseye` filter.
+    // - **1 has nowhere to stand** — no point inside its brushes that a
+    //   32×32×72 hull fits in.
+    assert_eq!(killed, 138);
+    assert_eq!(disabled, 72, "StartDisabled 1");
+    assert_eq!(refused, 4, "no SF_TRIGGER_ALLOW_CLIENTS, or a filter");
+    assert_eq!(unreachable, 1);
+    // **Every death reaches `RespawnPlayer`**, three seconds later — which is
+    // inside the sixteen for every one of them.
+    assert_eq!(restarts, killed, "a death did not reach RespawnPlayer");
 }

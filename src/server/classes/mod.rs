@@ -6,7 +6,13 @@
 //!
 //! # What is here, and what it covers
 //!
-//! Twenty-two classnames, **22,639 of the shipped game's 60,925 entities**.
+//! **Thirty-nine classnames, 26,044 of the shipped game's 60,925 entity
+//! blocks.** Three of the 39 are placed by no map: `player` (the engine makes
+//! it when a client connects), `trigger_portal_button` (a `prop_floor_button`
+//! makes it in its own `Spawn`) and `light_glspot` (registered because Valve
+//! registers it) — so **36 of the 200 classnames the maps place** are
+//! implemented.
+//!
 //! Stage 1 brought ten of them — `worldspawn`, the light family,
 //! `info_target`, `info_player_start`, `logic_relay` and
 //! `func_instance_io_proxy` — as keyvalue bags with one piece of behaviour
@@ -15,13 +21,20 @@
 //! and `env_tonemap_controller`. Stage 3 adds the brush family — `func_brush`,
 //! `func_door`, `func_door_rotating`, `func_movelinear`, `func_button` and
 //! `func_rotating`, 3,410 entities — and with it everything in a map that
-//! moves.
+//! moves. Stage 4 adds five triggers, six filters and `point_teleport`, 3,322
+//! more, and with them everything in a map that *notices* you.
+//! `prop_floor_button` is 65 on its own, and is the first class from
+//! `game/server/portal2/`. Stage 5 adds two — `logic_playerproxy` (9) and
+//! `player_loadsaved` (9) — which are the map's interface to the player and
+//! Portal 2's second way of dying.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
-//! entities — but by what a map needs in order to *run*: `logic_auto` is how
-//! every map in the game starts itself, `env_tonemap_controller` is how 105 of
-//! the 106 say how bright they should be, and `func_brush` is the third
-//! commonest classname in the game.
+//! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
+//! *run*: `logic_auto` is how every map in the game starts itself,
+//! `env_tonemap_controller` is how 105 of the 106 say how bright they should
+//! be, `func_brush` is the third commonest classname in the game, and **every
+//! one of the five `logic_playerproxy` output connections in the entire game
+//! is on `sp_a1_intro1`**, which is the map this port loads by default.
 //!
 //! # One file per family
 //!
@@ -50,7 +63,7 @@ pub use filter::{
 };
 pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
-pub use player::Player;
+pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
 pub use point::PointTeleport;
 pub use prop::{ButtonTrigger, FloorButton};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
@@ -318,10 +331,29 @@ pub(super) static CLASSES: &[ClassDef] = &[
     // it, and because a map is allowed to.
     ClassDef {
         name: "player",
-        keys: &[],
-        inputs: &[],
-        outputs: &[],
+        keys: player::PLAYER_KEYS,
+        inputs: player::PLAYER_INPUTS,
+        outputs: player::PLAYER_OUTPUTS,
         create: Player::create,
+    },
+    // `portdocs/SERVER.md` stage 5's two map-facing player classes.
+    // `logic_playerproxy` is the player's *interface* to the map — 9 in the
+    // game, and every one of the five output connections in the whole game is
+    // on `sp_a1_intro1`. `player_loadsaved` is the game's other way of dying:
+    // 9 entities, 11 `Reload` connections, mostly named `fade_to_death`.
+    ClassDef {
+        name: "logic_playerproxy",
+        keys: player::PLAYER_PROXY_KEYS,
+        inputs: player::PLAYER_PROXY_INPUTS,
+        outputs: player::PLAYER_PROXY_OUTPUTS,
+        create: LogicPlayerProxy::create,
+    },
+    ClassDef {
+        name: "player_loadsaved",
+        keys: player::REVERT_SAVED_KEYS,
+        inputs: player::REVERT_SAVED_INPUTS,
+        outputs: player::REVERT_SAVED_OUTPUTS,
+        create: RevertSaved::create,
     },
     ClassDef {
         name: "info_target",

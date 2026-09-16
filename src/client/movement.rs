@@ -49,8 +49,8 @@
 use glam::Vec3;
 
 use super::player::{
-    MoveType, VEC_DUCK_HULL_MAX, VEC_DUCK_HULL_MIN, VEC_DUCK_VIEW, VEC_HULL_MAX, VEC_HULL_MIN,
-    VEC_VIEW,
+    MoveType, VEC_DEAD_VIEWHEIGHT, VEC_DUCK_HULL_MAX, VEC_DUCK_HULL_MIN, VEC_DUCK_VIEW,
+    VEC_HULL_MAX, VEC_HULL_MIN, VEC_VIEW,
 };
 use super::{ButtonBits, ViewAngles};
 use crate::engine::trace::{Contents, Ray, Tracer};
@@ -246,6 +246,10 @@ pub struct MoveData {
     /// `mv->m_flMaxSpeed`, which for Portal 2 is [`SV_SPEED_NORMAL`].
     pub max_speed: f32,
     pub move_type: MoveType,
+    /// `player->m_iHealth` — see [`is_dead`].
+    pub health: i32,
+    /// `player->GetFlags() & FL_FROZEN`.
+    pub frozen: bool,
 
     /// `player->GetGroundEntity()`, reduced to what a world-only port can say:
     /// the normal of the plane underfoot, or `None` for airborne.
@@ -1252,7 +1256,7 @@ fn fraction_unducked(msecs: i32) -> f32 {
 ///
 /// The speed clip is **skipped entirely for `MOVETYPE_NOCLIP`** (`:1140`),
 /// which is the first reason noclip was a clean stage 1.
-pub fn check_parameters(mv: &mut MoveData) {
+pub fn check_parameters(mv: &mut MoveData, old_angles: ViewAngles) {
     if mv.move_type != MoveType::Noclip {
         let spd =
             mv.forwardmove * mv.forwardmove + mv.sidemove * mv.sidemove + mv.upmove * mv.upmove;
@@ -1264,10 +1268,46 @@ pub fn check_parameters(mv: &mut MoveData) {
         }
     }
 
+    // `if ( player->GetFlags() & FL_FROZEN || player->GetFlags() & FL_ONTRAIN
+    // || IsDead() )` (`portal_gamemovement.cpp:2986`) — the move is zeroed and
+    // **nothing else is**: the velocity survives, so a corpse that was falling
+    // keeps falling and a frozen player standing on a lift still rides it.
+    // `FL_ONTRAIN` has no source in this port; `func_tracktrain` is not ported.
+    if mv.frozen || is_dead(mv) {
+        mv.forwardmove = 0.0;
+        mv.sidemove = 0.0;
+        mv.upmove = 0.0;
+    }
+
+    // `if ( !IsDead() ) { v_angle = mv->m_vecAngles; … } else { mv->m_vecAngles
+    // = mv->m_vecOldAngles; }` (`:2998`). **A dead player cannot look around**,
+    // which is what makes the death camera hold still while the body slides.
+    if is_dead(mv) {
+        mv.angles = old_angles;
+    }
+
     // `CalcRoll` is `sv_rollangle`, which is 0 in this branch, so the roll is
     // zero either way — and it is forced to zero outright for noclip (`:1224`).
     // A rolled *view* must not roll the *movement* basis.
     mv.angles.roll = 0.0;
+
+    // "Set dead player view_offset" (`:3023`) — after the angles, and
+    // unconditionally every command, so it survives a duck transition that was
+    // in progress when the player died.
+    if is_dead(mv) {
+        mv.view_offset = VEC_DEAD_VIEWHEIGHT;
+    }
+}
+
+/// `CGameMovement::IsDead` (`gamemovement.cpp:1091`) — `m_iHealth <= 0`.
+///
+/// > **It is the health, not the life state.** `CBaseEntity::IsAlive` asks
+/// > about `m_lifeState`, and the two disagree for the single dispatch between
+/// > `OnTakeDamage` subtracting the last point and `Event_Killed` running. The
+/// > movement wants this one, and getting them the wrong way round leaves a
+/// > corpse that can still walk for one frame.
+pub fn is_dead(mv: &MoveData) -> bool {
+    mv.health <= 0
 }
 
 /// `CGameMovement::FullNoClipMove` (`gamemovement.cpp:2525`).
@@ -1387,20 +1427,157 @@ pub fn full_walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVar
         mv.velocity.z = 0.0;
     }
 
-    // `CheckFalling` is fall damage, the landing sound and the landing
-    // animation — none of which exist.
+    // `CheckFalling` is the landing sound, the landing animation and **fall
+    // damage** — and the last of those is a measurement rather than a gap:
+    // `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall
+    // damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules
+    // agree in words (`portal_mp_gamerules.cpp:1463`: "No fall damage in
+    // Portal!"). Nothing in Portal 2 can be killed by landing, whatever the
+    // height, which is why 34 of the game's `trigger_hurt`s carry `DMG_FALL`:
+    // the pit does the killing, not the fall.
+}
+
+/// `CGameMovement::PushEntity` (`gamemovement.cpp:3861`) — sweep the hull by
+/// `push` and take whatever fraction of it is free.
+///
+/// Not `TryPlayerMove`: there is no clip-and-retry and no plane list, so
+/// hitting anything stops the move dead at the impact point. That is what
+/// makes a `MOVETYPE_FLYGRAVITY` corpse feel like a dropped object rather than
+/// like a player.
+fn push_entity(
+    mv: &mut MoveData,
+    tracer: &mut Tracer<'_>,
+    push: Vec3,
+) -> crate::engine::trace::Trace {
+    let end = mv.origin + push;
+    let trace = trace_player_bbox(mv, tracer, mv.origin, end);
+    mv.origin = trace.end;
+    trace
+}
+
+/// `CGameMovement::PerformFlyCollisionResolution` (`gamemovement.cpp:5146`) —
+/// what a flier does when it hits something.
+///
+/// **Three of Valve's four branches collapse for a player**, and each collapses
+/// because of `MOVECOLLIDE_DEFAULT`:
+///
+/// - The backoff is **1** — a slide — rather than `2 - m_surfaceFriction`,
+///   which is `MOVECOLLIDE_FLY_BOUNCE`'s.
+/// - The `vel < 30*30 || GetMoveCollide() != MOVECOLLIDE_FLY_BOUNCE` test is
+///   therefore **always true**, so the bounce-and-push-again alternative is
+///   unreachable and a corpse that lands on anything flat stops there.
+/// - Which in turn subsumes the "rolling on the ground, add static friction"
+///   block above it: that one zeroes the *vertical* velocity below
+///   `sv_gravity * frametime` and this one zeroes all three unconditionally.
+///   Reproducing it would be writing a line that cannot be observed.
+///
+/// `MOVECOLLIDE_FLY_CUSTOM` is the fourth, and Valve's own comment on it is
+/// "Should this ever occur for players!?" over an `Assert(0)`.
+fn perform_fly_collision_resolution(
+    mv: &mut MoveData,
+    trace: &crate::engine::trace::Trace,
+) {
+    // `MOVECOLLIDE_DEFAULT` → `backoff = 1`.
+    let (velocity, _) = clip_velocity(mv.velocity, trace.normal, 1.0);
+    mv.velocity = velocity;
+
+    // "stop if on ground" — and for a player that is the whole of it.
+    if trace.normal.z > 0.7 {
+        set_ground(mv, Some(trace.normal));
+        mv.velocity = Vec3::ZERO;
+    }
+}
+
+/// `CGameMovement::FullTossMove` (`gamemovement.cpp:5198`) — the dead player.
+///
+/// Gravity, one swept move, and a stop. The opening wish-velocity block is
+/// reproduced and is **unreachable for a corpse**, because
+/// [`check_parameters`] has already zeroed all three move axes for a dead or
+/// frozen player and `MOVETYPE_FLYGRAVITY` is only ever reached by dying — it
+/// is kept because it is the difference between this function and "apply
+/// gravity", and because `MOVETYPE_FLY` would enter it.
+///
+/// `CheckWater` is absent along with water.
+fn full_toss_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32) {
+    if mv.forwardmove != 0.0 || mv.sidemove != 0.0 || mv.upmove != 0.0 {
+        let (forward, right, _) = mv.angles.vectors();
+        let mut wishvel =
+            forward.normalize_or_zero() * mv.forwardmove + right.normalize_or_zero() * mv.sidemove;
+        wishvel.z += mv.upmove;
+
+        let wishdir = wishvel.normalize_or_zero();
+        let mut wishspeed = wishvel.length();
+        if wishspeed > mv.max_speed {
+            wishspeed = mv.max_speed;
+        }
+        accelerate(mv, wishdir, wishspeed, vars.accelerate, dt);
+    }
+
+    if mv.velocity.z > 0.0 {
+        set_ground(mv, None);
+    }
+
+    // "If on ground and not moving, return." — a corpse at rest costs one
+    // comparison a frame and no trace.
+    if mv.ground.is_some() && mv.base_velocity == Vec3::ZERO && mv.velocity == Vec3::ZERO {
+        return;
+    }
+
+    check_velocity(mv, vars);
+
+    // `if ( player->GetMoveType() == MOVETYPE_FLYGRAVITY ) AddGravity();` —
+    // the **whole** frame's worth, not the half that `FullWalkMove` splits
+    // either side of its move. `AddGravity` also spends the vertical base
+    // velocity, exactly as [`start_gravity`] does.
+    if mv.move_type == MoveType::FlyGravity {
+        mv.velocity.z -= vars.gravity * dt;
+        mv.velocity.z += mv.base_velocity.z * dt;
+        mv.base_velocity.z = 0.0;
+        check_velocity(mv, vars);
+    }
+
+    // "Base velocity is not properly accounted for since this entity will move
+    // again after the bounce without taking it into account" — Valve's own
+    // comment on the add/scale/subtract below.
+    mv.velocity += mv.base_velocity;
+    check_velocity(mv, vars);
+    let push = mv.velocity * dt;
+    mv.velocity -= mv.base_velocity;
+
+    let trace = push_entity(mv, tracer, push);
+    check_velocity(mv, vars);
+
+    if trace.all_solid {
+        // "entity is trapped in another solid" — `SetGroundEntity( &pm )` with
+        // a trace that has no usable plane, because nothing was hit on the way
+        // in. World `+Z` is this port's substitute for Valve's ground *entity*,
+        // which carries no normal at all; either way what it means is "stop".
+        set_ground(mv, Some(Vec3::Z));
+        mv.velocity = Vec3::ZERO;
+        return;
+    }
+    if trace.fraction != 1.0 {
+        perform_fly_collision_resolution(mv, &trace);
+    }
 }
 
 /// `CGameMovement::PlayerMove` (`gamemovement.cpp:4994`) — the per-command
 /// entry point, and the order everything else runs in.
-pub fn player_move(mv: &mut MoveData, tracer: Option<&mut Tracer<'_>>, vars: &MoveVars, dt: f32) {
-    check_parameters(mv);
+pub fn player_move(
+    mv: &mut MoveData,
+    tracer: Option<&mut Tracer<'_>>,
+    vars: &MoveVars,
+    dt: f32,
+    old_angles: ViewAngles,
+) {
+    check_parameters(mv, old_angles);
     reduce_timers(mv, dt);
 
     // `CheckStuck` is skipped for noclip anyway, and is not ported.
 
     let Some(tracer) = tracer else {
-        // No map loaded: noclip still flies, walking has nothing to stand on.
+        // No map loaded: noclip still flies, walking has nothing to stand on
+        // and a corpse has nothing to land on.
         if mv.move_type == MoveType::Noclip {
             full_noclip_move(mv, vars, dt);
         }
@@ -1416,11 +1593,19 @@ pub fn player_move(mv: &mut MoveData, tracer: Option<&mut Tracer<'_>>, vars: &Mo
         set_ground(mv, None);
     }
 
+    // `UpdateDuckJumpEyeOffset(); Duck();` — and it runs for a dead player
+    // too, which is why [`check_parameters`] writes the dead view offset
+    // *before* this rather than after: `Duck` would otherwise interpolate the
+    // eye back up out of the corpse over the next 400 ms.
     duck(mv, tracer, vars);
+    if is_dead(mv) {
+        mv.view_offset = VEC_DEAD_VIEWHEIGHT;
+    }
 
     match mv.move_type {
         MoveType::Noclip => full_noclip_move(mv, vars, dt),
         MoveType::Walk => full_walk_move(mv, tracer, vars, dt),
+        MoveType::FlyGravity => full_toss_move(mv, tracer, vars, dt),
     }
 }
 
@@ -1477,6 +1662,8 @@ mod tests {
             old_buttons: ButtonBits::NONE,
             max_speed: SV_SPEED_NORMAL,
             move_type: MoveType::Walk,
+            health: 100,
+            frozen: false,
             ground: None,
             base_velocity: Vec3::ZERO,
             surface_friction: 1.0,
@@ -1509,7 +1696,8 @@ mod tests {
             mv.buttons = ButtonBits::NONE;
             mv.speed_cropped = false;
             fill(mv);
-            player_move(mv, Some(&mut tracer), &MoveVars::PORTAL2, dt);
+            let angles = mv.angles;
+            player_move(mv, Some(&mut tracer), &MoveVars::PORTAL2, dt, angles);
         }
     }
 
@@ -1923,7 +2111,8 @@ mod tests {
             for _ in 0..60 {
                 mv.forwardmove = SV_SPEED_NORMAL;
                 mv.speed_cropped = false;
-                player_move(&mut mv, Some(&mut tracer), &MoveVars::PORTAL2, TICK);
+                let angles = mv.angles;
+                player_move(&mut mv, Some(&mut tracer), &MoveVars::PORTAL2, TICK, angles);
 
                 let stuck = trace_player_bbox(&mv, &mut tracer, mv.origin, mv.origin);
                 assert!(!stuck.start_solid, "stuck at {:?} facing {yaw}", mv.origin);
@@ -1937,8 +2126,125 @@ mod tests {
     fn a_walking_player_without_a_map_does_not_move() {
         let mut mv = walker(Vec3::new(0.0, 0.0, 100.0));
         for _ in 0..60 {
-            player_move(&mut mv, None, &MoveVars::PORTAL2, TICK);
+            let angles = mv.angles;
+            player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, angles);
         }
         assert_eq!(mv.origin, Vec3::new(0.0, 0.0, 100.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // the dead player — `server/` stage 5
+    // -----------------------------------------------------------------------
+
+    /// A corpse falls, lands, and stops. `MOVETYPE_FLYGRAVITY` and
+    /// `FullTossMove`.
+    #[test]
+    fn a_dead_player_falls_under_gravity_and_stops_on_the_floor() {
+        let world = room();
+        let mut mv = walker(Vec3::new(0.0, 0.0, 200.0));
+        mv.move_type = MoveType::FlyGravity;
+        mv.health = 0;
+
+        run(&mut mv, &world, 120, TICK, |_| {});
+
+        assert!(
+            (mv.origin.z - 0.0).abs() < 0.1,
+            "landed on the floor, at {}",
+            mv.origin.z
+        );
+        // `PerformFlyCollisionResolution`'s "stop if on ground" — the velocity
+        // is zeroed outright rather than bled off, because a player's
+        // move-collide is `MOVECOLLIDE_DEFAULT`.
+        assert_eq!(mv.velocity, Vec3::ZERO);
+        assert!(mv.ground.is_some());
+    }
+
+    /// A dead player takes no input at all: `CheckParameters` zeroes all three
+    /// move axes when `IsDead()`, so holding forward does nothing.
+    #[test]
+    fn a_dead_player_cannot_walk() {
+        let world = room();
+        let mut mv = walker(Vec3::new(0.0, 0.0, 0.0));
+        mv.health = 0;
+        mv.move_type = MoveType::FlyGravity;
+
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+            mv.buttons = ButtonBits::FORWARD;
+        });
+
+        assert!(
+            mv.origin.x.abs() < 1e-3,
+            "a corpse walked to {}",
+            mv.origin.x
+        );
+    }
+
+    /// A **frozen** player is the same test with health left alone: the move
+    /// is zeroed and the player is still `MOVETYPE_WALK`.
+    ///
+    /// `CRevertSaved::InputReload` is the one thing in this port that sets the
+    /// flag — 11 connections at the nine `player_loadsaved` entities.
+    #[test]
+    fn a_frozen_player_cannot_walk_and_is_still_alive() {
+        let world = room();
+        let mut mv = walker(Vec3::new(0.0, 0.0, 0.0));
+        mv.frozen = true;
+
+        run(&mut mv, &world, 60, TICK, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+            mv.buttons = ButtonBits::FORWARD;
+        });
+
+        assert!(mv.origin.x.abs() < 1e-3, "a frozen player walked");
+        assert!(!is_dead(&mv), "frozen is not dead");
+        assert_eq!(mv.move_type, MoveType::Walk);
+    }
+
+    /// The eye drops from 64 to [`VEC_DEAD_VIEWHEIGHT`], and it is 14 rather
+    /// than the multiplayer table's 60 — see that constant.
+    ///
+    /// Also pins the *ordering*: the dead offset is written after `Duck()`,
+    /// which would otherwise interpolate the eye back up out of the corpse
+    /// over the 400 ms of an un-duck.
+    #[test]
+    fn the_dead_view_drops_to_the_floor_and_duck_does_not_lift_it_back() {
+        let world = room();
+        let mut mv = walker(Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(mv.view_offset, VEC_VIEW);
+
+        // Crouch first, so that a duck transition is in flight when the player
+        // dies — the shape that would otherwise fight the dead offset.
+        run(&mut mv, &world, 40, TICK, |mv| {
+            mv.buttons = ButtonBits::DUCK;
+        });
+        assert!(mv.ducked);
+
+        mv.health = 0;
+        mv.move_type = MoveType::FlyGravity;
+        run(&mut mv, &world, 60, TICK, |_| {});
+        assert_eq!(mv.view_offset, VEC_DEAD_VIEWHEIGHT);
+    }
+
+    /// A dead player's *movement basis* is pinned to the previous command's
+    /// angles (`portal_gamemovement.cpp:3020`), which is a distinct `if` from
+    /// the one that zeroes the move.
+    #[test]
+    fn a_dead_players_movement_basis_is_the_previous_commands() {
+        let mut mv = walker(Vec3::ZERO);
+        mv.health = 0;
+        mv.move_type = MoveType::FlyGravity;
+        mv.angles = ViewAngles::new(10.0, 90.0);
+
+        let old = ViewAngles::new(0.0, 0.0);
+        player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, old);
+        assert_eq!(mv.angles.yaw, 0.0, "pinned to m_vecOldAngles");
+        assert_eq!(mv.angles.pitch, 0.0);
+
+        // …and a *live* player takes the command's angles unchanged.
+        let mut mv = walker(Vec3::ZERO);
+        mv.angles = ViewAngles::new(10.0, 90.0);
+        player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, old);
+        assert_eq!(mv.angles.yaw, 90.0);
     }
 }
