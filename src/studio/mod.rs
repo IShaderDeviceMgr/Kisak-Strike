@@ -64,6 +64,7 @@ mod build;
 #[cfg(test)]
 mod fixture;
 mod mdl;
+pub mod anim;
 pub mod vhv;
 mod vtx;
 mod vvd;
@@ -164,6 +165,14 @@ pub struct Batch {
     /// Offset into [`StudioModel::indices`].
     pub first_index: u32,
     pub index_count: u32,
+    /// This batch's indices, split into contiguous runs by the **bone** that
+    /// moves them.
+    ///
+    /// One run covering the whole batch for a model with one bone, which is
+    /// every static prop in the game. See
+    /// [`StudioModel::rigid_bones`] for why the split is a substitute for
+    /// skinning and when it stops being one.
+    pub bones: Vec<BoneRun>,
     /// Which body part and model within it this came from.
     ///
     /// Batches are grouped by material *within* a model and never across one,
@@ -173,6 +182,19 @@ pub struct Batch {
     /// merging across them would make body-group selection impossible to add.
     pub body_part: u16,
     pub model: u16,
+}
+
+/// One bone's slice of a [`Batch`]'s indices.
+///
+/// The triangles a batch draws are sorted by bone at load, so each bone's are
+/// contiguous and can be drawn as one range under that bone's matrix. That is
+/// this port's substitute for skinning — see [`StudioModel::rigid_bones`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoneRun {
+    pub bone: u16,
+    /// Offset into [`StudioModel::indices`], not into the batch.
+    pub first_index: u32,
+    pub index_count: u32,
 }
 
 /// A studio model, resolved and ready to upload.
@@ -202,6 +224,20 @@ pub struct StudioModel {
     /// The studio meshes of LOD 0, in file order — what a [`Vhv`]'s meshes are
     /// matched against.
     pub meshes: Vec<HardwareMesh>,
+    /// The bone list. Empty for a model with no bones at all.
+    pub bones: Vec<anim::Bone>,
+    /// The sequences, in file order. [`sequence`](StudioModel::sequence) is
+    /// `LookupSequence`.
+    pub sequences: Vec<anim::Sequence>,
+    /// The animations, parallel to nothing — a [`Sequence`](anim::Sequence)
+    /// indexes them.
+    pub animations: Vec<anim::Animation>,
+    /// Which bone moves each vertex, parallel to
+    /// [`vertices`](StudioModel::vertices).
+    ///
+    /// `None` when some vertex is moved by more than one — see
+    /// [`rigid_bones`](StudioModel::rigid_bones).
+    vertex_bones: Option<Vec<u8>>,
 }
 
 /// One studio mesh, as the *hardware* would hold it.
@@ -274,6 +310,48 @@ impl StudioModel {
     /// Total triangles across every batch.
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// `LookupSequence` (`studio.cpp`) — a sequence's index by label, case
+    /// insensitively.
+    pub fn sequence(&self, label: &str) -> Option<usize> {
+        self.sequences
+            .iter()
+            .position(|s| s.label.eq_ignore_ascii_case(label))
+    }
+
+    /// The animation a sequence plays, if the sequence exists.
+    pub fn animation(&self, sequence: usize) -> Option<&anim::Animation> {
+        let sequence = self.sequences.get(sequence)?;
+        self.animations.get(sequence.anim)
+    }
+
+    /// Which bone moves each vertex — `Some` only if **every** vertex is moved
+    /// by exactly one.
+    ///
+    /// # Why this decides how a model is drawn
+    ///
+    /// Valve skins: every vertex is transformed on the way to the GPU by a
+    /// weighted blend of up to three bone matrices. This port does not, and
+    /// draws each bone's triangles as their own range under that bone's matrix
+    /// instead — which needs no change to the vertex format, no bone matrices
+    /// on the GPU and no change to any shader, and is **exact** for a model
+    /// whose vertices each answer to one bone.
+    ///
+    /// That is a measurement, not a hope — and it is a *bounded* one. Every
+    /// vertex of all four floor-button models binds to exactly one bone, and a
+    /// `prop_floor_button`'s 7,929 split 7,263 on the body and 666 on the
+    /// plate. But across the whole game **420 of 2,017 models have more than
+    /// one bone and 141 of those share a vertex between two**, so the split is
+    /// exact for 279 of them and not for the rest — the `a4_destruction` set,
+    /// which is Wheatley's chamber falling apart.
+    ///
+    /// So `None` is not hypothetical: it is the 141, and it is the measured
+    /// condition that makes real skinning worth writing. A model that returns
+    /// it is drawn in its **bind pose** rather than wrongly, and counted
+    /// (`EntityModelStats::models_not_rigid`).
+    pub fn rigid_bones(&self) -> Option<&[u8]> {
+        self.vertex_bones.as_deref()
     }
 }
 
@@ -772,6 +850,11 @@ mod tests {
         );
 
         let (mut loaded, mut static_props, mut skipped) = (0, 0, 0);
+        // The measurement the whole animation path rests on: how many models
+        // in the game have a vertex that answers to more than one bone, and so
+        // could not be posed by splitting their triangles between bones.
+        let (mut multi_bone, mut not_rigid) = (0usize, Vec::new());
+        let (mut sequences, mut widest_animation) = (0usize, 0usize);
         let (mut widest, mut widest_at) = (0usize, String::new());
         let (mut failed, mut animated_failed) = (Vec::new(), Vec::new());
         for path in &paths {
@@ -797,6 +880,15 @@ mod tests {
             match StudioModel::load(&vfs, path) {
                 Ok(model) => {
                     loaded += 1;
+                    sequences += model.sequences.len();
+                    widest_animation = widest_animation
+                        .max(model.animations.iter().map(|a| a.frame_count).max().unwrap_or(0));
+                    if model.bones.len() > 1 {
+                        multi_bone += 1;
+                        if model.rigid_bones().is_none() {
+                            not_rigid.push(path.clone());
+                        }
+                    }
                     if is_static && model.vertices.len() > widest {
                         widest = model.vertices.len();
                         widest_at = path.clone();
@@ -832,6 +924,15 @@ mod tests {
             animated_failed.len()
         );
         println!("widest static prop: {widest} vertices ({widest_at})");
+        println!(
+            "{multi_bone} of {loaded} models have more than one bone; \
+             {} of those share a vertex between bones; \
+             {sequences} sequences, longest animation {widest_animation} frames",
+            not_rigid.len()
+        );
+        for line in not_rigid.iter().take(10) {
+            println!("  shares vertices between bones: {line}");
+        }
         for line in animated_failed.iter().take(5) {
             println!("  (not a static prop) {line}");
         }
@@ -843,5 +944,118 @@ mod tests {
             "{} static props failed to load",
             failed.len()
         );
+
+        // **The two numbers the animation path's shape rests on, and both of
+        // them bound it rather than bless it.**
+        //
+        // 420 models have a skeleton worth posing and **141 of those share a
+        // vertex between bones**, so the per-bone draw split
+        // ([`StudioModel::rigid_bones`]) is exact for 279 of them and not for
+        // the rest. That is fine today — every model an *entity* places is in
+        // the 279 — and it is the measurement that says real skinning is worth
+        // writing the moment something places one of the 141. They are the
+        // `a4_destruction` set, which is Wheatley's chamber falling apart.
+        //
+        // And the longest animation in the game is **4,050 frames**, against
+        // the 11 a floor button's has. `anim.rs` expands every animation at
+        // load; at 4,050 frames that is a megabyte or so for one model, which
+        // is affordable but is the number to watch if a class ever loads one.
+        assert_eq!(multi_bone, 420, "models with more than one bone");
+        assert_eq!(not_rigid.len(), 141, "models that share a vertex between bones");
+        assert_eq!(sequences, 5_434);
+        assert_eq!(widest_animation, 4_050, "the longest animation in the game");
+    }
+}
+
+#[cfg(test)]
+mod anim_depot_tests {
+    use super::*;
+
+    /// The `prop_floor_button` model, read out of the real game: its bones,
+    /// its sequences, and **how far its plate actually travels**.
+    ///
+    /// This is the test that says the animation decoder works, and nothing
+    /// synthetic can replace it: the RLE stream, the `Quaternion64` constants,
+    /// the `posscale` fixed point and the `poseToBone` inverse bind are all
+    /// real data written by `studiomdl`, and every one of them is a silent
+    /// wrong answer rather than an error.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_floor_button_model -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_floor_button_model_animates() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let model = StudioModel::load(&vfs, "models/props/portal_button.mdl").expect("the model");
+        println!("{}: {} vertices", model.path, model.vertices.len());
+        for (i, bone) in model.bones.iter().enumerate() {
+            println!("  bone {i} {:?} parent={:?} pos={:?}", bone.name, bone.parent, bone.pos);
+        }
+        for (i, seq) in model.sequences.iter().enumerate() {
+            let anim = &model.animations[seq.anim];
+            println!(
+                "  seq {i} {:?} -> {:?} {} frames @ {} fps ({:.3}s), {} tracks",
+                seq.label,
+                anim.name,
+                anim.frame_count,
+                anim.fps,
+                anim.duration(),
+                anim.tracks.len()
+            );
+        }
+
+        // Three bones, in a chain, and the plate sits 13.64 units up the model.
+        assert_eq!(model.bones.len(), 3);
+        assert_eq!(model.bones[0].name, "portal_button_export");
+        assert_eq!(model.bones[1].parent, Some(0));
+        assert_eq!(model.bones[2].parent, Some(1));
+        assert!((model.bones[2].pos.y - 13.64).abs() < 0.01);
+
+        // The two sequences `CPropFloorButton::LookUpAnimationSequences` asks
+        // for by name, and a lookup that is case insensitive as Valve's is.
+        let up = model.sequence("up").expect("an `up` sequence");
+        let down = model.sequence("DOWN").expect("`down`, case insensitively");
+        assert_eq!(model.animations[model.sequences[down].anim].frame_count, 11);
+        assert_eq!(model.animations[model.sequences[down].anim].fps, 24.0);
+
+        // …and the whole point: the plate is somewhere else at the end of
+        // `down` than at the start of it.
+        let travel = |sequence: usize| {
+            let anim = &model.animations[model.sequences[sequence].anim];
+            let start = anim::pose(&model.bones, Some(anim), 0.0);
+            let end = anim::pose(&model.bones, Some(anim), 1.0);
+            // Bone 2 is the plate; compare where it puts a bind-pose point.
+            let probe = glam::Vec3::ZERO;
+            (end[2].transform_point3(probe) - start[2].transform_point3(probe)).length()
+        };
+        let down_travel = travel(down);
+        let up_travel = travel(up);
+        println!("  plate travel: down {down_travel:.3} units, up {up_travel:.3} units");
+        assert!(
+            down_travel > 1.0,
+            "the plate does not move over `down`: {down_travel}"
+        );
+        assert!(
+            (down_travel - up_travel).abs() < 0.01,
+            "`up` should retrace `down`: {up_travel} vs {down_travel}"
+        );
+
+        // Every vertex is moved by exactly one bone, and both bones are used —
+        // the measurement the per-bone draw split depends on.
+        let rigid = model.rigid_bones().expect("every vertex binds to one bone");
+        let mut counts = [0usize; 3];
+        for &bone in rigid {
+            counts[bone as usize] += 1;
+        }
+        println!("  vertices per bone: {counts:?}");
+        assert_eq!(counts[1] + counts[2], model.vertices.len());
+        assert!(counts[2] > 0, "no vertex is on the moving plate");
     }
 }

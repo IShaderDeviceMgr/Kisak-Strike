@@ -143,14 +143,64 @@ fn decode(colour: crate::materials::lightmap::ColorRgbExp32) -> [f32; 3] {
     colour.to_vector()
 }
 
-/// The lighting one prop is drawn with.
+/// The parts of a `.bsp` that answer "how bright is it here", kept after the
+/// rest of the file is dropped.
 ///
-/// The ambient cube from [`ambient_at`], no local lights, and no baked static
-/// light — the `.vhv` stream is stage 4, and until it lands
-/// [`ModelLighting::static_light`] stays 0 so the shader does not read a black
-/// colour stream as real darkness.
-pub fn lighting_for(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> ModelLighting {
-    let cube = ambient_at(bsp, collision, position);
+/// [`World::load`](crate::engine::world::World::load) reads a map, uploads it
+/// and lets the `Bsp` go; the only thing that needs it afterwards is lighting a
+/// model placed at a point — which for a *static* prop is answered once at load
+/// and never again, and for a model an **entity** places cannot be, because the
+/// entities do not exist until the game server has spawned them.
+///
+/// Three lumps, and all three are small: `sp_a1_intro1`'s are 2,038 leaves and
+/// their ambient samples, a few tens of kilobytes against the map's 12 MB of
+/// lightmaps.
+#[derive(Debug, Clone, Default)]
+pub struct AmbientLighting {
+    index: Vec<LeafAmbientIndex>,
+    /// Each leaf's bounds, which is all [`reconstruct`] reads of a leaf.
+    bounds: Vec<(Vec3, Vec3)>,
+    samples: Vec<LeafAmbientSample>,
+}
+
+impl AmbientLighting {
+    pub fn from_bsp(bsp: &Bsp) -> AmbientLighting {
+        let bounds = |v: [i16; 3]| Vec3::new(f32::from(v[0]), f32::from(v[1]), f32::from(v[2]));
+        AmbientLighting {
+            index: bsp.leaf_ambient_index.clone(),
+            bounds: bsp
+                .leaves
+                .iter()
+                .map(|leaf| (bounds(leaf.mins), bounds(leaf.maxs)))
+                .collect(),
+            samples: bsp.leaf_ambient.clone(),
+        }
+    }
+
+    /// [`ambient_at`], against the retained lumps.
+    pub fn ambient_at(&self, collision: &CollisionBsp, position: Vec3) -> AmbientCube {
+        let Some((leaf_index, first, count)) =
+            samples_for(&self.index, collision.leaf(position))
+        else {
+            return [[0.0; 3]; AMBIENT_CUBE_FACES];
+        };
+        let (Some(&(mins, maxs)), Some(samples)) = (
+            self.bounds.get(leaf_index),
+            self.samples.get(first..first + count),
+        ) else {
+            return [[0.0; 3]; AMBIENT_CUBE_FACES];
+        };
+        reconstruct(mins, maxs, samples, position)
+    }
+
+    /// [`lighting_for`], against the retained lumps.
+    pub fn lighting_at(&self, collision: &CollisionBsp, position: Vec3) -> ModelLighting {
+        from_cube(self.ambient_at(collision, position))
+    }
+}
+
+/// An ambient cube as the shader's [`ModelLighting`] block wants it.
+fn from_cube(cube: AmbientCube) -> ModelLighting {
     let mut ambient_cube = [[0.0f32; 4]; AMBIENT_CUBE_FACES];
     for (out, face) in ambient_cube.iter_mut().zip(cube) {
         *out = [face[0], face[1], face[2], 0.0];
@@ -163,6 +213,16 @@ pub fn lighting_for(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> Mode
         ambient_light: 1,
         _padding: 0,
     }
+}
+
+/// The lighting one prop is drawn with.
+///
+/// The ambient cube from [`ambient_at`], no local lights, and no baked static
+/// light — the `.vhv` stream is stage 4, and until it lands
+/// [`ModelLighting::static_light`] stays 0 so the shader does not read a black
+/// colour stream as real darkness.
+pub fn lighting_for(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> ModelLighting {
+    from_cube(ambient_at(bsp, collision, position))
 }
 
 #[cfg(test)]

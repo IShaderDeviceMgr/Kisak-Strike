@@ -1,10 +1,11 @@
 # `src/studio/` and `src/engine/world/props/` — API reference
 
-Studio models (`.mdl` / `.vvd` / `.dx90.vtx` / `.vhv`) and the static props a map
-places.
+Studio models (`.mdl` / `.vvd` / `.dx90.vtx` / `.vhv`), the static props a map
+places, and the **animated models its entities place**.
 Two modules, because the *asset* and the *instance* have different lifetimes:
-`studio/` reads files and needs no map; `world/props/` places them and dies with
-one. Design and the measurements behind the scoping: `portdocs/STUDIO.md`.
+`studio/` reads files and needs no map; `world/props/` and
+`world/entities/` place them and die with one. Design and the measurements
+behind the scoping: `portdocs/STUDIO.md`.
 
 | Stage (`portdocs/STUDIO.md` §8) | What | Status |
 |---|---|---|
@@ -14,11 +15,13 @@ one. Design and the measurements behind the scoping: `portdocs/STUDIO.md`.
 | 4 | the `.bsp` pak lump and `.vhv` per-vertex light | **done** |
 | 5 | the leaf ambient cube | **done** |
 | 6 | LOD selection and fade | **not started** (optional) |
+| — | bones, sequences and animation | **done** for rigid models — `studio/anim.rs`, below |
 
 Not implemented and not planned here: `.phy` collision (that is
 `ENGINE_TRACE.md` stage 5), the prop leaf lists as a *visibility* structure
-(read and kept, unused), decals, and every animated-model concern — skinning,
-flexes, sub-d surfaces. See "What is deliberately absent" below.
+(read and kept, unused), decals, flexes and sub-d surfaces — and **skinning**,
+which `anim.rs` deliberately substitutes a per-bone draw split for. See "What
+is deliberately absent" below.
 
 ---
 
@@ -57,7 +60,20 @@ pub struct StudioModel {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
+    pub bones: Vec<anim::Bone>,
+    pub sequences: Vec<anim::Sequence>,
+    pub animations: Vec<anim::Animation>,
 }
+
+impl StudioModel {
+    pub fn sequence(&self, label: &str) -> Option<usize>;   // LookupSequence
+    pub fn animation(&self, sequence: usize) -> Option<&anim::Animation>;
+    /// Which bone moves each vertex — `Some` only if EVERY vertex answers to
+    /// exactly one. See gotcha 9.
+    pub fn rigid_bones(&self) -> Option<&[u8]>;
+}
+
+pub struct BoneRun { pub bone: u16, pub first_index: u32, pub index_count: u32 }
 
 impl StudioModel {
     pub fn load(vfs: &Vfs, name: &str) -> Result<StudioModel, StudioError>;
@@ -79,6 +95,55 @@ most other callers do not.
 
 One vertex buffer and one index buffer per model, sliced by material. `.vtx`
 LOD 0 only.
+
+### `anim` — bones, sequences and the pose
+
+```rust
+pub struct Bone {
+    pub name: String,
+    pub parent: Option<usize>,   // always a LOWER index than this bone's
+    pub pos: Vec3,               // the bind pose, and what an animated position adds to
+    pub quat: Quat,
+    pub rot: Vec3,               // the bind pose again, as a RadianEuler
+    pub pos_scale: Vec3,         // the fixed-point scale an RLE channel is multiplied by
+    pub rot_scale: Vec3,
+    pub flags: u32,
+    pub pose_to_bone: Mat4,      // the INVERSE BIND matrix
+}
+
+pub struct Sequence { pub label: String, pub flags: u32, pub anim: usize }
+pub struct BoneTrack { pub bone: usize, pub pos: Vec<Vec3>, pub rot: Vec<Quat> }
+pub struct Animation {
+    pub name: String, pub fps: f32, pub flags: u32,
+    pub frame_count: usize, pub tracks: Vec<BoneTrack>,
+}
+impl Animation { pub fn duration(&self) -> f32; }
+
+pub const STUDIO_LOOPING: u32 = 0x0001;
+
+/// R_StudioSetupBones + ComputePoseToWorld, in model space.
+pub fn pose(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4>;
+```
+
+`bonesetup/bone_decode.cpp` plus the slice of `studiorender/r_studio.cpp`'s
+`R_StudioSetupBones` that a model with one animation, no layers, no pose
+parameters and no IK needs.
+
+**The RLE stream is expanded at load, not walked at draw.** Valve keeps it and
+decodes per frame because a `.mdl` can carry hundreds of long sequences; the
+four button models carry 4 or 5 sequences of at most 11 frames over 2 to 4
+bones, so a whole model's expanded animation is a few hundred bytes and `pose`
+is two lookups and a blend.
+
+**This one is bounded too.** The game holds 5,434 sequences and its longest
+animation is **4,050 frames** — about a megabyte expanded, for one model.
+Nothing a class loads today is near that; the first one that is, is the
+condition for going back to Valve's lazy walk.
+
+`pose` returns **pose-to-model** matrices: `boneToWorld[i] * poseToBone[i]`,
+which is what a *bind-pose* vertex is multiplied by. With no animation every
+one of them is the identity, which is what lets a static prop and an animated
+model share one draw path.
 
 ### The three readers
 
@@ -197,7 +262,7 @@ bind once rather than once per instance.
 
 ## Invariants and gotchas
 
-Ordered by how likely each is to bite.
+Ordered by how likely each is to bite. **13-16 are the animation's.**
 
 1. **`sizeof(StaticPropLumpV9_t)` is 72, not 69.** The prop structs in
    `gamebspfile.h` are the only ones on this path *not* `#pragma pack(1)`, so
@@ -277,7 +342,36 @@ Ordered by how likely each is to bite.
    were caught only by parsing the real depot. Write a format fixture from the
    header, never from the reader.
 
-12. **A material naming a brush shader cannot draw a prop**, and vice versa. A
+13. **Bone 255 terminates an animation's bone chain — it is not a bone.**
+   `studiomdl` writes a link with `bone = 255` after the last real one
+   (`utils/studiomdl/write.cpp:1182`) and the decoder's loop is
+   `while (panim && panim->bone < 255)` (`bone_decode.cpp:1395`). Reading it as
+   an index refuses models that are perfectly valid — it refused 15 of the ones
+   `sp_a1_intro1` places, and every one of them still parsed as a *file*, so
+   nothing but loading the real game showed it.
+
+14. **A `RadianEuler` is `(roll, pitch, yaw)` in radians; a `QAngle` is
+   `(pitch, yaw, roll)` in degrees.** `AngleQuaternion` has two overloads with
+   different component orders and Valve's own comment says *"p, y, r are not in
+   the same locations in QAngle + RadianEuler. Yay!"*. An animation's angles are
+   `RadianEuler`s, so `crate::math::angle_matrix` is the **wrong** function for
+   them: it would give a plausible rotation about the wrong axis.
+
+15. **An animated rotation is added to the bind pose in *Euler* space, before
+   it becomes a quaternion**, and two frames are then blended as quaternions.
+   Interpolating the angles and interpolating the quaternions are not the same
+   operation, and `CalcBoneQuaternion` does the second of them over values
+   produced by the first. The blend itself is `QuaternionBlend` — align, then a
+   **normalized lerp, not a slerp**.
+
+16. **`pose` needs `Bone::pose_to_bone`, and skipping it is not subtle.**
+   `poseToBone` is the *inverse bind* matrix and `R_StudioSetupBones` ends in
+   `ConcatTransforms( boneToWorld[i], poseToBone[i], poseToWorld[i] )`. Without
+   it every bone applies its own bind transform twice and the model turns
+   inside out — and with no animation playing, *with* it every matrix is the
+   identity, which is the property that lets one draw path serve both.
+
+17. **A material naming a brush shader cannot draw a prop**, and vice versa. A
    prop's geometry is `ModelVertex` and nothing else, so `PropModels::load`
    substitutes `MaterialCache::error_model_material()` — a second checkerboard
    under `VertexLitGeneric`, because this port picks the vertex layout per
@@ -293,13 +387,37 @@ Ordered by how likely each is to bite.
 
 ## What is deliberately absent
 
-- **Skinning, flexes and sub-division surfaces** — absent from the *data*, not
-  deferred. Every one of the 968 models Portal 2 places as a static prop has
-  exactly one bone, every strip group is `STRIPGROUP_IS_HWSKINNED` with no
-  `STRIPGROUP_IS_DELTA_FLEXED`, every strip is `STRIP_IS_TRILIST`, and
-  `StripHeader_t::numBones` is 0 throughout. The readers refuse flex deltas and
-  quad lists rather than drawing them wrong — which is why 16 of the game's
-  *animated* `props_destruction` models are refused, and correctly so.
+- **Skinning** — replaced rather than deferred, **for now**. A model is drawn
+  one [`BoneRun`](#studiomodel) at a time, each under its own bone's matrix,
+  which is **exact** when every vertex answers to exactly one bone and needs no
+  change to the vertex format, the shaders or the bind groups. Every vertex of
+  every model the port draws does: a `prop_floor_button`'s 7,929 split 7,263 on
+  the body and 666 on the plate.
+
+  **It does not generalise, and the number is known.** Across the game 420 of
+  2,017 models have more than one bone and **141 of those share a vertex
+  between two** — the `a4_destruction` set, Wheatley's chamber falling apart.
+  `StudioModel::rigid_bones` is where the precondition is checked rather than
+  assumed; a model that fails it is drawn in its **bind pose** and counted, and
+  the 141 are the measured condition that makes real skinning worth writing.
+- **Everything in `bone_setup.cpp` that blends** — ~5,000 lines of layering,
+  pose parameters, IK, procedural bones, bone controllers and blend sequences.
+  A sequence here has one animation (`numblends` is 1 for every sequence in
+  every model the port loads), there are no pose parameters, and switching
+  sequences is a cut — which is what `ResetSequence` means and what the only
+  caller does.
+- **External `.ani` animation blocks** (`animblock != 0`), `STUDIO_FRAMEANIM`'s
+  frame-major encoding, `STUDIO_ALLZEROS`, delta animations, zero-frame spans
+  and `BONE_FIXED_ALIGNMENT`'s `QuaternionAlign`. Each is detected and skipped —
+  the animation reads as empty, which holds the bind pose — rather than
+  mis-read. 68 files in the game have an `.ani` and no model the port loads is
+  among them.
+- **Flexes and sub-division surfaces** — absent from the *data*. Every strip
+  group is `STRIPGROUP_IS_HWSKINNED` with no `STRIPGROUP_IS_DELTA_FLEXED`,
+  every strip is `STRIP_IS_TRILIST`, and `StripHeader_t::numBones` is 0
+  throughout. The readers refuse flex deltas and quad lists rather than drawing
+  them wrong — which is why 16 of the game's *animated* `props_destruction`
+  models are refused, and correctly so.
 - **`CMDLCache`'s cache management** — LRU eviction, memory budgets, async
   queues, lock/unlock refcounting, `CreateThinVertexes`. All of it existed to
   fit models into a 2007 console; a `StudioModel` is an owned value and dropping
@@ -339,6 +457,14 @@ Ordered by how likely each is to bite.
 | `studio::tests::materials_resolve_through_the_cdtexture_cross_product` | material resolution order |
 | `studio::tests::quad_lists_and_flex_deltas_are_refused` | the refusals §3 justifies |
 | `studio::tests::a_stale_companion_file_is_refused` | the checksum guard |
+| `studio::anim::tests::a_radian_euler_is_roll_pitch_yaw_and_not_a_qangle` | gotcha 14 |
+| `studio::anim::tests::the_rle_walk_repeats_the_last_valid_value` | `ExtractAnimValue`'s run encoding |
+| `studio::anim::tests::a_compressed_quaternion_rebuilds_its_w` | `Quaternion48`/`Quaternion64` |
+| `studio::anim::tests::the_blend_aligns_and_normalizes` | gotcha 15's blend half |
+| `studio::anim::tests::halves_decode` | `Vector48` |
+| `studio::anim::tests::the_bind_pose_is_the_identity` | gotcha 16 |
+| `studio::anim_depot_tests::the_floor_button_model_animates` | **the decoder, against the real `portal_button.mdl`** — bones, sequences, 7.29 units of plate travel, and `up` retracing `down` |
+| `engine::world::entities::tests::the_button_draws_and_moves_as_it_presses` | **the whole path, on real pixels** — the model on screen, and the image changing as it presses |
 | `props::tests::the_second_prop_lands_on_the_seventy_two_byte_boundary` | gotcha 1 |
 | `props::tests::a_stride_that_is_not_seventy_two_is_refused` | the stride assertion |
 | `props::tests::valves_angle_order_is_yaw_then_pitch_then_roll` | gotcha 3, against `AngleMatrix` evaluated by hand |

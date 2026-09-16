@@ -36,6 +36,7 @@ pub mod light;
 pub mod logic;
 pub mod player;
 pub mod point;
+pub mod prop;
 pub mod trigger;
 pub mod world;
 
@@ -51,6 +52,7 @@ pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
 pub use player::Player;
 pub use point::PointTeleport;
+pub use prop::{ButtonTrigger, FloorButton};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
 
@@ -328,6 +330,25 @@ pub(super) static CLASSES: &[ClassDef] = &[
         outputs: &[],
         create: PointEntity::create,
     },
+    // Portal 2's own, and the first class here from `game/server/portal2/`.
+    // 77 across 52 maps, one of them on `sp_a1_intro1`.
+    ClassDef {
+        name: "prop_floor_button",
+        keys: prop::FLOOR_BUTTON_KEYS,
+        inputs: FLOOR_BUTTON_INPUTS,
+        outputs: prop::FLOOR_BUTTON_OUTPUTS,
+        create: FloorButton::create,
+    },
+    // Never in an entity lump: one is created by every `prop_floor_button`'s
+    // `Spawn`. It is in the table because the table is the *factory*, and
+    // `Context::create_entity` goes through it.
+    ClassDef {
+        name: "trigger_portal_button",
+        keys: BUTTON_TRIGGER_KEYS,
+        inputs: TRIGGER_INPUTS,
+        outputs: trigger::BASE_TRIGGER_OUTPUTS,
+        create: ButtonTrigger::create,
+    },
     ClassDef {
         name: "info_player_start",
         keys: &[],
@@ -410,6 +431,12 @@ static CASE_INPUTS: InputDefs = &[
 
 // The tables the class files own, under the names [`CLASSES`] reads.
 static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
+static FLOOR_BUTTON_INPUTS: InputDefs = prop::FLOOR_BUTTON_INPUTS;
+/// `CBaseTrigger`'s two keys, which a `trigger_portal_button` is never offered
+/// — it is built from code — but which its `key_value` forwards, so they are
+/// declared. The invariant test checks the declaration against the code, not
+/// against the map data.
+static BUTTON_TRIGGER_KEYS: &[&str] = &["StartDisabled", "filtername"];
 static HURT_INPUTS: InputDefs = trigger::HURT_INPUTS;
 static PUSH_INPUTS: InputDefs = trigger::PUSH_INPUTS;
 static TELEPORT_INPUTS: InputDefs = trigger::TELEPORT_INPUTS;

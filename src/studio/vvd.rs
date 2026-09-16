@@ -58,17 +58,58 @@ const TANGENT_STRIDE: usize = 16;
 /// `sizeof(vertexFileFixup_t)`, `studio.h:2380`.
 const FIXUP_STRIDE: usize = 12;
 
-/// One vertex, with the bone weights dropped.
+/// `mstudioboneweight_t` (`studio.h:284`) — which bones move this vertex.
 ///
-/// `mstudiovertex_t` leads with a 16-byte `mstudioboneweight_t`, which for a
-/// static prop is always "one bone, weight 1" — every one of the 968 models
-/// measured has exactly one bone. It is read past rather than stored; when
-/// skinned models land, this grows a `bones` field and nothing else changes.
+/// Three slots, of which `count` are used. **Every vertex in every model this
+/// port draws uses exactly one**, which is the measurement the whole animation
+/// path is built on: `bone[0]` alone decides where the vertex goes, so a model
+/// can be drawn by splitting its triangles between bones instead of skinning
+/// them. [`StudioModel::rigid_bone`] is where that is checked rather than
+/// assumed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoneWeights {
+    /// `bone[3]`. Indices into the `.mdl`'s bone list.
+    pub bones: [u8; 3],
+    /// `weight[3]`, summing to 1 over the first `count`.
+    pub weights: [f32; 3],
+    /// `numbones`.
+    pub count: u8,
+}
+
+impl BoneWeights {
+    /// The one bone that moves this vertex, if exactly one does.
+    pub fn rigid(&self) -> Option<u8> {
+        match self.count {
+            1 => Some(self.bones[0]),
+            _ => None,
+        }
+    }
+}
+
+impl Default for BoneWeights {
+    /// What a model with no bone data means: bone 0, weight 1.
+    fn default() -> BoneWeights {
+        BoneWeights {
+            bones: [0; 3],
+            weights: [1.0, 0.0, 0.0],
+            count: 1,
+        }
+    }
+}
+
+/// One vertex.
+///
+/// `mstudiovertex_t` leads with a 16-byte `mstudioboneweight_t`, which for
+/// every static prop in the game is "one bone, weight 1" — which is why this
+/// was read past and discarded until animation landed. It is kept now, because
+/// a `prop_floor_button`'s 7,929 vertices are split 7,263 on the body and 666
+/// on the plate that moves, and that split *is* the animation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub texcoord: Vec2,
+    pub bones: BoneWeights,
 }
 
 /// A parsed `.vvd`, already reordered into mesh order for one root LOD.
@@ -164,11 +205,24 @@ impl Vvd {
 
         let read_vertex = |index: usize| -> Result<Vertex, StudioError> {
             let at = vertex_start + index * VERTEX_STRIDE;
+            // 0..16 is `mstudioboneweight_t`: three floats, three signed
+            // bytes, and a count.
+            let count = r.u8(at + 15)?.min(3);
+            let mut bones = [0u8; 3];
+            let mut weights = [0.0f32; 3];
+            for slot in 0..count as usize {
+                weights[slot] = r.f32(at + slot * 4)?;
+                bones[slot] = r.u8(at + 12 + slot)?;
+            }
             Ok(Vertex {
-                // 0..16 is mstudioboneweight_t, deliberately skipped.
                 position: r.vec3(at + 16)?,
                 normal: r.vec3(at + 28)?,
                 texcoord: Vec2::new(r.f32(at + 40)?, r.f32(at + 44)?),
+                bones: BoneWeights {
+                    bones,
+                    weights,
+                    count,
+                },
             })
         };
         let read_tangent = |index: usize| -> Result<Vec4, StudioError> {

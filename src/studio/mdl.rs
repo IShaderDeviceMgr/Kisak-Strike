@@ -16,6 +16,7 @@
 //! owned `Vec`s. That is the same trade `world::bsp` made, for the same reason:
 //! it is what most of the C++'s lifetime management exists to support.
 
+use super::anim::{self, Animation, Bone, Sequence};
 use super::StudioError;
 use glam::Vec3;
 
@@ -155,6 +156,13 @@ pub struct Mdl {
     pub bounds: (Vec3, Vec3),
     pub illum_position: Vec3,
     pub bone_count: u32,
+    /// The bone list, in file order. A bone's parent is always earlier in it.
+    pub bones: Vec<Bone>,
+    /// The sequences, in file order — what `LookupSequence` searches.
+    pub sequences: Vec<Sequence>,
+    /// The animations a sequence names, already expanded out of their RLE
+    /// blocks. See [`anim`](super::anim) for why that happens at load.
+    pub animations: Vec<Animation>,
     /// `mstudiotexture_t` names, in order — what a mesh's `material` indexes.
     /// These are *bare* names with no directory: `pillar_64` and not
     /// `models/props_bts/pillar_64`.
@@ -208,6 +216,23 @@ impl Mdl {
         let bounds = (r.vec3(128)?, r.vec3(140)?);
         let flags = StudioFlags(r.u32(152)?);
         let bone_count = r.i32(156)?.max(0) as u32;
+
+        // The animation block. Read before the geometry because the bone list
+        // is what the other two are decoded against: an RLE channel's values
+        // are scaled and offset by the bone they belong to.
+        let bones = anim::parse_bones(&r, r.offset(160, "boneindex")?, bone_count as usize)?;
+        let animations = anim::parse_animations(
+            &r,
+            r.offset(184, "localanimindex")?,
+            r.count(180, "animations")?,
+            &bones,
+        )?;
+        let sequences = anim::parse_sequences(
+            &r,
+            r.offset(192, "localseqindex")?,
+            r.count(188, "sequences")?,
+            animations.len(),
+        )?;
 
         let textures = {
             let count = r.count(204, "textures")?;
@@ -264,6 +289,9 @@ impl Mdl {
             bounds,
             illum_position,
             bone_count,
+            bones,
+            sequences,
+            animations,
             textures,
             texture_dirs,
             body_parts,
@@ -424,6 +452,20 @@ impl Reader<'_> {
     pub fn f32(&self, at: usize) -> Result<f32, StudioError> {
         Ok(f32::from_le_bytes(
             self.bytes_at(at, 4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
+    pub fn u8(&self, at: usize) -> Result<u8, StudioError> {
+        Ok(self.bytes_at(at, 1)?[0])
+    }
+
+    pub fn i16(&self, at: usize) -> Result<i16, StudioError> {
+        Ok(self.u16(at)? as i16)
+    }
+
+    pub fn u64(&self, at: usize) -> Result<u64, StudioError> {
+        Ok(u64::from_le_bytes(
+            self.bytes_at(at, 8)?.try_into().expect("8 bytes"),
         ))
     }
 

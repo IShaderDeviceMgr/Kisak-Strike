@@ -299,6 +299,9 @@ pub struct Context<'a> {
     /// `Server::dispatch` can reconcile *their* schedules too and not only the
     /// dispatched entity's.
     changed: Vec<EntityId>,
+    /// What [`create_entity`](Context::create_entity) made, in creation order,
+    /// waiting for its `Spawn`.
+    created: Vec<EntityId>,
 }
 
 impl<'a> Context<'a> {
@@ -316,7 +319,59 @@ impl<'a> Context<'a> {
             entities,
             player,
             changed: Vec::new(),
+            created: Vec::new(),
         }
+    }
+
+    /// `CreateEntityByName` (`game/server/entitylist.cpp:206`) — a new entity,
+    /// of a class this port implements, added to the list here and now.
+    ///
+    /// `None` for a classname the port has not got, which is the same answer
+    /// `EntityFactoryDictionary()->Create` gives for one the game has not got.
+    /// The handle resolves immediately, so the caller can finish building the
+    /// entity through [`entity_mut`](Context::entity_mut) and
+    /// [`behaviour_mut`](Context::behaviour_mut) and keep the handle.
+    ///
+    /// > **`Spawn` has not run yet, and that is the divergence.** In the C++
+    /// > the creator calls `DispatchSpawn( pEnt )` itself, part-way through
+    /// > its own `Spawn` — plain re-entrancy, which this module does not have:
+    /// > `Server::dispatch` has lifted the *creator* out of the entity list
+    /// > for the duration, so nothing can dispatch into the list while it
+    /// > runs. So a created entity is **queued**, exactly the way
+    /// > [`EntityCore::remove`] queues a deletion, and `Server::dispatch`
+    /// > spawns it the moment the current handler returns. Everything a
+    /// > creator does between `CreateEntityByName` and `DispatchSpawn` — set
+    /// > the origin, the angles, the size, the owner — happens before the
+    /// > `Spawn` either way, which is the order that matters.
+    ///
+    /// The one thing that order changes is a creator that reads its child's
+    /// *post-`Spawn`* state before returning. Nothing does; `CreateTriggers`
+    /// stores the handle and stops.
+    pub fn create_entity(&mut self, classname: &str) -> Option<EntityId> {
+        let class = super::classes::lookup(classname)?;
+        let id = self.entities.insert(Entity::new(class));
+        self.created.push(id);
+        Some(id)
+    }
+
+    /// Another entity's *class* state, to write — the narrow counterpart of
+    /// [`entity_mut`](Context::entity_mut), which reaches only the shared
+    /// [`EntityCore`].
+    ///
+    /// This is `assert_cast< CPortalButtonTrigger* >( pTrigger )->m_pOwnerButton
+    /// = pOwner`: the handful of lines in the game where one entity reaches
+    /// into another's own fields rather than sending it an input. It is
+    /// deliberately not a way to run the other class's code — there is no
+    /// `&mut dyn Behaviour` on offer, because calling into a behaviour from
+    /// inside a behaviour is the re-entrancy
+    /// [`create_entity`](Context::create_entity) exists to avoid.
+    ///
+    /// `None` if the handle has stopped resolving, if it is the entity this
+    /// handler belongs to, or if the class is not `T`.
+    pub fn behaviour_mut<T: Behaviour>(&mut self, id: EntityId) -> Option<&mut T> {
+        let entity = self.entities.get_mut(id)?;
+        self.changed.push(id);
+        entity.behaviour.downcast_mut::<T>()
     }
 
     /// Another entity, read-only. `EHANDLE::Get()`.
@@ -385,6 +440,12 @@ impl<'a> Context<'a> {
     /// The handles [`entity_mut`](Context::entity_mut) gave out.
     pub(super) fn take_changed(&mut self) -> Vec<EntityId> {
         std::mem::take(&mut self.changed)
+    }
+
+    /// The entities [`create_entity`](Context::create_entity) made, in
+    /// creation order, for `Server::dispatch` to spawn.
+    pub(super) fn take_created(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.created)
     }
 
     /// `gpGlobals->curtime`.
@@ -656,6 +717,21 @@ pub trait Behaviour: Any {
     /// choosing between `OnHurtPlayer` and `OnHurt`, `filter_activator_name`'s
     /// special case for the literal string `!player`, and `trigger_teleport`
     /// taking the eye angles rather than the entity angles.
+    /// What this entity's studio model is doing, if it draws one.
+    ///
+    /// `None` — the default — for the 35 classes that draw no model or whose
+    /// model never animates. `Some` is `CBaseAnimating`'s networked animation
+    /// state, reduced to what the renderer needs to pose a model: which
+    /// sequence, and when it started.
+    ///
+    /// **This is the whole of the seam** between the game and the model
+    /// renderer, which is why the sequence is a `&'static str` rather than an
+    /// index: looking a label up in a `.mdl` needs the `.mdl`, and this module
+    /// names no studio type.
+    fn model_state(&self) -> Option<ModelState> {
+        None
+    }
+
     fn is_player(&self) -> bool {
         false
     }
@@ -697,6 +773,35 @@ impl dyn Behaviour {
     pub fn downcast_ref<T: Behaviour>(&self) -> Option<&T> {
         (self as &dyn Any).downcast_ref::<T>()
     }
+
+    /// The same, to write — what [`Context::behaviour_mut`] is built on.
+    pub fn downcast_mut<T: Behaviour>(&mut self) -> Option<&mut T> {
+        (self as &mut dyn Any).downcast_mut::<T>()
+    }
+}
+
+/// `CBaseAnimating`'s animation state, as much of it as anything reads.
+///
+/// `m_nSequence` and `m_flAnimTime` (`baseanimating.h`), plus the skin. Valve
+/// networks all three to the client, which is where they are turned into a
+/// pose — see
+/// [`entities`](crate::engine::world::entities) for why the split survives here
+/// with one process.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelState {
+    /// The sequence's label, as `LookupSequence` takes it. `""` is the bind
+    /// pose.
+    pub sequence: &'static str,
+    /// `m_flAnimTime` — when the sequence was last reset.
+    ///
+    /// > **It is the *server's* clock**, and the renderer measures against the
+    /// > scene's (gotcha 1). The two track each other and differ by at most one
+    /// > tick, because the server's is the scene's quantised down; the renderer
+    /// > clamps a negative elapsed time to zero so the worst case is a single
+    /// > frame of an animation not having started yet.
+    pub anim_time: f32,
+    /// `m_nSkin`.
+    pub skin: i32,
 }
 
 /// The behaviour of a class with no state of its own.

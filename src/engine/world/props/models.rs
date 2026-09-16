@@ -43,6 +43,12 @@ pub struct PropBatch {
     pub material: Arc<Material>,
     pub first_index: u32,
     pub index_count: u32,
+    /// The same indices, split into contiguous runs by the bone that moves
+    /// them — [`studio::BoneRun`], carried through unchanged.
+    ///
+    /// One run under bone 0 for a model with one bone, which is every static
+    /// prop in the game, so the static path can ignore this and does.
+    pub bones: Vec<crate::studio::BoneRun>,
 }
 
 /// One distinct model, uploaded once and drawn by every instance of it.
@@ -68,6 +74,17 @@ pub struct PropModel {
     pub vertex_count: usize,
     /// The `.mdl`'s, which a `.vhv` has to agree with.
     pub checksum: u32,
+    /// The bone list, in file order — what [`studio::anim::pose`] chains.
+    ///
+    /// Empty for a model with one bone or none, in which case there is nothing
+    /// to pose and the identity is the whole answer.
+    ///
+    /// [`studio::anim::pose`]: crate::studio::anim::pose
+    pub bones: Vec<crate::studio::anim::Bone>,
+    /// The sequences, in file order. `LookupSequence` searches it by label.
+    pub sequences: Vec<crate::studio::anim::Sequence>,
+    /// The animations a sequence names.
+    pub animations: Vec<crate::studio::anim::Animation>,
     /// The studio meshes a `.vhv`'s per-LOD blocks are matched against, in
     /// hardware vertex order.
     ///
@@ -149,6 +166,70 @@ pub struct PropModels {
     pub stats: PropModelStats,
 }
 
+impl PropModel {
+    /// Uploads one already-resolved [`StudioModel`], with its materials
+    /// already turned into [`PropBatch`]es.
+    ///
+    /// Shared by the static-prop path and by
+    /// [`entities`](crate::engine::world::entities), which need the same
+    /// buffers from the same files and differ only in where the instances come
+    /// from and how they are posed.
+    pub fn upload(
+        device: &wgpu::Device,
+        model: StudioModel,
+        batches: Vec<PropBatch>,
+    ) -> PropModel {
+        // See the module docs: the file's winding is the reverse of what this
+        // port's `front_face` names. Reversing each triangle **in place**
+        // leaves every batch's and every bone run's index range where it was.
+        let mut indices = model.indices.clone();
+        for triangle in indices.chunks_exact_mut(3) {
+            triangle.swap(0, 2);
+        }
+
+        PropModel {
+            vertex_count: model.vertices.len(),
+            checksum: model.checksum,
+            meshes: model.meshes.clone(),
+            vertices: VertexBuffer::new(device, &model.path, &model.vertices),
+            indices: IndexBuffer::new_u32(device, &model.path, &indices),
+            batches,
+            bounds: model.bounds,
+            illum_position: model.illum_position,
+            bones: model.bones,
+            sequences: model.sequences,
+            animations: model.animations,
+            name: model.path,
+        }
+    }
+
+    /// `LookupSequence` — a sequence's index by label, case insensitively.
+    pub fn sequence(&self, label: &str) -> Option<usize> {
+        self.sequences
+            .iter()
+            .position(|s| s.label.eq_ignore_ascii_case(label))
+    }
+
+    /// The animation a sequence plays, if it has one.
+    pub fn animation(&self, sequence: usize) -> Option<&crate::studio::anim::Animation> {
+        let sequence = self.sequences.get(sequence)?;
+        self.animations.get(sequence.anim)
+    }
+
+    /// Where every bone is at `cycle` through `sequence`, in model space.
+    ///
+    /// The identity for every bone of a model with no bones, no sequences, or
+    /// a sequence it does not have — which is what makes a static prop and an
+    /// animated model one draw path.
+    pub fn pose(&self, sequence: usize, cycle: f32) -> Vec<glam::Mat4> {
+        let anim = self
+            .sequences
+            .get(sequence)
+            .and_then(|s| self.animations.get(s.anim));
+        crate::studio::anim::pose(&self.bones, anim, cycle)
+    }
+}
+
 impl PropModels {
     /// Reads and uploads each distinct model [`Props`] names.
     ///
@@ -224,31 +305,15 @@ impl PropModels {
                             material,
                             first_index: batch.first_index,
                             index_count: batch.index_count,
+                            bones: batch.bones.clone(),
                         }
                     })
                     .collect();
 
-                // See the module docs: the file's winding is the reverse of
-                // what this port's `front_face` names.
-                let mut indices = model.indices.clone();
-                for triangle in indices.chunks_exact_mut(3) {
-                    triangle.swap(0, 2);
-                }
-
                 stats.models += 1;
                 stats.vertices += model.vertices.len();
-                stats.triangles += indices.len() / 3;
-                Some(PropModel {
-                    vertex_count: model.vertices.len(),
-                    checksum: model.checksum,
-                    meshes: model.meshes.clone(),
-                    vertices: VertexBuffer::new(device, &model.path, &model.vertices),
-                    indices: IndexBuffer::new_u32(device, &model.path, &indices),
-                    batches,
-                    bounds: model.bounds,
-                    illum_position: model.illum_position,
-                    name: model.path,
-                })
+                stats.triangles += model.indices.len() / 3;
+                Some(PropModel::upload(device, model, batches))
             })
             .collect::<Vec<_>>();
 

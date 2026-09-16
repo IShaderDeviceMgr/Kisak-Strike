@@ -21,7 +21,7 @@ is not compiled, not linked, and not edited.
   src/engine/      the engine; window/, host/, world/, trace/, input/, console/ (egui)
   src/client/      the game client — the player, CUserCmd, movement, the view, exposure
   src/server/      the game server — the entity list, the class table, spawn
-  src/studio/      studio models — .mdl/.vvd/.vtx into drawable geometry
+  src/studio/      studio models — .mdl/.vvd/.vtx into geometry, and animation
   src/cmdline.rs   CommandLine(), at the root because everything reads it
   src/math.rs      the parts of mathlib that are a convention, not arithmetic
   legacy/          the original C++ tree, verbatim; read-only reference
@@ -79,6 +79,9 @@ doors open and shut, panels slide, buttons press in and come back out and fans s
 decide who counts, `trigger_push` blows you across a room, `trigger_teleport`
 and `point_teleport` move you, and **doors are walls** — brush entities are in
 the player's clip chain now, so a shut door stops you and a trigger does not.
+**Standing on a floor button presses it** — and **you can see it happen**: the
+button's model draws and its plate animates down under you, which is the first
+studio *animation* and the first entity-placed model in the port.
 It is **still not a runnable game** — no sound, no netcode, no damage (nothing
 has health, so a `trigger_hurt` fires its outputs and takes nothing away), and
 a door moves *through* the player rather than shoving it — but the boot path is
@@ -715,8 +718,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   not reproduced**: the no-controller fallback resets every custom flag *except*
   `g_bUseCustomAutoExposureMin`, so a custom minimum is sticky for the rest of the level;
   `TonemapSettings::default` resets all of them.
-- **`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported**, and with them
-  **static props draw, lit the way the shipped game lights them**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
+- **`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported, plus animation**,
+  and with them **static props draw, lit the way the shipped game lights them, and an
+  entity's model animates**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
   buffer, one index buffer, per-material `Batch`es. The instances are
   `src/engine/world/props/` — the `sprp` game lump, `AngleMatrix` transforms, one upload
   per distinct model and one draw per instance, lit by the map's baked leaf ambient cubes.
@@ -726,7 +730,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   live in and **which also fixed the 8 `maps/<map>/…` cubemap materials** that used to
   draw as checkerboards — one change, two subsystems, as predicted. Not done: LOD
   selection (stage 6), `.phy` collision (that is `ENGINE_TRACE.md`'s), and the local
-  lights on a prop. `CMDLCache`'s eviction, budgets and async queues are
+  lights on a prop. **`studio/anim.rs` landed later, with `prop_floor_button`** — bones,
+  sequences and the RLE animation blocks, plus the `R_StudioSetupBones` slice that poses
+  them; skinning is *replaced* by a per-bone draw split rather than deferred, which is
+  exact for every model the port draws. See `src/server/`, below. `CMDLCache`'s eviction, budgets and async queues are
   **deleted rather than deferred**, and so are skinning, flexes and sub-d — which are
   absent from the *data*: all 968 models Portal 2 places as static props have one bone,
   trilist strips and no flex deltas. **API: `rustdocs/STUDIO.md`** — read it before
@@ -757,9 +764,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   synthetic test had passed**, because the fixture had been written from the reader
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
-- **`src/server/` — stages 1-4 of `portdocs/SERVER.md`'s five ported**, and with
-  them the map's **entity logic runs, its brush entities move, and it notices the
-  player**. Valve's `server.so` — 446,861 lines, of which the framework is
+- **`src/server/` — stages 1-4 of `portdocs/SERVER.md`'s five ported, plus
+  `prop_floor_button`**, and with them the map's **entity logic runs, its brush
+  entities move, it notices the player, and a pad you stand on presses**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
@@ -987,9 +994,127 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   of the game's 2,255 live triggers** it reloads the level, finds a point inside
   the trigger's *actual brushes* that a 32×32×72 hull fits in, puts a player
   there and runs two ticks through the same `ClipRayToCollideable` sweep the
-  running game uses. **2,246 notice, 1,879 dispatch something, 3 have no point a
+  running game uses. **2,246 notice, 1,888 dispatch something, 3 have no point a
   standing player fits in, 6 are switched off or deleted by the map's own
-  bootstrap.**
+  bootstrap.** (Nine of that 1,888 are a floor button, below: 21 of the probe
+  points also stand on a pad, and twelve of those were already firing.)
+
+  **`prop_floor_button` landed after stage 4 rather than inside it, and it is
+  the first class in the port from `game/server/portal2/`.** The big red pad you
+  stand on — **65 across 47 of the 106 maps, one of them on `sp_a1_intro1`** —
+  with 227 output connections on them. `src/server/classes/prop.rs` is
+  `CPropFloorButton` and `CPortalButtonTrigger`, taking the port to **36
+  classnames and 26,026 of the game's 60,925 entity blocks**.
+
+  It is small and what it *cost* is not, because a button is **two entities**:
+  the prop collides with nothing, and what notices the player is a second entity
+  the prop creates in its own `Spawn` — a `trigger_portal_button`, 40×40×14
+  units, centred on the pad and turned to match it. Three pieces of framework
+  came with that, and each is reusable:
+
+  - **`Context::create_entity`** — `CreateEntityByName` + `DispatchSpawn`, the
+    first entities in this port that are not in a `.bsp`. The spawn is
+    **deferred by one dispatch**, exactly the way `UTIL_Remove` defers a
+    deletion, because `Server::dispatch` has lifted the *creator* out of the
+    entity list and nothing can dispatch into it while a handler runs.
+    `LevelStats::created` is the new term that makes `spawned +
+    removed_on_spawn` differ from `matched`.
+  - **`Solid::Obb` and `src/server/obb.rs`** — `IntersectRayWithOBB`, the first
+    trigger in the port whose shape is a *box* rather than a brush model. It
+    lives in `server/` and not in `engine/trace/` because there is no map data
+    in it to ask the engine about — and that is where Valve keeps it too, in
+    `public/collisionutils.cpp`, compiled into both game DLLs. Two paths, chosen
+    by an **exact** comparison against zero angles: a slab clip for the 42
+    buttons at `angles "0 0 0"`, and a fifteen-plane separating-axis sweep for
+    the 23 that are turned — including `sp_a1_intro1`'s, which is at yaw 90.
+  - **`Touched`** — `OnStartTouchAll` and `OnEndTouchAll` are virtuals and until
+    now no class overrode either, so `BaseTrigger::start_touch` reports them
+    back to whatever contains it.
+
+  **The model draws and the plate animates**, which took the two pieces the
+  port did not have. **`src/studio/anim.rs`** is the bone list, the sequence
+  table and the RLE animation blocks — `bone_decode.cpp`'s `ExtractAnimValue`,
+  `CalcBoneQuaternion`, `CalcBonePosition`, the `Quaternion48`/`Quaternion64`/
+  `Vector48` compressed types, and the slice of `R_StudioSetupBones` that turns
+  a (sequence, cycle) into one matrix per bone. **`src/engine/world/entities.rs`**
+  is the third kind of geometry in a level shell: `.mdl` geometry the *game*
+  places, where world faces are `.bsp` geometry with a matrix and static props
+  are `.mdl` geometry the *compiler* placed.
+  Measured on the real file: `portal_button.mdl` is **3 bones, 4 sequences
+  (`BindPose`, `up`, `idledown`, `down`), 11 frames at 24 fps**, and the plate
+  travels **7.29 units**, with `up` retracing `down` exactly.
+
+  Four decisions there are worth knowing.
+  **There is no skinning, and that is a substitution rather than a gap — with a
+  measured expiry date.** Every vertex of every model the port *draws* answers
+  to exactly one bone — a button's 7,929 split 7,263 on the body and 666 on the
+  plate — so each batch's triangles are sorted by bone at load and each bone's
+  contiguous run is drawn under its own matrix. That needs no change to the
+  vertex format, the shaders or the bind groups, and it is **exact** for this
+  data. It does **not** generalise: across the game 420 of 2,017 models have
+  more than one bone and **141 of those share a vertex between two** (the
+  `a4_destruction` set), so `StudioModel::rigid_bones` checks the precondition
+  rather than assuming it, a model that fails it is drawn in its bind pose and
+  counted, and those 141 are the condition that makes real skinning worth
+  writing.
+  **The RLE stream is expanded at load, not walked at draw**, because a whole
+  button model's animation is a few hundred bytes — the game's longest is
+  **4,050 frames**, which is the matching bound on that decision.
+  **The join with the game is a sequence *name***: the server says `"down"` and
+  when it started, and the engine looks the label up and computes the cycle from
+  the scene clock — Valve's own server/client split, and what keeps the
+  animation smooth where a 64 Hz tick would step it.
+  And **`AnimateThink` is still not scheduled**, which is now a saving rather
+  than an absence: its body is `StudioFrameAdvance`, which the renderer does for
+  itself.
+
+  **One bug this found that nothing else would have.** Bone **255 terminates**
+  an animation's bone chain — `studiomdl` writes it (`write.cpp:1182`) and the
+  decoder reads `while (panim && panim->bone < 255)` (`bone_decode.cpp:1395`).
+  Reading it as a bone index refused 15 of the models `sp_a1_intro1` places, and
+  **every one of them still parsed as a file**; only loading the real game
+  showed it.
+
+  Six things about it that read as bugs until you check the reference.
+  **A button is pressed by an *input*, not by a call**: the trigger posts
+  `PressIn` at its owner where Valve calls `m_pOwnerButton->TriggerStartTouch`
+  directly, because a handler cannot dispatch into another class. It costs one
+  extra event and **no tick** — the queue restarts from the head, so the chain
+  lands inside the tick the touch happened in. **The rest of `CDynamicProp`
+  is still absent**: bone followers, `VPhysicsInitStatic`, prop data, LOS
+  blocking and fade distances, none of which has anything here to drive it —
+  and `m_nSkin`, which is parsed and printed by `ent_dump` and not drawn,
+  because skin families are `portdocs/STUDIO.md` stage 6's.
+  **`SetSkin( button_off_skin )` runs after
+  the `skin` key is read**, so a map cannot choose the starting skin — which is
+  why all 18 shipped `skin` keys are `0`. **`SetParent` on the trigger is
+  skipped** and nothing is lost: not one of the 65 has a `parentname` and none
+  is a mover. **`UpdateOnRemove` is skipped too**, so a killed button orphans
+  its trigger — and no connection in any shipped map fires `Kill` at one; an
+  orphan does nothing, because its owner handle stops resolving and its filter
+  then refuses everything. And **the three sibling classes are deliberately not
+  here**: `prop_floor_cube_button` and `prop_floor_ball_button` accept *only*
+  cubes and balls, and `prop_weighted_cube` is not ported, so in this port they
+  would be furniture nothing could ever press.
+
+  The measurement that says *this* works is
+  `server::tests::every_shipped_floor_button_presses_when_stood_on` — the
+  `SOLID_OBB` half of the trigger test, needing no collision data at all. For
+  every button in the game it reloads the level, puts the player's hull centre
+  on the pad's box centre (which is inside it whichever way the pad faces, and
+  some are on walls) and then walks away. **65 press, 65 release.**
+  The measurement that says the *model* works is
+  `engine::world::entities::tests::the_button_draws_and_moves_as_it_presses`,
+  which renders `sp_a1_intro1`'s button headlessly from four feet away: 24,889
+  of 65,536 pixels drawn, **11,467 of them different between the two ends of
+  `down`**, and the held-`up` image pixel-identical to `down` at cycle 0 —
+  which is what says the pose reaches the right geometry rather than just some
+  geometry. To watch one
+  do something, load **`sp_a1_intro5`**, where `button_1-button` drives a
+  `func_door` (`stair_ramp_door`) open and shut through a
+  `func_instance_io_proxy` and a pair of `logic_relay`s; `sp_a1_intro1`'s drives
+  an `env_texturetoggle`, which is not ported, so there the chain runs and
+  nothing moves.
 
   Not implemented, and each is a stage or a subsystem: the player as a *whole*
   entity (5), and **damage** — nothing has health, so `trigger_hurt` cannot hurt
@@ -1022,7 +1147,8 @@ Next: **the boot path is complete as far as one player can take it**, the level 
 is geometrically complete — world, brush entities, static props and terrain — it is
 **auto-exposed to the map's own limits**, the map's **entity logic runs**, its
 **doors and panels move**, and **it notices the player**: triggers fire, filters
-decide who counts, and a shut door is a wall.
+decide who counts, a shut door is a wall, and a floor button presses when you
+stand on it.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 The candidates, in the order they are worth doing:
 

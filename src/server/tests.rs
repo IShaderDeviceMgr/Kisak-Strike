@@ -2007,7 +2007,7 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("skin", 1),
     ("sunspreadangle", 27),
     ("vrad_brush_cast_shadows", 2456),
-    ("vscripts", 38),
+    ("vscripts", 39),
 ];
 
 /// Every shipped map's entity lump, spawned and then **run** for two seconds
@@ -2081,9 +2081,11 @@ fn every_shipped_map_spawns_its_entities() {
             stats.blocks,
             "{name}: blocks unaccounted for"
         );
+        // …and every entity alive is one of those, or one another entity's
+        // `Spawn` made — a `prop_floor_button`'s trigger.
         assert_eq!(
             stats.spawned + stats.removed_on_spawn,
-            stats.matched,
+            stats.matched + stats.created,
             "{name}: entities unaccounted for"
         );
         assert_eq!(stats.spawned, server.entities.len());
@@ -2113,6 +2115,7 @@ fn every_shipped_map_spawns_its_entities() {
         total.matched += stats.matched;
         total.spawned += stats.spawned;
         total.removed_on_spawn += stats.removed_on_spawn;
+        total.created += stats.created;
         total.outputs += stats.outputs;
         total.parented += stats.parented;
         total.parents_missing += stats.parents_missing;
@@ -2248,18 +2251,26 @@ fn every_shipped_map_spawns_its_entities() {
 
     assert_eq!(names.len(), 106, "Portal 2 ships 106 maps");
     assert_eq!(total.blocks, 60_925);
-    assert_eq!(total.spawned + total.removed_on_spawn, total.matched);
+    assert_eq!(
+        total.spawned + total.removed_on_spawn,
+        total.matched + total.created
+    );
     assert_eq!(total.removed_on_spawn, 6_937, "unnamed lights");
 
     // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
     // stage 2 took it to 19,229 and 12,292, stage 3's six brush classes were
-    // 3,410 more of both, and stage 4's twelve — five triggers, six filters
-    // and `point_teleport` — are 3,322 more again.
-    assert_eq!(total.matched, 25_961);
-    assert_eq!(total.spawned, 19_024);
-    assert_eq!(total.outputs, 53_155);
-    assert_eq!(total.unknown.len(), 167);
-    assert_eq!(total.unknown.values().sum::<usize>(), 34_964);
+    // 3,410 more of both, stage 4's twelve — five triggers, six filters and
+    // `point_teleport` — are 3,322 more again, and `prop_floor_button` is 65.
+    assert_eq!(total.matched, 26_026);
+    assert_eq!(total.spawned, 19_154);
+    assert_eq!(total.outputs, 53_382);
+    assert_eq!(total.unknown.len(), 166);
+    assert_eq!(total.unknown.values().sum::<usize>(), 34_899);
+    // **The first entities in this port that are not in a `.bsp`.** One
+    // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
+    // through `Context::create_entity` — so `spawned` is 130 larger than the
+    // stage before rather than 65.
+    assert_eq!(total.created, 65, "trigger_portal_button, one per button");
     assert_eq!(
         named_lights, 213,
         "lights that survive because they are named"
@@ -2307,6 +2318,11 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("filter_player_held"), Some(&4));
     assert_eq!(per_class.get("filter_damage_type"), Some(&2));
     assert_eq!(per_class.get("filter_activator_model"), Some(&1));
+    // Portal 2's own, and the pair that proves runtime entity creation works
+    // against real map data: 65 buttons in 47 of the 106 maps, and 65
+    // triggers that appear in no entity lump at all.
+    assert_eq!(per_class.get("prop_floor_button"), Some(&65));
+    assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
     // …and **no `player`**: the class is registered because Valve registers
     // it, and no shipped map places one. The 106 in the list are the ones
     // `spawn_player` put there, counted after this loop.
@@ -2384,13 +2400,19 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(moved, 67, "brush entities that left their spawn placement");
     assert_eq!(still_moving, 34, "…and were still travelling at 2s");
 
-    // Stage 4's own parse-side number: of those 6,302, how many are *live*
-    // triggers two ticks into the map — `FSOLID_TRIGGER` set, so the touch
-    // pass will look at them. 2,892 triggers are placed and 637 of them are
-    // `StartDisabled`, including **107 of the game's 110 `trigger_teleport`s**.
-    // `every_shipped_maps_triggers_notice_the_player` then walks a player into
-    // every one.
-    assert_eq!(triggers, 2_255);
+    // Stage 4's own parse-side number, and it is no longer only about brush
+    // entities: how many entities are *live* triggers two ticks into the map —
+    // `FSOLID_TRIGGER` set, so the touch pass will look at them. 2,892 brush
+    // triggers are placed and 637 of them are `StartDisabled`, including
+    // **107 of the game's 110 `trigger_teleport`s**, leaving 2,255; the other
+    // **65 are `SOLID_OBB` and have no brush model at all**, one over each
+    // `prop_floor_button`.
+    //
+    // `every_shipped_maps_triggers_notice_the_player` walks a player into each
+    // of the 2,255 and `every_shipped_floor_button_presses` stands one on each
+    // of the 65 — the two halves of the same claim, split because they are
+    // answered by different code.
+    assert_eq!(triggers, 2_320);
 
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
@@ -3312,6 +3334,10 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // A trigger with no point a standing player fits in, and one the map's own
     // bootstrap switched off or deleted before the second tick.
     let (mut unreachable, mut withdrawn) = (0usize, 0usize);
+    // Probe points that are *also* on a `prop_floor_button`, which is the only
+    // reason a brush trigger's probe can dispatch something a brush trigger
+    // did not cause.
+    let mut also_on_a_button = 0usize;
     let mut by_class: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
 
     for name in &names {
@@ -3427,6 +3453,13 @@ fn every_shipped_maps_triggers_notice_the_player() {
                     Some(_) => println!("    MISS {name} *{index} {classname} at {probe:?}"),
                 }
             }
+            // A `SOLID_OBB` trigger the same hull is standing in — see
+            // `also_on_a_button`.
+            if server.entities.iter().any(|(_, e)| {
+                e.classname() == "trigger_portal_button" && !e.core.touch_links.is_empty()
+            }) {
+                also_on_a_button += 1;
+            }
             if server.io.dispatched > before {
                 fired += 1;
             }
@@ -3438,7 +3471,8 @@ fn every_shipped_maps_triggers_notice_the_player() {
         "  {visited} triggers visited, {noticed} noticed the player, \
          {fired} of them fired something;\n  \
          {unreachable} had no point a standing player fits in, \
-         {withdrawn} were switched off or deleted by the map before the second tick"
+         {withdrawn} were switched off or deleted by the map before the second tick;\n  \
+         {also_on_a_button} of the probe points are also on a prop_floor_button"
     );
     for (classname, (visited, noticed)) in &by_class {
         println!("    {noticed:>5} of {visited:>5}  {classname}");
@@ -3464,12 +3498,24 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // elevator rather than a trap.
     assert_eq!(visited, 2_255);
     assert_eq!(noticed, 2_246);
-    // 1,879 of them get as far as dispatching something, which is the whole
+    // 1,888 of them get as far as dispatching something, which is the whole
     // chain — geometry, `FSOLID_TRIGGER`, the touch link, `PassesTriggerFilters`
-    // and an output with a connection on it. The 367 that do not are triggers
+    // and an output with a connection on it. The 358 that do not are triggers
     // whose outputs go to entities this port has no class for, or whose filter
     // says "cubes only".
-    assert_eq!(fired, 1_879);
+    //
+    // > **9 of those 1,888 are not the brush trigger's doing, and the number
+    // > is the difference between two measurements rather than a guess.**
+    // > A probe point is a place a player fits, and in **21** of them a
+    // > `prop_floor_button` sits inside the same brush trigger — so standing
+    // > there presses the pad as well and the press dispatches events of its
+    // > own. Twelve of those 21 belong to triggers that were already firing
+    // > something, so the count moved by nine. That is the shipped game's
+    // > behaviour — a chamber's exit trigger around its own button is ordinary
+    // > level design — and it is counted rather than filtered out so that the
+    // > number is explained rather than absorbed.
+    assert_eq!(fired, 1_888);
+    assert_eq!(also_on_a_button, 21, "probes that also stand on a pad");
     // Three triggers in the game have no point a 32x32x72 hull fits inside.
     assert_eq!(unreachable, 3);
     // …and six are switched off, deleted, or take the player with them within
@@ -3526,6 +3572,14 @@ fn every_brush_class_is_solid_unless_it_says_otherwise() {
         ("trigger_hurt", &[], true, false),
         ("trigger_push", &[], true, false),
         ("trigger_teleport", &[], true, false),
+        // A `SOLID_OBB` trigger: the same triple, with a box in place of the
+        // brush model — so the shape is answered inside this module rather
+        // than by the engine. Spawned straight from a lump here, which no map
+        // does; a real one is made by the button below.
+        ("trigger_portal_button", &[], true, false),
+        // …and the button itself is `SOLID_VPHYSICS` and genuinely solid,
+        // which nothing can yet collide with: its collision is a `.phy`.
+        ("prop_floor_button", &[], true, true),
     ];
 
     for &(classname, extra, expect_type, expect_solid) in CASES {
@@ -3555,4 +3609,387 @@ fn every_brush_class_is_solid_unless_it_says_otherwise() {
             "{classname} {extra:?}: FSOLID_TRIGGER"
         );
     }
+}
+
+// ===========================================================================
+// prop_floor_button — the pad you stand on
+// ===========================================================================
+
+/// A map with one `prop_floor_button` named `pad`, wired to two counters.
+///
+/// `extra` goes on the button, which is how these tests place and turn it.
+fn button_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("classname", "prop_floor_button"),
+        ("targetname", "pad"),
+        ("model", "models/props/portal_button.mdl"),
+    ];
+    pairs.extend_from_slice(extra);
+    let mut button = block(&pairs);
+    button.pairs.push((
+        "OnPressed".to_owned(),
+        conn("down", "Add", "1", "0", "-1"),
+    ));
+    button.pairs.push((
+        "OnUnPressed".to_owned(),
+        conn("up", "Add", "1", "0", "-1"),
+    ));
+
+    vec![
+        block(&[("classname", "worldspawn")]),
+        button,
+        block(&[("classname", "math_counter"), ("targetname", "down")]),
+        block(&[("classname", "math_counter"), ("targetname", "up")]),
+    ]
+}
+
+/// The button's own state, through the handle `ent_dump` would use.
+fn pad(server: &Server) -> &classes::FloorButton {
+    find_named(server, "pad")
+        .behaviour
+        .downcast_ref::<classes::FloorButton>()
+        .expect("a FloorButton")
+}
+
+/// The `trigger_portal_button` a button made, which has no `targetname` and so
+/// has to be found by class.
+fn pad_trigger(server: &Server) -> &Entity {
+    server
+        .entities
+        .iter()
+        .find(|(_, e)| e.classname() == "trigger_portal_button")
+        .map(|(_, e)| e)
+        .expect("the button created its trigger")
+}
+
+/// **The whole class in one test**: `Spawn` makes a second entity, and that
+/// entity is a box trigger sitting exactly where the pad is.
+///
+/// This is `Context::create_entity`'s first consumer, so it is also the test
+/// that says a runtime-created entity gets spawned at all.
+#[test]
+fn a_floor_button_creates_its_own_trigger() {
+    let mut server = Server::new();
+    server.level_init("test", &button_map(&[("origin", "100 200 64")]), &[]);
+
+    let trigger = pad_trigger(&server);
+    assert_eq!(trigger.origin, Vec3::new(100.0, 200.0, 64.0));
+    // `UTIL_SetSize( pTrigger, (-20,-20,0), (20,20,14) )`.
+    assert_eq!(trigger.model_bounds.mins, Vec3::new(-20.0, -20.0, 0.0));
+    assert_eq!(trigger.model_bounds.maxs, Vec3::new(20.0, 20.0, 14.0));
+
+    // The triple that makes it a trigger rather than a wall, and the `Obb`
+    // that decides *which module* answers for its shape.
+    assert_eq!(trigger.solid, crate::server::movement::Solid::Obb);
+    assert!(trigger.is_solid_flag_set(crate::server::movement::FSOLID_TRIGGER));
+    assert!(!trigger.is_solid(), "you walk through a button's trigger");
+
+    // And the button knows it is up.
+    assert!(!pad(&server).pressed);
+}
+
+/// Standing on the pad presses it, and stepping off releases it.
+#[test]
+fn standing_on_a_floor_button_presses_it_and_stepping_off_releases_it() {
+    let mut server = Server::new();
+    server.level_init("test", &button_map(&[("origin", "0 0 0")]), &[]);
+    server.spawn_player(player_at(Vec3::new(500.0, 0.0, 0.0)));
+
+    run_touching(&mut server, &mut NoTouchQuery, 0.2);
+    assert!(!pad(&server).pressed);
+    assert_eq!(counter_value(&server, "down"), 0.0);
+
+    // On it.
+    server.set_player_state(player_at(Vec3::ZERO));
+    run_touching(&mut server, &mut NoTouchQuery, 0.1);
+    assert!(pad(&server).pressed);
+    assert_eq!(counter_value(&server, "down"), 1.0);
+    assert_eq!(counter_value(&server, "up"), 0.0);
+
+    // Still on it: `OnStartTouchAll` does not re-fire.
+    run_touching(&mut server, &mut NoTouchQuery, 0.5);
+    assert_eq!(counter_value(&server, "down"), 1.0);
+
+    // Off it. The pad is 40 across and the hull 32, so 40 units clears it.
+    server.set_player_state(player_at(Vec3::new(40.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut NoTouchQuery, 0.1);
+    assert!(!pad(&server).pressed);
+    assert_eq!(counter_value(&server, "up"), 1.0);
+    assert_eq!(counter_value(&server, "down"), 1.0);
+}
+
+/// The one divergence in the class: the trigger sends its owner a `PressIn`
+/// rather than calling into it, which costs **one extra event and no tick**.
+///
+/// The queue restarts from the head after every event (gotcha 4), so the whole
+/// chain — trigger → `pad.PressIn` → `down.Add` — lands inside the single tick
+/// the touch happened in. If that were ever to become two ticks, every floor
+/// button in the game would answer a frame late.
+#[test]
+fn a_press_completes_in_the_tick_it_started_in() {
+    let mut server = Server::new();
+    server.level_init("test", &button_map(&[("origin", "0 0 0")]), &[]);
+    server.spawn_player(player_at(Vec3::new(500.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut NoTouchQuery, 0.2);
+
+    server.set_player_state(player_at(Vec3::ZERO));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(counter_value(&server, "down"), 1.0, "one tick, whole chain");
+}
+
+/// `InputPressIn` / `InputPressOut`, which four shipped connections each fire.
+/// Nobody has to be standing on the pad.
+#[test]
+fn the_press_inputs_work_with_nobody_on_the_pad() {
+    let mut server = Server::new();
+    server.level_init("test", &button_map(&[]), &[]);
+    let button = find_named(&server, "pad").id();
+
+    server.accept_input(button, "PressIn", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+    assert!(pad(&server).pressed);
+    assert_eq!(counter_value(&server, "down"), 1.0);
+
+    server.accept_input(button, "PressOut", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+    assert!(!pad(&server).pressed);
+    assert_eq!(counter_value(&server, "up"), 1.0);
+}
+
+/// A turned pad notices a turned area. 23 of the game's 65 are not at
+/// `angles "0 0 0"`, including the one on `sp_a1_intro1`, so this is the
+/// ordinary case rather than the exotic one — and it is the path
+/// [`obb`](crate::server::obb)'s fifteen planes exist for.
+#[test]
+fn a_turned_pad_notices_a_turned_area() {
+    // Straight out along +X, 40 units: outside an unturned pad (which reaches
+    // 20) and inside one turned 45 degrees (whose corner reaches 28.3).
+    let probe = Vec3::new(40.0, 0.0, 0.0);
+
+    for (angles, expect) in [("0 0 0", false), ("0 45 0", true)] {
+        let mut server = Server::new();
+        server.level_init(
+            "test",
+            &button_map(&[("origin", "0 0 0"), ("angles", angles)]),
+            &[],
+        );
+        server.spawn_player(player_at(Vec3::new(500.0, 0.0, 0.0)));
+        run_touching(&mut server, &mut NoTouchQuery, 0.2);
+
+        server.set_player_state(player_at(probe));
+        run_touching(&mut server, &mut NoTouchQuery, 0.1);
+        assert_eq!(pad(&server).pressed, expect, "angles {angles}");
+    }
+}
+
+/// `SetSkin( button_off_skin )` runs in `Spawn`, *after* the `skin` key has
+/// been read — so a map cannot choose the starting skin. All 18 shipped
+/// buttons that write the key write `0`, so nothing in the game can tell, and
+/// this is the test that says the order is Valve's rather than an accident.
+#[test]
+fn the_skin_key_is_read_and_then_overwritten_by_spawn() {
+    let mut server = Server::new();
+    server.level_init("test", &button_map(&[("skin", "1")]), &[]);
+    assert_eq!(pad(&server).skin, 0);
+
+    // …and the skin *input* is not overwritten, because nothing runs after it.
+    let button = find_named(&server, "pad").id();
+    server.accept_input(button, "skin", Variant::Int(3), None, None, 0);
+    run(&mut server, 0.1);
+    assert_eq!(pad(&server).skin, 3);
+
+    // Pressing sets it, which is the only thing that reads it here.
+    server.accept_input(button, "PressIn", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+    assert_eq!(pad(&server).skin, 1);
+}
+
+/// A button with no `model` key gets `PROP_FLOOR_BUTTON_DEFAULT_MODEL_NAME`.
+/// No shipped map reaches this — all 77 write one — but `GetButtonModelName`
+/// is two lines and the branch is the interesting one.
+#[test]
+fn a_button_with_no_model_gets_the_default_one() {
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[("classname", "prop_floor_button"), ("targetname", "pad")]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    assert_eq!(
+        find_named(&server, "pad").model.as_deref(),
+        Some("models/props/portal_button.mdl")
+    );
+}
+
+/// Every `prop_floor_button` in a loaded level, in lump order.
+fn buttons_in(server: &Server) -> Vec<crate::server::entity::EntityId> {
+    server
+        .entities
+        .iter()
+        .filter(|(_, e)| e.classname() == "prop_floor_button")
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Is the `ordinal`-th button in the level down?
+fn is_pressed(server: &Server, ordinal: usize) -> bool {
+    let id = buttons_in(server)[ordinal];
+    server
+        .entities
+        .get(id)
+        .expect("just listed")
+        .behaviour
+        .downcast_ref::<classes::FloorButton>()
+        .expect("a FloorButton")
+        .pressed
+}
+
+/// **Every `prop_floor_button` in the game, stood on.**
+///
+/// The `SOLID_OBB` half of what
+/// [`every_shipped_maps_triggers_notice_the_player`] does for brush triggers,
+/// and the test that could not be faked: it uses the real placements, the real
+/// angles — 23 of the 65 are turned, one of them to `44.9997 0 90.0004` — and
+/// the same `player_touch_triggers` pass the running game uses. A wrong
+/// `angle_matrix` convention, a trigger that never got created, a bad
+/// `Solid::Obb`, or a fifteen-plane sweep that disagrees with the
+/// axis-aligned one all fail here and are invisible to every synthetic test.
+///
+/// It needs no collision data at all, which is the whole point of
+/// [`obb`](crate::server::obb): a box trigger is answered inside `server/`.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release floor_button_presses -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_floor_button_presses_when_stood_on() {
+    use crate::engine::world::bsp::Bsp;
+    use crate::filesystem::Vfs;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut buttons, mut maps_with_one, mut pressed, mut released, mut turned) = (0, 0, 0, 0, 0);
+
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let entities = bsp.entities();
+
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+
+        // Where every button is, and which way it faces. Indexed by position
+        // in the entity list rather than by name: **22 of the 65 have no
+        // `targetname`**, and slot order is lump order and is stable across
+        // the reloads below.
+        let placements: Vec<(Vec3, Vec3)> = buttons_in(&server)
+            .iter()
+            .map(|&id| {
+                let e = server.entities.get(id).expect("just listed");
+                (e.core.origin, e.core.angles)
+            })
+            .collect();
+        if placements.is_empty() {
+            continue;
+        }
+        maps_with_one += 1;
+
+        for (ordinal, (origin, angles)) in placements.into_iter().enumerate() {
+            buttons += 1;
+            turned += usize::from(angles != Vec3::ZERO);
+
+            // **A fresh level per button**, for the same reason the trigger
+            // test reloads: a map's own bootstrap can move or kill things, and
+            // one button's press can change another's world.
+            server.level_init(name, &entities, &bsp.models);
+
+            // Put the player's *hull centre* on the pad's box centre, which is
+            // a point inside the trigger whichever way the pad faces — some of
+            // these are on walls. The feet are 36 units below it.
+            let centre = origin
+                + crate::math::angle_matrix(angles) * Vec3::new(0.0, 0.0, 7.0)
+                - Vec3::new(0.0, 0.0, 36.0);
+
+            server.spawn_player(player_at(centre + Vec3::new(0.0, 0.0, 4096.0)));
+            ticks_touching(&mut server, &mut NoTouchQuery, 2);
+
+            server.set_player_state(player_at(centre));
+            ticks_touching(&mut server, &mut NoTouchQuery, 2);
+            if is_pressed(&server, ordinal) {
+                pressed += 1;
+            } else {
+                println!("    MISS {name} #{ordinal} at {origin:?} {angles:?}");
+                continue;
+            }
+
+            // …and walking away releases it. 4,096 units up is well clear of
+            // any pad and is where the player started.
+            server.set_player_state(player_at(centre + Vec3::new(0.0, 0.0, 4096.0)));
+            ticks_touching(&mut server, &mut NoTouchQuery, 2);
+            released += usize::from(!is_pressed(&server, ordinal));
+        }
+    }
+
+    println!("\n{} maps", names.len());
+    println!(
+        "  {buttons} floor buttons in {maps_with_one} maps ({turned} of them turned); \
+         {pressed} pressed when stood on, {released} released on the way off"
+    );
+
+    assert_eq!(names.len(), 106);
+    assert_eq!(buttons, 65, "prop_floor_button, across the shipped maps");
+    assert_eq!(maps_with_one, 47);
+    // 23 are not at `angles "0 0 0"` and therefore take `obb`'s fifteen-plane
+    // path rather than its axis-aligned one — including the one on
+    // `sp_a1_intro1`, which is at yaw 90.
+    assert_eq!(turned, 23);
+    // **No room for a partial answer.** A button a player is standing inside
+    // presses, and one they have left comes back up.
+    assert_eq!(pressed, 65, "a button did not notice a player on it");
+    assert_eq!(released, 65, "a button did not come back up");
+}
+
+/// The thing that stands on the pad is the **activator** of `OnPressed`, all
+/// the way across the extra queue hop the trigger adds.
+///
+/// `m_OnPressed.FireOutput( pActivator, this )` — the activator is the
+/// toucher and the caller is the button, and a map that reads `!activator` off
+/// a button gets the player. Pinned with `Kill` at `!activator`, which needs no
+/// class beyond `CBaseEntity`: if the wrong entity arrives, the wrong one dies.
+#[test]
+fn the_thing_standing_on_the_pad_is_the_activator() {
+    let mut map = button_map(&[("origin", "0 0 0")]);
+    // `OnPressed !activator:Kill`.
+    map[1]
+        .pairs
+        .push(("OnPressed".to_owned(), conn("!activator", "Kill", "", "0", "-1")));
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    server.spawn_player(player_at(Vec3::new(500.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut NoTouchQuery, 0.2);
+    assert!(server.player().is_some());
+
+    server.set_player_state(player_at(Vec3::ZERO));
+    run_touching(&mut server, &mut NoTouchQuery, 0.1);
+    assert!(
+        server.player().is_none(),
+        "`!activator` off a button must be whoever stood on it"
+    );
+    // …and the button still fired its ordinary output, with itself as caller.
+    assert_eq!(counter_value(&server, "down"), 1.0);
 }

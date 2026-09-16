@@ -72,6 +72,7 @@ pub mod io;
 pub mod keyvalue;
 pub mod movement;
 pub mod name;
+pub mod obb;
 pub mod random;
 pub mod think;
 pub mod touch;
@@ -163,6 +164,29 @@ pub struct Server {
     player_prev_origin: Vec3,
     /// Scratch for the touch query, so that a tick does not allocate.
     overlaps: Vec<usize>,
+    /// Scratch for the [`Solid::Obb`](movement::Solid::Obb) half of the same
+    /// query — the triggers this module tests itself. See
+    /// [`Server::obb_triggers_touching`].
+    obb_overlaps: Vec<EntityId>,
+    /// Entities [`Context::create_entity`] made and that have not been spawned
+    /// yet — `DispatchSpawn`, deferred by one dispatch. See
+    /// [`Server::flush_created`].
+    pending_spawn: Vec<EntityId>,
+    /// Re-entrancy guard for [`Server::flush_created`]: only the outermost
+    /// dispatch drains the queue, so a chain of creations is a loop rather
+    /// than a stack.
+    spawning: bool,
+    /// Entities created during [`Server::level_init`]'s spawn pass, which
+    /// therefore still owe an `Activate`.
+    ///
+    /// `ServerActivate` (`gameinterface.cpp:1316`) walks the whole live entity
+    /// list rather than the spawn list, so anything a `Spawn` created is
+    /// reached by it. Anything created *after* the level has loaded is not,
+    /// and gets a `Spawn` and nothing else — which is also Valve's.
+    created_while_loading: Vec<EntityId>,
+    /// Whether [`Server::level_init`] is between its spawn pass and its
+    /// activate pass, which is what makes the field above meaningful.
+    level_loading: bool,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -243,6 +267,37 @@ pub struct PlayerState {
     pub maxs: Vec3,
 }
 
+/// One entity's studio model, as the renderer needs to see it.
+///
+/// `world/` names no server type and `server/` names no studio or GPU type, so
+/// this is the vocabulary between them — the same arrangement [`PlayerState`]
+/// and `world/`'s `Placement` already have.
+///
+/// # The list is positional and the order is the contract
+///
+/// `engine::world::entities::EntityModels` loads from
+/// [`Server::model_entities`] once and syncs against it every frame, matching
+/// by position — so the `n`th entry has to stay the `n`th. It does: the order
+/// is the entity list's slot order, and nothing in the game creates or
+/// destroys a model entity after the spawn pass. The condition for giving it a
+/// real key is the first class that appears or disappears at run time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelEntityState {
+    /// The model path, e.g. `models/props/portal_button.mdl`.
+    pub model: String,
+    pub origin: Vec3,
+    /// Pitch, yaw, roll.
+    pub angles: Vec3,
+    pub skin: i32,
+    /// The sequence label — see
+    /// [`ModelState::sequence`](class::ModelState::sequence).
+    pub sequence: &'static str,
+    /// The **server's** clock when the sequence was reset. See
+    /// [`ModelState::anim_time`](class::ModelState::anim_time) for why that is
+    /// not the scene's.
+    pub anim_time: f32,
+}
+
 /// A [`TouchQuery`] that never reports anything.
 ///
 /// What a server with no map loaded — or a unit test with no collision —
@@ -271,6 +326,14 @@ pub struct LevelStats {
     pub spawned: usize,
     /// Entities their own `Spawn` deleted — almost all of them unnamed lights.
     pub removed_on_spawn: usize,
+    /// Entities that were **not** in the entity lump — made by another
+    /// entity's `Spawn` through [`Context::create_entity`](class::Context::create_entity).
+    ///
+    /// The `trigger_portal_button` every `prop_floor_button` puts over itself,
+    /// and so far nothing else. It is broken out because it is the one term
+    /// that makes `spawned + removed_on_spawn` differ from `matched`, and a
+    /// silent difference there would look like an entity going missing.
+    pub created: usize,
     /// Output connections parsed.
     pub outputs: usize,
     /// Entities that named a parent, and how many of those resolved.
@@ -294,12 +357,14 @@ impl LevelStats {
     /// One line, in the shape `World::summary` uses.
     pub fn summary(&self) -> String {
         format!(
-            "{} of {} entity blocks matched a class, {} spawned ({} removed themselves), \
-             {} outputs, {} unknown classnames, {} unhandled keys",
+            "{} of {} entity blocks matched a class, {} spawned ({} removed themselves, \
+             {} created by another entity), {} outputs, {} unknown classnames, \
+             {} unhandled keys",
             self.matched,
             self.blocks,
             self.spawned,
             self.removed_on_spawn,
+            self.created,
             self.outputs,
             self.unknown.values().sum::<usize>(),
             self.unhandled.values().sum::<usize>(),
@@ -378,6 +443,11 @@ impl Server {
             player: None,
             player_prev_origin: Vec3::ZERO,
             overlaps: Vec::new(),
+            obb_overlaps: Vec::new(),
+            pending_spawn: Vec::new(),
+            spawning: false,
+            created_while_loading: Vec::new(),
+            level_loading: false,
         }
     }
 
@@ -507,10 +577,20 @@ impl Server {
         // first place a class may look at another entity — and, for
         // `logic_auto` and `logic_relay`, the first place a think may be
         // scheduled.
+        self.level_loading = true;
         for &id in &ordered {
             self.dispatch_spawn(id);
         }
-        for &id in &ordered {
+        self.level_loading = false;
+
+        // `ServerActivate` walks `gEntList`, not the spawn list, so an entity
+        // a `Spawn` created — a `prop_floor_button`'s trigger — is activated
+        // too. Appended rather than merged: the ordering within `ordered` is
+        // the hierarchy sort and there is nothing to sort a runtime creation
+        // into.
+        let created = std::mem::take(&mut self.created_while_loading);
+        stats.created = created.len();
+        for &id in ordered.iter().chain(created.iter()) {
             self.dispatch(id, |core, behaviour, cx| {
                 if !core.removed {
                     behaviour.activate(core, cx);
@@ -637,6 +717,10 @@ impl Server {
         self.player = None;
         self.player_prev_origin = Vec3::ZERO;
         self.overlaps.clear();
+        self.obb_overlaps.clear();
+        self.pending_spawn.clear();
+        self.created_while_loading.clear();
+        self.level_loading = false;
     }
 
     // -----------------------------------------------------------------------
@@ -736,6 +820,19 @@ impl Server {
         let mut overlaps = std::mem::take(&mut self.overlaps);
         overlaps.clear();
         query.brush_models_touching(start, origin, mins, maxs, &mut overlaps);
+        // The other half of the same enumeration, and the reason it is a
+        // separate call rather than a second kind of answer from the engine:
+        // a `SOLID_OBB` trigger is a box the *game* made out of numbers it
+        // owns, so there is nothing to ask the engine about. See
+        // [`obb`](self::obb).
+        //
+        // **Both halves are collected before either is handled**, which is
+        // `CTouchLinks`'s own shape: `EnumElement` fills `m_TouchedEntities`
+        // and `HandleTouchedEntities` runs afterwards. It matters because a
+        // handler can move the player — a `trigger_teleport` does — and every
+        // candidate this tick is meant to have been tested against the same
+        // swept box.
+        let obb_found = self.obb_triggers_touching(start, origin, mins, maxs);
         // Taken rather than borrowed: the loop dispatches into behaviours,
         // which reach `&mut Server` through `Context`.
         let found = std::mem::take(&mut overlaps);
@@ -762,6 +859,13 @@ impl Server {
         }
         self.overlaps = overlaps;
 
+        let mut obb_found = obb_found;
+        for &trigger in obb_found.iter() {
+            self.mark_entities_as_touching(trigger, player);
+        }
+        obb_found.clear();
+        self.obb_overlaps = obb_found;
+
         // > **A teleport discards the swept-from point.** Something in that
         // > loop may have moved the player — a `trigger_teleport` does it from
         // > inside its own `Touch` — and the next tick's sweep must start
@@ -775,6 +879,57 @@ impl Server {
                 self.player_prev_origin = entity.core.origin;
             }
         }
+    }
+
+    /// The [`Solid::Obb`](movement::Solid::Obb) half of `CTouchLinks`'s
+    /// enumeration — every box trigger the swept hull meets.
+    ///
+    /// Returns the scratch buffer, emptied by the caller and handed back; the
+    /// list is short enough that it is usually still capacity zero.
+    ///
+    /// > **This is a linear scan of the entity list and Valve's is a spatial
+    /// > partition query.** `SpatialPartition()->EnumerateElementsAlongRay`
+    /// > exists because Valve's list is every entity in a map — 598 blocks on
+    /// > `sp_a1_intro1`, and the partition is shared with tracing and
+    /// > rendering. Here the scan reads two fields per entity and the
+    /// > geometry runs only for the handful that pass both: across all 106
+    /// > shipped maps the *whole game* has 65 `SOLID_OBB` triggers — one per
+    /// > `prop_floor_button` — and no map has more than four. `spatialpartition.cpp` is not ported and
+    /// > `ENGINE_TRACE.md` §5 says why; the condition for revisiting this is a
+    /// > class that makes box triggers in bulk.
+    fn obb_triggers_touching(
+        &mut self,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+    ) -> Vec<EntityId> {
+        let mut found = std::mem::take(&mut self.obb_overlaps);
+        found.clear();
+        for (id, entity) in self.entities.iter() {
+            let core = &entity.core;
+            // `GetRequiredTriggerFlags()` for a solid non-trigger is
+            // `FSOLID_TRIGGER`, and `EnumElement` requires every bit of it —
+            // the same line that drops the solid brush models above.
+            if core.solid != movement::Solid::Obb
+                || !core.is_solid_flag_set(movement::FSOLID_TRIGGER)
+            {
+                continue;
+            }
+            if obb::swept_box_touches_obb(
+                start,
+                end,
+                mins,
+                maxs,
+                core.origin,
+                core.angles,
+                core.model_bounds.mins,
+                core.model_bounds.maxs,
+            ) {
+                found.push(id);
+            }
+        }
+        found
     }
 
     /// `CPlayerMove::CheckMovingGround` (`player_command.cpp:93`) — turn a
@@ -1104,6 +1259,7 @@ impl Server {
         let mut cx = Context::new(time, queue, random, entities, player);
         let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
         let changed = cx.take_changed();
+        let created = cx.take_created();
         let next_think = entity.core.next_think_tick();
         // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
         // `SetMoveType` both call — reconciled here for the same reason the
@@ -1130,7 +1286,54 @@ impl Server {
             self.thinks
                 .entity_changed(other, next_think, simulates, removed);
         }
+
+        // `DispatchSpawn( pEnt )`, which in the C++ the creator calls itself
+        // part-way through its own handler. It happens here instead, on the
+        // way out — see [`Context::create_entity`] for why, and
+        // [`Server::flush_created`] for what stops it recursing.
+        self.pending_spawn.extend(created);
+        self.flush_created();
+
         Some(result)
+    }
+
+    /// Spawns whatever [`Context::create_entity`] made, and whatever *those*
+    /// `Spawn`s made in turn.
+    ///
+    /// Called on the way out of every [`dispatch`](Server::dispatch), and
+    /// re-entered by every one of the dispatches it starts — so the guard is
+    /// what turns a chain of creations into a loop at the outermost frame
+    /// rather than a stack. The bound is the same kind of thing as the event
+    /// queue's: Valve has none, and a class that creates itself would recurse
+    /// until the stack ran out.
+    fn flush_created(&mut self) {
+        if self.spawning {
+            return;
+        }
+        self.spawning = true;
+        // A generous multiple of the largest thing any shipped map creates:
+        // one `trigger_portal_button` per button, and the most any map has is
+        // `mp_coop_fling_crushers`' four.
+        const LIMIT: usize = 4096;
+        let mut spawned = 0;
+        while !self.pending_spawn.is_empty() {
+            for id in std::mem::take(&mut self.pending_spawn) {
+                if self.level_loading {
+                    self.created_while_loading.push(id);
+                }
+                self.dispatch_spawn(id);
+                spawned += 1;
+            }
+            if spawned > LIMIT {
+                eprintln!(
+                    "source-engine: server: LEVEL DESIGN ERROR: more than {LIMIT} entities \
+                     created in one dispatch; dropping the rest"
+                );
+                self.pending_spawn.clear();
+                break;
+            }
+        }
+        self.spawning = false;
     }
 
     /// `gEntList.CleanupDeleteList` plus the two lists that name entities.
@@ -1211,6 +1414,35 @@ impl Server {
     /// Read once per rendered frame by `Engine::render`, because a controller's
     /// values change whenever map I/O says so — `sp_a1_intro1` changes them
     /// 0.21 seconds in.
+    pub fn model_entities(&self) -> Vec<ModelEntityState> {
+        self.entities
+            .iter()
+            .filter(|(_, e)| !e.core.removed)
+            .filter_map(|(_, entity)| {
+                let state = entity.behaviour.model_state()?;
+                let model = entity.core.model.as_deref()?;
+                // A `"*N"` brush model is the *other* seam's, and a name that
+                // is not a `.mdl` is nothing the studio loader can read.
+                if model.starts_with('*') || !model.to_ascii_lowercase().ends_with(".mdl") {
+                    return None;
+                }
+                // What `StartDisabled` sets, and what `C_BaseEntity::ShouldDraw`
+                // refuses.
+                if entity.core.effects & movement::EF_NODRAW != 0 {
+                    return None;
+                }
+                Some(ModelEntityState {
+                    model: model.to_owned(),
+                    origin: entity.core.origin,
+                    angles: entity.core.angles,
+                    skin: state.skin,
+                    sequence: state.sequence,
+                    anim_time: state.anim_time,
+                })
+            })
+            .collect()
+    }
+
     pub fn tonemap_settings(&self) -> TonemapSettings {
         self.master_tonemap
             .and_then(|id| self.entities.get(id))

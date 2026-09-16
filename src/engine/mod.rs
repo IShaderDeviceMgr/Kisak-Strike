@@ -644,6 +644,11 @@ impl<'a> Engine<'a> {
         // here because neither names the other.
         if let Some(world) = self.scene.world.as_mut() {
             sync_brush_models(world, &self.scene.server);
+            // …and the same join for the models entities place: where they are
+            // and which sequence they are playing. Cheap — the whole game has
+            // 65 of them and no map more than four — so it is unconditional
+            // rather than dirty-flagged.
+            world.sync_entity_models(&model_entities(&self.scene.server));
         }
 
         // `CL_Move` (`engine/cl_main.cpp:2734`), which is
@@ -819,7 +824,7 @@ impl<'a> Engine<'a> {
                 &camera,
                 Load::Clear(CLEAR_COLOR),
             );
-            world.draw(&mut pass);
+            world.draw(&mut pass, curtime);
         }
 
         // `UpdateRefractTexture` and `DrawTranslucentRenderables`, in that
@@ -843,7 +848,7 @@ impl<'a> Engine<'a> {
                 // the first one left, against the depth buffer it left.
                 Load::Keep,
             );
-            world.draw_refracting(&mut pass);
+            world.draw_refracting(&mut pass, curtime);
         }
 
         post.resolve(frame, measure);
@@ -929,6 +934,26 @@ fn sync_brush_models(world: &mut World, server: &Server) {
             solid: entity.is_solid(),
         })
     });
+}
+
+/// Every model an entity places, as `world/` wants it.
+///
+/// The conversion neither module can do for itself: `server/` names no studio
+/// type and `world/` names no server type, so `engine/` owns the two-field
+/// translation. Same shape as [`sync_brush_models`] above.
+fn model_entities(server: &Server) -> Vec<world::entities::ModelEntity> {
+    server
+        .model_entities()
+        .into_iter()
+        .map(|entity| world::entities::ModelEntity {
+            model: entity.model,
+            origin: entity.origin,
+            angles: entity.angles,
+            skin: entity.skin,
+            sequence: entity.sequence,
+            anim_time: entity.anim_time,
+        })
+        .collect()
 }
 
 /// `client::Player` as the server's copy of it. See
@@ -1086,6 +1111,20 @@ impl Level for Scene<'_> {
         // the entities once here as well as once per frame.
         let mut world = world;
         sync_brush_models(&mut world, &self.server);
+
+        // The models the game's entities place, read and uploaded now that
+        // there *are* entities. This cannot happen inside `World::load` — the
+        // entity list is built from the lump that load just read — and it is
+        // the one place the two halves of a level are both in hand.
+        let placements = model_entities(&self.server);
+        world.load_entity_models(vfs, &mut self.materials, &self.device, &placements);
+        if !placements.is_empty() {
+            eprintln!(
+                "source-engine: world: {}",
+                world.entity_models.summary()
+            );
+        }
+
         self.world = Some(world);
         Ok(())
     }

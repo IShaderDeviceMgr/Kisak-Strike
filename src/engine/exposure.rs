@@ -165,7 +165,7 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                world.draw(&mut pass);
+                world.draw(&mut pass, 0.0);
             }
             let drawn = Instant::now();
             post.record(

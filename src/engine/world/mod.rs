@@ -33,6 +33,7 @@
 mod bench;
 pub mod bsp;
 pub mod disp;
+pub mod entities;
 pub mod props;
 
 use std::collections::BTreeMap;
@@ -50,6 +51,8 @@ use crate::materials::shader::Lighting;
 use crate::materials::{Material, MaterialCache};
 
 use bsp::{Bsp, BspError, Face};
+use entities::{EntityModels, ModelEntity};
+use props::light::AmbientLighting;
 use props::{PropModels, Props};
 
 /// Where a batch has to be split.
@@ -255,6 +258,17 @@ pub struct World {
     pub props: Props,
     /// The models those placements name, uploaded once each.
     pub prop_models: PropModels,
+    /// The models the map's **entities** place, posed by their animation.
+    ///
+    /// Empty until [`load_entity_models`](World::load_entity_models), which
+    /// cannot run inside [`load`](World::load): which entities draw a model is
+    /// the game's to say and the game has not spawned them yet.
+    pub entity_models: EntityModels,
+    /// The map's baked ambient cubes, kept after the `.bsp` is dropped.
+    ///
+    /// Static props are lit during [`load`](World::load) and would not need
+    /// this; an entity's model is placed later and does.
+    pub ambient: AmbientLighting,
     /// The entity lump, parsed, kept for the map's lifetime.
     ///
     /// The engine reads the `.bsp`, so the engine is what holds the lump and
@@ -448,6 +462,7 @@ impl World {
         // being cheap when `ENGINE_TRACE.md` stage 3 made building it also
         // build an AABB tree per displacement.
         props.light(&bsp, &collision);
+        let ambient = AmbientLighting::from_bsp(&bsp);
         stats.pak_files = pak_files;
         stats.props = props.instances.len();
         stats.prop_models = props.models.len();
@@ -477,6 +492,8 @@ impl World {
             collision,
             props,
             prop_models,
+            entity_models: EntityModels::default(),
+            ambient,
             entities,
             stats,
         })
@@ -487,7 +504,7 @@ impl World {
     /// The model matrix is the identity: world geometry is already in world
     /// space, which is the whole difference between the world model and the
     /// brush models that are not drawn yet.
-    pub fn draw(&self, pass: &mut Pass<'_>) {
+    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32) {
         self.draw_brushes(pass);
         // Brush entities next: they are part of the level shell — a door in a
         // doorway, a panel in a wall — so they belong with the world rather
@@ -499,6 +516,10 @@ impl World {
         // already there. `CStaticPropMgr::DrawStaticProps` runs in the same
         // opaque pass for the same reason.
         self.prop_models.draw(pass, &self.props);
+        // Last of the three, for the same reason props come after the world:
+        // an entity's model sits on top of the level shell, and a button is
+        // usually in a wall the world already drew.
+        self.entity_models.draw(pass, curtime);
     }
 
     /// Whether this map has anything that reads the frame it is drawn into,
@@ -515,7 +536,7 @@ impl World {
     ///
     /// [update]: crate::materials::context::RenderContext::update_refract_texture
     pub fn needs_frame_buffer_copy(&self) -> bool {
-        self.prop_models.refracts()
+        self.prop_models.refracts() || self.entity_models.refracts()
     }
 
     /// Records what [`draw`](World::draw) held back: the geometry whose
@@ -536,8 +557,39 @@ impl World {
     /// the water surface) are not ported.
     ///
     /// [update]: crate::materials::context::RenderContext::update_refract_texture
-    pub fn draw_refracting(&self, pass: &mut Pass<'_>) {
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32) {
         self.prop_models.draw_refracting(pass, &self.props);
+        self.entity_models.draw_refracting(pass, curtime);
+    }
+
+    /// Loads and places the models the game's entities name.
+    ///
+    /// Separate from [`load`](World::load), and after it, because the entity
+    /// list does not exist until `Server::level_init` has run — which itself
+    /// needs the entity lump this already read. `Level::load` is where the two
+    /// meet.
+    pub fn load_entity_models(
+        &mut self,
+        vfs: &Vfs,
+        materials: &mut MaterialCache,
+        device: &wgpu::Device,
+        entities: &[ModelEntity],
+    ) {
+        self.entity_models = EntityModels::load(
+            vfs,
+            materials,
+            device,
+            entities,
+            &self.ambient,
+            &self.collision,
+        );
+    }
+
+    /// Takes every entity model's placement and pose from the game server,
+    /// once a frame — the animated counterpart of
+    /// [`sync_brush_models`](World::sync_brush_models).
+    pub fn sync_entity_models(&mut self, entities: &[ModelEntity]) {
+        self.entity_models.sync(entities);
     }
 
     /// Takes every brush entity's placement from whoever owns it — the game

@@ -221,9 +221,9 @@ impl RenderTarget {
     /// The colour attachment itself, for `copy_texture_to_buffer`.
     ///
     /// `ReadPixels` and `CopyRenderTargetToTexture` both need the texture
-    /// rather than a view; today its only caller is the readback in the GPU
-    /// tests.
-    pub(super) fn color_texture(&self) -> &wgpu::Texture {
+    /// rather than a view; its only callers are the readbacks in the GPU
+    /// tests, here and in `engine::world::entities`.
+    pub fn color_texture(&self) -> &wgpu::Texture {
         self.color.texture()
     }
 

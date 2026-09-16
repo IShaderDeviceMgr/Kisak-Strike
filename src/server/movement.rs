@@ -170,6 +170,19 @@ pub enum Solid {
     Bsp,
     /// `SOLID_BBOX` — an axis-aligned box. The player.
     Bbox,
+    /// `SOLID_OBB` — a box in the entity's *own* frame, turned by its
+    /// `angles`. What a trigger built out of nothing but numbers is: the
+    /// `trigger_portal_button` a `prop_floor_button` puts over itself, and in
+    /// Valve every non-solid `prop_dynamic` as well.
+    ///
+    /// > **This is the one solidity type the port chooses between rather than
+    /// > records.** [`Bsp`](Solid::Bsp) and [`VPhysics`](Solid::VPhysics) are
+    /// > the same brushes by two names and nothing reads which; `Obb` decides
+    /// > *which collision question gets asked* — a box entity's overlap is
+    /// > answered by [`obb`](super::obb) inside this module, where a brush
+    /// > entity's goes out to the engine through
+    /// > [`TouchQuery`](super::TouchQuery).
+    Obb,
     /// `SOLID_VPHYSICS` — the model's `vcollide`. For a brush entity that is
     /// the same brushes [`Bsp`](Solid::Bsp) names.
     VPhysics,

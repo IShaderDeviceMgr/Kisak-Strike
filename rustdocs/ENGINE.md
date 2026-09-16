@@ -225,10 +225,18 @@ A loaded map and the geometry it draws.
 ```rust
 pub fn load(vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device, name: &str)
     -> Result<World, WorldError>;
-pub fn draw(&self, pass: &mut Pass<'_>);
+pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
 pub fn needs_frame_buffer_copy(&self) -> bool;
-pub fn draw_refracting(&self, pass: &mut Pass<'_>);
+pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
+/// The models the game's entities place. Cannot run inside `load` — the entity
+/// list is built from the lump `load` just read, so `Level::load` is where the
+/// two halves meet.
+pub fn load_entity_models(
+    &mut self, vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
+    entities: &[entities::ModelEntity],
+);
+pub fn sync_entity_models(&mut self, entities: &[entities::ModelEntity]);
 pub fn center(&self) -> Vec3;
 pub fn summary(&self) -> String;
 
@@ -507,6 +515,78 @@ shell is. On `sp_a1_intro1`: 11 displacements, 1,408 of 15,954 triangles.
 
 `Spawn` is `info_player_start`'s origin raised by `VEC_VIEW` (64 units) — the entity's
 origin is at the player's feet, and a camera placed there looks at the floor.
+
+### `world::entities` — the models a *game entity* places
+
+```rust
+pub struct ModelEntity {
+    pub model: String,        // models/props/portal_button.mdl
+    pub origin: Vec3,
+    pub angles: Vec3,         // pitch, yaw, roll
+    pub skin: i32,
+    pub sequence: &'static str,   // the LABEL — "up", "down"; "" is the bind pose
+    pub anim_time: f32,           // when the sequence was reset
+}
+
+pub struct EntityModels { pub stats: EntityModelStats, /* private */ }
+
+impl EntityModels {
+    pub fn load(
+        vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
+        entities: &[ModelEntity], ambient: &AmbientLighting, collision: &CollisionBsp,
+    ) -> EntityModels;
+    pub fn sync(&mut self, entities: &[ModelEntity]);
+    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
+    pub fn refracts(&self) -> bool;
+    pub fn summary(&self) -> String;
+}
+```
+
+The third kind of geometry in a level shell. World faces and brush entities are
+`.bsp` geometry drawn with a matrix; static props are `.mdl` geometry the *map
+compiler* placed, never moving and lit once. This is `.mdl` geometry the
+**game** places, and where it is and what it is doing can change every tick.
+
+Three things about it are worth knowing.
+
+- **The join with the game is a sequence *name*, and the cycle is the engine's.**
+  The server says which sequence and when it started; the engine looks the label
+  up in the model and works the cycle out from the scene clock. That is Valve's
+  own split — `CBaseAnimating` networks `m_nSequence` and `m_flAnimTime` and
+  `C_BaseAnimating::FrameAdvance` on the *client* turns them into a pose — and
+  it is what keeps `server/`'s promise to name no studio type. It also makes the
+  animation smooth where the server's 64 Hz ticks would step it.
+
+- **The list is positional.** `load` and `sync` are both fed
+  `Server::model_entities()`, and the `n`th entry has to stay the `n`th. It
+  does: the order is the entity list's slot order and nothing creates or
+  destroys a model entity after the spawn pass. The condition for a real key is
+  the first class that does.
+
+- **Lighting is sampled once, at load.** An entity model has no `.vhv` —
+  `vrad` bakes per-vertex light for static props and nothing else — so each one
+  is lit by the leaf ambient cube where it stands, through
+  [`AmbientLighting`](#ambientlighting). The condition for resampling per frame
+  is the first entity model that travels; a `prop_floor_button` does not.
+
+### `AmbientLighting`
+
+```rust
+pub struct AmbientLighting { /* private */ }
+impl AmbientLighting {
+    pub fn from_bsp(bsp: &Bsp) -> AmbientLighting;
+    pub fn ambient_at(&self, collision: &CollisionBsp, position: Vec3) -> AmbientCube;
+    pub fn lighting_at(&self, collision: &CollisionBsp, position: Vec3) -> ModelLighting;
+}
+```
+
+The three lumps that answer "how bright is it here", kept after the rest of the
+`.bsp` is dropped. `World::load` reads a map, uploads it and lets the `Bsp` go;
+a *static* prop is lit before that happens and needs nothing, but an entity's
+model is placed later — the entities do not exist until the game server has
+spawned them — and does. A few tens of kilobytes against the map's 12 MB of
+lightmaps.
 
 ### `world::disp` — the terrain
 

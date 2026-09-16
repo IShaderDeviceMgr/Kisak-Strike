@@ -139,7 +139,7 @@ mod tests {
         run("props only", &|pass| {
             world.prop_models.draw(pass, &world.props)
         });
-        run("everything", &|pass| world.draw(pass));
+        run("everything", &|pass| world.draw(pass, 0.0));
         drop(run);
 
         // The refracting half, which is a *second* pass with a full-screen copy
@@ -163,7 +163,7 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                world.draw(&mut pass);
+                world.draw(&mut pass, 0.0);
             }
             context.record_refract_texture(&mut encoder, &target);
             {
@@ -174,7 +174,7 @@ mod tests {
                     &camera,
                     Load::Keep,
                 );
-                world.draw_refracting(&mut pass);
+                world.draw_refracting(&mut pass, 0.0);
             }
             queue.submit([encoder.finish()]);
         };

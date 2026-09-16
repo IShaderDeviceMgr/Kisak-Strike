@@ -176,6 +176,24 @@ pub static BASE_TRIGGER_OUTPUTS: &[&str] = &[
     "OnNotTouching",
 ];
 
+/// What one [`BaseTrigger::start_touch`] did.
+///
+/// Two separate facts, because `CBaseTrigger::StartTouch` reports both and
+/// different derived classes read different ones. `passed` saves a derived
+/// class asking the filters twice. `all` is the return of a **virtual**:
+/// `OnStartTouchAll` is overridden by `CPortalButtonTrigger`, and it is how a
+/// `prop_floor_button` learns it has been stood on — so a class that
+/// *contains* a [`BaseTrigger`] has to be able to see the call the base would
+/// have made on it. Same rule as `rustdocs/SERVER.md` gotcha 13, one method
+/// down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Touched {
+    /// `PassesTriggerFilters( pOther )`.
+    pub passed: bool,
+    /// `OnStartTouchAll( pOther )` — we were empty and now we are not.
+    pub all: bool,
+}
+
 impl BaseTrigger {
     /// `CBaseTrigger`'s two keys.
     pub fn key_value(&mut self, key: &str, value: &str) -> bool {
@@ -295,17 +313,38 @@ impl BaseTrigger {
     }
 
     /// `CBaseTrigger::StartTouch` (`triggers.cpp:466`).
-    ///
-    /// Returns whether the toucher passed the filters, so a derived class can
-    /// chain without asking twice.
     pub fn start_touch(
         &mut self,
         entity: &mut EntityCore,
         other: EntityId,
         cx: &mut Context<'_>,
-    ) -> bool {
-        if !self.passes_trigger_filters(entity, other, cx) {
-            return false;
+    ) -> Touched {
+        let passed = self.passes_trigger_filters(entity, other, cx);
+        self.start_touch_passing(passed, entity, other, cx)
+    }
+
+    /// `CBaseTrigger::StartTouch` with the filter question already answered.
+    ///
+    /// `PassesTriggerFilters` is a **virtual** and `StartTouch` calls it
+    /// virtually, so a class that overrides it —
+    /// [`ButtonTrigger`](super::prop::ButtonTrigger), which lets a player onto
+    /// the pad and a cube onto a cube button — cannot reach the rest of
+    /// `StartTouch` through [`start_touch`](BaseTrigger::start_touch) without
+    /// the base asking the wrong question first. This is the rest of
+    /// `StartTouch`; the five classes that do not override the filter reach it
+    /// through the method above.
+    pub fn start_touch_passing(
+        &mut self,
+        passed: bool,
+        entity: &mut EntityCore,
+        other: EntityId,
+        cx: &mut Context<'_>,
+    ) -> Touched {
+        if !passed {
+            return Touched {
+                passed: false,
+                all: false,
+            };
         }
         let added = !self.touching.contains(&other);
         if added {
@@ -325,7 +364,13 @@ impl BaseTrigger {
         // "First entity to touch us that passes our filters." Note that it
         // tests the *count*, not `added` alone, so a second toucher arriving
         // while the first is still inside does not re-fire it.
-        if added && self.touching.len() == 1 {
+        //
+        // In the C++ this is `OnStartTouchAll( pOther )`, a **virtual** whose
+        // base implementation is the one line that fires the output. A class
+        // that overrides it — `CPortalButtonTrigger`, to press the button it
+        // belongs to — is reported to through [`Touched::all`] instead.
+        let all = added && self.touching.len() == 1;
+        if all {
             entity.fire_output(
                 "OnStartTouchAll",
                 Variant::Void,
@@ -335,7 +380,7 @@ impl BaseTrigger {
                 cx,
             );
         }
-        true
+        Touched { passed: true, all }
     }
 
     /// `CBaseTrigger::EndTouch` (`triggers.cpp:495`).
@@ -346,9 +391,18 @@ impl BaseTrigger {
     /// > `m_bDisabled` test was commented out, and the behaviour they describe
     /// > is the shipped behaviour: disabling a trigger somebody is standing in
     /// > fires `OnEndTouch`. Reproduced, comments and all.
-    pub fn end_touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+    ///
+    /// Returns whether the last thing inside us has left — the `OnEndTouchAll`
+    /// half of [`Touched`]. `false` also means "was not touching us", which is
+    /// the early return.
+    pub fn end_touch(
+        &mut self,
+        entity: &mut EntityCore,
+        other: EntityId,
+        cx: &mut Context<'_>,
+    ) -> bool {
         let Some(index) = self.touching.iter().position(|&id| id == other) else {
-            return;
+            return false;
         };
         self.touching.remove(index);
 
@@ -359,7 +413,10 @@ impl BaseTrigger {
         // and look for existing" — a handle that has stopped resolving is
         // dropped rather than counted.
         self.touching.retain(|&id| cx.entity(id).is_some());
-        if self.touching.is_empty() {
+        // `OnEndTouchAll( pOther )`, the other virtual — see
+        // [`Touched::all`].
+        let all = self.touching.is_empty();
+        if all {
             entity.fire_output(
                 "OnEndTouchAll",
                 Variant::Void,
@@ -369,6 +426,7 @@ impl BaseTrigger {
                 cx,
             );
         }
+        all
     }
 
     /// `CBaseTrigger::TouchTest` (`triggers.cpp:278`).
