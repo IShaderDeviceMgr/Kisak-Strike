@@ -130,6 +130,26 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   (inheritance became composition), §7.3's FGD cross-check (the FGD is not a superset of
   the datadesc, so the check with teeth is against map data), and §4.4's wildcard rule.
 
+- [`PORTAL.md`](PORTAL.md) — **`prop_portal`: teleportation and a drawn frame.** Written
+  before the port; nothing has landed. ~26,600 lines of `game/{server,shared}/portal/` and `mathlib/`
+  plus a 7,400-line client renderer that is entirely out of scope, of which roughly
+  **1,900** have a counterpart. Scoped deliberately to the mechanism rather than the look — you will see the
+  *wall* through a portal, with a coloured oval on it, and walking into it will put you
+  out of the other one. Scoped by measuring the maps: a portal is overwhelmingly a thing
+  the **gun** makes, and the gun is out of scope, so what the shipped content offers is
+  **21 `prop_portal`s across 10 maps** — two of them on `sp_a1_intro1`, which makes the
+  default map the test bed. Its central finding is that **the collision carve does not
+  need a polyhedron library**: `CarveWallBrushes_Sub` is four clips of the same four
+  planes at four distance sets, and `clip_box_to_brush` consumes *planes only*, so a
+  carved piece is the original brush's planes plus four more and `mathlib/polyhedron.cpp`
+  (3,895 lines) plus `staticcollisionpolyhedroncache.cpp` (586) delete outright. Records
+  that the teleport lives in the **movement** and not the entity (Valve's own
+  `Warning( "PORTALLING PLAYER SHOULD BE DONE IN GAMEMOVEMENT" )`), that `portal1.mdl` is
+  a 4-vertex quad wearing a **depth-only** shader and is invisible on purpose, that
+  linkage is by **group and size** rather than by colour, and that the whole of §7 is
+  gated on a **blended pass** this port has never had — which is stage 1, is not portal
+  work, and unblocks the five translucent brush entities too. Five stages.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current
