@@ -65,6 +65,15 @@ pub struct Material {
     /// yes. See [`Lighting`].
     pub lighting: Lighting,
 
+    /// Whether a model wearing this material is lit per pixel, and so reads
+    /// no baked per-vertex lighting.
+    ///
+    /// `STUDIOHDR_FLAGS_USES_BUMPMAPPING`, which a model gets if *any* of its
+    /// materials sets it. Read by
+    /// [`PropModels`](crate::engine::world::props::PropModels), which is where
+    /// the consequence is — see [`shader::uses_bumpmapping`].
+    pub uses_bumpmapping: bool,
+
     /// Whether drawing this material needs a readable copy of the scene so
     /// far, taken before the draw.
     ///
@@ -215,6 +224,7 @@ impl Material {
             state: shader::render_state(shader, vmt, resolved),
             modulation: shader::modulation_color(shader, vmt),
             lighting: shader::lighting(shader, vmt),
+            uses_bumpmapping: shader::uses_bumpmapping(vmt),
             needs_frame_buffer_copy: shader::needs_frame_buffer_copy(shader, vmt),
             textures: textures.into_iter().map(|(_, texture)| texture).collect(),
             uniforms,

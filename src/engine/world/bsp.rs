@@ -59,6 +59,11 @@ const LUMP_LEAFS: usize = 10;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
+/// The two worldlight lumps. Read here for the same reason the collision lumps
+/// are, and consumed by [`light`](crate::engine::world::light), which turns
+/// each one into a term of a model's lighting.
+const LUMP_WORLDLIGHTS: usize = 15;
+const LUMP_WORLDLIGHTS_HDR: usize = 54;
 const LUMP_LEAFBRUSHES: usize = 17;
 const LUMP_BRUSHES: usize = 18;
 const LUMP_BRUSHSIDES: usize = 19;
@@ -102,6 +107,18 @@ const LVLFLAGS_LIGHTMAP_ALPHA_3: u32 = 0x0000_0010;
 /// rather than read at the wrong stride, which would produce a plausible tree
 /// of nonsense rather than an error. See [`BspError::UnsupportedLeafVersion`].
 const LEAFS_VERSION: i32 = 1;
+
+/// `LUMP_WORLDLIGHTS_VERSION` (`public/bspfile.h:372`). Version 0 is
+/// `dworldlight_version0_t`, 88 bytes; version 1 added `shadow_cast_offset` and
+/// is 100. `Mod_LoadWorldlights` (`modelloader.cpp:1412`) widens the old one
+/// field by field and `Host_Error`s on anything else.
+///
+/// Measured on the depot: **all 106 of Portal 2's maps ship version 1**, in the
+/// HDR lump, so the widening path has no data to exercise it. Refused rather
+/// than written, exactly as [`LEAFS_VERSION`] is and for the same reason —
+/// reading 88-byte records at a 100-byte stride gives lights in plausible
+/// places with nonsense intensities rather than an error.
+const WORLDLIGHTS_VERSION: i32 = 1;
 
 /// `MAXLIGHTMAPS` (`public/bspfile.h:773`): how many lightstyles one face can
 /// carry. A style of 255 means "no more".
@@ -592,6 +609,12 @@ pub enum BspError {
     )]
     UnsupportedLeafVersion { path: String, version: i32 },
 
+    #[error(
+        "{path} has version {version} world lights; this engine reads version {}",
+        WORLDLIGHTS_VERSION
+    )]
+    UnsupportedWorldLightVersion { path: String, version: i32 },
+
     #[error("{path} is internally inconsistent: {what}")]
     Corrupt { path: String, what: String },
 }
@@ -697,6 +720,23 @@ pub struct Bsp {
     pub leaf_ambient: Vec<LeafAmbientSample>,
     /// `LUMP_LEAF_AMBIENT_INDEX*` — parallel to [`leaves`](Bsp::leaves).
     pub leaf_ambient_index: Vec<LeafAmbientIndex>,
+    /// `LUMP_WORLDLIGHTS_HDR` if the map has one, else `LUMP_WORLDLIGHTS` —
+    /// the light sources themselves, as `vrad` left them.
+    ///
+    /// Empty on a map compiled without `vrad`, and on one whose lights were
+    /// all baked away, both of which are legal. **Not fixed up**: see
+    /// [`WorldLight`].
+    pub world_lights: Vec<WorldLight>,
+    /// Whether [`world_lights`](Bsp::world_lights) came from the HDR lump.
+    ///
+    /// A separate answer from [`lighting_is_hdr`](Bsp::lighting_is_hdr)
+    /// because `Mod_LoadWorldlights` asks a separate question — it takes the
+    /// HDR lump whenever *that* lump is non-empty
+    /// (`modelloader.cpp:5311`) — and because the answer changes a number:
+    /// `ComputeLightRadius` halves its cutoff for HDR, "usually our designers
+    /// scale the light intensity by 0.5 in HDR" (`gl_drawlights.cpp:51`).
+    /// Measured on the depot: all 106 of Portal 2's maps answer true to both.
+    pub world_lights_are_hdr: bool,
     /// `LUMP_PAKFILE` — a whole ZIP archive of the content `vbsp` generated
     /// for this map, still in its on-disk form.
     ///
@@ -817,6 +857,22 @@ impl Bsp {
             });
         }
 
+        // `Mod_LoadWorldlights` (`modelloader.cpp:5311`): the HDR lump whenever
+        // it has anything in it, which for Portal 2 is always. The lump's own
+        // stride changed between versions, so refuse an unknown one for the
+        // same reason `LUMP_LEAFS` does.
+        let worldlights_lump = match reader.is_empty(LUMP_WORLDLIGHTS_HDR) {
+            false => LUMP_WORLDLIGHTS_HDR,
+            true => LUMP_WORLDLIGHTS,
+        };
+        let worldlights_version = reader.version(worldlights_lump);
+        if !reader.is_empty(worldlights_lump) && worldlights_version != WORLDLIGHTS_VERSION {
+            return Err(BspError::UnsupportedWorldLightVersion {
+                path,
+                version: worldlights_version,
+            });
+        }
+
         let bsp = Bsp {
             entity_lump: reader.text(LUMP_ENTITIES)?,
             lighting: reader.records(lighting_lump)?,
@@ -833,6 +889,8 @@ impl Bsp {
             } else {
                 LUMP_LEAF_AMBIENT_INDEX
             })?,
+            world_lights: reader.records(worldlights_lump)?,
+            world_lights_are_hdr: worldlights_lump == LUMP_WORLDLIGHTS_HDR,
             pak: Arc::from(reader.raw(LUMP_PAKFILE).unwrap_or(&[])),
             vertices: reader.records(LUMP_VERTEXES)?,
             edges: reader.records(LUMP_EDGES)?,
@@ -1374,6 +1432,112 @@ pub struct LeafAmbientSample {
     pub y: u8,
     pub z: u8,
     pub _pad: u8,
+}
+
+/// One of `vrad`'s light sources, kept so that the runtime can light a model
+/// with the lights `vrad` could not bake into a surface.
+///
+/// `dworldlight_t` (`bspfile.h:1101`), 100 bytes. **This is the lump as
+/// written**, not as the engine uses it: `Mod_LoadWorldlights` applies four
+/// fixups on the way in — two attenuation defaults, a spot exponent default
+/// and a computed [`radius`](WorldLight::radius) — and those live with the
+/// light cache in [`light`](crate::engine::world::light) rather than here, the
+/// way every other transform in this port does.
+///
+/// `shadow_cast_offset`, `tex_info` and `owner` are read because they are part
+/// of the record's stride and are consumed by nothing: the first belongs to
+/// entity shadows, the second to `vrad` and the third to the switchable-light
+/// entities that `DWL_FLAGS` and lightstyles go with.
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct WorldLight {
+    pub origin: [f32; 3],
+    /// Linear RGB **radiance, not a colour** — `vrad` writes the light's
+    /// intensity here already multiplied out, so the numbers run to five
+    /// figures (`sp_a1_intro1`'s brightest is 107,843).
+    pub intensity: [f32; 3],
+    /// The direction the light shines. Meaningful for
+    /// [`Surface`](emit::SURFACE), [`Spotlight`](emit::SPOTLIGHT) and
+    /// [`Skylight`](emit::SKYLIGHT); zero otherwise.
+    pub normal: [f32; 3],
+    /// Added to the origin when the light casts an entity shadow. Unread:
+    /// there are no shadows here.
+    pub shadow_cast_offset: [f32; 3],
+    /// The PVS cluster the light is in, or -1. Read by `FastRejectLightSource`
+    /// and by nothing in this port — see
+    /// [`light`](crate::engine::world::light)'s note on visibility.
+    pub cluster: i32,
+    /// `emittype_t` — one of the [`emit`] constants.
+    pub emit_type: i32,
+    /// The lightstyle that animates this light, 0 for a light that never
+    /// changes. 14,033 of Portal 2's 14,246 world lights are style 0.
+    pub style: i32,
+    /// `cos` of the spotlight's inner cone half-angle; inside it there is no
+    /// angular falloff.
+    pub stopdot: f32,
+    /// `cos` of the outer cone half-angle; outside it the light is off.
+    pub stopdot2: f32,
+    /// The spotlight's angular falloff exponent between the two cones.
+    pub exponent: f32,
+    /// Cutoff distance, or **less than 1 meaning "compute it"** — which is what
+    /// 14,237 of the game's 14,246 lights say. See `ComputeLightRadius`.
+    pub radius: f32,
+    /// The falloff denominator's three terms:
+    /// `1 / (constant + linear * d + quadratic * d²)`.
+    pub constant_attn: f32,
+    pub linear_attn: f32,
+    pub quadratic_attn: f32,
+    /// `DWL_FLAGS_*` — see [`dwl`].
+    pub flags: i32,
+    /// `vrad`'s back-reference to the face an [`emit::SURFACE`] light came
+    /// from. Unread.
+    pub tex_info: i32,
+    /// The entity the light belongs to, for switchable lights. Unread.
+    pub owner: i32,
+}
+
+/// `emittype_t` (`public/bspfile.h:1062`): what shape of light a
+/// [`WorldLight`] is.
+///
+/// Constants rather than an enum because the field is an `i32` read straight
+/// out of a file and a value outside this set is a map to reject, not a panic
+/// — `Engine_WorldLightDistanceFalloff`'s own `default:` returns 1 and says
+/// "Bug: need to return an error".
+pub mod emit {
+    /// A 90-degree spotlight standing in for a lit surface. `vrad` makes one
+    /// of these per emissive face, which is why they are the commonest kind:
+    /// 7,073 of Portal 2's 14,246.
+    pub const SURFACE: i32 = 0;
+    pub const POINT: i32 = 1;
+    /// A spotlight with a penumbra between [`WorldLight::stopdot`] and
+    /// [`WorldLight::stopdot2`].
+    pub const SPOTLIGHT: i32 = 2;
+    /// A directional light with no falloff. Only lights a point that can see
+    /// the sky.
+    pub const SKYLIGHT: i32 = 3;
+    /// Linear falloff, non-Lambertian. Quake's. **None in Portal 2**, and
+    /// nothing in this port's light selection can produce a hardware light
+    /// from one — `WorldLightToMaterialLight` returns `false` for it.
+    pub const QUAKELIGHT: i32 = 4;
+    /// The sky's own ambient term. Contributes to `vrad`'s bake and to nothing
+    /// at runtime: `LightIntensityAndDirectionAtPoint` answers 0 for it before
+    /// doing anything else.
+    pub const SKYAMBIENT: i32 = 5;
+}
+
+/// `DWL_FLAGS_*` (`public/bspfile.h:1074`) — [`WorldLight::flags`].
+pub mod dwl {
+    /// **`vrad` already folded this light into the per-leaf ambient cubes.**
+    ///
+    /// Set on the dim `emit_surface` lights, of which there are a great many —
+    /// 6,731 of Portal 2's 7,073 — and which `r_worldlightmin` would throw
+    /// away anyway. Anything reading the baked leaf cubes must therefore skip
+    /// these lights or count them twice; see
+    /// [`light`](crate::engine::world::light).
+    pub const IN_AMBIENT_CUBE: i32 = 0x0001;
+    /// The light casts shadows from entities. Unread — there are no shadows.
+    #[allow(dead_code)]
+    pub const CAST_ENTITY_SHADOWS: i32 = 0x0002;
 }
 
 /// One leaf's slice of [`Bsp::leaf_ambient`].

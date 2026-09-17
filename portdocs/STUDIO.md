@@ -595,10 +595,11 @@ fixes the 8 cubemap materials** that draw as checkerboards today, which is a sec
 subsystem's bug closed by the same change.
 
 ### Stage 5 — the ambient cube — **DONE** (out of order; it is independent of stage 4)
-`bsp.rs` reads the leaf-ambient pair; `world/props/light.rs` finds the leaf for a prop's
-lighting origin, interpolates the samples, decodes with `TexLightToLinear`, and fills
+`bsp.rs` reads the leaf-ambient pair; `world/light.rs` finds the leaf for a prop's
+lighting origin, interpolates the samples, decodes with `ColorRGBExp32ToVector` (see
+§11.2 — this plan said `TexLightToLinear` and was wrong), and fills
 `ModelLighting::ambient_cube`. After this a prop is lit the way the shipped game lights
-it, less the local lights.
+it, less the local lights — **which §13 supplies**.
 
 ### Stage 6 — LOD selection and fade *(optional, and small)* — **not started**
 `switchPoint` per LOD, `m_FadeMinDist`/`m_FadeMaxDist`/`m_flForcedFadeScale` per prop.
@@ -922,3 +923,190 @@ cycles.
   7 MB each, at level load and not per frame. Valve gets sharing free from
   `CMDLCache`; the equivalent here is a cache above `StudioModel::load`, and the
   condition for writing one is a map whose load time is actually a problem.
+
+---
+
+## 13. The local lights, which §5 left out
+
+> Written **after** the port, like §12 and `portdocs/CLIENT_TONEMAP.md`, and
+> for the same reason: it is not one of §8's six stages. §5 split a prop's
+> lighting into "the ambient cube" and "the per-vertex bake" and said local
+> lights were "not ported — that needs `LUMP_WORLDLIGHTS` and the attenuation
+> model". This is that, plus the thing §5 did not see: **the two terms it
+> named do not add together.** The API is `rustdocs/ENGINE.md`, "world::light".
+
+### 13.1 What §5's split got wrong
+
+§5's table has two independent terms. The shipped engine has two *alternatives*
+and a third term, and the choice between them is one `bool`:
+
+```c
+// CModelRender::DrawModelExStaticProp, l_studio.cpp:3046
+bool bStaticLighting = (( drawFlags & STUDIORENDER_DRAW_STATIC_LIGHTING ) &&
+    ( pStudioHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP ) &&
+    ( !bUsesBumpmapping || numLightingComponents > 1 ) &&
+    ( pInfo.instance != MODEL_INSTANCE_INVALID ));
+```
+
+and then, in `StudioSetupLighting` (`l_studio.cpp:1430`):
+
+```c
+if ( bStaticLighting )
+    pLightingState = LightcacheGetStatic( *pLightcache, &pEnvCubemapTexture,
+                                          LIGHTCACHEFLAGS_DYNAMIC | LIGHTCACHEFLAGS_LIGHTSTYLE );
+else
+    lightingState = *(LightcacheGetStatic( *pLightcache, &pEnvCubemapTexture ));
+    //                          default flags: STATIC | DYNAMIC | LIGHTSTYLE
+```
+
+`LIGHTCACHEFLAGS_STATIC` is what decides whether `LightcacheGetStatic` starts
+from `m_StaticLightingState` or from `ZeroLightingState()`. So a prop that uses
+its `.vhv` gets **a zeroed ambient cube and no local lights** — the bake is
+everything — and one that does not gets the light cache and no bake.
+
+This port had been adding the leaf ambient cube on top of the bake since stage
+5, which double-counts a prop's indirect light. It did not read as a bug
+because both terms are dim and the tone mapper absorbs the difference.
+
+`numLightingComponents` is `r_staticlight_streams`, `"1"`
+(`vertexlitgeneric_dx9_helper.cpp:54`), so the term is always false and
+`bUsesBumpmapping` alone decides. That flag is
+`STUDIOHDR_FLAGS_USES_BUMPMAPPING`, ORed over a model's materials by
+`CStudioRenderContext::ComputeModelFlags` (`studiorendercontext.cpp:274`): a
+`$bumpmap` that needs tangent space, **or `$phong` non-zero on its own**. The
+second is a wider net than `WantsPhongShader` casts, so it is read from the
+`.vmt` rather than from `ShaderKind`.
+
+There is no third possibility to worry about:
+`STUDIOHDR_BAKED_VERTEX_LIGHTING_IS_INDIRECT_ONLY`, which would ask for *both*,
+is set only when `r_staticlight_streams == 3` or
+`r_staticlight_streams_indirect_only` is true, and neither is reachable from a
+shipped Portal 2 configuration.
+
+**On `sp_a1_intro1`: 816 baked, 246 per-pixel, 18 with no file at all.**
+
+### 13.2 The lump
+
+`LUMP_WORLDLIGHTS` (15) and `LUMP_WORLDLIGHTS_HDR` (54), `dworldlight_t`
+(`bspfile.h:1101`), 100 bytes at version 1 and 88 at version 0. Measured over
+the depot: **106 maps, 14,246 lights, every one of them version 1 in the HDR
+lump**, so the version-0 widening path has no data to exercise it and is
+refused rather than written — the same decision `LUMP_LEAFS` already took.
+
+| | count | |
+|---|---|---|
+| `emit_surface` | 7,073 | one per emissive face; `vrad` makes them |
+| `emit_point` | 4,651 | |
+| `emit_spotlight` | 2,470 | |
+| `emit_skylight` | 28 | |
+| `emit_skyambient` | 24 | ignored at runtime, before anything else |
+| `emit_quakelight` | 0 | and it has no hardware form anyway |
+
+Two numbers decide the shape of the port:
+
+- **6,731 of the 7,073 `emit_surface` lights carry `DWL_FLAGS_INAMBIENTCUBE`**,
+  which is `vrad` saying it already folded them into the per-leaf cubes
+  (`leaf_ambient_lighting.cpp:179`). §13.3 is why that matters.
+- **14,237 of the 14,246 have no radius**, so `ComputeLightRadius`
+  (`gl_drawlights.cpp:46`) is the normal path rather than an upgrade path — and
+  its HDR branch, which halves the cutoff because "usually our designers scale
+  the light intensity by 0.5 in HDR", applies to every Portal 2 map.
+
+A third: **213 carry a lightstyle**, across styles 32-37. Those belong to
+`LIGHTCACHEFLAGS_LIGHTSTYLE` and are dropped at load, because nothing here
+animates `d_lightstylevalue[]`.
+
+### 13.3 The ambient cube this port uses is not the one a static prop gets
+
+`R_StudioGetAmbientLightForPoint` branches on `r_radiosity` (4) *and* on whether
+the caller is a static prop:
+
+```c
+case 4:
+    if (bIsStaticProp)  ComputeAmbientFromSphericalSamples( start, pLightBoxColor );
+    else                ComputeAmbientFromLeaf( start, leafID, pLightBoxColor,
+                                                bAddedLeafAmbientCube );
+```
+
+The two are the *same function*, once in `lightcache.cpp` and once in
+`vrad`'s `leaf_ambient_lighting.cpp` — except that `vrad`'s ends with
+`AddEmitSurfaceLights`, which adds the direct light of exactly the
+`DWL_FLAGS_INAMBIENTCUBE` lights. That is what `bAddedLeafAmbientCube` reports,
+and it is what `AddStaticLighting`'s first `continue` reads:
+
+```c
+if ( bAddedLeafAmbientCube && (wl->flags & DWL_FLAGS_INAMBIENTCUBE) )
+    continue;
+```
+
+So the engine's two paths carry the same total energy by different routes: a
+static prop gathers bounce at runtime and takes *all* the world lights
+including the dim surface ones, and everything else reads `vrad`'s cube — which
+already has them — and skips them.
+
+**This port uses the leaf cube for everything** (§5 and §11.2), so
+`bAddedLeafAmbientCube` is true here and the 6,731 are skipped. That is a
+consistent choice rather than an approximation, and it is also the cheaper one:
+the alternative is 162 rays per prop against the lightmaps.
+
+### 13.4 What the selection actually is
+
+`AddStaticLighting` (`lightcache.cpp:1875`) walks every world light and hands
+each to `AddWorldLightToLightingState`, which:
+
+1. culls it against the light cache's **32x32x128 grid cell** around the sample
+   point — not the prop's own box, which is only used by the dlight path;
+2. measures it at the point with `LightIntensityAndDirectionAtPointOld`, which
+   ends in **one trace from the point to the light**;
+3. ranks it by `ratio * dot( intensity, (0.299, 0.587, 0.114) )`;
+4. gives it one of `MIN( MaxNumLights(), r_worldlights )` slots if it is bright
+   enough, evicting the dimmest if it must — and **returns**;
+5. or, if it got no slot, folds it into the ambient cube by
+   `AddWorldLightToLightCube`, which spreads `ratio * angular * intensity` over
+   the faces pointing at it.
+
+Steps 4 and 5 are exclusive, which is the part worth stating out loud: **no
+light is in both terms and none is lost.** A light that just misses the cut
+stops being directional rather than stopping existing.
+
+`r_worldlights` is the number to argue about. The tree has three answers —
+4 as designed, 3 "Changed from 4 to 3 for L4D!", and 2 under `#ifdef POSIX`
+with "JasonM GL - capping at 2 world lights at the moment" — and this port
+compiles on the platform whose answer is 2. Measured: **44,421 of the game's
+56,955 props fill both slots**, so the cap binds almost everywhere and is worth
+revisiting if the shading ever looks flat.
+
+### 13.5 What it cost, and what the PVS reject would have bought
+
+**1.4 seconds to light all 56,955 static props in the game**, about 13 ms a
+map, against 0.25 s for `sp_a1_intro1`'s collision model alone. `vvis` is
+conservative, so `FastRejectLightSource` can only reject lights the occlusion
+trace would reject anyway; leaving it out is a time cost and not a picture
+change, and 13 ms is not a time cost worth writing a PVS reader for. The
+`world/` visibility work will bring one for its own reasons, and this can use it
+then.
+
+The frame cost did not move: the whole of this is load-time, and what reaches
+the GPU is two more iterations of a loop that was already there.
+
+### 13.6 Things that read as bugs and are not
+
+Twelve are listed in `rustdocs/ENGINE.md`; three are worth repeating here,
+because they are the ones that would be "fixed" by someone reading only the
+reference.
+
+- **`1 / (thetaDot - phiDot)` is 1 when the two are equal, not 0.**
+  `WorldLightToMaterialLight` turns every `emit_surface` light into a
+  180-degree spotlight with both cone cosines 0 and writes that register as 1
+  by hand; `RecalculateOneOverThetaDotMinusPhiDot` does the same for anything
+  else, with the comment "hard falloff instead of divide by zero". The shader
+  computes `pow( max( 1e-4, (cos - phiDot) * ood ), falloff )`, so a 0 there
+  turns 7,073 lights off.
+- **A skylight's direction comes back from the last corner tested, not the
+  brightest one.** `LightIntensityAndDirectionInBox` takes the maximum of nine
+  ratios and leaves `pDirection` holding whatever the ninth call wrote — so a
+  cell whose `maxs` corner is in shadow gets a ratio of 1 and a zero direction,
+  which the angular term then turns into 0. Reproduced.
+- **Eight units of slack decide shadowing**, under a comment reading `// hack`:
+  `if ( (1.f - pm.fraction) * dist > 8 )`. It is what lets a light embedded in
+  the surface of its own fixture still light the room.

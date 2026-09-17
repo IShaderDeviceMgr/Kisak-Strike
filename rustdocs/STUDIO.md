@@ -258,13 +258,15 @@ once per model, and the count is in `stats`.
 
 ### Lighting
 
-A prop is lit by two things, and both are baked:
+A prop is lit by one of two things, and **it is one or the other, not both**:
 
 ```rust
-// The leaf ambient cube — `Mod_LeafAmbientColorAtPos`, inverse-squared-distance
-// weighted over the leaf's samples.
-pub fn ambient_at(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> AmbientCube;
-pub fn lighting_for(bsp: &Bsp, collision: &CollisionBsp, position: Vec3) -> ModelLighting;
+// The light cache: the leaf ambient cube plus the world lights that reach the
+// point. `rustdocs/ENGINE.md`, "world::light".
+pub struct LightCache { /* private */ }
+impl LightCache {
+    pub fn lighting_at(&self, tracer: &mut Tracer<'_>, position: Vec3) -> ModelLighting;
+}
 
 // The per-vertex bake — one `.vhv` per placement, out of the map's pak lump.
 pub struct Vhv { pub checksum: u32, pub vertex_count: u32, pub meshes: Vec<VhvMesh> }
@@ -277,13 +279,21 @@ impl Vhv {
 pub fn prop_lighting_path(index: usize, hdr: bool) -> String;  // sp_hdr_<i>.vhv
 ```
 
-`PropModels::load` reads every instance's `.vhv` into **one** `VertexBuffer` for
-the whole map and slices it per prop; `ModelLighting::static_light` is set per
-instance, because whether a prop got a file is per instance.
+`PropModels::load` reads every usable instance's `.vhv` into **one**
+`VertexBuffer` for the whole map and slices it per prop.
 
-Local lights are **not** ported — that needs `LUMP_WORLDLIGHTS` and the
-attenuation model — so beyond the ambient cube and the vertex bake a prop has no
-lighting.
+**Which of the two a prop gets is `bStaticLighting`** (`l_studio.cpp:3046`), and
+the deciding term is `PropModel::uses_bumpmapping` — set for a model any of
+whose materials has a `$bumpmap` or a non-zero `$phong`. Such a model is lit per
+pixel, has no `bStaticLight` in its shader at all, and the shipped engine does
+not fetch its colour mesh; every other prop with a file uses the bake and gets a
+**zeroed** ambient cube and no local lights, because `StudioSetupLighting` asks
+`LightcacheGetStatic` without `LIGHTCACHEFLAGS_STATIC`. Adding the two together
+double-counts a prop's indirect light. On `sp_a1_intro1` the split is **816
+baked, 246 per-pixel, 18 with no file at all**.
+
+`rustdocs/ENGINE.md`'s "world::light" section is the whole of the light cache
+half, including the twelve rules that produce a plausible wrong picture.
 
 ---
 

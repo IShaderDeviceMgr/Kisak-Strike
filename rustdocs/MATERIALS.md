@@ -530,6 +530,8 @@ pub struct Material {
     pub state: RenderState,       // what the shadow phase decided
     pub modulation: [f32; 4],     // $color * $color2, with $alpha in w
     pub lighting: Lighting,       // how wide a lightmap block its surfaces reserve
+    pub uses_bumpmapping: bool,   // STUDIOHDR_FLAGS_USES_BUMPMAPPING: lit per pixel
+    pub needs_frame_buffer_copy: bool,
 }
 
 pub fn bind_group(&self) -> &wgpu::BindGroup;               // group 1
@@ -544,6 +546,14 @@ pub fn new(
     resolve: impl FnMut(&str, ColorSpace, TextureDimension) -> Arc<Texture>,
 ) -> Option<Material>;   // None if the .vmt names a shader we do not have
 ```
+
+**`uses_bumpmapping` is a question a *model* asks of a material**, not something the
+material does: `$bumpmap` present, or `$phong` non-zero, which is
+`CStudioRenderContext::ComputeModelFlags` (`studiorendercontext.cpp:274`) ORing the answer
+over every material on a model. It is a wider net than `ShaderKind::resolve` casts — a
+`$phong 1` material with no bump map, no light warp and no base-alpha mask draws as
+`VertexLitGeneric` and still counts. What it decides is which of two lighting sources a
+static prop gets; `rustdocs/ENGINE.md`'s "world::light" has the consequence.
 
 **`Material::shader` is what will draw it, not what the `.vmt` said.** `Material::new`
 calls [`ShaderKind::resolve`](#shaderkind), so a `VertexLitGeneric` material that asks for
@@ -2103,6 +2113,13 @@ Ordered by how likely each is to bite.
     `Light::spot` and `Light::directional` rather than filling the fields, and fill unused
     slots with `Light::NONE` — a *zeroed* slot divides by zero in the attenuation
     denominator, which is why `s_pTwoEmptyLights` has a constant attenuation of 1.
+    **A spot light whose two cone cosines are equal gets `1 / (thetaDot - phiDot)` = 1,
+    not 0** (`RecalculateOneOverThetaDotMinusPhiDot`, `lightdesc.cpp:15`, whose comment
+    reads "hard falloff instead of divide by zero"). That is not a corner case:
+    `WorldLightToMaterialLight` turns every `emit_surface` world light — 7,073 of Portal
+    2's 14,246 — into a 180° spotlight with both cosines 0, and the shader's
+    `pow( max( 1e-4, (cos - phiDot) * ood ), falloff )` reads a 0 there as "this light is
+    off".
 28. **A bumped model gets no baked vertex light at all, and an unbumped one does.** That
     asymmetry is Valve's: `vertexlit_and_unlit_generic_bump_ps2x.fxc:452` calls
     `PixelShaderDoLighting` with `bStaticLight = false`, because the per-vertex stream
@@ -2222,12 +2239,15 @@ Ordered by how likely each is to bite.
     would otherwise be a no-op. Getting it the other way round makes every phong prop in
     the game shade harder and look contrastier, with no error.
 
-45. **A `Phong` model is lit by its ambient cube alone today, and the shader is not what
-    is wrong.** `bStaticLight = false` is Valve's — it is a per-pixel shader, so it cannot
-    re-evaluate a per-vertex bake — and the local lights that would replace the bake are
-    not filled in yet (`world::props::lighting_for` supplies none). So a phong prop has no
-    specular highlight, because the term needs a light. The fix is
-    `LightcacheGetStatic`'s local-light half, not this shader.
+45. **A `Phong` model reads no per-vertex bake, and the light cache is the whole of its
+    lighting.** `bStaticLight = false` is Valve's — it is a per-pixel shader, so it cannot
+    re-evaluate a per-vertex bake — and that same fact is what
+    `CModelRender::DrawModelExStaticProp` calls `bStaticLighting`: a phong or bumped model
+    never has its colour mesh fetched, and `StudioSetupLighting` asks `LightcacheGetStatic`
+    for the *static* lighting instead. Both halves are ported now, so the specular term
+    has lights to work with; `Material::uses_bumpmapping` is the predicate and
+    `rustdocs/ENGINE.md`'s "world::light" is the cache. Until the local lights landed a
+    phong prop had no highlight at all, because the term needs a light.
 
 ## Deliberate divergences from Valve's behavior
 

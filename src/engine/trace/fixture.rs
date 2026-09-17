@@ -36,6 +36,10 @@ pub(crate) struct Fixture {
     pub(crate) disp_info: Vec<DispInfo>,
     pub(crate) disp_verts: Vec<DispVert>,
     pub(crate) disp_tris: Vec<DispTri>,
+    /// `SURF_*` for the one texinfo [`bsp`](Fixture::bsp) emits, which is what
+    /// a brush side built by [`add_surfaced_box`](Fixture::add_surfaced_box)
+    /// names.
+    pub(crate) surface_flags: i32,
 }
 
 impl Fixture {
@@ -86,6 +90,33 @@ impl Fixture {
             contents: contents.0 as i32,
         });
         self.brushes.len() as u16 - 1
+    }
+
+    /// A box brush whose sides name a real surface, so that a trace hitting it
+    /// comes back with `flags` in [`Trace::surface_flags`].
+    ///
+    /// One caller: the light cache's skylight test, which decides whether a
+    /// point is in sunlight by asking whether a ray fired at the sky hit
+    /// `SURF_SKY`. There is one texinfo in a [`Fixture`], so the flags are the
+    /// fixture's rather than the box's.
+    ///
+    /// [`Trace::surface_flags`]: super::Trace::surface_flags
+    pub(crate) fn add_surfaced_box(
+        &mut self,
+        mins: Vec3,
+        maxs: Vec3,
+        contents: Contents,
+        flags: i32,
+    ) -> u16 {
+        self.surface_flags = flags;
+        let brush = self.add_box(mins, maxs, contents, true);
+        let sides = &self.brushes[brush as usize];
+        let first = sides.first_side as usize;
+        let count = sides.num_sides as usize;
+        for side in &mut self.brush_sides[first..first + count] {
+            side.tex_info = 0;
+        }
+        brush
     }
 
     /// A displacement over a four-cornered face, with a per-vertex offset.
@@ -369,31 +400,34 @@ impl Fixture {
         }
         // One texinfo and texdata, so a displacement's surface resolves to a
         // real table entry rather than the null surface.
-        let (texinfo, texdata, texdata_string_table) = match self.faces.is_empty() {
-            true => (Vec::new(), Vec::new(), Vec::new()),
-            false => (
-                vec![TexInfo {
-                    texture_vecs: [[0.0; 4]; 2],
-                    lightmap_vecs: [[0.0; 4]; 2],
-                    flags: 0,
-                    tex_data: 0,
-                }],
-                vec![TexData {
-                    reflectivity: [0.5; 3],
-                    name_string_table_id: 0,
-                    width: 64,
-                    height: 64,
-                    view_width: 64,
-                    view_height: 64,
-                }],
-                vec!["nature/test_displacement".to_owned()],
-            ),
-        };
+        let (texinfo, texdata, texdata_string_table) =
+            match self.faces.is_empty() && self.surface_flags == 0 {
+                true => (Vec::new(), Vec::new(), Vec::new()),
+                false => (
+                    vec![TexInfo {
+                        texture_vecs: [[0.0; 4]; 2],
+                        lightmap_vecs: [[0.0; 4]; 2],
+                        flags: self.surface_flags,
+                        tex_data: 0,
+                    }],
+                    vec![TexData {
+                        reflectivity: [0.5; 3],
+                        name_string_table_id: 0,
+                        width: 64,
+                        height: 64,
+                        view_width: 64,
+                        view_height: 64,
+                    }],
+                    vec!["nature/test_displacement".to_owned()],
+                ),
+            };
 
         Bsp {
             game_lumps: Vec::new(),
             leaf_ambient: Vec::new(),
             leaf_ambient_index: Vec::new(),
+            world_lights: Vec::new(),
+            world_lights_are_hdr: true,
             pak: std::sync::Arc::from(&[][..]),
             path: "test".to_owned(),
             version: 21,

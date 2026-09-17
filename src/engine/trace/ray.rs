@@ -121,6 +121,9 @@ impl Contents {
     pub const SLIME: Contents = Contents(0x10);
     pub const WATER: Contents = Contents(0x20);
     pub const OPAQUE: Contents = Contents(0x80);
+    /// Blocks light and nothing else — a `vbsp` brush that casts a shadow you
+    /// can walk through. In the light cache's trace mask and nowhere else.
+    pub const BLOCKLIGHT: Contents = Contents(0x400);
     /// Ignore `OPAQUE` on surfaces marked `SURF_NODRAW`.
     pub const IGNORE_NODRAW_OPAQUE: Contents = Contents(0x2000);
     /// Doors, platforms — anything `MOVETYPE_PUSH`.

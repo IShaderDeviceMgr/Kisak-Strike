@@ -139,6 +139,11 @@ entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces 
 triangles, each under the placement its entity gives it — and since `prop_dynamic`
 landed, **so do 90 entity-placed models from 52 more `.mdl`s**, which is the furniture
 the map is made of rather than the shell it sits in.
+**Every model in it is lit the way the shipped game lights it**, now that the light
+cache has its local half: **39 of the map's 43 world lights** reach props through
+`AddStaticLighting`, and the 246 props whose materials are bumped or phong are lit per
+pixel by them instead of by `vrad`'s per-vertex bake — which is what gives a phong prop a
+specular highlight at all.
 **The scene is auto-exposed**: it is drawn into an
 offscreen target, a compute pass bins its pixels by luminance, and a port of
 `CTonemapSystem` picks the scalar the lit shaders multiply by — `tonemap` in the console
@@ -393,10 +398,12 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   table, `Phong` and `LightmappedGeneric` none — so making them agree would be a
   divergence and a factor of 36.
   **A Phong model gets no baked vertex light**, because it is always a per-pixel shader
-  (`bStaticLight = false`); the CS:GO `STATICLIGHT3` work exists because of it. The
-  consequence today is visible: `world::props` supplies an ambient cube and *zero* local
-  lights, so a Phong prop is lit by its cube and **has no highlight at all** until
-  `LightcacheGetStatic`'s local-light half lands.
+  (`bStaticLight = false`); the CS:GO `STATICLIGHT3` work exists because of it. That same
+  fact is what `DrawModelExStaticProp` calls `bStaticLighting`, and **`world/light.rs`
+  now acts on it**: a phong or bumped prop's `.vhv` is never opened and the light cache
+  is its whole lighting, ambient cube *and* local lights, so the specular term has
+  something to work with. Until that landed a Phong prop had no highlight at all,
+  because the term needs a light.
   **The envmap mask is base alpha whether the material asked or not**, so
   `$basealphaenvmapmask` is inert and `$envmapmask` is not even sampled.
   **`$phongexponent` unset is a sentinel**, not a default: zero means "read the exponent
@@ -430,8 +437,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   one, because the tangent is in the `.vvd` either way — and `Phong` asks for the tangent
   unconditionally, so for its 317 one layout is not even a simplification.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
-  lightmaps and terrain, `trace/` (stages 1-4 of 5), `input/` (stages 1-4 of 5), and
-  `console/` (all five stages, complete)**
+  lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5), `input/` (stages 1-4
+  of 5), and `console/` (all five stages, complete)**
   (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
   Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
   its own module, 14 surviving, ~45,700 lines deleted outright.
@@ -580,7 +587,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   answered for is left *out* rather than assumed in. Defaulting the other way
   fills every chamber with invisible walls, silently.
   Not implemented: simulation, visibility, the skybox, dynamic lights and
-  lightstyle animation. Brush entities are solid, drawn, **moved and collided
+  lightstyle animation. **The static world lights are** — `world/light.rs`,
+  below. Brush entities are solid, drawn, **moved and collided
   with**. **Displacements are solid and drawn** —
   `world/disp/` has landed, below.
   **`world/disp/` is the rendering half of `trace/` stage 3's lumps, and terrain now
@@ -636,6 +644,52 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `every_shader_compiles_and_builds_a_pipeline` now builds a real pipeline for every
   `ShaderKind`, which also checks the thing a WGSL author gets wrong most often — that the
   bind group layout and the `@group`/`@binding` declarations agree.
+  **`world/light.rs` is the light cache, and with it every model in a level is lit the
+  way the shipped game lights it.** `engine/lightcache.cpp`'s static half —
+  `LightcacheGetStatic` and everything under it — plus the
+  `dworldlight_t`-to-hardware-light conversion out of `engine/l_studio.cpp`. It absorbed
+  `props/light.rs`, which held the ambient-cube half and was in the wrong directory once
+  entity models started using it too. `bsp.rs` reads `LUMP_WORLDLIGHTS_HDR` (version 1 on
+  all 106 maps, so version 0 is refused rather than widened) and the module does the
+  selection: the grid-cell cull, the falloff, the angular term, **one trace per light**,
+  the `MIN( MaxNumLights(), r_worldlights )` slots and the fold-the-rest-into-the-cube
+  step. Measured: **14,246 world lights across the game, 7,302 surviving the load-time
+  filters, and 1.4 s to light all 56,955 static props** — 13 ms a map, against 0.25 s for
+  `sp_a1_intro1`'s collision model, which is why `FastRejectLightSource`'s PVS test is
+  left out. The frame cost did not move; all of this is load-time.
+  **The finding that mattered most was not about lights at all: the two lighting terms
+  do not add together.** `StudioSetupLighting` asks `LightcacheGetStatic` *without*
+  `LIGHTCACHEFLAGS_STATIC` for a prop that wears `vrad`'s per-vertex bake, so that prop's
+  ambient cube and local lights come back **zeroed** and the bake is everything; a prop
+  that is bumped or phong is lit per pixel, never has its `.vhv` opened at all, and gets
+  the cache instead. This port had been adding the leaf ambient cube on top of the bake
+  since `studio/` stage 5, which double-counts a prop's indirect light. The predicate is
+  `STUDIOHDR_FLAGS_USES_BUMPMAPPING` — `$bumpmap`, **or `$phong` non-zero on its own**,
+  which is a wider net than `WantsPhongShader` casts — and it now lives on
+  `Material::uses_bumpmapping`. On `sp_a1_intro1`: **816 baked, 246 per-pixel, 18 with no
+  file at all**, where before all 1,062 with a file took both.
+  Three more rules produce a plausible wrong picture rather than an error, and the first
+  decides whether half the lights in Portal 2 are counted twice.
+  **The ambient cube this port uses is not the one a static prop gets.** Valve gathers a
+  static prop's by firing 162 rays at the lightmaps and everything else's from `vrad`'s
+  baked leaf cubes — and the two carry the same energy by different routes, because
+  `vrad`'s cube already contains the dim `emit_surface` lights and the runtime gather does
+  not. That is `bAddedLeafAmbientCube`, and it is what `AddStaticLighting`'s first
+  `continue` reads. This port uses the leaf cube for everything, so the flag is *true*
+  here and the `DWL_FLAGS_INAMBIENTCUBE` lights are dropped at load: **6,731 of the
+  14,246**.
+  **`1 / (thetaDot - phiDot)` is 1 when the two cone cosines are equal, not 0** — "hard
+  falloff instead of divide by zero". `WorldLightToMaterialLight` turns every
+  `emit_surface` light, 7,073 of the game's 14,246, into a 180-degree spotlight with both
+  cosines 0, and the shader reads a 0 there as "this light is off". `uniforms::Light::spot`
+  had the other answer and no callers; it has Valve's now.
+  And **`r_worldlights` is 2 because this port is POSIX** — the tree offers 4 as designed,
+  3 "Changed from 4 to 3 for L4D!", and 2 under `#ifdef POSIX` with "JasonM GL - capping
+  at 2 world lights at the moment". It is the least certain constant in the module, it
+  binds almost everywhere (**44,421 of the game's 56,955 props fill both slots**), and
+  raising it is one edit because everything downstream already carries four. What it buys
+  is directionality rather than brightness: a light that misses a slot is folded into the
+  ambient cube rather than discarded.
   **One `egui` rule that produces a plausible wrong behavior rather than an error:** the
   key bound to `toggleconsole` is never shown to `egui` at all, on either edge
   (`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
@@ -778,14 +832,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   entity's model animates**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
   buffer, one index buffer, per-material `Batch`es. The instances are
   `src/engine/world/props/` — the `sprp` game lump, `AngleMatrix` transforms, one upload
-  per distinct model and one draw per instance, lit by the map's baked leaf ambient cubes.
+  per distinct model and one draw per instance, lit by `world/light.rs`'s light cache.
   `sp_a1_intro1` now draws **1,080 props from 136 models, 224,924 triangles** on top of
-  the world's 14,546, **1,062 of them wearing `vrad`'s per-vertex bake**. Stage 4 also
-  mounted the `.bsp`'s `LUMP_PAKFILE` as a search path, which is what the `.vhv` files
-  live in and **which also fixed the 8 `maps/<map>/…` cubemap materials** that used to
-  draw as checkerboards — one change, two subsystems, as predicted. Not done: LOD
-  selection (stage 6), `.phy` collision (that is `ENGINE_TRACE.md`'s), and the local
-  lights on a prop. **`studio/anim.rs` landed later, with `prop_floor_button`** — bones,
+  the world's 14,546, **816 of them wearing `vrad`'s per-vertex bake and 246 lit per
+  pixel by the world lights instead** (18 have neither and take the cache too). Stage 4
+  also mounted the `.bsp`'s `LUMP_PAKFILE` as a search path, which is what the `.vhv`
+  files live in and **which also fixed the 8 `maps/<map>/…` cubemap materials** that used
+  to draw as checkerboards — one change, two subsystems, as predicted. Not done: LOD
+  selection (stage 6) and `.phy` collision (that is `ENGINE_TRACE.md`'s). **`studio/anim.rs` landed later, with `prop_floor_button`** — bones,
   sequences and the RLE animation blocks, plus the `R_StudioSetupBones` slice that poses
   them; skinning is *replaced* by a per-bone draw split rather than deferred, which is
   exact for every model the port draws. See `src/server/`, below.
@@ -1625,7 +1679,8 @@ state and read 2-3x high. The two rules that came out of it live in `rustdocs/MA
 second is A/B/A, not A/B.
 
 Next: **the boot path is complete as far as one player can take it**, the level shell
-is geometrically complete — world, brush entities, static props and terrain — it is
+is geometrically complete — world, brush entities, static props and terrain — **every
+model in it is lit the way the shipped game lights it**, it is
 **auto-exposed to the map's own limits**, the map's **entity logic runs**, its
 **doors and panels move**, **it notices the player**, and **it can kill them**:
 triggers fire, filters decide who counts, a shut door is a wall, a floor button
@@ -1663,14 +1718,6 @@ The candidates, in the order they are worth doing:
   and the personality sphere — is a model this cannot pose anyway, so reading `.ani`
   before skinning buys nothing. `vvd::Vertex` grows a `bones` field, `vtx` stops
   discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
-- **The local lights on a static prop** — `LightcacheGetStatic`'s other half, which
-  `world::props::lighting_for` currently answers with `count: 0`. It has just become the
-  most *visible* thing missing from the model path: `Phong` is ported and its specular
-  term needs a light to exist, so **the 96 phong materials a static prop wears have no
-  highlight until this lands**, and a Phong prop is lit by its ambient cube alone (it
-  reads no baked vertex light, which is Valve's). `uniforms::Light` and the whole group-3
-  block are already built and tested for it; what is missing is the light cache's
-  per-position light list.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale.
@@ -1720,6 +1767,17 @@ third subsystem — `stuffcmds` and the `+<cvar>` default seeding both read it �
 lives at `src/cmdline.rs`. The move also fixed a real divergence: `CCommandLine::ParmValue`
 refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the port's
 `value()` did not, which would have had `-window` swallow `+map`.
+
+- **Every static prop is lit by the light cache, including the 76% that then throw the
+  answer away.** `World::load` runs `Props::light` before `PropModels::load`, because the
+  models an instance names are not read until the second — so the `bStaticLighting`
+  answer, which decides whether a prop uses the light cache at all, is not known when the
+  cache is asked. Valve skips the work instead: `ComputeStaticLightingForCacheEntry` runs
+  only when `LIGHTCACHEFLAGS_STATIC` is asked for. Measured: **1.4 s for all 56,955 props
+  in the game**, about 13 ms a map, of which roughly three quarters is discarded — against
+  0.25 s for `sp_a1_intro1`'s collision model alone. **Fix it when a map's load time is
+  actually a problem**, by moving `Props::light` after `PropModels::load` and passing it
+  the per-instance answer; the seam already exists as `PropModels::light_ranges`.
 
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and

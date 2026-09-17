@@ -910,6 +910,19 @@ mod tests {
                 .map(|mdl| (mdl.include_models.len(), mdl.sequences.len()))
                 .unwrap_or((0, 0));
             declares += usize::from(declared > 0);
+            // **The assumption `world::props::models` makes about a prop's two
+            // lighting sources.** They replace each other — the colour mesh or
+            // the light cache, never both — and this flag is the one thing that
+            // would make them add. Valve sets it at load, from cvars Portal 2
+            // leaves at their defaults; this checks no shipped *file* carries
+            // it either.
+            if let Some(mdl) = &header {
+                assert!(
+                    !mdl.flags
+                        .contains(StudioFlags::BAKED_VERTEX_LIGHTING_IS_INDIRECT_ONLY),
+                    "{path} asks for indirect-only baked lighting"
+                );
+            }
 
             match StudioModel::load(&vfs, path) {
                 Ok(model) => {

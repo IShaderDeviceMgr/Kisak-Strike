@@ -27,7 +27,6 @@
 //! read yet (stages 4 and 5), so a [`Prop`] is currently a placement waiting
 //! for a renderer.
 
-pub mod light;
 pub mod lump;
 pub mod models;
 
@@ -35,6 +34,7 @@ pub use lump::{PropLumpError, StaticPropLump};
 pub use models::PropModels;
 
 use super::bsp::Bsp;
+use super::light::LightCache;
 use glam::{Mat3, Mat4, Vec3};
 
 /// `GAMELUMP_STATIC_PROPS` (`gamebspfile.h:29`) — the four-CC `'sprp'` read as
@@ -247,17 +247,26 @@ impl Props {
         })
     }
 
-    /// Fills [`lighting`](Props::lighting) from the map's baked ambient cubes.
+    /// Fills [`lighting`](Props::lighting) from the map's light cache.
     ///
     /// Separate from [`from_lump`](Props::from_lump) because it needs the BSP
     /// tree as well as the lump — a prop's lighting is sampled at a *point*,
-    /// and finding which leaf that point is in is a tree walk. See
-    /// [`light::lighting_for`].
-    pub fn light(&mut self, bsp: &Bsp, collision: &crate::engine::trace::CollisionBsp) {
+    /// finding which leaf that point is in is a tree walk, and deciding which
+    /// world lights reach it is a trace per light. See
+    /// [`LightCache::lighting_at`].
+    ///
+    /// **One [`Tracer`] for the whole map**, not one per prop: a fresh one
+    /// allocates a visit stamp per brush and per displacement, and
+    /// `sp_a1_intro1` would make 1,080 of them.
+    ///
+    /// [`LightCache::lighting_at`]: crate::engine::world::light::LightCache::lighting_at
+    /// [`Tracer`]: crate::engine::trace::Tracer
+    pub fn light(&mut self, cache: &LightCache, collision: &crate::engine::trace::CollisionBsp) {
+        let mut tracer = collision.tracer();
         self.lighting = self
             .instances
             .iter()
-            .map(|prop| light::lighting_for(bsp, collision, prop.lighting_origin))
+            .map(|prop| cache.lighting_at(&mut tracer, prop.lighting_origin))
             .collect();
     }
 

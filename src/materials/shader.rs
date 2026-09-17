@@ -1411,6 +1411,42 @@ pub fn wants_phong(vmt: &Vmt) -> bool {
     true
 }
 
+/// `STUDIOHDR_FLAGS_USES_BUMPMAPPING` — whether a model wearing this material
+/// is lit per pixel, and therefore whether it reads `vrad`'s per-vertex bake.
+///
+/// `CStudioRenderContext::ComputeModelFlags` (`studiorendercontext.cpp:274`)
+/// asks two questions of every material on a model and ORs the answers over
+/// the whole model:
+///
+/// - a `$bumpmap` that is actually used — "FIXME: I'd rather know that the
+///   material is definitely using the bumpmap. It could be in the file without
+///   actually being used" — which for a model shader is the same test
+///   [`vertex_lit_uniforms`] makes for [`VertexLitFlags::BUMPMAP`];
+/// - **`$phong` non-zero, on its own**, which is a wider net than
+///   [`wants_phong`] casts: a `$phong 1` material with no bump map, no light
+///   warp and no base-alpha mask draws as `VertexLitGeneric` and still counts
+///   as bumped here.
+///
+/// It matters because it is what `CModelRender::DrawModelExStaticProp`
+/// (`l_studio.cpp:3046`) calls `bStaticLighting`, and that decides which
+/// lighting a static prop gets: a bumped model is lit by the light cache and
+/// reads no colour mesh at all, an unbumped one is lit by its colour mesh and
+/// gets no ambient cube and no local lights. Getting it backwards adds one to
+/// the other.
+///
+/// The `numLightingComponents > 1` half of Valve's test is not here:
+/// `r_staticlight_streams` is `"1"` (`vertexlitgeneric_dx9_helper.cpp:54`), so
+/// the term is always false and the flag alone decides.
+pub fn uses_bumpmapping(vmt: &Vmt) -> bool {
+    let kind = ShaderKind::VertexLitGeneric;
+    if param_value(kind, vmt, "$phong").is_some_and(|var| var.as_bool()) {
+        return true;
+    }
+    vmt.var("$bumpmap")
+        .and_then(|var| var.as_str())
+        .is_some_and(|value| !value.is_empty())
+}
+
 /// Which textures a material wants, and whether each is colour or data.
 ///
 /// **This is where `rustdocs/MATERIALS.md`'s open rule gets encoded.** Valve

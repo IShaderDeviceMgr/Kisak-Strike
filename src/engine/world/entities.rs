@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 
-use super::props::light::AmbientLighting;
+use super::light::LightCache;
 use super::props::models::{PropBatch, PropModel};
 use crate::engine::trace::CollisionBsp;
 use crate::filesystem::Vfs;
@@ -203,19 +203,27 @@ impl EntityModels {
     /// that will not load is an entity that does not draw, and the shipped
     /// engine logs and carries on.
     ///
-    /// `ambient` and `collision` light each instance where it stands. That
+    /// `lighting` and `collision` light each instance where it stands. That
     /// happens **once, here** — a `prop_floor_button` does not move, and
     /// nothing that does yet draws a model — so the condition for resampling
     /// per frame is the first entity model that travels.
+    ///
+    /// An entity's model never wears `vrad`'s per-vertex bake — only a
+    /// `prop_static` gets a `.vhv` — so the light cache's answer is the whole
+    /// of its lighting, ambient cube and local lights together, with no
+    /// `bStaticLighting` question to ask.
     pub fn load(
         vfs: &Vfs,
         materials: &mut MaterialCache,
         device: &wgpu::Device,
         entities: &[ModelEntity],
-        ambient: &AmbientLighting,
+        lighting: &LightCache,
         collision: &CollisionBsp,
     ) -> EntityModels {
         let mut stats = EntityModelStats::default();
+        // One for the whole list, for the reason `Props::light` makes one for
+        // the whole map: a `Tracer` allocates a stamp per brush.
+        let mut tracer = collision.tracer();
         let mut models: Vec<PropModel> = Vec::new();
         let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
         let mut resolved: HashMap<String, Arc<Material>> = HashMap::new();
@@ -299,7 +307,7 @@ impl EntityModels {
                 cycle: entity.cycle,
                 anim_time: entity.anim_time,
                 playback_rate: entity.playback_rate,
-                lighting: ambient.lighting_at(collision, entity.origin),
+                lighting: lighting.lighting_at(&mut tracer, entity.origin),
             });
         }
 

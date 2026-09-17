@@ -34,6 +34,8 @@ mod bench;
 pub mod bsp;
 pub mod disp;
 pub mod entities;
+/// The light cache — what lights a model standing at a point.
+pub mod light;
 pub mod props;
 
 use std::collections::BTreeMap;
@@ -52,7 +54,7 @@ use crate::materials::{Material, MaterialCache};
 
 use bsp::{Bsp, BspError, Face};
 use entities::{EntityModels, ModelEntity};
-use props::light::AmbientLighting;
+use light::LightCache;
 use props::{PropModels, Props};
 
 /// Where a batch has to be split.
@@ -151,6 +153,9 @@ pub struct WorldStats {
     pub faces_fullbright: usize,
     /// Atlas pages, including the 1x1 white one.
     pub lightmap_pages: usize,
+    /// How many `dworldlight_t` records the map holds, before
+    /// [`light::LightCache`] drops the styled and already-baked ones.
+    pub world_lights: usize,
     /// Faces carrying more than one lightstyle — switchable or animated lights.
     ///
     /// Only style 0 is baked into the atlas, so these draw with their
@@ -264,11 +269,12 @@ pub struct World {
     /// cannot run inside [`load`](World::load): which entities draw a model is
     /// the game's to say and the game has not spawned them yet.
     pub entity_models: EntityModels,
-    /// The map's baked ambient cubes, kept after the `.bsp` is dropped.
+    /// The map's lighting — baked ambient cubes and world lights — kept after
+    /// the `.bsp` is dropped.
     ///
     /// Static props are lit during [`load`](World::load) and would not need
     /// this; an entity's model is placed later and does.
-    pub ambient: AmbientLighting,
+    pub lighting: LightCache,
     /// The entity lump, parsed, kept for the map's lifetime.
     ///
     /// The engine reads the `.bsp`, so the engine is what holds the lump and
@@ -461,8 +467,9 @@ impl World {
         // and the duplicate was cheap while the tree was brushes; it stopped
         // being cheap when `ENGINE_TRACE.md` stage 3 made building it also
         // build an AABB tree per displacement.
-        props.light(&bsp, &collision);
-        let ambient = AmbientLighting::from_bsp(&bsp);
+        let lighting = LightCache::from_bsp(&bsp);
+        stats.world_lights = bsp.world_lights.len();
+        props.light(&lighting, &collision);
         stats.pak_files = pak_files;
         stats.props = props.instances.len();
         stats.prop_models = props.models.len();
@@ -493,7 +500,7 @@ impl World {
             props,
             prop_models,
             entity_models: EntityModels::default(),
-            ambient,
+            lighting,
             entities,
             stats,
         })
@@ -580,7 +587,7 @@ impl World {
             materials,
             device,
             entities,
-            &self.ambient,
+            &self.lighting,
             &self.collision,
         );
     }
@@ -744,7 +751,8 @@ impl World {
              ({} hidden{primitives}), \
              {} vertices, {} triangles ({} terrain, over {} displacements), {} batches, \
              {} materials ({} missing), \
-             {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}); \
+             {} lit ({} lightstyled) + {} fullbright over {} lightmap pages ({} MiB {}), \
+             {}/{} world lights; \
              {}/{} brush models drawn ({} faces, {} triangles, {} lit); \
              {} static props from {} models ({}); \
              {} files in the map pak; \
@@ -768,6 +776,8 @@ impl World {
             self.lightmaps.len(),
             self.lightmaps.bytes() / (1024 * 1024),
             if self.lighting_is_hdr { "hdr" } else { "ldr" },
+            self.lighting.lights().len(),
+            s.world_lights,
             s.brush_models_drawn,
             self.brush_models.len(),
             s.brush_model_faces,

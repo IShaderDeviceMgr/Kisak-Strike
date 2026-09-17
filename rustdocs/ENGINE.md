@@ -216,8 +216,8 @@ A loaded map and the geometry it draws.
 | | |
 |---|---|
 | Module | `crate::engine::world` |
-| Lines | ~7,200 including tests |
-| Tests | 64 (`cargo test engine::world`), plus four depot-gated |
+| Lines | ~10,500 including tests |
+| Tests | 76 (`cargo test engine::world`), plus nine depot-gated |
 | Dependencies | `bytemuck`, `glam`, `crate::filesystem`, `crate::materials` |
 
 ### `World`
@@ -542,7 +542,7 @@ pub struct EntityModels { pub stats: EntityModelStats, /* private */ }
 impl EntityModels {
     pub fn load(
         vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
-        entities: &[ModelEntity], ambient: &AmbientLighting, collision: &CollisionBsp,
+        entities: &[ModelEntity], lighting: &LightCache, collision: &CollisionBsp,
     ) -> EntityModels;
     pub fn sync(&mut self, entities: &[ModelEntity]);
     /// What each loaded model says about each of its sequences — the answer
@@ -647,31 +647,218 @@ Six things about it are worth knowing.
   time.
 
 - **Lighting is sampled once, at load.** An entity model has no `.vhv` —
-  `vrad` bakes per-vertex light for static props and nothing else — so each one
-  is lit by the leaf ambient cube where it stands, through
-  [`AmbientLighting`](#ambientlighting). The condition for resampling per frame
-  is the first entity model that **travels**, and `prop_dynamic` is not quite
-  it: a prop that *animates* is re-posed every frame but its origin does not
+  `vrad` bakes per-vertex light for static props and nothing else — so the
+  [light cache](#worldlight--the-light-cache) is the *whole* of its lighting,
+  ambient cube and local lights together, with no `bStaticLighting` question to
+  ask. The condition for resampling per frame is the first entity model that
+  **travels**, and `prop_dynamic` is not quite it: a prop that *animates* is re-posed every frame but its origin does not
   move, and 2,355 of them name a `parentname` whose transform this port does not
   apply anyway (`rustdocs/SERVER.md` gotcha 34).
 
-### `AmbientLighting`
+### `world::light` — the light cache
 
 ```rust
-pub struct AmbientLighting { /* private */ }
-impl AmbientLighting {
-    pub fn from_bsp(bsp: &Bsp) -> AmbientLighting;
+pub struct LightCache { /* private */ }
+impl LightCache {
+    pub fn from_bsp(bsp: &Bsp) -> LightCache;
+    /// `Mod_LeafAmbientColorAtPos` — the baked ambient cube at a point.
     pub fn ambient_at(&self, collision: &CollisionBsp, position: Vec3) -> AmbientCube;
-    pub fn lighting_at(&self, collision: &CollisionBsp, position: Vec3) -> ModelLighting;
+    /// `LightcacheGetStatic( …, LIGHTCACHEFLAGS_STATIC )` — the whole state.
+    pub fn lighting_at(&self, tracer: &mut Tracer<'_>, position: Vec3) -> ModelLighting;
+    /// The world lights that survived the load-time filters.
+    pub fn lights(&self) -> &[WorldLight];
 }
+
+pub type AmbientCube = [[f32; 3]; 6];   // +x, -x, +y, -y, +z, -z
+pub const WORLD_LIGHTS: usize = 2;      // how many local lights one model gets
 ```
 
-The three lumps that answer "how bright is it here", kept after the rest of the
-`.bsp` is dropped. `World::load` reads a map, uploads it and lets the `Bsp` go;
-a *static* prop is lit before that happens and needs nothing, but an entity's
-model is placed later — the entities do not exist until the game server has
-spawned them — and does. A few tens of kilobytes against the map's 12 MB of
-lightmaps.
+**What lights a model standing at a point.** `engine/lightcache.cpp`'s static half, plus
+the `dworldlight_t`-to-hardware-light conversion that lives in `engine/l_studio.cpp`. It
+is the four lumps the question is answered from, kept after the rest of the `.bsp` is
+dropped: `World::load` reads a map, uploads it and lets the `Bsp` go, and a *static* prop
+is lit before that happens, but an entity's model is placed later — the entities do not
+exist until the game server has spawned them — and needs this. A few tens of kilobytes
+against the map's 12 MB of lightmaps.
+
+Two independent terms reach `ModelLighting`, and **they do not both apply to every
+model**:
+
+| Term | Source | Reference |
+|---|---|---|
+| the ambient cube | `vrad`'s per-leaf samples, interpolated by distance | `Mod_LeafAmbientColorAtPos` |
+| up to `WORLD_LIGHTS` local lights | `LUMP_WORLDLIGHTS`, selected per point | `AddStaticLighting` |
+
+Measured over the depot: **106 maps hold 14,246 world lights, 7,302 of which survive the
+load-time filters**, and lighting all 56,955 static props in the game costs **1.4 s** —
+about 13 ms a map, against 0.25 s for `sp_a1_intro1`'s collision model alone. That number
+is why the PVS reject below is left out.
+
+#### `WORLD_LIGHTS` is 2, and it is the least certain constant in the module
+
+`MIN( MaxNumLights(), r_worldlights )`. The tree offers three numbers for the second of
+those and the comments say where each came from (`lightcache.cpp:254`):
+
+```c
+// NOTE!  Changed from 4 to 3 for L4D!  May or may not want to merge this to main.
+#ifdef POSIX
+ConVar r_worldlights ("r_worldlights", "2", …);
+// JasonM GL - capping at 2 world lights at the moment
+#else
+ConVar r_worldlights ("r_worldlights", "3", …);
+#endif
+```
+
+This port is POSIX-only, so 2 is the tree's answer for the platform it compiles on. It
+matters: **44,421 of the game's 56,955 props fill both slots**, so the limit is the
+common case and not a ceiling nothing reaches. What raising it buys is *directionality*
+rather than brightness — a light that misses a slot is folded into the ambient cube by
+`AddWorldLightToLightCube` rather than discarded — and everything downstream already
+carries four slots (`uniforms::MAX_LIGHTS`, `ModelLighting::lights`), so changing it is
+one edit here.
+
+#### Which lighting a static prop actually gets
+
+This is `StudioSetupLighting`'s one real decision (`l_studio.cpp:1430`) and it is the
+thing most likely to be got backwards, because both halves draw a lit prop:
+
+- A prop wearing `vrad`'s per-vertex bake asks `LightcacheGetStatic` for
+  `LIGHTCACHEFLAGS_DYNAMIC | LIGHTCACHEFLAGS_LIGHTSTYLE` — **without**
+  `LIGHTCACHEFLAGS_STATIC` — so its ambient cube and its local lights come back *zeroed*
+  and the baked stream is the whole of its lighting. That is `models::BAKED_LIGHTING`.
+- A prop that does not asks for all three and gets the light cache instead.
+
+The predicate is `bStaticLighting` (`l_studio.cpp:3046`), and the half that decides it is
+`STUDIOHDR_FLAGS_USES_BUMPMAPPING` — set for a model **any** of whose materials has a
+`$bumpmap` or a non-zero `$phong` (`studiorendercontext.cpp:274`). A bumped or phong
+model is lit per pixel, has no `bStaticLight` in its shader at all, and so never reads a
+colour mesh. In this port that lives on `Material::uses_bumpmapping`, is ORed onto
+`PropModel::uses_bumpmapping`, and reaches the draw as `PropModels::light_ranges[i]`:
+**the `.vhv` is not even opened** for such a prop, which is what makes the two decisions
+one decision. On `sp_a1_intro1` the split is **816 baked, 246 per-pixel, 18 with no file
+at all**.
+
+Adding the two together instead — which is what this port did before the local lights
+landed — double-counts every prop's indirect light.
+
+#### The ambient cube is the *leaf* one, and that decides a `continue`
+
+Valve computes a static prop's ambient term by firing 162 rays and sampling the lightmap
+each one hits (`ComputeAmbientFromSphericalSamples`), and every *other* model's by
+interpolating `vrad`'s baked per-leaf cubes (`ComputeAmbientFromLeaf`). The two differ in
+exactly one way, which `R_StudioGetAmbientLightForPoint` reports as
+`bAddedLeafAmbientCube`: **`vrad`'s bake already contains the dim `emit_surface` lights**
+(`leaf_ambient_lighting.cpp:179`), and the runtime gather does not.
+
+This port uses the leaf cubes for everything, so `bAddedLeafAmbientCube` is *true* here
+and the lights flagged `DWL_FLAGS_INAMBIENTCUBE` are dropped at load. That is **6,731 of
+the game's 14,246 world lights**, so getting it backwards is not subtle: it counts nearly
+half the lights in Portal 2 twice.
+
+#### Invariants and gotchas (light)
+
+1. **`lighting_at` returns `static_light` 0, always.** Whether a model also wears a
+   per-vertex bake is not a question about the point it stands at — see above — and the
+   answer decides whether the whole returned state applies. `PropModels::record` is where
+   it is answered.
+2. **A light that wins a local slot is *not* also in the ambient cube.** The two terms
+   partition the lights rather than overlapping: `AddWorldLightToLightingState` returns
+   early when the light takes a slot and falls through to `AddWorldLightToLightCube` when
+   it does not. So no light's energy disappears, and none is counted twice.
+3. **Pass one `Tracer` and keep it.** A fresh one allocates a visit stamp per brush and
+   per displacement; `Props::light` makes one for a whole map's 1,080 props and
+   `EntityModels::load` one for a whole entity list.
+4. **An `emit_surface` light is never rejected for being dim.** Every other kind is
+   dropped below `r_worldlightmin` (0.0002); these bypass the test in two places, because
+   `vrad` has already moved the dim ones into the ambient cube and the ones left are the
+   bright ones. 342 of the game's 7,073 survive that filter.
+5. **The box the light selection uses is the light cache's 32×32×128 grid cell**, not the
+   model's own bounding box — `ComputeLightcacheBounds` around the sample point, whoever
+   is asking. The prop's real box is used only by the dlight path, which is not ported.
+   `light_cache_bounds`' `-(i + 1)` looks wrong and is not: a right shift of a negative
+   number is not the floor Valve wants, so the magnitude is shifted and the sign put back
+   by hand.
+6. **`r_lightcache_radiusfactor` multiplies a *squared* radius in one place and a plain
+   one in the other** (`lightcache.cpp:1105` against `:1117`), so its 1000 is ~31.6× for
+   a point light's box test and 1000× for a spotlight's sphere test. Either way the box
+   tests reject almost nothing and the real cull is the intensity one — which is the
+   point: the comment beside it reads "try harder to get contributions from lights at the
+   edges of their radii".
+7. **The direction register holds the direction the light *shines*, not the one it is
+   seen from.** `m_Direction = pWorldLight->normal` (`l_studio.cpp:252`), and the shader
+   negates it. Writing the reverse lights every outdoor map from underneath.
+8. **`Light::spot`'s zero-spread case is 1, not 0.** `WorldLightToMaterialLight` turns
+   every `emit_surface` light — 7,073 of the game's 14,246 — into a 180° spotlight whose
+   two cone cosines are both 0, and writes `1 / (thetaDot - phiDot)` as **1** by hand.
+   The shader computes `pow( max( 1e-4, (cos - phiDot) * ood ), falloff )`, so a 0 there
+   is not "no penumbra", it is "this light is off".
+9. **The angular term's two vector arguments are the same vector.** Every call is
+   `Engine_WorldLightAngle( light, light.normal, direction, direction )`, because the
+   thing being lit is a *point* and not a surface — so the `dot( snormal, delta )` Lambert
+   factor is always 1 and the cone is the whole answer. The per-pixel `N·L` happens in the
+   shader.
+10. **A skylight is answered by a trace at the sky and by nothing else** — no radius, no
+    falloff. `LightIntensityAndDirectionInBox` takes the brightest of the grid cell's
+    centre and its eight corners, which is **nine traces** per skylight per prop; 28 of
+    the game's lights are skylights. **`direction` comes back holding the *last* corner's
+    answer rather than the brightest one's**, which is Valve's and is load-bearing: a cell
+    whose `maxs` corner is in shadow gets a ratio of 1 and a zero direction, and the
+    angular term then turns that into 0.
+11. **`LightIntensityAndDirectionAtPointOld` is the one that runs.** The "new"
+    shadow-z-buffer form is reached only when `AddStaticLighting` is handed a
+    `lightzbuffer_t`, and `r_lightcache_zbuffercache` defaults to 0. The two differ in
+    more than caching: the old traces from the point to the light and the new from the
+    light to the point, and only the old puts `CONTENTS_BLOCKLIGHT` in the mask.
+12. **Eight units of slack decide shadowing**, not the fraction: `(1 - fraction) * dist >
+    8`. Valve's comment on the line is the single word "hack", and it is what lets a light
+    sitting in the surface of its own fixture still light the room.
+
+#### Not implemented, and what each waits on
+
+- **Lightstyles.** `AddStaticLighting` skips any light with a non-zero `style` and
+  `AddLightStylesForStaticProp` adds it back under `LIGHTCACHEFLAGS_LIGHTSTYLE`, animated
+  by `d_lightstylevalue[]`. Nothing animates a lightstyle here, so those lights are
+  dropped at load — **213 of the game's 14,246**, across styles 32-37, which are the
+  switchable ones a `light` entity owns. They arrive with the lightstyle animator, which
+  is also what the world lightmap's `faces_with_lightstyles` count waits on.
+- **Dynamic lights** (`LIGHTCACHEFLAGS_DYNAMIC`), because `cl_dlights` does not exist.
+- **The cache.** `lightcache_t`, its 200-entry LRU, the hash grid, `FindNearestCache` and
+  `AdjustLightCacheOrigin` are deleted rather than deferred: they exist because Valve
+  recomputed this for moving models every frame, and everything here is lit once, at load,
+  at its exact position — which is strictly better than a bucket-snapped one. The grid
+  cell survives as `light_cache_bounds`, because it is an *argument* to the selection and
+  not just a cache key. The condition that brings the cache back is the first model that
+  moves far enough to be relit.
+- **The PVS reject.** `FastRejectLightSource` asks whether the light's cluster is in the
+  sample point's PVS before doing anything else, and there is no visibility here. Leaving
+  it out is safe rather than approximate: `vvis` is conservative, so a cluster it calls
+  invisible has no sight line and the occlusion trace rejects that light anyway. What it
+  costs is time, and the measurement above says the time is 13 ms a map.
+- **`emit_quakelight`.** It has no hardware form — "Can't do quake lights in hardware
+  (x-r factor)" — so `to_hardware_light` returns `None` and a light that won a slot
+  silently vanishes from the count, exactly as `R_SetNonAmbientLightingState` drops it.
+  `vrad` writes none: **0 in all 106 maps**.
+- **The `.mdl`'s `illumposition`.** A prop's sample point is its origin (or
+  `m_LightingOrigin` where the flag says so) rather than the model's own illumination
+  point transformed into world space — `CStaticProp::GetLightingOrigin`,
+  `staticpropmgr.cpp:579`. Unchanged by this work.
+
+#### Test coverage (light)
+
+`cargo test engine::world::light` — 17, none needing a GPU or a map. The world-light half
+is built on `trace::fixture`, so the occlusion tests sweep a real BSP:
+`a_wall_between_the_point_and_the_light_takes_it_away`,
+`the_local_lights_and_the_ambient_cube_partition_the_lights` (gotcha 2) and
+`a_skylight_reaches_a_point_that_can_see_a_sky_surface`, which is the one caller of
+`Fixture::add_surfaced_box`.
+
+Depot-gated: `every_shipped_map_lights_its_props` reads all 106 maps' worldlight lumps and
+lights every static prop in the game, checking that nothing comes back non-finite — the
+failure mode every guarded division in the module exists for — and printing the census the
+numbers above are quoted from. `props::models::tests::a_per_pixel_prop_is_lit_by_the_world_lights`
+is the one that can say the work *reached the GPU*: it renders a bumped prop on
+`sp_a1_intro1` with its lights and again with them zeroed, and the mean channel goes
+**2.60 against 1.22**.
 
 ### `world::disp` — the terrain
 
@@ -756,8 +943,15 @@ pub struct Bsp {
     pub disp_info: Vec<DispInfo>,
     pub disp_verts: Vec<DispVert>,
     pub disp_tris: Vec<DispTri>,
+    /// `LUMP_WORLDLIGHTS_HDR` or its LDR twin, **as written** — the fixups
+    /// `Mod_LoadWorldlights` applies live in `world::light`.
+    pub world_lights: Vec<WorldLight>,
+    pub world_lights_are_hdr: bool,
     // ...plus the game lumps, leaf ambient lighting and the pak lump.
 }
+
+pub mod emit { /* SURFACE, POINT, SPOTLIGHT, SKYLIGHT, QUAKELIGHT, SKYAMBIENT */ }
+pub mod dwl  { /* IN_AMBIENT_CUBE, CAST_ENTITY_SHADOWS */ }
 
 pub fn world_model(&self) -> &Model;
 pub fn model_faces(&self, model: &Model) -> &[Face];
@@ -792,6 +986,19 @@ has `light_ofs` 0. `Mod_LoadFaces` (`modelloader.cpp:2188`) makes the same choic
 to find it: `vrad` writes one average colour per style *ahead* of the samples and points
 `light_ofs` past them. Verified against `sp_a1_intro1`, where consecutive faces' offsets
 differ by exactly the sample bytes plus the next face's average colours.
+
+**`world_lights_are_hdr` is a separate answer from `lighting_is_hdr`**, because
+`Mod_LoadWorldlights` asks a separate question — it takes the HDR lump whenever *that*
+lump is non-empty (`modelloader.cpp:5311`) — and because the answer changes a number:
+`ComputeLightRadius` halves its cutoff for HDR, "usually our designers scale the light
+intensity by 0.5 in HDR". Measured on the depot: all 106 of Portal 2's maps answer true to
+both.
+
+**Two lumps have a version this reader refuses rather than converts**: `LUMP_LEAFS` and
+`LUMP_WORLDLIGHTS`, whose strides changed between versions and whose old and new forms are
+indistinguishable except by the directory entry. Reading either at the wrong stride gives
+a plausible tree of nonsense, or lights in plausible places with nonsense intensities,
+rather than an error. Portal 2 ships version 1 of both, on all 106 maps.
 
 Versions 19–21 are accepted (`MINBSPVERSION`/`BSPVERSION`); Portal 2 ships 21. The record
 structs are `#[repr(C)]` + `bytemuck::Pod` transcriptions of `public/bspfile.h`, and their

@@ -239,6 +239,15 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The collision model this tracer sweeps against.
+    ///
+    /// Exposed so that a caller holding a tracer does not also have to carry
+    /// the [`CollisionBsp`] it came from — the light cache asks for a leaf and
+    /// then traces, and passing both would let the two disagree.
+    pub fn collision(&self) -> &'a CollisionBsp {
+        self.bsp
+    }
+
     /// Puts brush entities in the clip chain — `ENGINE_TRACE.md` stage 4, and
     /// the thing that makes a door a wall.
     ///

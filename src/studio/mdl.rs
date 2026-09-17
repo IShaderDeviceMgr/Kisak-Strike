@@ -107,6 +107,20 @@ impl StudioFlags {
     pub const AMBIENT_BOOST: Self = Self(1 << 16);
     pub const DO_NOT_CAST_SHADOWS: Self = Self(1 << 17);
     pub const CAST_TEXTURE_SHADOWS: Self = Self(1 << 18);
+    /// `STUDIOHDR_BAKED_VERTEX_LIGHTING_IS_INDIRECT_ONLY` (`studio.h:2486`):
+    /// the `.vhv` holds *bounce* only, so the model wants the light cache's
+    /// direct lighting on top of it rather than instead of it — the one
+    /// configuration in which a static prop's two lighting terms add.
+    ///
+    /// Set at **load** time rather than by the compiler, and only when
+    /// `r_staticlight_streams` is 3 or `r_staticlight_streams_indirect_only`
+    /// is on (`studiorendercontext.cpp:294`); Portal 2's defaults are 1 and
+    /// off, so it is unreachable there. Read by nothing here, and asserted
+    /// clear on every shipped file by
+    /// `tests::every_shipped_studio_model_parses`, because
+    /// `world::props::models`' choice between the two lighting sources assumes
+    /// it.
+    pub const BAKED_VERTEX_LIGHTING_IS_INDIRECT_ONLY: Self = Self(1 << 27);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0

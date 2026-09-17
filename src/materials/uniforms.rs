@@ -359,11 +359,6 @@ impl Light {
 
     /// A spot light. `falloff` is `LightDesc_t::m_Falloff`, and the two dots
     /// are the cosines of the inner and outer cone half-angles.
-    // No caller in the binary yet: the thing that builds these is
-    // `R_StudioSetupLighting`, which arrives with static props. Kept, and
-    // tested, because the `w`-component type encoding they exist to hide is
-    // the part of this ABI that is silent when it is wrong.
-    #[allow(dead_code)]
     pub fn spot(
         color: [f32; 3],
         position: [f32; 3],
@@ -373,12 +368,25 @@ impl Light {
         theta_dot: f32,
         phi_dot: f32,
     ) -> Light {
-        // `LightDesc_t::OneOverThetaDotMinusPhiDot`. A cone whose two angles
-        // are equal is a hard edge, not a division by zero.
-        let ood = if (theta_dot - phi_dot).abs() > f32::EPSILON {
-            1.0 / (theta_dot - phi_dot)
+        // `RecalculateOneOverThetaDotMinusPhiDot` (`lightdesc.cpp:15`). A cone
+        // whose two angles are equal is a **hard edge, not a division by
+        // zero** — and the fallback is Valve's `1.0f`, not 0: the shader
+        // computes `pow( max( 1e-4, (cos - phiDot) * ood ), falloff )`, so a 0
+        // here is not "no penumbra", it is "this light is off".
+        //
+        // That is not a corner case. `WorldLightToMaterialLight` turns every
+        // `emit_surface` world light — 7,073 of Portal 2's 14,246 — into a
+        // 180-degree spotlight whose two dots are both 0, and writes this
+        // register as 1 by hand for exactly that reason.
+        //
+        // The threshold is the original's `1.0e-10f` rather than
+        // `f32::EPSILON`, which is a thousand times larger.
+        let spread = theta_dot - phi_dot;
+        let ood = if spread > 1.0e-10 {
+            // "note - this quantity is very sensitive to round off error"
+            1.0 / spread
         } else {
-            0.0
+            1.0
         };
         Light {
             color: [color[0], color[1], color[2], 0.0],
@@ -390,7 +398,11 @@ impl Light {
     }
 
     /// A directional light. No position, no attenuation.
-    #[allow(dead_code)]
+    ///
+    /// Valve writes the light's own origin into the position register
+    /// (`shaderapidx8.cpp:14044`) and nothing reads it: both the direction to
+    /// the light and its attenuation are selected off `color.w` before the
+    /// position is used. Left at the origin here, which is the same light.
     pub fn directional(color: [f32; 3], direction: [f32; 3]) -> Light {
         Light {
             color: [color[0], color[1], color[2], 1.0],
