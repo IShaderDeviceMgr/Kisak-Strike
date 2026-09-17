@@ -1355,8 +1355,8 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   through an include) and **183 name one that is in no model at all** — Valve's
   own map errors, which the shipped game answers with a `Warning`.
 
-  Five more rules produce a plausible wrong answer rather than an error
-  (`rustdocs/SERVER.md` gotchas 60-64). **A prop's playback rate starts at
+  Six more rules produce a plausible wrong answer rather than an error
+  (`rustdocs/SERVER.md` gotchas 60-65). **A prop's playback rate starts at
   zero, not one** — `CBaseProp::Spawn` sets it and only `ResetSequenceInfo`
   puts it back to 1, which is what makes the 6,046 props with no `DefaultAnim`
   stand perfectly still rather than looping their first sequence. And two
@@ -1366,6 +1366,28 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   for the rest of the level, and **`SetPlaybackRate` re-bases `m_flCycle` and
   `m_flAnimTime`**, which Valve does not touch — without it each of those 427
   `-1`s would snap its prop to a different frame before running it backwards.
+  And the one that was a real bug on the default map: **an empty sequence label
+  is `m_nSequence`'s zero, not "no animation"** — the seam carries a *label*
+  where Valve networks an `int`, and an `int` starts at 0 where a label starts
+  empty. `Spawn` calls `PropSetAnim` only for a prop with a `DefaultAnim`, and
+  `PropSetAnim` answers a name the model does not have with an explicit
+  `SetSequence( 0 )`, so **every prop in the game is posed by some sequence**
+  and the bind pose belongs to a model with none.
+
+  **That matters because a bind pose is not a pose anybody ever looked at.**
+  For most models it happens to equal sequence 0 frame 0; for **20 of
+  `sp_a1_intro1`'s 91 entity models** it does not.
+  `props_motel/hotel_container_furniture01`-`03` — the intro room's dresser,
+  wardrobe and desk — bind at `rot_x(+90)` against a `poseToBone` of
+  `rot_x(-90)`, whose product is the identity, while their `idle` holds
+  `Quaternion64(0.5, 0.5, 0.5, 0.5)`, a 120° turn about `(1,1,1)`, which
+  against the same `poseToBone` is `rot_z(+90)`. Drawn from the bind pose all
+  three came out a quarter turn wrong and standing inside the bed — and the bed
+  is `hotel_container_furniture04`, a **static prop** at the same anchor and
+  the same yaw, on a path that never looks at a sequence, so it stayed put and
+  the three around it did not. The `.mdl` says so without rendering anything:
+  `hull_min`/`hull_max` and the `.vvd`'s own vertex bounds differ by exactly
+  that quarter turn.
 
   It changed three things outside the class. `ModelEntityState`/`ModelEntity`
   are **keyed on an opaque id and carry `visible`**, where they were positional

@@ -558,6 +558,9 @@ pub trait Behaviour: Any {
 /// an index, because looking one up needs the `.mdl` and this module names no
 /// studio type — and it is borrowed, because a `prop_dynamic`'s comes out of
 /// the map and there are 1,141 distinct ones in the game.
+///
+/// **An empty label, or one the model does not have, means `m_nSequence`'s
+/// zero — not "no animation".** See gotcha 65; the engine closes it.
 pub struct ModelState<'a> {
     pub sequence: &'a str, pub cycle: f32, pub anim_time: f32,
     pub playback_rate: f32, pub skin: i32,
@@ -1778,6 +1781,23 @@ entity built is not there start at 47, and if something will not die start at
     survive is `m_bAnimationDone = false`: without it a looping sequence
     followed by a finite one fires no `OnAnimationDone`.
 
+65. **An empty sequence label is sequence 0, and the engine is what knows it.**
+    `ModelState::sequence` is a label where Valve networks `m_nSequence` as an
+    `int`, and the two differ in exactly one place: an `int` starts at zero and
+    a label starts empty. `CDynamicProp::Spawn` calls `PropSetAnim` only for a
+    prop carrying a `DefaultAnim` (`props.cpp:2036`), and `PropSetAnim` answers
+    a name the model does not have with an explicit `SetSequence( 0 )`
+    (`props.cpp:2422`) — so **every prop in the game is posed by some
+    sequence**, 6,046 of the 8,462 by sequence 0 alone.
+
+    This side is right to leave the label empty: the server cannot look one up.
+    What must not happen is the *engine* reading "no label" as "no animation",
+    because that is the bind pose, and a bind pose is not a pose anybody ever
+    looked at — `props_motel/hotel_container_furniture01`-`03` are a quarter
+    turn away from their own `idle`, which stands `sp_a1_intro1`'s furniture
+    inside the bed. `EntityModels` resolves an unknown label to 0; see
+    `rustdocs/ENGINE.md`'s `world::entities`.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2039,6 +2059,7 @@ case values.
 | `tests::only_an_override_prop_may_be_given_health_by_the_map` | `CBaseProp::KeyValue`'s one line |
 | `tests::a_sequence_the_model_does_not_have_is_refused_once_the_models_are_loaded` | `PropSetAnim`'s failure branch, and `Lookup::Missing` |
 | `sequences::a_model_nobody_loaded_is_not_a_model_without_the_sequence` | gotcha 62 |
+| `engine::world::entities::tests::a_prop_with_no_default_anim_is_posed_by_sequence_zero` | gotcha 65 — depot-gated |
 | `engine::world::entities::the_button_draws_and_moves_as_it_presses` | the pose reaching the right geometry (`rustdocs/ENGINE.md`) |
 | `tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for` | **the depot test**: 8,462 props across 106 maps, 606 models, and what `$includemodel`, flex deltas and the missing skinning each cost |
 | `tests::filter_multi_combines_its_children` | the handler that reads other entities |

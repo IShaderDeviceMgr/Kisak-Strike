@@ -1641,6 +1641,38 @@ does not touch. Same cause, opposite sign: the pose at that instant is
 identical, and without it each of the 427 `SetPlaybackRate -1` connections
 would snap its prop to a different frame before running it backwards.
 
+#### The label seam's one gap: an empty label is sequence 0
+
+`ModelState::sequence` is a label where `DT_BaseAnimating` networks
+`m_nSequence` as an `int`, and the two differ in exactly one place: an `int`
+starts at zero and a label starts empty. `CDynamicProp::Spawn` calls
+`PropSetAnim` only for a prop carrying a `DefaultAnim` (`props.cpp:2036`), and
+`PropSetAnim` answers a name the model does not have with an explicit
+`SetSequence( 0 )` (`props.cpp:2422`) — so **every prop in the game is posed by
+some sequence**, 6,046 of the 8,462 by sequence 0 with no `DefaultAnim` at all
+and 183 more because the name their map wrote is in no model.
+
+The server side is right to send an empty label; it cannot look one up. The
+*engine* is what must not read it as "no animation", because that is the bind
+pose — and **a bind pose is not a pose anybody ever looked at**. For most models
+it happens to equal sequence 0 frame 0 and nothing shows; for **20 of
+`sp_a1_intro1`'s 91 entity models** it does not.
+`props_motel/hotel_container_furniture01`-`03` bind at `rot_x(+90)` against a
+`poseToBone` of `rot_x(-90)` — the identity — while their `idle` holds
+`Quaternion64(0.5, 0.5, 0.5, 0.5)`, a 120° turn about `(1,1,1)`, which against
+the same `poseToBone` is `rot_z(+90)`. Drawn from the bind pose the intro room's
+dresser, wardrobe and desk came out a quarter turn wrong and standing inside the
+bed, which is `hotel_container_furniture04` — a **static prop**, at the same
+anchor and the same yaw, on a path that never looks at a sequence, so it stayed
+put while the three around it did not.
+
+Two things are worth carrying forward from finding it. The `.mdl` says so
+without rendering anything: a model whose `hull_min`/`hull_max` disagrees with
+its own `.vvd` vertex bounds is posed by something. And the failure is
+*invisible in the shape of the code* — both paths compute a matrix, both
+compose it the same way, and the wrong one is the identity, which is exactly
+what a correct one looks like for every other model on the map.
+
 #### What it changed outside the class
 
 - `ModelEntityState`/`ModelEntity` are **keyed on an opaque id and carry
@@ -1668,6 +1700,11 @@ only test in `server/` that names a `studio` type, and it does so because this
 is the *seam* — fills the sequence table exactly as `Engine::load_level` does,
 and runs two seconds. It is what pins the 8,462, the 606 models, and the
 `$includemodel` cost.
+
+`engine::world::entities::tests::a_prop_with_no_default_anim_is_posed_by_sequence_zero`
+is the other half, and it is on the engine side because that is where the
+fallback lives: it loads `sp_a1_intro1`'s models and asserts the three furniture
+props are posed by `rot_z(+90)` rather than the identity.
 
 ### Beyond
 

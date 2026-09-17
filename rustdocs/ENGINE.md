@@ -526,7 +526,7 @@ pub struct ModelEntity {
     pub angles: Vec3,         // pitch, yaw, roll
     pub skin: i32,
     pub visible: bool,        // ShouldDraw; an invisible one is still uploaded
-    pub sequence: String,     // the LABEL — "up", "down"; "" is the bind pose
+    pub sequence: String,     // the LABEL — "up", "down"; "" is sequence 0
     pub cycle: f32,           // where in the sequence it was at anim_time
     pub anim_time: f32,       // when that was
     pub playback_rate: f32,   // signed; 0 holds the pose
@@ -561,7 +561,7 @@ followed places **8,462 entities across 105 of the 106 maps, 90 of them from 52
 models on `sp_a1_intro1` alone**. Everything below either dates from the button
 or was changed by the prop.
 
-Five things about it are worth knowing.
+Six things about it are worth knowing.
 
 - **The join with the game is a sequence *name*, and the cycle is the engine's.**
   The server says which sequence, where in it the entity was, when that was, and
@@ -573,6 +573,32 @@ Five things about it are worth knowing.
   into a pose, and it is what keeps `server/`'s promise to name no studio type.
   It also makes the animation smooth where the server's 64 Hz ticks would step
   it.
+
+- **A label that resolves to nothing is sequence 0, not the bind pose.** This
+  is the one place the label seam does not say what Valve's seam says, and it
+  has to be closed by hand. `m_nSequence` is an `int` that starts at zero, and
+  `CDynamicProp` only ever moves it off zero deliberately: `Spawn` calls
+  `PropSetAnim` only for a prop that has a `DefaultAnim` (`props.cpp:2036`),
+  and `PropSetAnim` answers a name the model does not have with an explicit
+  `SetSequence( 0 )` (`props.cpp:2422`). So **every prop in the game is posed
+  by some sequence** — 6,046 of the 8,462 have no `DefaultAnim` at all and 183
+  more name a sequence that is in no model — and the bind pose is reachable
+  only by a model with no sequences whatsoever.
+
+  The reason to care is that **a bind pose is not a pose anybody ever looked
+  at**. For most models it happens to equal sequence 0 frame 0 and the
+  difference cannot be seen; for 20 of `sp_a1_intro1`'s 91 entity models it
+  cannot. `props_motel/hotel_container_furniture01`-`03` bind at `rot_x(+90)`
+  against a `poseToBone` of `rot_x(-90)`, whose product is the identity, while
+  their `idle` holds `Quaternion64(0.5, 0.5, 0.5, 0.5)` — a 120° turn about
+  `(1,1,1)` — and *that* against the same `poseToBone` is `rot_z(+90)`. Posed
+  from the bind pose the intro room's dresser, wardrobe and desk come out a
+  quarter turn wrong and standing inside the bed, which is
+  `hotel_container_furniture04` and a **static prop**: the static path never
+  looks at a sequence, so the bed stays where it belongs and the three around
+  it do not.
+  `entities::tests::a_prop_with_no_default_anim_is_posed_by_sequence_zero`
+  pins it.
 
 - **`sequences()` is the same seam pointing the other way.** The game needs to
   know when an animation has *ended* — `CDynamicProp::AnimThink` fires

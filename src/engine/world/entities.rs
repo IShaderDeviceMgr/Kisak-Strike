@@ -109,9 +109,24 @@ struct Instance {
     /// entirely is set invisible and left in place rather than removed, so
     /// that the model it uploaded stays valid for its neighbours.
     visible: bool,
-    /// The sequence index this model has for the entity's label, or `None` for
-    /// the bind pose.
-    sequence: Option<usize>,
+    /// `m_nSequence` — which of the model's sequences poses it.
+    ///
+    /// **A label that resolves to nothing is sequence 0, not "no sequence".**
+    /// `m_nSequence` is an `int` that starts at zero, and `CDynamicProp` only
+    /// ever moves it off zero deliberately: a prop with no `DefaultAnim` never
+    /// calls `PropSetAnim` at all (`props.cpp:2036`), and one whose
+    /// `DefaultAnim` names a sequence its model does not have is answered with
+    /// an explicit `SetSequence( 0 )` (`props.cpp:2422`). So every prop in the
+    /// game is posed by *some* sequence, and the bind pose is reached only by
+    /// a model that has none at all.
+    ///
+    /// That distinction is not academic, because a bind pose is not a pose the
+    /// artist ever looked at. `props_motel/hotel_container_furniture01`-`03`
+    /// bind at `rot_x(+90)` and their `idle` holds a 120° turn about
+    /// `(1,1,1)`, whose product with `poseToBone` is `rot_z(+90)` — so posing
+    /// them from the bind pose turns `sp_a1_intro1`'s furniture a quarter turn
+    /// and stands it in the bed.
+    sequence: usize,
     cycle: f32,
     anim_time: f32,
     playback_rate: f32,
@@ -244,7 +259,7 @@ impl EntityModels {
                 transform: Mat4::from_translation(entity.origin)
                     * Mat4::from_mat3(crate::math::angle_matrix(entity.angles)),
                 visible: entity.visible,
-                sequence: model.sequence(&entity.sequence),
+                sequence: model.sequence(&entity.sequence).unwrap_or(0),
                 cycle: entity.cycle,
                 anim_time: entity.anim_time,
                 playback_rate: entity.playback_rate,
@@ -313,7 +328,9 @@ impl EntityModels {
             instance.transform = Mat4::from_translation(entity.origin)
                 * Mat4::from_mat3(crate::math::angle_matrix(entity.angles));
             instance.visible = entity.visible;
-            instance.sequence = self.models[instance.model].sequence(&entity.sequence);
+            instance.sequence = self.models[instance.model]
+                .sequence(&entity.sequence)
+                .unwrap_or(0);
             instance.cycle = entity.cycle;
             instance.anim_time = entity.anim_time;
             instance.playback_rate = entity.playback_rate;
@@ -394,7 +411,7 @@ impl EntityModels {
             // One pose per instance per frame: three `Mat4`s for a button.
             // Taken before the batch loop because every batch of one instance
             // shares it.
-            let pose = model.pose(instance.sequence.unwrap_or(usize::MAX), self.cycle(instance, curtime));
+            let pose = model.pose(instance.sequence, self.cycle(instance, curtime));
 
             pass.set_model_lighting(&instance.lighting);
             pass.bind_static_light(&unlit);
@@ -438,9 +455,7 @@ impl EntityModels {
     /// > number is negative.
     fn cycle(&self, instance: &Instance, curtime: f32) -> f32 {
         let model = &self.models[instance.model];
-        let Some(sequence) = instance.sequence else {
-            return 0.0;
-        };
+        let sequence = instance.sequence;
         let Some(anim) = model.animation(sequence) else {
             return 0.0;
         };
@@ -716,6 +731,134 @@ mod tests {
              {same} pixels differ"
         );
     }
+
+    /// **A prop with no `DefaultAnim` is posed by sequence 0, not by its bind
+    /// pose** — and `sp_a1_intro1`'s furniture is what says so.
+    ///
+    /// `m_nSequence` is an `int` that starts at zero, so every prop in the
+    /// game is posed by *some* sequence: `CDynamicProp::Spawn` calls
+    /// `PropSetAnim` only for a prop that has a `DefaultAnim`
+    /// (`props.cpp:2036`), and `PropSetAnim` answers a name its model does not
+    /// have with an explicit `SetSequence( 0 )` (`props.cpp:2422`). This
+    /// port's seam carries a sequence *label*, and a label that resolves to
+    /// nothing has to mean sequence 0 for the same reason — "no animation",
+    /// which is the bind pose, is reachable only by a model with no sequences
+    /// at all.
+    ///
+    /// For most models the two are the same matrix and the difference cannot
+    /// be seen. **A bind pose is not a pose anybody ever looked at**, though,
+    /// and `props_motel/hotel_container_furniture01`-`03` are a quarter turn
+    /// apart: the single bone binds at `rot_x(+90)` against a `poseToBone` of
+    /// `rot_x(-90)`, whose product is the identity, while `idle` frame 0 holds
+    /// a 120° turn about `(1,1,1)` — `Quaternion64(0.5, 0.5, 0.5, 0.5)` — and
+    /// *that* against the same `poseToBone` is `rot_z(+90)`.
+    ///
+    /// So posed from the bind pose the room's dresser, wardrobe and desk come
+    /// out turned ninety degrees and standing in the bed. The bed is
+    /// `hotel_container_furniture04`, and it is a **static prop** on a path
+    /// that never looks at a sequence — so it stays where it belongs and the
+    /// error is plain to see rather than moving everything together.
+    ///
+    /// The check is geometric rather than rendered: the posed, placed vertices
+    /// of each of the three must clear the bed's own box. Sharing an anchor
+    /// and a yaw with it, they cannot pass that by accident.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release posed_by_sequence_zero -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
+    fn a_prop_with_no_default_anim_is_posed_by_sequence_zero() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let mut materials = MaterialCache::new(&device, &queue);
+        let map = "sp_a1_intro1";
+        let mut world =
+            super::super::World::load(&vfs, &mut materials, &device, map).expect("the map loads");
+
+        let mut server = Server::new();
+        server.level_init(map, &world.entities, &world.models);
+        let placements: Vec<ModelEntity> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| ModelEntity {
+                id: e.id,
+                model: e.model,
+                origin: e.origin,
+                angles: e.angles,
+                skin: e.skin,
+                visible: e.visible,
+                sequence: e.sequence,
+                cycle: e.cycle,
+                anim_time: e.anim_time,
+                playback_rate: e.playback_rate,
+            })
+            .collect();
+        world.load_entity_models(&vfs, &mut materials, &device, &placements);
+
+        // What the whole map says, before the three under test: how many of
+        // its models are posed differently by sequence 0 than by their bind
+        // pose. It is a small minority, which is exactly why the fallback was
+        // wrong for a year of frames without anybody noticing.
+        let mut differ = 0;
+        for instance in &world.entity_models.instances {
+            let model = &world.entity_models.models[instance.model];
+            let posed = model.pose(instance.sequence, 0.0);
+            let bind = model.pose(usize::MAX, 0.0);
+            if !posed
+                .iter()
+                .zip(&bind)
+                .all(|(a, b)| a.abs_diff_eq(*b, 1e-4))
+            {
+                differ += 1;
+            }
+        }
+        println!(
+            "{} of {} instances are posed away from their bind pose",
+            differ,
+            world.entity_models.instances.len()
+        );
+
+        // `rot_z(+90)`: the 120° turn about `(1,1,1)` that `idle` frame 0
+        // holds, times the bone's `rot_x(-90)` `poseToBone`.
+        let quarter = Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let mut checked = 0;
+        for instance in &world.entity_models.instances {
+            let model = &world.entity_models.models[instance.model];
+            if !model
+                .name
+                .to_ascii_lowercase()
+                .contains("hotel_container_furniture")
+            {
+                continue;
+            }
+            // Nothing on this map gives one a `DefaultAnim`, so the label the
+            // server sends is empty and this is the fallback under test.
+            assert_eq!(
+                instance.sequence, 0,
+                "{} should be posed by sequence 0",
+                model.name
+            );
+            let pose = model.pose(instance.sequence, 0.0);
+            assert_eq!(pose.len(), 1, "{} has one bone", model.name);
+            println!("{}: {:?}", model.name, pose[0]);
+            assert!(
+                pose[0].abs_diff_eq(quarter, 1e-4),
+                "{} is posed by {:?}, not the quarter turn its `idle` holds — \
+                 it is being drawn in its bind pose, which stands it in the bed",
+                model.name,
+                pose[0]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "sp_a1_intro1 places three furniture props");
+    }
 }
-
-

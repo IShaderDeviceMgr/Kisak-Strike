@@ -371,6 +371,18 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
    inside out — and with no animation playing, *with* it every matrix is the
    identity, which is the property that lets one draw path serve both.
 
+   **What does not follow is that the bind pose is a safe default.** `pose`'s
+   `anim: None` is the bind pose, and that is the right answer only for a model
+   with no sequences at all — never for "I could not resolve which sequence".
+   `m_nSequence` starts at zero, so real content is always posed by sequence 0,
+   and **an artist never looks at the bind pose**:
+   `props_motel/hotel_container_furniture01`-`03` bind at `rot_x(+90)` with a
+   `poseToBone` of `rot_x(-90)` — identity, as above — while their one sequence
+   holds a 120° turn about `(1,1,1)`, so the two are a quarter turn apart and
+   the bind pose stands `sp_a1_intro1`'s furniture inside the bed. A quick way
+   to spot a model like that without rendering it: its `hull_min`/`hull_max`
+   and its `.vvd` vertex bounds will not agree.
+
 17. **A material naming a brush shader cannot draw a prop**, and vice versa. A
    prop's geometry is `ModelVertex` and nothing else, so `PropModels::load`
    substitutes `MaterialCache::error_model_material()` — a second checkerboard
