@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 907 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 922 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -86,6 +86,11 @@ studio *animation* and the first entity-placed model in the port.
 away at the rate the map asked for, and at zero the body drops, the camera
 falls to fourteen units off the floor, and three seconds later the level starts
 again — which is what single-player Portal 2 does, minus the save.
+**And the map is furnished**: `prop_dynamic` is 8,462 entities across 105 of
+the game's 106 maps — the second commonest classname in Portal 2 — so the
+signs, pipes, panel arms and machinery a chamber is built out of now draw,
+and they *animate*, on the sequence the map names and for as long as the map
+says.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it — but the boot path is
 continuous from `main` to a rendered, lit, self-starting level you can walk
@@ -119,7 +124,10 @@ static props, and it is ported now — so the container's observation window and
 light covers refract instead of drawing as checkerboards, and that window is why the map
 takes the second, frame-buffer-copy pass.) **26 of its 78 brush
 entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
-triangles, each under the placement its entity gives it. **The scene is auto-exposed**: it is drawn into an
+triangles, each under the placement its entity gives it — and since `prop_dynamic`
+landed, **so do 90 entity-placed models from 52 more `.mdl`s**, which is the furniture
+the map is made of rather than the shell it sits in.
+**The scene is auto-exposed**: it is drawn into an
 offscreen target, a compute pass bins its pixels by luminance, and a port of
 `CTonemapSystem` picks the scalar the lit shaders multiply by — `tonemap` in the console
 reports what it is doing. **The map's own exposure limits apply too**, now that entities run: 105 of the game's
@@ -768,7 +776,16 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   lights on a prop. **`studio/anim.rs` landed later, with `prop_floor_button`** — bones,
   sequences and the RLE animation blocks, plus the `R_StudioSetupBones` slice that poses
   them; skinning is *replaced* by a per-bone draw split rather than deferred, which is
-  exact for every model the port draws. See `src/server/`, below. `CMDLCache`'s eviction, budgets and async queues are
+  exact for every model the port draws. See `src/server/`, below.
+  **`prop_dynamic` measured two gaps in that half.** `$includemodel` is the larger: 9
+  of the 606 models the game's props name keep their sequences in a companion
+  `*_animation.mdl`, **926 entities wear one**, and until
+  `CStudioHdr::ResolveIncludedModels` and its bone remapping land those 926 stand in
+  their bind pose. And **flex deltas stop being academic**: the 16 models the reader
+  refuses are `models/props_destruction/toxin*`, 15 of them are placed as
+  `prop_dynamic`s by **41 entities**, and those 41 draw nothing. The "absent from the
+  data" claim below is about *static props* and is still exactly true; `prop_dynamic`
+  is the first thing in the port that places a model that is not one. `CMDLCache`'s eviction, budgets and async queues are
   **deleted rather than deferred**, and so are skinning, flexes and sub-d — which are
   absent from the *data*: all 968 models Portal 2 places as static props have one bone,
   trilist strips and no flex deltas. **API: `rustdocs/STUDIO.md`** — read it before
@@ -800,9 +817,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   instead of from `optimize.h`; the second found the hardware-order rule.
   `portdocs/STUDIO.md` §11 has both.
 - **`src/server/` — all five stages of `portdocs/SERVER.md` ported, plus
-  `prop_floor_button`**, and with them the map's **entity logic runs, its brush
-  entities move, it notices the player, a pad you stand on presses — and the
-  player can be hurt, and can die**. Valve's `server.so` — 446,861 lines, of which the framework is
+  `prop_floor_button` and `prop_dynamic`**, and with them the map's **entity logic
+  runs, its brush entities move, it notices the player, a pad you stand on
+  presses, the models it places draw and animate — and the player can be hurt,
+  and can die**. Valve's `server.so` — 446,861 lines, of which the framework is
   ~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
   entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
   own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
@@ -1093,7 +1111,14 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `a4_destruction` set), so `StudioModel::rigid_bones` checks the precondition
   rather than assuming it, a model that fails it is drawn in its bind pose and
   counted, and those 141 are the condition that makes real skinning worth
-  writing.
+  writing. **`prop_dynamic` cashed that condition in.** It places models rather
+  than static props, so it reaches them: **74 of the 591 readable models the
+  game's props name share a vertex between bones, and 290 entities wear one**,
+  drawn in their bind pose instead of animating. Seven of those models are on
+  `sp_a1_intro1` — the `models/container_ride/finedebris_part*` set — so it is
+  visible on the map this port loads by default rather than only in a census.
+  Skinning is now the *second*-largest gap in the model path, behind
+  `$includemodel`'s 926.
   **The RLE stream is expanded at load, not walked at draw**, because a whole
   button model's animation is a few hundred bytes — the game's longest is
   **4,050 frames**, which is the matching bound on that decision.
@@ -1265,6 +1290,91 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   (Portal has none), drowning, the HEV suit, and everything else that can hurt
   you — turrets, crushers, `prop_physics`. `trigger_hurt` is the whole damage
   surface the shipped maps reach.
+
+  **`prop_dynamic` landed after stage 5, and it is the biggest class in the
+  game.** `CDynamicProp` across its four classnames — `prop_dynamic` (8,072),
+  `prop_dynamic_override` (390), and `dynamic_prop`/`prop_dynamic_glow`, which
+  Valve registers and no map places — is **8,462 entities across 105 of the 106
+  maps**, ten short of `logic_relay` and ahead of everything else. It carries
+  **5,311 `SetAnimation` connections**, more than any other input in the game
+  reaches an implemented class, and 1,141 distinct sequence names. That takes
+  the port to **43 registered classnames and 34,506 of the game's 60,925 entity
+  blocks** — 38 of them among the 200 the maps place. **`sp_a1_intro1` gains 90
+  of them from 52 models**, so the default map's signage, pipework and panels
+  draw for the first time.
+
+  The plan's "Beyond" list had it as *"needs `studio/` stage 6 and skin
+  families"* and **that was wrong**: skin families decide which texture a model
+  wears, `m_nSkin` is `0` on 7,808 of the 8,462, and what the class needed was
+  what `studio/` already had after `prop_floor_button` — bones, sequences and
+  the RLE animation blocks.
+
+  Six findings.
+  **The classname is behaviour, and a rename two statements later hides it.**
+  `CDynamicProp::Spawn` promotes a `SOLID_NONE` prop to `SOLID_OBB` only
+  `if ( FClassnameIs( this, "prop_dynamic" ) )` — and *then* renames
+  `prop_dynamic_override` to `prop_dynamic`. So 2,622 props take the promotion
+  and **211 `_override`s with the identical `solid 0` do not**.
+  `CBaseProp::KeyValue` asks the same question about `health`, swallowing the
+  key for everything but an `_override`; all 344 shipped keys write `0`.
+  **`GotoSequence` deletes on a measurement.** The sequence *transition graph*
+  — `$node`/`$transition`, which walks an NPC from "stand" to "crouch" through
+  an intermediate — opens with "bail if we're going to or from a node 0", and
+  across the **2,597 sequences of the 606 models the game's props name, not one
+  has a non-zero entry or exit node and not one has `nodeflags`**. So no other
+  branch is reachable, `m_iTransitionDirection` is `+1` everywhere, and every
+  sequence starts playing *forwards* — which is why the 427 `SetPlaybackRate
+  -1` connections in the game violate Valve's own `Assert` in `AnimThink`.
+  **The server needed a fact from a `.mdl` and the answer is a table, not a
+  call.** `AnimThink` fires `OnAnimationDone` (181 connections, **10 of them on
+  `sp_a1_intro1`**) and reverts a finished animation to `DefaultAnim` (2,416
+  props); both need the sequence's duration, and `server/` names no `studio`
+  type. `src/server/sequences.rs` holds the *answers* — a duration and a loop
+  flag per model and label — and `Engine::load_level` fills it in from the
+  models `World::load_entity_models` has just read. Same shape as `world/`'s
+  `Placement`, pointing the other way.
+  **It forced a third answer onto that lookup.** A level loads `World::load` →
+  `Server::level_init` → `World::load_entity_models`, and it cannot load in any
+  other order, because the models an entity places are named by the entities.
+  So **every `Spawn` in the game runs against an empty table**, and "nobody has
+  loaded this model" has to be told apart from "it is loaded and has no such
+  sequence": `Lookup::Unknown` succeeds where `LookupSequence` would have and
+  yields no duration, so an animation with no model never finishes.
+  **`ParsePropData` is a deletion, and it costs twelve entities.** A plain
+  `prop_dynamic` whose model carries a `prop_data` block is removed at load by
+  the shipped game with a `DevWarning`; an `_override` is not, which is what
+  that classname is *for*. 15 of the 606 models have such a block and 106
+  entities wear one — but **94 of the 106 are `prop_dynamic_override`**, so not
+  porting the whole propdata system leaves **12 entities across three maps**
+  drawn that the shipped game deletes.
+  And **`$includemodel` is the measured gap, and it belongs to `studio/`**:
+  nine of the 606 models keep their sequences in a companion
+  `*_animation.mdl`, **926 entities wear one**, and their labels resolve to
+  nothing here so they stand in their bind pose. Of the game's 2,416
+  `DefaultAnim` keys 2,233 name a sequence that exists somewhere (849 only
+  through an include) and **183 name one that is in no model at all** — Valve's
+  own map errors, which the shipped game answers with a `Warning`.
+
+  Five more rules produce a plausible wrong answer rather than an error
+  (`rustdocs/SERVER.md` gotchas 60-64). **A prop's playback rate starts at
+  zero, not one** — `CBaseProp::Spawn` sets it and only `ResetSequenceInfo`
+  puts it back to 1, which is what makes the 6,046 props with no `DefaultAnim`
+  stand perfectly still rather than looping their first sequence. And two
+  divergences follow from the port *deriving* the cycle instead of accumulating
+  it: **`AnimThink` cancels itself** once its sequence cannot end (looping,
+  zero-length, or a model that never loaded) where Valve re-arms it at 10 Hz
+  for the rest of the level, and **`SetPlaybackRate` re-bases `m_flCycle` and
+  `m_flAnimTime`**, which Valve does not touch — without it each of those 427
+  `-1`s would snap its prop to a different frame before running it backwards.
+
+  It changed three things outside the class. `ModelEntityState`/`ModelEntity`
+  are **keyed on an opaque id and carry `visible`**, where they were positional
+  and `EF_NODRAW`-filtered — forced by the 556 `Kill` connections aimed at a
+  prop and the 1,000 props that are `StartDisabled`. `ModelState::sequence` is
+  a `&str` rather than a `&'static str`, because a prop's comes out of the map.
+  And `CBaseEntity` gained the `solid` key — measured: **only the prop family
+  writes it** — and the `DisableDraw`/`EnableDraw` inputs, whose 206 shipped
+  connections are **all** aimed at a `prop_dynamic`.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -1272,19 +1382,30 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
 the way, and times the CPU. **`engine::exposure` is its sibling** — same shape, same
 gating — and answers the other headless question: where the exposure settles on a real map
 and what the histogram looks like when it gets there. On `sp_a1_intro1` at 1280x720 the
-two passes the tone mapper added cost **0.008 ms of CPU a frame** against 1.21 ms for the
-world draw they sit around. Reach for it before and after any change to the draw path —
+two passes the tone mapper added cost **0.004 ms of CPU a frame** against 0.64 ms for the
+scene draw they sit around — read as a ratio rather than as absolutes, because both move
+together with thermal state (an earlier run read 0.008 against 1.21). Reach for it before and after any change to the draw path —
 the running game cannot be profiled from outside, because macOS stops delivering redraws
 to an occluded window and `sample` only ever shows a main thread parked in `mach_msg`.
-`sp_a1_intro1` records a whole frame in **about 1 ms** (release) / 6.6 ms (debug); it was
-12.7 ms when static props first drew, and `portdocs/STUDIO.md` §11.8 has what the three
-causes were. Terrain did not move that number: it added 2 batches and 1,408 triangles to a
-frame whose cost is 1,080 prop draws. **`Refract` did move it, and it is the copy rather
-than the draw**: the whole frame goes from **1.19 ms to 1.41 ms** on `sp_a1_intro1`, for
-one full-screen `copy_texture_to_texture` and one extra pass recording a single prop —
-which is why `needs_frame_buffer_copy` gates both and 35 of the game's 106 maps pay
-neither. Run the four sub-benchmarks on their own — back to back they share thermal
-state and read 2x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
+`sp_a1_intro1` records a whole frame in **1.86 ms** (release, 2.14 with the refracting
+pass) / 6.6 ms (debug); it was 12.7 ms when static props first drew, and
+`portdocs/STUDIO.md` §11.8 has what the three causes were. Terrain did not move that
+number: it added 2 batches and 1,408 triangles to a frame whose cost is 1,080 prop draws.
+**`Refract` did move it, and it is the copy rather than the draw** — one full-screen
+`copy_texture_to_texture` and one extra pass recording a single prop, which is why
+`needs_frame_buffer_copy` gates both and 35 of the game's 106 maps pay neither.
+**`prop_dynamic` moved it more than anything since static props**: the five
+sub-benchmarks are now 0.25 ms of world brushes, 0.10 of brush models, 1.01 of static
+props and **0.72 of entity models**, so the class costs about 60% of what all 1,080
+static props do — for 91 instances, because they carry **355,469 triangles against the
+props' 224,924** and each bone run is its own draw.
+**The benchmark itself had to be fixed to see that**, and the fix is worth knowing about:
+`World::load` cannot read the models an entity places, because they are named by the
+entity lump it has just parsed — so `bench` now spawns a `Server` and calls
+`load_entity_models`, the same two calls `Level::load` makes. Before that it was silently
+measuring a frame with the largest thing in it missing.
+Run the five sub-benchmarks on their own — back to back they share thermal
+state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the
 second is A/B/A, not A/B.
@@ -1309,11 +1430,19 @@ The candidates, in the order they are worth doing:
   without standing on something that moves.
 - **The local/abs transform pair on `EntityCore`**, which is smaller than a stage and
   unblocks two things at once: `SetParent`/`ClearParent`/`SetParentAttachment*` —
-  **1,078 of the 1,081 inputs the depot test reports as unhandled** — and parented
+  **1,103 of the 1,285 inputs the depot test reports as unhandled** — and parented
   movers, which currently move in world space where Valve moves them in the parent's
-  frame (174 of the game's 1,164 movers name a parent). The attachment forms also want
+  frame (174 of the game's 1,164 movers name a parent). `prop_dynamic` raised the
+  stakes: **2,355 of the game's 8,462 props name a `parentname`**, and 177 of the
+  unhandled inputs are now theirs. The attachment forms also want
   `LookupAttachment` on a studio model, which would be `server/`'s first dependency on
   `studio/`.
+- **`$includemodel` in `src/studio/`** — `CStudioHdr::ResolveIncludedModels` and the
+  bone remapping under it. Nine of the 606 models the game's `prop_dynamic`s name keep
+  their sequences in a companion `*_animation.mdl`, and **926 entities wear one**, so
+  their animations resolve to nothing and they stand in their bind pose. It is the
+  largest measured gap `prop_dynamic` left, and it is `studio/`'s rather than
+  `server/`'s.
 - **The local lights on a static prop** — `LightcacheGetStatic`'s other half, which
   `world::props::lighting_for` currently answers with `count: 0`. It has just become the
   most *visible* thing missing from the model path: `Phong` is ported and its specular

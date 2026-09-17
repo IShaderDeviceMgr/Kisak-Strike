@@ -962,14 +962,37 @@ fn model_entities(server: &Server) -> Vec<world::entities::ModelEntity> {
         .model_entities()
         .into_iter()
         .map(|entity| world::entities::ModelEntity {
+            id: entity.id,
             model: entity.model,
             origin: entity.origin,
             angles: entity.angles,
             skin: entity.skin,
+            visible: entity.visible,
             sequence: entity.sequence,
+            cycle: entity.cycle,
             anim_time: entity.anim_time,
+            playback_rate: entity.playback_rate,
         })
         .collect()
+}
+
+/// `(model, label, duration, loops)` rows into one entry per model.
+///
+/// The flat iterator is what `world/` can produce without allocating a map of
+/// its own; the grouping is what `server/`'s table wants. One place rather
+/// than either side, because it is neither module's business.
+fn group_sequences<'a>(
+    rows: impl Iterator<Item = (&'a str, &'a str, f32, bool)>,
+) -> Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> {
+    let mut out: Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> = Vec::new();
+    for (model, label, duration, loops) in rows {
+        let info = crate::server::sequences::SequenceInfo { duration, loops };
+        match out.iter_mut().find(|(name, _)| name == model) {
+            Some((_, labels)) => labels.push((label.to_owned(), info)),
+            None => out.push((model.to_owned(), vec![(label.to_owned(), info)])),
+        }
+    }
+    out
 }
 
 /// `client::Player` as the server's copy of it. See
@@ -1173,6 +1196,28 @@ impl Level for Scene<'_> {
                 world.entity_models.summary()
             );
         }
+
+        // …and the answer back the other way. `server/` names no studio type,
+        // so what a `.mdl` says about its sequences is copied into a plain
+        // table here — the one moment in a level's life when the entities and
+        // their models are both in hand. Without it `CDynamicProp::AnimThink`
+        // cannot tell when an animation has finished, which is 181
+        // `OnAnimationDone` connections in the game and 10 on `sp_a1_intro1`.
+        //
+        // **After `level_init`, and that is forced**: the models are named by
+        // the entities. `crate::server::sequences` has what every `Spawn` in
+        // the game therefore has to cope with.
+        let mut sequences = crate::server::sequences::SequenceTable::new();
+        for (model, labels) in group_sequences(world.entity_models.sequences()) {
+            sequences.insert_model(&model, labels);
+        }
+        if !sequences.is_empty() {
+            eprintln!(
+                "source-engine: server: {} model(s) with animation the map can ask for",
+                sequences.len()
+            );
+        }
+        self.server.set_sequences(sequences);
 
         self.world = Some(world);
         Ok(())

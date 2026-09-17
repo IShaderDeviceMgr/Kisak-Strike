@@ -1536,6 +1536,139 @@ one of those is switched on by its own map's bootstrap and then refuses),
 `SF_TRIGGER_ALLOW_CLIENTS` and one names an `npc_bullseye` filter), and **1 has
 no point a standing player fits in**.
 
+### `prop_dynamic` — **DONE** (after stage 5, not part of it)
+
+Not on the five-stage plan; the plan's "Beyond" list had it as *"needs
+`studio/` stage 6 and skin families"*, and **that was wrong**. Skin families
+decide which *texture* a model wears, `m_nSkin` is `0` on 7,808 of the 8,462
+props that write it, and what the class actually needs is what `studio/` already
+had after `prop_floor_button`: bones, sequences and the RLE animation blocks.
+
+**8,462 entities across four classnames** — `prop_dynamic` (8,072) and
+`prop_dynamic_override` (390) placed, `dynamic_prop` and `prop_dynamic_glow`
+registered — which makes it the **commonest thing in a Portal 2 map after
+`logic_relay`**, by ten entities. 90 of them are on `sp_a1_intro1`, from 52
+models. It carries **5,311 `SetAnimation` connections**, more than any other
+input in the game reaches a class this port implements, and 1,141 distinct
+sequence names.
+
+Taking the port to **43 registered classnames, 34,506 of the game's 60,925
+entity blocks** — 38 of them among the 200 the shipped maps place.
+
+#### Six findings
+
+**The classname is behaviour, and the rename hides it.**
+`CDynamicProp::Spawn` promotes a `SOLID_NONE` prop to `SOLID_OBB` only
+`if ( FClassnameIs( this, "prop_dynamic" ) )` — and *then*, two statements
+later, renames `prop_dynamic_override` to `prop_dynamic`. So 2,622 props take
+the promotion and **211 `_override`s with the identical `solid 0` do not**.
+`CBaseProp::KeyValue` asks the same question about `health`, swallowing the key
+for everything but an `_override`. Both are what that classname is *for*, and
+both are invisible unless you read the order.
+
+**`GotoSequence` deletes on a measurement.** `PropSetSequence`'s transition
+graph — `$node`/`$transition`, the machinery that walks an NPC from "stand" to
+"crouch" through an intermediate animation — has "bail if we're going to or from
+a node 0" as its first test. Across the **2,597 sequences of the 606 models the
+game's props name, not one has a non-zero entry or exit node and not one has
+`nodeflags`**, so no other branch is reachable, `m_iTransitionDirection` is
+`+1` for every prop in the game, and the whole function reduces to "go to the
+goal, forwards, from cycle 0". One consequence is that **every sequence starts
+playing forwards** and the 427 `SetPlaybackRate -1` connections in the game are
+what turn one round afterwards — which violates Valve's own `Assert` in
+`AnimThink`.
+
+**The server needed a fact from a `.mdl`, and the answer is a table rather than
+a call.** `AnimThink` fires `OnAnimationDone` (181 connections, **10 of them on
+`sp_a1_intro1`**) and reverts a finished animation to `DefaultAnim` (2,416
+props), and both need the sequence's duration. `server/` names no `studio` type
+and should not start; so `src/server/sequences.rs` holds the *answers* —
+duration and the loop flag, per model and label — and `Engine::load_level`
+fills it in from the models `World::load_entity_models` has just read. That is
+the same shape as `world/`'s `Placement`, pointing the other way.
+
+**It forced the third answer that `Lookup` has.** A level loads
+`World::load` → `Server::level_init` → `World::load_entity_models`, and it
+cannot load in any other order, because the models an entity places are named
+by the entities. So **every `Spawn` in the game runs against an empty table**,
+and "nobody has loaded this model" has to be distinguishable from "it is loaded
+and has no such sequence". `Lookup::Unknown` succeeds where `LookupSequence`
+would have and yields no duration — so an animation with no model never
+finishes, which is what an entity with nothing on screen should do.
+
+**`ParsePropData` is a *deletion*, and it costs twelve entities.** The
+breakable-prop system decides one thing for this class: a plain `prop_dynamic`
+whose model carries a `prop_data` block is removed at load with a
+`DevWarning`, and an `_override` is not. 15 of the 606 models have such a block
+and 106 entities wear one — but **94 of the 106 are `prop_dynamic_override`**.
+So not porting the whole propdata system leaves **12 entities across three maps**
+(`sp_a2_bts3`, `mp_coop_tbeam_end`, `sp_a1_intro7` — laser gibs and a lab
+chair) drawn that the shipped game deletes.
+
+**Two gaps in `studio/` stopped being academic, and both are measured here.**
+The 16 models `StudioModel::load` refuses are all
+`models/props_destruction/toxin*`, whose `.dx90.vtx` opens with flex-delta data
+this reader does not decode — and **15 of them are placed as `prop_dynamic`s,
+by 41 entities**, which draw nothing. `portdocs/STUDIO.md` records flex deltas
+as absent *from the data* because no **static prop** has any; that is still
+exactly true, and `prop_dynamic` is the first thing in the port that places a
+model which is not a static prop.
+
+The larger one is `$includemodel`. Nine of
+the 606 models keep their sequences in a companion `*_animation.mdl`, and those
+nine are worn by **926 entities** — `arm64x64_interior.mdl` and the rest of the
+`anim_wp/room_transform` set. Their labels resolve to nothing here, so they draw
+in their bind pose. Of the game's 2,416 `DefaultAnim` keys, 2,233 name a
+sequence that exists somewhere (849 only through an include) and **183 name one
+that is in no model at all** — Valve's own map errors, which the shipped game
+answers with `Warning( "Dynamic prop %s: no sequence named:%s" )`.
+
+#### Two divergences, both from the cycle being derived
+
+The port does not accumulate `m_flCycle`; it stores a cycle, a time and a rate
+and solves for now, so that a 64 Hz server can drive a smooth animation
+(`rustdocs/SERVER.md`'s `ModelEntityState`). Two things follow.
+
+`AnimThink` **cancels itself** once its sequence cannot end — looping,
+zero-length, or a model that never loaded — where Valve re-arms it at 10 Hz for
+the rest of the level. Valve's second job in that function is
+`StudioFrameAdvance`, which does not exist here; the first job has nothing to
+decide. Nothing observable changes, because `SetAnimation`, `SetPlaybackRate`
+and `Spawn` all re-arm it.
+
+`InputSetPlaybackRate` **re-bases `m_flCycle` and `m_flAnimTime`**, which Valve
+does not touch. Same cause, opposite sign: the pose at that instant is
+identical, and without it each of the 427 `SetPlaybackRate -1` connections
+would snap its prop to a different frame before running it backwards.
+
+#### What it changed outside the class
+
+- `ModelEntityState`/`ModelEntity` are **keyed on an opaque id and carry
+  `visible`**, where they were positional and `EF_NODRAW`-filtered. 556
+  connections fire `Kill` at a prop and 1,000 props are `StartDisabled`, so
+  both halves were forced.
+- `ModelState::sequence` is a **`&str`** rather than a `&'static str`, because a
+  prop's comes out of the map.
+- `CBaseEntity` gained the `solid` key (`CCollisionProperty`'s keyfield — and
+  measured: **only the prop family writes it**, 8,470 entities across four
+  classnames and nothing else) and the `DisableDraw`/`EnableDraw` inputs, whose
+  206 shipped connections are **all** aimed at a `prop_dynamic`.
+- The fade block (`fademindist`/`fademaxdist`/`fadescale`) and the quality-level
+  block (`min`/`maxcpulevel`, `min`/`maxgpulevel`) are consumed and dropped —
+  Valve reads all seven on the *client*, and this port has one quality level and
+  no distance fade. `mindxlevel`, `maxdxlevel` and `disablex360` deliberately
+  stay unread beside them, because nothing anywhere in `legacy/` reads those
+  three either.
+
+#### The measurement
+
+`server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
+spawns every map, loads every `.mdl` its props name through `StudioModel` — the
+only test in `server/` that names a `studio` type, and it does so because this
+is the *seam* — fills the sequence table exactly as `Engine::load_level` does,
+and runs two seconds. It is what pins the 8,462, the 606 models, and the
+`$includemodel` cost.
+
 ### Beyond
 
 **The five stages are done, so what follows is individual classes and
@@ -1552,9 +1685,14 @@ subsystems rather than a staged plan.** In the order they are worth doing:
   test's 1,102 unhandled inputs** — and parented movers.
 - **`player_speedmod`** (4 placed): `SetLaggedMovementValue` and
   `DisableButtons`, two more `PlayerState` fields. Small.
-- `prop_dynamic` (8,072 placed) needs `studio/` stage 6 and skin families.
-  `prop_physics` and `func_physbox` need `rapier`. The 41 reconstructed Portal 2
-  classes (§1.3) need the paint and portal systems. Each gets its own portdoc.
+- **`$includemodel` in `studio/`**, which is not a class at all but is the
+  largest measured gap `prop_dynamic` left: nine models, **926 entities**, drawn
+  in their bind pose because their sequences live in a companion
+  `*_animation.mdl`. It wants `CStudioHdr::ResolveIncludedModels`' bone
+  remapping by name.
+- `prop_physics` (132) and `func_physbox` need `rapier`. The 41 reconstructed
+  Portal 2 classes (§1.3) need the paint and portal systems. Each gets its own
+  portdoc.
 
 ---
 

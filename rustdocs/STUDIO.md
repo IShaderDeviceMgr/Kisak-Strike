@@ -387,19 +387,30 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 
 ## What is deliberately absent
 
-- **Skinning** — replaced rather than deferred, **for now**. A model is drawn
+- **Skinning** — replaced rather than deferred, and `prop_dynamic` has now put
+  a price on it. A model is drawn
   one [`BoneRun`](#studiomodel) at a time, each under its own bone's matrix,
   which is **exact** when every vertex answers to exactly one bone and needs no
-  change to the vertex format, the shaders or the bind groups. Every vertex of
-  every model the port draws does: a `prop_floor_button`'s 7,929 split 7,263 on
-  the body and 666 on the plate.
+  change to the vertex format, the shaders or the bind groups. A
+  `prop_floor_button`'s 7,929 vertices split 7,263 on the body and 666 on the
+  plate, and every model the port drew until `prop_dynamic` was like that.
 
   **It does not generalise, and the number is known.** Across the game 420 of
   2,017 models have more than one bone and **141 of those share a vertex
   between two** — the `a4_destruction` set, Wheatley's chamber falling apart.
   `StudioModel::rigid_bones` is where the precondition is checked rather than
-  assumed; a model that fails it is drawn in its **bind pose** and counted, and
-  the 141 are the measured condition that makes real skinning worth writing.
+  assumed; a model that fails it is drawn in its **bind pose** and counted.
+
+  > **`prop_dynamic` turned that from a bound into a bill.** It is the first
+  > class that places models the map chose rather than models the compiler
+  > placed, so it reaches them: **74 of the 591 readable models the game's
+  > props name share a vertex between bones, and 290 entities wear one**. Seven
+  > of the 74 are on `sp_a1_intro1` — the `models/container_ride/finedebris_part*`
+  > set — so the substitution is visible on the default map rather than only in
+  > a census, and the startup log says so per model.
+  > `server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
+  > pins both numbers. It is the second-largest gap in this module, behind
+  > `$includemodel`'s 926 entities.
 - **Everything in `bone_setup.cpp` that blends** — ~5,000 lines of layering,
   pose parameters, IK, procedural bones, bone controllers and blend sequences.
   A sequence here has one animation (`numblends` is 1 for every sequence in
@@ -412,12 +423,41 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   the animation reads as empty, which holds the bind pose — rather than
   mis-read. 68 files in the game have an `.ani` and no model the port loads is
   among them.
-- **Flexes and sub-division surfaces** — absent from the *data*. Every strip
-  group is `STRIPGROUP_IS_HWSKINNED` with no `STRIPGROUP_IS_DELTA_FLEXED`,
-  every strip is `STRIP_IS_TRILIST`, and `StripHeader_t::numBones` is 0
-  throughout. The readers refuse flex deltas and quad lists rather than drawing
-  them wrong — which is why 16 of the game's *animated* `props_destruction`
-  models are refused, and correctly so.
+- **`$includemodel`** — `studiohdr_t::numincludemodels` /
+  `includemodelindex`, and the `virtualmodel_t` that
+  `CStudioHdr::ResolveIncludedModels` builds out of it: a model whose sequences
+  and animations live in a *different* `.mdl`, merged in at load with each
+  included bone remapped onto the host's by **name**. `StudioModel::load`
+  ignores the list, so such a model has only its own local sequences.
+
+  > **Measured, and it is the largest gap in this module.** Across the 606
+  > models the shipped game's `prop_dynamic`s name, **9 do this — and 926
+  > entities wear one**, the `models/anim_wp/room_transform` panel-arm set
+  > chief among them. Their `DefaultAnim` and `SetAnimation` labels resolve to
+  > nothing, so they draw in their bind pose and their `AnimThink` cancels
+  > (`rustdocs/SERVER.md` gotcha 64). Of the game's 2,416 `DefaultAnim` keys,
+  > 849 resolve **only** through an include.
+  >
+  > The work is the bone remap, not the parse: an included animation's
+  > `BoneTrack::bone` indexes the *included* model's bone list, so merging
+  > without remapping poses the wrong bones — which would be a silently wrong
+  > picture rather than an error.
+- **Flexes and sub-division surfaces** — absent from the *static prop* data.
+  Every strip group a static prop uses is `STRIPGROUP_IS_HWSKINNED` with no
+  `STRIPGROUP_IS_DELTA_FLEXED`, every strip is `STRIP_IS_TRILIST`, and
+  `StripHeader_t::numBones` is 0 throughout. The readers refuse flex deltas and
+  quad lists rather than drawing them wrong, which is why 16 of the game's
+  *animated* `props_destruction` models are refused.
+
+  > **Those 16 stopped being academic when `prop_dynamic` landed.** They are
+  > all `models/props_destruction/toxin*`, and **15 of them are placed as
+  > `prop_dynamic`s, by 41 entities across the shipped maps** — so 41 entities
+  > that the shipped game draws as toxin pipework draw nothing here. The claim
+  > above is still exactly true and is about static props; `prop_dynamic` is
+  > the first thing in the port that places a model which is not one.
+  > `server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
+  > pins the number. It is the smaller of the two studio gaps that class
+  > measured — `$includemodel` is 9 models and 926 entities.
 - **`CMDLCache`'s cache management** — LRU eviction, memory budgets, async
   queues, lock/unlock refcounting, `CreateThinVertexes`. All of it existed to
   fit models into a 2007 console; a `StudioModel` is an owned value and dropping
@@ -498,3 +538,16 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release -- --ignored --nocapture
 - `engine::world::bench::tests::frame_cost` is not a test but a stopwatch: it
   loads a real map and times the CPU cost of recording a frame, with no window
   in the way. Use it before and after any change to the draw path.
+
+  It reports five figures, and on `sp_a1_intro1` they are **0.25 ms of world
+  brushes, 0.10 of brush models, 1.01 of static props, 0.72 of entity models
+  and 1.86 for the lot** (2.14 with the refracting pass). Run them on their own
+  — back to back they share thermal state and read 2-3x high.
+
+  > **It spawns a `Server`**, which is the only reason a benchmark in `world/`
+  > names a `server/` type: `World::load` cannot read the models an entity
+  > places, because they are named by the entity lump it has just parsed. Until
+  > `prop_dynamic` that omission was invisible, because the only model a game
+  > entity placed was one floor button; now it is 91 instances and 355,469
+  > triangles on the default map — more than all 1,080 static props — so a
+  > stopwatch that skipped them would be measuring the wrong frame.

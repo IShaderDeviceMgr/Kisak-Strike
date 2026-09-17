@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses — and **the player can be hurt, and die**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button` and `prop_dynamic`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate** — and **the player can be hurt, and die**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 159 unit tests + four depot tests over all 106 shipped maps |
+| Tests | 172 unit tests + five depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -20,13 +20,21 @@ and the think schedule. Porting doc:
 kills**: 138 of the game's 215 kill a player standing in them, and the other 77
 are switched off, admit no clients or have nowhere to stand.
 
+**What `prop_dynamic` added** (after stage 5, not part of it): `CDynamicProp`
+across its four classnames — **8,462 entities, the commonest thing in a Portal 2
+map after `logic_relay`** — `sequences.rs` (the seam that tells the game what a
+`.mdl`'s animation is), `DisableDraw`/`EnableDraw` and the `solid` key on
+`CBaseEntity`, and a `ModelEntityState` that is **keyed and carries visibility**
+rather than positional and filtered.
+
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
 **nothing pushes what is in its way** — a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why). **36 of the 200
-classnames the shipped maps place are implemented**, out of 39 registered — the
-other three (`player`, `trigger_portal_button`, `light_glspot`) are placed by
-no map ([What is deliberately absent](#what-is-deliberately-absent)).
+than shoving it (`portdocs/SERVER.md` stage 3 says why). **38 of the 200
+classnames the shipped maps place are implemented**, out of 43 registered — the
+other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
+`prop_dynamic_glow`) are placed by no map
+([What is deliberately absent](#what-is-deliberately-absent)).
 
 ---
 
@@ -40,8 +48,8 @@ let mut server = Server::new();
 // and the model bounding boxes a mover measures itself against.
 let stats = server.level_init("sp_a1_intro1", &world.entities, &world.models);
 eprintln!("{}", stats.summary());
-// 250 of 598 entity blocks matched a class, 228 spawned (22 removed themselves),
-// 714 outputs, 348 unknown classnames, 259 unhandled keys
+// 342 of 598 entity blocks matched a class, 321 spawned (22 removed themselves,
+// 1 created by another entity), 740 outputs, 256 unknown classnames, 324 unhandled keys
 
 // `ClientPutInServer` — the player joins the list, so that `!player` resolves
 // and a trigger has something to notice.
@@ -106,6 +114,8 @@ impl Server {
     pub fn brush_entity_count(&self) -> usize;
     pub fn tonemap_settings(&self) -> TonemapSettings;
     pub fn model_entities(&self) -> Vec<ModelEntityState>;
+    // What `studio/` says about those models. Filled in once, AFTER level_init.
+    pub fn set_sequences(&mut self, sequences: SequenceTable);
 
     // stage 4 — the player
     pub fn spawn_player(&mut self, state: PlayerState) -> EntityId;
@@ -251,12 +261,16 @@ a shipped server sees one usercmd per tick and computes the same edge from it.
 
 ```rust
 pub struct ModelEntityState {
+    pub id: u64,                  // EntityId::to_int — opaque, stable, the sync key
     pub model: String,            // models/props/portal_button.mdl
     pub origin: Vec3,
     pub angles: Vec3,
     pub skin: i32,
-    pub sequence: &'static str,   // the label; "" is the bind pose
-    pub anim_time: f32,           // the SERVER's clock — see below
+    pub visible: bool,            // ShouldDraw — EF_NODRAW or rendermode 10
+    pub sequence: String,         // the label; "" is the bind pose
+    pub cycle: f32,               // m_flCycle at anim_time
+    pub anim_time: f32,           // m_flAnimTime — the SERVER's clock, see below
+    pub playback_rate: f32,       // m_flPlaybackRate, signed; 0 holds the pose
 }
 ```
 
@@ -265,14 +279,35 @@ counterpart of [`brush_entity`](#the-brush-entity-seam), which answers "where is
 brush model `N`". `engine::world::entities::EntityModels` loads from it once and
 syncs against it every frame.
 
-Excluded, and each for its own reason: a class that returns no `ModelState`
-(35 of the 36, because a model is the exception); an entity whose `model` is a
-`"*N"` brush model, which goes out through the other seam; and `EF_NODRAW`,
-which is what `StartDisabled` sets.
+**The five animation fields are exactly `DT_BaseAnimating`'s**, which is not a
+coincidence: what Valve's client needs in order to pose a model is what this
+renderer needs, and one process does not change the list. The pose is
+`cycle + (now - anim_time) * playback_rate / duration`, wrapped for a looping
+sequence and clamped otherwise; **`DynamicProp::cycle_now` and
+`EntityModels::cycle` both compute it** — the server from its
+[`sequences`](#sequences-sequencesrs) table and the renderer from the `.mdl` —
+and the two must not drift.
 
-**The list is positional and the order is the contract** — the `n`th entry has
-to stay the `n`th, which holds because the order is slot order and nothing
-creates or destroys a model entity after the spawn pass.
+Excluded, and each for its own reason: a class that returns no `ModelState`
+(39 of the 43, because a model is the exception); and an entity whose `model` is
+a `"*N"` brush model, which goes out through the other seam.
+
+`visible` is `C_BaseEntity::ShouldDraw`, and it refuses **two** things:
+`EF_NODRAW` (what `StartDisabled` sets) and `rendermode 10`
+(`movement::RENDER_NONE`). `world/`'s brush seam has refused both since stage 3,
+where the second hides 94 entities; **no shipped `prop_dynamic` writes it**, so
+it is there to keep the two seams agreeing rather than for content. The
+*translucent* modes 1 and 2 are **not** honoured — 30 props write one and they
+want a blended pass, the same gap `world/` records for its five brush
+entities.
+
+**The list is keyed on `id`, and it used to be positional.** The note here said
+the condition for a real key would be "the first class that appears or
+disappears at run time"; `prop_dynamic` is that class twice over — 556 shipped
+connections fire `Kill` at one and 51 fire `FadeAndKill`. `EF_NODRAW` is
+likewise **carried rather than filtered**, because a prop that is invisible now
+may be visible next tick (1,000 are `StartDisabled` and 206 connections toggle
+one) and a filtered-out entity is one whose model was never uploaded.
 
 > **`anim_time` is the *server's* clock and the renderer measures against the
 > scene's** (gotcha 1). The two track each other and differ by at most one tick,
@@ -299,8 +334,8 @@ pub struct LevelStats {
 impl LevelStats { pub fn summary(&self) -> String; }
 ```
 
-The parse-side progress metric. Across all 106 maps it is 26,044 of 60,925
-blocks matched, 65 created and 19,172 spawned.
+The parse-side progress metric. Across all 106 maps it is 34,506 of 60,925
+blocks matched, 65 created and 27,634 spawned.
 
 `created` is the term that makes `spawned + removed_on_spawn` differ from
 `matched`: entities that were never in the entity lump, made by another
@@ -505,7 +540,7 @@ pub trait Behaviour: Any {
         &self, entity: &EntityCore, other: &EntityCore, filters: &Filters<'_>,
     ) -> bool;
     fn is_player(&self) -> bool;                         // CBaseEntity::IsPlayer
-    fn model_state(&self) -> Option<ModelState>;         // CBaseAnimating's, networked
+    fn model_state(&self) -> Option<ModelState<'_>>;     // CBaseAnimating's, networked
 
     // stage 5 — damage
     fn on_take_damage(
@@ -519,10 +554,14 @@ pub trait Behaviour: Any {
     ) -> bool;
 }
 
-/// `m_nSequence` / `m_flAnimTime` / `m_nSkin`, as much of `CBaseAnimating` as
-/// anything reads. The sequence is a **label**, not an index, because looking
-/// one up needs the `.mdl` and this module names no studio type.
-pub struct ModelState { pub sequence: &'static str, pub anim_time: f32, pub skin: i32 }
+/// Exactly `DT_BaseAnimating`'s five fields. The sequence is a **label**, not
+/// an index, because looking one up needs the `.mdl` and this module names no
+/// studio type — and it is borrowed, because a `prop_dynamic`'s comes out of
+/// the map and there are 1,141 distinct ones in the game.
+pub struct ModelState<'a> {
+    pub sequence: &'a str, pub cycle: f32, pub anim_time: f32,
+    pub playback_rate: f32, pub skin: i32,
+}
 
 impl dyn Behaviour {
     pub fn downcast_ref<T: Behaviour>(&self) -> Option<&T>;
@@ -554,6 +593,9 @@ impl Context<'_> {
     pub fn player(&self) -> Option<EntityId>;            // UTIL_GetLocalPlayer
     pub fn take_damage(&mut self, target: EntityId, info: DamageInfo) -> bool;
     pub fn reload_level(&mut self);                      // ServerCommand("reload")
+
+    // prop_dynamic — LookupSequence/SequenceDuration/SequenceLoops in one call
+    pub fn sequence(&self, model: &str, label: &str) -> Lookup;
 }
 
 /// The read-only view a `filter_*` class evaluates against.
@@ -734,6 +776,49 @@ impl ThinkList {
     pub fn clear(&mut self);
 }
 ```
+
+### `sequences` (`sequences.rs`)
+
+```rust
+pub struct SequenceInfo { pub duration: f32, pub loops: bool }
+pub enum Lookup { Unknown, Missing, Found(SequenceInfo) }
+
+pub struct SequenceTable { /* private */ }
+impl SequenceTable {
+    pub fn new() -> SequenceTable;
+    pub fn insert_model(&mut self, model: &str,
+                        sequences: impl IntoIterator<Item = (String, SequenceInfo)>);
+    pub fn lookup(&self, model: &str, label: &str) -> Lookup;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
+// Filled in once by the engine, after level_init:
+impl Server { pub fn set_sequences(&mut self, sequences: SequenceTable); }
+// Read by a class during a dispatch:
+impl Context<'_> { pub fn sequence(&self, model: &str, label: &str) -> Lookup; }
+```
+
+**`LookupSequence` + `SequenceDuration` + `SequenceLoops`, answered in
+advance.** `server/` names no `studio` type, so what a `.mdl` says about its
+animation is *copied in* rather than called for — the same shape `world/`
+already has in the other direction, where a `Placement` is the answer to "where
+is this brush model". Both keys fold case and slashes.
+
+One class reads it (`DynamicProp`, in `AnimThink` and `SetPlaybackRate`) and
+`Engine::load_level` fills it, from the models
+`World::load_entity_models` has just uploaded.
+
+> **Three answers, not two, and every `Spawn` in the game sees the third.** A
+> level loads `World::load` → `Server::level_init` →
+> `World::load_entity_models`, and it cannot load in any other order: the models
+> an entity places are named by the entities. So the table is **empty** while
+> every `Spawn` runs, and `Lookup::Unknown` is what "nobody has loaded this
+> model" has to be told apart from `Lookup::Missing`, "it is loaded and has no
+> such sequence". The rule a caller follows is: `Unknown` succeeds where
+> `LookupSequence` would have, and has no duration — so an animation whose
+> model was never loaded never finishes, which is what an entity with nothing
+> on screen should do.
 
 ### `RandomStream` (`random.rs`)
 
@@ -1066,14 +1151,21 @@ pub struct FilterMulti / FilterPlayerHeld / FilterDamageType { /* private */ }
 pub struct PointTeleport { /* private */ }
 // classes/player.rs
 pub struct Player;    // stateless; see the file for why
-// classes/prop.rs — Portal 2's own, and the first entity that makes another
+// classes/prop.rs — the models the game places, and the one you stand on
+pub struct DynamicProp { /* private; all four prop_dynamic classnames */ }
 pub struct FloorButton { pub pressed: bool, pub skin: i32 }
 pub struct ButtonTrigger { /* private; the SOLID_OBB box over a pad */ }
+// classes/player.rs — stage 5's two
+pub struct LogicPlayerProxy;
+pub struct RevertSaved { /* private; player_loadsaved */ }
 ```
 
-Thirty-six classnames, **26,026 of the shipped game's 60,925 entities** —
-thirty-five of which the maps place, plus `trigger_portal_button`, which no map
-places and every `prop_floor_button` makes:
+Forty-three classnames, **34,506 of the shipped game's 60,925 entity blocks**.
+**Thirty-eight of them are among the 200 classnames the maps place**; the other
+five are `player` (the engine makes it when a client connects),
+`trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
+`light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
+because Valve registers them:
 
 | classname | C++ | instances |
 |---|---|---:|
@@ -1108,6 +1200,11 @@ places and every `prop_floor_button` makes:
 | `filter_player_held` | `CFilterPlayerHeld` | 4 |
 | `filter_damage_type` | `FilterDamageType` | 2 |
 | `filter_activator_model` | `CFilterModel` | 1 |
+| `prop_dynamic` | `CDynamicProp` | 8,072, in 105 maps |
+| `prop_dynamic_override` | `CDynamicProp` | 390 |
+| `dynamic_prop`, `prop_dynamic_glow` | `CDynamicProp` | **0 placed** |
+| `logic_playerproxy` | `CLogicPlayerProxy` | 9 |
+| `player_loadsaved` | `CRevertSaved` | 9 |
 | `prop_floor_button` | `CPropFloorButton` | 65, in 47 maps |
 | `trigger_portal_button` | `CPortalButtonTrigger` | **0 placed** — one per button, 65 |
 | `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
@@ -1643,6 +1740,44 @@ entity built is not there start at 47, and if something will not die start at
     the 215 deal 100 or more, so any scale between about 0.1 and 10 kills the
     player in the same place.
 
+60. **A `prop_dynamic`'s playback rate starts at *zero*, not one.**
+    `CBaseProp::Spawn` sets `m_flPlaybackRate = 0` and only `ResetSequenceInfo`
+    — reached through `PropSetAnim`/`PropSetSequence` — puts it back to 1. That
+    is what makes the 6,046 props in the game with no `DefaultAnim` stand
+    perfectly still instead of looping their first sequence, and it is why the
+    rate is a field of `ModelState` rather than an assumed 1. A `FloorButton`'s
+    is 1 for the opposite reason: its `Spawn` ends with a `ResetSequence`.
+
+61. **The classname is behaviour on a `prop_dynamic`, and two lines apart.**
+    `CDynamicProp::Spawn` promotes `SOLID_NONE` to `SOLID_OBB` only
+    `if ( FClassnameIs( this, "prop_dynamic" ) )`, and *then* renames
+    `prop_dynamic_override` to `prop_dynamic` — so 2,622 props take the
+    promotion and 211 `_override`s with the identical `solid 0` do not.
+    `CBaseProp::KeyValue` asks the same question about `health`. Both are
+    `DynamicProp::is_plain_dynamic` / `allows_health`, asked of
+    `EntityCore::class` rather than stored.
+
+62. **`Lookup::Unknown` is not `Lookup::Missing`, and every `Spawn` in the game
+    gets `Unknown`.** See [`sequences`](#sequences-sequencesrs). A class that
+    treats the two alike either believes a map that names a sequence nothing
+    has (harmless: the renderer draws the bind pose) or refuses 2,416 shipped
+    `DefaultAnim` keys at spawn (not harmless).
+
+63. **`SetNextThink( curtime )` at tick zero means *never*.** `SetNextThink(0)`
+    is "not scheduled" — `physics_run_think`'s `think_tick <= 0` guard, which
+    is Valve's too — so `SUB_StartFadeOut( 0 )` fired before the first tick
+    arms nothing. It cannot happen from map data, because an input needs an
+    event and an event needs a tick; it happens in tests that fire an input
+    into a freshly loaded level.
+
+64. **`AnimThink` cancels itself when there is nothing left to decide**, where
+    Valve re-arms it for ever. The port derives the cycle from `ModelState`'s
+    five numbers instead of accumulating it, so a think over a looping
+    sequence, a zero-length one, or one whose model never loaded has no work —
+    see the divergence table. The one line of Valve's `else` branch that had to
+    survive is `m_bAnimationDone = false`: without it a looping sequence
+    followed by a finite one fires no `OnAnimationDone`.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -1668,6 +1803,11 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `respawn()` in single player | `engine->ServerCommand( "reload\n" )` — restores the last **save** | `Context::reload_level`, which restarts the map | There is no save/restore (`portdocs/SERVER.md` §6 defers it as `serde` over the entity state). For a Portal 2 chamber the two are usually the same place, because the game autosaves on entry. |
 | `UTIL_ScreenFade` on death and on `player_loadsaved` | Fades the screen to black over three seconds | Nothing is drawn; the *timer* it is drawn over is kept exactly | A screen fade is a user message to a HUD that does not exist. The respawn still happens at `m_flDeathTime + 3` and the reload still at `loadtime`. |
 | `CBasePlayer::PreThink`'s proxy outputs | Called from `CPlayerMove::RunCommand`, once per usercmd | A step of `Server::run_tick`, before the touch pass | The think schedule cannot express "every tick, first". Same place in the order, same once-per-tick cadence. |
+| `CDynamicProp::AnimThink`'s cadence | Re-arms itself at 10 Hz for as long as the entity has a sequence, so that `StudioFrameAdvance` can accumulate `m_flCycle` | Cancels itself once the sequence cannot end — looping, zero-length, or a model that never loaded | The cycle is *derived* here, not accumulated (`ModelEntityState`), so the second half of Valve's think does not exist and the first half has nothing to decide. `SetAnimation`, `SetPlaybackRate` and `Spawn` all re-arm it, so a prop given something new to do wakes for it. Gotcha 64. |
+| `CDynamicProp::InputSetPlaybackRate` | Changes `m_flPlaybackRate` and leaves `m_flCycle` where it is, because it is accumulated | Also re-bases `m_flCycle` and `m_flAnimTime` so the derived pose is unchanged at that instant | Same cause, opposite sign: without it the 427 shipped `SetPlaybackRate -1` connections would each snap their prop to a different frame before running it backwards. The pose is identical; the fields it is stored in are not. |
+| `CDynamicProp::PropSetSequence`'s `GotoSequence` | Walks the model's `$node`/`$transition` graph to reach the goal sequence, possibly through an intermediate | Goes straight to the goal, forwards, from cycle 0 | That *is* `GotoSequence`'s first branch — "bail if we're going to or from a node 0". Measured: across the **2,597 sequences of the 606 models the game's props name, not one has a non-zero entry or exit node and not one has `nodeflags`**, so no other branch is reachable and `m_iTransitionDirection` is `+1` everywhere. |
+| `PropSetAnim`'s failure branch | `SetSequence( 0 )` — the model's first sequence, at whatever cycle | The bind pose | This module has labels, not indices, and sequence 0 has no label it can name. Reached by 183 `DefaultAnim` keys in the game, every one of them naming a sequence that is in no model at all. |
+| `AddFlag( FL_UNPAINTABLE )` | Sets `1 << 32` on a 32-bit `m_fFlags` | Nothing | Valve's own comment three lines above it: `// FIXME[HPE]: this won't actually work - we're out of bits. :(`. There is no paint system here to read it either. |
 | `logic_playerproxy`'s inputs | Twenty declared across three `#ifdef` families | **None** | Every input the class has in Portal 2 is a portal-gun or grab-controller input, and `RequestPlayerHealth`/`SetPlayerHealth` are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`. Accepting none is the shape rather than a gap — and it is why the `PlayerHealth` output cannot fire in Portal 2 at all. |
 | Entities created *by* a spawn | Bounded only by the stack | Bounded at 4,096 per dispatch, then dropped with a warning | Same shape as the zero-delay event chain's bound. The most any map creates is four. |
 | `Enable`/`Disable`/`Toggle` on a trigger | Calls `PhysicsTouchTriggers()` at once, so enabling a trigger you are standing in fires `OnStartTouch` in the same tick | Fires it on the **next** tick | The touch pass is player-driven and runs at one fixed point in the tick. At most 15.6 ms late; the condition for closing it is a touch query the server can ask mid-tick. |
@@ -1701,7 +1841,17 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CBaseToggle`'s `master` / `UTIL_IsMasterTriggered` | The `multisource` interlock. **No shipped Portal 2 map sets a `master` key on any of these classes.** |
 | `SF_DOOR_START_OPEN_OBSOLETE` | **No shipped map sets it.** The 40 doors that spawn open use `spawnpos 1`. |
 | `func_rot_button` (2), `momentary_rot_button` (1), `func_tracktrain` (233), `func_tanktrain` (20) | The remaining movers. `CBaseButton`'s `m_fRotating` branch is `CRotButton`'s and is therefore dead here; the trains need `path_track`. |
-| `AnimateThink`, and the rest of `CDynamicProp` — bone followers, `VPhysicsInitStatic`, prop data, LOS blocking, fade distances | **The model and its animation are not absent any more** — a floor button draws and its plate presses. What is still not scheduled is the 10 Hz `AnimateThink`, and that is now a saving: its body is `StudioFrameAdvance`, which the renderer does for itself from `m_flAnimTime` and does *smoothly*, where a 10 Hz think would step it. So 65 entities do not wake ten times a second and no button sits in the simulation list for ever. `m_nSkin` is parsed and printed and not drawn; skin families are `portdocs/STUDIO.md` stage 6's. |
+| `CPropFloorButton::AnimateThink` | Still not scheduled, and it is a saving: its body is `StudioFrameAdvance`, which the renderer does for itself from `m_flAnimTime` and does *smoothly*, where a 10 Hz think would step it. So 65 entities do not wake ten times a second and no button sits in the simulation list for ever. (`CDynamicProp::AnimThink` **is** scheduled, because it does a second job: it decides when a sequence has ended. See the divergence table for the half of it that is not here.) |
+| `CDynamicProp`'s `ParsePropData` — `scripts/propdata.txt`, the gib lists, `PROPINTER_*`, `prop_physics` | The breakable-prop system. The one thing it decides for `prop_dynamic` is a *deletion*: a plain `prop_dynamic` whose model carries a `prop_data` block is removed at load with a `DevWarning`, and an `_override` — which is what that classname is *for* — is not. Measured: 15 of the 606 models the game's props name have such a block and 106 entities wear one, but **94 of the 106 are `prop_dynamic_override`**, so the whole cost is **12 entities across three maps** (`sp_a2_bts3`, `mp_coop_tbeam_end`, `sp_a1_intro7` — laser gibs and a lab chair) that the shipped game deletes and this port draws. |
+| `CDynamicProp`'s bone followers — `CreateBoneFollowers`, `m_BoneFollowerManager`, `TestCollision`, `NotifyPositionChanged`, `DisableBoneFollowers` | One physics entity per named bone, so that an animated prop *collides* as it moves. That is `vphysics`, replaced here by `rapier` and not reached. 260 props set the key that would turn it off. |
+| `CDynamicProp`'s `VPhysicsInitStatic` | A prop's collision is its `.phy` (`ENGINE_TRACE.md` stage 5), and `World::clip_models` only ever sees `"*N"` brush models. So **5,629 props that write `solid 6` are drawn and walked through**. |
+| `CDynamicProp`'s glow block — `m_bShouldGlow`, `m_clrGlow`, `m_nGlowStyle`, `SetGlowEnabled`/`SetGlowDisabled`/`SetGlowColor`/`GlowColor{Red,Green,Blue}Value`, `ShouldTransmit` | CS:GO's wall-hack glow; it reaches the client as a `CCSUsrMsg_GlowPropTurnOff` user message. **No shipped Portal 2 map writes `glowenabled`, `glowcolor`, `glowdist` or `glowstyle`, and no connection fires one of the six inputs**, so the class declares none of them. |
+| `m_bRandomAnimator` and `SelectWeightedSequence( ACT_IDLE )` | Parsed and dead: **all 5,117 props that write `RandomAnimation` write `0`**, and `MinAnimTime`/`MaxAnimTime` are Hammer's defaults of 5 and 10 on every one of the 8,462. It is the one branch of `AnimThink` that needs the activity table. |
+| `HandleAnimEvent`, `DispatchAnimEvents`, `SuppressAnimSounds`, `m_bUseHitboxesForRenderBox`, `AnimateEveryFrame`, `CalculateBlockLOS`, `BecomeRagdollOnClient` | Each parsed where it is a key, each with nothing here to drive it: anim events want sounds, the render box wants hitboxes, `AnimateEveryFrame` asks the *server* to advance the cycle more often and the server does not advance it at all, LOS wants an AI, and there are no ragdolls. `BecomeRagdoll` is declared and no shipped connection fires it. |
+| `m_nSkin` and `m_nBody` | Parsed, carried across the seam and printed by `ent_dump`; not drawn. Skin families and bodygroups are `portdocs/STUDIO.md` stage 6's. **1,437 shipped connections fire `Skin` at a prop**, so this is the most-fired input in the game that lands on a field nothing reads. |
+| Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
+| `$includemodel` | Not this module's — `studio/`'s. It is what makes 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**: their animation labels resolve to nothing, so they draw in the bind pose and their `AnimThink` cancels. It is the measured condition for writing it. |
+| `prop_dynamic_ornament` (`COrnamentProp`) | A prop that `FollowEntity`s another, which needs the same local/abs transform pair the `SetParent` family does. **Zero placed by any shipped map.** |
 | `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls, and `prop_weighted_cube` is not ported — so in this port they would be furniture that nothing can ever press. The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | All of it needs `prop_weighted_cube`, which needs `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
@@ -1876,6 +2026,21 @@ case values.
 | `tests::a_disabled_trigger_notices_nothing_until_it_is_enabled` | `StartDisabled` and `Enable` |
 | `tests::a_class_filter_keeps_the_player_out` | the filter 250 `trigger_multiple`s wear |
 | `tests::a_negated_filter_is_the_other_way_round` | `Negated`, and Hammer writing a label |
+| `tests::a_dynamic_prop_spawns_still_and_a_plain_one_is_promoted_to_an_obb` | gotchas 60 and 61 |
+| `tests::the_solid_key_reaches_a_prop_and_no_other_class_writes_one` | the `solid` key, and `SF_DYNAMICPROP_DISABLE_COLLISION` |
+| `tests::a_prop_with_no_model_removes_itself` | `CBaseProp::Spawn`'s first four lines |
+| `tests::set_animation_plays_a_sequence_and_fires_both_of_its_outputs` | **the class, end to end** — 5,311 and 181 shipped connections |
+| `tests::a_finished_animation_reverts_to_the_default_unless_the_prop_holds_it` | `DefaultAnim` (2,416) against `HoldAnimation` (857) |
+| `tests::a_looping_sequence_never_finishes_and_stops_thinking` | gotcha 64, and the flag reset that had to survive it |
+| `tests::set_playback_rate_rebases_the_pose_so_it_does_not_jump` | the `SetPlaybackRate` divergence; 427 shipped `-1`s |
+| `tests::start_disabled_hides_a_prop_and_enable_brings_it_back` | `EF_NODRAW` carried across the seam rather than filtered |
+| `tests::fade_and_kill_removes_the_prop_after_a_second` | `SUB_FadeOut`, and gotcha 63 in its comment |
+| `tests::the_break_input_fires_on_break_and_removes_the_prop` | the only way `OnBreak` can fire in Portal 2 |
+| `tests::only_an_override_prop_may_be_given_health_by_the_map` | `CBaseProp::KeyValue`'s one line |
+| `tests::a_sequence_the_model_does_not_have_is_refused_once_the_models_are_loaded` | `PropSetAnim`'s failure branch, and `Lookup::Missing` |
+| `sequences::a_model_nobody_loaded_is_not_a_model_without_the_sequence` | gotcha 62 |
+| `engine::world::entities::the_button_draws_and_moves_as_it_presses` | the pose reaching the right geometry (`rustdocs/ENGINE.md`) |
+| `tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for` | **the depot test**: 8,462 props across 106 maps, 606 models, and what `$includemodel`, flex deltas and the missing skinning each cost |
 | `tests::filter_multi_combines_its_children` | the handler that reads other entities |
 | `tests::point_teleport_sends_the_player_where_it_was_told` | `!player`, 121 of 128 |
 | `tests::a_landmark_teleport_carries_the_offset_across` | the elevator, and gotcha 44 |
@@ -1918,13 +2083,22 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release floor_button_presses -- --i
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 26,026 matched, 65
-created, 19,154 spawned, 6,937 lights deleted, 213 kept, 53,382 connections,
-166 unimplemented classnames, the full 42-name unhandled-key table, 5,766
-events dispatched, 2,480 inputs accepted, 1,450 thinks, 2,548 events that found
-no target, zero bad conversions, the 11-name unhandled-input table, a peak of 48
-entities in the simulation list at once, 105 maps with a master tone mapper —
-and that `sp_a1_intro1` ends up asking for an exposure ceiling of **1.5**.
+server time**, and asserts exact totals: 60,925 blocks, 34,506 matched, 65
+created, 27,634 spawned, 6,937 lights deleted, 213 kept, 53,980 connections,
+162 unimplemented classnames, the full 48-name unhandled-key table, 5,785
+events dispatched, 3,923 inputs accepted, 4,420 thinks, 1,129 events that found
+no target, zero bad conversions, the 18-name unhandled-input table, a peak of
+214 entities in the simulation list at once, 105 maps with a master tone
+mapper — and that `sp_a1_intro1` ends up asking for an exposure ceiling of
+**1.5**.
+
+> **Four of those numbers moved a long way with `prop_dynamic` and each says
+> something.** `accepted` and `thinks` rose because a prop that is given an
+> animation wakes at 10 Hz until it has finished one; `no_target` more than
+> halved because most events used to reach nothing for the single reason that
+> most *targets* were props; and the peak think count went from 48 to 214,
+> which is the first time that number has said anything about the shape of the
+> list rather than about the `logic_auto` bootstrap.
 
 Stage 3 added its own three numbers to that list, and they are the ones that
 say the stage works: **3,410 brush entities have a class, 67 of them are

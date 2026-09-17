@@ -34,8 +34,10 @@ use std::any::Any;
 use super::damage::{self, Damaged, DamageInfo, DamageMode, LifeState};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
+use super::movement::EF_NODRAW;
 use super::name;
 use super::random::RandomStream;
+use super::sequences::{Lookup, SequenceTable};
 use super::think::{Time, TICK_NEVER_THINK};
 
 /// One input a class accepts. `DEFINE_INPUTFUNC( fieldType, "Name", handler )`.
@@ -137,10 +139,16 @@ impl ClassDef {
 /// port implements, plus one it does not.** Valve declares 30; the rest either
 /// need a subsystem that does not exist (`DispatchResponse`, `RunScriptCode`)
 /// or need a piece of `EntityCore` that is not written yet (`SetParent` and
-/// the parenting family want a local/abs transform pair; `Alpha`, `Color` and
-/// `DisableDraw` are the renderer's). Each absence is a measurement: the depot
-/// test's expected-unhandled table lists every input name in the game that
-/// reaches an implemented class and is refused.
+/// the parenting family want a local/abs transform pair; `Alpha` and `Color`
+/// are the renderer's). Each absence is a measurement: the depot test's
+/// expected-unhandled table lists every input name in the game that reaches an
+/// implemented class and is refused.
+///
+/// `DisableDraw`/`EnableDraw` were on that list until `prop_dynamic` landed,
+/// and moved off it unchanged: they are two lines each and they were only ever
+/// pointless because nothing an entity placed was drawn. 206 shipped
+/// connections fire one, and **every one of them is aimed at a
+/// `prop_dynamic`**.
 ///
 /// `SetDamageFilter` is the "one it does not": **no shipped connection fires
 /// it**, and it is here because `portdocs/SERVER.md` stage 5 gave the port a
@@ -163,6 +171,10 @@ pub const BASE_INPUTS: &[InputDef] = &[
     InputDef::new("FireUser2", FieldType::String),
     InputDef::new("FireUser3", FieldType::String),
     InputDef::new("FireUser4", FieldType::String),
+    // `DEFINE_INPUTFUNC( FIELD_VOID, "DisableDraw", InputDisableDraw )`
+    // (`baseentity.cpp:2403`).
+    InputDef::new("DisableDraw", FieldType::Void),
+    InputDef::new("EnableDraw", FieldType::Void),
 ];
 
 /// The type [`BASE_INPUTS`] declares for `name`, if any.
@@ -212,6 +224,18 @@ pub fn base_accept_input(
         // null, so accepting and doing nothing is the behaviour rather than a
         // stub — see [`Behaviour::use_entity`] and [`BASE_INPUTS`].
         behaviour.use_entity(entity, UseType::from_output_id(input.output_id), input, cx);
+        return true;
+    }
+    // `InputDisableDraw`/`InputEnableDraw` (`baseentity.cpp:7831`), which are
+    // one `AddEffects`/`RemoveEffects` each. `prop_dynamic`'s own `TurnOff`
+    // and `TurnOn` are the same two lines under two other names, and Valve
+    // really does declare both pairs.
+    if is("DisableDraw") {
+        entity.effects |= EF_NODRAW;
+        return true;
+    }
+    if is("EnableDraw") {
+        entity.effects &= !EF_NODRAW;
         return true;
     }
     for (name, output) in [
@@ -329,6 +353,10 @@ pub struct Context<'a> {
     damage: Vec<(EntityId, DamageInfo)>,
     /// Whether [`reload_level`](Context::reload_level) was called.
     reload_level: bool,
+    /// What `studio/` said about the models this level's entities place —
+    /// `modelinfo->GetModelPtr`, answered in advance. See
+    /// [`sequences`](super::sequences).
+    sequences: &'a SequenceTable,
 }
 
 impl<'a> Context<'a> {
@@ -338,6 +366,7 @@ impl<'a> Context<'a> {
         random: &'a mut RandomStream,
         entities: &'a mut EntityList,
         player: Option<EntityId>,
+        sequences: &'a SequenceTable,
     ) -> Context<'a> {
         Context {
             time,
@@ -349,7 +378,19 @@ impl<'a> Context<'a> {
             created: Vec::new(),
             damage: Vec::new(),
             reload_level: false,
+            sequences,
         }
+    }
+
+    /// `LookupSequence` + `SequenceDuration` + `SequenceLoops`, for a model
+    /// this level's entities place.
+    ///
+    /// **Read [`Lookup`]'s three cases before branching on this.** The one
+    /// that is easy to get wrong is [`Lookup::Unknown`], which every `Spawn`
+    /// in the game sees, because the models are not loaded until the entities
+    /// that name them exist.
+    pub fn sequence(&self, model: &str, label: &str) -> Lookup {
+        self.sequences.lookup(model, label)
     }
 
     /// `CreateEntityByName` (`game/server/entitylist.cpp:206`) — a new entity,
@@ -923,7 +964,7 @@ pub trait Behaviour: Any {
     /// renderer, which is why the sequence is a `&'static str` rather than an
     /// index: looking a label up in a `.mdl` needs the `.mdl`, and this module
     /// names no studio type.
-    fn model_state(&self) -> Option<ModelState> {
+    fn model_state(&self) -> Option<ModelState<'_>> {
         None
     }
 
@@ -985,17 +1026,42 @@ impl dyn Behaviour {
 
 /// `CBaseAnimating`'s animation state, as much of it as anything reads.
 ///
-/// `m_nSequence` and `m_flAnimTime` (`baseanimating.h`), plus the skin. Valve
-/// networks all three to the client, which is where they are turned into a
-/// pose — see
-/// [`entities`](crate::engine::world::entities) for why the split survives here
-/// with one process.
+/// **These are exactly the five fields `IMPLEMENT_SERVERCLASS_ST(
+/// CBaseAnimating, DT_BaseAnimating )` sends** — `m_nSequence`, `m_flCycle`,
+/// `m_flAnimTime`, `m_flPlaybackRate` and `m_nSkin` — which is not a
+/// coincidence: what the client needs in order to pose a model is what the
+/// renderer needs here, and one process does not change the list. See
+/// [`entities`](crate::engine::world::entities) for why the split survives
+/// with no network in between.
+///
+/// # The pose is `cycle + elapsed * playback_rate / duration`
+///
+/// Valve *accumulates* the cycle — `StudioFrameAdvance` adds
+/// `dt * rate / duration` every frame — and this port *derives* it from the
+/// three fields below, because a 64 Hz server would otherwise step an
+/// animation the renderer can interpolate. The two agree exactly while the
+/// rate is constant, and the server re-bases [`cycle`](ModelState::cycle) and
+/// [`anim_time`](ModelState::anim_time) whenever it is not, which is what
+/// keeps a `SetPlaybackRate` mid-animation from jumping the pose.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelState {
+pub struct ModelState<'a> {
     /// The sequence's label, as `LookupSequence` takes it. `""` is the bind
-    /// pose.
-    pub sequence: &'static str,
-    /// `m_flAnimTime` — when the sequence was last reset.
+    /// pose, and so is a label the model does not have.
+    ///
+    /// **Borrowed from the behaviour**, because a `prop_dynamic`'s comes out
+    /// of the map (`DefaultAnim`, or a `SetAnimation` parameter) and there are
+    /// 1,141 distinct ones in the shipped game. It was a `&'static str` while
+    /// the only animated class in the port was `prop_floor_button`, whose two
+    /// are literals.
+    pub sequence: &'a str,
+    /// `m_flCycle` — where in the sequence the entity was at
+    /// [`anim_time`](ModelState::anim_time), from 0 to 1.
+    ///
+    /// Not always zero: `CDynamicProp::FinishSetSequence` starts a sequence at
+    /// **0.999** when the playback rate is negative, which is what the 427
+    /// `SetPlaybackRate -1` connections in the game rely on.
+    pub cycle: f32,
+    /// `m_flAnimTime` — when [`cycle`](ModelState::cycle) was true.
     ///
     /// > **It is the *server's* clock**, and the renderer measures against the
     /// > scene's (gotcha 1). The two track each other and differ by at most one
@@ -1003,6 +1069,13 @@ pub struct ModelState {
     /// > clamps a negative elapsed time to zero so the worst case is a single
     /// > frame of an animation not having started yet.
     pub anim_time: f32,
+    /// `m_flPlaybackRate` — sequence lengths per second, signed.
+    ///
+    /// **Zero is the resting value for a prop**: `CBaseProp::Spawn` sets it,
+    /// and `ResetSequenceInfo` puts it back to 1 the first time a sequence is
+    /// set. So a `prop_dynamic` that is never given an animation holds frame
+    /// zero for ever rather than playing sequence 0 on a loop.
+    pub playback_rate: f32,
     /// `m_nSkin`.
     pub skin: i32,
 }

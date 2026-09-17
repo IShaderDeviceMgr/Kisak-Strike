@@ -1952,9 +1952,16 @@ recorded and never collected, and eventually no staging buffer free to record in
 ### What it costs
 
 Measured by `engine::exposure` on `sp_a1_intro1` at 1280x720, release, an M1 Pro:
-**0.008 ms of CPU per frame** to record the compute dispatch and the presenting pass,
-against 1.21 ms for the world draw they sit around. One screen-sized texture, one
+**0.004 ms of CPU per frame** to record the compute dispatch and the presenting pass,
+against 0.64 ms for the scene draw they sit around. One screen-sized texture, one
 screen-sized depth buffer, and two 64-byte staging buffers.
+
+**Read the two numbers as a ratio, not as absolutes.** Both move together with the
+machine's thermal state — an earlier run of the same test reported 0.008 against 1.21 —
+and what the measurement says either way is that the tone mapper is **well under one per
+cent** of the frame. This test's scene is also not the whole frame: it draws
+`World::draw` without the models a game entity places, which
+`engine::world::bench` does load.
 
 
 ## Invariants and gotchas

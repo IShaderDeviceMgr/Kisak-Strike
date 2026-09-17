@@ -65,7 +65,7 @@ pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
 pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
 pub use point::PointTeleport;
-pub use prop::{ButtonTrigger, FloorButton};
+pub use prop::{ButtonTrigger, DynamicProp, FloorButton};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
 
@@ -81,6 +81,48 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: RELAY_INPUTS,
         outputs: &["OnTrigger", "OnSpawn"],
         create: Relay::create,
+    },
+    // `CDynamicProp`, four ways (`props.cpp:1914`). Second only to
+    // `logic_relay` by ten entities, and the class carries more shipped input
+    // connections than any other in the port.
+    //
+    // **The classname is behaviour, not decoration**: `CDynamicProp::Spawn`
+    // asks `FClassnameIs` twice, so a `prop_dynamic_override` keeps
+    // `SOLID_NONE` where a `prop_dynamic` is promoted to `SOLID_OBB`, and it
+    // is the only one of the four a map may give `health` to. See
+    // [`DynamicProp::is_plain_dynamic`] and [`DynamicProp::allows_health`].
+    ClassDef {
+        name: "prop_dynamic",
+        keys: prop::DYNAMIC_PROP_KEYS,
+        inputs: DYNAMIC_PROP_INPUTS,
+        outputs: prop::DYNAMIC_PROP_OUTPUTS,
+        create: DynamicProp::create,
+    },
+    ClassDef {
+        name: "prop_dynamic_override",
+        keys: prop::DYNAMIC_PROP_KEYS,
+        inputs: DYNAMIC_PROP_INPUTS,
+        outputs: prop::DYNAMIC_PROP_OUTPUTS,
+        create: DynamicProp::create,
+    },
+    // The two `LINK_ENTITY_TO_CLASS` names no shipped map uses, registered for
+    // the reason `light_glspot` is: a map that placed one would otherwise get
+    // an entity the game would not. `dynamic_prop` renames itself to
+    // `prop_dynamic` in its own `Spawn`, which is what puts it on the
+    // promoted side of the solidity test; `prop_dynamic_glow` does not.
+    ClassDef {
+        name: "dynamic_prop",
+        keys: prop::DYNAMIC_PROP_KEYS,
+        inputs: DYNAMIC_PROP_INPUTS,
+        outputs: prop::DYNAMIC_PROP_OUTPUTS,
+        create: DynamicProp::create,
+    },
+    ClassDef {
+        name: "prop_dynamic_glow",
+        keys: prop::DYNAMIC_PROP_KEYS,
+        inputs: DYNAMIC_PROP_INPUTS,
+        outputs: prop::DYNAMIC_PROP_OUTPUTS,
+        create: DynamicProp::create,
     },
     ClassDef {
         name: "light",
@@ -464,6 +506,7 @@ static CASE_INPUTS: InputDefs = &[
 // The tables the class files own, under the names [`CLASSES`] reads.
 static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
 static FLOOR_BUTTON_INPUTS: InputDefs = prop::FLOOR_BUTTON_INPUTS;
+static DYNAMIC_PROP_INPUTS: InputDefs = prop::DYNAMIC_PROP_INPUTS;
 /// `CBaseTrigger`'s two keys, which a `trigger_portal_button` is never offered
 /// — it is built from code — but which its `key_value` forwards, so they are
 /// declared. The invariant test checks the declaration against the code, not
@@ -509,7 +552,7 @@ mod tests {
     fn lookup_is_case_insensitive_and_knows_nothing_it_was_not_given() {
         assert!(lookup("logic_relay").is_some());
         assert!(lookup("LOGIC_RELAY").is_some());
-        assert!(lookup("prop_dynamic").is_none());
+        assert!(lookup("ambient_generic").is_none());
         assert_eq!(lookup("light_spot").map(|c| c.name), Some("light_spot"));
     }
 

@@ -75,8 +75,11 @@ fn sample() -> Vec<bsp::Entity> {
             ("parentname", "flicker"),
             ("origin", "1 2 3"),
         ]),
-        block(&[("classname", "prop_dynamic"), ("model", "models/x.mdl")]),
-        block(&[("classname", "prop_dynamic"), ("model", "models/y.mdl")]),
+        // Two blocks of a classname the port does not implement. It was
+        // `prop_dynamic` until that landed; `ambient_generic` is the
+        // replacement because sound is the furthest-away subsystem there is.
+        block(&[("classname", "ambient_generic"), ("message", "a.wav")]),
+        block(&[("classname", "ambient_generic"), ("message", "b.wav")]),
     ]
 }
 
@@ -86,8 +89,8 @@ fn a_map_becomes_an_entity_list() {
     let stats = server.level_init("test", &sample(), &[]);
 
     assert_eq!(stats.blocks, 8);
-    assert_eq!(stats.matched, 6, "prop_dynamic is not implemented yet");
-    assert_eq!(stats.unknown.get("prop_dynamic"), Some(&2));
+    assert_eq!(stats.matched, 6, "ambient_generic is not implemented yet");
+    assert_eq!(stats.unknown.get("ambient_generic"), Some(&2));
     assert_eq!(
         stats.removed_on_spawn, 1,
         "the unnamed light removes itself and nothing else does"
@@ -1988,21 +1991,38 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("_zero_percent_distance", 4292),
     ("addonpoints", 1),
     ("ambient", 2),
+    // Written onto 599 `prop_dynamic`s by Hammer and declared by no `.fgd` in
+    // the depot; nothing in `legacy/` reads either name. Mapper leftovers, the
+    // same category as `inputfilter`.
+    ("canbecaptured", 599),
     ("detailvbsp", 106),
+    // `disableX360` **is** in `base.fgd`'s `SystemLevelChoice`, beside the four
+    // CPU/GPU-level keys the port now consumes — and unlike those four it is
+    // read by nothing in the whole tree, on either side of the DLL boundary.
+    ("disablex360", 123),
     ("filtername", 1),
     ("inputfilter", 2497),
     ("mapversion", 106),
+    // The DirectX-level fade pair. In no Portal 2 `.fgd` and read nowhere in
+    // `legacy/`: they are HL2-era Hammer keys that survived in copied prefabs.
+    ("maxdxlevel", 3924),
     ("message", 3),
+    ("mindxlevel", 3924),
     ("npcpoints", 1),
     ("onendtouchblueplayer", 1),
     ("onendtouchorangeplayer", 1),
-    ("onfullyopen", 2),
+    // One `prop_dynamic` declares an output only a `func_portal_cleanser` has;
+    // ten declare `func_door`'s. Mapper mistakes, now visible because the class
+    // that carries them is implemented.
+    ("onfizzled", 1),
+    ("onfullyopen", 10),
     ("onproxyrelay", 135),
     ("onstarttouchblueplayer", 1),
     ("onstarttouchorangeplayer", 1),
     ("ontrigger", 15),
     ("onunpressed", 2),
     ("paintinmap", 25),
+    ("scalevalue", 599),
     ("skin", 1),
     ("sunspreadangle", 27),
     ("vrad_brush_cast_shadows", 2456),
@@ -2259,16 +2279,19 @@ fn every_shipped_map_spawns_its_entities() {
     // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
     // stage 2 took it to 19,229 and 12,292, stage 3's six brush classes were
     // 3,410 more of both, stage 4's twelve — five triggers, six filters and
-    // `point_teleport` — are 3,322 more again, `prop_floor_button` is 65, and
-    // stage 5's two — `logic_playerproxy` and `player_loadsaved` — are 9 each.
-    assert_eq!(total.matched, 26_044);
-    assert_eq!(total.spawned, 19_172);
-    // +5 over stage 4: the five `logic_playerproxy` connections in the whole
-    // game, all of them on `sp_a1_intro1`, are outputs now rather than keys on
-    // a block with no class.
-    assert_eq!(total.outputs, 53_387);
-    assert_eq!(total.unknown.len(), 164);
-    assert_eq!(total.unknown.values().sum::<usize>(), 34_881);
+    // `point_teleport` — are 3,322 more again, `prop_floor_button` is 65,
+    // stage 5's two — `logic_playerproxy` and `player_loadsaved` — are 9 each,
+    // and **`prop_dynamic` is 8,462 on its own**, which is more than stages 3
+    // and 4 together.
+    assert_eq!(total.matched, 34_506);
+    assert_eq!(total.spawned, 27_634);
+    // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
+    // connections used to be keys on a block with no class. The other 267 are
+    // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
+    // `OnUser2`-`OnUser4`.
+    assert_eq!(total.outputs, 53_980);
+    assert_eq!(total.unknown.len(), 162);
+    assert_eq!(total.unknown.values().sum::<usize>(), 26_419);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -2330,6 +2353,14 @@ fn every_shipped_map_spawns_its_entities() {
     // against real map data: 65 buttons in 47 of the 106 maps, and 65
     // triggers that appear in no entity lump at all.
     assert_eq!(per_class.get("prop_floor_button"), Some(&65));
+    // …and `prop_dynamic`, which is the commonest thing in a Portal 2 map
+    // after `logic_relay` — by ten entities. The two classnames a map can
+    // place are one C++ class and two different behaviours; see
+    // `DynamicProp::is_plain_dynamic`.
+    assert_eq!(per_class.get("prop_dynamic"), Some(&8_072));
+    assert_eq!(per_class.get("prop_dynamic_override"), Some(&390));
+    assert_eq!(per_class.get("dynamic_prop"), None, "registered, never placed");
+    assert_eq!(per_class.get("prop_dynamic_glow"), None);
     assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
     // …and **no `player`**: the class is registered because Valve registers
     // it, and no shipped map places one. The 106 in the list are the ones
@@ -2345,13 +2376,16 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(custom_max, 100);
 
     // The run side. These are what two seconds of every shipped map does.
-    assert_eq!(io.dispatched, 5_766);
-    assert_eq!(io.accepted, 2_480);
-    assert_eq!(io.thinks, 1_450);
-    // Most events reach nothing because most *targets* are entities of classes
-    // this port has not got — `prop_dynamic` alone is 8,072 of them. Expect
-    // this number to fall as classes land.
-    assert_eq!(io.no_target, 2_548);
+    //
+    // **`accepted` and `thinks` both jumped with `prop_dynamic`** — 1,443 more
+    // inputs land and 2,970 more thinks run, because a prop that is given an
+    // animation wakes at 10 Hz until it has finished one. `no_target` fell by
+    // more than half for the same reason: most events used to reach nothing
+    // because most *targets* were props.
+    assert_eq!(io.dispatched, 5_785);
+    assert_eq!(io.accepted, 3_923);
+    assert_eq!(io.thinks, 4_420);
+    assert_eq!(io.no_target, 1_129);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -2359,18 +2393,19 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The whole set of inputs that reach an implemented class and are refused.
     //
-    // **Nine names, and 1,078 of the 1,081 occurrences are the parenting
+    // **Eighteen names, and 1,103 of the 1,285 occurrences are the parenting
     // family.** `func_brush` alone takes 883 `SetParentAttachmentMaintainOffset`
     // in the first two seconds of the game, because a Hammer instance parents
     // its clip brushes to a moving platform and the `logic_auto` bootstrap is
-    // what does the parenting. That family stays unimplemented on purpose and
-    // the condition is a real one: `SetParent` needs a local/abs transform
-    // pair on `EntityCore`, which this port does not have (a child's origin is
-    // the world-space one the map gave and nothing rebases it), and
-    // `SetParentAttachment*` needs `LookupAttachment` on a studio model, which
-    // would be this module's first dependency on `studio/`. Three of the
-    // remaining names are the player procedurals (stage 5's) and one is
-    // `RunScriptCode` (`portdocs/SERVER.md` §9).
+    // what does the parenting; `prop_dynamic` brought 177 more of the same
+    // family, which is the largest single thing that would be fixed by giving
+    // `EntityCore` a local/abs transform pair. That family stays unimplemented
+    // on purpose and the condition is a real one: `SetParent` needs that pair
+    // (a child's origin is the world-space one the map gave and nothing
+    // rebases it), and `SetParentAttachment*` needs `LookupAttachment` on a
+    // studio model. Three of the remaining names are the player procedurals
+    // (stage 5's), one is `RunScriptCode` (`portdocs/SERVER.md` §9), and
+    // `prop_dynamic.Disabled` is eight connections misspelling `Disable`.
     let unhandled: Vec<(&str, usize)> =
         io.unhandled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_eq!(
@@ -2385,6 +2420,13 @@ fn every_shipped_map_spawns_its_entities() {
             ("info_target.SetParentAttachmentMaintainOffset", 1),
             ("logic_relay.RunScriptCode", 1),
             ("player.SetFogController", 97),
+            ("prop_dynamic.Disabled", 8),
+            ("prop_dynamic.SetParent", 2),
+            ("prop_dynamic.SetParentAttachment", 3),
+            ("prop_dynamic.SetParentAttachmentMaintainOffset", 148),
+            ("prop_dynamic_override.SetParent", 16),
+            ("prop_dynamic_override.SetParentAttachment", 3),
+            ("prop_dynamic_override.SetParentAttachmentMaintainOffset", 3),
             ("trigger_hurt.SetParentAttachmentMaintainOffset", 19),
             ("trigger_multiple.SetParentAttachmentMaintainOffset", 2),
         ],
@@ -2431,7 +2473,16 @@ fn every_shipped_map_spawns_its_entities() {
     // `logic_auto` bootstrap rather than by anything that moves. Stage 4 takes
     // it to 48 — a `trigger_multiple` holds a think for its whole `wait`, and
     // a `trigger_once` for the tenth of a second before it deletes itself.
-    assert_eq!(peak_thinks, 48);
+    //
+    // **`prop_dynamic` takes it to 214, and that is the first time this number
+    // has said anything about the shape of the list.** A prop that is given an
+    // animation thinks at 10 Hz until that animation *ends*, and a map's
+    // bootstrap starts a lot of them at once. It is still a list being entered
+    // and left rather than filled once — `AnimThink` cancels itself the moment
+    // its sequence cannot end (`rustdocs/SERVER.md` gotcha 64), so a prop that
+    // is looping or holding is **not** in here — and 214 against 27,634 live
+    // entities is still under one per cent.
+    assert_eq!(peak_thinks, 214);
 
     // The one map this port looks at most, and the headline of the whole
     // stage: `sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default
@@ -3220,9 +3271,10 @@ fn the_player_is_an_entity_and_resolves_procedurally() {
             entities,
             queue,
             random,
+            sequences,
             ..
         } = &mut server;
-        let mut cx = Context::new(time, queue, random, entities, Some(player));
+        let mut cx = Context::new(time, queue, random, entities, Some(player), sequences);
         cx.post_named("!player", "Kill", Variant::Void, 0.0, None, Some(spot), 0);
     }
     run(&mut server, 0.1);
@@ -3520,11 +3572,13 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // elevator rather than a trap.
     assert_eq!(visited, 2_255);
     assert_eq!(noticed, 2_246);
-    // 1,888 of them get as far as dispatching something, which is the whole
+    // 1,889 of them get as far as dispatching something, which is the whole
     // chain — geometry, `FSOLID_TRIGGER`, the touch link, `PassesTriggerFilters`
-    // and an output with a connection on it. The 358 that do not are triggers
+    // and an output with a connection on it. The 357 that do not are triggers
     // whose outputs go to entities this port has no class for, or whose filter
-    // says "cubes only".
+    // says "cubes only". It was 1,888 before `prop_dynamic`: one more trigger
+    // in the game has a connection whose only target is a prop, and the
+    // number rises again with every class that lands.
     //
     // > **9 of those 1,888 are not the brush trigger's doing, and the number
     // > is the difference between two measurements rather than a guess.**
@@ -3536,7 +3590,7 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // > behaviour — a chamber's exit trigger around its own button is ordinary
     // > level design — and it is counted rather than filtered out so that the
     // > number is explained rather than absorbed.
-    assert_eq!(fired, 1_888);
+    assert_eq!(fired, 1_889);
     assert_eq!(also_on_a_button, 21, "probes that also stand on a pad");
     // Three triggers in the game have no point a 32x32x72 hull fits inside.
     assert_eq!(unreachable, 3);
@@ -4606,4 +4660,700 @@ fn every_shipped_trigger_hurt_kills_the_player_standing_in_it() {
     // **Every death reaches `RespawnPlayer`**, three seconds later — which is
     // inside the sixteen for every one of them.
     assert_eq!(restarts, killed, "a death did not reach RespawnPlayer");
+}
+
+// ===========================================================================
+// prop_dynamic — the model the map places, and animates
+// ===========================================================================
+
+/// A map with one `prop_dynamic` named `prop`, wired so that both of its
+/// animation outputs land on a counter.
+///
+/// `extra` goes on the prop, which is how these tests choose its classname's
+/// siblings, its `solid`, and its `DefaultAnim`.
+fn prop_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("classname", "prop_dynamic"),
+        ("targetname", "prop"),
+        ("model", "models/props/panel.mdl"),
+    ];
+    for (key, value) in extra {
+        match pairs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            // A `classname` in `extra` *replaces* the default rather than
+            // being a second one — the lump is a list of pairs, and the first
+            // `classname` is the one that chooses the class.
+            Some(pair) => pair.1 = value,
+            None => pairs.push((key, value)),
+        }
+    }
+    let mut prop = block(&pairs);
+    prop.pairs.push((
+        "OnAnimationBegun".to_owned(),
+        conn("begun", "Add", "1", "0", "-1"),
+    ));
+    prop.pairs.push((
+        "OnAnimationDone".to_owned(),
+        conn("done", "Add", "1", "0", "-1"),
+    ));
+
+    vec![
+        block(&[("classname", "worldspawn")]),
+        prop,
+        block(&[("classname", "math_counter"), ("targetname", "begun")]),
+        block(&[("classname", "math_counter"), ("targetname", "done")]),
+    ]
+}
+
+/// The pose `engine::world::entities` would compute, against a sequence of
+/// `duration` seconds that does not loop.
+///
+/// **The renderer's arithmetic, written out here**, because the seam is five
+/// numbers and the whole point of this class is that the two sides agree on
+/// what they mean.
+fn prop_cycle(server: &Server, duration: f32) -> f32 {
+    let state = prop_of(server)
+        .model_state()
+        .expect("it draws a model");
+    let elapsed = (server.time().curtime - state.anim_time).max(0.0);
+    (state.cycle + elapsed * state.playback_rate / duration).clamp(0.0, 1.0)
+}
+
+fn prop_of(server: &Server) -> &classes::DynamicProp {
+    find_named(server, "prop")
+        .behaviour
+        .downcast_ref::<classes::DynamicProp>()
+        .expect("a DynamicProp")
+}
+
+/// A table saying `open` takes a second and does not loop, and `spin` loops.
+fn panel_sequences() -> sequences::SequenceTable {
+    let mut table = sequences::SequenceTable::new();
+    table.insert_model(
+        "models/props/panel.mdl",
+        [
+            (
+                "open".to_owned(),
+                sequences::SequenceInfo {
+                    duration: 1.0,
+                    loops: false,
+                },
+            ),
+            (
+                "open_idle".to_owned(),
+                sequences::SequenceInfo {
+                    duration: 1.0,
+                    loops: false,
+                },
+            ),
+            (
+                "spin".to_owned(),
+                sequences::SequenceInfo {
+                    duration: 2.0,
+                    loops: true,
+                },
+            ),
+        ],
+    );
+    table
+}
+
+/// `CBaseProp::Spawn`'s resting state, and the promotion that is the whole
+/// difference between the two classnames a map can place.
+#[test]
+fn a_dynamic_prop_spawns_still_and_a_plain_one_is_promoted_to_an_obb() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[("solid", "0")]), &[]);
+
+    let prop = find_named(&server, "prop");
+    // `SetSolid( SOLID_OBB ); AddSolidFlags( FSOLID_NOT_SOLID )`.
+    assert_eq!(prop.solid, crate::server::movement::Solid::Obb);
+    assert!(!prop.is_solid(), "you walk through a prop_dynamic");
+    // `CBaseProp::Spawn`.
+    assert_eq!(prop.move_type, crate::server::movement::MoveType::Push);
+    assert_eq!(prop.health, 0);
+    assert_eq!(prop.max_health, 1);
+    assert_eq!(prop.take_damage, crate::server::damage::DamageMode::EventsOnly);
+    // A mover with no alarm is not in the simulation list — 8,462 props in the
+    // game would otherwise be.
+    assert!(!prop.will_simulate_game_physics());
+
+    // **The rate is zero**, so a prop with no `DefaultAnim` holds frame zero
+    // for ever rather than looping sequence 0.
+    let state = prop.behaviour.model_state().expect("it draws a model");
+    assert_eq!(state.playback_rate, 0.0);
+    assert_eq!(state.sequence, "");
+
+    // And an `_override` with the same `solid 0` is *not* promoted — 211 of
+    // the game's 390 are in exactly this position.
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &prop_map(&[("classname", "prop_dynamic_override"), ("solid", "0")]),
+        &[],
+    );
+    assert_eq!(
+        find_named(&server, "prop").solid,
+        crate::server::movement::Solid::None,
+        "prop_dynamic_override keeps SOLID_NONE"
+    );
+}
+
+/// `solid 6` survives `Spawn`, because the prop family is the one family whose
+/// `Spawn` does not call `SetSolid`.
+#[test]
+fn the_solid_key_reaches_a_prop_and_no_other_class_writes_one() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[("solid", "6")]), &[]);
+    assert_eq!(
+        find_named(&server, "prop").solid,
+        crate::server::movement::Solid::VPhysics
+    );
+    // `SF_DYNAMICPROP_DISABLE_COLLISION`, which 161 shipped props set.
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &prop_map(&[("solid", "6"), ("spawnflags", "256")]),
+        &[],
+    );
+    assert!(!find_named(&server, "prop").is_solid());
+}
+
+/// **A prop with no model deletes itself**, which is `CBaseProp::Spawn`'s
+/// first four lines. No shipped map reaches it; a hand-made one would.
+#[test]
+fn a_prop_with_no_model_removes_itself() {
+    let mut server = Server::new();
+    let stats = server.level_init(
+        "test",
+        &[
+            block(&[("classname", "worldspawn")]),
+            block(&[("classname", "prop_dynamic"), ("targetname", "prop")]),
+        ],
+        &[],
+    );
+    assert_eq!(stats.matched, 2);
+    assert_eq!(stats.removed_on_spawn, 1);
+}
+
+/// **`SetAnimation` plays a sequence, and `OnAnimationDone` fires when it
+/// ends** — the two halves of what 5,311 and 181 shipped connections do.
+#[test]
+fn set_animation_plays_a_sequence_and_fires_both_of_its_outputs() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[]), &[]);
+    server.set_sequences(panel_sequences());
+    run(&mut server, 0.5);
+    assert_eq!(counter_value(&server, "begun"), 0.0, "nothing has begun yet");
+
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    run(&mut server, 0.1);
+
+    // `PropSetAnim` fires `OnAnimationBegun` and `FinishSetSequence` starts
+    // the sequence forwards from zero at rate 1.
+    assert_eq!(counter_value(&server, "begun"), 1.0);
+    let state = prop_of(&server).model_state().expect("it draws a model");
+    assert_eq!(state.sequence, "open");
+    assert_eq!(state.cycle, 0.0);
+    assert_eq!(state.playback_rate, 1.0);
+
+    // Half a second in, nothing has finished.
+    run(&mut server, 0.4);
+    assert_eq!(counter_value(&server, "done"), 0.0);
+
+    // A second in, it has — once, and only once however long we wait.
+    run(&mut server, 0.7);
+    assert_eq!(counter_value(&server, "done"), 1.0);
+    run(&mut server, 2.0);
+    assert_eq!(counter_value(&server, "done"), 1.0, "it fires once");
+}
+
+/// **A finished animation reverts to `DefaultAnim`**, which is what puts a
+/// panel that was told to `open` into `open_idle` without the map saying so —
+/// and `HoldAnimation` is what stops it. 2,416 props carry the first and 857
+/// the second.
+#[test]
+fn a_finished_animation_reverts_to_the_default_unless_the_prop_holds_it() {
+    for (hold, expected) in [("0", "open_idle"), ("1", "open")] {
+        let mut server = Server::new();
+        server.level_init(
+            "test",
+            &prop_map(&[("DefaultAnim", "open_idle"), ("HoldAnimation", hold)]),
+            &[],
+        );
+        server.set_sequences(panel_sequences());
+
+        // `Spawn`'s own `PropSetAnim( DefaultAnim )` — which ran against an
+        // empty table and was believed anyway.
+        assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open_idle");
+
+        let prop_id = find_named(&server, "prop").id();
+        server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+        run(&mut server, 0.1);
+        assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open");
+
+        run(&mut server, 1.2);
+        assert_eq!(
+            prop_of(&server).model_state().expect("it draws a model").sequence,
+            expected,
+            "HoldAnimation {hold}"
+        );
+        // Either way the end was noticed exactly once.
+        assert_eq!(counter_value(&server, "done"), 1.0);
+    }
+}
+
+/// A **looping** sequence never finishes, so nothing fires — and the think
+/// stops rather than waking the entity ten times a second for the rest of the
+/// level.
+#[test]
+fn a_looping_sequence_never_finishes_and_stops_thinking() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[("DefaultAnim", "spin")]), &[]);
+    server.set_sequences(panel_sequences());
+    run(&mut server, 5.0);
+
+    assert_eq!(counter_value(&server, "begun"), 1.0, "Spawn's PropSetAnim");
+    assert_eq!(counter_value(&server, "done"), 0.0, "a loop never ends");
+    assert_eq!(
+        find_named(&server, "prop").next_think_tick(),
+        think::TICK_NEVER_THINK,
+        "the think has nothing left to decide"
+    );
+
+    // And the flag is reset on the way, so a *later* sequence that does finish
+    // still fires. This is the one line of Valve's `else` branch that had to
+    // survive the think being cancelled.
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    run(&mut server, 1.3);
+    assert_eq!(counter_value(&server, "done"), 1.0);
+}
+
+/// **`SetPlaybackRate -1` runs the sequence backwards from where it is** —
+/// 427 shipped connections — and the pose does not jump when it arrives.
+#[test]
+fn set_playback_rate_rebases_the_pose_so_it_does_not_jump() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[]), &[]);
+    server.set_sequences(panel_sequences());
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    run(&mut server, 0.5);
+
+    // Half a second into a one-second sequence.
+    let before = prop_cycle(&server, 1.0);
+    assert!((before - 0.5).abs() < 0.05, "half way through: {before}");
+
+    server.accept_input(prop_id, "SetPlaybackRate", Variant::Float(-1.0), None, None, 0);
+    // The pose is the same one instant later…
+    let after = prop_cycle(&server, 1.0);
+    assert!(
+        (after - before).abs() < 1e-5,
+        "the pose jumped: {before} -> {after}"
+    );
+    assert_eq!(
+        prop_of(&server)
+            .model_state()
+            .expect("it draws a model")
+            .playback_rate,
+        -1.0
+    );
+    // …and then runs backwards to the start, where `bPropFinished` is
+    // `cycle <= 0` rather than `cycle >= 0.999`.
+    run(&mut server, 0.6);
+    assert_eq!(counter_value(&server, "done"), 1.0);
+    assert_eq!(prop_cycle(&server, 1.0), 0.0);
+}
+
+/// `StartDisabled` is `EF_NODRAW`, and `Enable`/`Disable` are Valve's own
+/// second names for `TurnOn`/`TurnOff`.
+///
+/// **The seam carries the invisible prop rather than dropping it**, which is
+/// what lets it come back: 1,000 props in the game start this way.
+#[test]
+fn start_disabled_hides_a_prop_and_enable_brings_it_back() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[("StartDisabled", "1")]), &[]);
+
+    let drawn = |server: &Server| server.model_entities()[0].visible;
+    assert_eq!(server.model_entities().len(), 1, "it is in the list");
+    assert!(!drawn(&server));
+
+    let prop_id = find_named(&server, "prop").id();
+    for (input, visible) in [
+        ("Enable", true),
+        ("Disable", false),
+        ("TurnOn", true),
+        ("TurnOff", false),
+        ("EnableDraw", true),
+        ("DisableDraw", false),
+    ] {
+        server.accept_input(prop_id, input, Variant::Void, None, None, 0);
+        run(&mut server, 0.05);
+        assert_eq!(drawn(&server), visible, "{input}");
+    }
+}
+
+/// `FadeAndKill` takes a second and then the prop is gone — and the seam
+/// notices, because it is keyed rather than positional.
+#[test]
+fn fade_and_kill_removes_the_prop_after_a_second() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[]), &[]);
+    // A tick of clearance first, and it is load-bearing: `SUB_StartFadeOut`
+    // arms its think for `curtime + 0` and `SetNextThink( 0 )` means **not
+    // scheduled**, at tick zero, in this port and in Valve's alike
+    // (`physics_main.cpp`'s `thinktick <= 0` guard). No shipped map can fire
+    // an input before the first tick.
+    run(&mut server, 0.1);
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "FadeAndKill", Variant::Void, None, None, 0);
+
+    run(&mut server, 0.5);
+    assert!(
+        server.entities.get(prop_id).is_some(),
+        "half a second in, it is still fading"
+    );
+    assert!(
+        server.entities.get(prop_id).expect("alive").render_color[3] < 200,
+        "and it has faded some of the way"
+    );
+
+    run(&mut server, 0.6);
+    assert!(server.entities.get(prop_id).is_none());
+    assert!(server.model_entities().is_empty());
+}
+
+/// `Break` is the only way an `OnBreak` connection can fire in Portal 2 — a
+/// prop spawns at `DAMAGE_EVENTS_ONLY` with no health, so nothing can damage
+/// it into breaking. 8 shipped connections fire it and 16 listen for the
+/// output.
+#[test]
+fn the_break_input_fires_on_break_and_removes_the_prop() {
+    let mut map = prop_map(&[]);
+    map[1]
+        .pairs
+        .push(("OnBreak".to_owned(), conn("done", "Add", "1", "0", "-1")));
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "Break", Variant::Void, None, None, 0);
+    run(&mut server, 0.1);
+    assert_eq!(counter_value(&server, "done"), 1.0);
+    assert!(server.entities.get(prop_id).is_none());
+}
+
+/// **`health` is swallowed unless the classname is an `_override`** —
+/// `CBaseProp::KeyValue`'s one line. All 344 shipped keys write `0`, so this
+/// is a test of the mechanism rather than of anything a map does.
+#[test]
+fn only_an_override_prop_may_be_given_health_by_the_map() {
+    for (classname, unhandled) in [("prop_dynamic", 0), ("prop_dynamic_override", 0)] {
+        let mut server = Server::new();
+        let stats = server.level_init(
+            "test",
+            &prop_map(&[("classname", classname), ("health", "50")]),
+            &[],
+        );
+        assert_eq!(
+            stats.unhandled.get("health"),
+            None,
+            "{classname} consumed the key either way"
+        );
+        let _ = unhandled;
+        // What differs is whether it was *kept*. Both end at zero, because
+        // `CBreakableProp::Spawn` zeroes an unbreakable prop's health — which
+        // every Portal 2 prop is.
+        assert_eq!(find_named(&server, "prop").health, 0);
+    }
+}
+
+/// A `SetAnimation` naming a sequence the model does not have warns and stands
+/// still, which is Valve's `else` branch — and it is reachable only because
+/// the table is filled in.
+#[test]
+fn a_sequence_the_model_does_not_have_is_refused_once_the_models_are_loaded() {
+    let mut server = Server::new();
+    server.level_init("test", &prop_map(&[]), &[]);
+    server.set_sequences(panel_sequences());
+
+    let prop_id = find_named(&server, "prop").id();
+    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    run(&mut server, 0.1);
+    assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open");
+
+    server.accept_input(
+        prop_id,
+        "SetAnimation",
+        Variant::String("sideways".to_owned()),
+        None,
+        None,
+        0,
+    );
+    run(&mut server, 0.1);
+    // `SetSequence( 0 )`, which here is the bind pose — and **no**
+    // `OnAnimationBegun`, so the counter is still on the one from `open`.
+    assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "");
+    assert_eq!(counter_value(&server, "begun"), 1.0);
+}
+
+/// **Every `prop_dynamic` in the game, spawned, with its model's real
+/// sequences in hand.**
+///
+/// The class's own depot test, and the one that says what the port can and
+/// cannot animate. For each of the 106 maps it spawns the entities, loads
+/// every `.mdl` they name — through `StudioModel`, which needs a `Vfs` and no
+/// GPU — fills in the sequence table exactly as `Engine::load_level` does, and
+/// runs two seconds.
+///
+/// It is the only test in this file that names a `studio` type, and it does so
+/// for the same reason `Engine` does: this is the *seam*, and a seam is only
+/// checkable from both sides.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release prop_dynamic -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
+    use crate::filesystem::Vfs;
+    use crate::studio::StudioModel;
+
+    const RUN_SECONDS: f32 = 2.0;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    // Every `.mdl` read so far, as the table wants it — `None` for one that
+    // would not load, which is an entity that draws nothing.
+    let mut loaded: BTreeMap<String, Option<Vec<(String, sequences::SequenceInfo)>>> =
+        BTreeMap::new();
+    // …and, for each that did load, whether the renderer can pose it: a model
+    // with more than one bone whose vertices are **not** each bound to exactly
+    // one bone cannot be drawn by `EntityModels`' per-bone split and is drawn
+    // in its bind pose instead. See `StudioModel::rigid_bones`.
+    let mut rigidity: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+
+    let mut spawned = 0usize;
+    let mut props = 0usize;
+    let mut models_missing = 0usize;
+    let mut invisible = 0usize;
+    let mut resolved = 0usize;
+    let mut unresolved = 0usize;
+    let mut animating = 0usize;
+    let mut animatable = 0usize;
+    let mut not_rigid = 0usize;
+    let mut solid_key = [0usize; 2];
+    let mut maps_with_a_prop = 0usize;
+
+    let mut server = Server::new();
+    for name in &names {
+        let bsp = crate::engine::world::bsp::Bsp::load(&vfs, name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        server.level_init(name, &bsp.entities(), &bsp.models);
+
+        // The engine's job, done here: read every model the entities name and
+        // hand the answers back. `Engine::load_level` does exactly this,
+        // between `World::load_entity_models` and the first tick.
+        let mut table = sequences::SequenceTable::new();
+        let mut here = 0usize;
+        for (_, entity) in server.entities.iter() {
+            if !entity.classname().starts_with("prop_dynamic")
+                && entity.classname() != "dynamic_prop"
+            {
+                continue;
+            }
+            here += 1;
+            let Some(model) = entity.core.model.clone() else {
+                continue;
+            };
+            let entry = loaded.entry(model.to_ascii_lowercase()).or_insert_with(|| {
+                let studio = StudioModel::load(&vfs, &model).ok()?;
+                rigidity.insert(
+                    model.to_ascii_lowercase(),
+                    (
+                        studio.bones.len() > 1,
+                        studio.bones.len() > 1 && studio.rigid_bones().is_none(),
+                    ),
+                );
+                Some(
+                    studio
+                        .sequences
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sequence)| {
+                            let duration = studio
+                                .animation(i)
+                                .map(|anim| anim.duration())
+                                .unwrap_or(0.0);
+                            (
+                                sequence.label.clone(),
+                                sequences::SequenceInfo {
+                                    duration,
+                                    loops: sequence.flags
+                                        & crate::studio::anim::STUDIO_LOOPING
+                                        != 0,
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            });
+            match entry {
+                Some(labels) => table.insert_model(&model, labels.clone()),
+                None => {}
+            }
+        }
+        if here > 0 {
+            maps_with_a_prop += 1;
+        }
+        server.set_sequences(table);
+
+        spawned += here;
+        run(&mut server, RUN_SECONDS);
+
+        for (_, entity) in server.entities.iter() {
+            let Some(prop) = entity.behaviour.downcast_ref::<classes::DynamicProp>() else {
+                continue;
+            };
+            props += 1;
+            let model = entity.core.model.clone().unwrap_or_default();
+            if loaded
+                .get(&model.to_ascii_lowercase())
+                .map(Option::is_none)
+                .unwrap_or(true)
+            {
+                models_missing += 1;
+            }
+            if entity.core.effects & movement::EF_NODRAW != 0 {
+                invisible += 1;
+            }
+            match rigidity.get(&model.to_ascii_lowercase()) {
+                Some((_, true)) => not_rigid += 1,
+                Some((true, false)) => animatable += 1,
+                _ => {}
+            }
+            match entity.core.solid {
+                crate::server::movement::Solid::VPhysics => solid_key[1] += 1,
+                _ => solid_key[0] += 1,
+            }
+            let state = prop.model_state().expect("a prop draws a model");
+            if !state.sequence.is_empty() {
+                animating += 1;
+                match server.sequences.lookup(&model, state.sequence) {
+                    sequences::Lookup::Found(_) => resolved += 1,
+                    // `Unknown` cannot happen here: a prop that is playing a
+                    // sequence has a model, and every model a prop names was
+                    // offered to the table above.
+                    _ => unresolved += 1,
+                }
+            }
+        }
+    }
+
+    let unreadable = loaded.values().filter(|m| m.is_none()).count();
+    println!("\n{} maps, {maps_with_a_prop} of them with a prop_dynamic", names.len());
+    println!(
+        "  {spawned} prop_dynamic* spawned, {props} alive after {RUN_SECONDS}s, \
+         {} distinct models",
+        loaded.len()
+    );
+    println!("    {unreadable} models would not load; {models_missing} entities wear one");
+    for (name, model) in &loaded {
+        if model.is_none() {
+            println!("      {name}");
+        }
+    }
+    println!("    {invisible} are invisible (StartDisabled, or turned off since)");
+    println!(
+        "    solid: {} SOLID_NONE-or-OBB, {} SOLID_VPHYSICS",
+        solid_key[0], solid_key[1]
+    );
+    println!(
+        "  {animating} are playing a sequence — {resolved} their model has, \
+         {unresolved} it does not"
+    );
+    println!(
+        "  {animatable} wear a model the renderer can pose; \
+         {not_rigid} wear one it cannot ({} of the {} models)",
+        rigidity.values().filter(|(_, shared)| *shared).count(),
+        rigidity.len()
+    );
+
+    // The census, which is the number every doc in the port quotes.
+    assert_eq!(spawned, 8_462, "prop_dynamic + prop_dynamic_override");
+    assert_eq!(maps_with_a_prop, 105, "every map but one places a prop");
+    assert_eq!(loaded.len(), 606, "distinct models");
+
+    // **Ten props do not survive the first two seconds of their map.** `Kill`
+    // (556 shipped connections) and `FadeAndKill` (51) — which is exactly why
+    // `ModelEntityState` is keyed rather than positional.
+    assert_eq!(props, 8_452, "ten were removed while the map ran");
+
+    // **15 of the 606 models will not read, and 41 entities wear one.**
+    //
+    // > **All fifteen are `models/props_destruction/toxin*`, and they are the
+    // > *flex-delta* refusals** — the ones `studio::every_shipped_studio_model_parses`
+    // > counts as "16 non-static models refused", whose `.dx90.vtx` opens with
+    // > a strip group this reader does not decode. That reframes them: the
+    // > studio port records flex deltas as "absent from the data" on the
+    // > grounds that no **static prop** has any, and that is still true — but
+    // > `prop_dynamic` is the first thing in the port that *places* one, so
+    // > 41 entities across the game now draw nothing where the shipped engine
+    // > draws a toxin pipe. That is the second measured condition for reading
+    // > flex deltas (the first is skinning's 141 shared-vertex models), and it
+    // > is a smaller number than either of `$includemodel`'s.
+    assert_eq!(unreadable, 15);
+    assert_eq!(models_missing, 41);
+
+    // 1,000 props carry `StartDisabled 1`; the other 127 were switched off by
+    // their map's own first two seconds.
+    assert_eq!(invisible, 1_127);
+
+    // The `solid` key, which only the prop family writes. 2,830 are
+    // `SOLID_NONE` promoted to `SOLID_OBB` (or left alone, for an `_override`)
+    // and 5,622 ask for `SOLID_VPHYSICS` and get drawn and walked through,
+    // because a `.phy` is `portdocs/ENGINE_TRACE.md` stage 5's.
+    assert_eq!(solid_key, [2_830, 5_622]);
+
+    // **The measured cost of not having `$includemodel`.** Of the sequences
+    // still playing after two seconds, 897 name a label the port cannot find —
+    // and almost all of them are in a companion `*_animation.mdl` that nine of
+    // the 606 models `$includemodel`. `portdocs/STUDIO.md` has it as the
+    // condition for writing it. The rest are Valve's own map errors: 183
+    // `DefaultAnim` keys in the game name a sequence that is in **no** model.
+    assert_eq!(animating, 2_563);
+    assert_eq!(resolved, 1_666);
+    assert_eq!(unresolved, 897);
+
+    // **The measured cost of having no skinning**, which `portdocs/STUDIO.md`
+    // called the condition that would make real skinning worth writing.
+    // `prop_dynamic` is what makes it concrete: **74 of the 591 readable
+    // models share a vertex between two bones**, so the per-bone draw split
+    // cannot express them and they are drawn in their bind pose — and **290
+    // entities wear one**. Seven of those models are on `sp_a1_intro1`
+    // (`models/container_ride/finedebris_part*.mdl`), so it is visible on the
+    // map this port loads by default rather than only in a census.
+    assert_eq!(
+        rigidity.values().filter(|(_, shared)| *shared).count(),
+        74,
+        "models whose vertices are shared between bones"
+    );
+    assert_eq!(not_rigid, 290, "entities drawn in their bind pose");
+    assert_eq!(animatable, 3_323, "entities whose model the renderer can pose");
 }

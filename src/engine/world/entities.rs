@@ -57,6 +57,14 @@ use crate::studio::StudioModel;
 /// [`Placement`](super::Placement) already has for brush entities.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelEntity {
+    /// An opaque, stable key for this entity, from whoever made the list.
+    ///
+    /// **Not an index into anything here.** [`sync`](EntityModels::sync)
+    /// matches on it rather than on position, because an entity that places a
+    /// model can be destroyed while the level runs — 556 shipped connections
+    /// fire `Kill` at a `prop_dynamic` — and a positional match would then
+    /// re-point every instance after the one that went.
+    pub id: u64,
     /// The model path, as [`StudioModel::load`] wants it.
     pub model: String,
     pub origin: Vec3,
@@ -66,26 +74,47 @@ pub struct ModelEntity {
     /// `portdocs/STUDIO.md` stage 6's — and carried so that the seam does not
     /// have to change when they are.
     pub skin: i32,
+    /// `ShouldDraw` — whether this entity is drawn *this frame*.
+    ///
+    /// An invisible instance is still loaded and still uploaded, because it
+    /// can be turned back on: 1,000 `prop_dynamic`s in the game are
+    /// `StartDisabled` and 206 connections toggle one.
+    pub visible: bool,
     /// The sequence's **label**, as `LookupSequence` takes it: `"up"`,
-    /// `"down"`. An empty string, or one the model does not have, is the bind
-    /// pose.
-    pub sequence: &'static str,
-    /// `m_flAnimTime` — the scene time the sequence was reset at, which is
-    /// what the cycle is measured from.
+    /// `"item_dropper_open"`. An empty string, or one the model does not have,
+    /// is the bind pose.
+    pub sequence: String,
+    /// `m_flCycle` at [`anim_time`](ModelEntity::anim_time) — where in the
+    /// sequence the pose was then, 0 to 1.
+    pub cycle: f32,
+    /// `m_flAnimTime` — the scene time the pose above was true at, which is
+    /// what the elapsed time is measured from.
     pub anim_time: f32,
+    /// `m_flPlaybackRate` — sequence lengths per second, signed. **Zero holds
+    /// the pose**, which is how a prop that was never given an animation
+    /// stands still.
+    pub playback_rate: f32,
 }
 
 /// One placed instance, resolved against a loaded model.
 struct Instance {
+    /// [`ModelEntity::id`], which is what a sync matches on.
+    id: u64,
     /// Index into [`EntityModels::models`].
     model: usize,
     /// `model_to_world` — the entity's placement, which every bone's matrix is
     /// composed onto the left of.
     transform: Mat4,
+    /// Whether it is drawn. An instance whose entity has gone from the list
+    /// entirely is set invisible and left in place rather than removed, so
+    /// that the model it uploaded stays valid for its neighbours.
+    visible: bool,
     /// The sequence index this model has for the entity's label, or `None` for
     /// the bind pose.
     sequence: Option<usize>,
+    cycle: f32,
     anim_time: f32,
+    playback_rate: f32,
     lighting: ModelLighting,
 }
 
@@ -113,6 +142,9 @@ pub struct EntityModelStats {
 pub struct EntityModels {
     models: Vec<PropModel>,
     instances: Vec<Instance>,
+    /// [`Instance::id`] to its index, so that a sync is a lookup rather than a
+    /// scan over a map's several hundred instances.
+    by_id: HashMap<u64, usize>,
     /// The black colour stream every instance binds in slot 1.
     ///
     /// An entity model has no `.vhv` — `vrad` bakes per-vertex lighting for
@@ -207,11 +239,15 @@ impl EntityModels {
                 stats.animated += 1;
             }
             instances.push(Instance {
+                id: entity.id,
                 model: slot,
                 transform: Mat4::from_translation(entity.origin)
                     * Mat4::from_mat3(crate::math::angle_matrix(entity.angles)),
-                sequence: model.sequence(entity.sequence),
+                visible: entity.visible,
+                sequence: model.sequence(&entity.sequence),
+                cycle: entity.cycle,
                 anim_time: entity.anim_time,
+                playback_rate: entity.playback_rate,
                 lighting: ambient.lighting_at(collision, entity.origin),
             });
         }
@@ -224,7 +260,14 @@ impl EntityModels {
                 .any(|batch| batch.material.needs_frame_buffer_copy)
         });
 
+        let by_id = instances
+            .iter()
+            .enumerate()
+            .map(|(i, instance)| (instance.id, i))
+            .collect();
+
         EntityModels {
+            by_id,
             unlit: (widest > 0).then(|| {
                 VertexBuffer::new(
                     device,
@@ -239,25 +282,63 @@ impl EntityModels {
         }
     }
 
-    /// Takes each entity's sequence and start time from whoever owns them —
-    /// the game server — once a frame.
+    /// Takes each entity's placement, visibility and pose from whoever owns
+    /// them — the game server — once a frame.
     ///
-    /// The list is positional: the `n`th [`ModelEntity`] here is the `n`th that
-    /// [`load`](EntityModels::load) was given, which holds because nothing
-    /// creates or destroys a model entity after the spawn pass. A shorter or
-    /// longer list is ignored past the overlap rather than being an error, the
-    /// way [`sync_brush_models`](super::World::sync_brush_models)'s `None` is.
+    /// **Matched by [`ModelEntity::id`], not by position.** It was positional
+    /// while `prop_floor_button` was the only class that placed a model, on
+    /// the grounds that nothing created or destroyed one after the spawn pass;
+    /// `prop_dynamic` ends that, with 556 shipped `Kill` connections and 51
+    /// `FadeAndKill`s. An instance whose id is missing from this frame's list
+    /// is made **invisible and kept**, so that the model it uploaded — which
+    /// its neighbours are very likely sharing — stays valid.
+    ///
+    /// An entity that is in the list and was not in [`load`](EntityModels::load)'s
+    /// is ignored: its model was never read, so there is nothing to draw. Only
+    /// something created at run time can be in that position, and nothing that
+    /// places a model is.
     ///
     /// **The placement is taken too**, so that an entity model on a moving
     /// platform follows it — its *lighting* does not, which is the limitation
     /// [`load`](EntityModels::load) records.
     pub fn sync(&mut self, entities: &[ModelEntity]) {
-        for (instance, entity) in self.instances.iter_mut().zip(entities) {
+        for instance in &mut self.instances {
+            instance.visible = false;
+        }
+        for entity in entities {
+            let Some(&at) = self.by_id.get(&entity.id) else {
+                continue;
+            };
+            let instance = &mut self.instances[at];
             instance.transform = Mat4::from_translation(entity.origin)
                 * Mat4::from_mat3(crate::math::angle_matrix(entity.angles));
-            instance.sequence = self.models[instance.model].sequence(entity.sequence);
+            instance.visible = entity.visible;
+            instance.sequence = self.models[instance.model].sequence(&entity.sequence);
+            instance.cycle = entity.cycle;
             instance.anim_time = entity.anim_time;
+            instance.playback_rate = entity.playback_rate;
         }
+    }
+
+    /// Every sequence of every model loaded here, for the table the game reads
+    /// durations out of.
+    ///
+    /// The other direction of the same seam: `world/` tells `server/` what the
+    /// `.mdl`s say, once, so that `AnimThink` can tell when an animation has
+    /// finished without this module and that one naming each other's types.
+    /// See `crate::server::sequences`.
+    pub fn sequences(&self) -> impl Iterator<Item = (&str, &str, f32, bool)> + '_ {
+        self.models.iter().flat_map(|model| {
+            model.sequences.iter().map(move |sequence| {
+                let duration = model
+                    .animations
+                    .get(sequence.anim)
+                    .map(|anim| anim.duration())
+                    .unwrap_or(0.0);
+                let loops = sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0;
+                (model.name.as_str(), sequence.label.as_str(), duration, loops)
+            })
+        })
     }
 
     /// A one-line summary for the startup log.
@@ -298,6 +379,9 @@ impl EntityModels {
 
     fn record(&self, pass: &mut Pass<'_>, curtime: f32, refracting: bool) {
         for instance in &self.instances {
+            if !instance.visible {
+                continue;
+            }
             let model = &self.models[instance.model];
             let Some(unlit) = self
                 .unlit
@@ -335,15 +419,23 @@ impl EntityModels {
         }
     }
 
-    /// `C_BaseAnimating::FrameAdvance` reduced to what a non-looping sequence
-    /// needs: how far through the animation we are, from how long it has been
-    /// playing.
+    /// `C_BaseAnimating::FrameAdvance` — how far through the sequence we are,
+    /// from where the entity says it was and how long ago that was.
     ///
-    /// > **A sequence that is not `STUDIO_LOOPING` clamps at 1 and stays
-    /// > there.** That is what makes a floor button *stay* pressed: `down` is
-    /// > 11 frames at 24 fps, and at 0.42 seconds the plate has arrived and
-    /// > the pose stops changing. All four of the button models' sequences are
-    /// > `STUDIO_NOFORCELOOP`, and a looping one wraps instead.
+    /// `StudioFrameAdvance`'s `m_flCycle += dt * rate / duration`, integrated
+    /// rather than stepped: the server writes a cycle, a time and a rate and
+    /// this solves for now, which is what lets a 64 Hz server drive a smooth
+    /// animation. **`DynamicProp::cycle_now` computes the same expression**
+    /// against the same five numbers so that `AnimThink` can tell when a
+    /// sequence has finished; the two must not drift.
+    ///
+    /// > **A sequence that is not `STUDIO_LOOPING` clamps and stays there.**
+    /// > That is what makes a floor button *stay* pressed: `down` is 11 frames
+    /// > at 24 fps, and at 0.42 seconds the plate has arrived and the pose
+    /// > stops changing. A looping one wraps instead — and wraps *backwards*
+    /// > too, which is why this is `rem_euclid` and not `fract`: 427 shipped
+    /// > connections set a playback rate of `-1`, and `fract` on a negative
+    /// > number is negative.
     fn cycle(&self, instance: &Instance, curtime: f32) -> f32 {
         let model = &self.models[instance.model];
         let Some(sequence) = instance.sequence else {
@@ -354,13 +446,13 @@ impl EntityModels {
         };
         let duration = anim.duration();
         if duration <= 0.0 {
-            return 0.0;
+            return instance.cycle;
         }
         let elapsed = (curtime - instance.anim_time).max(0.0);
-        let cycle = elapsed / duration;
+        let cycle = instance.cycle + elapsed * instance.playback_rate / duration;
         match model.sequences[sequence].flags & crate::studio::anim::STUDIO_LOOPING != 0 {
-            true => cycle.fract(),
-            false => cycle.min(1.0),
+            true => cycle.rem_euclid(1.0),
+            false => cycle.clamp(0.0, 1.0),
         }
     }
 }
@@ -457,16 +549,33 @@ mod tests {
         // place — the same two calls `Level::load` makes.
         let mut server = Server::new();
         server.level_init(&map, &world.entities, &world.models);
+        // **Only the floor button.** `sp_a1_intro1` places 90 `prop_dynamic`s
+        // as well as its one pad, and drawing them would swamp the pixel
+        // comparison below — this module is what is under test, not the map.
+        //
+        // By model path, because the seam carries no classname and does not
+        // need one; the `placements.len() == 1` below is what checks it. It is
+        // a *prefix*, and that is load-bearing: the game's 65 floor buttons
+        // wear three models — `portal_button.mdl` (47),
+        // `portal_button_damaged01.mdl` (10) and `..._damaged02.mdl` (8) — and
+        // **`sp_a1_intro1`'s is a damaged one**. All three animate `up` and
+        // `down` the same way.
+        const BUTTON: &str = "models/props/portal_button";
         let placements: Vec<ModelEntity> = server
             .model_entities()
             .into_iter()
+            .filter(|e| e.model.to_ascii_lowercase().starts_with(BUTTON))
             .map(|e| ModelEntity {
+                id: e.id,
                 model: e.model,
                 origin: e.origin,
                 angles: e.angles,
                 skin: e.skin,
+                visible: e.visible,
                 sequence: e.sequence,
+                cycle: e.cycle,
                 anim_time: e.anim_time,
+                playback_rate: e.playback_rate,
             })
             .collect();
         assert!(
@@ -483,8 +592,9 @@ mod tests {
         assert_eq!(world.entity_models.stats.models_missing, 0);
         assert!(world.entity_models.stats.animated > 0, "nothing to animate");
 
-        // Look at the first one from four feet in front and a little above,
-        // which is roughly where a player standing next to it would.
+        assert_eq!(placements.len(), 1, "exactly the button");
+        // Look at it from four feet in front and a little above, which is
+        // roughly where a player standing next to it would.
         let target_point = placements[0].origin;
         let eye = target_point + Vec3::new(48.0, 48.0, 40.0);
         let camera = Camera::perspective(
@@ -573,7 +683,7 @@ mod tests {
 
         // Now press it, and look at the two ends of `down`.
         world.entity_models.sync(&[ModelEntity {
-            sequence: "down",
+            sequence: "down".to_owned(),
             anim_time: 100.0,
             ..placements[0].clone()
         }]);
@@ -607,3 +717,5 @@ mod tests {
         );
     }
 }
+
+

@@ -63,8 +63,40 @@ mod tests {
 
         let mut materials = MaterialCache::new(&device, &queue);
         let map = std::env::var("KISAK_MAP").unwrap_or_else(|_| "sp_a1_intro1".to_owned());
-        let world = World::load(&vfs, &mut materials, &device, &map).expect("the map loads");
+        let mut world = World::load(&vfs, &mut materials, &device, &map).expect("the map loads");
         println!("{}", world.summary());
+
+        // **The models the game's entities place, which `World::load` cannot
+        // read for itself** — they are named by the entity lump it has just
+        // parsed, so they need a spawned entity list first. `Level::load` does
+        // these two calls in this order and so does this; without them
+        // `World::draw`'s fourth call records nothing and this stopwatch
+        // silently stops measuring the largest thing in the frame.
+        //
+        // It went in with `prop_dynamic`: **`sp_a1_intro1` places 91 entity
+        // models with 355,469 triangles**, against 1,080 static props with
+        // 224,924.
+        let mut server = crate::server::Server::new();
+        server.level_init(&map, &world.entities, &world.models);
+        let placements: Vec<crate::engine::world::entities::ModelEntity> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| crate::engine::world::entities::ModelEntity {
+                id: e.id,
+                model: e.model,
+                origin: e.origin,
+                angles: e.angles,
+                skin: e.skin,
+                visible: e.visible,
+                sequence: e.sequence,
+                cycle: e.cycle,
+                anim_time: e.anim_time,
+                playback_rate: e.playback_rate,
+            })
+            .collect();
+        world.load_entity_models(&vfs, &mut materials, &device, &placements);
+        println!("{}", world.entity_models.summary());
+        let world = world;
 
         let mut context = RenderContext::new(&device, &queue, materials.pipelines());
         let target = RenderTarget::new(
@@ -139,6 +171,7 @@ mod tests {
         run("props only", &|pass| {
             world.prop_models.draw(pass, &world.props)
         });
+        run("entity models", &|pass| world.entity_models.draw(pass, 0.0));
         run("everything", &|pass| world.draw(pass, 0.0));
         drop(run);
 

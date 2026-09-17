@@ -75,6 +75,7 @@ pub mod movement;
 pub mod name;
 pub mod obb;
 pub mod random;
+pub mod sequences;
 pub mod think;
 pub mod touch;
 
@@ -93,6 +94,7 @@ use io::{Event, EventQueue, FieldType, Input, IoStats, Target, Variant};
 use movement::ModelBounds;
 use name::Procedural;
 use random::RandomStream;
+use sequences::SequenceTable;
 use think::{ServerClock, ThinkList};
 
 /// The seed the level's random stream starts from.
@@ -205,6 +207,12 @@ pub struct Server {
     /// `engine->ServerCommand( "reload\n" )` in one process and with no
     /// saves — see [`Server::take_level_restart`].
     level_restart: Option<String>,
+    /// `modelinfo->GetModelPtr`, answered in advance — see
+    /// [`sequences`] and [`Server::set_sequences`].
+    ///
+    /// Empty until the engine has loaded the level's models, which is *after*
+    /// `level_init`, and empty for ever in a test with no engine.
+    sequences: SequenceTable,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -339,29 +347,49 @@ pub struct PlayerState {
 /// this is the vocabulary between them — the same arrangement [`PlayerState`]
 /// and `world/`'s `Placement` already have.
 ///
-/// # The list is positional and the order is the contract
+/// # The list is keyed, and it used to be positional
 ///
 /// `engine::world::entities::EntityModels` loads from
 /// [`Server::model_entities`] once and syncs against it every frame, matching
-/// by position — so the `n`th entry has to stay the `n`th. It does: the order
-/// is the entity list's slot order, and nothing in the game creates or
-/// destroys a model entity after the spawn pass. The condition for giving it a
-/// real key is the first class that appears or disappears at run time.
+/// on [`id`](ModelEntityState::id). It matched by *position* while
+/// `prop_floor_button` was the only class here, and the note in this place
+/// said the condition for a real key would be "the first class that appears or
+/// disappears at run time". `prop_dynamic` is that class twice over: **556
+/// shipped connections fire `Kill` at one** and 51 fire `FadeAndKill`, and a
+/// positional list would re-point every instance after the one that went.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelEntityState {
+    /// [`EntityId::to_int`] — an opaque, stable key.
+    ///
+    /// Opaque on purpose: `world/` must not name an `EntityId`, and it has no
+    /// use for one beyond telling two instances apart.
+    pub id: u64,
     /// The model path, e.g. `models/props/portal_button.mdl`.
     pub model: String,
     pub origin: Vec3,
     /// Pitch, yaw, roll.
     pub angles: Vec3,
     pub skin: i32,
+    /// `C_BaseEntity::ShouldDraw` — `false` for `EF_NODRAW`.
+    ///
+    /// > **Carried rather than filtered**, which is the other half of the
+    /// > keying above. 1,000 of the game's `prop_dynamic`s are `StartDisabled`
+    /// > and 206 connections turn one on or off, so an entity that is invisible
+    /// > now is one that may be visible next tick — and dropping it from the
+    /// > list would mean the renderer had never uploaded its model.
+    pub visible: bool,
     /// The sequence label — see
-    /// [`ModelState::sequence`](class::ModelState::sequence).
-    pub sequence: &'static str,
-    /// The **server's** clock when the sequence was reset. See
+    /// [`ModelState::sequence`](class::ModelState::sequence). Owned here
+    /// because the seam outlives the borrow.
+    pub sequence: String,
+    /// `m_flCycle` at [`anim_time`](ModelEntityState::anim_time).
+    pub cycle: f32,
+    /// The **server's** clock when the pose above was true. See
     /// [`ModelState::anim_time`](class::ModelState::anim_time) for why that is
     /// not the scene's.
     pub anim_time: f32,
+    /// `m_flPlaybackRate`, signed. Zero holds the pose.
+    pub playback_rate: f32,
 }
 
 /// A [`TouchQuery`] that never reports anything.
@@ -518,6 +546,7 @@ impl Server {
             pending_damage: Vec::new(),
             damaging: false,
             level_restart: None,
+            sequences: SequenceTable::new(),
         }
     }
 
@@ -804,6 +833,18 @@ impl Server {
         self.pending_spawn.clear();
         self.created_while_loading.clear();
         self.level_loading = false;
+        self.sequences = SequenceTable::new();
+    }
+
+    /// What `studio/` says about the models this level's entities place.
+    ///
+    /// Called once by the engine, **after** [`level_init`](Server::level_init)
+    /// — the models are named by the entities, so there is nothing to load
+    /// until they exist. See [`sequences`] for the consequence, which is that
+    /// every `Spawn` in the game runs against an empty table and every class
+    /// has to know it.
+    pub fn set_sequences(&mut self, sequences: SequenceTable) {
+        self.sequences = sequences;
     }
 
     // -----------------------------------------------------------------------
@@ -1408,10 +1449,11 @@ impl Server {
             entities,
             queue,
             random,
+            sequences,
             ..
         } = self;
         let mut entity = entities.detach(id)?;
-        let mut cx = Context::new(time, queue, random, entities, player);
+        let mut cx = Context::new(time, queue, random, entities, player, sequences);
         let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
         let changed = cx.take_changed();
         let created = cx.take_created();
@@ -1636,7 +1678,7 @@ impl Server {
         self.entities
             .iter()
             .filter(|(_, e)| !e.core.removed)
-            .filter_map(|(_, entity)| {
+            .filter_map(|(id, entity)| {
                 let state = entity.behaviour.model_state()?;
                 let model = entity.core.model.as_deref()?;
                 // A `"*N"` brush model is the *other* seam's, and a name that
@@ -1644,18 +1686,27 @@ impl Server {
                 if model.starts_with('*') || !model.to_ascii_lowercase().ends_with(".mdl") {
                     return None;
                 }
-                // What `StartDisabled` sets, and what `C_BaseEntity::ShouldDraw`
-                // refuses.
-                if entity.core.effects & movement::EF_NODRAW != 0 {
-                    return None;
-                }
                 Some(ModelEntityState {
+                    id: id.to_int(),
                     model: model.to_owned(),
                     origin: entity.core.origin,
                     angles: entity.core.angles,
                     skin: state.skin,
-                    sequence: state.sequence,
+                    // `C_BaseEntity::ShouldDraw` refuses **two** things:
+                    // `EF_NODRAW`, which is what `StartDisabled` sets, and
+                    // `kRenderNone`. `world/`'s brush seam has refused both
+                    // since stage 3 — see [`movement::RENDER_NONE`] for why
+                    // this seam has to agree even though no shipped prop
+                    // writes it. The *translucent* modes 1 and 2 are a
+                    // different question and are **not** honoured: 30 props
+                    // write one and they need a blended pass, which is the
+                    // same gap `world/` records for its five brush entities.
+                    visible: entity.core.effects & movement::EF_NODRAW == 0
+                        && entity.core.render_mode != movement::RENDER_NONE,
+                    sequence: state.sequence.to_owned(),
+                    cycle: state.cycle,
                     anim_time: state.anim_time,
+                    playback_rate: state.playback_rate,
                 })
             })
             .collect()

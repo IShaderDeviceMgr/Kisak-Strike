@@ -29,6 +29,7 @@
 use glam::Vec3;
 
 use super::entity::EntityCore;
+use super::movement::Solid;
 
 /// `EF_*` (`public/const.h:264`) — the render-flag bits the `KeyValue` ladder
 /// sets. Only the ones some shipped map actually asks for; the rest of the
@@ -372,6 +373,53 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
     }
     if is("damagefilter") {
         entity.damage_filter_name = Some(value.to_owned());
+        return true;
+    }
+
+    // `DEFINE_KEYFIELD( m_nSolidType, FIELD_CHARACTER, "solid" )` — a field of
+    // the `CCollisionProperty` that `CBaseEntity` embeds
+    // (`collisionproperty.cpp:283`), so the datadesc walk finds it for every
+    // class. See [`Solid::from_key`] for the value table and for the
+    // measurement that says the prop family is the only thing in Portal 2 that
+    // writes it.
+    //
+    // > **It is a raw keyfield write and not `SetSolid()`**, here and in the
+    // > original. What that skips in Valve is the spatial-partition update, a
+    // > system this port has replaced rather than ported; what it means here
+    // > is that a class's `Spawn` overwrites the key for every class whose
+    // > `Spawn` calls `SetSolid`, which is all of them but the prop family.
+    if is("solid") {
+        if let Some(solid) = Solid::from_key(atoi(value)) {
+            entity.solid = solid;
+        }
+        return true;
+    }
+
+    // The fade block — `m_fadeMinDist`, `m_fadeMaxDist` and `m_flFadeScale`
+    // (`baseentity.cpp:2372`), which every one of the game's 8,462
+    // `prop_dynamic`s carries and nothing else does.
+    //
+    // **Read and dropped.** They are the client's: `C_BaseEntity` turns them
+    // into a distance fade in `UpdateVisibility`, and this port has no
+    // per-instance fade in `world/` to put them in. Consuming them is what
+    // separates "the port knows what this key is" from "nothing in the port
+    // has heard of it" — the depot test's unhandled-key table is that ledger.
+    // The condition for storing them is the first distance fade in the
+    // renderer.
+    if is("fademindist") || is("fademaxdist") || is("fadescale") {
+        return true;
+    }
+
+    // The quality-level block — `m_nMinCPULevel` and its three siblings
+    // (`baseentity.cpp:2212`). Dropped for the same reason and with a sharper
+    // one: they are read in exactly one place in the whole tree,
+    // `C_BaseEntity::ShouldDraw`'s `m_nMinCPULevel-1 > nCPULevel`
+    // (`c_baseentity.cpp:1890`), and this port has **one** quality level, so
+    // there is no comparison to make. `mindxlevel`/`maxdxlevel` and
+    // `disablex360` deliberately stay unread beside them: those three have no
+    // consumer anywhere in `legacy/` either, so they belong with `_light` and
+    // the rest of the compiler's leftovers in the unhandled table.
+    if is("mincpulevel") || is("maxcpulevel") || is("mingpulevel") || is("maxgpulevel") {
         return true;
     }
 

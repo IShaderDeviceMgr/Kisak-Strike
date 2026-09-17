@@ -66,6 +66,20 @@ impl EntityId {
     pub fn slot(self) -> u32 {
         self.slot
     }
+
+    /// `CBaseHandle::ToInt` — the whole handle as one integer, generation
+    /// included.
+    ///
+    /// **This one *is* an identity**, which is the difference from
+    /// [`slot`](EntityId::slot): no two entities in a level's lifetime share
+    /// it. It exists so that a module which must not name an `EntityId` can
+    /// still key on one — `world/` matches an entity's studio model to the
+    /// instance it uploaded by this number, because a `prop_dynamic` can be
+    /// killed (556 shipped connections do) and a positional list would then
+    /// re-point every instance after it.
+    pub fn to_int(self) -> u64 {
+        u64::from(self.slot) << 32 | u64::from(self.generation)
+    }
 }
 
 /// The state every entity has, whatever its class. `CBaseEntity`'s fields.

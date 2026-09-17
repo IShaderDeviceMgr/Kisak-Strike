@@ -11,6 +11,7 @@ use super::class::{Behaviour, ClassDef, Context, SpawnResult};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{EventQueue, FieldType, Input, Variant};
 use super::random::RandomStream;
+use super::sequences::SequenceTable;
 use super::think::{ServerClock, DEFAULT_TICK_INTERVAL};
 
 /// Everything a [`Context`] borrows, owned.
@@ -27,6 +28,12 @@ pub(super) struct Harness {
     pub clock: ServerClock,
     pub entities: EntityList,
     pub player: Option<EntityId>,
+    /// What `studio/` would have said about this level's models.
+    ///
+    /// **Empty by default**, which is the state every `Spawn` in the real game
+    /// runs in too — see [`sequences`](super::sequences). A test that wants a
+    /// prop's animation to *finish* fills it in first.
+    pub sequences: SequenceTable,
 }
 
 impl Harness {
@@ -37,6 +44,7 @@ impl Harness {
             clock: ServerClock::new(DEFAULT_TICK_INTERVAL),
             entities: EntityList::new(),
             player: None,
+            sequences: SequenceTable::new(),
         }
     }
 
@@ -49,6 +57,7 @@ impl Harness {
             &mut self.random,
             &mut self.entities,
             self.player,
+            &self.sequences,
         )
     }
 
@@ -61,6 +70,7 @@ impl Harness {
             &mut self.random,
             &mut self.entities,
             self.player,
+            &self.sequences,
         );
         behaviour.spawn(core, &mut cx)
     }
@@ -80,6 +90,7 @@ impl Harness {
             &mut self.random,
             &mut self.entities,
             self.player,
+            &self.sequences,
         );
         super::movement::simulate(core, behaviour, &mut cx);
     }
@@ -106,6 +117,7 @@ impl Harness {
             &mut self.random,
             &mut self.entities,
             self.player,
+            &self.sequences,
         );
         let input = Input {
             name,

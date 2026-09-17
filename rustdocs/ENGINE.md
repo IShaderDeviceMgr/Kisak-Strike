@@ -520,12 +520,16 @@ origin is at the player's feet, and a camera placed there looks at the floor.
 
 ```rust
 pub struct ModelEntity {
+    pub id: u64,              // opaque and stable — what `sync` matches on
     pub model: String,        // models/props/portal_button.mdl
     pub origin: Vec3,
     pub angles: Vec3,         // pitch, yaw, roll
     pub skin: i32,
-    pub sequence: &'static str,   // the LABEL — "up", "down"; "" is the bind pose
-    pub anim_time: f32,           // when the sequence was reset
+    pub visible: bool,        // ShouldDraw; an invisible one is still uploaded
+    pub sequence: String,     // the LABEL — "up", "down"; "" is the bind pose
+    pub cycle: f32,           // where in the sequence it was at anim_time
+    pub anim_time: f32,       // when that was
+    pub playback_rate: f32,   // signed; 0 holds the pose
 }
 
 pub struct EntityModels { pub stats: EntityModelStats, /* private */ }
@@ -536,6 +540,9 @@ impl EntityModels {
         entities: &[ModelEntity], ambient: &AmbientLighting, collision: &CollisionBsp,
     ) -> EntityModels;
     pub fn sync(&mut self, entities: &[ModelEntity]);
+    /// (model path, sequence label, duration, loops) — the answer back, for
+    /// `crate::server::sequences::SequenceTable`.
+    pub fn sequences(&self) -> impl Iterator<Item = (&str, &str, f32, bool)> + '_;
     pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn refracts(&self) -> bool;
@@ -548,27 +555,54 @@ The third kind of geometry in a level shell. World faces and brush entities are
 compiler* placed, never moving and lit once. This is `.mdl` geometry the
 **game** places, and where it is and what it is doing can change every tick.
 
-Three things about it are worth knowing.
+**`prop_dynamic` is what this module is for.** It was written for a
+`prop_floor_button` — 65 in the game, 1 on `sp_a1_intro1` — and the class that
+followed places **8,462 entities across 105 of the 106 maps, 90 of them from 52
+models on `sp_a1_intro1` alone**. Everything below either dates from the button
+or was changed by the prop.
+
+Five things about it are worth knowing.
 
 - **The join with the game is a sequence *name*, and the cycle is the engine's.**
-  The server says which sequence and when it started; the engine looks the label
-  up in the model and works the cycle out from the scene clock. That is Valve's
-  own split — `CBaseAnimating` networks `m_nSequence` and `m_flAnimTime` and
-  `C_BaseAnimating::FrameAdvance` on the *client* turns them into a pose — and
-  it is what keeps `server/`'s promise to name no studio type. It also makes the
-  animation smooth where the server's 64 Hz ticks would step it.
+  The server says which sequence, where in it the entity was, when that was, and
+  how fast it is playing — exactly `DT_BaseAnimating`'s five networked fields —
+  and the engine looks the label up in the model and solves for now:
+  `cycle + elapsed * playback_rate / duration`, wrapped for a looping sequence
+  and clamped otherwise. That is Valve's own split, with
+  `C_BaseAnimating::FrameAdvance` on the *client* turning the networked state
+  into a pose, and it is what keeps `server/`'s promise to name no studio type.
+  It also makes the animation smooth where the server's 64 Hz ticks would step
+  it.
 
-- **The list is positional.** `load` and `sync` are both fed
-  `Server::model_entities()`, and the `n`th entry has to stay the `n`th. It
-  does: the order is the entity list's slot order and nothing creates or
-  destroys a model entity after the spawn pass. The condition for a real key is
-  the first class that does.
+- **`sequences()` is the same seam pointing the other way.** The game needs to
+  know when an animation has *ended* — `CDynamicProp::AnimThink` fires
+  `OnAnimationDone`, and 181 shipped connections listen for it — and it cannot
+  read a `.mdl`. So `Engine::load_level` walks this iterator once and fills in
+  `crate::server::sequences::SequenceTable`. `DynamicProp::cycle_now` then
+  computes the *same* expression as `EntityModels::cycle` from the same five
+  numbers; the two must not drift.
+
+- **The list is keyed on `id`, and it used to be positional.** The note here
+  said the condition for a real key would be "the first class that creates or
+  destroys a model entity after the spawn pass". `prop_dynamic` is it: 556
+  shipped connections fire `Kill` at one and 51 fire `FadeAndKill`. An instance
+  whose id is missing from a frame's list is made **invisible and kept**, so
+  that the model it uploaded — very likely shared with its neighbours — stays
+  valid.
+
+- **`visible` is carried, not filtered.** 1,000 props in the game are
+  `StartDisabled` and 206 connections toggle one, so an invisible instance is
+  one that may be drawn next tick. It is loaded, uploaded and skipped at record
+  time.
 
 - **Lighting is sampled once, at load.** An entity model has no `.vhv` —
   `vrad` bakes per-vertex light for static props and nothing else — so each one
   is lit by the leaf ambient cube where it stands, through
   [`AmbientLighting`](#ambientlighting). The condition for resampling per frame
-  is the first entity model that travels; a `prop_floor_button` does not.
+  is the first entity model that **travels**, and `prop_dynamic` is not quite
+  it: a prop that *animates* is re-posed every frame but its origin does not
+  move, and 2,355 of them name a `parentname` whose transform this port does not
+  apply anyway (`rustdocs/SERVER.md` gotcha 34).
 
 ### `AmbientLighting`
 

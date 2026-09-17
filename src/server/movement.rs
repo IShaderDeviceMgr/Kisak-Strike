@@ -93,6 +93,16 @@ pub enum MoveType {
     FlyGravity,
 }
 
+/// `kRenderNone` (`public/const.h:348`) — the one `rendermode` that is a flat
+/// refusal to draw rather than a blend.
+///
+/// `C_BaseEntity::ShouldDraw` tests it alongside [`EF_NODRAW`], so the two
+/// model seams and the brush seam all have to refuse it together —
+/// `engine::world::RENDER_NONE` is the same number on the brush side, where it
+/// hides 94 of the game's brush entities. **No `prop_dynamic` in the shipped
+/// game writes it**; it is here so the paths agree rather than for content.
+pub const RENDER_NONE: u8 = 10;
+
 /// `EF_NODRAW` (`public/const.h:268`) — "don't draw entity".
 ///
 /// The only `EF_*` bit this module sets, and it is what
@@ -200,8 +210,10 @@ pub enum Solid {
     Bbox,
     /// `SOLID_OBB` — a box in the entity's *own* frame, turned by its
     /// `angles`. What a trigger built out of nothing but numbers is: the
-    /// `trigger_portal_button` a `prop_floor_button` puts over itself, and in
-    /// Valve every non-solid `prop_dynamic` as well.
+    /// `trigger_portal_button` a `prop_floor_button` puts over itself, and
+    /// every `prop_dynamic` in the game whose `solid` key is `0` — 2,622 of
+    /// them, promoted here by `CDynamicProp::Spawn` so that a *turned* prop's
+    /// render box turns with it.
     ///
     /// > **This is the one solidity type the port chooses between rather than
     /// > records.** [`Bsp`](Solid::Bsp) and [`VPhysics`](Solid::VPhysics) are
@@ -214,6 +226,34 @@ pub enum Solid {
     /// `SOLID_VPHYSICS` — the model's `vcollide`. For a brush entity that is
     /// the same brushes [`Bsp`](Solid::Bsp) names.
     VPhysics,
+}
+
+impl Solid {
+    /// The `solid` map key — `DEFINE_KEYFIELD( m_nSolidType, FIELD_CHARACTER,
+    /// "solid" )` (`collisionproperty.cpp:283`).
+    ///
+    /// It is a `CCollisionProperty` field and therefore `CBaseEntity`'s, which
+    /// is why it is read by
+    /// [`base_key_value`](super::keyvalue::base_key_value) rather than by a
+    /// class — even though, measured over the 106 shipped maps, **only the
+    /// prop family ever writes it**: 8,462 `prop_dynamic`/`prop_dynamic_override`,
+    /// 5 `prop_vehicle_choreo_generic` and 3 `prop_button`, and no other
+    /// classname at all.
+    ///
+    /// `None` for `SOLID_OBB_YAW` (4) and `SOLID_CUSTOM` (5), which have no
+    /// counterpart here and which no shipped map writes; the caller leaves the
+    /// field alone, the way a raw keyfield write of an unusable value would
+    /// leave the *behaviour* alone.
+    pub fn from_key(value: i32) -> Option<Solid> {
+        match value {
+            0 => Some(Solid::None),
+            1 => Some(Solid::Bsp),
+            2 => Some(Solid::Bbox),
+            3 => Some(Solid::Obb),
+            6 => Some(Solid::VPhysics),
+            _ => Option::None,
+        }
+    }
 }
 
 /// The bounding box of the brush model an entity names, in the model's own
