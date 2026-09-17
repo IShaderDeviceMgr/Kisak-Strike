@@ -1614,14 +1614,18 @@ as absent *from the data* because no **static prop** has any; that is still
 exactly true, and `prop_dynamic` is the first thing in the port that places a
 model which is not a static prop.
 
-The larger one is `$includemodel`. Nine of
+The larger one is `$includemodel`, and it has since been **closed** by
+`src/studio/include.rs` (`portdocs/STUDIO.md` §12); what follows is what this
+stage measured, kept because it is why that work happened. Nine of
 the 606 models keep their sequences in a companion `*_animation.mdl`, and those
 nine are worn by **926 entities** — `arm64x64_interior.mdl` and the rest of the
-`anim_wp/room_transform` set. Their labels resolve to nothing here, so they draw
+`anim_wp/room_transform` set. Their labels resolved to nothing here, so they drew
 in their bind pose. Of the game's 2,416 `DefaultAnim` keys, 2,233 name a
 sequence that exists somewhere (849 only through an include) and **183 name one
 that is in no model at all** — Valve's own map errors, which the shipped game
-answers with `Warning( "Dynamic prop %s: no sequence named:%s" )`.
+answers with `Warning( "Dynamic prop %s: no sequence named:%s" )`. After the
+merge the depot test's unresolved count is **182** of 2,738, which is that same
+183 less one prop that does not survive its map's first two seconds.
 
 #### Two divergences, both from the cycle being derived
 
@@ -1722,11 +1726,12 @@ subsystems rather than a staged plan.** In the order they are worth doing:
   test's 1,102 unhandled inputs** — and parented movers.
 - **`player_speedmod`** (4 placed): `SetLaggedMovementValue` and
   `DisableButtons`, two more `PlayerState` fields. Small.
-- **`$includemodel` in `studio/`**, which is not a class at all but is the
-  largest measured gap `prop_dynamic` left: nine models, **926 entities**, drawn
-  in their bind pose because their sequences live in a companion
-  `*_animation.mdl`. It wants `CStudioHdr::ResolveIncludedModels`' bone
-  remapping by name.
+- ~~**`$includemodel` in `studio/`**~~ — **done**, in `src/studio/include.rs`.
+  It was never a class: nine models, **926 entities**, drawn in their bind pose
+  because their sequences live in a companion `*_animation.mdl`.
+  `CStudioHdr::ResolveIncludedModels`' bone remapping by name is what it
+  wanted, and `portdocs/STUDIO.md` §12 is the writeup. **Skinning is what
+  `prop_dynamic` left that is still open** — 74 models, 290 entities.
 - `prop_physics` (132) and `func_physbox` need `rapier`. The 41 reconstructed
   Portal 2 classes (§1.3) need the paint and portal systems. Each gets its own
   portdoc.

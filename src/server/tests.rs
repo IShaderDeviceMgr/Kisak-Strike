@@ -5331,15 +5331,23 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // because a `.phy` is `portdocs/ENGINE_TRACE.md` stage 5's.
     assert_eq!(solid_key, [2_830, 5_622]);
 
-    // **The measured cost of not having `$includemodel`.** Of the sequences
-    // still playing after two seconds, 897 name a label the port cannot find —
-    // and almost all of them are in a companion `*_animation.mdl` that nine of
-    // the 606 models `$includemodel`. `portdocs/STUDIO.md` has it as the
-    // condition for writing it. The rest are Valve's own map errors: 183
-    // `DefaultAnim` keys in the game name a sequence that is in **no** model.
-    assert_eq!(animating, 2_563);
-    assert_eq!(resolved, 1_666);
-    assert_eq!(unresolved, 897);
+    // **What `$includemodel` was worth, measured on the running maps.**
+    // Before `studio::include` landed these read 2,563 / 1,666 / **897**: of
+    // every sequence still playing after two seconds, more than a third named
+    // a label the port could not find, because nine of the 606 models keep
+    // their animation in a companion `*_animation.mdl`. Merging those
+    // companions leaves **182** unresolved, and that remainder is not a gap —
+    // it is Valve's own map errors, 183 `DefaultAnim` keys in the game naming
+    // a sequence that is in no model at all (one of the 183 is on a prop that
+    // does not survive the two seconds).
+    //
+    // `animating` rose with it, from 2,563 to 2,738, and that is the second
+    // order effect worth naming: an animation that can now *end* fires
+    // `OnAnimationDone`, and the game's 5,311 `SetAnimation` connections
+    // start more props animating than the map's own `DefaultAnim` keys do.
+    assert_eq!(animating, 2_738);
+    assert_eq!(resolved, 2_556);
+    assert_eq!(unresolved, 182);
 
     // **The measured cost of having no skinning**, which `portdocs/STUDIO.md`
     // called the condition that would make real skinning worth writing.

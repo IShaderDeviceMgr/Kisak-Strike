@@ -16,6 +16,7 @@ behind the scoping: `portdocs/STUDIO.md`.
 | 5 | the leaf ambient cube | **done** |
 | 6 | LOD selection and fade | **not started** (optional) |
 | — | bones, sequences and animation | **done** for rigid models — `studio/anim.rs`, below |
+| — | `$includemodel` | **done** — `studio/include.rs`, below; 25 shipped models declare one, 9 of them worn by 926 `prop_dynamic`s |
 
 Not implemented and not planned here: `.phy` collision (that is
 `ENGINE_TRACE.md` stage 5), the prop leaf lists as a *visibility* structure
@@ -63,6 +64,8 @@ pub struct StudioModel {
     pub bones: Vec<anim::Bone>,
     pub sequences: Vec<anim::Sequence>,
     pub animations: Vec<anim::Animation>,
+    /// The `$includemodel` companions merged into the two lists above.
+    pub includes: Vec<String>,
 }
 
 impl StudioModel {
@@ -144,6 +147,38 @@ condition for going back to Valve's lazy walk.
 which is what a *bind-pose* vertex is multiplied by. With no animation every
 one of them is the identity, which is what lets a static prop and an animated
 model share one draw path.
+
+### `include` — `$includemodel`
+
+A `.mdl` can name other `.mdl` files whose sequences and animations it borrows.
+`StudioModel::load` merges them in before the geometry is joined, so nothing
+downstream — `sequence`, `animation`, `pose`, `server::sequences` — can tell
+the difference between a sequence the model owned and one it inherited.
+
+```rust
+let model = StudioModel::load(vfs, "models/anim_wp/room_transform/arm64x64_interior.mdl")?;
+assert_eq!(model.includes, ["models/anim_wp/room_transform/arm64x64_interior_animation.mdl"]);
+assert_eq!(model.sequences.len(), 1 + 1_350);   // one local, 1,350 inherited
+model.sequence("makeramp_02open_idleend");      // resolves; the host has no such label
+```
+
+There is no public entry point: the module is `pub(super)` and the only caller
+is `load`. `Mdl::include_models` is the list as the *file* declares it;
+`StudioModel::includes` is the subset that could actually be read.
+
+`CStudioHdr::ResolveIncludedModels` and the `virtualmodel_t` under it
+(`public/studio_virtualmodel.cpp`), with the indirection **resolved rather
+than recorded** — Valve keeps the included headers separate and hops through a
+per-group remap table on every access, because they are cache entries that can
+be evicted; a `StudioModel` is an owned value, so the merge happens once at
+load and the groups collapse. `masterSeq`, `boneMap`, the attachment/pose/node
+tables and `CModelLookupContext` go with them.
+
+What does **not** collapse is `masterBone`, and it is the whole of the work:
+an included animation's track names a bone of the *included* model, and the two
+skeletons are the same bones in a different order in eight of the nine models
+this reaches. See gotchas 20-23. `portdocs/STUDIO.md` §12 has the C++ anatomy
+and the measurements.
 
 ### The three readers
 
@@ -389,11 +424,47 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
    under `VertexLitGeneric`, because this port picks the vertex layout per
    shader where Valve picked it per `$model` flag.
 
-13. **`Prop::leaves` is a PVS structure and is not used yet.** Every prop is
+18. **`Prop::leaves` is a PVS structure and is not used yet.** Every prop is
     drawn every frame.
 
-14. **`TRANSLUCENT_TWOPASS` models draw unsorted.** 38 of Portal 2's models set
+19. **`TRANSLUCENT_TWOPASS` models draw unsorted.** 38 of Portal 2's models set
     it and this port has no sorted translucent pass.
+
+20. **An included animation's track names the *include's* bone, not the
+    host's** — `mstudio_rle_anim_t::bone` is an index into the file the
+    animation came from, and `CalcVirtualAnimation` puts the decoded value at
+    `masterBone[panim->bone]`. The two skeletons are the same bones in a
+    **different order** in eight of the nine models this reaches, so a merge
+    that skipped the remap would draw a panel arm bending at the wrong joint —
+    a plausible wrong picture, not an error. An included bone the host has not
+    got is dropped along with its track (one in the shipped game:
+    `thigh_A_R_GRP`, in `models/eggbot_animations.mdl`).
+
+21. **The RLE is decoded against the *include's* bones and that is not the same
+    remap.** `posscale`, `rotscale` and the bind-pose `rot` an animated value
+    is added to all come from `pAnimbone[panim->bone]` — the animation file's
+    bone. It happens for free here because the include is parsed as its own
+    file; it would *not* if anything ever tried to decode an included stream
+    against the host's bone table.
+
+22. **The host wins every name collision, and an animation's dedup is by
+    *name*.** `AppendAnimations`/`AppendSequences` keep the first thing they
+    saw and group 0 is the host, so `arm64x64_interior`'s one local `BindPose`
+    survives its include's 1,350 sequences. **The window is `int numCheck =
+    m_anim.Count()`, captured before the loop**, so a name repeated *inside one
+    include* is appended twice rather than folded together — searching the
+    whole list as it grows is the obvious implementation and silently plays the
+    wrong animation. No shipped companion has a duplicate name, so only a unit
+    test reaches it. The consequence worth knowing:
+    because animations dedup by name independently of sequences, an *included*
+    sequence can end up pointing at the **host's** animation — which is then
+    not remapped, because it never belonged to the include. That is Valve's
+    and it is deliberate.
+
+23. **`StudioModel::includes` is empty from `assemble`, and that is not a
+    bug.** `assemble` joins three already-parsed files and has no filesystem to
+    resolve a fourth against; only `StudioModel::load` merges. A test that
+    builds a model from fixtures therefore never sees an include.
 
 ---
 
@@ -421,8 +492,9 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   > set — so the substitution is visible on the default map rather than only in
   > a census, and the startup log says so per model.
   > `server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
-  > pins both numbers. It is the second-largest gap in this module, behind
-  > `$includemodel`'s 926 entities.
+  > pins both numbers. **With `$includemodel` merged it is now the largest gap
+  > in this module**, and it gates the next one: the six include hosts whose
+  > animation is in an `.ani` are all models this cannot pose anyway.
 - **Everything in `bone_setup.cpp` that blends** — ~5,000 lines of layering,
   pose parameters, IK, procedural bones, bone controllers and blend sequences.
   A sequence here has one animation (`numblends` is 1 for every sequence in
@@ -435,25 +507,31 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   the animation reads as empty, which holds the bind pose — rather than
   mis-read. 68 files in the game have an `.ani` and no model the port loads is
   among them.
-- **`$includemodel`** — `studiohdr_t::numincludemodels` /
-  `includemodelindex`, and the `virtualmodel_t` that
-  `CStudioHdr::ResolveIncludedModels` builds out of it: a model whose sequences
-  and animations live in a *different* `.mdl`, merged in at load with each
-  included bone remapped onto the host's by **name**. `StudioModel::load`
-  ignores the list, so such a model has only its own local sequences.
+- **External `.ani` animation blocks** are now the binding constraint on
+  animation, where `$includemodel` was. `mstudioanimdesc_t::animblock != 0`
+  means the frames live in a companion `.ani` rather than in the `.mdl`, and
+  such an animation reads as empty here — which holds the bind pose rather
+  than mis-reading bytes. It did not matter until the merge landed. The nine
+  models a `prop_dynamic` includes for name **eight distinct companions**
+  (both panel arms share one), and only two of the eight are inline:
+  `arm64x64_interior_animation` (1,350 of 1,350) and
+  `personality_sphere_animation` (313 of 318). `eggbot_animations`,
+  `ballbot_animations`, `player_animations`, `headless_player_animations`,
+  `headless_s8player_animations` and `glados_wheatley_boss_animation` keep
+  almost all of theirs in an `.ani`, so their labels now resolve and their
+  poses are empty.
 
-  > **Measured, and it is the largest gap in this module.** Across the 606
-  > models the shipped game's `prop_dynamic`s name, **9 do this — and 926
-  > entities wear one**, the `models/anim_wp/room_transform` panel-arm set
-  > chief among them. Their `DefaultAnim` and `SetAnimation` labels resolve to
-  > nothing, so they draw in their bind pose and their `AnimThink` cancels
-  > (`rustdocs/SERVER.md` gotcha 64). Of the game's 2,416 `DefaultAnim` keys,
-  > 849 resolve **only** through an include.
-  >
-  > The work is the bone remap, not the parse: an included animation's
-  > `BoneTrack::bone` indexes the *included* model's bone list, so merging
-  > without remapping poses the wrong bones — which would be a silently wrong
-  > picture rather than an error.
+  > **Every model that reaches those six is also drawn in its bind pose for
+  > want of skinning — and so is the personality sphere** — so reading `.ani`
+  > buys nothing on its own. Skinning first. The panel arms are the only two
+  > of the nine that are rigid, and they are the whole visible payoff.
+- **Sequence bone weights** (`mstudioseqdesc_t::weightlistindex`) — a
+  per-sequence, per-bone weight that `CalcVirtualAnimation` uses to leave a
+  bone at its bind pose. 85 sequences across the nine companions set one to
+  zero, all of them on the same three models above. `pose` takes an
+  `Animation`, not a `Sequence`, so this would change its signature; the
+  condition for doing it is a model that both needs the weights and can be
+  posed at all.
 - **Flexes and sub-division surfaces** — absent from the *static prop* data.
   Every strip group a static prop uses is `STRIPGROUP_IS_HWSKINNED` with no
   `STRIPGROUP_IS_DELTA_FLEXED`, every strip is `STRIP_IS_TRILIST`, and
@@ -469,7 +547,8 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   > the first thing in the port that places a model which is not one.
   > `server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
   > pins the number. It is the smaller of the two studio gaps that class
-  > measured — `$includemodel` is 9 models and 926 entities.
+  > measured; the larger, `$includemodel`'s 9 models and 926 entities, is
+  > closed.
 - **`CMDLCache`'s cache management** — LRU eviction, memory budgets, async
   queues, lock/unlock refcounting, `CreateThinVertexes`. All of it existed to
   fit models into a 2007 console; a `StudioModel` is an owned value and dropping
@@ -492,6 +571,12 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 - **Skinned models** — `vvd::Vertex` grows a `bones` field, `vtx` stops
   discarding `StripHeader_t`'s bone plumbing, and `mdl` reads the bone array it
   currently counts and skips.
+- **Sharing an included model between hosts** — both panel arms include the
+  same 1.3 MB companion, and a map placing both reads and expands it twice
+  (about 50 ms and 7 MB each, at level load; the frame path is untouched).
+  Valve gets the sharing free from `CMDLCache`; the equivalent here is a cache
+  above `StudioModel::load`, and the condition for writing one is a level load
+  that is actually too slow.
 - **Skin families** — `Prop::skin` is parsed and ignored; `mdl` reads
   `numskinref`/`skinindex` but does not resolve them.
 - **Culling** — `PropModel::bounds` is already in hand for it.
@@ -515,6 +600,12 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 | `studio::anim::tests::the_blend_aligns_and_normalizes` | gotcha 15's blend half |
 | `studio::anim::tests::halves_decode` | `Vector48` |
 | `studio::anim::tests::the_bind_pose_is_the_identity` | gotcha 16 |
+| `studio::include::tests::a_tracks_bone_is_remapped_by_name_and_not_by_index` | gotcha 20 — the one merge failure that draws something wrong rather than nothing |
+| `studio::include::tests::a_track_for_a_bone_the_host_does_not_have_is_dropped` | `masterBone` of -1 |
+| `studio::include::tests::bones_sequences_and_animations_all_match_case_insensitively`, `a_deduplicated_animation_keeps_the_hosts_own_tracks` | gotcha 22 — `AppendAnimations`/`AppendSequences`' dedup, and its subtle half |
+| `studio::include::tests::the_dedup_window_is_fixed_before_the_include_rather_than_growing` | `numCheck` being captured before the loop — invisible in Portal 2, and wrong the obvious way |
+| `studio::include::tests::a_missing_include_is_skipped_and_not_an_error`, `a_cycle_terminates` | `FindModel` returning null, and the cycle guard Valve has not got |
+| `studio::anim_depot_tests::an_included_model_supplies_the_sequences_a_map_asks_for` | **the merge, against the real panel arm** — 1,351 sequences, a pose 112 units off the bind pose, and all sixteen bones agreeing with the companion's own frame at three cycles |
 | `studio::anim_depot_tests::the_floor_button_model_animates` | **the decoder, against the real `portal_button.mdl`** — bones, sequences, 7.29 units of plate travel, and `up` retracing `down` |
 | `engine::world::entities::tests::the_button_draws_and_moves_as_it_presses` | **the whole path, on real pixels** — the model on screen, and the image changing as it presses |
 | `props::tests::the_second_prop_lands_on_the_seventy_two_byte_boundary` | gotcha 1 |
@@ -541,7 +632,9 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release -- --ignored --nocapture
 - `studio::tests::every_shipped_studio_model_parses` — 2,041 models, of which
   2,017 load (all 1,444 flagged `STATIC_PROP`), 8 ship without companions and
   16 are animated flex-delta models refused by design. **This is the test that
-  found gotcha 8.**
+  found gotcha 8.** It also carries the `$includemodel` census: **25 models
+  declare one, 24 companions can be read, and they carry 5,232 of the 10,666
+  sequences the game's models hold** — that total was 5,434 before the merge.
 - `props::tests::every_shipped_map_places_its_props` — 106 maps, 104 with props,
   56,955 props placed; asserts `sp_a1_intro1`'s measured 1,080 props from 136
   models, prints the luminance comparison behind gotcha 2, and checks that

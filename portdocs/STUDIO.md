@@ -794,3 +794,131 @@ twice as high.)
 A fourth cause was not in this port's code at all: a debug build leaves `wgpu`
 unoptimised, and almost all of a frame's CPU time is inside it. `[profile.dev.package."*"] opt-level = 3`
 takes the debug frame from 37 ms to 6.6 ms and costs nothing at the debugger.
+
+---
+
+## 12. `$includemodel`, which was not on the plan
+
+> Written **after** the port, like `portdocs/CLIENT_TONEMAP.md` and for the
+> same reason: this is not one of §8's six stages. It arrived as a measurement
+> that `prop_dynamic` took — nine of the 606 models the game's props name keep
+> their animation somewhere else, and **926 entities wear one** — so the
+> analysis below is the justification for the shape `src/studio/include.rs`
+> has rather than a plan to follow. The API is `rustdocs/STUDIO.md`.
+
+### 12.1 What the C++ does
+
+`studiohdr_t::numincludemodels` / `includemodelindex` (`studio.h:2767`) is an
+array of `mstudiomodelgroup_t` (`studio.h:662`), which is two struct-relative
+offsets — a label nothing reads and a **file name**, a plain model path that
+`FindModel` hands straight to `CMDLCache::FindMDL`.
+
+`virtualmodel_t::AppendModels` (`public/studio_virtualmodel.cpp:79`) walks that
+list depth first, adding one `virtualgroup_t` per file, and each group carries
+five remapping tables:
+
+| Table | Maps | Ported |
+|---|---|---|
+| `masterBone` | included bone -> host bone, matched by **name** | **yes**, and it is the whole difficulty |
+| `boneMap` | host bone -> included bone | no — only used to seed an unanimated bone from the sequence model's bind pose, and the two bind poses are identical (§12.3) |
+| `masterAnim` | included animation -> merged animation | **yes**, as the index the merged sequence is rewritten to hold |
+| `masterSeq` | included sequence -> merged sequence | no — it exists for `iRelativeSeq`, which serves `nextseq` and autolayers, and neither is ported |
+| `masterAttachment` / `masterPose` / `masterNode` | the rest | no — none of those subsystems exists here |
+
+Valve keeps the included `studiohdr_t`s **separate** and indirects through the
+tables on every `pSeqdesc`, `pAnimdesc` and `CalcVirtualAnimation` call,
+because they are cache entries that can be evicted independently. Nothing in
+this port can be evicted — a `StudioModel` is an owned value — so the groups
+collapse and the remap is applied once, at load. That deletes `masterSeq`,
+`boneMap`, `CModelLookupContext`'s string-table optimisation, the thread mutex,
+the `HandleAndHeader_t list[64]` stack guard and the whole lazy-resolution
+path: `GetNumSeq_Internal`, `pSeqdesc_Internal`, `pAnimdesc_Internal`,
+`iRelativeAnim_Internal` and `iRelativeSeq_Internal` all exist only to hide the
+indirection and have nothing left to hide.
+
+The one line to carry across exactly is in `CalcVirtualAnimation`
+(`bone_decode.cpp:1397`):
+
+```cpp
+j = pAnimGroup->masterBone[panim->bone];
+…
+CalcBoneQuaternion( iLocalFrame, s, &pAnimbone[panim->bone], …, q[j] );
+```
+
+The RLE stream is decoded against the **animation file's** bone — its
+`posscale`, `rotscale` and bind-pose `rot`, which are the numbers its
+fixed-point values were written against — and the *result* is stored at the
+**host's** bone index. Parsing the include as its own file gives the first half
+for free; the second half is `masterBone`.
+
+### 12.2 The measurements that scoped it
+
+Over the shipped depot, and over the search path `portal2/gameinfo.txt`
+actually mounts:
+
+- **25 models declare an `$includemodel`** and **24 of those companions can be
+  read**. The three that cannot are all `models/props_lab/bot_male.mdl`'s
+  (`bot_male_animations`, `_gestures`, `_postures`), which are in no VPK — so
+  `FindModel` returns null and that model keeps its seven local sequences.
+  (A 26th host, `models/info_character/info_character_player.mdl`, is in
+  `portal2_dlc2`, which this mount does not reach.)
+- **Nothing nests.** No included model includes anything, so the recursion is
+  there because Valve's is.
+- **Nine of the 25 are placed by a `prop_dynamic`, by 926 entities**, and
+  **898 of those 926 are the two `anim_wp/room_transform` panel arms**, both
+  including the same `arm64x64_interior_animation.mdl`.
+- **270 distinct `DefaultAnim` labels — 849 entities' worth — resolve only
+  through an include.** Another 183 entities name a label that is in no model
+  at all, which is Valve's own map errors and not this feature's to fix.
+- **`STUDIO_OVERRIDE` is set on 0 of the game's 7,885 sequences**, so
+  `AppendSequences`' "the one in memory is a forward declaration, replace it"
+  branch is unreachable and is not ported.
+- **Sequence bone weights are 1 everywhere it matters.** Across the nine
+  companions a prop model includes, 85 sequences carry a zero `pBoneweight` —
+  44 in `eggbot_animations`, 36 in `ballbot_animations`, 5 in
+  `player_animations` — and **none at all** in the two panel-arm files, the
+  personality sphere's or the Wheatley boss's. Every model that has one is
+  drawn in its bind pose here anyway, for want of skinning. Not ported; see
+  §12.4.
+
+### 12.3 The finding that made the merge simple
+
+`CalcVirtualAnimation` seeds a bone the animation does not mention from the
+**sequence model's** bind pose (`pSeqbone[ boneMap[nBone] ]`), where
+`anim::pose` seeds it from the host's. Those are different models, so on paper
+this is a divergence.
+
+Measured, it is not: across all nine hosts, every bone that matches by name has
+a bind `pos` within **4e-6 units** and a bind `quat` within **0** of its
+counterpart's. An animation-only `.mdl` is compiled from the same skeleton as
+the model it animates, and `studiomdl` writes the same numbers. So `boneMap`
+buys nothing here and is not built — and the depot test proves the equivalence
+rather than assuming it, by posing the host with the merged animation and the
+companion with its own, and comparing all sixteen bones **by name** at three
+cycles.
+
+### 12.4 What is still missing, and what would make it worth having
+
+- **External `.ani` animation blocks.** This is now the binding constraint
+  rather than `$includemodel`. The nine prop models name **eight distinct
+  companions** (both panel arms share one), and only two of the eight keep
+  their animations inline: `arm64x64_interior_animation` has all 1,350 of
+  them, and `personality_sphere_animation` 313 of 318. The other six —
+  `eggbot_animations`, `ballbot_animations`, `player_animations`,
+  `headless_player_animations`, `headless_s8player_animations` and
+  `glados_wheatley_boss_animation` — keep almost all of theirs in a companion
+  `.ani`, so their labels now *resolve* and their poses are empty (1, 1, 0, 0,
+  0 and 2 animations with data respectively).
+
+  > **All six, and the personality sphere as well, are models this port draws
+  > in its bind pose for want of skinning**, so neither `.ani` nor anything
+  > else changes a pixel for them until skinning lands. That is the order to do
+  > them in, and it is why the panel arms are the whole visible payoff of the
+  > merge: they are the only two of the nine that are rigid.
+- **Sequence bone weights** (`mstudioseqdesc_t::weightlistindex`), as above:
+  85 sequences, all on models this port cannot pose anyway.
+- **One parse per host, not per file.** Both panel arms include the same 1.3 MB
+  companion, so a map placing both reads and expands it twice — about 50 ms and
+  7 MB each, at level load and not per frame. Valve gets sharing free from
+  `CMDLCache`; the equivalent here is a cache above `StudioModel::load`, and the
+  condition for writing one is a map whose load time is actually a problem.

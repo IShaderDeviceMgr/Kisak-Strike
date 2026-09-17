@@ -777,11 +777,33 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   sequences and the RLE animation blocks, plus the `R_StudioSetupBones` slice that poses
   them; skinning is *replaced* by a per-bone draw split rather than deferred, which is
   exact for every model the port draws. See `src/server/`, below.
-  **`prop_dynamic` measured two gaps in that half.** `$includemodel` is the larger: 9
-  of the 606 models the game's props name keep their sequences in a companion
-  `*_animation.mdl`, **926 entities wear one**, and until
-  `CStudioHdr::ResolveIncludedModels` and its bone remapping land those 926 stand in
-  their bind pose. And **flex deltas stop being academic**: the 16 models the reader
+  **`prop_dynamic` measured two gaps in that half, and the larger one is now closed.**
+  **`studio/include.rs` is `$includemodel`** — `CStudioHdr::ResolveIncludedModels` and
+  the `virtualmodel_t` under it: 9 of the 606 models the game's props name keep their
+  sequences in a companion `*_animation.mdl`, **926 entities wear one**, and until it
+  landed those 926 stood in their bind pose. Valve keeps the included headers separate
+  and hops through a per-group remap table on every access, because they are cache
+  entries that can be evicted; a `StudioModel` is an owned value, so the merge happens
+  **once, at load**, and `masterSeq`, `boneMap`, the attachment/pose/node tables and
+  `CModelLookupContext` all delete. What does not delete is `masterBone`: an included
+  animation's track names a bone of the *included* model, and the two skeletons are the
+  same bones **in a different order** in eight of the nine — so a merge without the
+  remap bends a panel arm at the wrong joint, which is a wrong picture and not an
+  error. Measured on the running maps: of the 2,738 props playing a sequence two
+  seconds into their level, the labels that resolve went from 1,666 to **2,556** and
+  the ones that do not from 897 to **182** — and that remainder is Valve's own map
+  errors rather than a gap. `portdocs/STUDIO.md` §12 has the anatomy; the rest of the
+  measurements are there too, including the one that made it simple (**host and include
+  bind poses agree to 4e-6**, so `boneMap` buys nothing) and the one that bounds it
+  (**nothing nests**, and `STUDIO_OVERRIDE` is set on 0 of the game's 7,885 sequences).
+  **`.ani` animation blocks are the binding constraint now**: the nine models name
+  eight distinct companions (both panel arms share one) and only two are inline —
+  `arm64x64_interior_animation`, all 1,350 of them, and `personality_sphere_animation`,
+  313 of 318 — while the other six keep almost all of theirs in a companion `.ani`, so
+  their labels resolve and their poses are empty. Every model but the two panel arms is
+  one this port draws in its bind pose for want of skinning anyway, so skinning comes
+  first and the arms are the whole visible payoff: **898 of the 926**.
+  And **flex deltas stop being academic**: the 16 models the reader
   refuses are `models/props_destruction/toxin*`, 15 of them are placed as
   `prop_dynamic`s by **41 entities**, and those 41 draw nothing. The "absent from the
   data" claim below is about *static props* and is still exactly true; `prop_dynamic`
@@ -1117,8 +1139,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   drawn in their bind pose instead of animating. Seven of those models are on
   `sp_a1_intro1` — the `models/container_ride/finedebris_part*` set — so it is
   visible on the map this port loads by default rather than only in a census.
-  Skinning is now the *second*-largest gap in the model path, behind
-  `$includemodel`'s 926.
+  With `$includemodel` merged, skinning is now the **largest** gap in the model
+  path — and it gates the next one, because the six include hosts whose
+  animation is in an `.ani` are all models it cannot pose anyway.
   **The RLE stream is expanded at load, not walked at draw**, because a whole
   button model's animation is a few hundred bytes — the game's longest is
   **4,050 frames**, which is the matching bound on that decision.
@@ -1347,13 +1370,17 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   entities wear one — but **94 of the 106 are `prop_dynamic_override`**, so not
   porting the whole propdata system leaves **12 entities across three maps**
   drawn that the shipped game deletes.
-  And **`$includemodel` is the measured gap, and it belongs to `studio/`**:
-  nine of the 606 models keep their sequences in a companion
-  `*_animation.mdl`, **926 entities wear one**, and their labels resolve to
-  nothing here so they stand in their bind pose. Of the game's 2,416
-  `DefaultAnim` keys 2,233 name a sequence that exists somewhere (849 only
-  through an include) and **183 name one that is in no model at all** — Valve's
-  own map errors, which the shipped game answers with a `Warning`.
+  And **`$includemodel` was the measured gap, it belonged to `studio/`, and it
+  is done** (above): nine of the 606 models keep their sequences in a companion
+  `*_animation.mdl` and **926 entities wear one**. Of the game's 2,416
+  `DefaultAnim` keys 2,233 name a sequence that exists somewhere — **849 only
+  through an include**, which is what the merge bought — and **183 name one
+  that is in no model at all**, Valve's own map errors, which the shipped game
+  answers with a `Warning`. A second-order effect came with it: an animation
+  that can now *end* fires `OnAnimationDone`, so the game's 5,311
+  `SetAnimation` connections start more props animating than the maps'
+  `DefaultAnim` keys alone do — 2,738 props are playing a sequence two seconds
+  in, where 2,563 were.
 
   Six more rules produce a plausible wrong answer rather than an error
   (`rustdocs/SERVER.md` gotchas 60-65). **A prop's playback rate starts at
@@ -1459,12 +1486,17 @@ The candidates, in the order they are worth doing:
   unhandled inputs are now theirs. The attachment forms also want
   `LookupAttachment` on a studio model, which would be `server/`'s first dependency on
   `studio/`.
-- **`$includemodel` in `src/studio/`** — `CStudioHdr::ResolveIncludedModels` and the
-  bone remapping under it. Nine of the 606 models the game's `prop_dynamic`s name keep
-  their sequences in a companion `*_animation.mdl`, and **926 entities wear one**, so
-  their animations resolve to nothing and they stand in their bind pose. It is the
-  largest measured gap `prop_dynamic` left, and it is `studio/`'s rather than
-  `server/`'s.
+- **Skinning in `src/studio/`**, which `$includemodel` promoted to the largest gap in
+  the model path and which now gates the second largest. The per-bone draw split is
+  exact only when every vertex answers to one bone, and **74 of the 591 readable models
+  the game's props name share a vertex between two — 290 entities wear one**, drawn in
+  their bind pose. Seven of the 74 are on `sp_a1_intro1`
+  (`models/container_ride/finedebris_part*`), so it is visible on the default map. It
+  gates **external `.ani` animation blocks**, because every `$includemodel` host but
+  the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
+  and the personality sphere — is a model this cannot pose anyway, so reading `.ani`
+  before skinning buys nothing. `vvd::Vertex` grows a `bones` field, `vtx` stops
+  discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
 - **The local lights on a static prop** — `LightcacheGetStatic`'s other half, which
   `world::props::lighting_for` currently answers with `count: 0`. It has just become the
   most *visible* thing missing from the model path: `Phong` is ported and its specular

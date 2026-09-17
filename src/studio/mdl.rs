@@ -27,9 +27,16 @@ const IDENT: u32 = u32::from_le_bytes(*b"IDST");
 /// ships is this version, so there is nothing to branch on.
 const VERSION: i32 = 49;
 
-/// `sizeof(studiohdr_t)` is much larger, but this is everything up to and
-/// including `bodypartindex` at 236 — the last field this reader needs.
-const MIN_HEADER: usize = 240;
+/// `sizeof(studiohdr_t)` is larger still (`studiohdr2index` sits at 400), but
+/// this is everything up to and including `includemodelindex` at 340 — the
+/// last field this reader needs.
+///
+/// It was 240 until `$includemodel` landed, which is the whole reason the
+/// number is a constant with a comment: the include list is 100 bytes further
+/// into the header than anything read before it, past `numlocalattachments`,
+/// the node graph, the flex tables, the IK chains, the pose parameters and
+/// `mass`.
+const MIN_HEADER: usize = 344;
 
 /// `sizeof(mstudiobodyparts_t)`, `studio.h:1985`.
 const BODY_PART_STRIDE: usize = 16;
@@ -52,6 +59,10 @@ pub(super) const MESH_STRIDE: usize = 116;
 
 /// `sizeof(mstudiotexture_t)`, `studio.h:1463`.
 const TEXTURE_STRIDE: usize = 64;
+
+/// `sizeof(mstudiomodelgroup_t)`, `studio.h:662` — two offsets, a label and a
+/// file name.
+const MODEL_GROUP_STRIDE: usize = 8;
 
 /// `sizeof(mstudiovertex_t)`, `studio.h:1447` — and the header says so in a
 /// comment, because it matters. Used here to convert
@@ -166,6 +177,15 @@ pub struct Mdl {
     /// `mstudiotexture_t` names, in order — what a mesh's `material` indexes.
     /// These are *bare* names with no directory: `pillar_64` and not
     /// `models/props_bts/pillar_64`.
+    /// `$includemodel` — the `.mdl` files this one borrows its sequences and
+    /// animations from, as paths relative to the game root and already
+    /// normalized (`models/anim_wp/room_transform/arm64x64_interior_animation.mdl`).
+    ///
+    /// This is the list as the *file* declares it. Whether any of them could
+    /// be read, and what merging one did, is
+    /// [`include::resolve`](super::include::resolve)'s answer — see
+    /// [`StudioModel::includes`](super::StudioModel::includes).
+    pub include_models: Vec<String>,
     pub textures: Vec<String>,
     /// `cdtextureindex` — the directories to try, in order, each already
     /// slash-normalized, lowercased and terminated with `/`.
@@ -234,6 +254,33 @@ impl Mdl {
             animations.len(),
         )?;
 
+        // `$includemodel` (`studio.h:2767`). Read before the geometry for the
+        // same reason the bone list is: it is the sequences' half of the file,
+        // and `include::resolve` merges into the lists `parse_sequences` has
+        // just built.
+        let include_models = {
+            let count = r.count(336, "include models")?;
+            let mut names = Vec::with_capacity(count);
+            if count > 0 {
+                let base = r.offset(340, "includemodelindex")?;
+                for i in 0..count {
+                    let at = base + i * MODEL_GROUP_STRIDE;
+                    // `pszName()` is `((char *)this) + sznameindex` — measured
+                    // from the **struct**, not from the field that holds it,
+                    // which is four bytes further on. Reading it from the
+                    // field lops the first four characters off every path and
+                    // turns `models/…` into `ls/…`, which is a file that does
+                    // not exist rather than an error.
+                    let name_at = r.relative_offset(at + 4, at, "mstudiomodelgroup_t::sznameindex")?;
+                    let name = normalize(&r.c_string(name_at)?);
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+            names
+        };
+
         let textures = {
             let count = r.count(204, "textures")?;
             let base = r.offset(208, "textureindex")?;
@@ -292,6 +339,7 @@ impl Mdl {
             bones,
             sequences,
             animations,
+            include_models,
             textures,
             texture_dirs,
             body_parts,

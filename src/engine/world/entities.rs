@@ -150,6 +150,15 @@ pub struct EntityModelStats {
     /// which are therefore drawn in their bind pose rather than wrongly. See
     /// [`StudioModel::rigid_bones`](crate::studio::StudioModel::rigid_bones).
     pub models_not_rigid: usize,
+    /// Models whose sequences came out of a `$includemodel` companion, and the
+    /// instances wearing one.
+    ///
+    /// Worth a line in the startup log because those instances are the ones
+    /// whose `DefaultAnim` would otherwise resolve to nothing: nine models in
+    /// the game do this and **926 `prop_dynamic`s wear one**. See
+    /// [`StudioModel::includes`](crate::studio::StudioModel::includes).
+    pub models_with_includes: usize,
+    pub instances_with_includes: usize,
 }
 
 /// Every studio model the map's entities place, uploaded and placed.
@@ -196,6 +205,10 @@ impl EntityModels {
         let mut resolved: HashMap<String, Arc<Material>> = HashMap::new();
         let error = materials.error_model_material();
         let mut instances = Vec::new();
+        // Parallel to `models`: whether that model's sequences came out of a
+        // `$includemodel` companion. Kept here rather than on `PropModel`
+        // because nothing but the startup log ever asks.
+        let mut from_include: Vec<bool> = Vec::new();
 
         for entity in entities {
             let key = entity.model.to_ascii_lowercase();
@@ -243,6 +256,10 @@ impl EntityModels {
 
                 stats.models += 1;
                 stats.triangles += model.indices.len() / 3;
+                if !model.includes.is_empty() {
+                    stats.models_with_includes += 1;
+                }
+                from_include.push(!model.includes.is_empty());
                 models.push(PropModel::upload(device, model, batches));
                 Some(models.len() - 1)
             });
@@ -252,6 +269,9 @@ impl EntityModels {
             stats.instances += 1;
             if model.bones.len() > 1 {
                 stats.animated += 1;
+            }
+            if from_include[slot] {
+                stats.instances_with_includes += 1;
             }
             instances.push(Instance {
                 id: entity.id,
@@ -370,6 +390,12 @@ impl EntityModels {
         }
         if s.models_not_rigid > 0 {
             out += &format!(", {} not rigid (drawn unanimated)", s.models_not_rigid);
+        }
+        if s.models_with_includes > 0 {
+            out += &format!(
+                ", {} model(s) animated by a $includemodel ({} instances)",
+                s.models_with_includes, s.instances_with_includes
+            );
         }
         out
     }

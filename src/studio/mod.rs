@@ -63,6 +63,7 @@
 mod build;
 #[cfg(test)]
 mod fixture;
+mod include;
 mod mdl;
 pub mod anim;
 pub mod vhv;
@@ -232,6 +233,15 @@ pub struct StudioModel {
     /// The animations, parallel to nothing — a [`Sequence`](anim::Sequence)
     /// indexes them.
     pub animations: Vec<anim::Animation>,
+    /// The `$includemodel` companions whose sequences and animations are in
+    /// the two lists above, in the order they were merged.
+    ///
+    /// Empty for all but nine of the 606 models the game's `prop_dynamic`s
+    /// name — and those nine are worn by 926 entities, so it is empty for
+    /// most models and load-bearing for a lot of props. See
+    /// [`include`](self::include) for what merging one does; a model that
+    /// *declares* an include which could not be read does not list it here.
+    pub includes: Vec<String>,
     /// Which bone moves each vertex, parallel to
     /// [`vertices`](StudioModel::vertices).
     ///
@@ -293,18 +303,28 @@ impl StudioModel {
         let vvd_path = format!("{stem}.vvd");
         let vtx_path = format!("{stem}{VTX_EXTENSION}");
 
-        let mdl = Mdl::parse(mdl_path.clone(), &read(&mdl_path)?)?;
+        let mut mdl = Mdl::parse(mdl_path.clone(), &read(&mdl_path)?)?;
+
+        // `CStudioHdr::ResolveIncludedModels`, before anything reads the
+        // sequence list. A model that names no `$includemodel` — 2,160 of the
+        // game's 2,186 — reads no extra file and this is one empty loop.
+        let includes = include::resolve(&mut mdl, |path| vfs.read(path).ok());
+
         let vvd_bytes = read(&vvd_path)?;
         let vvd = Vvd::parse(vvd_path, &vvd_bytes)?;
         let vtx_bytes = read(&vtx_path)?;
         let vtx = Vtx::parse(vtx_path, &vtx_bytes)?;
 
-        build::build(&mdl, &vvd, &vtx, |candidates| {
+        let mut model = build::build(&mdl, &vvd, &vtx, |candidates| {
             candidates
                 .iter()
                 .find(|candidate| vfs.exists(&format!("materials/{candidate}.vmt")))
                 .cloned()
-        })
+        })?;
+        // `build` joins three *files* and knows nothing about a fourth, so the
+        // list is attached here rather than threaded through it.
+        model.includes = includes;
+        Ok(model)
     }
 
     /// Total triangles across every batch.
@@ -855,6 +875,9 @@ mod tests {
         // could not be posed by splitting their triangles between bones.
         let (mut multi_bone, mut not_rigid) = (0usize, Vec::new());
         let (mut sequences, mut widest_animation) = (0usize, 0usize);
+        // `$includemodel`: how many models declare one, how many of those the
+        // game actually ships, and what merging them is worth.
+        let (mut declares, mut merged, mut from_includes) = (0usize, 0usize, 0usize);
         let (mut widest, mut widest_at) = (0usize, String::new());
         let (mut failed, mut animated_failed) = (Vec::new(), Vec::new());
         for path in &paths {
@@ -873,14 +896,27 @@ mod tests {
             // this reader refuses on purpose. So the flag is read before the
             // whole trio is asked for, and only a static prop's failure is a
             // failure of the port.
-            let is_static = Mdl::parse(path.clone(), &vfs.read(path).expect("read the .mdl"))
+            //
+            // It is also where `$includemodel` is counted, because this is the
+            // model *before* its companions are merged in: how many sequences
+            // it owns, against how many it ends up with.
+            let header = Mdl::parse(path.clone(), &vfs.read(path).expect("read the .mdl")).ok();
+            let is_static = header
+                .as_ref()
                 .map(|mdl| mdl.flags.contains(StudioFlags::STATIC_PROP))
                 .unwrap_or(false);
+            let (declared, local_sequences) = header
+                .as_ref()
+                .map(|mdl| (mdl.include_models.len(), mdl.sequences.len()))
+                .unwrap_or((0, 0));
+            declares += usize::from(declared > 0);
 
             match StudioModel::load(&vfs, path) {
                 Ok(model) => {
                     loaded += 1;
                     sequences += model.sequences.len();
+                    merged += model.includes.len();
+                    from_includes += model.sequences.len() - local_sequences;
                     widest_animation = widest_animation
                         .max(model.animations.iter().map(|a| a.frame_count).max().unwrap_or(0));
                     if model.bones.len() > 1 {
@@ -930,6 +966,10 @@ mod tests {
              {sequences} sequences, longest animation {widest_animation} frames",
             not_rigid.len()
         );
+        println!(
+            "{declares} models declare a $includemodel; {merged} include(s) merged, \
+             carrying {from_includes} of the {sequences} sequences"
+        );
         for line in not_rigid.iter().take(10) {
             println!("  shares vertices between bones: {line}");
         }
@@ -960,9 +1000,29 @@ mod tests {
         // the 11 a floor button's has. `anim.rs` expands every animation at
         // load; at 4,050 frames that is a megabyte or so for one model, which
         // is affordable but is the number to watch if a class ever loads one.
+        // **`$includemodel`, measured.** 25 of the models this mount can see
+        // name one, and 24 of those companions can be read: the three that
+        // cannot are all `models/props_lab/bot_male.mdl`'s —
+        // `bot_male_animations`, `_gestures` and `_postures` are in no VPK —
+        // so that model keeps its seven local sequences and nothing else,
+        // which is `FindModel` returning null and is not an error.
+        //
+        // (A 26th host, `models/info_character/info_character_player.mdl`,
+        // lives in `portal2_dlc2`, which `portal2/gameinfo.txt` does not
+        // mount. It is not in the 2,041 above either.)
+        //
+        // Nine of them are placed by a `prop_dynamic`, by **926 entities**,
+        // and merging their companions is what turns 270 `DefaultAnim` labels
+        // — 849 entities' worth — from "no such sequence" into a pose.
+        assert_eq!(declares, 25, "models that name a $includemodel");
+        assert_eq!(merged, 24, "companions that could be read");
         assert_eq!(multi_bone, 420, "models with more than one bone");
         assert_eq!(not_rigid.len(), 141, "models that share a vertex between bones");
-        assert_eq!(sequences, 5_434);
+        // Was 5,434 before the merge, and the difference is what every
+        // `prop_dynamic` naming an `anim_wp/room_transform` sequence was
+        // missing.
+        assert_eq!(sequences, 10_666, "sequences, including included ones");
+        assert_eq!(from_includes, 5_232, "sequences that came from a companion");
         assert_eq!(widest_animation, 4_050, "the longest animation in the game");
     }
 }
@@ -1058,4 +1118,210 @@ mod anim_depot_tests {
         assert_eq!(counts[1] + counts[2], model.vertices.len());
         assert!(counts[2] > 0, "no vertex is on the moving plate");
     }
+
+    /// `$includemodel`, read out of the real game: the panel arm whose 1,350
+    /// animations live in a file the map never names.
+    ///
+    /// `models/anim_wp/room_transform/arm64x64_interior` and its `_rusty`
+    /// twin are **898 of the 926 `prop_dynamic`s in Portal 2 that wear an
+    /// include host**, and the only two of the nine whose vertices each answer
+    /// to one bone — so they are the only ones this port can visibly animate,
+    /// and they are what this tests.
+    ///
+    /// The check with teeth is the last one. The host's skeleton and the
+    /// include's are the same sixteen bones **in a different order**, so
+    /// posing the host with a merged animation and posing the *include* with
+    /// its own unmerged one must agree bone-for-bone **by name**. That fails
+    /// if the remap is skipped, if it is applied in the wrong direction, or if
+    /// the two bind poses were not really interchangeable.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release an_included_model -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn an_included_model_supplies_the_sequences_a_map_asks_for() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        const HOST: &str = "models/anim_wp/room_transform/arm64x64_interior.mdl";
+        const ANIM: &str = "models/anim_wp/room_transform/arm64x64_interior_animation.mdl";
+
+        let clock = std::time::Instant::now();
+        let model = StudioModel::load(&vfs, HOST).expect("the panel arm");
+        let cost = clock.elapsed();
+        // **What the merge costs, and where.** `anim.rs` expands every RLE
+        // stream at load rather than walking it at draw, and this is the file
+        // that puts a price on that: 1,350 animations over 55,007 frames and
+        // sixteen bones, about 7 MB expanded. Read as a ratio — the same model
+        // without its companion loads in about 3.5 ms — and note that it is a
+        // *level load* cost and not a frame one: `engine::world::bench` does
+        // not move.
+        println!("  loaded in {cost:?}");
+        println!(
+            "{}: {} bones, {} sequences, {} animations, includes {:?}",
+            model.path,
+            model.bones.len(),
+            model.sequences.len(),
+            model.animations.len(),
+            model.includes
+        );
+
+        assert_eq!(model.includes, vec![ANIM.to_owned()]);
+        assert_eq!(model.bones.len(), 16);
+        // One local sequence, `BindPose`, and 1,350 from the companion. The
+        // host wins every label collision and there are none.
+        assert_eq!(model.sequences.len(), 1 + 1_350);
+        assert_eq!(model.sequences[0].label, "BindPose");
+
+        // What a shipped map actually writes into `DefaultAnim`. Neither
+        // resolves without the merge: the first is the commonest of the 270
+        // labels in the game that only an include has, and the second is the
+        // host's own.
+        let asked = model
+            .sequence("makeramp_02open_idleend")
+            .expect("a label only the include has");
+        assert!(model.sequence("bindpose").is_some(), "and the host's own");
+
+        // The animation arrived with data rather than as an empty husk: this
+        // file keeps all 1,350 of its animations inline, where the other seven
+        // include models in the game keep most of theirs in an `.ani` this
+        // port does not read.
+        let animation = model.animation(asked).expect("an animation");
+        println!(
+            "  {:?}: {} frames @ {} fps ({:.3}s), {} tracks",
+            animation.name,
+            animation.frame_count,
+            animation.fps,
+            animation.duration(),
+            animation.tracks.len()
+        );
+        assert!(!animation.tracks.is_empty());
+        // Every track names a bone of the **host**, which is what the remap is
+        // for.
+        assert!(animation.tracks.iter().all(|t| t.bone < model.bones.len()));
+
+        // **Most of what this buys is a still pose, not motion.** The panel
+        // arms' `DefaultAnim` keys are overwhelmingly `…_idle` and
+        // `…_idleend`, and an `_idleend` is *one frame*: the shape the arm
+        // holds once it has finished unfolding. So the thing to assert is that
+        // the pose is not the bind pose — which is exactly what those 898
+        // props were stuck in before the merge.
+        let posed = anim::pose(&model.bones, Some(animation), 0.0);
+        let bind = anim::pose(&model.bones, None, 0.0);
+        let bend = posed
+            .iter()
+            .zip(&bind)
+            .map(|(a, b)| {
+                (a.transform_point3(glam::Vec3::ZERO) - b.transform_point3(glam::Vec3::ZERO))
+                    .length()
+            })
+            .fold(0.0f32, f32::max);
+        println!("  furthest bone sits {bend:.3} units off the bind pose");
+        assert!(bend > 1.0, "`{}` is the bind pose", animation.name);
+
+        // And the ones that do move, move. The longest animation in the file
+        // is the honest place to look for that, since which sequences a map
+        // plays through is `server/`'s question and not this module's.
+        let (longest, animation) = model
+            .animations
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, a)| a.frame_count)
+            .expect("an animation");
+        let travel = |cycle_a: f32, cycle_b: f32| {
+            let a = anim::pose(&model.bones, Some(animation), cycle_a);
+            let b = anim::pose(&model.bones, Some(animation), cycle_b);
+            a.iter()
+                .zip(&b)
+                .map(|(a, b)| {
+                    (b.transform_point3(glam::Vec3::ZERO) - a.transform_point3(glam::Vec3::ZERO))
+                        .length()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        println!(
+            "  longest animation {longest} {:?}: {} frames, furthest bone travels {:.3} units",
+            animation.name,
+            animation.frame_count,
+            travel(0.0, 1.0)
+        );
+        assert!(animation.frame_count > 1);
+        assert!(travel(0.0, 1.0) > 1.0, "nothing moved over the longest animation");
+
+        // ------------------------------------------------------------------
+        // The remap, checked against the animation in its own frame.
+        // ------------------------------------------------------------------
+        let bytes = vfs.read(ANIM).expect("the companion");
+        let companion = Mdl::parse(ANIM.to_owned(), &bytes).expect("parse the companion");
+
+        // The two skeletons are the same names in a different order — which is
+        // what makes the remap load-bearing rather than decorative. Pin it, so
+        // that a future file that happened to agree could not quietly turn
+        // this test into a tautology.
+        let host_names: Vec<&str> = model.bones.iter().map(|b| b.name.as_str()).collect();
+        let their_names: Vec<&str> = companion.bones.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(host_names.len(), their_names.len());
+        assert_ne!(host_names, their_names, "the orders should differ");
+
+        let theirs = companion
+            .animations
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(&animation.name))
+            .expect("the companion's own copy of it");
+        for cycle in [0.0, 0.37, 1.0] {
+            let ours = anim::pose(&model.bones, Some(animation), cycle);
+            let theirs = anim::pose(&companion.bones, Some(theirs), cycle);
+            for (i, bone) in model.bones.iter().enumerate() {
+                let j = companion
+                    .bones
+                    .iter()
+                    .position(|b| b.name.eq_ignore_ascii_case(&bone.name))
+                    .expect("every bone is in both");
+                let (a, b) = (ours[i], theirs[j]);
+                let worst = a
+                    .to_cols_array()
+                    .iter()
+                    .zip(b.to_cols_array())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    worst < 1e-4,
+                    "bone {:?} at cycle {cycle}: {a:?} vs {b:?}",
+                    bone.name
+                );
+            }
+        }
+        println!("  all 16 bones agree with the companion's own frame at three cycles");
+
+        // The other eight hosts in the game, for the record — and the
+        // measurement that says what is still missing from each.
+        for path in [
+            "models/anim_wp/room_transform/arm64x64_interior_rusty.mdl",
+            "models/npcs/personality_sphere/personality_sphere_skins.mdl",
+            "models/player/eggbot/eggbot.mdl",
+            "models/player/ballbot/ballbot.mdl",
+            "models/player/br/headless_s8player.mdl",
+            "models/player/chell/player.mdl",
+            "models/player/chell/headless_player.mdl",
+            "models/npcs/glados/glados_wheatley_boss.mdl",
+        ] {
+            let m = StudioModel::load(&vfs, path).expect("a host model");
+            let with_data = m.animations.iter().filter(|a| !a.tracks.is_empty()).count();
+            println!(
+                "  {path}: {} sequences, {}/{} animations with data, rigid={}",
+                m.sequences.len(),
+                with_data,
+                m.animations.len(),
+                m.rigid_bones().is_some()
+            );
+            assert_eq!(m.includes.len(), 1, "{path} should have merged one include");
+            assert!(!m.sequences.is_empty(), "{path} has no sequences");
+        }
+    }
+
 }

@@ -12,8 +12,12 @@
 use super::mdl::{MESH_STRIDE, MODEL_STRIDE};
 
 /// The `.mdl` header size this fixture writes — the real one is larger, but
-/// every field after `bodypartindex` is zero here and unread.
-const HEADER: usize = 256;
+/// every field after `includemodelindex` is zero here and unread.
+///
+/// It must be at least `mdl::MIN_HEADER`, which is where `$includemodel`'s
+/// count and offset live; a fixture shorter than that is refused as truncated
+/// rather than read as having no includes.
+const HEADER: usize = 344;
 
 /// One mesh: a material, a slice of its model's vertices, and triangles naming
 /// vertices *within that slice*.
