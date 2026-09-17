@@ -112,7 +112,7 @@ use crate::server::classes::trigger::BaseTrigger;
 use crate::server::damage::DamageMode;
 use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
-use crate::server::keyvalue::{atoi, effects};
+use crate::server::keyvalue::{atof, atoi, effects};
 use crate::server::movement::{
     ModelBounds, MoveType, Solid, EF_NODRAW, FSOLID_NOT_SOLID, FSOLID_TRIGGER, FL_CLIENT,
 };
@@ -1291,6 +1291,523 @@ impl Behaviour for DynamicProp {
             ("skin", self.skin.to_string()),
             ("body", self.body.to_string()),
             ("fading", self.fading.to_string()),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPropTestChamberDoor
+// ---------------------------------------------------------------------------
+
+/// `TESTCHAMBER_DOOR_MODEL_NAME` (`prop_testchamber_door.cpp:15`).
+///
+/// Hard-coded in `Spawn` and not a key: **no shipped door writes `model`**,
+/// and one that did would be overwritten here as it is there.
+const TESTCHAMBER_DOOR_MODEL: &str = "models/props/portal_door_combined.mdl";
+
+/// The one sequence a test chamber door ever plays.
+///
+/// > **`open` played backwards is how the door shuts** — `close` is never
+/// > used. `Spawn` looks up four sequences and caches them in four fields, and
+/// > `m_nSequenceOpenIdle`, `m_nSequenceClose` and `m_nSequenceCloseIdle` are
+/// > read by nothing in the class or anywhere else in the tree. All the door
+/// > does is `SetPlaybackRate( ±1 )` against the sequence `Spawn` reset it to.
+/// >
+/// > The model agrees that this is deliberate rather than an oversight:
+/// > `open` is 23 frames and `close` is **36**, so they are not the same
+/// > travel and shutting a door by playing `close` would take 1.46 seconds
+/// > where the shipped game takes 0.92.
+const OPEN_SEQUENCE: &str = "open";
+
+/// `AnimateThink`'s cadence (`prop_testchamber_door.cpp:379`) — ten times a
+/// second, the same as [`ANIM_THINK_INTERVAL`] and from a different file.
+const ANIMATE_THINK_INTERVAL: f32 = 0.1;
+
+/// `CPropTestChamberDoor` (`prop_testchamber_door.h:22`,
+/// `prop_testchamber_door.cpp:55`) — the big round
+/// chamber door, and the second class in this port from
+/// `game/server/portal2/`.
+///
+/// ```text
+///    138  prop_testchamber_door    across 71 of the game's 106 maps
+/// ```
+///
+/// **Two of them are on `sp_a1_intro1`**, the map this port loads by default.
+/// They carry 247 output connections — `OnFullyClosed` (150), `OnOpen` (66)
+/// and `OnFullyOpen` (31), and **not one `OnClose`** — and 296 shipped
+/// connections fire an input at one: `Open` (137, one of them spelled
+/// `open`), `Close` (130) and `LockOpen` (29). `Lock` and `Unlock` are
+/// declared by the class and fired by nothing.
+///
+/// # It is a `CBaseAnimating`, not a prop
+///
+/// The classname says `prop_`; the class does not. `CPropTestChamberDoor`
+/// derives straight from `CBaseAnimating`, so it has no `DefaultAnim`, no
+/// `SetAnimation`, no propdata, no `StartDisabled` and none of
+/// [`DynamicProp`]'s inputs — it is five inputs and a playback rate. It lives
+/// in this file because what it needs is what this file already has: a model
+/// name, a sequence label and the five [`ModelState`] fields.
+///
+/// # What it does
+///
+/// `Spawn` resets it to cycle 0 of `open` at **playback rate zero**, which is
+/// the shut pose held still. `Open` sets the rate to `+1` and `Close` to
+/// `-1`; `Activate` arms a 10 Hz think whose only job is to notice
+/// `IsSequenceFinished()` and fire `OnFullyOpen` or `OnFullyClosed`. Both
+/// doors are refused while `m_bIsLocked`, and `LockOpen` is `Open` followed
+/// by the lock.
+///
+/// # Deliberately not here, each measured
+///
+/// - **The area portal window.** Four keys — 84 doors name a
+///   `func_areaportalwindow` and 94 write the fade triple — and all
+///   `AreaPortalOpen`/`AreaPortalClose` do is write `m_flFadeStartDist` and
+///   `m_flFadeDist` on it. `func_areaportalwindow` is part of the visibility
+///   system (areas and areaportals, `cmodel.cpp`), which `CLAUDE.md` lists as
+///   unported, so there is nothing to write to. The keys are consumed and
+///   kept — see [`describe`](TestChamberDoor::describe) — and the two calls
+///   are at their sites as comments, so that wiring them up later is one line
+///   each.
+/// - **Bone followers, and therefore collision.** `CreateVPhysics` turns the
+///   model's `bone_followers` block into one physics entity per moving bone
+///   and then makes the door itself `FSOLID_NOT_SOLID`; that is `vphysics`,
+///   which this port replaces with `rapier` and has not reached. So the door
+///   is drawn and **walked through**, exactly as a `prop_floor_button` is.
+///   `TestCollision`'s bone-follower loop goes with it.
+/// - **The two sounds.** `prop_portal_door.open` and `.close`, which is the
+///   whole of what `EmitSound` is asked for. There is no sound system.
+/// - **`SetFadeDistance( -1, 0 )` and `SetGlobalFadeScale( 0 )`** — "never let
+///   crucial game components fade out". The three fade keys are already read
+///   and dropped by
+///   [`base_key_value`](crate::server::keyvalue::base_key_value) because there
+///   is no per-instance distance fade in `world/`, so the override has nothing
+///   to override.
+/// - **`UpdateOnRemove`**, which destroys the bone followers there and has
+///   none to destroy here.
+pub struct TestChamberDoor {
+    /// `m_bIsOpen` — where the door is *going*, not where it is. It is set the
+    /// instant `Open` is accepted, three quarters of a second before the door
+    /// has finished opening, and it is what decides which of the two "fully"
+    /// outputs the think fires.
+    open: bool,
+    /// `m_bIsAnimating` — whether a "fully" output is still owed.
+    animating: bool,
+    /// `m_bIsLocked`.
+    locked: bool,
+    /// `m_flCycle` at [`anim_time`](TestChamberDoor::anim_time), 0 to 1 over
+    /// `open`.
+    cycle: f32,
+    /// `m_flAnimTime`.
+    anim_time: f32,
+    /// `m_flPlaybackRate` — `0` shut or held open, `+1` opening, `-1`
+    /// shutting.
+    playback_rate: f32,
+    /// `m_bSequenceFinished`, and **it is sticky** — see
+    /// [`studio_frame_advance`](TestChamberDoor::studio_frame_advance).
+    sequence_finished: bool,
+    /// `m_strAreaPortalWindowName`, and the fade triple beside it. Parsed,
+    /// kept and printed; nothing reads them, because this port has no
+    /// `func_areaportalwindow` — see the type's docs.
+    area_portal_window: Option<String>,
+    use_area_portal_fade: bool,
+    area_portal_fade_start: f32,
+    area_portal_fade_end: f32,
+}
+
+/// The keys (`prop_testchamber_door.cpp:33`).
+///
+/// All four are the area portal block, and the maps write three of them onto
+/// 94 doors and the name onto 84. Two doors write Hammer instance-fixup
+/// leftovers into them (`"$FadeStartDistance"`, `"pre_solved_chamber-???"`),
+/// which is what a `$`-prefixed instance parameter that was never given a
+/// value looks like after compilation; [`atof`] reads those as zero, and so
+/// does Valve's.
+pub static TESTCHAMBER_DOOR_KEYS: &[&str] = &[
+    "AreaPortalWindow",
+    "UseAreaPortalFade",
+    "AreaPortalFadeStart",
+    "AreaPortalFadeEnd",
+];
+
+/// The inputs (`prop_testchamber_door.cpp:40`), all five and all `FIELD_VOID`.
+///
+/// `CBaseAnimating`'s `skin` and `SetBodyGroup` are **not** declared, on a
+/// measurement: no connection in any of the 106 maps fires either at a door,
+/// and the class has no skin families to choose between anyway.
+pub static TESTCHAMBER_DOOR_INPUTS: InputDefs = &[
+    InputDef::new("Open", FieldType::Void),
+    InputDef::new("Close", FieldType::Void),
+    InputDef::new("Lock", FieldType::Void),
+    InputDef::new("LockOpen", FieldType::Void),
+    InputDef::new("Unlock", FieldType::Void),
+];
+
+/// The outputs (`prop_testchamber_door.cpp:46`).
+///
+/// **`OnClose` is declared, fired and connected to nothing**: all 247 output
+/// connections on the game's 138 doors are one of the other three. It is here
+/// for the reason `BecomeRagdoll` is on [`DynamicProp`] — so that a map which
+/// wrote one would parse it as an output rather than count it as a key nobody
+/// understood.
+pub static TESTCHAMBER_DOOR_OUTPUTS: &[&str] =
+    &["OnOpen", "OnClose", "OnFullyOpen", "OnFullyClosed"];
+
+impl TestChamberDoor {
+    pub fn create() -> Box<dyn Behaviour> {
+        Box::new(TestChamberDoor {
+            // The constructor's three initialisers (`:60`).
+            open: false,
+            animating: false,
+            locked: false,
+            cycle: 0.0,
+            anim_time: 0.0,
+            playback_rate: 0.0,
+            sequence_finished: false,
+            area_portal_window: None,
+            use_area_portal_fade: false,
+            area_portal_fade_start: 0.0,
+            area_portal_fade_end: 0.0,
+        })
+    }
+
+    /// What the sequence table says about `open`, for this door's model.
+    fn current_sequence(&self, entity: &EntityCore, cx: &Context<'_>) -> Lookup {
+        match entity.model.as_deref() {
+            Some(model) => cx.sequence(model, OPEN_SEQUENCE),
+            None => Lookup::Unknown,
+        }
+    }
+
+    /// The cycle `StudioFrameAdvanceInternal` would have arrived at, **before
+    /// it clamps** — which is the number the finished test is made against.
+    fn raw_cycle(&self, now: f32, info: SequenceInfo) -> f32 {
+        self.cycle + (now - self.anim_time).max(0.0) * self.playback_rate * info.cycle_rate()
+    }
+
+    /// The pose, clamped as `SetCycle` leaves it and as the renderer will show
+    /// it.
+    ///
+    /// Must agree with `engine::world::entities`' `cycle` — see
+    /// [`ModelState`].
+    fn cycle_now(&self, now: f32, info: SequenceInfo) -> f32 {
+        let cycle = self.raw_cycle(now, info);
+        match info.loops {
+            true => cycle.rem_euclid(1.0),
+            false => cycle.clamp(0.0, 1.0),
+        }
+    }
+
+    /// `SetPlaybackRate`, **re-based** — the same divergence
+    /// [`DynamicProp`]'s `SetPlaybackRate` input records, and here it is not
+    /// optional.
+    ///
+    /// Valve accumulates `m_flCycle`, so changing the rate simply changes how
+    /// fast it grows from where it already is. This port derives the cycle
+    /// from `(cycle, anim_time, rate)`, so the *same* continuity needs the
+    /// pose pinned first: take the cycle now, make it the new starting cycle,
+    /// and restart the clock. Skip it and a door told to `Close` would
+    /// compute its position from the moment it spawned.
+    fn set_playback_rate(&mut self, rate: f32, entity: &EntityCore, cx: &Context<'_>) {
+        if let Lookup::Found(info) = self.current_sequence(entity, cx) {
+            self.cycle = self.cycle_now(cx.curtime(), info);
+        }
+        self.anim_time = cx.curtime();
+        self.playback_rate = rate;
+    }
+
+    /// `CPropTestChamberDoor::Open` (`:163`).
+    fn open_door(
+        &mut self,
+        entity: &mut EntityCore,
+        activator: Option<EntityId>,
+        cx: &mut Context<'_>,
+    ) {
+        // "Don't fire the output if the door is already opened or locked".
+        if self.open || self.locked {
+            return;
+        }
+        // "Play the open animation forwards".
+        self.set_playback_rate(1.0, entity, cx);
+        self.open = true;
+        self.animating = true;
+
+        // `OnOpen` (`:385`), minus `EmitSound( "prop_portal_door.open" )` and
+        // `AreaPortalOpen()` — see the type's docs for both.
+        let me = entity.id();
+        entity.fire_output("OnOpen", Variant::Void, activator, Some(me), 0.0, cx);
+    }
+
+    /// `CPropTestChamberDoor::Close` (`:197`).
+    fn close_door(
+        &mut self,
+        entity: &mut EntityCore,
+        activator: Option<EntityId>,
+        cx: &mut Context<'_>,
+    ) {
+        if !self.open || self.locked {
+            return;
+        }
+        // "Play the open animation backwards".
+        self.set_playback_rate(-1.0, entity, cx);
+        self.open = false;
+        self.animating = true;
+
+        // `OnClose` (`:399`), minus `EmitSound( "prop_portal_door.close" )`.
+        // **No `AreaPortalClose` here** — that is on `OnFullyClosed`, so the
+        // window stays open for as long as the door is visibly shutting.
+        let me = entity.id();
+        entity.fire_output("OnClose", Variant::Void, activator, Some(me), 0.0, cx);
+    }
+
+    /// The half of `StudioFrameAdvanceInternal` (`baseanimating.cpp:468`) that
+    /// this port has anything to do: **when does `m_bSequenceFinished` go
+    /// true?**
+    ///
+    /// The other half — writing the advanced cycle back — does not exist here,
+    /// because the cycle is derived from [`ModelState`]'s fields rather than
+    /// accumulated.
+    ///
+    /// Valve's two branches both set the same flag, so they are one test:
+    /// the cycle ran off either end, or it passed
+    /// [`last_visible_cycle`](SequenceInfo::last_visible_cycle).
+    ///
+    /// > **The flag is sticky, and that is the single most surprising thing
+    /// > about this class.** Nothing clears `m_bSequenceFinished` except
+    /// > `ResetSequenceInfo`, and `CPropTestChamberDoor` calls `ResetSequence`
+    /// > exactly once, in `Spawn`. So only a door's **first** open reports its
+    /// > own completion honestly, at 0.72 seconds; from then on the flag is
+    /// > already true and **every later `OnFullyOpen` and every
+    /// > `OnFullyClosed` fires on the first think after the input**, about a
+    /// > tenth of a second in, while the door is still visibly moving.
+    /// >
+    /// > That is the shipped game's behaviour and it is reproduced
+    /// > deliberately, because 150 connections hang off `OnFullyClosed` and
+    /// > they were authored against it — `door_physics_clip Disable` on 29 of
+    /// > them, a fizzler on 25 more. Making the door "correct" would delay
+    /// > every one of them by three quarters of a second.
+    /// >
+    /// > It is also why `Close` needs no `last_visible_cycle` of its own:
+    /// > played backwards the threshold is above 1 and unreachable, and the
+    /// > `cycle < 0` branch that would fire at the true end of the travel is
+    /// > never the one that gets there first.
+    fn studio_frame_advance(&mut self, entity: &EntityCore, cx: &Context<'_>) {
+        // No model, or no `open` sequence: nothing can be decided, and Valve's
+        // `StudioFrameAdvance` returns at `!pStudioHdr` too. See
+        // `server::sequences` for why `Unknown` is not `Missing`.
+        let Lookup::Found(info) = self.current_sequence(entity, cx) else {
+            return;
+        };
+        let raw = self.raw_cycle(cx.curtime(), info);
+        if raw < 0.0 || raw >= 1.0 || raw > info.last_visible_cycle(self.playback_rate) {
+            self.sequence_finished = true;
+        }
+    }
+
+    /// `CPropTestChamberDoor::AnimateThink` (`:354`).
+    ///
+    /// `DispatchAnimEvents` and `UpdateBoneFollowers` are the two lines
+    /// between the advance and the test in the original; neither has anything
+    /// here to drive.
+    ///
+    /// > **The think re-arms unconditionally, which is Valve's, and this class
+    /// > deliberately does not take [`DynamicProp::anim_think`]'s divergence
+    /// > of cancelling itself when there is nothing left to decide.** The
+    /// > reason that divergence was worth it there was 8,462 entities;
+    /// > there are 138 doors in the whole game, two per map. What re-arming
+    /// > buys is the exact 0.1-second grid, and the grid is what decides when
+    /// > `OnFullyOpen` and `OnFullyClosed` fire — cancelling and re-arming on
+    /// > the next `Open` would shift every one of those 181 connections by up
+    /// > to a tenth of a second.
+    fn animate_think(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        self.studio_frame_advance(entity, cx);
+
+        if self.animating && self.sequence_finished {
+            let me = entity.id();
+            match self.open {
+                // `OnFullyOpened` (`:411`).
+                true => entity.fire_output("OnFullyOpen", Variant::Void, None, Some(me), 0.0, cx),
+                // `OnFullyClosed` (`:419`), minus its `AreaPortalClose()`.
+                false => {
+                    entity.fire_output("OnFullyClosed", Variant::Void, None, Some(me), 0.0, cx)
+                }
+            }
+            self.animating = false;
+        }
+
+        entity.set_next_think(cx.curtime() + ANIMATE_THINK_INTERVAL, cx);
+    }
+
+    /// Whether the door is open or opening. `IsOpen()` (`:181`); `IsClosed()`
+    /// is its negation and is written nowhere but in `Close`.
+    ///
+    /// The three below are read by the tests and by nothing else, the way
+    /// [`ClassDef::keys`](crate::server::class::ClassDef::keys) is — the
+    /// class's own state reaches `ent_dump` through
+    /// [`describe`](TestChamberDoor::describe) and reaches the renderer
+    /// through [`model_state`](TestChamberDoor::model_state), so there is no
+    /// third caller to have.
+    #[allow(dead_code)]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    #[allow(dead_code)]
+    pub fn is_animating(&self) -> bool {
+        self.animating
+    }
+
+    #[allow(dead_code)]
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+}
+
+impl Behaviour for TestChamberDoor {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        let is = |name: &str| key.eq_ignore_ascii_case(name);
+
+        if is("AreaPortalWindow") {
+            self.area_portal_window = Some(value.to_owned());
+            return true;
+        }
+        if is("UseAreaPortalFade") {
+            self.use_area_portal_fade = atoi(value) != 0;
+            return true;
+        }
+        if is("AreaPortalFadeStart") {
+            self.area_portal_fade_start = atof(value);
+            return true;
+        }
+        if is("AreaPortalFadeEnd") {
+            self.area_portal_fade_end = atof(value);
+            return true;
+        }
+        false
+    }
+
+    /// `CPropTestChamberDoor::Spawn` (`:83`), in Valve's order.
+    fn spawn(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) -> SpawnResult {
+        entity.move_type = MoveType::None;
+        // `SetSolid( SOLID_VPHYSICS )`. Nothing collides with it here —
+        // `CreateVPhysics`'s bone followers are absent and `World::clip_models`
+        // only ever sees `"*N"` brush models — so the door is a wall in the
+        // shipped game and is not one yet in this port.
+        entity.solid = Solid::VPhysics;
+        entity.effects |= effects::NOSHADOW;
+        entity.model = Some(TESTCHAMBER_DOOR_MODEL.to_owned());
+
+        // `CreateVPhysics()` — see the type's docs.
+
+        // The four `LookupSequence` calls have no counterpart: [`ModelState`]
+        // carries a *label*, so there is no index to cache and — since the
+        // models are not read until after `level_init` — nothing here to ask.
+        // Three of the four are dead in the original anyway; see
+        // [`OPEN_SEQUENCE`].
+
+        // `ResetSequence( m_nSequenceOpen )` — cycle 0, the clock, and
+        // `ResetSequenceInfo`'s `m_bSequenceFinished = false`. Its
+        // `m_flPlaybackRate = 1.0` is overwritten one line later by
+        // `SetPlaybackRate( 0.0f )`, which is what makes a door spawn **shut
+        // and still** rather than opening itself.
+        self.cycle = 0.0;
+        self.anim_time = cx.curtime();
+        self.sequence_finished = false;
+        self.playback_rate = 0.0;
+
+        // The `AreaPortalWindow` lookup and its `AreaPortalClose()` go here.
+
+        entity.effects |= effects::MARKED_FOR_FAST_REFLECTION;
+
+        // `SetFadeDistance( -1.0f, 0.0f )` / `SetGlobalFadeScale( 0.0f )` —
+        // see the type's docs.
+        SpawnResult::Ok
+    }
+
+    /// `CPropTestChamberDoor::Activate` (`:133`) — "start our animation
+    /// cycle".
+    fn activate(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        entity.set_next_think(cx.curtime() + ANIMATE_THINK_INTERVAL, cx);
+    }
+
+    fn think(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        self.animate_think(entity, cx);
+    }
+
+    fn accept_input(
+        &mut self,
+        entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        let is = |name: &str| input.name.eq_ignore_ascii_case(name);
+
+        // `InputOpen` (`:155`). 137 shipped connections, and **one of them
+        // spells it `open`** — which works because every name comparison in
+        // the original is `stricmp`.
+        if is("Open") {
+            self.open_door(entity, input.activator, cx);
+            return true;
+        }
+        if is("Close") {
+            self.close_door(entity, input.activator, cx);
+            return true;
+        }
+        // `InputLock` / `InputUnlock` (`:223`, `:241`). Declared by the class
+        // and fired by no shipped connection; `LockOpen` is what the maps use.
+        if is("Lock") {
+            self.locked = true;
+            return true;
+        }
+        // `InputLockOpen` (`:231`) — open it *and then* lock it, in that
+        // order, so the open is the one input that gets through. 29 shipped
+        // connections.
+        if is("LockOpen") {
+            self.open_door(entity, input.activator, cx);
+            self.locked = true;
+            return true;
+        }
+        if is("Unlock") {
+            self.locked = false;
+            return true;
+        }
+        false
+    }
+
+    /// The pose. The sequence is always `open`; what changes is the rate.
+    fn model_state(&self) -> Option<ModelState<'_>> {
+        Some(ModelState {
+            sequence: OPEN_SEQUENCE,
+            cycle: self.cycle,
+            anim_time: self.anim_time,
+            playback_rate: self.playback_rate,
+            // `m_nSkin` is `CBaseAnimating`'s and this class never writes it.
+            skin: 0,
+        })
+    }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("open", self.open.to_string()),
+            ("animating", self.animating.to_string()),
+            ("locked", self.locked.to_string()),
+            ("cycle", format!("{:.3}", self.cycle)),
+            ("anim_time", format!("{:.3}", self.anim_time)),
+            ("playback_rate", format!("{:.2}", self.playback_rate)),
+            ("sequence_finished", self.sequence_finished.to_string()),
+            (
+                "area_portal_window",
+                self.area_portal_window.clone().unwrap_or_default(),
+            ),
+            (
+                "area_portal_fade",
+                match self.use_area_portal_fade {
+                    true => format!(
+                        "{:.0}..{:.0}",
+                        self.area_portal_fade_start, self.area_portal_fade_end
+                    ),
+                    false => "off".to_owned(),
+                },
+            ),
         ]
     }
 }

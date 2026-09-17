@@ -532,6 +532,11 @@ pub struct ModelEntity {
     pub playback_rate: f32,   // signed; 0 holds the pose
 }
 
+pub struct SequenceRow<'a> {
+    pub model: &'a str, pub label: &'a str,
+    pub duration: f32, pub loops: bool, pub fade_out_time: f32,
+}
+
 pub struct EntityModels { pub stats: EntityModelStats, /* private */ }
 
 impl EntityModels {
@@ -540,9 +545,9 @@ impl EntityModels {
         entities: &[ModelEntity], ambient: &AmbientLighting, collision: &CollisionBsp,
     ) -> EntityModels;
     pub fn sync(&mut self, entities: &[ModelEntity]);
-    /// (model path, sequence label, duration, loops) — the answer back, for
-    /// `crate::server::sequences::SequenceTable`.
-    pub fn sequences(&self) -> impl Iterator<Item = (&str, &str, f32, bool)> + '_;
+    /// What each loaded model says about each of its sequences — the answer
+    /// back, for `crate::server::sequences::SequenceTable`.
+    pub fn sequences(&self) -> impl Iterator<Item = SequenceRow<'_>> + '_;
     pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn refracts(&self) -> bool;
@@ -559,7 +564,20 @@ compiler* placed, never moving and lit once. This is `.mdl` geometry the
 `prop_floor_button` — 65 in the game, 1 on `sp_a1_intro1` — and the class that
 followed places **8,462 entities across 105 of the 106 maps, 90 of them from 52
 models on `sp_a1_intro1` alone**. Everything below either dates from the button
-or was changed by the prop.
+or was changed by the prop. `prop_testchamber_door` then added 2 more instances
+and 1 more model to that map, for **93 entity models from 54 models**, and
+changed nothing here at all — which is the point of the list below.
+
+> **The chamber door is what says the per-bone draw split generalises.** A
+> floor button is two bone runs, one of which moves; a door is **five**, of
+> which three move, and they move in two separate acts — the two spinner rings
+> turn about their own axes over the first 62% of `open`, *inside* the door's
+> own thickness, and only then do the two leaves slide 53 units apart. So the
+> first two thirds of the animation draw pixel-identically from outside and the
+> doorway clears all at once, which is the model rather than the port;
+> `entities::tests::the_chamber_door_draws_and_opens` measures both acts
+> geometrically for that reason, and checks the pixels only where they can say
+> anything.
 
 Six things about it are worth knowing.
 
@@ -607,6 +625,13 @@ Six things about it are worth knowing.
   `crate::server::sequences::SequenceTable`. `DynamicProp::cycle_now` then
   computes the *same* expression as `EntityModels::cycle` from the same five
   numbers; the two must not drift.
+
+  It is a `SequenceRow` rather than a tuple because `prop_testchamber_door`
+  added a fourth number to it: `fade_out_time`, which is what
+  `CBaseAnimating::GetLastVisibleCycle` subtracts to decide that a non-looping
+  sequence has *finished* before it has *ended*. `world/` still names no server
+  type — the row-to-`SequenceInfo` translation is `engine::group_sequences`,
+  the one function in the port that names both.
 
 - **The list is keyed on `id`, and it used to be positional.** The note here
   said the condition for a real key would be "the first class that creates or

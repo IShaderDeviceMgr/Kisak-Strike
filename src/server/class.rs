@@ -523,6 +523,26 @@ impl<'a> Context<'a> {
         name::find_by_name(self.entities, query).next()
     }
 
+    /// `gEntList.FindEntityByName( NULL, name )` — **every** match, in list
+    /// order.
+    ///
+    /// The form Valve writes as a `while` loop
+    /// (`while ( ( pEntity = FindEntityGeneric( pEntity, … ) ) != NULL )`),
+    /// which [`find_by_name`](Context::find_by_name)'s first-match form
+    /// cannot express. `CLogicBranchList::Activate` is the only caller.
+    ///
+    /// **The classname fallback is deliberately not here.** Valve's loop calls
+    /// `FindEntityGeneric`, which falls back to `FindEntityByClassname` when
+    /// the name matches nothing (`entitylist.cpp:1237`) — so
+    /// `Branch01 "logic_branch"` would monitor every branch in the map. No
+    /// shipped `Branch*` key names a classname, and **all 350 of them resolve
+    /// by name, to exactly one entity each** — no empty key, no wildcard and
+    /// no duplicate — so the fallback is unreachable. Restoring it means
+    /// searching by classname here when the vector comes back empty.
+    pub fn find_all_by_name(&self, query: &str) -> Vec<EntityId> {
+        name::find_by_name(self.entities, query).collect()
+    }
+
     /// `gEntList.FindEntityByName( NULL, name, pSearching, pActivator,
     /// pCaller )` — the first match, procedural names included.
     ///

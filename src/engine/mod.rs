@@ -976,20 +976,26 @@ fn model_entities(server: &Server) -> Vec<world::entities::ModelEntity> {
         .collect()
 }
 
-/// `(model, label, duration, loops)` rows into one entry per model.
+/// [`SequenceRow`](world::entities::SequenceRow)s into one entry per model.
 ///
 /// The flat iterator is what `world/` can produce without allocating a map of
 /// its own; the grouping is what `server/`'s table wants. One place rather
-/// than either side, because it is neither module's business.
+/// than either side, because it is neither module's business — and so is the
+/// row-to-[`SequenceInfo`](crate::server::sequences::SequenceInfo)
+/// translation, which is the only line in the port that names both types.
 fn group_sequences<'a>(
-    rows: impl Iterator<Item = (&'a str, &'a str, f32, bool)>,
+    rows: impl Iterator<Item = world::entities::SequenceRow<'a>>,
 ) -> Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> {
     let mut out: Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> = Vec::new();
-    for (model, label, duration, loops) in rows {
-        let info = crate::server::sequences::SequenceInfo { duration, loops };
-        match out.iter_mut().find(|(name, _)| name == model) {
-            Some((_, labels)) => labels.push((label.to_owned(), info)),
-            None => out.push((model.to_owned(), vec![(label.to_owned(), info)])),
+    for row in rows {
+        let info = crate::server::sequences::SequenceInfo {
+            duration: row.duration,
+            loops: row.loops,
+            fade_out_time: row.fade_out_time,
+        };
+        match out.iter_mut().find(|(name, _)| name == row.model) {
+            Some((_, labels)) => labels.push((row.label.to_owned(), info)),
+            None => out.push((row.model.to_owned(), vec![(row.label.to_owned(), info)])),
         }
     }
     out

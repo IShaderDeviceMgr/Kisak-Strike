@@ -57,6 +57,48 @@ pub struct SequenceInfo {
     pub duration: f32,
     /// `GetSequenceFlags() & STUDIO_LOOPING`.
     pub loops: bool,
+    /// `mstudioseqdesc_t::fadeouttime`, in **seconds** — 0.2 for 10,664 of
+    /// the shipped game's 10,666 sequences and 0.5 for the other two.
+    ///
+    /// Here for one reader: `CBaseAnimating::GetLastVisibleCycle`, and so
+    /// [`last_visible_cycle`](SequenceInfo::last_visible_cycle). It is *not*
+    /// a blend time — nothing in this port cross-fades.
+    pub fade_out_time: f32,
+}
+
+impl SequenceInfo {
+    /// `CBaseAnimating::GetSequenceCycleRate` (`baseanimating.cpp:1028`) —
+    /// sequence lengths per second at a playback rate of 1.
+    ///
+    /// **A zero-length sequence is `1/0.1`, not infinity**, which is Valve's
+    /// guard and is why a one-frame sequence "finishes" in a tenth of a
+    /// second rather than never.
+    pub fn cycle_rate(&self) -> f32 {
+        match self.duration > 0.0 {
+            true => 1.0 / self.duration,
+            false => 1.0 / 0.1,
+        }
+    }
+
+    /// `CBaseAnimating::GetLastVisibleCycle` (`baseanimating.cpp:1043`) — the
+    /// cycle past which `m_bSequenceFinished` is set.
+    ///
+    /// > **A non-looping sequence is "finished" `fade_out_time` seconds before
+    /// > it ends**, because `fadeouttime * cycle_rate` is that many seconds
+    /// > expressed in cycles. For the test chamber door's 0.9167-second `open`
+    /// > that is cycle 0.782, i.e. 0.717 seconds in — which is when its
+    /// > `OnFullyOpen` fires, not at 0.917.
+    ///
+    /// The `playback_rate` factor is Valve's and is signed, so **playing
+    /// backwards puts the threshold above 1 and out of reach**: a reversed
+    /// sequence can only be finished by running off the bottom, which is the
+    /// `flNewCycle < 0` branch of `StudioFrameAdvanceInternal`.
+    pub fn last_visible_cycle(&self, playback_rate: f32) -> f32 {
+        match self.loops {
+            true => 1.0,
+            false => 1.0 - self.fade_out_time * self.cycle_rate() * playback_rate,
+        }
+    }
 }
 
 /// What [`SequenceTable::lookup`] found. See the module docs for why there are
@@ -153,6 +195,7 @@ mod tests {
                     SequenceInfo {
                         duration: 0.4166,
                         loops: false,
+                        fade_out_time: 0.2,
                     },
                 ),
                 (
@@ -160,6 +203,7 @@ mod tests {
                     SequenceInfo {
                         duration: 2.0,
                         loops: true,
+                        fade_out_time: 0.2,
                     },
                 ),
             ],

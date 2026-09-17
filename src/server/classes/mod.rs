@@ -6,12 +6,12 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Thirty-nine classnames, 26,044 of the shipped game's 60,925 entity
-//! blocks.** Three of the 39 are placed by no map: `player` (the engine makes
+//! **Forty-five classnames, 34,802 of the shipped game's 60,925 entity
+//! blocks.** Five of the 45 are placed by no map: `player` (the engine makes
 //! it when a client connects), `trigger_portal_button` (a `prop_floor_button`
-//! makes it in its own `Spawn`) and `light_glspot` (registered because Valve
-//! registers it) — so **36 of the 200 classnames the maps place** are
-//! implemented.
+//! makes it in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
+//! `light_glspot`, each registered because Valve registers it — so **40 of
+//! the 200 classnames the maps place** are implemented.
 //!
 //! Stage 1 brought ten of them — `worldspawn`, the light family,
 //! `info_target`, `info_player_start`, `logic_relay` and
@@ -26,7 +26,11 @@
 //! `prop_floor_button` is 65 on its own, and is the first class from
 //! `game/server/portal2/`. Stage 5 adds two — `logic_playerproxy` (9) and
 //! `player_loadsaved` (9) — which are the map's interface to the player and
-//! Portal 2's second way of dying.
+//! Portal 2's second way of dying. After the five stages came `prop_dynamic`
+//! and its three siblings — 8,462 entities, more than stages 3 and 4 together
+//! — and `prop_testchamber_door`, which is 138 across 71 maps and is the
+//! chamber door itself. `logic_branch_listener` (158, across 46 maps) came
+//! after it, because it is what shuts those doors again.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -62,10 +66,10 @@ pub use filter::{
     FilterClass, FilterDamageType, FilterModel, FilterMulti, FilterName, FilterPlayerHeld,
 };
 pub use light::{EnvLight, Light};
-pub use logic::{Auto, Branch, Case, InstanceIoProxy, MathCounter, Relay, Timer};
+pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Relay, Timer};
 pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
 pub use point::PointTeleport;
-pub use prop::{ButtonTrigger, DynamicProp, FloorButton};
+pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
 
@@ -237,6 +241,13 @@ pub(super) static CLASSES: &[ClassDef] = &[
         create: Branch::create,
     },
     ClassDef {
+        name: "logic_branch_listener",
+        keys: BRANCH_LIST_KEYS,
+        inputs: BRANCH_LIST_INPUTS,
+        outputs: &["OnAllTrue", "OnAllFalse", "OnMixed"],
+        create: BranchList::create,
+    },
+    ClassDef {
         name: "logic_timer",
         keys: &[
             "StartDisabled",
@@ -405,13 +416,24 @@ pub(super) static CLASSES: &[ClassDef] = &[
         create: PointEntity::create,
     },
     // Portal 2's own, and the first class here from `game/server/portal2/`.
-    // 77 across 52 maps, one of them on `sp_a1_intro1`.
+    // 65 across 47 maps, one of them on `sp_a1_intro1`.
     ClassDef {
         name: "prop_floor_button",
         keys: prop::FLOOR_BUTTON_KEYS,
         inputs: FLOOR_BUTTON_INPUTS,
         outputs: prop::FLOOR_BUTTON_OUTPUTS,
         create: FloorButton::create,
+    },
+    // …and the second, out of order so that the two sit together. 138 across
+    // 71 maps, **two of them on `sp_a1_intro1`** — and despite the classname
+    // it is a `CBaseAnimating` rather than a prop, so it shares nothing with
+    // its neighbours here but the file it is written in.
+    ClassDef {
+        name: "prop_testchamber_door",
+        keys: prop::TESTCHAMBER_DOOR_KEYS,
+        inputs: TESTCHAMBER_DOOR_INPUTS,
+        outputs: prop::TESTCHAMBER_DOOR_OUTPUTS,
+        create: TestChamberDoor::create,
     },
     // Never in an entity lump: one is created by every `prop_floor_button`'s
     // `Spawn`. It is in the table because the table is the *factory*, and
@@ -458,6 +480,23 @@ static BRANCH_INPUTS: InputDefs = &[
     InputDef::new("Toggle", FieldType::Void),
     InputDef::new("ToggleTest", FieldType::Void),
     InputDef::new("Test", FieldType::Void),
+];
+
+/// `Branch01`…`Branch16`. Sixteen slots; the game uses ten.
+static BRANCH_LIST_KEYS: &[&str] = &[
+    "Branch01", "Branch02", "Branch03", "Branch04", "Branch05", "Branch06", "Branch07",
+    "Branch08", "Branch09", "Branch10", "Branch11", "Branch12", "Branch13", "Branch14",
+    "Branch15", "Branch16",
+];
+
+/// All three are `FIELD_INPUT` in the datadesc — the value is passed through
+/// unconverted — and all three are fired with `Variant::Void` by everything
+/// that fires them. The two underscored ones are a [`Branch`] talking to its
+/// listeners and are not mapper-facing.
+static BRANCH_LIST_INPUTS: InputDefs = &[
+    InputDef::new("Test", FieldType::Input),
+    InputDef::new(logic::INPUT_BRANCH_CHANGED, FieldType::Input),
+    InputDef::new(logic::INPUT_BRANCH_REMOVED, FieldType::Input),
 ];
 
 static TIMER_INPUTS: InputDefs = &[
@@ -507,6 +546,7 @@ static CASE_INPUTS: InputDefs = &[
 static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
 static FLOOR_BUTTON_INPUTS: InputDefs = prop::FLOOR_BUTTON_INPUTS;
 static DYNAMIC_PROP_INPUTS: InputDefs = prop::DYNAMIC_PROP_INPUTS;
+static TESTCHAMBER_DOOR_INPUTS: InputDefs = prop::TESTCHAMBER_DOOR_INPUTS;
 /// `CBaseTrigger`'s two keys, which a `trigger_portal_button` is never offered
 /// — it is built from code — but which its `key_value` forwards, so they are
 /// declared. The invariant test checks the declaration against the code, not

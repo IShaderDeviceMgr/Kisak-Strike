@@ -1119,6 +1119,114 @@ mod anim_depot_tests {
         assert!(counts[2] > 0, "no vertex is on the moving plate");
     }
 
+    /// **The test chamber door, read out of the real game** — the model
+    /// `prop_testchamber_door` hard-codes, and the second model in the port
+    /// that an entity animates.
+    ///
+    /// What it pins is the set of facts the class is written against, each of
+    /// which is a silently wrong picture rather than an error if it moves:
+    /// that `open` and `close` are *different lengths* so playing `open`
+    /// backwards is a deliberate choice and not a shortcut; that `open` does
+    /// not loop, so its cycle clamps; that `fadeouttime` is the 0.2 that
+    /// `GetLastVisibleCycle` subtracts, which is what decides when
+    /// `OnFullyOpen` fires; and that **every vertex answers to exactly one
+    /// bone**, which is the precondition the per-bone draw split needs and
+    /// which 74 of the models the game's props name fail.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_testchamber_door_model -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_testchamber_door_model_animates() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let model =
+            StudioModel::load(&vfs, "models/props/portal_door_combined.mdl").expect("the model");
+        println!("{}: {} vertices", model.path, model.vertices.len());
+        for (i, bone) in model.bones.iter().enumerate() {
+            println!("  bone {i} {:?} parent={:?}", bone.name, bone.parent);
+        }
+        for (i, seq) in model.sequences.iter().enumerate() {
+            let anim = &model.animations[seq.anim];
+            println!(
+                "  seq {i} {:?} -> {:?} {} frames @ {} fps ({:.4}s), fadeout {}, {} tracks",
+                seq.label,
+                anim.name,
+                anim.frame_count,
+                anim.fps,
+                anim.duration(),
+                seq.fade_out_time,
+                anim.tracks.len()
+            );
+        }
+
+        // Two leaves on a spinner each, hung off a root — and two export bones
+        // that nothing is skinned to.
+        assert_eq!(model.bones.len(), 8);
+        assert_eq!(model.bones[2].name, "portal_door_root");
+        assert_eq!(model.bones[4].name, "portal_door_left");
+        assert_eq!(model.bones[5].name, "portal_door_right");
+
+        let open = model.sequence("open").expect("an `open` sequence");
+        let close = model.sequence("CLOSE").expect("`close`, case insensitively");
+        let anim = |s: usize| &model.animations[model.sequences[s].anim];
+
+        // **`open` is 23 frames and `close` is 36.** They are not the same
+        // travel, so `CPropTestChamberDoor` shutting the door by playing
+        // `open` at rate -1 is a decision rather than an accident — and it is
+        // why this port must not "fix" it by using `close`.
+        assert_eq!(anim(open).frame_count, 23);
+        assert_eq!(anim(close).frame_count, 36);
+        assert_eq!(anim(open).fps, 24.0);
+        assert!((anim(open).duration() - 22.0 / 24.0).abs() < 1e-5);
+
+        // Non-looping, so the cycle clamps at both ends and the door holds
+        // whichever one it reached.
+        assert_eq!(
+            model.sequences[open].flags & anim::STUDIO_LOOPING,
+            0,
+            "`open` must not loop"
+        );
+        // `studiomdl`'s default, and what `GetLastVisibleCycle` subtracts:
+        // 0.2 of 0.9167 seconds, so `OnFullyOpen` fires at cycle 0.782.
+        assert_eq!(model.sequences[open].fade_out_time, 0.2);
+
+        // The two leaves move, and `open` played backwards retraces itself —
+        // which is the whole of how this door shuts.
+        let travel = |sequence: usize, bone: usize| {
+            let anim = &model.animations[model.sequences[sequence].anim];
+            let start = anim::pose(&model.bones, Some(anim), 0.0);
+            let end = anim::pose(&model.bones, Some(anim), 1.0);
+            (end[bone].transform_point3(glam::Vec3::ZERO)
+                - start[bone].transform_point3(glam::Vec3::ZERO))
+            .length()
+        };
+        let (left, right) = (travel(open, 4), travel(open, 5));
+        println!("  leaf travel over `open`: left {left:.3}, right {right:.3}");
+        assert!(left > 1.0, "the left leaf does not move: {left}");
+        assert!(right > 1.0, "the right leaf does not move: {right}");
+
+        // Every vertex on exactly one bone — the precondition
+        // `EntityModels`' per-bone draw split needs.
+        let rigid = model.rigid_bones().expect("every vertex binds to one bone");
+        let mut counts = vec![0usize; model.bones.len()];
+        for &bone in rigid {
+            counts[bone as usize] += 1;
+        }
+        println!("  vertices per bone: {counts:?}");
+        assert_eq!(counts.iter().sum::<usize>(), model.vertices.len());
+        assert!(counts[4] > 0 && counts[5] > 0, "the leaves have no geometry");
+        // …and one material, so the whole door is five draws and not fifty.
+        assert_eq!(model.batches.len(), 1);
+        assert_eq!(model.batches[0].bones.len(), 5);
+    }
+
     /// `$includemodel`, read out of the real game: the panel arm whose 1,350
     /// animations live in a file the map never names.
     ///

@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button` and `prop_dynamic`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate** — and **the player can be hurt, and die**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic` and `prop_testchamber_door`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open** — and **the player can be hurt, and die**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 172 unit tests + five depot tests over all 106 shipped maps |
+| Tests | 179 unit tests + seven depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -27,11 +27,31 @@ map after `logic_relay`** — `sequences.rs` (the seam that tells the game what 
 `CBaseEntity`, and a `ModelEntityState` that is **keyed and carries visibility**
 rather than positional and filtered.
 
+**What `prop_testchamber_door` added** (after `prop_dynamic`): `CPropTestChamberDoor`
+— **138 entities across 71 of the 106 maps, two of them on `sp_a1_intro1`** —
+`SequenceInfo::fade_out_time` and the two `CBaseAnimating` questions it answers
+(`GetSequenceCycleRate`, `GetLastVisibleCycle`), and the first class here whose
+whole behaviour is a *playback rate*. Despite the classname it is a
+`CBaseAnimating` and not a prop: no `DefaultAnim`, no `SetAnimation`, no
+propdata, five inputs and four outputs.
+
+**What `logic_branch_listener` added** (after `prop_testchamber_door`, and
+because of it): `CLogicBranchList` — **158 entities across 46 of the 106 maps**
+— the listener list on `CLogicBranch`, and `Context::find_all_by_name`. It is
+the AND gate a test chamber shuts its door with, and it is the first class here
+where one entity **registers with another** rather than sending it an input:
+`Activate` reaches into each branch it names through `Context::behaviour_mut`,
+and the branch posts `_OnLogicBranchChanged` back at it when its value moves.
+`portdocs/SERVER.md` §10.3 named this class as the condition that would change
+the borrow shape, and it did not: stage 4's answer — `Server::dispatch` lifts
+the dispatched entity out of the list, so `Context` can carry the rest of it —
+was already enough.
+
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
 **nothing pushes what is in its way** — a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why). **38 of the 200
-classnames the shipped maps place are implemented**, out of 43 registered — the
+than shoving it (`portdocs/SERVER.md` stage 3 says why). **40 of the 200
+classnames the shipped maps place are implemented**, out of 45 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -586,6 +606,7 @@ impl Context<'_> {
     pub fn behaviour_mut<T: Behaviour>(&mut self, id: EntityId) -> Option<&mut T>;
     pub fn create_entity(&mut self, classname: &str) -> Option<EntityId>;
     pub fn find_by_name(&self, query: &str) -> Option<EntityId>;
+    pub fn find_all_by_name(&self, query: &str) -> Vec<EntityId>;   // names only
     pub fn find_target(
         &self, query: &str, searching: Option<EntityId>,
         activator: Option<EntityId>, caller: Option<EntityId>,
@@ -783,7 +804,11 @@ impl ThinkList {
 ### `sequences` (`sequences.rs`)
 
 ```rust
-pub struct SequenceInfo { pub duration: f32, pub loops: bool }
+pub struct SequenceInfo { pub duration: f32, pub loops: bool, pub fade_out_time: f32 }
+impl SequenceInfo {
+    pub fn cycle_rate(&self) -> f32;                       // GetSequenceCycleRate
+    pub fn last_visible_cycle(&self, playback_rate: f32) -> f32;  // GetLastVisibleCycle
+}
 pub enum Lookup { Unknown, Missing, Found(SequenceInfo) }
 
 pub struct SequenceTable { /* private */ }
@@ -808,9 +833,19 @@ animation is *copied in* rather than called for — the same shape `world/`
 already has in the other direction, where a `Placement` is the answer to "where
 is this brush model". Both keys fold case and slashes.
 
-One class reads it (`DynamicProp`, in `AnimThink` and `SetPlaybackRate`) and
-`Engine::load_level` fills it, from the models
-`World::load_entity_models` has just uploaded.
+Two classes read it — `DynamicProp` (in `AnimThink` and `SetPlaybackRate`) and
+`TestChamberDoor` (in `StudioFrameAdvance` and every rate change) — and
+`Engine::load_level` fills it, from the models `World::load_entity_models` has
+just uploaded.
+
+`fade_out_time` is `mstudioseqdesc_t::fadeouttime`, and it is here for exactly
+one reader: `GetLastVisibleCycle`, which is what `IsSequenceFinished()` is made
+of. **A non-looping sequence counts as finished `fade_out_time` seconds before
+it ends** — so a chamber door's 0.9167-second `open` is "finished" at cycle
+0.782, 0.717 seconds in. It is 0.2 for 10,664 of the shipped game's 10,666
+sequences and 0.5 for the other two; **none is zero**, so the term never folds
+away. `cycle_rate` is `1/duration` with Valve's `1/0.1` guard for a zero-length
+sequence.
 
 > **Three answers, not two, and every `Spawn` in the game sees the third.** A
 > level loads `World::load` → `Server::level_init` →
@@ -1119,7 +1154,12 @@ pub struct EnvLight { /* holds a Light */ pub sun_color: [u8; 4] }
 // classes/logic.rs
 pub struct Relay { pub disabled: bool, pub wait_for_refire: bool }
 pub struct Auto { pub global_state: Option<String> }
-pub struct Branch { pub value: bool }
+pub struct Branch { pub value: bool /* + its logic_branch_listeners */ }
+pub struct BranchList { /* private; logic_branch_listener */ }
+impl BranchList {
+    pub fn branches(&self) -> &[EntityId];  // resolved in Activate
+    pub fn state(&self) -> &'static str;    // "not-init" | "all-true" | …
+}
 pub struct Case { /* private */ }
 pub struct Timer { pub disabled, refire_time, use_random_time,
                    lower_random_bound, upper_random_bound }
@@ -1158,13 +1198,20 @@ pub struct Player;    // stateless; see the file for why
 pub struct DynamicProp { /* private; all four prop_dynamic classnames */ }
 pub struct FloorButton { pub pressed: bool, pub skin: i32 }
 pub struct ButtonTrigger { /* private; the SOLID_OBB box over a pad */ }
+/// The chamber door. A `CBaseAnimating`, not a prop — see the note below.
+pub struct TestChamberDoor { /* private */ }
+impl TestChamberDoor {
+    pub fn is_open(&self) -> bool;       // m_bIsOpen: where it is *going*
+    pub fn is_animating(&self) -> bool;  // m_bIsAnimating: a `fully` is owed
+    pub fn is_locked(&self) -> bool;     // m_bIsLocked
+}
 // classes/player.rs — stage 5's two
 pub struct LogicPlayerProxy;
 pub struct RevertSaved { /* private; player_loadsaved */ }
 ```
 
-Forty-three classnames, **34,506 of the shipped game's 60,925 entity blocks**.
-**Thirty-eight of them are among the 200 classnames the maps place**; the other
+Forty-five classnames, **34,802 of the shipped game's 60,925 entity blocks**.
+**Forty of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -1177,6 +1224,7 @@ because Valve registers them:
 | `func_instance_io_proxy` | `CFuncInstanceIoProxy` | 1,184 |
 | `logic_auto` | `CLogicAuto` | 1,112 |
 | `logic_branch` | `CLogicBranch` | 601 |
+| `logic_branch_listener` | `CLogicBranchList` | 158 |
 | `info_target` | `CInfoTarget` | 431 |
 | `logic_timer` | `CTimerEntity` | 151 |
 | `info_player_start` | `CPointEntity` | 116 |
@@ -1209,6 +1257,7 @@ because Valve registers them:
 | `logic_playerproxy` | `CLogicPlayerProxy` | 9 |
 | `player_loadsaved` | `CRevertSaved` | 9 |
 | `prop_floor_button` | `CPropFloorButton` | 65, in 47 maps |
+| `prop_testchamber_door` | `CPropTestChamberDoor` | 138, in 71 maps |
 | `trigger_portal_button` | `CPortalButtonTrigger` | **0 placed** — one per button, 65 |
 | `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
 
@@ -1798,6 +1847,78 @@ entity built is not there start at 47, and if something will not die start at
     inside the bed. `EntityModels` resolves an unknown label to 0; see
     `rustdocs/ENGINE.md`'s `world::entities`.
 
+66. **A test chamber door only ever plays `open`, and shuts by playing it
+    backwards.** `CPropTestChamberDoor::Spawn` looks up four sequences and
+    caches them in four fields; `m_nSequenceClose`, `m_nSequenceOpenIdle` and
+    `m_nSequenceCloseIdle` are then read by nothing in the class or anywhere
+    else in the tree. All `Open` and `Close` do is `SetPlaybackRate( ±1 )`.
+    The model says the asymmetry is deliberate rather than an oversight:
+    `open` is 23 frames and `close` is **36**, so shutting a door with `close`
+    would take 1.46 seconds where the shipped game takes 0.92.
+
+67. **`m_bSequenceFinished` is sticky, so only a door's *first* opening
+    reports its own end.** Nothing clears the flag except `ResetSequenceInfo`,
+    and `CPropTestChamberDoor` calls `ResetSequence` exactly once, in `Spawn`.
+    So the first `OnFullyOpen` waits for `GetLastVisibleCycle` — 0.797 seconds
+    on the tick grid, against a 0.9167-second travel — and **every later
+    `OnFullyOpen` and every `OnFullyClosed` fires on the first think after the
+    input**, 0.094 seconds in, while the door is still visibly moving.
+
+    It is reproduced deliberately. 150 of the game's 247 door output
+    connections are `OnFullyClosed` and they were authored against it — 29 of
+    them disable a `func_clip_vphysics` and 25 enable a fizzler — so a door
+    that waited for its animation would delay all of them by three quarters of
+    a second. `every_shipped_testchamber_door_opens_and_shuts` measures both
+    numbers over all 138.
+
+68. **A rate change on a derived cycle has to re-base, and for this class it
+    is not optional.** Valve accumulates `m_flCycle`, so `SetPlaybackRate`
+    simply changes how fast it grows from where it is; this port derives the
+    cycle from `(cycle, anim_time, playback_rate)`, so `Open` and `Close` must
+    first pin `cycle` to where the door actually is and restart `anim_time`.
+    Skip it and a door told to `Close` computes its position from the moment it
+    spawned. It is the same divergence `DynamicProp`'s `SetPlaybackRate` input
+    records (gotcha 63); there it keeps 427 connections from snapping, here it
+    is the whole of how a door shuts.
+
+69. **`AnimateThink` re-arms unconditionally, and this class deliberately does
+    *not* take `AnimThink`'s cancel-when-idle divergence** (gotcha 64). That
+    divergence is worth it for 8,462 props; there are 138 doors, two per map.
+    What re-arming buys is the exact 0.1-second grid, and the grid is what
+    decides when the 181 `OnFullyOpen`/`OnFullyClosed` connections fire. The
+    cost is visible in one depot number: **`io.thinks` went from 4,420 to
+    7,318**, and all 2,898 of those are doors.
+
+70. **`IsOpen()` is where the door is *going*, not where it is.** `m_bIsOpen`
+    is set the instant `Open` is accepted, three quarters of a second before
+    the door has finished opening — so a second `Open` during the travel is
+    refused, and it is what decides which of the two "fully" outputs the think
+    fires. `LockOpen` opens *and then* locks, in that order, so the open
+    itself gets through; that is what its 29 shipped connections want.
+
+71. **A `logic_branch_listener` reports nothing at level start, and every
+    chamber door in the game depends on it.** `Spawn` is empty, `Activate`
+    only registers, and `m_eLastState` starts `NOT_INIT` — so the first output
+    comes from the first branch *change*, not from the first evaluation. Both
+    branches of a door's listener read "shut me" at spawn; a listener that
+    tested itself on the way up would slam every door in the map closed on
+    tick one.
+
+72. **`SetValue` fires no output of its own and still reaches a listener.**
+    The notification in `CLogicBranch::UpdateValue` is guarded by the value
+    having *changed*; the `OnTrue`/`OnFalse` firing is guarded by the input
+    being a `*Test` form. They are independent, and getting it wrong in either
+    direction is silent: fold the notification under `eFire` and no door in
+    the game ever shuts (1,175 of the 1,601 connections into a branch are
+    `SetValue`), or drop the change guard and `Test` — 308 connections — makes
+    every listener re-report.
+
+73. **A listener with no branches reports `OnMixed`.** With an empty list
+    neither `bOneTrue` nor `bOneFalse` is set, so `DoTest` falls through both
+    arms into the `else`. Unreachable in shipped content — all 350 `Branch*`
+    keys in the game resolve, to exactly one entity each — and the arm a
+    reimplementation gets backwards.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -1829,6 +1950,9 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `PropSetAnim`'s failure branch | `SetSequence( 0 )` — the model's first sequence, at whatever cycle | The bind pose | This module has labels, not indices, and sequence 0 has no label it can name. Reached by 183 `DefaultAnim` keys in the game, every one of them naming a sequence that is in no model at all. |
 | `AddFlag( FL_UNPAINTABLE )` | Sets `1 << 32` on a 32-bit `m_fFlags` | Nothing | Valve's own comment three lines above it: `// FIXME[HPE]: this won't actually work - we're out of bits. :(`. There is no paint system here to read it either. |
 | `logic_playerproxy`'s inputs | Twenty declared across three `#ifdef` families | **None** | Every input the class has in Portal 2 is a portal-gun or grab-controller input, and `RequestPlayerHealth`/`SetPlayerHealth` are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`. Accepting none is the shape rather than a gap — and it is why the `PlayerHealth` output cannot fire in Portal 2 at all. |
+| `CPropTestChamberDoor`'s `Open`/`Close` | `SetPlaybackRate( ±1 )` and nothing else, because `m_flCycle` is accumulated | Also re-bases `m_flCycle` and `m_flAnimTime` onto where the door is now | Same cause as the `SetPlaybackRate` row above, and here it is not cosmetic: without it a door told to `Close` would compute its position from the moment it spawned. Gotcha 68. |
+| `CPropTestChamberDoor::AnimateThink`'s cadence | Re-arms at 10 Hz for the rest of the level | **The same** — this class does *not* take `AnimThink`'s cancel-when-idle divergence | Not a divergence, listed because the neighbouring row is: the grid is what decides when the 181 `OnFullyOpen`/`OnFullyClosed` connections fire, and there are 138 doors rather than 8,462 props. Gotcha 69. |
+| `CLogicBranchList::Activate`'s `FindEntityGeneric` | Falls back to `FindEntityByClassname` when the name matches nothing, so `Branch01 "logic_branch"` would monitor every branch in the map | `Context::find_all_by_name`, which searches names only | All 350 `Branch*` keys in the game resolve by name, to exactly one entity each — no empty slot, no wildcard, nothing named that is not a `logic_branch` — so the fallback is unreachable. |
 | Entities created *by* a spawn | Bounded only by the stack | Bounded at 4,096 per dispatch, then dropped with a warning | Same shape as the zero-delay event chain's bound. The most any map creates is four. |
 | `Enable`/`Disable`/`Toggle` on a trigger | Calls `PhysicsTouchTriggers()` at once, so enabling a trigger you are standing in fires `OnStartTouch` in the same tick | Fires it on the **next** tick | The touch pass is player-driven and runs at one fixed point in the tick. At most 15.6 ms late; the condition for closing it is a touch query the server can ask mid-tick. |
 | `!player_blue` / `!player_orange` | `GetGlobalTeam( … )->GetPlayer( 0 )` | Reported as "no such player" | Single player has no teams, so Valve answers null here too — this is a report line rather than a divergence, and it is 74 of the depot's unhandled procedurals. |
@@ -1861,6 +1985,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CBaseToggle`'s `master` / `UTIL_IsMasterTriggered` | The `multisource` interlock. **No shipped Portal 2 map sets a `master` key on any of these classes.** |
 | `SF_DOOR_START_OPEN_OBSOLETE` | **No shipped map sets it.** The 40 doors that spawn open use `spawnpos 1`. |
 | `func_rot_button` (2), `momentary_rot_button` (1), `func_tracktrain` (233), `func_tanktrain` (20) | The remaining movers. `CBaseButton`'s `m_fRotating` branch is `CRotButton`'s and is therefore dead here; the trains need `path_track`. |
+| `CPropTestChamberDoor`'s area portal window — `AreaPortalWindow`, `UseAreaPortalFade`, `AreaPortalFadeStart`/`End`, `AreaPortalOpen`/`Close`, `CFuncAreaPortalWindow` | All the two calls do is write `m_flFadeStartDist` and `m_flFadeDist` on a `func_areaportalwindow`, which belongs to the engine's visibility system (areas and areaportals, `cmodel.cpp`) and is not ported. **84 doors name a window and 94 write the fade triple.** The four keys are consumed and printed by `ent_dump`; the two call sites are marked in `Spawn`, `OnOpen` and `OnFullyClosed`, so wiring them up later is one line each. |
+| `CPropTestChamberDoor`'s bone followers — `CreateVPhysics`, `CreateBoneFollowers`, `TestCollision`, `UpdateOnRemove` | The same `vphysics` gap `prop_dynamic`'s row above records, and here it is the door's *whole* collision: the model's `bone_followers` block becomes one physics entity per moving bone and the door itself goes `FSOLID_NOT_SOLID`. So a chamber door is **drawn and walked through**. In the shipped map the doorway also carries a `func_clip_vphysics`, which is not ported either. |
+| `CPropTestChamberDoor`'s sounds — `prop_portal_door.open`, `prop_portal_door.close` | There is no sound system. They are the only two things `Precache` asks for beyond the model. |
+| `CPropTestChamberDoor`'s `SetFadeDistance( -1, 0 )` / `SetGlobalFadeScale( 0 )` — "never let crucial game components fade out" | `fademindist`/`fademaxdist`/`fadescale` are already read and dropped by `base_key_value`, because `world/` has no per-instance distance fade. There is nothing for the override to override. |
 | `CPropFloorButton::AnimateThink` | Still not scheduled, and it is a saving: its body is `StudioFrameAdvance`, which the renderer does for itself from `m_flAnimTime` and does *smoothly*, where a 10 Hz think would step it. So 65 entities do not wake ten times a second and no button sits in the simulation list for ever. (`CDynamicProp::AnimThink` **is** scheduled, because it does a second job: it decides when a sequence has ended. See the divergence table for the half of it that is not here.) |
 | `CDynamicProp`'s `ParsePropData` — `scripts/propdata.txt`, the gib lists, `PROPINTER_*`, `prop_physics` | The breakable-prop system. The one thing it decides for `prop_dynamic` is a *deletion*: a plain `prop_dynamic` whose model carries a `prop_data` block is removed at load with a `DevWarning`, and an `_override` — which is what that classname is *for* — is not. Measured: 15 of the 606 models the game's props name have such a block and 106 entities wear one, but **94 of the 106 are `prop_dynamic_override`**, so the whole cost is **12 entities across three maps** (`sp_a2_bts3`, `mp_coop_tbeam_end`, `sp_a1_intro7` — laser gibs and a lab chair) that the shipped game deletes and this port draws. |
 | `CDynamicProp`'s bone followers — `CreateBoneFollowers`, `m_BoneFollowerManager`, `TestCollision`, `NotifyPositionChanged`, `DisableBoneFollowers` | One physics entity per named bone, so that an animated prop *collides* as it moves. That is `vphysics`, replaced here by `rapier` and not reached. 260 props set the key that would turn it off. |
@@ -1882,7 +2010,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `IGameSystem` as a registry | One system exists (`CTonemapSystem`), so it is a method. The condition is the second system that needs a level hook. |
 | `FIELD_EHANDLE` and `FIELD_POSITION_VECTOR` | No class declares either. `FIELD_EHANDLE`'s two conversions both need the entity list, which `Variant::convert` has not got. |
 | `AddOutput`, `SetParent`, `ClearParent` and `SetParentAttachment*` | **The condition is a real local/abs transform pair on `EntityCore`**, which this port does not have — a child's origin is the world-space one the map gave and nothing rebases it — plus `LookupAttachment` on a studio model for the attachment forms, which would be this module's first dependency on `studio/`. It is the largest single absence left: **1,078 of the depot's 1,081 unhandled inputs** are this family, 883 of them `func_brush.SetParentAttachmentMaintainOffset`. See gotcha 34. |
-| `logic_branch_listener` | It is the first thing in the game that needs a handler to read *another* entity during dispatch — the condition that changes `Context`'s shape. |
+| `CLogicBranch::UpdateOnRemove`'s notification | Valve posts `_OnLogicBranchRemoved` at the *branch* instead of at the listener (`logicentities.cpp:2622`), so no listener in the shipped game has ever received one; a stale branch is counted as false for the rest of the level. This port reaches the same state by a different route — there is no `UpdateOnRemove` hook on `Behaviour`, and a dead id reads as false in `DoTest`. **No shipped map fires `Kill` at a `logic_branch`.** |
 | `SendTable`/`DT_`/`edict_t` | One process. Deleted, not deferred. |
 | Save/restore, `FTYPEDESC_SAVE` | Deferred; `serde` over entity state when it comes back, not `ISave`. |
 | `ent_pause`/`ent_step` (`Debug_ShouldStep`) | 20 lines and genuinely useful; reconsider when entities do more. |
@@ -2091,25 +2219,42 @@ case values.
 | `tests::a_turned_pad_notices_a_turned_area` | the OBB path through the entity, not the maths |
 | `tests::the_skin_key_is_read_and_then_overwritten_by_spawn` | `SetSkin` running after `KeyValue` |
 | `tests::a_button_with_no_model_gets_the_default_one` | `GetButtonModelName`'s unreached branch |
+| `tests::a_testchamber_door_spawns_shut_and_still` | `ResetSequence` then `SetPlaybackRate( 0 )` — why a chamber does not open itself |
+| `tests::a_testchamber_door_opens_forwards_and_shuts_backwards` | gotchas 66 and 68 — **the class, end to end** |
+| `tests::only_a_doors_first_opening_reports_its_own_end` | gotcha 67, the sticky `m_bSequenceFinished` |
+| `tests::a_testchamber_door_refuses_an_input_it_is_already_obeying` | gotcha 70 |
+| `tests::a_locked_testchamber_door_refuses_everything_and_lockopen_gets_in_first` | `Lock`/`Unlock`/`LockOpen`'s ordering |
+| `tests::a_testchamber_door_with_no_model_loaded_opens_but_never_arrives` | gotcha 62 applied to a second class |
+| `tests::the_area_portal_keys_are_consumed_including_the_two_broken_ones` | the four keys, and the two Hammer instance-fixup leftovers |
+| `studio::the_testchamber_door_model_animates` | the facts the class is written against: `open` 23 frames against `close`'s 36, non-looping, `fadeouttime` 0.2, every vertex on one bone |
+| `engine::world::entities::the_chamber_door_draws_and_opens` | **the model drawn**: the doorway covered when shut and clear when open, the rings turning inside the door, the leaves travelling 53 units each |
 | `tests::every_shipped_map_spawns_its_entities` | **everything, against all 106 maps** |
 | `tests::every_shipped_maps_triggers_notice_the_player` | **every brush trigger in the game, touched** |
 | `tests::every_shipped_floor_button_presses_when_stood_on` | **every floor button in the game, stood on** |
+| `tests::every_shipped_testchamber_door_opens_and_shuts` | **every chamber door in the game, opened and shut** |
+| `tests::a_branch_listener_fires_only_when_the_verdict_changes` | gotchas 71 and 72 — **the class, end to end** |
+| `tests::test_forces_a_branch_listener_to_report_and_an_empty_one_is_mixed` | gotcha 73, and `InputTest`'s `NOT_INIT` reset |
+| `tests::the_intro_maps_door_opens_through_the_chain_its_map_built` | the default map's own `trigger → proxy → relay → door` chain, **both ways** — the `Close` half runs through a `logic_branch_listener` |
+| `tests::every_shipped_branch_listener_registers_and_shuts_the_doors_it_is_for` | **every branch listener in the game, registered and driven** |
 
-Both depot tests are `--ignored` and gated on `KISAK_GAME_DIR`:
+Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
 
 ```
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_map -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release triggers_notice -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release floor_button_presses -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release testchamber_door -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_intro_maps_door -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release branch_listener -- --ignored --nocapture
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 34,506 matched, 65
-created, 27,634 spawned, 6,937 lights deleted, 213 kept, 53,980 connections,
-162 unimplemented classnames, the full 48-name unhandled-key table, 5,785
-events dispatched, 3,923 inputs accepted, 4,420 thinks, 1,129 events that found
+server time**, and asserts exact totals: 60,925 blocks, 34,802 matched, 65
+created, 27,930 spawned, 6,937 lights deleted, 213 kept, 54,534 connections,
+160 unimplemented classnames, the full 49-name unhandled-key table, 5,787
+events dispatched, 3,930 inputs accepted, 7,318 thinks, 1,124 events that found
 no target, zero bad conversions, the 18-name unhandled-input table, a peak of
-214 entities in the simulation list at once, 105 maps with a master tone
+215 entities in the simulation list at once, 105 maps with a master tone
 mapper — and that `sp_a1_intro1` ends up asking for an exposure ceiling of
 **1.5**.
 
@@ -2120,6 +2265,23 @@ mapper — and that `sp_a1_intro1` ends up asking for an exposure ceiling of
 > most *targets* were props; and the peak think count went from 48 to 214,
 > which is the first time that number has said anything about the shape of the
 > list rather than about the `logic_auto` bootstrap.
+
+> **`thinks` then went from 4,420 to 7,318 with `prop_testchamber_door`, and
+> all 2,898 of those are doors.** `AnimateThink` re-arms unconditionally, which
+> is Valve's, so all 138 wake ten times a second for the whole level and never
+> leave the simulation list. That is a deliberate non-divergence and gotcha 69
+> says why.
+
+`prop_testchamber_door` added a depot test of its own, and its numbers are the
+argument for the class: **138 doors across 71 of the 106 maps, 130 of them
+opened by something in their own map.** Of the other eight, five carry no
+`targetname` at all and three are named and never fired at — Valve's dead map
+data, shut in the shipped game too. Seven are opened by their own map's
+bootstrap within a second of the level starting, so "a chamber door waits for
+the player" is nearly but not quite a rule. Every one of the 131 driven doors
+reports the same two times, because the whole schedule is quantised:
+**0.797 s for the first `OnFullyOpen` against a 0.9167-second travel, and
+0.094 s — one think — for every "fully" output after it** (gotcha 67).
 
 Stage 3 added its own three numbers to that list, and they are the ones that
 say the stage works: **3,410 brush entities have a class, 67 of them are
@@ -2203,3 +2365,30 @@ type `kill`, which takes the same path from `Event_Killed` onwards.
 only map in the game whose proxy is connected to anything: jumping fires three
 relays and ducking fires two. That is the stage-5 behaviour to watch on the
 default map.
+
+**`every_shipped_branch_listener_registers_and_shuts_the_doors_it_is_for` is
+`logic_branch_listener`'s, and it exists because the 106-map census cannot see
+the class at all.** In the first two seconds of a level **not one
+`logic_branch` in the game changes value** — a chamber door shuts after the
+player has walked through it, which is minutes in — so `every_shipped_map`'s
+event, input and think totals are *identical* with the class registered and
+with it disabled. The measurement had to drive the maps instead: per map it
+opens every chamber door, sets every `logic_branch` true, and reads back what
+each listener reported.
+
+**158 listeners across 46 maps; 350 `Branch*` keys written and 350 resolved;
+157 of the 157 that survive their map's bootstrap report a verdict.** That last
+number is the check with teeth — a listener still on `NOT_INIT` either failed
+to register in `Activate` or was never told a branch had moved, and either one
+leaves a chamber door open for ever. Of the 157, only **56 end up all-true**,
+and that is the map logic working rather than a fault: a door's
+`OnAllTrue → logic_relay` chain ends by setting the very branch that asked for
+it back to `0`, so the listener is talked straight back down to mixed inside
+the same tick. **99 of the game's 138 chamber doors are on one of these 46
+maps; all 99 take an `Open`, and 79 are shut again by a listener going
+all-true.**
+
+> That "same tick" is worth keeping in hand, because it makes the obvious
+> assertion wrong: after driving `sp_a1_intro1`'s close chain the branch reads
+> `false` and the listener reads `mixed`, which is indistinguishable from a
+> chain that never arrived. Check the **door**.

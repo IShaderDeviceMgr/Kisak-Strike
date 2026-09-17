@@ -267,6 +267,7 @@ mod tests {
         Sequence {
             label: label.to_owned(),
             flags: 0,
+            fade_out_time: 0.2,
             anim,
         }
     }

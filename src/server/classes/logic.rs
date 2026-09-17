@@ -11,7 +11,7 @@
 //! classes and why porting them exercises nearly the whole subsystem.
 
 use crate::server::class::{Behaviour, Context, InputDef, InputDefs, SpawnResult, NEVER_THINK};
-use crate::server::entity::EntityCore;
+use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::{atof, atoi};
 
@@ -269,24 +269,50 @@ impl Behaviour for Auto {
 /// `SetValueTest` does both. 1,175 of the game's 1,601 connections into a
 /// branch are `SetValue`, so most of the time it is pure memory.
 ///
-/// The `logic_branch_listener` half — 158 placed — is not implemented: a
-/// branch keeps a list of listeners and posts `_OnLogicBranchChanged` at them
-/// when its value moves, and that is the first thing in this port that needs a
-/// handler to reach *another* entity during dispatch. See
-/// [`Context`](crate::server::class::Context) for why that is the condition
-/// that changes the borrow shape.
+/// The other half is [`BranchList`], the `logic_branch_listener` below: a
+/// branch keeps a list of the listeners monitoring it and posts
+/// [`INPUT_BRANCH_CHANGED`] at each of them **when, and only when, its value
+/// actually moves**. That is what makes `SetValue` — 1,175 of the game's 1,601
+/// connections into a branch, and the input that fires no output of its own —
+/// still reach a listener.
 pub struct Branch {
     /// `m_bInValue` — `InitialValue`. 182 of the 601 set it.
     pub value: bool,
+    /// `m_Listeners` — the [`BranchList`]s that registered with this branch in
+    /// their own `Activate`.
+    ///
+    /// Held as plain ids rather than as anything resolved: a listener can be
+    /// killed (three shipped connections do), and a handle that has stopped
+    /// resolving is simply skipped, which is Valve's `if ( pEntity )`.
+    listeners: Vec<EntityId>,
 }
 
 impl Branch {
     pub(super) fn create() -> Box<dyn Behaviour> {
-        Box::new(Branch { value: false })
+        Box::new(Branch {
+            value: false,
+            listeners: Vec::new(),
+        })
     }
 
-    /// `CLogicBranch::UpdateValue` (`logicentities.cpp:2687`), minus the
-    /// listener notification.
+    /// `CLogicBranch::AddLogicBranchListener` (`logicentities.cpp:2731`) —
+    /// the one line of this class another class reaches in to write.
+    ///
+    /// Valve dedups with `m_Listeners.Find( pEntity ) == -1`, and so does
+    /// this: a listener naming the same branch in two `Branch*` slots would
+    /// otherwise be told twice about one change.
+    pub(super) fn add_listener(&mut self, listener: EntityId) {
+        if !self.listeners.contains(&listener) {
+            self.listeners.push(listener);
+        }
+    }
+
+    /// `CLogicBranch::UpdateValue` (`logicentities.cpp:2690`).
+    ///
+    /// **The listener notification is guarded by the change and the output is
+    /// not**, which is the whole asymmetry of the class: `Test` re-fires
+    /// `OnTrue`/`OnFalse` every time it is asked (308 shipped connections do),
+    /// while a listener hears nothing unless the value really moved.
     fn update(
         &mut self,
         entity: &mut EntityCore,
@@ -295,7 +321,26 @@ impl Branch {
         input: &Input<'_>,
         cx: &mut Context<'_>,
     ) {
-        self.value = new;
+        if self.value != new {
+            self.value = new;
+
+            // `g_EventQueue.AddEvent( pEntity, "_OnLogicBranchChanged", 0,
+            // this, this )` — the branch is both activator and caller, so the
+            // listener's own outputs fire with the branch that moved as their
+            // activator. Zero delay, so the whole chain lands inside this tick
+            // (`rustdocs/SERVER.md` gotcha 4).
+            let me = entity.id();
+            for &listener in &self.listeners {
+                cx.post_entity(
+                    listener,
+                    INPUT_BRANCH_CHANGED,
+                    Variant::Void,
+                    0.0,
+                    Some(me),
+                    Some(me),
+                );
+            }
+        }
         if !fire {
             return;
         }
@@ -347,7 +392,268 @@ impl Behaviour for Branch {
     }
 
     fn describe(&self) -> Vec<(&'static str, String)> {
-        vec![("value", self.value.to_string())]
+        vec![
+            ("value", self.value.to_string()),
+            ("listeners", self.listeners.len().to_string()),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// logic_branch_listener
+// ---------------------------------------------------------------------------
+
+/// `MAX_LOGIC_BRANCH_NAMES` (`logicentities.cpp:3024`).
+///
+/// Sixteen slots; **no shipped map uses more than ten**, and 137 of the 158
+/// listeners use exactly two.
+const MAX_LOGIC_BRANCH_NAMES: usize = 16;
+
+/// `"_OnLogicBranchChanged"` — the private input a [`Branch`] posts at each of
+/// its listeners when its value moves.
+///
+/// It is not a mapper-facing input: the leading underscore is Valve's marker
+/// for one entity talking to another through the event queue rather than
+/// through a connection a `.vmf` could name. Nothing in any shipped map fires
+/// it.
+pub(super) const INPUT_BRANCH_CHANGED: &str = "_OnLogicBranchChanged";
+
+/// `"_OnLogicBranchRemoved"` — declared, handled, and **unreachable**.
+///
+/// `CLogicBranch::UpdateOnRemove` (`logicentities.cpp:2622`) walks its
+/// listener list and then posts the event at `this` — the branch — instead of
+/// at the listener it just looked up:
+///
+/// ```text
+/// CBaseEntity *pEntity = m_Listeners.Element( i ).Get();
+/// if ( pEntity )
+///     g_EventQueue.AddEvent( this, "_OnLogicBranchRemoved", 0, this, this );
+/// ```
+///
+/// So in the shipped game a dying branch tells *itself*, a listener never
+/// drops the dead branch, and the stale handle is counted as **false** for the
+/// rest of the level by `DoTest`'s `if ( pBranch && … )`. That is also what
+/// this port does, for free and by a different route: there is no
+/// `UpdateOnRemove` hook on [`Behaviour`], nothing posts this input, and a
+/// branch whose id no longer resolves reads as false in
+/// [`BranchList::do_test`]. **No shipped map fires `Kill` at a
+/// `logic_branch`**, so the two are indistinguishable anyway.
+pub(super) const INPUT_BRANCH_REMOVED: &str = "_OnLogicBranchRemoved";
+
+/// `LogicBranchListenerLastState_t` (`logicentities.cpp:3036`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BranchState {
+    /// `LOGIC_BRANCH_LISTENER_NOT_INIT` — nothing has been reported yet, so
+    /// the next test fires whatever it finds.
+    NotInit,
+    AllTrue,
+    AllFalse,
+    Mixed,
+}
+
+impl BranchState {
+    fn name(self) -> &'static str {
+        match self {
+            BranchState::NotInit => "not-init",
+            BranchState::AllTrue => "all-true",
+            BranchState::AllFalse => "all-false",
+            BranchState::Mixed => "mixed",
+        }
+    }
+}
+
+/// `CLogicBranchList` (`logicentities.cpp:3026`) — `logic_branch_listener`,
+/// an AND gate over a handful of [`Branch`]es. **158 placed across 46 of the
+/// 106 maps.**
+///
+/// It is what a Portal 2 test chamber closes its door with. `Branch01` is "the
+/// map wants this door shut" and `Branch02` is "the player is not standing in
+/// the doorway"; when both become true the listener's `OnAllTrue` fires the
+/// relay that sends the door `Close`. That is 130 of the game's 138
+/// `prop_testchamber_door`s, and it is why `OnAllTrue` carries **272 of the
+/// class's 307 output connections** against `OnAllFalse`'s 19 and `OnMixed`'s
+/// 16.
+///
+/// Three things about it read as bugs until you check the reference.
+///
+/// **It fires nothing at level start.** `Spawn` is empty, `Activate` only
+/// registers, and `m_eLastState` is `NOT_INIT` — so a map whose branches are
+/// already all true when it loads gets no `OnAllTrue` until one of them
+/// *changes*. Every door in the game depends on that: both of its branches
+/// would otherwise report shut-and-clear at spawn and close a door that is
+/// already closed.
+///
+/// **An empty list is `OnMixed`, not `OnAllTrue`.** With no branches neither
+/// `bOneTrue` nor `bOneFalse` is set, so `DoTest`'s first two arms are both
+/// skipped and the `else` fires. Unreachable in shipped content — all 350
+/// `Branch*` keys in the game resolve — and kept because it is free and
+/// because the alternative reading is the one a reimplementation reaches for.
+///
+/// **`Test` forces an output and the private input does not.** `InputTest`
+/// resets `m_eLastState` to `NOT_INIT` first, so it always reports; a branch
+/// change reports only when the *verdict* changes, which is what stops a
+/// two-branch listener firing `OnMixed` twice on its way from all-false to
+/// all-true. No shipped map fires `Test` at a listener.
+pub struct BranchList {
+    /// `m_nLogicBranchNames[0..16]` — `Branch01`…`Branch16`.
+    names: [Option<String>; MAX_LOGIC_BRANCH_NAMES],
+    /// `m_LogicBranchList` — resolved once, in `Activate`.
+    branches: Vec<EntityId>,
+    /// `m_eLastState`.
+    last: BranchState,
+}
+
+impl BranchList {
+    pub(super) fn create() -> Box<dyn Behaviour> {
+        Box::new(BranchList {
+            names: [const { None }; MAX_LOGIC_BRANCH_NAMES],
+            branches: Vec::new(),
+            last: BranchState::NotInit,
+        })
+    }
+
+    /// `CLogicBranchList::DoTest` (`logicentities.cpp:3182`).
+    ///
+    /// A branch whose id has stopped resolving counts as **false**, which is
+    /// Valve's `if ( pBranch && pBranch->GetLogicBranchState() )` — the null
+    /// check and the value share one arm. See [`INPUT_BRANCH_REMOVED`] for why
+    /// that is the only cleanup a dead branch ever gets.
+    fn do_test(
+        &mut self,
+        entity: &mut EntityCore,
+        activator: Option<EntityId>,
+        cx: &mut Context<'_>,
+    ) {
+        let mut one_true = false;
+        let mut one_false = false;
+        for &id in &self.branches {
+            let value = cx
+                .entity(id)
+                .and_then(|other| other.behaviour.downcast_ref::<Branch>())
+                .is_some_and(|branch| branch.value);
+            match value {
+                true => one_true = true,
+                false => one_false = true,
+            }
+        }
+
+        let state = match (one_true, one_false) {
+            (true, false) => BranchState::AllTrue,
+            (false, true) => BranchState::AllFalse,
+            _ => BranchState::Mixed,
+        };
+        if state == self.last {
+            return;
+        }
+        self.last = state;
+
+        let output = match state {
+            BranchState::AllTrue => "OnAllTrue",
+            BranchState::AllFalse => "OnAllFalse",
+            _ => "OnMixed",
+        };
+        let me = Some(entity.id());
+        entity.fire_output(output, Variant::Void, activator, me, 0.0, cx);
+    }
+}
+
+impl Behaviour for BranchList {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        for (i, slot) in self.names.iter_mut().enumerate() {
+            if key.eq_ignore_ascii_case(&format!("Branch{:02}", i + 1)) {
+                *slot = Some(value.to_owned());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `CLogicBranchList::Activate` (`logicentities.cpp:3117`) — find every
+    /// branch named and register with it in both directions.
+    ///
+    /// The registration is the one place this class reaches into another's own
+    /// fields, and it is exactly what
+    /// [`Context::behaviour_mut`](crate::server::class::Context::behaviour_mut)
+    /// is for. It cannot be an input, because the branch has to hold the
+    /// listener's id *before* anything fires — and it is safe here for the
+    /// same reason `Activate` is where a class may look at another entity at
+    /// all: every entity in the map has spawned.
+    ///
+    /// Valve's `DevWarning` for a name that is not a `logic_branch` is kept as
+    /// the same test and no message; nothing in the game trips it.
+    fn activate(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        let me = entity.id();
+        let names: Vec<String> = self.names.iter().flatten().cloned().collect();
+        for name in &names {
+            for id in cx.find_all_by_name(name) {
+                let is_branch = cx
+                    .entity(id)
+                    .is_some_and(|other| other.classname() == "logic_branch");
+                if !is_branch {
+                    continue;
+                }
+                if let Some(branch) = cx.behaviour_mut::<Branch>(id) {
+                    branch.add_listener(me);
+                }
+                self.branches.push(id);
+            }
+        }
+    }
+
+    fn accept_input(
+        &mut self,
+        entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        let is = |name: &str| input.name.eq_ignore_ascii_case(name);
+
+        if is("Test") {
+            // `InputTest` (`:3171`): "Force an output."
+            self.last = BranchState::NotInit;
+            self.do_test(entity, input.activator, cx);
+        } else if is(INPUT_BRANCH_CHANGED) {
+            self.do_test(entity, input.activator, cx);
+        } else if is(INPUT_BRANCH_REMOVED) {
+            // `Input_OnLogicBranchRemoved` (`:3145`). Unreachable — see
+            // [`INPUT_BRANCH_REMOVED`] — and written out anyway because the
+            // datadesc declares it and the `FastRemove` is the behaviour a
+            // reader would otherwise have to go and look up.
+            if let Some(dead) = input.activator {
+                self.branches.retain(|&id| id != dead);
+            }
+            self.do_test(entity, input.activator, cx);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("branches", self.branches.len().to_string()),
+            ("state", self.last.name().to_owned()),
+        ]
+    }
+}
+
+impl BranchList {
+    /// The branches `Activate` resolved, in `Branch01`…`Branch16` order.
+    ///
+    /// Read by the tests and by nothing else — the same convention as
+    /// [`TestChamberDoor::is_open`](super::TestChamberDoor::is_open) — because
+    /// what the class does with them reaches `ent_dump` through
+    /// [`describe`](Behaviour::describe) and reaches the rest of the map
+    /// through its three outputs.
+    #[allow(dead_code)]
+    pub fn branches(&self) -> &[EntityId] {
+        &self.branches
+    }
+
+    /// The last verdict reported, as `DrawDebugTextOverlays` would print it.
+    #[allow(dead_code)]
+    pub fn state(&self) -> &'static str {
+        self.last.name()
     }
 }
 

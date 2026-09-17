@@ -96,6 +96,22 @@ pub struct ModelEntity {
     pub playback_rate: f32,
 }
 
+/// One row of [`EntityModels::sequences`] — what a `.mdl` says about one
+/// sequence, in the vocabulary `server/`'s table wants.
+///
+/// A struct rather than a tuple because it grew a fourth number
+/// (`fade_out_time`) and the two `f32`s beside a `bool` were becoming easy to
+/// transpose. `world/` still names no server type: the translation into a
+/// `SequenceInfo` is `engine/`'s, as it has always been.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SequenceRow<'a> {
+    pub model: &'a str,
+    pub label: &'a str,
+    pub duration: f32,
+    pub loops: bool,
+    pub fade_out_time: f32,
+}
+
 /// One placed instance, resolved against a loaded model.
 struct Instance {
     /// [`ModelEntity::id`], which is what a sync matches on.
@@ -364,16 +380,18 @@ impl EntityModels {
     /// `.mdl`s say, once, so that `AnimThink` can tell when an animation has
     /// finished without this module and that one naming each other's types.
     /// See `crate::server::sequences`.
-    pub fn sequences(&self) -> impl Iterator<Item = (&str, &str, f32, bool)> + '_ {
+    pub fn sequences(&self) -> impl Iterator<Item = SequenceRow<'_>> + '_ {
         self.models.iter().flat_map(|model| {
-            model.sequences.iter().map(move |sequence| {
-                let duration = model
+            model.sequences.iter().map(move |sequence| SequenceRow {
+                model: model.name.as_str(),
+                label: sequence.label.as_str(),
+                duration: model
                     .animations
                     .get(sequence.anim)
                     .map(|anim| anim.duration())
-                    .unwrap_or(0.0);
-                let loops = sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0;
-                (model.name.as_str(), sequence.label.as_str(), duration, loops)
+                    .unwrap_or(0.0),
+                loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                fade_out_time: sequence.fade_out_time,
             })
         })
     }
@@ -755,6 +773,333 @@ mod tests {
             same * 100 < (SIZE * SIZE) as usize,
             "a released button and a just-pressed one should look alike: \
              {same} pixels differ"
+        );
+    }
+
+    /// **The chamber door, drawn — and drawn open, half open and shut.**
+    ///
+    /// The door is the second model an entity animates in this port and the
+    /// first whose animation is a *pair* of moving parts, so it exercises
+    /// something the button could not: five bone runs under five different
+    /// matrices, of which three move and two do not. Every step of that is
+    /// invisible on its own — the leaves could be drawn under each other's
+    /// matrices, or under the root's, or the pose could be composed on the
+    /// wrong side of the placement — and all of those draw *something*.
+    ///
+    /// It renders `sp_a1_intro1`'s door from in front, at three points of
+    /// `open`, and asks for the one thing only a correct pose gives: the
+    /// middle of the doorway is **covered when the door is shut and clear
+    /// when it is open**.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_chamber_door_draws -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
+    fn the_chamber_door_draws_and_opens() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let mut materials = MaterialCache::new(&device, &queue);
+        let map = "sp_a1_intro1";
+        let mut world =
+            super::super::World::load(&vfs, &mut materials, &device, map).expect("the map loads");
+
+        let mut server = Server::new();
+        server.level_init(map, &world.entities, &world.models);
+        // **Only the doors.** `sp_a1_intro1` places 90 `prop_dynamic`s as
+        // well, and drawing them would put geometry between the camera and
+        // the thing under test.
+        const DOOR: &str = "models/props/portal_door_combined";
+        let placements: Vec<ModelEntity> = server
+            .model_entities()
+            .into_iter()
+            .filter(|e| e.model.to_ascii_lowercase().starts_with(DOOR))
+            .map(|e| ModelEntity {
+                id: e.id,
+                model: e.model,
+                origin: e.origin,
+                angles: e.angles,
+                skin: e.skin,
+                visible: e.visible,
+                sequence: e.sequence,
+                cycle: e.cycle,
+                anim_time: e.anim_time,
+                playback_rate: e.playback_rate,
+            })
+            .collect();
+        println!("{} chamber doors:", placements.len());
+        for p in &placements {
+            println!("  {} at {:?} angles {:?}", p.model, p.origin, p.angles);
+        }
+        assert_eq!(placements.len(), 2, "sp_a1_intro1 places two");
+
+        // One of them, drawn on its own so that nothing else can be what
+        // changed.
+        let door = placements[0].clone();
+        world.load_entity_models(&vfs, &mut materials, &device, std::slice::from_ref(&door));
+        assert_eq!(world.entity_models.stats.models_missing, 0);
+        assert_eq!(world.entity_models.stats.models_not_rigid, 0, "it must pose");
+        assert_eq!(world.entity_models.instances.len(), 1);
+        println!("{}", world.entity_models.summary());
+
+        // Where to stand. The `.mdl`'s own frame is not the obvious one — the
+        // leaves are 65 units apart along its local **x** — so the camera is
+        // aimed from the geometry rather than from a guess: take the shut
+        // pose's world-space vertex bounds and look at the middle of them
+        // from along whichever horizontal axis the door is *thinnest* in,
+        // which is the way a doorway is looked through.
+        let studio = StudioModel::load(&vfs, &door.model).expect("the door model");
+        let bones = studio.rigid_bones().expect("rigid").to_vec();
+        // Taken by value so that the borrow ends here: `sync` below needs the
+        // list mutably, and the pose of a held door does not change.
+        let (transform, shut, opened) = {
+            let instance = &world.entity_models.instances[0];
+            let model = &world.entity_models.models[instance.model];
+            (
+                instance.transform,
+                model.pose(instance.sequence, 0.0),
+                model.pose(instance.sequence, 1.0),
+            )
+        };
+        let world_vertex = |i: usize, pose: &[Mat4]| {
+            let bone = pose
+                .get(usize::from(bones[i]))
+                .copied()
+                .unwrap_or(Mat4::IDENTITY);
+            (transform * bone).transform_point3(Vec3::from(studio.vertices[i].position))
+        };
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for i in 0..studio.vertices.len() {
+            let p = world_vertex(i, &shut);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        let middle = (lo + hi) * 0.5;
+        let size = hi - lo;
+        println!("shut bounds {lo:?}..{hi:?} (size {size:?})");
+        let back = match size.x < size.y {
+            true => Vec3::X,
+            false => Vec3::Y,
+        };
+        let eye = middle + back * 220.0;
+        let camera = Camera::perspective(
+            eye,
+            glam::Mat4::look_at_rh(eye, middle, Vec3::Z),
+            75.0,
+            1.0,
+            1.0,
+            4096.0,
+        );
+
+        let mut context = RenderContext::new(&device, &queue, materials.pipelines());
+        let render_target = RenderTarget::new(
+            &device,
+            "chamber door",
+            SIZE,
+            SIZE,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            true,
+        );
+
+        let mut shot = |models: &EntityModels, curtime: f32| -> Vec<u8> {
+            context.begin_frame();
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: (SIZE * SIZE * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = context.offscreen_pass(
+                    &mut encoder,
+                    materials.pipelines(),
+                    &render_target,
+                    &camera,
+                    Load::Clear(wgpu::Color::BLACK),
+                );
+                models.draw(&mut pass, curtime);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: render_target.color_texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(SIZE * 4),
+                        rows_per_image: Some(SIZE),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |r| {
+                r.expect("readback mapped");
+            });
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the queue drained");
+            let pixels = readback.slice(..).get_mapped_range().unwrap().to_vec();
+            readback.unmap();
+            pixels
+        };
+
+        // A door held at each of three points of `open`. The rate is zero, so
+        // `curtime` does not move the pose and the cycle is whatever is asked
+        // for — which is exactly how a door that has arrived is held.
+        let at = |cycle: f32| ModelEntity {
+            sequence: "open".to_owned(),
+            cycle,
+            anim_time: 0.0,
+            playback_rate: 0.0,
+            ..door.clone()
+        };
+        let drawn = |image: &[u8]| image.chunks_exact(4).filter(|p| p[0..3] != [0, 0, 0]).count();
+
+        // **The middle of the doorway.** A shut door covers it and an open one
+        // does not — which no wrong pose gives, because the geometry that has
+        // to move out of the way is on the two leaf bones and nothing else.
+        let centre = |image: &[u8]| {
+            let mut covered = 0;
+            for y in (SIZE / 2 - 16)..(SIZE / 2 + 16) {
+                for x in (SIZE / 2 - 16)..(SIZE / 2 + 16) {
+                    let at = ((y * SIZE + x) * 4) as usize;
+                    if image[at..at + 3] != [0, 0, 0] {
+                        covered += 1;
+                    }
+                }
+            }
+            covered
+        };
+        let differences = |a: &[u8], b: &[u8]| {
+            a.chunks_exact(4)
+                .zip(b.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+
+        // The whole travel, sampled. **A chamber door does not open at a
+        // constant rate**: the leaves hold, rotate and then retract, so most
+        // of the doorway clears in the last third — which is why this is
+        // measured here rather than assumed to be linear.
+        let mut frames = Vec::new();
+        for step in 0..=8 {
+            let cycle = step as f32 / 8.0;
+            world.entity_models.sync(&[at(cycle)]);
+            let image = shot(&world.entity_models, 0.0);
+            println!(
+                "  cycle {cycle:.3}: {} pixels drawn, centre 32x32 {}/1024 covered",
+                drawn(&image),
+                centre(&image)
+            );
+            frames.push(image);
+        }
+        let (closed, open) = (frames.first().unwrap(), frames.last().unwrap());
+
+        assert!(
+            drawn(closed) > 5_000,
+            "the door drew {} pixels; it is not on screen",
+            drawn(closed)
+        );
+        assert_eq!(centre(closed), 32 * 32, "a shut door covers the doorway");
+        assert_eq!(centre(open), 0, "an open door does not");
+        // It only ever gets clearer, never darker: an animation drawn from a
+        // wrong bone would not be monotonic.
+        for pair in frames.windows(2) {
+            assert!(
+                centre(&pair[1]) <= centre(&pair[0]),
+                "the doorway un-cleared part way through: {} then {}",
+                centre(&pair[0]),
+                centre(&pair[1])
+            );
+        }
+        // **The first 62% of `open` draws nothing different, and that is the
+        // model rather than the port.** The geometry below says why: what
+        // moves over the first half is the two spinner rings, which turn
+        // about their own axis *inside* the door's thickness. So the pixel
+        // test can only speak for the second half, and the rest of this test
+        // is geometric.
+        let moved_late = differences(&frames[5], &frames[6]);
+        assert!(
+            moved_late > 1_000,
+            "the leaves did not draw differently as they parted: {moved_late} pixels differ"
+        );
+
+        // **What `open` actually animates, in two acts.** Vertices that have
+        // left where they started, per bone, and the furthest any one of them
+        // went — which is the check with teeth here, because a pose composed
+        // on the wrong side of the placement or read off the wrong bone would
+        // move the *frame* as readily as the leaves.
+        let survey = |pose: &[Mat4]| {
+            let mut moved = vec![0usize; studio.bones.len()];
+            let mut furthest = vec![0.0f32; studio.bones.len()];
+            let mut spinner = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for i in 0..studio.vertices.len() {
+                let bone = usize::from(bones[i]);
+                let (was, now) = (world_vertex(i, &shut), world_vertex(i, pose));
+                let distance = was.distance(now);
+                if distance > 0.5 {
+                    moved[bone] += 1;
+                }
+                furthest[bone] = furthest[bone].max(distance);
+                if bone == 6 || bone == 7 {
+                    spinner = (spinner.0.min(now), spinner.1.max(now));
+                }
+            }
+            (moved, furthest, spinner)
+        };
+
+        // Act one: the rings turn, and **nothing else moves at all**. They
+        // turn about their own axis, so their world bounding box is the same
+        // box it was when the door was shut — which is what makes the first
+        // half of the animation invisible from outside.
+        let half_way = {
+            let instance = &world.entity_models.instances[0];
+            world.entity_models.models[instance.model].pose(instance.sequence, 0.5)
+        };
+        let (moved, furthest, spinner_half) = survey(&half_way);
+        println!("at cycle 0.5: moved/bone {moved:?}, furthest {furthest:?}");
+        assert_eq!(moved[2], 0, "the door frame must not move");
+        assert_eq!((moved[4], moved[5]), (0, 0), "the leaves wait their turn");
+        assert!(moved[6] > 50 && moved[7] > 50, "the rings must turn");
+        assert!(
+            furthest[6] > 20.0 && furthest[7] > 20.0,
+            "the rings barely turned: {furthest:?}"
+        );
+        let (_, _, spinner_shut) = survey(&shut);
+        assert!(
+            spinner_half.0.abs_diff_eq(spinner_shut.0, 0.05)
+                && spinner_half.1.abs_diff_eq(spinner_shut.1, 0.05),
+            "a ring turning about its own axis keeps its box: \
+             {spinner_shut:?} became {spinner_half:?}"
+        );
+
+        // Act two: the leaves part, 53 units each and symmetrically, and the
+        // rings go with them because they hang off the leaves.
+        let (moved, furthest, _) = survey(&opened);
+        println!("at cycle 1.0: moved/bone {moved:?}, furthest {furthest:?}");
+        assert_eq!(moved[2], 0, "the door frame must not move");
+        assert_eq!((moved[4], moved[5]), (573, 578), "both leaves must move");
+        assert!(
+            (furthest[4] - 52.998).abs() < 0.01 && (furthest[5] - 52.998).abs() < 0.01,
+            "the leaves should each travel 53 units: {furthest:?}"
         );
     }
 

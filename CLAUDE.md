@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 922 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 938 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -91,8 +91,20 @@ the game's 106 maps — the second commonest classname in Portal 2 — so the
 signs, pipes, panel arms and machinery a chamber is built out of now draw,
 and they *animate*, on the sequence the map names and for as long as the map
 says.
+**And the chamber doors open, and shut behind you.**
+`prop_testchamber_door` is 138 entities
+across 71 maps, two of them on `sp_a1_intro1`: the big round door draws,
+its two rings spin and then its two halves part, and 130 of the 138 are
+driven by a chain — `trigger_once` → `func_instance_io_proxy` →
+`logic_relay` → the door — that is now ported end to end, so walking into
+a chamber opens its door. The way *back* out runs through
+`logic_branch_listener` (158 across 46 maps), an AND gate over a pair of
+`logic_branch`es that says "the map wants this shut" and "the player is
+not in the doorway" — so the door waits for you to be clear of it and
+then closes.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
-a door moves *through* the player rather than shoving it — but the boot path is
+a door moves *through* the player rather than shoving it (a chamber door is
+walked through for the same reason) — but the boot path is
 continuous from `main` to a rendered, lit, self-starting level you can walk
 around, interact with and die in.
 
@@ -926,7 +938,9 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `FireOutput` appends to the queue rather than calling the target, so nothing in the
   subsystem is re-entrant and a behaviour's `Context` does not hold the entity list at
   all — the condition that changes that is `logic_branch_listener`, the first class in
-  the game that must read *another* entity during dispatch. And **`CUniformRandomStream`
+  the game that must read *another* entity during dispatch. **It landed, and it did not
+  change the shape**: stage 4's `Server::dispatch` lifting the dispatched entity out of
+  the list was already enough. And **`CUniformRandomStream`
   was ported rather than replaced by a crate**, one of the few places `PORTING.md`'s
   "prefer the crate" rule points the other way: `ran1`'s rejection sampling and its lossy
   seed convention (0, 1 and -1 are one stream) are behaviour a dependency would silently
@@ -1424,6 +1438,151 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   And `CBaseEntity` gained the `solid` key — measured: **only the prop family
   writes it** — and the `DisableDraw`/`EnableDraw` inputs, whose 206 shipped
   connections are **all** aimed at a `prop_dynamic`.
+
+  **`prop_testchamber_door` landed after it, and it is the door itself** —
+  the big round one at both ends of every test chamber. `CPropTestChamberDoor`
+  (`game/server/portal2/prop_testchamber_door.cpp`) is **138 entities across
+  71 of the 106 maps, two of them on `sp_a1_intro1`**, carrying 247 output
+  connections and 296 input ones. That took the port to **44 registered
+  classnames and 34,644 of the game's 60,925 entity blocks** — 39 of them
+  among the 200 the maps place.
+
+  **Despite the classname it is not a prop**: it derives straight from
+  `CBaseAnimating`, so it has no `DefaultAnim`, no `SetAnimation`, no
+  propdata, no `StartDisabled` and none of `CDynamicProp`'s fifteen inputs. It
+  is five inputs, four outputs and a playback rate, and it lives in
+  `classes/prop.rs` only because what it needs — a model name, a sequence
+  label and the five `ModelState` fields — is what that file already has.
+
+  **The whole class is one sequence played in two directions.** `Spawn` resets
+  it to cycle 0 of `open` at rate **zero**, which is the shut pose held still;
+  `Open` sets the rate to `+1` and `Close` to `-1`. `close`,
+  `idleopen` and `idleclose` are looked up into three fields that **nothing in
+  the tree ever reads** — and the model says that is deliberate rather than an
+  oversight, because `open` is 23 frames and `close` is **36**, so shutting a
+  door with `close` would take 1.46 seconds where the shipped game takes 0.92.
+
+  **It is the first thing in the port that needed `fadeouttime`.**
+  `IsSequenceFinished()` is what `OnFullyOpen` waits on, and
+  `GetLastVisibleCycle` calls a non-looping sequence finished
+  `fadeouttime * cycleRate * playbackRate` **before** it ends — so the door's
+  0.9167-second `open` is "finished" at cycle 0.782, 0.717 seconds in. Worth
+  carrying rather than assuming, and measured: **10,664 of the shipped game's
+  10,666 sequences write 0.2 and the other two write 0.5**, so the term never
+  folds away. `studio::anim::Sequence`, `server::sequences::SequenceInfo` and
+  the `world/` → `server/` seam each grew the field, and the seam's four-tuple
+  became a `SequenceRow`.
+
+  Five things about it read as bugs until you check the reference, and the
+  first is the big one.
+
+  **`m_bSequenceFinished` is sticky, so only a door's *first* opening reports
+  its own end.** Nothing clears the flag but `ResetSequenceInfo`, and this
+  class calls `ResetSequence` exactly once, in `Spawn`. So the first
+  `OnFullyOpen` waits for the animation — 0.797 seconds on the tick grid — and
+  **every later `OnFullyOpen` and every `OnFullyClosed` fires on the first
+  think after the input**, 0.094 seconds in, while the door is still visibly
+  moving. It is reproduced deliberately: 150 of the game's 247 door output
+  connections are `OnFullyClosed` and were authored against it — 29 disable a
+  `func_clip_vphysics` and 25 enable a fizzler — so a "correct" door would
+  delay every one of them by three quarters of a second. Both numbers are
+  identical for all 138 doors, because the whole schedule is quantised.
+  **`IsOpen()` is where the door is *going*, not where it is** — it is set the
+  instant `Open` is accepted — so a second `Open` during the travel is refused,
+  and `LockOpen` opens *and then* locks, in that order, so the open itself gets
+  through.
+  **`AnimateThink` re-arms unconditionally and this class deliberately does
+  *not* take `CDynamicProp::AnimThink`'s cancel-when-idle divergence.** That
+  divergence is worth it for 8,462 props; there are 138 doors, two per map, and
+  what re-arming buys is the exact 0.1-second grid that decides when those 181
+  "fully" connections fire. The cost is one depot number: **`io.thinks` went
+  from 4,420 to 7,318, and all 2,898 of those are doors.**
+  **`Open`/`Close` must re-base the derived cycle**, the same way
+  `SetPlaybackRate` does for a `prop_dynamic` — skip it and a door told to
+  `Close` computes its position from the moment it spawned.
+  And **the area portal window is parsed and does nothing**: 84 doors name a
+  `func_areaportalwindow` and 94 write the fade triple, but all
+  `AreaPortalOpen`/`Close` do is write two fade distances on a class that
+  belongs to the engine's unported visibility system. The two call sites are
+  marked so wiring them up later is one line each.
+
+  Also absent: the bone followers, which *are* a chamber door's whole collision
+  in the shipped game — so like every other model in this port it is drawn and
+  walked through — and the two sounds.
+
+  **What it looks like** is two rings and two leaves in two acts: the spinner
+  rings turn about their own axes over the first 62% of `open`, *inside* the
+  door's thickness, and only then do the two halves slide 53 units apart. So
+  the first two thirds of the animation draw pixel-identically from outside and
+  the doorway clears all at once. That is the model rather than the port, and
+  it is what makes the door the test that says the per-bone draw split
+  generalises: a floor button is two bone runs with one moving, a door is
+  **five with three moving**.
+
+  **To watch one, load `sp_a1_intro1` and walk into the first chamber.** Both
+  of its doors are driven by `trigger_once` → `func_instance_io_proxy` →
+  `logic_relay` → the door, which is ported end to end, and **130 of the
+  game's 138 doors are opened by a chain in their own map** (five of the other
+  eight carry no `targetname` at all and three are named and never fired at —
+  Valve's dead map data, shut in the shipped game too). **And they shut again**,
+  now that `logic_branch_listener` is ported — see below.
+
+  **`logic_branch_listener` landed after it, and it is what shuts those doors.**
+  `CLogicBranchList` (`logicentities.cpp:3026`) is **158 entities across 46 of the
+  106 maps**, and it is an AND gate over a handful of `logic_branch`es: `Branch01`
+  is "the map wants this door shut" and `Branch02` is "the player is not standing
+  in the doorway", and when both go true `OnAllTrue` fires the relay that sends the
+  door `Close`. That takes the port to **45 registered classnames and 34,802 of the
+  game's 60,925 entity blocks** — 40 of them among the 200 the maps place.
+
+  It is small — one `Activate`, one three-way test and three outputs — and what it
+  cost was one framework addition and one field. `Context::find_all_by_name` is the
+  `while ( pEntity = FindEntityGeneric( pEntity, … ) )` loop that
+  `find_by_name`'s first-match form cannot express, and `logic_branch` grew a
+  **listener list**: this is the first class in the port where one entity
+  *registers* with another rather than sending it an input, which is
+  `Context::behaviour_mut` doing exactly what it was written for. The branch then
+  posts `_OnLogicBranchChanged` back at each listener when its value moves — an
+  ordinary queued input, zero delay, so the whole chain lands inside one tick.
+  `portdocs/SERVER.md` §10.3 named this class as the condition that would change
+  the borrow shape and **it did not**: stage 4's answer was already enough.
+
+  Three things about it read as bugs until you check the reference.
+  **It reports nothing at level start**, because `Spawn` is empty, `Activate` only
+  registers and `m_eLastState` begins `NOT_INIT` — so the first output comes from
+  the first branch *change*, never from the first evaluation. Every door in the
+  game depends on that: both branches of a door's listener read "shut me" at spawn,
+  and a listener that tested itself on the way up would slam every door in the map
+  closed on tick one. **`SetValue` fires no output of its own and still reaches a
+  listener**, because the notification is guarded by the value having changed and
+  the output by the input being a `*Test` form — two independent guards, and
+  conflating them is silent either way: fold the notification under the output and
+  no door in the game ever shuts (1,175 of the 1,601 connections into a branch are
+  `SetValue`), or drop the change guard and `Test`'s 308 connections make every
+  listener re-report. And **an empty branch list is `OnMixed`**, because neither
+  `bOneTrue` nor `bOneFalse` gets set and `DoTest` falls through into the `else`.
+
+  One Valve bug is **not** reproduced, because reproducing it would take more code
+  than not: `CLogicBranch::UpdateOnRemove` walks its listener list and then posts
+  `_OnLogicBranchRemoved` at *itself* rather than at the listener it just looked up,
+  so no listener in the shipped game has ever received one and a dead branch is
+  counted as false for the rest of the level. This port reaches the same state by
+  having no removal hook at all. **No shipped map fires `Kill` at a `logic_branch`**,
+  so the two are indistinguishable.
+
+  **The class is invisible to the 106-map census**, and that is the finding worth
+  carrying: in the first two seconds of a level **not one `logic_branch` in the game
+  changes value** — a chamber door shuts after the player has walked through it,
+  which is minutes in — so every event, input and think total in
+  `every_shipped_map_spawns_its_entities` is *identical* with the class registered
+  and with it disabled. Its own depot test drives the maps instead: per map it opens
+  every chamber door, sets every `logic_branch` true and reads back what each
+  listener reported. **350 `Branch*` keys written and 350 resolved; 157 of the 157
+  listeners that survive their map's bootstrap report a verdict; and 79 of the 99
+  chamber doors on those 46 maps are shut again by one going all-true.** Only 56 end
+  up all-true, and that is the map logic rather than a fault — a door's
+  `OnAllTrue → logic_relay` chain ends by setting the branch that asked for it back
+  to `0`, inside the same tick.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -1448,6 +1607,12 @@ sub-benchmarks are now 0.25 ms of world brushes, 0.10 of brush models, 1.01 of s
 props and **0.72 of entity models**, so the class costs about 60% of what all 1,080
 static props do — for 91 instances, because they carry **355,469 triangles against the
 props' 224,924** and each bone run is its own draw.
+**`prop_testchamber_door` barely moved it**, and the exact numbers are the ones to
+quote rather than the timings: 91 instances became 93, 52 models 54, and 355,469
+triangles **361,072** — one more model and ten more draws, because a door is five bone
+runs and there are two of them. The timed share of the entity-model pass against the
+static-prop pass went from 0.71 to 0.76 in a back-to-back run where every figure was
+about 3x high, which is the thermal inflation the note below is about.
 **The benchmark itself had to be fixed to see that**, and the fix is worth knowing about:
 `World::load` cannot read the models an entity places, because they are named by the
 entity lump it has just parsed — so `bench` now spawns a `Server` and calls
@@ -1464,8 +1629,9 @@ is geometrically complete — world, brush entities, static props and terrain �
 **auto-exposed to the map's own limits**, the map's **entity logic runs**, its
 **doors and panels move**, **it notices the player**, and **it can kill them**:
 triggers fire, filters decide who counts, a shut door is a wall, a floor button
-presses when you stand on it, and a `trigger_hurt` takes your health and
-restarts the level when it runs out.
+presses when you stand on it, **a chamber door opens when you walk up to it and
+shuts behind you**, and a `trigger_hurt` takes your health and restarts the level
+when it runs out.
 **`portdocs/SERVER.md` is finished** — all five stages — so the game layer's
 next steps are individual classes and subsystems rather than a staged plan.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.

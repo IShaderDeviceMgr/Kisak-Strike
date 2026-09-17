@@ -1084,6 +1084,10 @@ and flagged a re-entrant panic as the expensive thing to discover late. `FireOut
 drains — so nothing in stage 2 is re-entrant and `Context` does not borrow the entity
 list at all. The condition that changes this is a handler that must *read* another
 entity during dispatch, and `logic_branch_listener` is the first one in the game.
+**It has since landed and the prediction held on both counts**: it is the first class
+that reads another entity mid-dispatch, and it needed no change to the borrow shape —
+stage 4's `Server::dispatch` lifting the dispatched entity out of the list was already
+the answer.
 
 **An output's connections fire in reverse lump order.** `AddEventAction` prepends.
 Three lines of C++, observable whenever two connections on one output reach the same
@@ -1809,6 +1813,9 @@ question into a number.
    reopens it is a handler that must *read* another entity during dispatch;
    `logic_branch_listener` is the first one in the game, and the shape to reach for
    then is the entity list minus the one entity being dispatched, not a `RefCell`.
+   **Settled.** That class is ported and the shape named here is exactly what it
+   uses: `Context::entity` to read a branch's value and `Context::behaviour_mut` to
+   register with it in `Activate`. No cell, no `unsafe`.
 4. **How much of `CPhysicsPushedEntities` is really needed.** Stage 3 deferred all
    of it, as planned, and the shape it left behind is the right one: `PerformPush`
    is ported with the blocker always null, `EntityCore::local_time` is real and

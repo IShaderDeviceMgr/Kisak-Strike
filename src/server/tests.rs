@@ -360,6 +360,33 @@ fn counter_value(server: &Server, name: &str) -> f32 {
         .value
 }
 
+/// A `logic_branch_listener`, by [`EntityId`] — a free function and not a
+/// closure, because a closure that borrows a `&Server` and returns a reference
+/// into it cannot name the lifetime that relates them.
+fn branch_list_at(server: &Server, id: EntityId) -> &classes::BranchList {
+    server
+        .entities
+        .get(id)
+        .expect("a live entity")
+        .behaviour
+        .downcast_ref::<classes::BranchList>()
+        .expect("a BranchList")
+}
+
+/// A `logic_branch`'s remembered boolean, by [`EntityId`] — the form the door
+/// chain wants, because the branches there are looked up once and then watched
+/// across several ticks.
+fn branch_value(server: &Server, id: EntityId) -> bool {
+    server
+        .entities
+        .get(id)
+        .expect("a live entity")
+        .behaviour
+        .downcast_ref::<classes::Branch>()
+        .expect("a Branch")
+        .value
+}
+
 /// The whole loop end to end: a relay's `OnSpawn` starts a chain that reaches
 /// a counter, through the queue, on a think, in one tick.
 #[test]
@@ -1072,6 +1099,358 @@ fn a_branch_separates_setting_from_testing() {
         (counter_value(&server, "yes"), counter_value(&server, "no")),
         (1.0, 1.0)
     );
+}
+
+/// `logic_branch_listener` is silent at level start, reports only when the
+/// **verdict** changes, and hears a `SetValue` that fires no output of its own.
+///
+/// All three are load-bearing for a test chamber door. The door's listener
+/// watches "the map wants this shut" and "the player is not in the doorway";
+/// both are driven by `SetValue`, and 130 of the game's 138 doors close
+/// through exactly this.
+#[test]
+fn a_branch_listener_fires_only_when_the_verdict_changes() {
+    let counter = |name: &str| {
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", name),
+            ("max", "100"),
+        ])
+    };
+    let map = vec![
+        block(&[
+            ("classname", "logic_branch"),
+            ("targetname", "a"),
+            ("InitialValue", "0"),
+        ]),
+        block(&[
+            ("classname", "logic_branch"),
+            ("targetname", "b"),
+            ("InitialValue", "0"),
+        ]),
+        block(&[
+            ("classname", "logic_branch_listener"),
+            ("targetname", "both"),
+            ("Branch01", "a"),
+            ("Branch02", "b"),
+            ("OnAllTrue", &conn("yes", "Add", "1", "0", "-1")),
+            ("OnAllFalse", &conn("no", "Add", "1", "0", "-1")),
+            ("OnMixed", &conn("mixed", "Add", "1", "0", "-1")),
+        ]),
+        counter("yes"),
+        counter("no"),
+        counter("mixed"),
+    ];
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    let a = find_named(&server, "a").id();
+    let b = find_named(&server, "b").id();
+    let tally = |server: &Server| {
+        (
+            counter_value(server, "yes"),
+            counter_value(server, "no"),
+            counter_value(server, "mixed"),
+        )
+    };
+
+    // **Nothing at level start.** `Spawn` is empty and `Activate` only
+    // registers, so a listener whose branches are already all-false says so to
+    // nobody. A door whose branches both read "close me" at spawn would
+    // otherwise slam shut on the first tick.
+    run(&mut server, 1.0);
+    assert_eq!(tally(&server), (0.0, 0.0, 0.0));
+
+    // `SetValue` fires neither `OnTrue` nor `OnFalse` — and still reaches the
+    // listener, because the notification is guarded by the *change* and not by
+    // the output.
+    server.accept_input(a, "SetValue", Variant::Bool(true), None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(tally(&server), (0.0, 0.0, 1.0), "one of two is mixed");
+
+    server.accept_input(b, "SetValue", Variant::Bool(true), None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(tally(&server), (1.0, 0.0, 1.0), "both true");
+
+    // Setting a branch to the value it already holds changes nothing, so the
+    // listener is not even told — let alone made to re-report.
+    server.accept_input(a, "SetValue", Variant::Bool(true), None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(tally(&server), (1.0, 0.0, 1.0));
+
+    // A real change whose *verdict* is unchanged is told and stays quiet.
+    server.accept_input(a, "SetValue", Variant::Bool(false), None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(tally(&server), (1.0, 0.0, 2.0));
+
+    server.accept_input(b, "SetValue", Variant::Bool(false), None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(tally(&server), (1.0, 1.0, 2.0), "both false");
+}
+
+/// `Test` resets `m_eLastState` first, so it reports whatever it finds even
+/// when nothing has moved — and a listener monitoring nothing reports
+/// `OnMixed`.
+///
+/// Neither is reachable from shipped content: no map fires `Test` at a
+/// listener, and all 350 `Branch*` keys in the game resolve. Both are pinned
+/// because they are the two arms a reimplementation gets backwards.
+#[test]
+fn test_forces_a_branch_listener_to_report_and_an_empty_one_is_mixed() {
+    let counter = |name: &str| {
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", name),
+            ("max", "100"),
+        ])
+    };
+    let map = vec![
+        block(&[
+            ("classname", "logic_branch"),
+            ("targetname", "a"),
+            ("InitialValue", "1"),
+        ]),
+        block(&[
+            ("classname", "logic_branch_listener"),
+            ("targetname", "one"),
+            ("Branch01", "a"),
+            ("OnAllTrue", &conn("yes", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "logic_branch_listener"),
+            ("targetname", "none"),
+            ("OnAllTrue", &conn("yes", "Add", "1", "0", "-1")),
+            ("OnMixed", &conn("mixed", "Add", "1", "0", "-1")),
+        ]),
+        counter("yes"),
+        counter("mixed"),
+    ];
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    let one = find_named(&server, "one").id();
+    let none = find_named(&server, "none").id();
+
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "yes"), 0.0, "silent at level start");
+
+    server.accept_input(one, "Test", Variant::Void, None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(counter_value(&server, "yes"), 1.0);
+
+    // And again: `Test` forces an output every time, where a branch change
+    // would be deduplicated away.
+    server.accept_input(one, "Test", Variant::Void, None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(counter_value(&server, "yes"), 2.0);
+
+    // No branches: neither `bOneTrue` nor `bOneFalse`, so `DoTest` falls
+    // through both arms into the `else`.
+    server.accept_input(none, "Test", Variant::Void, None, None, 0);
+    run(&mut server, 0.05);
+    assert_eq!(
+        (counter_value(&server, "yes"), counter_value(&server, "mixed")),
+        (2.0, 1.0)
+    );
+}
+
+/// **Every `logic_branch_listener` in the game, registered and driven** — and
+/// the number that actually matters: how many test chamber doors shut when
+/// their listener goes all-true.
+///
+/// The class is invisible to the 106-map census, because in the first two
+/// seconds of a level **not one branch in the game changes value** — a chamber
+/// door closes after the player has walked through it, which is minutes in.
+/// So this is the test with teeth: it opens every door in the map, sets every
+/// `logic_branch` true, and watches what comes back.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release branch_listener -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_branch_listener_registers_and_shuts_the_doors_it_is_for() {
+    use crate::filesystem::Vfs;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut listeners, mut maps_with_one) = (0usize, 0usize);
+    // `Branch01`…`Branch16` keys written by the map, against the entities
+    // `Activate` actually found. The two must agree exactly: a key that
+    // resolves to nothing is a branch the listener will never hear from.
+    let (mut keys_written, mut keys_resolved) = (0usize, 0usize);
+    // What each live listener had reported by the end. `reported` is the
+    // check — every one of them must have moved off `NOT_INIT`, which is only
+    // possible if `Activate` registered it and a branch told it something —
+    // and `all_true` is information: the sweep sets every branch true, and a
+    // listener's own `OnAllTrue` chain routinely sets one of them back.
+    let (mut reported, mut all_true) = (0usize, 0usize);
+    // Listeners their own map deletes before they can be driven. Three
+    // shipped connections fire `Kill` at one.
+    let mut killed = 0usize;
+    let (mut doors_here, mut doors_locked) = (0usize, 0usize);
+    let (mut doors_opened, mut doors_shut) = (0usize, 0usize);
+
+    for name in &names {
+        let bsp = crate::engine::world::bsp::Bsp::load(&vfs, name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let blocks = bsp.entities();
+
+        // The map's own count, straight out of the lump.
+        let written = blocks
+            .iter()
+            .filter(|e| {
+                e.pairs.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("classname") && v == "logic_branch_listener"
+                })
+            })
+            .flat_map(|e| e.pairs.iter())
+            .filter(|(k, v)| {
+                let branch = k.len() == 8
+                    && k[..6].eq_ignore_ascii_case("Branch")
+                    && k[6..].bytes().all(|b| b.is_ascii_digit());
+                branch && !v.is_empty()
+            })
+            .count();
+
+        let mut server = Server::new();
+        server.level_init(name, &blocks, &bsp.models);
+
+        let by_class = |server: &Server, class: &str| -> Vec<EntityId> {
+            server
+                .entities
+                .iter()
+                .filter(|(_, e)| e.classname() == class)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let here = by_class(&server, "logic_branch_listener");
+        if here.is_empty() {
+            assert_eq!(written, 0, "{name}: branch keys with no listener");
+            continue;
+        }
+        maps_with_one += 1;
+        let listeners_here = here.len();
+        listeners += listeners_here;
+        keys_written += written;
+
+        // Registration happens in `Activate`, so the key census is taken
+        // before anything runs — three shipped connections fire `Kill` at a
+        // listener, and one of them lands during the bootstrap below.
+        keys_resolved += here
+            .iter()
+            .map(|&id| branch_list_at(&server, id).branches().len())
+            .sum::<usize>();
+
+        // A second of the map's own bootstrap, so that nothing below is
+        // racing `logic_auto`.
+        run(&mut server, 1.0);
+        let here: Vec<EntityId> = here
+            .into_iter()
+            .filter(|&id| server.entities.get(id).is_some())
+            .collect();
+        killed += listeners_here - here.len();
+
+        // Open every door, so that a `Close` reaching one is visible.
+        let doors = by_class(&server, "prop_testchamber_door");
+        doors_here += doors.len();
+        doors_locked += doors
+            .iter()
+            .filter(|&&id| door_at(&server, id).is_locked())
+            .count();
+        for &door in &doors {
+            server.accept_input(door, "Open", Variant::Void, None, None, 0);
+        }
+        run(&mut server, 1.0);
+        let open_now: Vec<EntityId> = doors
+            .iter()
+            .copied()
+            .filter(|&id| door_at(&server, id).is_open())
+            .collect();
+        doors_opened += open_now.len();
+
+        // Now tell the whole map that every condition it is waiting on is
+        // met. Every listener has at least one branch, so every one of them
+        // must come back all-true.
+        for branch in by_class(&server, "logic_branch") {
+            server.accept_input(branch, "SetValue", Variant::Bool(true), None, None, 0);
+        }
+        run(&mut server, 0.5);
+
+        // Filtered again: a listener's own `OnAllTrue` chain can end in a
+        // `Kill` aimed at it, so surviving the bootstrap is not the same as
+        // surviving the sweep.
+        let mut live_now = 0usize;
+        for &id in &here {
+            if server.entities.get(id).is_none() {
+                continue;
+            }
+            live_now += 1;
+            match branch_list_at(&server, id).state() {
+                "not-init" => {}
+                "all-true" => {
+                    reported += 1;
+                    all_true += 1;
+                }
+                _ => reported += 1,
+            }
+        }
+        killed += here.len() - live_now;
+        doors_shut += open_now
+            .iter()
+            .filter(|&&id| !door_at(&server, id).is_open())
+            .count();
+    }
+
+    println!(
+        "logic_branch_listener across {} maps:\n  \
+         {listeners} listeners on {maps_with_one} maps\n  \
+         {keys_written} Branch* keys written, {keys_resolved} resolved\n  \
+         {reported} of {live} reported a verdict, {all_true} of them all-true \
+         ({killed} killed by their own map)\n  \
+         {doors_here} chamber doors on those maps, {doors_locked} locked at spawn; \
+         {doors_opened} opened, {doors_shut} shut again",
+        names.len(),
+        live = listeners - killed
+    );
+
+    assert_eq!(listeners, 158);
+    assert_eq!(maps_with_one, 46);
+    // **Every key resolves, to exactly one entity.** No empty slot, no
+    // wildcard, nothing named that is not a `logic_branch` — which is why
+    // `Context::find_all_by_name` needs no `FindEntityByClassname` fallback.
+    assert_eq!(keys_written, 350);
+    assert_eq!(keys_resolved, 350);
+    // **The check.** A listener that never moved off `NOT_INIT` either failed
+    // to register in `Activate` or was never told a branch had changed, and
+    // either one is the bug that leaves a chamber door open for ever.
+    assert_eq!(reported, 158 - killed, "every live listener heard its branches");
+    assert_eq!(all_true, 56, "the rest were talked back down by their own map");
+    // The payoff, and the reason the class was worth porting before anything
+    // else: this is how a test chamber shuts behind you.
+    // **99 of the game's 138 chamber doors are on one of these 46 maps** —
+    // the other 39 are on maps with no branch listener at all, and shut (if
+    // they shut) through some other chain. All 99 take an `Open`, and **79 of
+    // them are shut again by a listener going all-true**, which is the whole
+    // point of the class.
+    assert_eq!(doors_here, 99);
+    assert_eq!(doors_locked, 0, "none is locked at spawn");
+    assert_eq!(doors_opened, 99);
+    assert_eq!(doors_shut, 79);
 }
 
 /// `logic_case`'s `PickRandom` chooses among the cases whose **output** has
@@ -2025,8 +2404,12 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("scalevalue", 599),
     ("skin", 1),
     ("sunspreadangle", 27),
+    // VScript's two keys, and the pair rises together: 33 chamber doors carry
+    // a `vscripts` and two a `thinkfunction`, which are the puzzle-completion
+    // and door-close-sensor Squirrel files. There is no VScript here.
+    ("thinkfunction", 2),
     ("vrad_brush_cast_shadows", 2456),
-    ("vscripts", 39),
+    ("vscripts", 72),
 ];
 
 /// Every shipped map's entity lump, spawned and then **run** for two seconds
@@ -2282,16 +2665,21 @@ fn every_shipped_map_spawns_its_entities() {
     // `point_teleport` — are 3,322 more again, `prop_floor_button` is 65,
     // stage 5's two — `logic_playerproxy` and `player_loadsaved` — are 9 each,
     // and **`prop_dynamic` is 8,462 on its own**, which is more than stages 3
-    // and 4 together.
-    assert_eq!(total.matched, 34_506);
-    assert_eq!(total.spawned, 27_634);
+    // and 4 together. `prop_testchamber_door` is 138 after it, and
+    // `logic_branch_listener` — the class that shuts those doors — is 158.
+    assert_eq!(total.matched, 34_802);
+    assert_eq!(total.spawned, 27_930);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
     // `OnUser2`-`OnUser4`.
-    assert_eq!(total.outputs, 53_980);
-    assert_eq!(total.unknown.len(), 162);
-    assert_eq!(total.unknown.values().sum::<usize>(), 26_419);
+    // +247 for the doors: `OnFullyClosed` (150), `OnOpen` (66) and
+    // `OnFullyOpen` (31). **No shipped map connects an `OnClose`.**
+    // +307 for the branch listeners, and they are as lopsided: `OnAllTrue`
+    // (272), `OnAllFalse` (19), `OnMixed` (16).
+    assert_eq!(total.outputs, 54_534);
+    assert_eq!(total.unknown.len(), 160);
+    assert_eq!(total.unknown.values().sum::<usize>(), 26_123);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -2320,6 +2708,7 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("worldspawn"), Some(&106));
     assert_eq!(per_class.get("env_tonemap_controller"), Some(&110));
     assert_eq!(per_class.get("logic_branch"), Some(&601));
+    assert_eq!(per_class.get("logic_branch_listener"), Some(&158));
     assert_eq!(per_class.get("logic_case"), Some(&84));
     assert_eq!(per_class.get("logic_timer"), Some(&151));
     assert_eq!(per_class.get("math_counter"), Some(&102));
@@ -2382,10 +2771,16 @@ fn every_shipped_map_spawns_its_entities() {
     // animation wakes at 10 Hz until it has finished one. `no_target` fell by
     // more than half for the same reason: most events used to reach nothing
     // because most *targets* were props.
-    assert_eq!(io.dispatched, 5_785);
-    assert_eq!(io.accepted, 3_923);
-    assert_eq!(io.thinks, 4_420);
-    assert_eq!(io.no_target, 1_129);
+    assert_eq!(io.dispatched, 5_787);
+    assert_eq!(io.accepted, 3_930);
+    // **+2,898, and every one of them is a chamber door.** `AnimateThink`
+    // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
+    // times a second for the whole level — 2 seconds at a `SetNextThink`
+    // quantised to six 64 Hz ticks. See `TestChamberDoor::animate_think` for
+    // why this class deliberately does not take `DynamicProp`'s
+    // cancel-when-idle divergence.
+    assert_eq!(io.thinks, 7_318);
+    assert_eq!(io.no_target, 1_124);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -2480,9 +2875,10 @@ fn every_shipped_map_spawns_its_entities() {
     // bootstrap starts a lot of them at once. It is still a list being entered
     // and left rather than filled once — `AnimThink` cancels itself the moment
     // its sequence cannot end (`rustdocs/SERVER.md` gotcha 64), so a prop that
-    // is looping or holding is **not** in here — and 214 against 27,634 live
-    // entities is still under one per cent.
-    assert_eq!(peak_thinks, 214);
+    // is looping or holding is **not** in here — and 215 against 27,930 live
+    // entities is still under one per cent. The 215th is a chamber door,
+    // which never leaves the list at all.
+    assert_eq!(peak_thinks, 215);
 
     // The one map this port looks at most, and the headline of the whole
     // stage: `sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default
@@ -4736,6 +5132,7 @@ fn panel_sequences() -> sequences::SequenceTable {
                 sequences::SequenceInfo {
                     duration: 1.0,
                     loops: false,
+                    fade_out_time: 0.2,
                 },
             ),
             (
@@ -4743,6 +5140,7 @@ fn panel_sequences() -> sequences::SequenceTable {
                 sequences::SequenceInfo {
                     duration: 1.0,
                     loops: false,
+                    fade_out_time: 0.2,
                 },
             ),
             (
@@ -4750,6 +5148,7 @@ fn panel_sequences() -> sequences::SequenceTable {
                 sequences::SequenceInfo {
                     duration: 2.0,
                     loops: true,
+                    fade_out_time: 0.2,
                 },
             ),
         ],
@@ -5208,6 +5607,7 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
                                     loops: sequence.flags
                                         & crate::studio::anim::STUDIO_LOOPING
                                         != 0,
+                                    fade_out_time: sequence.fade_out_time,
                                 },
                             )
                         })
@@ -5364,4 +5764,734 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     );
     assert_eq!(not_rigid, 290, "entities drawn in their bind pose");
     assert_eq!(animatable, 3_323, "entities whose model the renderer can pose");
+}
+
+// ---------------------------------------------------------------------------
+// prop_testchamber_door
+// ---------------------------------------------------------------------------
+
+/// The one sequence a chamber door plays, as the real `.mdl` describes it:
+/// 23 frames at 24 fps, non-looping, with `studiomdl`'s default fade-out.
+///
+/// Every number here is measured by
+/// `studio::tests::the_testchamber_door_model_animates` against the shipped
+/// file, so the two cannot drift without one of them failing.
+fn chamber_door_sequences() -> sequences::SequenceTable {
+    let mut table = sequences::SequenceTable::new();
+    table.insert_model(
+        "models/props/portal_door_combined.mdl",
+        [(
+            "open".to_owned(),
+            sequences::SequenceInfo {
+                duration: 22.0 / 24.0,
+                loops: false,
+                fade_out_time: 0.2,
+            },
+        )],
+    );
+    table
+}
+
+/// `open` is 0.9167 seconds long, and `GetLastVisibleCycle` calls it finished
+/// 0.2 of those early.
+const DOOR_TRAVEL: f32 = 22.0 / 24.0;
+const DOOR_LAST_VISIBLE: f32 = DOOR_TRAVEL - 0.2;
+
+/// A map with one chamber door and a counter on each of its four outputs.
+fn door_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut door = block(&[
+        ("classname", "prop_testchamber_door"),
+        ("targetname", "door"),
+        ("origin", "0 0 0"),
+    ]);
+    for (k, v) in extra {
+        door.pairs.push(((*k).to_owned(), (*v).to_owned()));
+    }
+    for output in ["OnOpen", "OnClose", "OnFullyOpen", "OnFullyClosed"] {
+        door.pairs.push((
+            output.to_owned(),
+            conn(&output.to_ascii_lowercase(), "Add", "1", "0", "-1"),
+        ));
+    }
+    let mut map = vec![block(&[("classname", "worldspawn")]), door];
+    for output in ["OnOpen", "OnClose", "OnFullyOpen", "OnFullyClosed"] {
+        map.push(block(&[
+            ("classname", "math_counter"),
+            ("targetname", &output.to_ascii_lowercase()),
+        ]));
+    }
+    map
+}
+
+fn door_of(server: &Server) -> &classes::TestChamberDoor {
+    find_named(server, "door")
+        .behaviour
+        .downcast_ref::<classes::TestChamberDoor>()
+        .expect("a TestChamberDoor")
+}
+
+/// The same by id, for the depot test, which has 138 of them and no name it
+/// chose.
+fn door_at(server: &Server, id: EntityId) -> &classes::TestChamberDoor {
+    server
+        .entities
+        .get(id)
+        .expect("the door")
+        .behaviour
+        .downcast_ref::<classes::TestChamberDoor>()
+        .expect("a TestChamberDoor")
+}
+
+/// The five numbers the renderer would be handed for that entity.
+fn pose_of(server: &Server, id: EntityId) -> class::ModelState<'_> {
+    door_at(server, id)
+        .model_state()
+        .expect("it draws a model")
+}
+
+/// The pose `engine::world::entities` would draw, worked out here from the
+/// five numbers the seam carries — the same duplication `prop_cycle` is, and
+/// for the same reason.
+fn door_cycle(server: &Server) -> f32 {
+    let state = door_of(server).model_state().expect("it draws a model");
+    let elapsed = (server.time().curtime - state.anim_time).max(0.0);
+    (state.cycle + elapsed * state.playback_rate / DOOR_TRAVEL).clamp(0.0, 1.0)
+}
+
+fn door_server(extra: &[(&str, &str)]) -> Server {
+    let mut server = Server::new();
+    server.level_init("test", &door_map(extra), &[]);
+    server.set_sequences(chamber_door_sequences());
+    server
+}
+
+/// **A door spawns shut and still**, on frame zero of `open` at playback rate
+/// zero — which is `ResetSequence` followed by `SetPlaybackRate( 0.0f )`, and
+/// is the whole reason a chamber does not open itself at map load.
+#[test]
+fn a_testchamber_door_spawns_shut_and_still() {
+    let server = door_server(&[]);
+    let door = find_named(&server, "door");
+
+    // `SetModel( TESTCHAMBER_DOOR_MODEL_NAME )` — hard-coded, not a key.
+    assert_eq!(
+        door.model.as_deref(),
+        Some("models/props/portal_door_combined.mdl")
+    );
+    assert_eq!(door.move_type, crate::server::movement::MoveType::None);
+    assert_eq!(door.solid, crate::server::movement::Solid::VPhysics);
+    assert!(door.effects & crate::server::keyvalue::effects::NOSHADOW != 0);
+
+    let state = door.behaviour.model_state().expect("it draws a model");
+    assert_eq!(state.sequence, "open", "`close` is never played");
+    assert_eq!(state.cycle, 0.0);
+    assert_eq!(state.playback_rate, 0.0, "shut and held");
+
+    let door = door_of(&server);
+    assert!(!door.is_open());
+    assert!(!door.is_animating());
+    assert!(!door.is_locked());
+}
+
+/// **A door opens by playing `open` forwards and shuts by playing it
+/// backwards** — 137 and 130 shipped connections — and the pose the renderer
+/// would draw follows it both ways.
+#[test]
+fn a_testchamber_door_opens_forwards_and_shuts_backwards() {
+    let mut server = door_server(&[]);
+    let id = find_named(&server, "door").id();
+    run(&mut server, 0.5);
+    assert_eq!(door_cycle(&server), 0.0, "still shut");
+
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    assert_eq!(
+        door_of(&server)
+            .model_state()
+            .expect("it draws a model")
+            .playback_rate,
+        1.0
+    );
+    assert!(door_of(&server).is_open());
+    run(&mut server, 0.1);
+    assert_eq!(counter_value(&server, "onopen"), 1.0);
+
+    // Half way through the travel, half way through the sequence — this is
+    // the number the renderer computes from the same five fields.
+    run(&mut server, DOOR_TRAVEL / 2.0 - 0.1);
+    let half = door_cycle(&server);
+    assert!(
+        (half - 0.5).abs() < 0.02,
+        "half a second's travel should be half the sequence: {half}"
+    );
+
+    // …and it arrives, and stays arrived.
+    run(&mut server, DOOR_TRAVEL);
+    assert_eq!(door_cycle(&server), 1.0);
+    run(&mut server, 5.0);
+    assert_eq!(door_cycle(&server), 1.0, "a non-looping sequence clamps");
+
+    // Now shut it. The rate turns round and the cycle is re-based onto where
+    // the door actually is, which is what stops it snapping.
+    server.accept_input(id, "Close", Variant::Void, None, None, 0);
+    let state = door_of(&server).model_state().expect("it draws a model");
+    assert_eq!(state.playback_rate, -1.0);
+    assert_eq!(state.cycle, 1.0, "re-based onto the open pose");
+    assert!(!door_of(&server).is_open());
+    run(&mut server, 0.1);
+    assert_eq!(counter_value(&server, "onclose"), 1.0);
+
+    run(&mut server, DOOR_TRAVEL / 2.0 - 0.1);
+    let half = door_cycle(&server);
+    assert!(
+        (half - 0.5).abs() < 0.02,
+        "it should be half shut, not snapped: {half}"
+    );
+    run(&mut server, DOOR_TRAVEL);
+    assert_eq!(door_cycle(&server), 0.0, "shut again");
+}
+
+/// **Only a door's *first* opening reports its own end**, because
+/// `m_bSequenceFinished` is never cleared after `Spawn`.
+///
+/// The first `OnFullyOpen` waits for the sequence — 0.72 seconds, not 0.92,
+/// because `GetLastVisibleCycle` subtracts the 0.2-second fade — and every
+/// "fully" output after it fires on the first 10 Hz think following the
+/// input, while the door is still visibly moving. It is Valve's, and the 150
+/// `OnFullyClosed` connections in the shipped game were authored against it.
+#[test]
+fn only_a_doors_first_opening_reports_its_own_end() {
+    let mut server = door_server(&[]);
+    let id = find_named(&server, "door").id();
+    run(&mut server, 0.5);
+
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    // Not yet: the fade-out threshold is 0.72 seconds in.
+    run(&mut server, DOOR_LAST_VISIBLE - 0.15);
+    assert_eq!(counter_value(&server, "onfullyopen"), 0.0);
+    assert!(door_of(&server).is_animating());
+
+    // …and there, within one think of the threshold.
+    run(&mut server, 0.15 + 0.1);
+    assert_eq!(counter_value(&server, "onfullyopen"), 1.0);
+    assert!(!door_of(&server).is_animating());
+    // Once, however long we wait.
+    run(&mut server, 3.0);
+    assert_eq!(counter_value(&server, "onfullyopen"), 1.0);
+
+    // Now the sticky flag. `Close` starts a 0.92-second travel and
+    // `OnFullyClosed` fires on the next think regardless.
+    server.accept_input(id, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 0.15);
+    assert_eq!(
+        counter_value(&server, "onfullyclosed"),
+        1.0,
+        "OnFullyClosed fires a tenth of a second in, not at the end"
+    );
+    // The door is still most of the way open while that has already happened.
+    let cycle = door_cycle(&server);
+    assert!(
+        cycle > 0.8,
+        "the door should still be shutting when OnFullyClosed fires: {cycle}"
+    );
+    assert!(!door_of(&server).is_animating());
+
+    // The same for a second opening.
+    run(&mut server, 2.0);
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 0.15);
+    assert_eq!(counter_value(&server, "onfullyopen"), 2.0);
+    let cycle = door_cycle(&server);
+    assert!(cycle < 0.2, "the door has barely started: {cycle}");
+}
+
+/// A door refuses a second `Open` while it is open, and a `Close` while it is
+/// shut — so neither fires an output. `IsOpen()` is where the door is
+/// *going*, so the refusal starts the instant the input lands.
+#[test]
+fn a_testchamber_door_refuses_an_input_it_is_already_obeying() {
+    let mut server = door_server(&[]);
+    let id = find_named(&server, "door").id();
+    run(&mut server, 0.5);
+
+    // Shut already.
+    server.accept_input(id, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onclose"), 0.0);
+
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    // Immediately, while it is still travelling.
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onopen"), 1.0, "the second is refused");
+}
+
+/// `Lock` refuses both doors until `Unlock`, and `LockOpen` is `Open`
+/// *followed* by the lock — so the open itself gets through, which is the
+/// point of the input and what its 29 shipped connections want.
+#[test]
+fn a_locked_testchamber_door_refuses_everything_and_lockopen_gets_in_first() {
+    let mut server = door_server(&[]);
+    let id = find_named(&server, "door").id();
+    run(&mut server, 0.5);
+
+    server.accept_input(id, "Lock", Variant::Void, None, None, 0);
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onopen"), 0.0, "locked shut");
+    assert!(door_of(&server).is_locked());
+
+    server.accept_input(id, "Unlock", Variant::Void, None, None, 0);
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onopen"), 1.0);
+
+    // Shut it, then `LockOpen`: the door opens and is locked afterwards.
+    server.accept_input(id, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 2.0);
+    server.accept_input(id, "LockOpen", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onopen"), 2.0, "the open got through");
+    assert!(door_of(&server).is_locked());
+    assert!(door_of(&server).is_open());
+
+    // …and now nothing moves it.
+    server.accept_input(id, "Close", Variant::Void, None, None, 0);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "onclose"), 1.0, "only the earlier one");
+}
+
+/// **A door whose model nobody loaded opens, and never finishes opening.**
+///
+/// `server::sequences`' three-way answer: `Lookup::Unknown` is treated as
+/// `LookupSequence` succeeding and `SequenceDuration` returning nothing, so
+/// the input is accepted and `OnOpen` fires while `IsSequenceFinished()` can
+/// never become true. That is the state every `Spawn` in the game runs in, and
+/// the state a headless test without a `Vfs` stays in.
+#[test]
+fn a_testchamber_door_with_no_model_loaded_opens_but_never_arrives() {
+    let mut server = Server::new();
+    server.level_init("test", &door_map(&[]), &[]);
+    let id = find_named(&server, "door").id();
+    run(&mut server, 0.5);
+
+    server.accept_input(id, "Open", Variant::Void, None, None, 0);
+    run(&mut server, 5.0);
+    assert_eq!(counter_value(&server, "onopen"), 1.0);
+    assert_eq!(counter_value(&server, "onfullyopen"), 0.0);
+    assert!(door_of(&server).is_animating(), "still owed a `fully`");
+}
+
+/// The area portal block is read and kept, not dropped — 84 doors name a
+/// window and 94 write the fade triple, and two of them write Hammer
+/// instance-fixup leftovers that must read as zero rather than as an error.
+#[test]
+fn the_area_portal_keys_are_consumed_including_the_two_broken_ones() {
+    let server = door_server(&[
+        ("AreaPortalWindow", "door_1-door_areaportal_window"),
+        ("UseAreaPortalFade", "1"),
+        ("AreaPortalFadeStart", "500"),
+        ("AreaPortalFadeEnd", "$FadeEndDistance"),
+    ]);
+    let door = find_named(&server, "door");
+    assert!(door.unhandled.is_empty(), "{:?}", door.unhandled);
+
+    let fields = door.behaviour.describe();
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    };
+    assert_eq!(field("area_portal_window"), "door_1-door_areaportal_window");
+    assert_eq!(field("area_portal_fade"), "500..0", "the second reads as zero");
+}
+
+/// **Every test chamber door in the game, opened and shut, with the real
+/// model's sequences in hand.**
+///
+/// The class's own depot test. For each of the 106 maps it spawns the
+/// entities, fills the sequence table from the one `.mdl` every door wears,
+/// and then drives each door through a full cycle — checking at every step
+/// the things that are a wrong picture rather than an error: that it spawns
+/// shut and still, that `Open` turns the sequence forwards, that the pose the
+/// renderer would draw arrives at 1.0 and stays, that `Close` re-bases rather
+/// than snapping, and that it comes back to 0.0.
+///
+/// It also measures the sticky-flag behaviour on real data, because it is the
+/// one thing about this class that reads as a bug: **a door's first
+/// `OnFullyOpen` waits for the sequence and every "fully" output after it
+/// does not.**
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release testchamber_door -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_testchamber_door_opens_and_shuts() {
+    use crate::filesystem::Vfs;
+    use crate::studio::StudioModel;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    // The one model every door in the game wears, read once. `Spawn`
+    // hard-codes it, so there is exactly one entry in this table and no map
+    // can add another.
+    const MODEL: &str = "models/props/portal_door_combined.mdl";
+    let studio = StudioModel::load(&vfs, MODEL).expect("the door model");
+    let mut table = sequences::SequenceTable::new();
+    table.insert_model(
+        MODEL,
+        studio
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(i, sequence)| {
+                (
+                    sequence.label.clone(),
+                    sequences::SequenceInfo {
+                        duration: studio.animation(i).map(|a| a.duration()).unwrap_or(0.0),
+                        loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                        fade_out_time: sequence.fade_out_time,
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let travel = studio
+        .animation(studio.sequence("open").expect("`open`"))
+        .expect("its animation")
+        .duration();
+
+    let mut doors = 0usize;
+    let mut maps_with_a_door = 0usize;
+    let mut reachable = 0usize;
+    // How long each door took to report its own opening, the first time and
+    // the second. The first waits for `GetLastVisibleCycle`; the second does
+    // not, because `m_bSequenceFinished` is never cleared.
+    let (mut first_arrival, mut second_arrival) = (Vec::new(), Vec::new());
+    // Doors their own map opens within a second of the level starting.
+    let mut opened_by_bootstrap = 0usize;
+
+    for name in &names {
+        let bsp = crate::engine::world::bsp::Bsp::load(&vfs, name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        let ids: Vec<EntityId> = {
+            let mut server = Server::new();
+            server.level_init(name, &bsp.entities(), &bsp.models);
+            server
+                .entities
+                .iter()
+                .filter(|(_, e)| e.classname() == "prop_testchamber_door")
+                .map(|(id, _)| id)
+                .collect()
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        maps_with_a_door += 1;
+        doors += ids.len();
+
+        // Reachability: does anything in the map fire `Open` at this door?
+        // The shipped answer is what says the class is worth having.
+        let names_opened: Vec<String> = bsp
+            .entities()
+            .iter()
+            .flat_map(|e| e.pairs.iter())
+            .filter_map(|(_, v)| {
+                let mut parts = v.split('\u{1b}');
+                let target = parts.next()?.to_ascii_lowercase();
+                let input = parts.next()?;
+                (input.eq_ignore_ascii_case("Open") || input.eq_ignore_ascii_case("LockOpen"))
+                    .then_some(target)
+            })
+            .collect();
+
+        // One door at a time, from a fresh level each time, so that a map's
+        // own bootstrap cannot have moved the others.
+        for &id in &ids {
+            let mut server = Server::new();
+            server.level_init(name, &bsp.entities(), &bsp.models);
+            server.set_sequences(table.clone());
+
+            let door_name = server
+                .entities
+                .get(id)
+                .and_then(|e| e.core.name.clone())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if names_opened.iter().any(|t| *t == door_name) {
+                reachable += 1;
+            }
+
+            let rate = |server: &Server| pose_of(server, id).playback_rate;
+            let cycle = |server: &Server| {
+                let s = pose_of(server, id);
+                let elapsed = (server.time().curtime - s.anim_time).max(0.0);
+                (s.cycle + elapsed * s.playback_rate / travel).clamp(0.0, 1.0)
+            };
+
+            // A second of the map's own bootstrap. Almost every door in the
+            // game is still shut and still after it — a chamber waits for the
+            // player — and the handful that are not are counted rather than
+            // asserted away.
+            run(&mut server, 1.0);
+            assert_eq!(pose_of(&server, id).sequence, "open", "{name}: {door_name}");
+            if door_at(&server, id).is_open() {
+                opened_by_bootstrap += 1;
+                continue;
+            }
+            assert_eq!(rate(&server), 0.0, "{name}: {door_name}");
+            assert_eq!(cycle(&server), 0.0, "{name}: {door_name} is not shut");
+
+            // Open it, and time how long it takes to say it has.
+            let started = server.time().curtime;
+            server.accept_input(id, "Open", Variant::Void, None, None, 0);
+            assert_eq!(rate(&server), 1.0, "{name}: {door_name}");
+            assert!(door_at(&server, id).is_open(), "{name}: {door_name}");
+            let mut arrival = None;
+            for _ in 0..40 {
+                run(&mut server, 0.05);
+                if !door_at(&server, id).is_animating() && arrival.is_none() {
+                    arrival = Some(server.time().curtime - started);
+                }
+            }
+            first_arrival.push(arrival.expect("the door reports opening"));
+            assert_eq!(cycle(&server), 1.0, "{name}: {door_name} did not arrive");
+
+            // Shut it. The cycle must come *down* from 1 rather than snap.
+            server.accept_input(id, "Close", Variant::Void, None, None, 0);
+            assert_eq!(rate(&server), -1.0, "{name}: {door_name}");
+            assert_eq!(pose_of(&server, id).cycle, 1.0, "{name}: {door_name} snapped");
+            run(&mut server, travel / 2.0);
+            let half = cycle(&server);
+            assert!(
+                (half - 0.5).abs() < 0.05,
+                "{name}: {door_name} is at {half} half way through shutting"
+            );
+            run(&mut server, travel);
+            assert_eq!(cycle(&server), 0.0, "{name}: {door_name} did not shut");
+
+            // …and open it again, which is the sticky flag.
+            let started = server.time().curtime;
+            server.accept_input(id, "Open", Variant::Void, None, None, 0);
+            let mut arrival = None;
+            for _ in 0..40 {
+                run(&mut server, 0.05);
+                if !door_at(&server, id).is_animating() && arrival.is_none() {
+                    arrival = Some(server.time().curtime - started);
+                }
+            }
+            second_arrival.push(arrival.expect("the door reports opening"));
+        }
+    }
+
+    let range = |v: &[f32]| {
+        let lo = v.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        (lo, hi)
+    };
+    let (first_lo, first_hi) = range(&first_arrival);
+    let (second_lo, second_hi) = range(&second_arrival);
+    println!(
+        "{doors} prop_testchamber_door across {maps_with_a_door} of {} maps, \
+         {reachable} of them opened by their map\n  \
+         {opened_by_bootstrap} opened by their own map's bootstrap\n  \
+         `open` is {travel:.4}s; first OnFullyOpen after {first_lo:.3}..{first_hi:.3}s, \
+         second after {second_lo:.3}..{second_hi:.3}s",
+        names.len()
+    );
+
+    assert_eq!(doors, 138);
+    assert_eq!(maps_with_a_door, 71);
+    // **130 of the 138 are opened by something in their own map**, which is
+    // what says the class is worth having: the chain that gets there —
+    // `trigger_once` → `func_instance_io_proxy` → `logic_relay` → the door —
+    // is ported end to end. Of the other eight, **five carry no `targetname`
+    // at all** so nothing can aim at one, and three are named and never
+    // fired at (`sp_a1_intro3`'s `door_2`, `sp_a2_column_blocker`'s
+    // `testchamber_door` and `sp_a4_laser_platform`'s `tb_catch_inner_door`)
+    // — Valve's own dead map data, and all eight stand shut in the shipped
+    // game too.
+    assert_eq!(reachable, 130);
+    // Seven doors are opened by their own map within a second of the level
+    // starting, so "a chamber door waits for the player" is nearly but not
+    // quite a rule.
+    assert_eq!(opened_by_bootstrap, 7);
+
+    // **The sticky flag, measured.** The first opening waits for
+    // `GetLastVisibleCycle` — 0.9167 - 0.2 = 0.717 seconds — and is noticed on
+    // the next 10 Hz think, which `SetNextThink` has quantised to six 64 Hz
+    // ticks. The second is noticed on the first think after the input,
+    // because `m_bSequenceFinished` was never cleared.
+    // Every one of the 131 driven doors reports the same two times, because
+    // the whole schedule is quantised: 0.797s the first time, against a
+    // 0.9167s travel, and 0.094s — one think — the second.
+    assert_eq!((first_lo, first_hi), (0.796875, 0.796875));
+    assert_eq!((second_lo, second_hi), (0.09375, 0.09375));
+}
+
+/// **`sp_a1_intro1`'s door, opened the way the map opens it** — through the
+/// chain the mapper actually built rather than by firing `Open` at it.
+///
+/// The default map's two doors are driven by
+///
+/// ```text
+///   trigger_once → logic_relay "door_open_relay"
+///                → func_instance_io_proxy "door_1-proxy" (OnProxyRelay2)
+///                → logic_relay "door_1-door_open_relay"
+///                → prop_testchamber_door "door_1-testchamber_door" (Open)
+/// ```
+///
+/// and every class in it is ported, which is what makes the door open in the
+/// running game when you walk into the chamber. This test fires `Trigger` at
+/// the head of the chain and watches the far end of it, so a break anywhere
+/// in between shows up here rather than as a door that silently never moves.
+///
+/// **And it shuts again**, which is a longer chain and one the map does not
+/// build out of relays alone:
+///
+/// ```text
+///   trigger_once → logic_relay "door_close_relay"
+///                → func_instance_io_proxy "door_1-proxy" (OnProxyRelay1)
+///                → logic_relay "door_1-door_close_relay"
+///                → logic_branch "door_1-door_wants_to_close_branch" (SetValue 1)
+///                ⇢ logic_branch_listener "door_1-door_can_close_branch_listener"
+///                → logic_relay "door_1-close_door_rl"
+///                → prop_testchamber_door "door_1-testchamber_door" (Close)
+///                → logic_branch "door_1-door_wants_to_close_branch" (SetValue 0)
+/// ```
+///
+/// The last line is the same branch again: the relay that shuts the door
+/// consumes the flag that asked for it, so by the end of the tick the branch
+/// reads `false` and the listener reads `mixed` — which looks exactly like a
+/// chain that never arrived, and is why this test checks the **door** and not
+/// the branch.
+///
+/// The `⇢` is the only hop in either chain that is not a connection a mapper
+/// typed: it is the branch posting `_OnLogicBranchChanged` at the listener
+/// that registered with it. The listener's other branch,
+/// `door_1-player_not_in_door_branch`, starts `1` and is driven to `0` by a
+/// `trigger_multiple` in the doorway — so with nobody standing in the door the
+/// verdict flips to all-true the instant the map asks, and the door closes.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_intro_maps_door -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn the_intro_maps_door_opens_through_the_chain_its_map_built() {
+    use crate::filesystem::Vfs;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+    let bsp = crate::engine::world::bsp::Bsp::load(&vfs, "sp_a1_intro1").expect("the intro map");
+
+    let mut server = Server::new();
+    server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
+    run(&mut server, 1.0);
+
+    let door = find_named(&server, "door_1-testchamber_door").id();
+    assert!(!door_at(&server, door).is_open(), "it starts shut");
+    assert_eq!(pose_of(&server, door).playback_rate, 0.0);
+
+    // The head of the chain — what the `trigger_once` at the chamber entrance
+    // fires when the player walks through it.
+    let head = find_named(&server, "door_open_relay").id();
+    server.accept_input(head, "Trigger", Variant::Void, None, None, 0);
+
+    // Zero-delay all the way, so the whole chain lands inside one tick: the
+    // queue restarts from the head after every event.
+    run(&mut server, 1.0 / 64.0);
+    assert!(
+        door_at(&server, door).is_open(),
+        "the map's own chain did not reach the door"
+    );
+    assert_eq!(pose_of(&server, door).playback_rate, 1.0, "it is opening");
+
+    // …and the second door, whose chain is one link shorter.
+    let exit = find_named(&server, "@exit_door-testchamber_door").id();
+    let head = find_named(&server, "@exit_door-door_open_relay").id();
+    assert!(!door_at(&server, exit).is_open());
+    server.accept_input(head, "Trigger", Variant::Void, None, None, 0);
+    run(&mut server, 1.0 / 64.0);
+    assert!(door_at(&server, exit).is_open());
+
+    // -----------------------------------------------------------------------
+    // and shut again, through the `logic_branch_listener` half
+    // -----------------------------------------------------------------------
+
+    // Let the first door finish opening, so that what follows is a real
+    // reversal rather than a rate flip mid-travel.
+    run(&mut server, 1.0);
+
+    let wants = find_named(&server, "door_1-door_wants_to_close_branch").id();
+    let clear = find_named(&server, "door_1-player_not_in_door_branch").id();
+    let listener = find_named(&server, "door_1-door_can_close_branch_listener").id();
+    assert_eq!(branch_list_at(&server, listener).branches().len(), 2);
+    assert_eq!(
+        branch_list_at(&server, listener).state(),
+        "not-init",
+        "it has reported nothing at all yet"
+    );
+    assert!(
+        !branch_value(&server, wants),
+        "nothing has asked for it to shut yet"
+    );
+    assert!(
+        branch_value(&server, clear),
+        "`InitialValue 1` — nobody is standing in the doorway"
+    );
+
+    // The head of the *close* chain: the `trigger_once` beyond the door.
+    let head = find_named(&server, "door_close_relay").id();
+    server.accept_input(head, "Trigger", Variant::Void, None, None, 0);
+
+    // Zero delay the whole way, branch notification included, so all of it
+    // lands inside a single tick.
+    run(&mut server, 1.0 / 64.0);
+    assert!(
+        !door_at(&server, door).is_open(),
+        "the branch listener did not reach the door"
+    );
+
+    // **And the branch is back to `false`**, which is not a failure to arrive:
+    // `door_1-close_door_rl` fires `SetValue 0` at it in the same breath as
+    // the door's `Close`, so the condition is consumed. The listener's own
+    // verdict followed it back down to mixed.
+    assert!(!branch_value(&server, wants), "the chain consumed its own flag");
+    assert_eq!(
+        branch_list_at(&server, listener).state(),
+        "mixed",
+        "all-true, then talked straight back down"
+    );
+    assert_eq!(
+        pose_of(&server, door).playback_rate,
+        -1.0,
+        "`open` is played backwards to shut"
+    );
+
+    println!(
+        "sp_a1_intro1: both chamber doors open through their own map logic, \
+         and door_1 shuts again through its logic_branch_listener"
+    );
 }

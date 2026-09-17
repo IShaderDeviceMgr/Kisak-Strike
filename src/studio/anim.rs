@@ -118,6 +118,21 @@ pub struct Bone {
 pub struct Sequence {
     pub label: String,
     pub flags: u32,
+    /// `fadeouttime` — "ideal cross fade out time (0.2 default)", in
+    /// **seconds**.
+    ///
+    /// Nothing here cross-fades, and this is not what it is read for.
+    /// `CBaseAnimating::GetLastVisibleCycle` (`baseanimating.cpp:1043`) turns
+    /// it into the cycle at which a non-looping sequence counts as *finished*
+    /// — `1 - fadeouttime * cycleRate * playbackRate`, so a sequence played
+    /// forwards is finished `fadeouttime` seconds before it ends — and
+    /// `IsSequenceFinished()` is what `prop_testchamber_door` opens on.
+    ///
+    /// Worth carrying rather than assuming, because Valve's default is what
+    /// content overwhelmingly writes and "overwhelmingly" is not "always":
+    /// **10,664 of the 10,666 sequences in the shipped game are 0.2 and two
+    /// are 0.5**. None is zero, so the term never folds away.
+    pub fade_out_time: f32,
     /// Which [`Animation`] plays. Valve resolves this through a blend table of
     /// `groupsize[0] * groupsize[1]` entries; **every sequence in every model
     /// this port loads has a 1x1 table**, so only entry zero is read and the
@@ -270,6 +285,9 @@ pub(super) fn parse_sequences(
         sequences.push(Sequence {
             label: r.c_string(label_at)?,
             flags: r.u32(at + 12)?,
+            // `fadeouttime`, which sits after `fadeintime` at the end of the
+            // pose-parameter block: `paramparent` at 100, `fadeintime` at 104.
+            fade_out_time: r.f32(at + 108)?,
             anim,
         });
     }

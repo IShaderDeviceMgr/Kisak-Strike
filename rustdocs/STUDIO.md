@@ -114,7 +114,10 @@ pub struct Bone {
     pub pose_to_bone: Mat4,      // the INVERSE BIND matrix
 }
 
-pub struct Sequence { pub label: String, pub flags: u32, pub anim: usize }
+pub struct Sequence {
+    pub label: String, pub flags: u32, pub anim: usize,
+    pub fade_out_time: f32,   // mstudioseqdesc_t::fadeouttime, in SECONDS
+}
 pub struct BoneTrack { pub bone: usize, pub pos: Vec<Vec3>, pub rot: Vec<Quat> }
 pub struct Animation {
     pub name: String, pub fps: f32, pub flags: u32,
@@ -142,6 +145,17 @@ is two lookups and a blend.
 animation is **4,050 frames** — about a megabyte expanded, for one model.
 Nothing a class loads today is near that; the first one that is, is the
 condition for going back to Valve's lazy walk.
+
+**`fade_out_time` is not a blend time here.** Nothing in this port cross-fades
+between sequences; the field is carried for one reader, `CBaseAnimating`'s
+`GetLastVisibleCycle` (`baseanimating.cpp:1043`), which turns it into the cycle
+at which a non-looping sequence counts as **finished**:
+`1 - fadeouttime * cycleRate * playbackRate`. So a sequence played forwards is
+finished `fadeouttime` seconds before it ends, and that is what
+`IsSequenceFinished()` — and so `prop_testchamber_door`'s `OnFullyOpen` — is
+made of. Measured over the shipped game: **10,664 of its 10,666 sequences write
+0.2 and the other two write 0.5**; none writes zero, so the term never folds
+away. See `rustdocs/SERVER.md`'s `sequences` and gotcha 67.
 
 `pose` returns **pose-to-model** matrices: `boneToWorld[i] * poseToBone[i]`,
 which is what a *bind-pose* vertex is multiplied by. With no animation every
