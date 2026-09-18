@@ -850,9 +850,17 @@ mod tests {
             ShaderKind::Phong,
             ShaderKind::Refract,
         ] {
-            // Both blend modes and both target formats, so the state axes that
-            // do change the pipeline are exercised rather than just the module.
-            for blend in [BlendMode::None, BlendMode::Blend] {
+            // **Every** blend mode, not just two: the translucent pass made all
+            // five reachable, and a `ColorTargetState` whose factors a backend
+            // will not accept is a validation error rather than a wrong
+            // picture.
+            for blend in [
+                BlendMode::None,
+                BlendMode::Blend,
+                BlendMode::Add,
+                BlendMode::BlendAdd,
+                BlendMode::Multiply,
+            ] {
                 cache.get(&PipelineKey {
                     shader,
                     state: RenderState {

@@ -92,6 +92,7 @@ mod tests {
                 cycle: e.cycle,
                 anim_time: e.anim_time,
                 playback_rate: e.playback_rate,
+                modulation: e.modulation,
             })
             .collect();
         world.load_entity_models(&vfs, &mut materials, &device, &placements);
@@ -174,6 +175,58 @@ mod tests {
         run("entity models", &|pass| world.entity_models.draw(pass, 0.0));
         run("everything", &|pass| world.draw(pass, 0.0));
         drop(run);
+
+        // The translucent half, which is a *third* pass and — unlike the two
+        // above — records one draw per instance rather than one per batch,
+        // because a back-to-front order is what a sort costs. Measured
+        // separately for that reason: the number to watch is how the per-item
+        // cost compares with the batched passes, not the absolute.
+        {
+            let list = world.translucent_list(eye, Vec3::X);
+            println!("  {:<16} {} draws", "translucent", list.len());
+            let translucent_frame = |context: &mut RenderContext, materials: &mut MaterialCache| {
+                context.begin_frame();
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = context.offscreen_pass(
+                        &mut encoder,
+                        materials.pipelines(),
+                        &target,
+                        &camera,
+                        Load::Clear(wgpu::Color::BLACK),
+                    );
+                    world.draw_translucent(&mut pass, 0.0, &list);
+                }
+                queue.submit([encoder.finish()]);
+            };
+            translucent_frame(&mut context, &mut materials);
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("idle");
+            let start = Instant::now();
+            for _ in 0..FRAMES {
+                translucent_frame(&mut context, &mut materials);
+            }
+            let recorded = start.elapsed();
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("idle");
+            let total = start.elapsed();
+            println!(
+                "  {:<16} {:>7.2} ms/frame CPU  ({:>6.2} ms with GPU wait, \
+                 {:>5.0} fps ceiling from CPU alone)",
+                "translucent",
+                recorded.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+                total.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+                f64::from(FRAMES) / recorded.as_secs_f64(),
+            );
+        }
 
         // The refracting half, which is a *second* pass with a full-screen copy
         // in front of it — so it cannot be measured through `run` above, which

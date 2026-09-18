@@ -478,6 +478,38 @@ impl EntityCore {
         self.solid != Solid::None && self.solid_flags & FSOLID_NOT_SOLID == 0
     }
 
+    /// `GetColorModulation()` and `CClientAlphaProperty::ComputeRenderAlpha()`
+    /// as one vector — `m_DiffuseModulation`, which every model and brush draw
+    /// is multiplied by (`modelrendersystem.cpp:1723`).
+    ///
+    /// The alpha is the whole of the render-mode question for a model: a mode
+    /// other than `kRenderNormal` substitutes `renderamt` for the 255 an
+    /// ordinary entity gets (`clientalphaproperty.cpp:239`), and a value below
+    /// 255 is what puts the entity in the translucent list. **The mode does not
+    /// pick a blend equation** — that was GoldSrc; in Source the equation comes
+    /// from the material, and the only mode that does anything else is a glow,
+    /// which switches the depth test off (`clientalphaproperty.h:112`) and which
+    /// no ported class in Portal 2 sets.
+    ///
+    /// `world/`'s [`PlacedBrushModel::modulation`] is the same arithmetic over
+    /// the same three keys read from the `.bsp` lump instead of from here,
+    /// because a brush entity's placement is resolved before the game has
+    /// spawned anything.
+    ///
+    /// [`PlacedBrushModel::modulation`]: crate::engine::world::PlacedBrushModel::modulation
+    pub fn modulation(&self) -> [f32; 4] {
+        let alpha = match self.render_mode {
+            0 => 255,
+            _ => self.render_color[3],
+        };
+        [
+            f32::from(self.render_color[0]) / 255.0,
+            f32::from(self.render_color[1]) / 255.0,
+            f32::from(self.render_color[2]) / 255.0,
+            f32::from(alpha) / 255.0,
+        ]
+    }
+
     /// `IsSolidFlagSet`. Takes a mask and asks whether *any* of it is set,
     /// which is what the C++'s `( m_usSolidFlags & flags ) != 0` does.
     pub fn is_solid_flag_set(&self, flags: u32) -> bool {

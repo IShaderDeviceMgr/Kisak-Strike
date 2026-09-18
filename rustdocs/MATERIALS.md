@@ -1144,6 +1144,32 @@ orderings inside `render_state` are the original's and look wrong out of context
 `get` returns an `Arc` on purpose — asking the cache borrows it mutably and recording a
 pass borrows the frame, so the pipeline has to outlive the lookup.
 
+**A material carries two of these, and the draw picks one.** Valve's materials hold up to
+eight `StateSnapshot_t`s indexed by modulation flags, and `DrawMesh` selects with
+`bIsAlphaModulating = pInstances[0].m_DiffuseModulation[3] != 1.0f`
+(`shaderapidx8.cpp:4944`). Only the alpha bit is reachable here — the other three are the
+flashlight, the editor and paint — so there are two:
+
+```rust
+pub state: RenderState,                 // SHADER_USING_ALPHA_MODULATION clear
+pub state_alpha_modulated: RenderState, // …set
+pub fn state_for(&self, modulation_alpha: f32) -> RenderState;
+pub fn is_translucent(&self) -> bool;   // CMaterial::IsTranslucent
+```
+
+`Pass::draw_modulated` calls `state_for` with the **product** of the material's own
+modulation and the instance's, which is the number Valve tests. The second snapshot is
+`render_state` re-run rather than "the first with blending on": `IsAlphaModulating()` is
+one of the three terms `EvaluateBlendRequirements` ORs, so the result still goes through
+`$additive`'s fork (`Blend` or `BlendAdd`), still turns depth writes off, still loses
+alpha writes, and is still replaced wholesale by `$multiply`.
+
+That is what makes a `rendermode 5 renderamt 10` brush entity transparent even though
+every material on it is opaque, and it is the only mechanism by which an entity's render
+mode reaches the pipeline — **the mode itself does not pick a blend equation**. That was
+GoldSrc; in Source the equation is the material's and the mode survives only as "is this
+transparent", "how transparent", and `IgnoresZBuffer()` for the two glow modes.
+
 Note what is *not* a field of `PipelineKey`: the vertex layout. It comes from
 `ShaderKind::vertex_layout()`, because that is where `IShaderShadow::VertexShaderVertexFormat`
 put it — the shader declares the layout it reads, in its shadow phase.
@@ -1445,12 +1471,37 @@ if world.needs_frame_buffer_copy() {
                                        Load::Keep);   // Keep, not Clear
     world.draw_refracting(&mut pass);
 }
+let translucent = world.translucent_list(camera.eye, camera.forward());
+if !translucent.is_empty() {
+    let scene = post.scene(frame.size());
+    let mut pass = context.target_pass(frame, materials.pipelines(), scene, &camera,
+                                       Load::Keep);
+    world.draw_translucent(&mut pass, curtime, &translucent);
+}
 post.resolve(frame, measure);
 ```
 
 That is Valve's structure too — the opaque list, then `UpdateRefractTexture`, then the
 translucent list — it just never had to say so, because D3D9 allowed a shader to read the
 frame buffer it was writing and simply gave undefined results.
+
+**The frame has three geometry passes and their order is a contract**, not a convenience:
+
+| pass | load | holds |
+|---|---|---|
+| opaque | `Clear` | everything whose material neither blends nor reads the frame |
+| refracting | `Keep` | `Material::needs_frame_buffer_copy`, after the copy |
+| translucent | `Keep` | `Material::is_translucent`, or an instance whose modulation alpha is below 1 — sorted back to front |
+
+`engine::world::GeometryPass::of` is the one place that decides, and **refracting wins
+over translucent** when a material is both: it would otherwise be drawn out of sorted
+order, which is worse than what it costs. Nothing in Portal 2 is both.
+
+Each pass is skipped when it would be empty — `needs_frame_buffer_copy()` and
+`translucent_list(..).is_empty()`. That is not micro-optimisation: every GPU this port
+runs on is tile-based, where opening a pass with `Load::Keep` is a full tile load and the
+store at the end is another, so an empty pass over a 1280x720 target is about 7 MB of
+bandwidth for nothing.
 
 Three things about it:
 
@@ -2512,10 +2563,10 @@ headless `egui::Context` and never touch a GPU. The split that makes both possib
 
 ## Test coverage
 
-224 tests, in three groups: 171 pure logic, 52 end-to-end on a GPU, and one depot-gated
+227 tests, in three groups: 173 pure logic, 53 end-to-end on a GPU, and one depot-gated
 census.
 
-**Pure logic, no GPU** (171) — the parts where a mistake is invisible rather than loud:
+**Pure logic, no GPU** (173) — the parts where a mistake is invisible rather than loud:
 
 | Tests | Guard |
 |---|---|
@@ -2527,7 +2578,7 @@ census.
 | `var` (12) | the value grammar and every coercion between the arms, plus the flag-name table against the bit constants |
 | `texture` (7) | the `.vtf` flags -> sampler policy, and `NormalizeTextureName` — extensions stripped except `.hdr`, and only in the last path component |
 | `uniforms` (10) | the uniform block sizes WGSL expects — `RefractUniforms` is guarded in `shader` instead, beside the struct — including `ModelLighting`'s hand-written tail padding, where Rust's alignment for an array of `[f32; 4]` is 4 and WGSL's is 16 — the no-fog packing, the row-major/column-major conversion in both directions, and the light type's two-`w`-component encoding |
-| `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout |
+| `pipeline` (5) | `RenderState::default()` against `SetDefaultState` field by field, the blend factor pairs, and that the shader is what decides the vertex layout. `every_shader_compiles_and_builds_a_pipeline` builds every shader against **all five** blend modes, because the translucent pass made all five reachable and a factor pair a backend rejects is a validation error rather than a wrong picture |
 | `context` (5) | the projection conventions — depth in `0..1`, `z` into the screen, horizontal-to-vertical fov — and that a `StateOverride` touches only what it names |
 | `mesh` (6) | the vertex layouts against the structs they describe — including every attribute offset, since `wgpu` derives those by accumulating format sizes and a reordered field shifts everything after it — and the copy-alignment padding at every remainder |
 | `material` (2) | material name normalization, and that the error material is a valid `UnlitGeneric` — it is built with `expect` at startup, so a typo in it would be a panic on every run |
@@ -2566,7 +2617,18 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --igno
     608 <the error material>
 57 pipelines for the whole set
 345 materials define $envmaptint
+1212 materials draw in the translucent pass:
+     35 blend Add
+   1037 blend Blend
+     71 blend BlendAdd
+     69 $translucent with no blending
 ```
+
+**1,212 of those materials are translucent** — 41% of everything the port draws — which
+is the measurement that says the translucent pass is not a corner case. No shipped material
+reaches `BlendMode::Multiply`, and the 69 with no blending at all are `$translucent` over
+a texture with no alpha channel: `CMaterial::IsTranslucent`'s one term that the blend mode
+does not imply, and they are sorted into the pass for the same reason Valve sorts them.
 
 So **2,947 of the mounted game's 3,555 materials draw with a real shader**, and the whole
 set needs 57 pipelines — which is the standing answer to
@@ -2591,7 +2653,7 @@ The 608 that fall back are dominated by six unported shaders — `SpriteCard` (1
 `Portal`/`Portal_Refract` 14, `ScreenSpace_General` 7, `Sky` 6) and, at the end, a handful
 of `.vmt` files that name a texture or an `include` the depot does not contain.
 
-**End to end, on a real GPU** (52 — 37 in `preview.rs`, 7 in `histogram.rs`, 5 in
+**End to end, on a real GPU** (53 — 38 in `preview.rs`, 7 in `histogram.rs`, 5 in
 `post.rs`, 2 in `ui.rs` and 1 in `pipeline.rs`) — a `.vmt` and a `.vtf`, through the
 material system, onto the GPU, through real WGSL, and back to the CPU by rendering to an
 offscreen `RenderTarget` and reading the pixels back. Each skips rather than fails on a
@@ -2605,6 +2667,7 @@ machine with no usable adapter:
 | `each_draw_gets_its_own_model_matrix` | the per-draw uniform arena: one buffer rewritten between draws would give both draws the second matrix |
 | `a_render_target_can_be_drawn_into_and_then_sampled` | the render-to-texture path that replaces `PushRenderTargetAndViewport` |
 | `a_state_override_turns_the_depth_test_off` | `OverrideDepthEnable`, the `$ignorez` path |
+| `a_modulation_alpha_below_one_blends_an_opaque_material` | **the whole of how an entity's render mode reaches the GPU**, against a hand-computed byte: that `state_for` picks `state_alpha_modulated` on an exact comparison with 1, that the snapshot blends and stops writing depth, that `UnlitGeneric` multiplies the modulation alpha into its output alpha, and that `BlendMode::Blend` is `SrcAlpha` over `OneMinusSrcAlpha`. Every link fails silently on its own; the alpha-1 render is the control |
 | `back_faces_are_culled_and_a_state_override_can_stop_it` | the winding convention, and `CullMode`/`FlipCullMode` |
 | `a_static_vertex_buffer_can_be_drawn_with_dynamic_indices` | the world and model draw pattern — the reason vertex and index buffers are separate |
 | `an_index_range_draws_only_its_batch` | `IMesh::Draw( first, count )` over a shared buffer |

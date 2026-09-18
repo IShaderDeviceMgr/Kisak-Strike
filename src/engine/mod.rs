@@ -867,6 +867,18 @@ impl<'a> Engine<'a> {
             world.draw_refracting(&mut pass, curtime);
         }
 
+        // `DrawTranslucentRenderables`' own place in the frame: last, on top of
+        // everything opaque, sorted back to front. Built before the pass is
+        // opened so that a map with nothing blended pays neither the pass nor
+        // the tile load and store it costs.
+        let translucent = world.translucent_list(camera.eye, camera.forward());
+        if !translucent.is_empty() {
+            let scene = post.scene(frame.size());
+            let mut pass =
+                context.target_pass(frame, materials.pipelines(), scene, &camera, Load::Keep);
+            world.draw_translucent(&mut pass, curtime, &translucent);
+        }
+
         post.resolve(frame, measure);
     }
 
@@ -972,6 +984,7 @@ fn model_entities(server: &Server) -> Vec<world::entities::ModelEntity> {
             cycle: entity.cycle,
             anim_time: entity.anim_time,
             playback_rate: entity.playback_rate,
+            modulation: entity.modulation,
         })
         .collect()
 }

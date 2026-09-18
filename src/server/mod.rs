@@ -390,6 +390,10 @@ pub struct ModelEntityState {
     pub anim_time: f32,
     /// `m_flPlaybackRate`, signed. Zero holds the pose.
     pub playback_rate: f32,
+    /// [`EntityCore::modulation`] — `rendercolor` and the render mode's alpha,
+    /// as the draw wants them. An alpha below 1 is what makes an entity
+    /// translucent.
+    pub modulation: [f32; 4],
 }
 
 /// A [`TouchQuery`] that never reports anything.
@@ -1697,16 +1701,16 @@ impl Server {
                     // `kRenderNone`. `world/`'s brush seam has refused both
                     // since stage 3 — see [`movement::RENDER_NONE`] for why
                     // this seam has to agree even though no shipped prop
-                    // writes it. The *translucent* modes 1 and 2 are a
-                    // different question and are **not** honoured: 30 props
-                    // write one and they need a blended pass, which is the
-                    // same gap `world/` records for its five brush entities.
+                    // writes it. The *translucent* modes are the
+                    // `modulation` below, and are honoured since the blended
+                    // pass landed: 30 props in the game write one.
                     visible: entity.core.effects & movement::EF_NODRAW == 0
                         && entity.core.render_mode != movement::RENDER_NONE,
                     sequence: state.sequence.to_owned(),
                     cycle: state.cycle,
                     anim_time: state.anim_time,
                     playback_rate: state.playback_rate,
+                    modulation: entity.core.modulation(),
                 })
             })
             .collect()

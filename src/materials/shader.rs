@@ -3248,16 +3248,48 @@ pub struct ResolvedTextures {
 /// `base_texture` is the resolved `$basetexture`, because step 2 cannot be
 /// answered without it.
 ///
-/// # What alpha modulation costs, and why it is not final
+/// # Alpha modulation, and why there are two of these
 ///
 /// `bIsAlphaModulating` is a *draw-time* input in the original: it comes from
-/// the instance's diffuse modulation alpha (`shaderapidx8.cpp:4870`), which is
-/// `$alpha` times whatever `IMatRenderContext::OverrideAlpha` set. That is why
-/// a material carried up to eight state snapshots. Here it is read from
-/// `$alpha` alone, because there is no render context to override it yet; when
-/// there is, this becomes an argument and [`RenderState`] stays exactly as it
-/// is — the pipeline cache already keys on it.
+/// the instance's diffuse modulation alpha (`shaderapidx8.cpp:4944`), which is
+/// `$alpha` times whatever the renderable's own modulation supplied. That is
+/// why a material carried up to eight state snapshots, indexed by
+/// `SHADER_USING_ALPHA_MODULATION` and friends.
+///
+/// This is the snapshot with that bit **clear**;
+/// [`render_state_modulated`] is the one with it set, and
+/// [`Material::state_for`](super::material::Material::state_for) picks between
+/// them from the final modulation alpha exactly as `CShaderAPIDx8::DrawMesh2`
+/// (`shaderapidx8.cpp:4907`) does. The `$alpha`
+/// parameter is read here as well, because the product Valve tests already has
+/// it in: a material with `$alpha 0.5` is alpha-modulating whoever draws it.
 pub fn render_state(kind: ShaderKind, vmt: &Vmt, textures: ResolvedTextures) -> RenderState {
+    render_state_with_modulation(kind, vmt, textures, false)
+}
+
+/// [`render_state`] with `SHADER_USING_ALPHA_MODULATION` set — the snapshot a
+/// draw whose modulation alpha is not 1 uses.
+///
+/// It is not simply "the same with blending turned on": `IsAlphaModulating()`
+/// is one of the three terms `EvaluateBlendRequirements` ORs, so the *result*
+/// still goes through `$additive`'s fork, still turns depth writes off, still
+/// loses alpha writes, and is still overridden wholesale by `$multiply`. One
+/// call, four consequences, which is why this re-runs the shadow phase rather
+/// than patching [`RenderState::blend`].
+pub fn render_state_modulated(
+    kind: ShaderKind,
+    vmt: &Vmt,
+    textures: ResolvedTextures,
+) -> RenderState {
+    render_state_with_modulation(kind, vmt, textures, true)
+}
+
+fn render_state_with_modulation(
+    kind: ShaderKind,
+    vmt: &Vmt,
+    textures: ResolvedTextures,
+    alpha_modulating: bool,
+) -> RenderState {
     let flags = vmt.flags;
     let mut state = RenderState::default();
 
@@ -3289,12 +3321,16 @@ pub fn render_state(kind: ShaderKind, vmt: &Vmt, textures: ResolvedTextures) -> 
     // `Refract` diverges from here on, so it returns rather than falling
     // through: see [`refract_render_state`].
     if kind == ShaderKind::Refract {
-        return refract_render_state(vmt, textures, state);
+        return refract_render_state(vmt, textures, state, alpha_modulating);
     }
 
     // --- EvaluateBlendRequirements ---------------------------------------
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
-    let alpha_modulating = param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
+    // `IsAlphaModulating()` (`shaderlib/BaseShader.cpp:656`) is the modulation
+    // flag alone; `$alpha` is here because the draw-time product Valve tests
+    // has it folded in already.
+    let alpha_modulating =
+        alpha_modulating || param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
     let translucent = alpha_modulating
         || flags.contains(MaterialFlags::VERTEXALPHA)
         || (base_texture_is_translucent(vmt, textures.base) && !alpha_test);
@@ -3399,6 +3435,7 @@ fn refract_render_state(
     vmt: &Vmt,
     textures: ResolvedTextures,
     mut state: RenderState,
+    alpha_modulating: bool,
 ) -> RenderState {
     let kind = ShaderKind::Refract;
     let flags = vmt.flags;
@@ -3421,7 +3458,8 @@ fn refract_render_state(
     // translucent by this test even though they are glass.
     let normal_map_is_translucent = textures.normal_map.is_some_and(|facts| facts.translucent);
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
-    let alpha_modulating = param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
+    let alpha_modulating =
+        alpha_modulating || param_value(kind, vmt, "$alpha").is_some_and(|var| var.as_f32() != 1.0);
 
     if defined("$normalmap") && envmap_name(vmt).is_none() {
         let translucent = alpha_modulating
@@ -3726,6 +3764,97 @@ mod tests {
         );
         assert_eq!(state.blend, BlendMode::Multiply);
         assert!(!state.write_alpha);
+    }
+
+    /// The second snapshot: `SHADER_USING_ALPHA_MODULATION` set, which is what
+    /// an instance drawn at `renderamt 200` selects.
+    #[test]
+    fn the_alpha_modulated_snapshot_is_the_shadow_phase_run_again() {
+        // A perfectly ordinary opaque material.
+        let opaque = vmt(r#""$basetexture" "wall""#);
+        assert_eq!(
+            render_state(
+                ShaderKind::UnlitGeneric,
+                &opaque,
+                ResolvedTextures::default()
+            )
+            .blend,
+            BlendMode::None
+        );
+
+        let modulated = render_state_modulated(
+            ShaderKind::UnlitGeneric,
+            &opaque,
+            ResolvedTextures::default(),
+        );
+        assert_eq!(modulated.blend, BlendMode::Blend);
+        assert!(
+            !modulated.depth_write,
+            "`EnableAlphaBlending` turns depth writes off too"
+        );
+        assert!(!modulated.write_alpha);
+
+        // It is not "blending on": every other term of the shadow phase still
+        // runs against it. `$additive` forks the result...
+        assert_eq!(
+            render_state_modulated(
+                ShaderKind::UnlitGeneric,
+                &vmt(r#""$additive" "1""#),
+                ResolvedTextures::default(),
+            )
+            .blend,
+            BlendMode::BlendAdd
+        );
+        // ...and `$multiply` still overrides it wholesale.
+        assert_eq!(
+            render_state_modulated(
+                ShaderKind::UnlitGeneric,
+                &vmt(r#""$multiply" "1""#),
+                ResolvedTextures::default(),
+            )
+            .blend,
+            BlendMode::Multiply
+        );
+        // The flags that have nothing to do with blending are untouched.
+        let decal = render_state_modulated(
+            ShaderKind::UnlitGeneric,
+            &vmt(r#""$decal" "1" "$nocull" "1""#),
+            ResolvedTextures::default(),
+        );
+        assert_eq!(decal.depth_bias, DepthBias::Decal);
+        assert!(!decal.cull);
+    }
+
+    /// `Refract`'s own shadow phase honours the modulation flag too — and only
+    /// where its own rules let it, which is the branch no shipped material
+    /// takes.
+    #[test]
+    fn refract_takes_alpha_modulation_only_without_an_envmap() {
+        // `$normalmap` and no `$envmap`: the branch that decides blending.
+        let state = render_state_modulated(
+            ShaderKind::Refract,
+            &refract_vmt(r#""$normalmap" "glass/refract_normal""#),
+            ResolvedTextures::default(),
+        );
+        assert_eq!(state.blend, BlendMode::Blend);
+
+        // With an `$envmap` the whole blend evaluation is skipped, so an
+        // alpha-modulated draw of one still draws opaque. All 29 of the game's
+        // `$model 1` refracting materials are here.
+        //
+        // `$envmap "env_cubemap"` is deliberately *not* used for this: it names
+        // no file, so [`envmap_name`] answers `None` and this branch is taken —
+        // where Valve's `bHasEnvmap` is `params[ENVMAP]->IsTexture()`
+        // (`refract_dx9_helper.cpp:127`) and the instance cubemap is a texture,
+        // so it would not be. That reduction is [`envmap_name`]'s and predates
+        // the blended pass; it becomes visible the day the per-instance cubemap
+        // is bound.
+        let state = render_state_modulated(
+            ShaderKind::Refract,
+            &refract_vmt(r#""$normalmap" "glass/refract_normal" "$envmap" "metal/shiny""#),
+            ResolvedTextures::default(),
+        );
+        assert_eq!(state.blend, BlendMode::None);
     }
 
     #[test]

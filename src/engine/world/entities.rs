@@ -42,6 +42,7 @@ use glam::{Mat4, Vec3};
 
 use super::light::LightCache;
 use super::props::models::{PropBatch, PropModel};
+use super::GeometryPass;
 use crate::engine::trace::CollisionBsp;
 use crate::filesystem::Vfs;
 use crate::materials::context::Pass;
@@ -94,6 +95,24 @@ pub struct ModelEntity {
     /// the pose**, which is how a prop that was never given an animation
     /// stands still.
     pub playback_rate: f32,
+    /// `GetColorModulation()` in `rgb` and `ComputeRenderAlpha()` in `a` —
+    /// `m_DiffuseModulation`, the vector
+    /// `CModelRenderSystem::SetupPerInstanceColorModulation`
+    /// (`modelrendersystem.cpp:1723`) hands every model draw.
+    ///
+    /// Computed on the server's side of the seam because that is where
+    /// `rendermode`, `rendercolor` and `renderamt` are parsed and where a
+    /// future `SetRenderMode` input would change them; `world/` only needs the
+    /// four numbers. An alpha below 1 puts the whole instance in the
+    /// translucent pass — see
+    /// [`GeometryPass::of_instance`](super::GeometryPass::of_instance).
+    ///
+    /// Measured: **30 of the game's 8,462 `prop_dynamic`s** set a translucent
+    /// render mode — 24 `kRenderTransTexture` and 6 `kRenderTransColor` — and
+    /// none sets a glow mode, which is the only render mode that would need
+    /// more than these four numbers (`IgnoresZBuffer()`, and with it a
+    /// per-draw depth-test override).
+    pub modulation: [f32; 4],
 }
 
 /// One row of [`EntityModels::sequences`] — what a `.mdl` says about one
@@ -146,6 +165,8 @@ struct Instance {
     cycle: f32,
     anim_time: f32,
     playback_rate: f32,
+    /// [`ModelEntity::modulation`], carried through to the draw.
+    modulation: [f32; 4],
     lighting: ModelLighting,
 }
 
@@ -307,6 +328,7 @@ impl EntityModels {
                 cycle: entity.cycle,
                 anim_time: entity.anim_time,
                 playback_rate: entity.playback_rate,
+                modulation: entity.modulation,
                 lighting: lighting.lighting_at(&mut tracer, entity.origin),
             });
         }
@@ -378,6 +400,7 @@ impl EntityModels {
             instance.cycle = entity.cycle;
             instance.anim_time = entity.anim_time;
             instance.playback_rate = entity.playback_rate;
+            instance.modulation = entity.modulation;
         }
     }
 
@@ -446,7 +469,88 @@ impl EntityModels {
         }
     }
 
+    /// Offers every batch of every visible instance that belongs in the
+    /// translucent pass, with the world-space centre the sort wants.
+    ///
+    /// The centre is the model's `view_bbmin`/`view_bbmax` centre under the
+    /// entity's transform — **not under its pose**. A bone that has moved is
+    /// not accounted for, which for a sort of whole entities against each other
+    /// is below the resolution of the answer: the largest travel in the port's
+    /// animated models is a chamber door's 53-unit slide, against models tens of
+    /// units across placed metres apart.
+    pub(crate) fn collect_translucent(&self, out: &mut dyn FnMut(Vec3, usize, usize)) {
+        for (index, instance) in self.instances.iter().enumerate() {
+            if !instance.visible {
+                continue;
+            }
+            let model = &self.models[instance.model];
+            let center = instance
+                .transform
+                .transform_point3((model.bounds.0 + model.bounds.1) * 0.5);
+            for (batch_index, batch) in model.batches.iter().enumerate() {
+                let pass =
+                    GeometryPass::of_instance(&batch.material, instance.modulation[3] != 1.0);
+                if pass == GeometryPass::Translucent {
+                    out(center, index, batch_index);
+                }
+            }
+        }
+    }
+
+    /// Records one (instance, batch) — the translucent list's unit of work.
+    pub(crate) fn draw_one(
+        &self,
+        pass: &mut Pass<'_>,
+        curtime: f32,
+        instance: usize,
+        batch: usize,
+    ) {
+        let instance = &self.instances[instance];
+        let model = &self.models[instance.model];
+        let Some(unlit) = self
+            .unlit
+            .as_ref()
+            .map(|buffer| buffer.range(0, model.vertex_count as u32))
+        else {
+            return;
+        };
+        pass.set_model_lighting(&instance.lighting);
+        pass.bind_static_light(&unlit);
+        let pose = model.pose(instance.sequence, self.cycle(instance, curtime));
+        self.record_batch(pass, model, instance, &pose, &model.batches[batch]);
+    }
+
+    /// One instance's one batch, bone run by bone run.
+    fn record_batch(
+        &self,
+        pass: &mut Pass<'_>,
+        model: &PropModel,
+        instance: &Instance,
+        pose: &[Mat4],
+        batch: &PropBatch,
+    ) {
+        let vertices = model.vertices.slice();
+        for run in &batch.bones {
+            let bone = pose
+                .get(usize::from(run.bone))
+                .copied()
+                .unwrap_or(Mat4::IDENTITY);
+            let indices = model.indices.range(run.first_index, run.index_count);
+            pass.draw_modulated(
+                &batch.material,
+                &vertices,
+                &indices,
+                instance.transform * bone,
+                instance.modulation,
+            );
+        }
+    }
+
     fn record(&self, pass: &mut Pass<'_>, curtime: f32, refracting: bool) {
+        let wanted = match refracting {
+            true => GeometryPass::Refracting,
+            false => GeometryPass::Opaque,
+        };
         for instance in &self.instances {
             if !instance.visible {
                 continue;
@@ -467,23 +571,13 @@ impl EntityModels {
 
             pass.set_model_lighting(&instance.lighting);
             pass.bind_static_light(&unlit);
-            let vertices = model.vertices.slice();
 
             for batch in &model.batches {
-                if batch.material.needs_frame_buffer_copy != refracting {
+                let translucent = instance.modulation[3] != 1.0;
+                if GeometryPass::of_instance(&batch.material, translucent) != wanted {
                     continue;
                 }
-                for run in &batch.bones {
-                    let bone = pose.get(usize::from(run.bone)).copied().unwrap_or(Mat4::IDENTITY);
-                    let indices = model.indices.range(run.first_index, run.index_count);
-                    pass.draw_modulated(
-                        &batch.material,
-                        &vertices,
-                        &indices,
-                        instance.transform * bone,
-                        [1.0; 4],
-                    );
-                }
+                self.record_batch(pass, model, instance, &pose, batch);
             }
         }
     }
@@ -643,6 +737,7 @@ mod tests {
                 cycle: e.cycle,
                 anim_time: e.anim_time,
                 playback_rate: e.playback_rate,
+                modulation: e.modulation,
             })
             .collect();
         assert!(
@@ -841,6 +936,7 @@ mod tests {
                 cycle: e.cycle,
                 anim_time: e.anim_time,
                 playback_rate: e.playback_rate,
+                modulation: e.modulation,
             })
             .collect();
         println!("{} chamber doors:", placements.len());
@@ -1179,6 +1275,7 @@ mod tests {
                 cycle: e.cycle,
                 anim_time: e.anim_time,
                 playback_rate: e.playback_rate,
+                modulation: e.modulation,
             })
             .collect();
         world.load_entity_models(&vfs, &mut materials, &device, &placements);

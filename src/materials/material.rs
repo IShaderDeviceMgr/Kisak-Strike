@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::filesystem::{keyvalues, Vfs};
 
 use super::error::VmtError;
-use super::pipeline::{BindLayouts, PipelineCache, RenderState};
+use super::pipeline::{BindLayouts, BlendMode, PipelineCache, RenderState};
 use super::shader::{self, Lighting, ResolvedTextures, ShaderKind, TextureDimension, TextureFacts};
 use super::texture::{Texture, TextureCache};
 use super::var::MaterialFlags;
@@ -46,7 +46,21 @@ pub struct Material {
     pub flags: MaterialFlags,
     /// The pipeline state its flags asked for. Half of a [`PipelineKey`]; the
     /// other half is the target, which the frame supplies.
+    ///
+    /// **This is the snapshot for a draw that is not alpha-modulating.** Use
+    /// [`state_for`](Material::state_for) rather than this field directly
+    /// unless the modulation is known to be 1.
     pub state: RenderState,
+    /// The same shadow phase re-run with `SHADER_USING_ALPHA_MODULATION` set.
+    ///
+    /// Valve's materials carry up to eight `StateSnapshot_t`s, one per
+    /// combination of modulation flags, and `CShaderAPIDx8::DrawMesh2`
+    /// (`shaderapidx8.cpp:4907`) picks one from the instance's diffuse
+    /// modulation (`:4944`). Only the alpha
+    /// bit is reachable in this port — the other three are the flashlight, the
+    /// editor and paint — so there are two, and
+    /// [`state_for`](Material::state_for) is the pick.
+    pub state_alpha_modulated: RenderState,
     /// `$color * $color2` with `$alpha` in `w`, ready for
     /// [`DrawUniforms::modulation`](super::uniforms::DrawUniforms::modulation).
     ///
@@ -99,6 +113,50 @@ impl Material {
     /// Binds the material's textures and parameters — bind group 1.
     pub fn bind_group(&self) -> &wgpu::BindGroup {
         &self.bind_group
+    }
+
+    /// Which of the two snapshots a draw with this much modulation alpha uses.
+    ///
+    /// `bIsAlphaModulating = pInstances[0].m_DiffuseModulation[3] != 1.0f`
+    /// (`shaderapidx8.cpp:4944`) — an **exact** comparison against one, on the
+    /// product of the material's own modulation and the instance's, which is
+    /// what [`Pass::draw_modulated`] passes in.
+    ///
+    /// [`Pass::draw_modulated`]: super::context::Pass::draw_modulated
+    pub fn state_for(&self, modulation_alpha: f32) -> RenderState {
+        match modulation_alpha != 1.0 {
+            true => self.state_alpha_modulated,
+            false => self.state,
+        }
+    }
+
+    /// Whether this belongs in the translucent pass — `CMaterial::IsTranslucent`
+    /// (`cmaterial.cpp:2979`).
+    ///
+    /// Valve ORs four things. Three of them have a counterpart here, and the
+    /// third is what makes this more than `blend != None`:
+    ///
+    /// - `::IsTranslucent( &m_ShaderRenderState )`, which is
+    ///   `m_AlphaBlendEnable && !m_AlphaBlendEnabledForceOpaque`
+    ///   (`shaderapidx8.cpp:4005`) — here [`RenderState::blend`], since
+    ///   `EnableBlendingForceOpaque` is `water.cpp`'s alone and water is not
+    ///   ported.
+    /// - `fAlphaModulation < 1.0f`, which is already folded into the blend
+    ///   above because [`render_state`](super::shader::render_state) reads
+    ///   `$alpha`. An *instance* alpha below 1 is not a property of the
+    ///   material and is the caller's to notice — see
+    ///   [`state_for`](Material::state_for).
+    /// - `m_pShader->IsTranslucent( params )`, which for every shader in the
+    ///   target set is `CBaseShader`'s `IS_FLAG_SET( MATERIAL_VAR_TRANSLUCENT )`
+    ///   (`BaseShader.cpp:723`). **This is not implied by the blend**:
+    ///   `TextureIsTranslucent` only says yes when the base texture really has
+    ///   an alpha channel, so `$translucent 1` over an opaque texture is
+    ///   classified translucent and yet draws with blending off. Valve sorts it
+    ///   into the translucent list all the same, and so does this.
+    /// - `MATERIAL_VAR_ALPHA_MODIFIED_BY_PROXY`, which no material can set
+    ///   here: proxies are unported.
+    pub fn is_translucent(&self) -> bool {
+        self.state.blend != BlendMode::None || self.flags.contains(MaterialFlags::TRANSLUCENT)
     }
 
     /// Resolves a parsed `.vmt` into something drawable.
@@ -222,6 +280,7 @@ impl Material {
             shader,
             flags: vmt.flags,
             state: shader::render_state(shader, vmt, resolved),
+            state_alpha_modulated: shader::render_state_modulated(shader, vmt, resolved),
             modulation: shader::modulation_color(shader, vmt),
             lighting: shader::lighting(shader, vmt),
             uses_bumpmapping: shader::uses_bumpmapping(vmt),
@@ -716,6 +775,13 @@ mod tests {
         // claim about *content*: nothing in the shipped game writes one.
         let mut envmap_tints = 0u32;
         let mut negative_envmap_tints = Vec::<String>::new();
+        // The translucent pass's own census: how much of the game blends, in
+        // which mode, and how much is translucent only because `$translucent`
+        // is set over a texture with no alpha channel — the one term of
+        // `CMaterial::IsTranslucent` that the blend mode does not imply.
+        let mut blends: std::collections::BTreeMap<String, u32> = Default::default();
+        let mut translucent = 0u32;
+        let mut translucent_without_blending = 0u32;
 
         // Validation errors arrive through the uncaptured-error handler rather
         // than as a `Result`, so they are latched and asserted at the end.
@@ -753,6 +819,17 @@ mod tests {
             }
             let entry = census.entry(material.shader.name()).or_default();
             entry.0 += 1;
+            if material.state.blend != BlendMode::None {
+                *blends
+                    .entry(format!("{:?}", material.state.blend))
+                    .or_default() += 1;
+            }
+            if material.is_translucent() {
+                translucent += 1;
+                if material.state.blend == BlendMode::None {
+                    translucent_without_blending += 1;
+                }
+            }
             let key = crate::materials::pipeline::PipelineKey {
                 shader: material.shader,
                 state: material.state,
@@ -771,6 +848,11 @@ mod tests {
         println!("  {unported:5} <the error material>");
         println!("{} pipelines for the whole set", pipelines.len());
         println!("{envmap_tints} materials define $envmaptint");
+        println!("{translucent} materials draw in the translucent pass:");
+        for (mode, count) in &blends {
+            println!("  {count:5} blend {mode}");
+        }
+        println!("  {translucent_without_blending:5} $translucent with no blending");
 
         assert!(
             negative_envmap_tints.is_empty(),

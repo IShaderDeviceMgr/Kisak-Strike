@@ -361,7 +361,7 @@ mod tests {
     use crate::materials::image_format::{ColorSpace, ImageFormat};
     use crate::materials::material::{MaterialCache, TextureFallbacks};
     use crate::materials::mesh::StaticLightVertex;
-    use crate::materials::pipeline::PipelineCache;
+    use crate::materials::pipeline::{BlendMode, PipelineCache};
     use crate::materials::shader::TextureDimension;
     use crate::materials::target::RenderTarget;
     use crate::materials::texture::{sampler_key, Texture, TextureCache};
@@ -851,6 +851,68 @@ mod tests {
         });
 
         assert_eq!(centre(&pixels), [200, 100, 50, 255]);
+    }
+
+    /// The alpha-modulated snapshot, end to end: an **opaque** material drawn
+    /// with a modulation alpha below 1 must blend.
+    ///
+    /// This is the whole of how an entity's `rendermode`/`renderamt` reaches
+    /// the GPU (`portdocs/PORTAL.md` §10 stage 1), and every link in it can
+    /// fail silently. `Material::state_for` has to pick
+    /// `state_alpha_modulated`; that snapshot has to have blending and no depth
+    /// writes; `UnlitGeneric` has to multiply the modulation alpha into its
+    /// output alpha; and `BlendMode::Blend` has to be `SrcAlpha` over
+    /// `OneMinusSrcAlpha`. Drop any one and the near quad draws solid.
+    #[test]
+    fn a_modulation_alpha_below_one_blends_an_opaque_material() {
+        let mut h = harness!(true);
+        // Both materials are as opaque as a `.vmt` can be: no `$translucent`,
+        // no `$alpha`, and a base texture with a full alpha channel.
+        let far = h.material("", h.texture([255, 0, 0, 255]));
+        let near = h.material("", h.texture([0, 0, 255, 255]));
+        assert_eq!(far.state.blend, BlendMode::None);
+        assert_eq!(near.state.blend, BlendMode::None);
+
+        // `Camera::screen`'s clip range is -1..1 in z, so a smaller z is
+        // nearer. Both quads cover the centre; the near one is drawn second,
+        // which is the order the translucent pass puts them in.
+        let (far_v, far_i) = quad([0.0, 0.0, 1.0, 1.0], 0.5);
+        let (near_v, near_i) = quad([0.0, 0.0, 1.0, 1.0], -0.5);
+
+        let shot = |h: &mut Harness, alpha: f32| {
+            h.render(|pass| {
+                let v = pass.vertices(&far_v);
+                let i = pass.indices(&far_i);
+                pass.draw(&far, &v, &i, Mat4::IDENTITY);
+                let v = pass.vertices(&near_v);
+                let i = pass.indices(&near_i);
+                pass.draw_modulated(&near, &v, &i, Mat4::IDENTITY, [1.0, 1.0, 1.0, alpha]);
+            })
+        };
+
+        // Alpha 1: the exact comparison in `state_for` keeps the opaque
+        // snapshot, so the near quad simply covers the far one.
+        let opaque = shot(&mut h, 1.0);
+        assert_eq!(centre(&opaque), [0, 0, 255, 255], "no modulation, no blend");
+
+        // Alpha 0.5: `0.5 * blue + 0.5 * red`. The target is `Rgba8Unorm` —
+        // deliberately not sRGB — so a byte is `round( value * 255 )` with no
+        // curve in the way, and 0.5 is 127 or 128.
+        let half = shot(&mut h, 0.5);
+        let blended = centre(&half);
+        assert!(
+            blended[0].abs_diff(128) <= 1 && blended[1] == 0 && blended[2].abs_diff(128) <= 1,
+            "expected a half-and-half blend of red under blue, got {blended:?}"
+        );
+
+        // And the snapshot really is a different pipeline, not the same one
+        // with a different uniform.
+        assert_ne!(near.state, near.state_alpha_modulated);
+        assert_eq!(near.state_alpha_modulated.blend, BlendMode::Blend);
+        assert!(
+            !near.state_alpha_modulated.depth_write,
+            "`EnableAlphaBlending` turns depth writes off as well"
+        );
     }
 
     #[test]

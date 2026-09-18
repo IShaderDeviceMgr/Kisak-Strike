@@ -291,6 +291,7 @@ pub struct ModelEntityState {
     pub cycle: f32,               // m_flCycle at anim_time
     pub anim_time: f32,           // m_flAnimTime — the SERVER's clock, see below
     pub playback_rate: f32,       // m_flPlaybackRate, signed; 0 holds the pose
+    pub modulation: [f32; 4],     // rendercolor + ComputeRenderAlpha
 }
 ```
 
@@ -298,6 +299,19 @@ Every entity that draws a studio model, and what its model is doing — the
 counterpart of [`brush_entity`](#the-brush-entity-seam), which answers "where is
 brush model `N`". `engine::world::entities::EntityModels` loads from it once and
 syncs against it every frame.
+
+**`modulation` is `GetColorModulation()` and `ComputeRenderAlpha()` as one vector** —
+`m_DiffuseModulation`, which `SetupPerInstanceColorModulation`
+(`modelrendersystem.cpp:1723`) hands every model draw. An alpha below 1 puts the whole
+instance in the renderer's translucent pass, and the alpha is the whole of the render-mode
+question: `kRenderNormal` substitutes 255 and every other mode reads `renderamt`, so a
+translucent mode at `renderamt 255` is opaque and a normal entity's `renderamt` is
+ignored. **30 of the game's 8,462 `prop_dynamic`s** set a translucent mode, 24
+`kRenderTransTexture` and 6 `kRenderTransColor`; none sets a glow mode, which is the only
+one that would need more than these four numbers. `EntityCore::modulation` is the
+computation, and `world/`'s `PlacedBrushModel::modulation` is the same arithmetic over the
+same three keys read from the `.bsp` lump instead — a brush entity's placement is resolved
+before the game has spawned anything.
 
 **The five animation fields are exactly `DT_BaseAnimating`'s**, which is not a
 coincidence: what Valve's client needs in order to pose a model is what this

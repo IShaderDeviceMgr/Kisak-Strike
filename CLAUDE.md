@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 938 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 954 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -419,6 +419,30 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   moves every tinted model, so it wants its own change; 48 materials set
   `$color`/`$color2`, 8 of them on a model shader.
 
+  **The translucent pass landed here too, as `portdocs/PORTAL.md` §10 stage 1**, and it
+  is the smallest change in this module with the widest reach: **1,212 of the game's
+  2,947 drawable materials are translucent** — 1,037 `Blend`, 71 `BlendAdd`, 35 `Add`,
+  0 `Multiply` and 69 that are `$translucent` over a texture with no alpha channel and so
+  blend nothing at all. What the plan called for was "a blend state in `PipelineCache`",
+  and **that half was already there**: the cache has honoured `BlendMode` since stage 3,
+  so those 1,212 have always drawn blended — with no *order*, recorded in batch order and
+  composited under whatever came after them. What was actually missing is two things.
+  **A material now carries two `RenderState`s**, which is Valve's up-to-eight
+  `StateSnapshot_t`s reduced to the one modulation flag this port can reach:
+  `Material::state_for( alpha )` picks `state_alpha_modulated` when the product of the
+  material's modulation and the instance's is not exactly 1, which is
+  `bIsAlphaModulating` (`shaderapidx8.cpp:4944`) — and it is the *only* way an entity's
+  render mode reaches the GPU, because **a render mode does not pick a blend equation**.
+  That was GoldSrc; in Source the equation is the material's and the mode survives as
+  "is this transparent", "how transparent", and `IgnoresZBuffer()` for the two glow modes,
+  which nothing ported sets. The second snapshot is the shadow phase *re-run*, not the
+  first with blending switched on — `$additive` still forks it, `$multiply` still
+  replaces it, depth writes still go off.
+  And **`Material::is_translucent` is `CMaterial::IsTranslucent`**, whose
+  `m_pShader->IsTranslucent( params )` term is the one the blend mode does not imply:
+  `$translucent` over an opaque texture is classified translucent and draws with blending
+  off, and Valve sorts it into the translucent list anyway.
+
   §10's "how are variants expressed" question is **closed**: six shaders in, none
   needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
   module with a uniform branch, `WorldVertexTransition` is a second *name* on
@@ -450,11 +474,26 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks, packs each
   surface's baked light into the material system's lightmap atlas, and groups faces into
   per-(material, page) batches at load — which is exactly what Valve's *sort ID* was.
-  **`World::draw` is now two calls and not one**: `draw` records the opaque scene and
+  **`World::draw` is now three calls and not one**: `draw` records the opaque scene,
   `draw_refracting` records the geometry whose material samples a copy of it, with
   `RenderContext::update_refract_texture` between them and the first pass *ended* — a
-  render pass cannot read its own attachment. `needs_frame_buffer_copy` says whether the
-  second pass is needed at all, and 71 of the game's 106 maps say yes. The split is per
+  render pass cannot read its own attachment — and `draw_translucent` records everything
+  blended, last and back to front. `needs_frame_buffer_copy` says whether the second pass
+  is needed at all, and 71 of the game's 106 maps say yes; `translucent_list(..).is_empty()`
+  says the same about the third, which matters for the same reason — every GPU this port
+  runs on is tile-based, so an empty pass is a full tile load and store for nothing.
+  `engine::world::GeometryPass` is the three-way decision and **refracting wins over
+  translucent** when a material is both; nothing in Portal 2 is.
+  The list is `CClientLeafSystem::SortEntities`' key —
+  `dot( center - eye, forward )`, ascending — walked in reverse, which is
+  `DrawTranslucentRenderables` counting down from the end of its array. What is *not*
+  ported is the leaf walk it interleaves with: Valve draws each leaf's translucent world
+  surfaces between the entities in it, and with no PVS there are no leaves, so world
+  batches are sorted by box centre along with everything else. **A world batch is the
+  whole map's worth of one material**, so that key is poor for them and the fix is the
+  leaf walk rather than a finer sort. Measured on `sp_a1_intro1`: **36 translucent
+  draws**, 4 of 79 world batches, 0 of 31 brush-model batches and 32 of 1,080 props.
+  The refracting split is per
   *batch* rather than per prop, which diverges from Valve on purpose: 60 of the 66 models
   in the game that wear a refracting material also wear an opaque one, and without a
   translucency sort the opaque half belongs in the opaque pass.
@@ -471,9 +510,16 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `Model::origin`. **The transform is `BrushModel::model_to_world` and is not cached**, so
   what is drawn and what `trace_model` collides with cannot drift apart — and **the
   placement is live now**: `World::sync_brush_models` takes it from the game server once a
-  frame, keyed by the `"*N"` model index, which is why doors open. Not honoured, and each
-  measured rather than guessed: the translucent render modes (five entities in the game;
-  they need a blended pass) and `renderamt`. `rendermode 10` **is** honoured, because it
+  frame, keyed by the `"*N"` model index, which is why doors open. **The render modes are
+  all honoured now**, since the blended pass landed:
+  `PlacedBrushModel::modulation` is `GetColorModulation` plus
+  `ComputeRenderAlpha`, and an alpha below 1 sends the entity's whole geometry to
+  `World::draw_translucent`. Measured, and **correcting a number this file used to give
+  as five**: of the game's 11,635 brush entities, 11,538 are `kRenderNormal`, 94 are
+  `kRenderNone` and **three** set a translucent mode — one in `mp_coop_teambts` at
+  `rendermode 1 renderamt 200` and two in `sp_a3_00` at `rendermode 5 renderamt 10`. No
+  brush entity sets a *glow* mode, which is the only one that would need more than four
+  numbers. `rendermode 10` is honoured for the separate reason that it
   is the one mode `C_BaseEntity::ShouldDraw` refuses — 94 entities; and `StartDisabled`
   **is** honoured for `func_brush`, which is the class whose `Spawn` reads it — 337 of
   the game's 2,502 start invisible and non-solid, where before `server/` stage 3 all of
@@ -1667,12 +1713,20 @@ triangles **361,072** — one more model and ten more draws, because a door is f
 runs and there are two of them. The timed share of the entity-model pass against the
 static-prop pass went from 0.71 to 0.76 in a back-to-back run where every figure was
 about 3x high, which is the thermal inflation the note below is about.
+**The translucent pass is the sixth sub-benchmark and the cheapest so far.** On
+`sp_a1_intro1` it is **39 draws for 0.22 ms** — the 36 above plus the three its entity
+models add, which `World::load` alone does not see — against 2.74 ms for `everything`
+in the same back-to-back (thermally inflated) run — about 8% — and most of that 0.22 is
+the pass itself rather than the draws: the 31-batch `brush models` line reads 0.19 ms in
+the same run. It costs about 3x per draw what the batched passes do, which is what a
+back-to-front sort *is*: one draw per instance instead of one per batch, and Valve pays
+it too.
 **The benchmark itself had to be fixed to see that**, and the fix is worth knowing about:
 `World::load` cannot read the models an entity places, because they are named by the
 entity lump it has just parsed — so `bench` now spawns a `Server` and calls
 `load_entity_models`, the same two calls `Level::load` makes. Before that it was silently
 measuring a frame with the largest thing in it missing.
-Run the five sub-benchmarks on their own — back to back they share thermal
+Run the six sub-benchmarks on their own — back to back they share thermal
 state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the
@@ -1690,7 +1744,12 @@ when it runs out.
 **`portdocs/SERVER.md` is finished** — all five stages — so the game layer's
 next steps are individual classes and subsystems rather than a staged plan.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
-The candidates, in the order they are worth doing:
+
+**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stage 1 of its five
+is done**: the blended pass, which is not portal work and is what §7's coloured oval was
+gated on. Stage 2 is the class drawn, stage 3 the hole in the wall's collision, stage 4
+the remote trace and the teleport. The other candidates, in the order they are worth
+doing:
 
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:

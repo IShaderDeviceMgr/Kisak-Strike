@@ -36,6 +36,7 @@ use crate::materials::uniforms::ModelLighting;
 use crate::materials::{Material, MaterialCache};
 use crate::studio::{vhv, StudioModel, Vhv};
 
+use super::super::GeometryPass;
 use super::Props;
 
 /// One material's slice of a model's indices.
@@ -512,6 +513,100 @@ impl PropModels {
         self.record(pass, props, true);
     }
 
+    /// Offers every batch of every instance that belongs in the translucent
+    /// pass, with the world-space centre the sort wants.
+    ///
+    /// A static prop has no `rendermode`, but it does have
+    /// `m_DiffuseModulation` in the `sprp` lump — so a prop can be
+    /// alpha-modulated even though nothing in the entity lump says so, and the
+    /// instance test below is that.
+    ///
+    /// The centre is the model's own `view_bbmin`/`view_bbmax` centre put
+    /// through the prop's transform, which is `BuildRenderListInfo_t`'s box
+    /// centre up to the difference between a transformed box and the box of a
+    /// transformed model. They agree for an axis-aligned prop and differ by at
+    /// most the box's own size for a turned one, which is below the resolution
+    /// a back-to-front sort of whole props has anyway.
+    pub(crate) fn collect_translucent(
+        &self,
+        props: &Props,
+        out: &mut dyn FnMut(Vec3, usize, usize, usize),
+    ) {
+        for (index, model) in self.models.iter().enumerate() {
+            let Some(model) = model else { continue };
+            let center = (model.bounds.0 + model.bounds.1) * 0.5;
+            for (batch_index, batch) in model.batches.iter().enumerate() {
+                for &i in &self.instances[index] {
+                    let prop = &props.instances[i];
+                    let pass =
+                        GeometryPass::of_instance(&batch.material, prop.modulation[3] != 1.0);
+                    if pass == GeometryPass::Translucent {
+                        out(
+                            prop.transform.transform_point3(center),
+                            index,
+                            batch_index,
+                            i,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records one (model, batch, instance) — the translucent list's unit of
+    /// work, where [`record`](PropModels::record) draws every instance of a
+    /// batch in one go.
+    ///
+    /// The batching the opaque path gets is exactly what a back-to-front sort
+    /// costs, and Valve pays it too: `DrawTranslucentRenderables` walks its
+    /// sorted list one renderable at a time.
+    pub(crate) fn draw_one(
+        &self,
+        pass: &mut Pass<'_>,
+        props: &Props,
+        model: usize,
+        batch: usize,
+        instance: usize,
+    ) {
+        let Some(model_data) = self.models.get(model).and_then(Option::as_ref) else {
+            return;
+        };
+        let batch = &model_data.batches[batch];
+        let prop = &props.instances[instance];
+
+        let lighting = match self.light_ranges[instance].is_some() {
+            true => BAKED_LIGHTING,
+            false => props
+                .lighting
+                .get(instance)
+                .copied()
+                .unwrap_or(FLAT_LIGHTING),
+        };
+        pass.set_model_lighting(&lighting);
+
+        let unlit = self
+            .unlit
+            .as_ref()
+            .map(|buffer| buffer.range(0, model_data.vertex_count as u32));
+        let light = match (&self.light, self.light_ranges[instance]) {
+            (Some(buffer), Some((first, count))) => Some(buffer.range(first, count)),
+            _ => unlit,
+        };
+        let Some(light) = light else { return };
+        pass.bind_static_light(&light);
+
+        let indices = model_data
+            .indices
+            .range(batch.first_index, batch.index_count);
+        pass.draw_modulated(
+            &batch.material,
+            &model_data.vertices.slice(),
+            &indices,
+            prop.transform,
+            prop.modulation,
+        );
+    }
+
     /// The body both entry points share. `refracting` selects which half of
     /// each model's batches to record.
     ///
@@ -526,6 +621,10 @@ impl PropModels {
         if self.is_empty() {
             return;
         }
+        let wanted = match refracting {
+            true => GeometryPass::Refracting,
+            false => GeometryPass::Opaque,
+        };
 
         // Phase one: one lighting slot per instance, taken up front.
         //
@@ -582,12 +681,17 @@ impl PropModels {
                 .as_ref()
                 .map(|buffer| buffer.range(0, model.vertex_count as u32));
             for batch in &model.batches {
-                if batch.material.needs_frame_buffer_copy != refracting {
-                    continue;
-                }
                 let indices = model.indices.range(batch.first_index, batch.index_count);
                 for &i in instances {
                     let prop = &props.instances[i];
+                    // Per instance rather than per batch: a prop whose
+                    // `m_DiffuseModulation` alpha is below 1 is translucent
+                    // even where the material is not.
+                    if GeometryPass::of_instance(&batch.material, prop.modulation[3] != 1.0)
+                        != wanted
+                    {
+                        continue;
+                    }
                     if let Some(&slot) = slots.get(i) {
                         pass.set_model_lighting_slot(slot);
                     }

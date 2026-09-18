@@ -68,6 +68,119 @@ use props::{PropModels, Props};
 /// wider indices.
 const MAX_BATCH_VERTICES: usize = 1 << 16;
 
+/// Which of the frame's three geometry passes a batch belongs in.
+///
+/// `CRendering3dView` has two lists, opaque and translucent, and calls
+/// `UpdateRefractTexture` from *inside* the translucent one when the renderable
+/// it is about to draw asks for it (`viewrender.cpp:6195`). `wgpu` cannot do
+/// that — a pass cannot sample the target it is writing — so the refracting
+/// draws became their own pass between the two, and the three-way answer is
+/// this enum.
+///
+/// **Refracting wins over translucent**, which is a decision and not an
+/// oversight: a material that both blends and reads the frame would be drawn in
+/// the refracting pass, unsorted, rather than in its sorted place among the
+/// blended geometry. Measured: all 29 of the game's `$model 1` `Refract`
+/// materials name an `$envmap` and so draw opaque (`refract_render_state`), and
+/// no world surface in the game names `Refract` at all — so nothing in Portal 2
+/// reaches the arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryPass {
+    /// [`World::draw`].
+    Opaque,
+    /// [`World::draw_refracting`], after the frame-buffer copy.
+    Refracting,
+    /// [`World::draw_translucent`], last, back to front.
+    Translucent,
+}
+
+impl GeometryPass {
+    /// Where this material's geometry is drawn.
+    pub fn of(material: &Material) -> GeometryPass {
+        if material.needs_frame_buffer_copy {
+            GeometryPass::Refracting
+        } else if material.is_translucent() {
+            GeometryPass::Translucent
+        } else {
+            GeometryPass::Opaque
+        }
+    }
+
+    /// Where an *instance's* geometry is drawn, given what its entity's render
+    /// mode says.
+    ///
+    /// `bIsTransparent = ( nAlpha != 255 ) || ( m_nTranslucencyType != OPAQUE )`
+    /// (`clientleafsystem.cpp:1947`): an entity that is transparent drags its
+    /// opaque materials into the translucent list with it, because the alpha it
+    /// is modulated by is what makes them transparent in the first place.
+    ///
+    /// > **One Valve quirk is deliberately not reproduced.** A renderable whose
+    /// > *model* is `RENDERABLE_IS_TWO_PASS` — opaque and translucent materials
+    /// > on one model — is put in **both** lists when its entity is also
+    /// > transparent, and the opaque-list copy is drawn with alpha **255**
+    /// > (`clientleafsystem.cpp:1955`), so half of it does not fade. Here the
+    /// > whole instance fades. It can only be seen on an entity that is both
+    /// > alpha-modulated and wearing a translucent material, and no entity in
+    /// > the shipped game is.
+    pub fn of_instance(material: &Material, instance_is_translucent: bool) -> GeometryPass {
+        match GeometryPass::of(material) {
+            GeometryPass::Opaque if instance_is_translucent => GeometryPass::Translucent,
+            pass => pass,
+        }
+    }
+}
+
+/// One frame's worth of blended geometry, sorted — built by
+/// [`World::translucent_list`] and drawn by [`World::draw_translucent`].
+///
+/// `CClientRenderablesList`'s `RENDER_GROUP_TRANSLUCENT`, which is likewise
+/// rebuilt every frame and thrown away. Opaque because the sort key and the
+/// item encoding are both `world/`'s business; a caller only ever asks whether
+/// it is empty.
+#[derive(Default)]
+pub struct TranslucentList(Vec<(f32, Translucent)>);
+
+impl TranslucentList {
+    /// Whether there is anything to draw, and therefore whether the pass is
+    /// worth opening at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many draws it will record. Reported by the `translucent` half of the
+    /// frame statistics and by the tests.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// One entry of the translucent list — `CClientRenderablesList::CEntry` reduced
+/// to the four kinds of geometry this port draws.
+///
+/// Indices rather than references because the list is built while [`World`] is
+/// borrowed immutably and drawn the same way; each arm names its owner and the
+/// owner does the recording.
+#[derive(Debug, Clone, Copy)]
+enum Translucent {
+    /// An index into [`World::batches`].
+    World(usize),
+    BrushModel {
+        /// An index into [`World::brush_model_geometry`].
+        geometry: usize,
+        batch: usize,
+    },
+    Prop {
+        model: usize,
+        batch: usize,
+        instance: usize,
+    },
+    Entity {
+        instance: usize,
+        batch: usize,
+    },
+}
+
 /// Anything that stops a map from loading.
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
@@ -100,8 +213,24 @@ pub struct Batch {
     /// A material whose surfaces did not all fit on one page is several
     /// batches.
     pub lightmap_page: u32,
+    /// The axis-aligned bounds of everything in it, in the model's own space —
+    /// world space for the world, the brush model's frame for a brush entity.
+    ///
+    /// Its one consumer is the translucent sort, which wants
+    /// `BuildRenderListInfo_t::m_vecMins`/`m_vecMaxs`' box centre
+    /// (`clientleafsystem.cpp:2001`). A degenerate `(MAX, MIN)` pair for an
+    /// empty batch is deliberate: an empty batch records no draw, so its centre
+    /// is never asked for.
+    pub bounds: (Vec3, Vec3),
     vertices: VertexBuffer,
     indices: IndexBuffer,
+}
+
+impl Batch {
+    /// The centre of [`bounds`](Batch::bounds) — the sort key's input.
+    pub fn center(&self) -> Vec3 {
+        (self.bounds.0 + self.bounds.1) * 0.5
+    }
 }
 
 /// Where the player starts when a map is loaded.
@@ -569,6 +698,123 @@ impl World {
         self.entity_models.draw_refracting(pass, curtime);
     }
 
+    /// Everything blended in this map, sorted back to front for this view.
+    ///
+    /// This is `CClientLeafSystem::BuildRenderablesList` plus
+    /// `SortEntities` (`clientleafsystem.cpp:1985`): built fresh every frame,
+    /// because the order depends on where the camera is. `eye` and `forward`
+    /// are the camera's — [`Camera::eye`] and [`Camera::forward`].
+    ///
+    /// Ask before opening the pass and skip it when the list is empty. Opening
+    /// a render pass over the scene target is not free on a tile-based GPU,
+    /// which is every GPU this port runs on: `Load::Keep` is a full tile load
+    /// and the store at the end is another. The same argument
+    /// [`needs_frame_buffer_copy`](World::needs_frame_buffer_copy) makes.
+    ///
+    /// [`Camera::eye`]: crate::materials::context::Camera::eye
+    /// [`Camera::forward`]: crate::materials::context::Camera::forward
+    pub fn translucent_list(&self, eye: Vec3, forward: Vec3) -> TranslucentList {
+        let mut list = TranslucentList::default();
+        let key = |center: Vec3| (center - eye).dot(forward);
+
+        for (index, batch) in self.batches.iter().enumerate() {
+            if GeometryPass::of(&batch.material) == GeometryPass::Translucent {
+                list.0
+                    .push((key(batch.center()), Translucent::World(index)));
+            }
+        }
+
+        for (index, geometry) in self.brush_model_geometry.iter().enumerate() {
+            let placed = &self.brush_models[geometry.placement];
+            if !placed.visible {
+                continue;
+            }
+            let model_to_world = placed.model.model_to_world();
+            for batch in 0..geometry.batches.len() {
+                if self.brush_model_batch_pass(index, batch) != GeometryPass::Translucent {
+                    continue;
+                }
+                let center = model_to_world.transform_point3(geometry.batches[batch].center());
+                list.0.push((
+                    key(center),
+                    Translucent::BrushModel {
+                        geometry: index,
+                        batch,
+                    },
+                ));
+            }
+        }
+
+        self.prop_models
+            .collect_translucent(&self.props, &mut |center, model, batch, instance| {
+                list.0.push((
+                    key(center),
+                    Translucent::Prop {
+                        model,
+                        batch,
+                        instance,
+                    },
+                ))
+            });
+        self.entity_models
+            .collect_translucent(&mut |center, instance, batch| {
+                list.0
+                    .push((key(center), Translucent::Entity { instance, batch }))
+            });
+
+        // Ascending along the view direction, which is `SortEntities`' order;
+        // `DrawTranslucentRenderables` then counts *down* from the end, so the
+        // draw below walks it in reverse.
+        list.0.sort_by(|a, b| a.0.total_cmp(&b.0));
+        list
+    }
+
+    /// Records everything in a [`translucent_list`](World::translucent_list),
+    /// farthest first.
+    ///
+    /// Call in a pass against the same target with
+    /// [`Load::Keep`](crate::materials::context::Load::Keep), **after**
+    /// [`draw_refracting`](World::draw_refracting).
+    ///
+    /// # What this is a reduction of
+    ///
+    /// `CRendering3dView::DrawTranslucentRenderables` (`viewrender.cpp:6369`)
+    /// walks the frame's leaves **backwards**, drawing each leaf's translucent
+    /// *world* surfaces and then the translucent *entities* that live in it,
+    /// where the entities within one leaf were pre-sorted on
+    /// `dot( boxCenter - viewOrigin, viewForward )`.
+    ///
+    /// This port has no visibility, so there are no leaves to walk and the leaf
+    /// interleave has nothing to reduce to. What is left is the sort, applied
+    /// to everything at once — and applied to *world* batches too, which Valve
+    /// never sorts because its leaf walk had already ordered them.
+    ///
+    /// **A world batch is the whole map's worth of one material**, so its box
+    /// centre is a poor sort key and two overlapping translucent world
+    /// materials can come out in the wrong order. That is the cost of having no
+    /// PVS, it is bounded by how few such materials a map has, and the fix is
+    /// the leaf walk rather than a finer sort.
+    pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList) {
+        for (_, item) in list.0.iter().rev() {
+            match *item {
+                Translucent::World(batch) => self.draw_world_batch(pass, batch),
+                Translucent::BrushModel { geometry, batch } => {
+                    self.draw_brush_model_batch(pass, geometry, batch)
+                }
+                Translucent::Prop {
+                    model,
+                    batch,
+                    instance,
+                } => self
+                    .prop_models
+                    .draw_one(pass, &self.props, model, batch, instance),
+                Translucent::Entity { instance, batch } => {
+                    self.entity_models.draw_one(pass, curtime, instance, batch)
+                }
+            }
+        }
+    }
+
     /// Loads and places the models the game's entities name.
     ///
     /// Separate from [`load`](World::load), and after it, because the entity
@@ -694,7 +940,7 @@ impl World {
     /// never disagree with what `trace/` collides against — see
     /// [`BrushModelGeometry`].
     pub(crate) fn draw_brush_models(&self, pass: &mut Pass<'_>) {
-        for geometry in &self.brush_model_geometry {
+        for (index, geometry) in self.brush_model_geometry.iter().enumerate() {
             let placed = &self.brush_models[geometry.placement];
             // `EF_NODRAW`, which a `func_brush` toggles. The `rendermode 10`
             // test happened at load, because that one cannot change; this one
@@ -702,34 +948,62 @@ impl World {
             if !placed.visible {
                 continue;
             }
-            let model_to_world = placed.model.model_to_world();
-            for batch in &geometry.batches {
-                pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
-                pass.draw(
-                    &batch.material,
-                    &batch.vertices.slice(),
-                    &batch.indices.slice(),
-                    model_to_world,
-                );
+            for batch in 0..geometry.batches.len() {
+                if self.brush_model_batch_pass(index, batch) != GeometryPass::Opaque {
+                    continue;
+                }
+                self.draw_brush_model_batch(pass, index, batch);
             }
         }
     }
 
+    /// Which pass one brush entity's batch is drawn in.
+    fn brush_model_batch_pass(&self, geometry: usize, batch: usize) -> GeometryPass {
+        let geometry = &self.brush_model_geometry[geometry];
+        let placed = &self.brush_models[geometry.placement];
+        GeometryPass::of_instance(&geometry.batches[batch].material, placed.is_translucent())
+    }
+
+    /// Records one brush entity's batch under its entity's transform and
+    /// modulation.
+    fn draw_brush_model_batch(&self, pass: &mut Pass<'_>, geometry: usize, batch: usize) {
+        let geometry = &self.brush_model_geometry[geometry];
+        let placed = &self.brush_models[geometry.placement];
+        let batch = &geometry.batches[batch];
+        pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
+        pass.draw_modulated(
+            &batch.material,
+            &batch.vertices.slice(),
+            &batch.indices.slice(),
+            placed.model.model_to_world(),
+            placed.modulation(),
+        );
+    }
+
     pub(crate) fn draw_brushes(&self, pass: &mut Pass<'_>) {
-        for batch in &self.batches {
-            // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
-            // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
-            // batches are page-ordered within a material, so consecutive draws
-            // usually name the same page, and a shader that does not read one
-            // ignores it.
-            pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
-            pass.draw(
-                &batch.material,
-                &batch.vertices.slice(),
-                &batch.indices.slice(),
-                glam::Mat4::IDENTITY,
-            );
+        for (index, batch) in self.batches.iter().enumerate() {
+            if GeometryPass::of(&batch.material) != GeometryPass::Opaque {
+                continue;
+            }
+            self.draw_world_batch(pass, index);
         }
+    }
+
+    /// Records one of the world model's batches, at the identity.
+    fn draw_world_batch(&self, pass: &mut Pass<'_>, index: usize) {
+        let batch = &self.batches[index];
+        // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
+        // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
+        // batches are page-ordered within a material, so consecutive draws
+        // usually name the same page, and a shader that does not read one
+        // ignores it.
+        pass.bind_lightmap_page(self.lightmaps.page(batch.lightmap_page));
+        pass.draw(
+            &batch.material,
+            &batch.vertices.slice(),
+            &batch.indices.slice(),
+            glam::Mat4::IDENTITY,
+        );
     }
 
     /// The centre of the world's bounding box — where the view goes when the
@@ -877,6 +1151,18 @@ impl MeshVertices {
             MeshVertices::World(v) => MeshVertices::World(std::mem::take(v)),
         }
     }
+
+    /// The axis-aligned bounds of the positions in it — see [`Batch::bounds`].
+    fn bounds(&self) -> (Vec3, Vec3) {
+        let positions: &mut dyn Iterator<Item = [f32; 3]> = match self {
+            MeshVertices::Simple(v) => &mut v.iter().map(|v| v.position),
+            MeshVertices::World(v) => &mut v.iter().map(|v| v.position),
+        };
+        positions.fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |b, p| {
+            let p = Vec3::from(p);
+            (b.0.min(p), b.1.max(p))
+        })
+    }
 }
 
 /// Selects the faces worth drawing in one model and groups them by material
@@ -964,6 +1250,7 @@ fn upload_batches(
         .map(|mesh| Batch {
             material: Arc::clone(&resolved[mesh.material.as_str()].0),
             lightmap_page: mesh.lightmap_page,
+            bounds: mesh.vertices.bounds(),
             vertices: match &mesh.vertices {
                 MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
                 MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
@@ -1303,11 +1590,18 @@ pub struct PlacedBrushModel {
     /// 0 (`kRenderNormal`) when the key is absent.
     ///
     /// Stored as the file's number rather than interpreted, because the
-    /// interpretation differs by consumer: [`RENDER_NONE`] means "do not draw"
-    /// and is the one value [`World`] acts on, while the translucent modes
-    /// 1-5 and 7-9 need a blended pass that does not exist. Collision ignores
-    /// it entirely — a `rendermode 10` brush is invisible and still solid.
+    /// interpretation differs by consumer: [`RENDER_NONE`] means "do not draw",
+    /// the translucent modes send the whole model to
+    /// [`World::draw_translucent`], and collision ignores it entirely — a
+    /// `rendermode 10` brush is invisible and still solid.
     pub render_mode: i32,
+    /// `m_clrRender` — `rendercolor` in `rgb` and `renderamt` in `a`, as the
+    /// file spells them, both defaulting to 255.
+    ///
+    /// Together with [`render_mode`](PlacedBrushModel::render_mode) this is the
+    /// whole of `CClientAlphaProperty::ComputeRenderAlpha`'s input; see
+    /// [`modulation`](PlacedBrushModel::modulation).
+    pub render_color: [u8; 4],
     /// Whether the game says to draw this one *right now* — `EF_NODRAW`
     /// cleared.
     ///
@@ -1349,6 +1643,52 @@ pub struct PlacedBrushModel {
     /// `false` until [`sync_brush_models`](World::sync_brush_models) hears
     /// otherwise.
     pub owned: bool,
+}
+
+impl PlacedBrushModel {
+    /// Whether it belongs in the translucent pass **because of its entity**
+    /// rather than because of its materials.
+    ///
+    /// `bIsTransparent = ( nAlpha != 255 ) || …` (`clientleafsystem.cpp:1947`)
+    /// with `nAlpha` from `ComputeRenderAlpha`: a mode other than
+    /// `kRenderNormal` substitutes `renderamt` for the 255 an ordinary entity
+    /// gets, and anything below 255 is transparent. A translucent mode with
+    /// `renderamt 255` is therefore **opaque**, which is Valve's and is not a
+    /// rounding of it.
+    pub fn is_translucent(&self) -> bool {
+        self.modulation()[3] != 1.0
+    }
+
+    /// `GetColorModulation` and `ComputeRenderAlpha` as one vector — the
+    /// `m_DiffuseModulation` `SetupPerInstanceColorModulation`
+    /// (`modelrendersystem.cpp:1723`) hands every brush model draw.
+    ///
+    /// Two things about it are worth knowing.
+    ///
+    /// **The render mode does not choose a blend equation.** In GoldSrc it
+    /// did; in Source the modes survive only as "is this transparent" and
+    /// "how transparent", plus `IgnoresZBuffer()` for the two glow modes
+    /// (`clientalphaproperty.h:112`) — the equation comes from the material.
+    /// The glow modes are not honoured here and cost nothing: of the game's
+    /// 11,635 brush entities **three** set a translucent mode at all, one
+    /// `kRenderTransColor` and two `kRenderTransAdd`, and none is a glow.
+    ///
+    /// **The colour goes through in gamma**, like `$color`, which
+    /// `rustdocs/MATERIALS.md` records as a standing divergence for the two
+    /// model shaders. All three shipped entities write `255 255 255`, so
+    /// nothing in Portal 2 can see it either way.
+    pub fn modulation(&self) -> [f32; 4] {
+        let alpha = match self.render_mode {
+            0 => 255,
+            _ => self.render_color[3],
+        };
+        [
+            f32::from(self.render_color[0]) / 255.0,
+            f32::from(self.render_color[1]) / 255.0,
+            f32::from(self.render_color[2]) / 255.0,
+            f32::from(alpha) / 255.0,
+        ]
+    }
 }
 
 /// Where a brush entity is, and whether it counts — the answer
@@ -1412,22 +1752,23 @@ pub struct BrushModelGeometry {
 ///
 /// # What is deliberately not read
 ///
-/// Three entity keys change whether a brush entity is drawn in the shipped game
-/// and are ignored here, because acting on them means running the game logic
-/// that owns them. Each is recorded with how much it actually costs, measured
-/// over the 106 shipped maps:
+/// One entity key changes whether a brush entity is drawn in the shipped game
+/// and is ignored here, because acting on it means running the game logic that
+/// owns it:
 ///
 /// - **`StartDisabled`** — a `func_brush` that starts switched off is invisible
 ///   *and* non-solid until something enables it. That is `CFuncBrush`'s spawn
 ///   code and so `server/`'s, the same argument [`PlacedBrushModel`] makes for
 ///   solidity. **86 of the 2,608 drawable brush entities** set it, so it is a
 ///   footnote rather than a visible problem.
-/// - **The translucent render modes** (1-5, 7-9). Honouring them needs a sorted
-///   blended pass, which does not exist; they draw opaque. Only
-///   [`RENDER_NONE`] is acted on, which is also the only one
-///   `C_BaseEntity::ShouldDraw` rejects. Five entities in the whole game set a
-///   translucent mode.
-/// - **`renderamt`**, for the same reason — there is nothing to fade into.
+///
+/// `rendermode`, `rendercolor` and `renderamt` **are** read, and have been
+/// since the translucent pass landed — see
+/// [`PlacedBrushModel::modulation`]. Measured over the 106 shipped maps:
+/// 11,538 brush entities are `kRenderNormal`, 94 are [`RENDER_NONE`] and
+/// **three** set a translucent mode — `mp_coop_teambts`' `func_brush` at
+/// `rendermode 1 renderamt 200` and two in `sp_a3_00` at `rendermode 5
+/// renderamt 10`.
 pub(crate) fn find_brush_models(
     entities: &[bsp::Entity],
     collision: &CollisionBsp,
@@ -1450,6 +1791,22 @@ pub(crate) fn find_brush_models(
                     entity.vector("origin").unwrap_or(Vec3::ZERO),
                     entity.vector("angles").unwrap_or(Vec3::ZERO),
                 )?,
+                // `rendercolor` fills rgb and `renderamt` then overwrites the
+                // alpha, which is `CBaseEntity::KeyValue`'s order and is why
+                // the two are one field — `server/`'s `EntityCore` spells it
+                // the same way. Both default to 255.
+                render_color: {
+                    let mut color = [255u8; 4];
+                    if let Some(rgb) = entity.get("rendercolor") {
+                        for (i, field) in rgb.split_whitespace().take(3).enumerate() {
+                            color[i] = field.parse().unwrap_or(255);
+                        }
+                    }
+                    if let Some(amt) = entity.get("renderamt") {
+                        color[3] = amt.trim().parse().unwrap_or(255);
+                    }
+                    color
+                },
                 // Absent, or unparseable, is `kRenderNormal` — the same
                 // default the entity system's keyvalue would have left.
                 render_mode: entity
@@ -2152,6 +2509,7 @@ mod tests {
                 .brush_model(1, Vec3::ZERO, Vec3::ZERO)
                 .expect("model 1"),
             render_mode: 0,
+            render_color: [255; 4],
             visible: true,
             solid: true,
             owned: false,
@@ -2245,14 +2603,175 @@ mod tests {
         assert_eq!(placed.len(), 1, "still placed, and still solid");
         assert_eq!(placed[0].render_mode, RENDER_NONE);
 
-        // The translucent modes are *not* honoured — they need a blended pass
-        // — so they must read as ordinary and be drawn rather than silently
-        // dropped.
+        // Every other mode is drawn rather than silently dropped — the
+        // translucent ones in the translucent pass, which is a question about
+        // the alpha rather than about being drawn at all.
         for mode in ["0", "1", "5", "9"] {
             let bsp = with_brush_model(1, &format!("\"rendermode\" \"{mode}\"\n"));
             let collision = CollisionBsp::build(&bsp);
             let placed = find_brush_models(&bsp.entities(), &collision);
             assert_ne!(placed[0].render_mode, RENDER_NONE, "mode {mode}");
+        }
+    }
+
+    /// `ComputeRenderAlpha` and `GetColorModulation`, from the keys the lump
+    /// carries.
+    #[test]
+    fn a_translucent_render_mode_is_what_reads_renderamt() {
+        // `kRenderNormal` ignores `renderamt` entirely — the 255 is
+        // substituted, not read — so a mapper who wrote one by accident does
+        // not get a see-through wall. 11,538 of the game's 11,635 brush
+        // entities are here.
+        let bsp = with_brush_model(1, "\"renderamt\" \"10\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+        assert_eq!(placed[0].modulation(), [1.0; 4]);
+        assert!(!placed[0].is_translucent());
+
+        // `sp_a3_00`'s two `func_brush`es, exactly.
+        let bsp = with_brush_model(1, "\"rendermode\" \"5\"\n\"renderamt\" \"10\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+        assert_eq!(placed[0].modulation()[3], 10.0 / 255.0);
+        assert!(placed[0].is_translucent());
+
+        // A translucent mode at full strength is opaque, which is
+        // `bIsTransparent`'s `nAlpha != 255` and not a rounding of it.
+        let bsp = with_brush_model(1, "\"rendermode\" \"1\"\n\"renderamt\" \"255\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+        assert!(!placed[0].is_translucent());
+
+        // `rendercolor` fills rgb and `renderamt` then overwrites the alpha,
+        // whatever order the lump wrote them in — and the colour applies at
+        // `kRenderNormal` too, because `GetColorModulation` is unconditional.
+        let bsp = with_brush_model(1, "\"rendercolor\" \"255 128 0 7\"\n\"renderamt\" \"64\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let placed = find_brush_models(&bsp.entities(), &collision);
+        assert_eq!(placed[0].render_color, [255, 128, 0, 64]);
+        assert_eq!(placed[0].modulation(), [1.0, 128.0 / 255.0, 0.0, 1.0]);
+    }
+
+    /// A real map's translucent list: what goes in it, and in what order.
+    ///
+    /// The measurement `portdocs/PORTAL.md` §10 stage 1 asks for — "testable
+    /// against `rendermode` on a shipped brush entity with no portal in sight".
+    /// It defaults to **`sp_a3_00`**, the one map in the game with a brush
+    /// entity that is translucent because of its *entity* rather than its
+    /// materials: two `func_brush`es at `rendermode 5 renderamt 10`. Set
+    /// `KISAK_MAP` for any other.
+    ///
+    /// Needs a GPU, because a `World` uploads geometry and the list is decided
+    /// by resolved materials.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release translucent_list -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
+    fn a_shipped_maps_translucent_list_is_sorted_and_holds_its_blended_geometry() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("skipping: no usable device");
+            return;
+        };
+
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+        let mut materials = crate::materials::MaterialCache::new(&device, &queue);
+        let map = std::env::var("KISAK_MAP").unwrap_or_else(|_| "sp_a3_00".to_owned());
+        let world = World::load(&vfs, &mut materials, &device, &map).expect("the map loads");
+
+        // Every brush entity the *entity* makes translucent, whatever its
+        // materials say. On `sp_a3_00` this is `*10` and `*12`.
+        let by_entity: Vec<&PlacedBrushModel> = world
+            .brush_models
+            .iter()
+            .filter(|placed| placed.is_translucent())
+            .collect();
+        for placed in &by_entity {
+            println!(
+                "  translucent entity: {} *{} rendermode {} alpha {:.3}",
+                placed.classname,
+                placed.index,
+                placed.render_mode,
+                placed.modulation()[3]
+            );
+        }
+
+        // Two views, so that the order is checked against a camera and not
+        // against an accident of construction order.
+        for forward in [Vec3::X, -Vec3::X] {
+            let list = world.translucent_list(world.center(), forward);
+            let (mut world_batches, mut brush, mut props) = (0, 0, 0);
+            for (_, item) in &list.0 {
+                match item {
+                    Translucent::World(_) => world_batches += 1,
+                    Translucent::BrushModel { .. } => brush += 1,
+                    Translucent::Prop { .. } => props += 1,
+                    Translucent::Entity { .. } => {}
+                }
+            }
+            println!(
+                "{map}, looking {forward:?}: {} translucent draws \
+                 ({world_batches} of {} world batches, {brush} of {} brush-model batches, \
+                 {props} of {} props)",
+                list.len(),
+                world.batches.len(),
+                world
+                    .brush_model_geometry
+                    .iter()
+                    .map(|g| g.batches.len())
+                    .sum::<usize>(),
+                world.stats.props,
+            );
+
+            // The list is walked in reverse, so ascending here is farthest
+            // first there — `SortEntities` plus `DrawTranslucentRenderables`'
+            // countdown.
+            for pair in list.0.windows(2) {
+                assert!(
+                    pair[0].0 <= pair[1].0,
+                    "the list must be ascending along the view direction"
+                );
+            }
+        }
+
+        // Every translucent brush entity with drawable geometry is in the
+        // list — which is the assertion with teeth, because the geometry is
+        // opaque and only the entity's alpha puts it there.
+        let list = world.translucent_list(world.center(), Vec3::X);
+        for placed in &by_entity {
+            let Some(geometry) = world
+                .brush_model_geometry
+                .iter()
+                .position(|g| world.brush_models[g.placement].index == placed.index)
+            else {
+                continue;
+            };
+            assert!(
+                list.0.iter().any(|(_, item)| matches!(
+                    item,
+                    Translucent::BrushModel { geometry: g, .. } if *g == geometry
+                )),
+                "*{} is translucent and drawable and is not in the list",
+                placed.index
+            );
         }
     }
 

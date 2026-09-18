@@ -228,6 +228,8 @@ pub fn load(vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device, nam
 pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
 pub fn needs_frame_buffer_copy(&self) -> bool;
 pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
+pub fn translucent_list(&self, eye: Vec3, forward: Vec3) -> TranslucentList;
+pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList);
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
@@ -303,6 +305,57 @@ materials are on models, and **no brush face or displacement in the shipped game
 that shader**. The other inhabitants of Valve's translucent list — particles, sprites,
 the water surface — are not ported.
 
+#### The translucent pass
+
+A fourth step follows the refracting one, and it is the last thing in the frame:
+
+```rust
+let translucent = world.translucent_list(camera.eye, camera.forward());
+if !translucent.is_empty() {
+    let mut pass = … Load::Keep …;
+    world.draw_translucent(&mut pass, curtime, &translucent);
+}
+```
+
+`translucent_list` is `CClientLeafSystem::BuildRenderablesList` plus `SortEntities`
+(`clientleafsystem.cpp:1985`): every batch of every instance whose material blends, or
+whose *entity* is alpha-modulated, with a sort key of
+`dot( boxCenter - viewOrigin, viewForward )`. The list comes back **ascending**, which is
+Valve's order, and `draw_translucent` walks it in reverse — farthest first — which is
+`DrawTranslucentRenderables`' countdown from the end of the array.
+
+It is rebuilt every frame because the order depends on where the camera is, and it is
+built *before* the pass is opened so that a map with nothing blended pays neither the pass
+nor the tile load and store it costs. `TranslucentList` is opaque; `is_empty()` and
+`len()` are all a caller needs.
+
+**What this is a reduction of.** `DrawTranslucentRenderables` walks the frame's leaves
+backwards, drawing each leaf's translucent *world* surfaces and then the translucent
+entities in that leaf. This port has no visibility, so there are no leaves and the
+interleave has nothing to reduce to; what is left is the sort, applied to everything at
+once — including world batches, which Valve never sorts because the leaf walk had already
+ordered them. **A world batch is the whole map's worth of one material**, so its box
+centre is a poor sort key and two overlapping translucent world materials can come out in
+the wrong order. The fix is the leaf walk, not a finer sort.
+
+**Sorting costs the batching.** Each list entry is one draw of one instance, where the
+opaque path draws every instance of a batch back to back. That is what a back-to-front
+order *is*, and Valve pays it too.
+
+**How much of the game is in it.** 1,212 of the mounted game's 2,947 drawable materials
+are translucent — 1,037 `Blend`, 71 `BlendAdd`, 35 `Add`, 0 `Multiply`, and 69 that are
+`$translucent` over a texture with no alpha channel and so blend nothing. Those 69 are the
+`CMaterial::IsTranslucent` term the blend mode does not imply, and they are in the list
+for the same reason Valve puts them there.
+
+> **The blending itself is not new and this is worth being precise about.**
+> `PipelineCache` has honoured `BlendMode` since stage 3 and `render_state` has produced
+> it since then, so those 1,212 materials have always drawn blended. What they did not
+> have was an *order*: they were recorded in batch order, interleaved with opaque
+> geometry, so anything drawn after them was composited on top. `portdocs/PORTAL.md` §7.3
+> describes stage 1 as "a blend state in `PipelineCache`" and that half was already
+> there; the pass, the sort and the alpha-modulated snapshot are what it actually added.
+
 `models` is the `.bsp`'s model lump kept for somebody else: the *server* needs it, because
 a `func_door` computes how far it slides from the size of its own brushes and that number
 is in the file rather than in the entity lump (`UTIL_SetModel`, `game/server/util.cpp:1426`).
@@ -324,10 +377,13 @@ pub struct PlacedBrushModel {
     pub index: usize,        // the model the entity named: "*12" is 12
     pub model: BrushModel,   // the placement, shared with trace/
     pub render_mode: i32,    // RenderMode_t, 0 when the key is absent
+    pub render_color: [u8; 4], // rendercolor in rgb, renderamt in a
     pub visible: bool,       // EF_NODRAW clear — live, from the server
     pub solid: bool,         // IsSolid() — ditto
     pub owned: bool,         // …and whether the server answered at all
 }
+pub fn modulation(&self) -> [f32; 4];   // GetColorModulation + ComputeRenderAlpha
+pub fn is_translucent(&self) -> bool;   // …whose alpha is not 1
 
 pub struct BrushModelGeometry {
     pub placement: usize,    // which entry of World::brush_models
@@ -419,6 +475,24 @@ differ: `World` acts only on `RENDER_NONE`, which is the only render mode
 entirely — a `rendermode 10` brush is invisible and still solid. 94 brush entities in the
 shipped game set it.
 
+**The other render modes are honoured too, since the translucent pass landed.**
+`modulation()` is `GetColorModulation()` in `rgb` and `ComputeRenderAlpha()` in `a`, and
+the alpha is the whole of it: `kRenderNormal` substitutes 255 and every other mode reads
+`renderamt`, so a translucent mode at `renderamt 255` is **opaque** and a
+`kRenderNormal` entity's `renderamt` is **ignored**. Anything below 255 sends the
+entity's whole geometry to the translucent pass, opaque materials included, and
+`Material::state_for` is what turns those materials' pipelines into blending ones.
+The colour applies at every mode, including `kRenderNormal`, because
+`SetupPerInstanceColorModulation` is unconditional.
+
+Measured over the 106 maps: 11,538 brush entities are `kRenderNormal`, 94 are
+`kRenderNone` and **three** set a translucent mode — one `func_brush` in `mp_coop_teambts`
+at `rendermode 1 renderamt 200`, and two in `sp_a3_00` at `rendermode 5 renderamt 10`.
+(An earlier draft of this file and of `CLAUDE.md` said five. It is three.) No brush entity
+in the game sets a *glow* mode, which is the one that would need more than these four
+numbers — `IgnoresZBuffer()` (`clientalphaproperty.h:112`), and with it a per-draw
+depth-test override.
+
 On `sp_a1_intro1`: **26 of 78 brush models draw**, 148 faces and 308 triangles, 117 of
 them lit. Across all 106 maps, 2,608 draw with 22,502 faces and 47,866 triangles.
 
@@ -450,8 +524,11 @@ same reason `clip_models` is.
 pub struct Batch {
     pub material: Arc<Material>,
     pub lightmap_page: u32,
+    /// Axis-aligned bounds, in the model's own space, of everything in it.
+    pub bounds: (Vec3, Vec3),
     // private: one VertexBuffer, one IndexBuffer
 }
+pub fn center(&self) -> Vec3;
 ```
 
 **A batch is a (material, lightmap page) pair**, which is exactly Valve's *sort ID*:
@@ -530,6 +607,9 @@ pub struct ModelEntity {
     pub cycle: f32,           // where in the sequence it was at anim_time
     pub anim_time: f32,       // when that was
     pub playback_rate: f32,   // signed; 0 holds the pose
+    /// `m_DiffuseModulation` — `rendercolor` in rgb, `ComputeRenderAlpha` in a.
+    /// Below 1 puts the whole instance in the translucent pass.
+    pub modulation: [f32; 4],
 }
 
 pub struct SequenceRow<'a> {
@@ -2753,11 +2833,12 @@ Not bugs; each names what it waits on.
 
 | Not drawn | Why |
 |---|---|
-| Shaders this port has not ported | 3 of `sp_a1_intro1`'s 74 materials name one — `SolidEnergy` (the fizzler field), `Refract` and `Black`. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
+| Shaders this port has not ported | 3 of `sp_a1_intro1`'s 76 materials name one — `SolidEnergy` (the fizzler field), `Black`, and a `.vmt` the game does not ship. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
 | Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
 | Displacement `$seamless_scale` | Terrain **draws** now (`world/disp/`), but seamless mapping is a triplanar projection blended by the world normal, and a `WorldVertex` has none. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` underground maps and **none in `sp_a1_intro1`**; they draw with the texinfo's ordinary planar mapping — the right texture at the wrong scale. It is the feature that will force `LightmappedGeneric`'s second vertex layout. |
-| Translucent brush entities | Render modes 1-5 and 7-9 need a sorted blended pass and draw opaque instead; only `kRenderNone` is honoured. Five entities in the shipped game set one. |
+| The *leaf order* of translucent geometry | The translucent pass exists and sorts by box centre; what is missing is `DrawTranslucentRenderables`' leaf walk, which interleaves each leaf's translucent world surfaces with the entities in it. With no PVS there are no leaves. A world batch is a whole map's worth of one material, so two overlapping translucent world materials can sort wrongly. |
+| The two glow render modes | `kRenderGlow` and `kRenderWorldGlow` additionally switch the depth test off (`IgnoresZBuffer()`), which needs a per-draw state override. **No brush entity and no `prop_dynamic` in the shipped game sets one** — they are `env_sprite`'s and `point_spotlight`'s, and neither class is ported. |
 | Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
 | Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. It is also possible to noclip *out* of the level and look back in, which nothing culls. |
@@ -3004,16 +3085,23 @@ It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
 `trace`, `tonemap`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
 
-### `Engine::render` — the frame, in four steps
+### `Engine::render` — the frame, in six steps
 
 `CViewRender::RenderView` (`viewrender.cpp:2989` onwards), reduced to what this port has:
 
 ```text
-post.measurement()          drain the readback, feed client.tonemap   DoTonemapping
-context.set_exposure(...)   BEFORE the scene, never after             UpdateMaterialSystemTonemapScalar
-world.draw(into post.scene) the scene, into an offscreen target       the 3D view
-post.resolve(frame, ...)    measure it, then put it on the screen     DoEnginePostProcessing
+post.measurement()        drain the readback, feed client.tonemap  DoTonemapping
+context.set_exposure(..)  BEFORE the scene, never after           UpdateMaterialSystemTonemapScalar
+world.draw(post.scene)    the opaque scene, offscreen             DrawWorld + DrawOpaqueRenderables
+update_refract_texture    the copy, then draw_refracting          UpdateRefractTexture
+world.draw_translucent    everything blended, back to front       DrawTranslucentRenderables
+post.resolve(frame, ..)   measure it, then put it on the screen   DoEnginePostProcessing
 ```
+
+The middle three are separate render passes over one target, each `Load::Keep`, and each
+of the last two is skipped when it would be empty — `needs_frame_buffer_copy()` and
+`translucent_list(..).is_empty()`. See
+[the world's translucent pass](#the-translucent-pass).
 
 Three rules, each of which fails quietly rather than loudly:
 
@@ -3074,7 +3162,9 @@ system's GPU regression suite.
 
 ## Test coverage
 
-229 tests across the five modules; 456 in the crate. **104 are `console/`'s** and have
+321 tests under `engine::`, 13 of them depot-gated; 980 in the crate. (Both counts had
+gone stale — they last read 229 and 456 — so treat them as a scale rather than a
+promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
 arrived with UI precedence, are split across both — because both features are.
@@ -3103,6 +3193,12 @@ behaviour against a headless `egui::Context` (`engine::console::ui`), and the
 | `a_compressed_lump_is_reported_rather_than_read_as_geometry` | gotcha #9 |
 | `a_face_naming_a_vertex_that_is_not_there_is_caught_at_load` | gotcha #7 |
 | `texture_coordinates_are_divided_by_the_texture_size` | gotcha #6 |
+| `a_translucent_render_mode_is_what_reads_renderamt` | `ComputeRenderAlpha`'s substitution: that `kRenderNormal` ignores `renderamt` entirely, that a translucent mode at 255 is opaque, that `rendercolor` fills rgb and `renderamt` then overwrites the alpha, and that the colour applies at every mode |
+| `a_shipped_maps_translucent_list_is_sorted_and_holds_its_blended_geometry` (`--ignored`) | the translucent list against a real map, both ways round: that it comes back ascending along the view direction, and that every brush entity made translucent by its *entity* rather than its materials is in it. Defaults to `sp_a3_00`, the only map in the game with two of those |
+
+The composite itself — that a modulation alpha below 1 really blends an opaque
+material — is a GPU test and lives with the material system:
+`materials::preview::tests::a_modulation_alpha_below_one_blends_an_opaque_material`.
 
 Anything touching `winit` or `wgpu` needs a display and a GPU, so the frame loop and the
 world draw are verified by running the binary — see [Quick start](#quick-start).

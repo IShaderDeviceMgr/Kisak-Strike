@@ -179,6 +179,18 @@ impl Camera {
         }
     }
 
+    /// Which way the camera looks, in world space — `CurrentViewForward()`.
+    ///
+    /// Taken out of [`view`](Camera::view) rather than stored, because the two
+    /// cannot then disagree: a right-handed view matrix's rotation rows are
+    /// `[right, up, -forward]`, so this is the third row negated. The one
+    /// consumer is the translucent sort
+    /// ([`World::draw_translucent`](crate::engine::world::World::draw_translucent)),
+    /// which needs the direction and not the matrix.
+    pub fn forward(&self) -> Vec3 {
+        -self.view.row(2).truncate()
+    }
+
     /// World space straight to clip space: `projection * view`.
     ///
     /// `m_viewProjMatrix`, which `RecomputeViewProjState` cached behind a dirty
@@ -1053,9 +1065,23 @@ impl Pass<'_> {
             return;
         }
 
+        let draw = DrawUniforms {
+            model: uniforms::from_mat4(model),
+            modulation: [
+                material.modulation[0] * modulation[0],
+                material.modulation[1] * modulation[1],
+                material.modulation[2] * modulation[2],
+                material.modulation[3] * modulation[3],
+            ],
+        };
+
         let key = PipelineKey {
             shader: material.shader,
-            state: self.overrides.apply(material.state),
+            // **The modulation picks the snapshot.** `bIsAlphaModulating` is
+            // read from the finished product, not from the material
+            // (`shaderapidx8.cpp:4944`), so an opaque material drawn at
+            // `renderamt 10` gets the blending state here and nowhere else.
+            state: self.overrides.apply(material.state_for(draw.modulation[3])),
             target: self.target,
         };
         // The cache lookup is a hash of the whole key; consecutive draws of one
@@ -1073,15 +1099,6 @@ impl Pass<'_> {
         // Bound above when it changed; nothing to do with it here.
         drop(pipeline);
 
-        let draw = DrawUniforms {
-            model: uniforms::from_mat4(model),
-            modulation: [
-                material.modulation[0] * modulation[0],
-                material.modulation[1] * modulation[1],
-                material.modulation[2] * modulation[2],
-                material.modulation[3] * modulation[3],
-            ],
-        };
         let offset = self
             .draws
             .push(self.device, self.queue, bytemuck::bytes_of(&draw));

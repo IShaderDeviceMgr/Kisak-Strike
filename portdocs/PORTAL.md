@@ -534,24 +534,41 @@ The three proxies (`CurrentTime`, `PortalOpenAmount`, `PortalStatic`) are the ma
 `$PortalOpenAmount` is the portal's own age since activation, which the entity knows;
 `$PortalStatic` is a co-op effect and is `0`.
 
-### 7.3 The blocker is a blended pass
+### 7.3 The blocker is a blended pass — **landed**
 
-An alpha-masked oval over a wall needs **alpha blending**, and this port has never drawn
-anything blended — `CLAUDE.md` records it as the reason the five translucent-render-mode
-brush entities are unhonoured, and `Refract` got away without it because all 29 of its
-model materials draw opaque.
+An alpha-masked oval over a wall needs **alpha blending**, and until stage 1 this port had
+no *ordered* place to put it.
 
-So §7 is gated on a `materials/` change that is not portal-specific:
+> **What was actually missing, corrected.** The paragraph this section used to open with
+> said the port "has never drawn anything blended". That was wrong: `PipelineCache` has
+> honoured `BlendMode` since `MATERIALSYSTEM.md` stage 3 and `render_state` has produced
+> it from the `.vmt` since then, so the **1,212 of the game's 2,947 drawable materials**
+> that blend have always drawn blended. What they had no way to get was an *order* — they
+> were recorded in batch order, interleaved with the opaque geometry, so whatever came
+> later was composited on top of them. And the *entity's* render mode reached nothing at
+> all, which is the part that really was absent.
 
-1. A blend state in `PipelineCache`.
+So §7 was gated on a `materials/` change that is not portal-specific, and it is done:
+
+1. ~~A blend state in `PipelineCache`~~ — already there; what was needed was the
+   **second snapshot**, `Material::state_alpha_modulated`, so that
+   `SHADER_USING_ALPHA_MODULATION` turns an opaque material's pipeline into a blending
+   one when the instance's modulation alpha is not 1
+   (`shaderapidx8.cpp:4944`). That is the whole of how a render mode reaches the GPU.
 2. A fourth pass in `Engine::render`'s ordering — opaque → frame-buffer copy →
-   refracting → **translucent**.
-3. A back-to-front sort within it, or the acceptance that portals are the only members
-   and there are at most two.
+   refracting → **translucent**. `engine::world::GeometryPass` is the three-way decision;
+   refracting wins over translucent, and nothing in Portal 2 is both.
+3. A back-to-front sort within it: `World::translucent_list` is
+   `CClientLeafSystem::SortEntities`' key, `dot( center - eye, forward )`, ascending, and
+   `World::draw_translucent` walks it in reverse the way
+   `DrawTranslucentRenderables` counts down from the end of its array. The pass is skipped
+   when the list is empty.
 
-**Do this first** (§10). It is the only part of this module that another subsystem is
-also waiting on, and it is testable on its own against the five translucent brush
-entities.
+Measured: `sp_a1_intro1` has **36 translucent draws** — 4 of its 79 world batches, 0 of 31
+brush-model batches and 32 of its 1,080 props — and the sort is over whole instances, so
+it costs the per-batch instancing the opaque path gets. `sp_a3_00` is the map the depot
+test defaults to, because it is the only one with a brush entity that is translucent
+because of its *entity* rather than its materials.
 
 ### 7.4 What you will actually see
 
@@ -647,11 +664,21 @@ lands.
 
 Ordered so that each stage is separately testable and the first is useful on its own.
 
-**Stage 1 — the blended pass.** `materials/`: a blend state in `PipelineCache` and a
-translucent pass after the refracting one. Not portal work; it unblocks §7 and the five
-translucent brush entities at once, and `rustdocs/MATERIALS.md` gains one rule about
-pass ordering. Testable against `rendermode` on a shipped brush entity with no portal in
-sight.
+**Stage 1 — the blended pass. LANDED.** `materials/`: the alpha-modulated state snapshot
+(the blend state itself was already there — see §7.3), and a translucent pass after the
+refracting one with a back-to-front sort. Not portal work; it unblocked §7 and the
+translucent brush entities at once, and `rustdocs/MATERIALS.md` gained the pass-ordering
+table. Tested against `rendermode` on shipped brush entities with no portal in sight —
+`engine::world::tests::a_shipped_maps_translucent_list_is_sorted_and_holds_its_blended_geometry`,
+which defaults to `sp_a3_00`.
+
+> **The count in §0 and in `CLAUDE.md` was wrong and is corrected here.** It is
+> **three** brush entities in the 106 shipped maps that set a translucent render mode,
+> not five: one `func_brush` in `mp_coop_teambts` at `rendermode 1 renderamt 200` and two
+> in `sp_a3_00` at `rendermode 5 renderamt 10`. The other beneficiary is bigger and was
+> not counted at all — **30 `prop_dynamic`s** across the game write one, 24
+> `kRenderTransTexture` and 6 `kRenderTransColor`, and they are honoured now too because
+> `server/` already parsed all three keys.
 
 **Stage 2 — the class, drawn.** §3 and §7: `prop_portal` with `Activated`, `PortalTwo`,
 `LinkageGroupID`, the five inputs, the five outputs, the linkage group, the teleport
