@@ -364,7 +364,9 @@ fn parse_tracks(
         let flags = r.u8(at + 1)?;
         let next = r.i16(at + 2)?;
         let Some(base) = bones.get(bone) else {
-            return Err(r.corrupt(format!("an animation names bone {bone}, which does not exist")));
+            return Err(r.corrupt(format!(
+                "an animation names bone {bone}, which does not exist"
+            )));
         };
 
         // `pData()` — everything after the 4-byte header.

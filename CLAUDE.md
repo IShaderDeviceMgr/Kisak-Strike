@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,004 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,023 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -148,10 +148,10 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 7 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract`. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No visibility, skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport — input→command→movement→view, `CPortalGameMovement`'s walk, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning** | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener` and `prop_portal` — **46 classnames, 34,823 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the two areaportals — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -161,16 +161,29 @@ models all draw, lit the way the shipped game lights them and auto-exposed to
 the map's own limits. The entity logic runs on a 64 Hz tick: doors and panels
 move, triggers fire, a floor button presses when you stand on it, a chamber
 door opens as you approach and shuts behind you, and a `trigger_hurt` can kill
-you. Two portals draw as coloured ovals — **and they work**.
+you. Two portals draw as coloured ovals — **and they work**. **And only what
+you can see is drawn**: the areas, the PVS and the frustum between them took
+the frame from 1.76 ms to 0.28 ms.
 
-**It is not a runnable game**: no sound, no netcode, no weapon, no visibility
-or skybox, and a door moves *through* the player rather than shoving one.
+**It is not a runnable game**: no sound, no netcode, no weapon, no skybox, and
+a door moves *through* the player rather than shoving one.
 **The portals teleport** — `portdocs/PORTAL.md` stages 3 and 4 have landed — so
 you walk into one oval and come out of the other, rotated, with your velocity
 rotated and clamped and your view turned with you. What is still missing is the
 *picture*: there is no view through and no reflection, so an oval is flat until
 you are inside it. Measured over the nine pairs the shipped maps form, a player
 hull walked through six.
+
+**Visibility has landed** — `portdocs/ENGINE_WORLD_VIS.md`. `mod_vis.cpp`,
+`r_areaportal.cpp`, the areaportal half of `cmodel.cpp` and
+`R_RecursiveWorldNode`'s pruning are `src/engine/world/vis.rs`; `func_areaportal`
+and `func_areaportalwindow` drive it from the entity list;
+`OcclusionSystem.cpp` (2,999 lines) is deleted outright because Portal 2 places
+no `func_occluder` at all. Across the 103 shipped spawns the PVS leaves **6.9%
+of world faces** standing. The finding that would have cost the game its
+terrain: **`LUMP_LEAFFACES` names none of the 1,181 displacement faces**, so a
+displacement's leaf list has to be rebuilt from its bounds the way the shipped
+loader builds `mleaf_t::dispListStart`.
 
 **Frame cost is measurable and has been measured**, by `engine::world::bench`
 and `engine::exposure` (both depot-gated, `--ignored`). `sp_a1_intro1` records a
@@ -205,6 +218,20 @@ window is one or two ticks rather than the whole approach, and
 is §7's **recursive view**, the one part of a portal that is purely drawing, and it needs a
 second camera and a stencil pass. Nothing else in the module is blocked on it.
 
+**Visibility was the thing to do before the recursive view, and it is done.** A portal's
+second camera draws the world again from somewhere else, and without a PVS that was a
+second whole-map frame — two levels of recursion would have been three times 1.76 ms, and
+it is now three times 0.28. What the recursive view still needs, in order: a **stencil**,
+which `materials/` chose `Depth24PlusStencil8` for and then never wired (`pipeline.rs`
+hardcodes `StencilState::default()`, passes leave `stencil_ops: None`); `PortalRefract`'s
+`$Stage 0` and `$Stage 1`, which `ShaderKind::resolve` deliberately answers `None` for;
+the recursion itself with oblique near-plane clipping; and
+`c_portalghostrenderable.cpp` (980) for the half of an entity that sticks out of the other
+portal. `Engine::render` builds its `Camera` from one call site, so making the view a
+parameter is a refactor rather than a rewrite, and `VisibleSet::frustum` is already the
+shape a second camera wants. It would want its own `portdocs/PORTAL_RENDER.md` first —
+`portdocs/PORTAL.md` §7 was only ever written to justify leaving it out.
+
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
   `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker
@@ -213,7 +240,7 @@ second camera and a stencil pass. Nothing else in the module is blocked on it.
   without standing on something that moves.
 - **The local/abs transform pair on `EntityCore`**, which is smaller than a stage and
   unblocks two things at once: `SetParent`/`ClearParent`/`SetParentAttachment*` —
-  **1,103 of the 1,285 inputs the depot test reports as unhandled** — and parented
+  **1,103 of the 1,371 inputs the depot test reports as unhandled** — and parented
   movers, which currently move in world space where Valve moves them in the parent's
   frame (174 of the game's 1,164 movers name a parent). `prop_dynamic` raised the
   stakes: **2,355 of the game's 8,462 props name a `parentname`**, and 177 of the
@@ -233,9 +260,10 @@ second camera and a stencil pass. Nothing else in the module is blocked on it.
   discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
-  geometry, plus `sky_camera`'s scale.
-- **`world/`'s visibility** (§7.14's PVS, and the areas/areaportals that live in
-  `cmodel.cpp` and belong to it). Every face is still drawn every frame.
+  geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and left one thing
+  behind for it**: `Map_VisSetup` takes an *array* of origins and ORs their PVS rows
+  together precisely so that a skybox camera and the world share one visible set, and
+  this port has one origin. The other consumer of that array is the recursive view.
 - **Bloom**, now that there is a scene target and a presenting pass to put it between.
   `Generate8BitBloomTexture`'s downsample/blur chain plus `BloomAdd`, three quarter-size
   render targets. It is the most visible thing still missing from the post chain and

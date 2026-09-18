@@ -104,7 +104,9 @@ pub fn swept_box_touches_obb(
     }
 
     let rotation = angle_matrix(angles);
-    ray_touches_obb(ray_start, delta, extents, origin, rotation, obb_mins, obb_maxs)
+    ray_touches_obb(
+        ray_start, delta, extents, origin, rotation, obb_mins, obb_maxs,
+    )
 }
 
 /// `IntersectRayWithBox( ray, boxMins, boxMaxs, … )` (`:1265`) and the
@@ -231,9 +233,8 @@ fn ray_touches_obb(
         normal[i] = Vec3::ZERO;
         normal[i][i] = 1.0;
         let axis = rotation.col(i);
-        let bloat = (axis.x * extents.x).abs()
-            + (axis.y * extents.y).abs()
-            + (axis.z * extents.z).abs();
+        let bloat =
+            (axis.x * extents.x).abs() + (axis.y * extents.y).abs() + (axis.z * extents.z).abs();
         dist[i][0] = obb_mins[i] - bloat;
         dist[i][1] = obb_maxs[i] + bloat;
 
@@ -351,7 +352,13 @@ fn support_map_2d(direction: Vec3, axes: [usize; 2], mins: Vec3, maxs: Vec3) -> 
 /// `IsRayIntersectingSphere` (`:375`) — the closest point on the *segment*,
 /// against the radius. `t` is clamped to `[0, 1]`, so this is a capsule test
 /// rather than an infinite-line one.
-fn ray_intersects_sphere(start: Vec3, delta: Vec3, centre: Vec3, radius: f32, tolerance: f32) -> bool {
+fn ray_intersects_sphere(
+    start: Vec3,
+    delta: Vec3,
+    centre: Vec3,
+    radius: f32,
+    tolerance: f32,
+) -> bool {
     let radius = radius + tolerance;
     let to_centre = centre - start;
     let numerator = to_centre.dot(delta);
@@ -404,7 +411,11 @@ mod tests {
 
         // The pad is 40 across and the hull 32, so the two stop overlapping
         // at 36 units of separation.
-        assert!(standing_on(button + Vec3::new(35.0, 0.0, 0.0), button, Vec3::ZERO));
+        assert!(standing_on(
+            button + Vec3::new(35.0, 0.0, 0.0),
+            button,
+            Vec3::ZERO
+        ));
         assert!(!standing_on(
             button + Vec3::new(37.0, 0.0, 0.0),
             button,
@@ -491,11 +502,27 @@ mod tests {
     #[test]
     fn height_matters_and_the_pad_is_fourteen_units_tall() {
         let button = Vec3::new(0.0, 0.0, 0.0);
-        assert!(standing_on(button + Vec3::new(0.0, 0.0, 13.0), button, Vec3::ZERO));
-        assert!(!standing_on(button + Vec3::new(0.0, 0.0, 15.0), button, Vec3::ZERO));
+        assert!(standing_on(
+            button + Vec3::new(0.0, 0.0, 13.0),
+            button,
+            Vec3::ZERO
+        ));
+        assert!(!standing_on(
+            button + Vec3::new(0.0, 0.0, 15.0),
+            button,
+            Vec3::ZERO
+        ));
         // Below it, the 72-unit hull still reaches up into the pad.
-        assert!(standing_on(button - Vec3::new(0.0, 0.0, 70.0), button, Vec3::ZERO));
-        assert!(!standing_on(button - Vec3::new(0.0, 0.0, 73.0), button, Vec3::ZERO));
+        assert!(standing_on(
+            button - Vec3::new(0.0, 0.0, 70.0),
+            button,
+            Vec3::ZERO
+        ));
+        assert!(!standing_on(
+            button - Vec3::new(0.0, 0.0, 73.0),
+            button,
+            Vec3::ZERO
+        ));
     }
 
     /// The separating-axis test the fifteen planes *are*, written out
@@ -549,13 +576,17 @@ mod tests {
                     let feet = button + Vec3::new(x as f32 * 7.0, y as f32 * 7.0, z as f32 * 13.0);
                     let got = standing_on(feet, button, angles);
                     let hull_centre = feet + (MINS + MAXS) * 0.5;
-                    let want = !separated(hull_centre, hull_extents, box_centre, rotation, box_extents);
+                    let want =
+                        !separated(hull_centre, hull_extents, box_centre, rotation, box_extents);
                     assert_eq!(got, want, "at {feet}: the sweep and the SAT disagree");
                     inside += usize::from(got);
                 }
             }
         }
-        assert!(inside > 50, "only {inside} of 3,179 probes were inside the pad");
+        assert!(
+            inside > 50,
+            "only {inside} of 3,179 probes were inside the pad"
+        );
     }
 
     /// The sphere reject must never be the thing that says no. A box the

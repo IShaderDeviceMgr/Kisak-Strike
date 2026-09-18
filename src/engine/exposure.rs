@@ -165,7 +165,11 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                world.draw(&mut pass, 0.0);
+                world.draw(
+                    &mut pass,
+                    0.0,
+                    &crate::engine::world::vis::VisibleSet::everything(),
+                );
             }
             let drawn = Instant::now();
             post.record(

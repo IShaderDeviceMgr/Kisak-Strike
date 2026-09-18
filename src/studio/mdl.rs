@@ -285,7 +285,8 @@ impl Mdl {
                     // field lops the first four characters off every path and
                     // turns `models/…` into `ls/…`, which is a file that does
                     // not exist rather than an error.
-                    let name_at = r.relative_offset(at + 4, at, "mstudiomodelgroup_t::sznameindex")?;
+                    let name_at =
+                        r.relative_offset(at + 4, at, "mstudiomodelgroup_t::sznameindex")?;
                     let name = normalize(&r.c_string(name_at)?);
                     if !name.is_empty() {
                         names.push(name);

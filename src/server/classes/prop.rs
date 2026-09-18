@@ -114,7 +114,7 @@ use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::{atof, atoi, effects};
 use crate::server::movement::{
-    ModelBounds, MoveType, Solid, EF_NODRAW, FSOLID_NOT_SOLID, FSOLID_TRIGGER, FL_CLIENT,
+    ModelBounds, MoveType, Solid, EF_NODRAW, FL_CLIENT, FSOLID_NOT_SOLID, FSOLID_TRIGGER,
 };
 use crate::server::sequences::{Lookup, SequenceInfo};
 
@@ -262,7 +262,12 @@ impl FloorButton {
     ///
     /// The three lines that are not animation: the state, the skin, and
     /// `OnPressed`.
-    fn press(&mut self, entity: &mut EntityCore, activator: Option<EntityId>, cx: &mut Context<'_>) {
+    fn press(
+        &mut self,
+        entity: &mut EntityCore,
+        activator: Option<EntityId>,
+        cx: &mut Context<'_>,
+    ) {
         self.pressed = true;
         self.skin = BUTTON_ON_SKIN;
         // `ResetSequence( m_DownSequence )` — a **cut**, not a blend, which is
@@ -834,7 +839,8 @@ impl DynamicProp {
         if info.duration <= 0.0 {
             return self.cycle;
         }
-        let cycle = self.cycle + (now - self.anim_time).max(0.0) * self.playback_rate / info.duration;
+        let cycle =
+            self.cycle + (now - self.anim_time).max(0.0) * self.playback_rate / info.duration;
         match info.loops {
             true => cycle.rem_euclid(1.0),
             false => cycle.clamp(0.0, 1.0),
@@ -1023,7 +1029,12 @@ impl DynamicProp {
     /// with zero health and nothing can damage it into breaking. That is also
     /// why the 16 `OnBreak` connections in the game would otherwise be
     /// unreachable.
-    fn break_prop(&mut self, entity: &mut EntityCore, breaker: Option<EntityId>, cx: &mut Context<'_>) {
+    fn break_prop(
+        &mut self,
+        entity: &mut EntityCore,
+        breaker: Option<EntityId>,
+        cx: &mut Context<'_>,
+    ) {
         entity.take_damage = DamageMode::No;
         let me = entity.id();
         entity.fire_output("OnBreak", Variant::Void, breaker, Some(me), 0.0, cx);

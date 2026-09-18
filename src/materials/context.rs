@@ -1029,9 +1029,9 @@ impl Pass<'_> {
     /// set, draw, set, draw, and a pass that draws two portals takes two
     /// slots. Draws of any other shader ignore it.
     pub fn set_portal_overlay(&mut self, overlay: &PortalOverlay) {
-        self.portal_offset = self
-            .portals
-            .push(self.device, self.queue, bytemuck::bytes_of(overlay));
+        self.portal_offset =
+            self.portals
+                .push(self.device, self.queue, bytemuck::bytes_of(overlay));
     }
 
     /// Overrides part of every subsequent draw's pipeline state.

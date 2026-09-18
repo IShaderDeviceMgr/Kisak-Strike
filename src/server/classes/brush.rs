@@ -1889,6 +1889,157 @@ impl Behaviour for Brush {
     }
 }
 
+// ---------------------------------------------------------------------------
+// func_areaportal and func_areaportalwindow
+// ---------------------------------------------------------------------------
+
+/// `AREAPORTAL_CLOSED`/`AREAPORTAL_OPEN` (`func_areaportal.cpp:18`).
+const AREAPORTAL_OPEN: i32 = 1;
+
+/// `CAreaPortal` (`game/server/func_areaportal.cpp:25`) and
+/// `CFuncAreaPortalWindow` (`func_areaportalwindow.cpp`) — **409 entities over
+/// 121 of the game's 106 maps**, 206 of the first and 203 of the second.
+///
+/// By the time it reaches the game it is not a brush entity at all: `vbsp`
+/// takes the brush away and leaves a point entity whose whole content is a
+/// `portalnumber` matching an `m_PortalKey` in `LUMP_AREAPORTALS`. Opening or
+/// closing it re-floods the area graph and changes what the renderer can see
+/// through the doorway — see [`Visibility`](crate::engine::world::vis::Visibility).
+///
+/// **It starts open unless `StartOpen` says otherwise**, because
+/// `CAreaPortal`'s constructor sets `m_state = AREAPORTAL_OPEN` and `Precache`
+/// pushes that straight down to the engine. 39 of the game's 206
+/// `func_areaportal`s start closed.
+/// The engine's own array starts all-closed (`cmodel_bsp.cpp:959`) and is
+/// opened entity by entity; this port starts it open instead, because the
+/// depot holds **922 areaportal records against 409 entities** and the ones
+/// with no entity would otherwise never open at all.
+///
+/// # What the window half does not do
+///
+/// `CFuncAreaPortalWindow` opens and closes itself by *distance*:
+/// `UpdateVisibility` closes the portal when the viewer is further away than
+/// `FadeStartDist` so that the fogged pane can stand in for the geometry
+/// behind it. That needs a per-view update inside the render loop and the
+/// translucent pane itself, neither of which exists here, so a window is a
+/// `func_areaportal` that happens to start open and answers the same three
+/// inputs. The cost is drawing through a window that the shipped game would
+/// have shut — too much, not too little.
+pub struct AreaPortal {
+    /// `m_portalNumber` — the key into `LUMP_AREAPORTALS`.
+    portal_number: i32,
+    /// `m_state`.
+    state: i32,
+}
+
+pub static AREAPORTAL_KEYS: &[&str] = &[
+    "portalnumber",
+    // `CAreaPortal::KeyValue` (`func_areaportal.cpp:162`), and the only key
+    // either class has that changes anything. **39 of the game's 206
+    // `func_areaportal`s start closed**; the other 167 say so explicitly and
+    // no `func_areaportalwindow` names it at all, which is right —
+    // `CFuncAreaPortalWindow` is not a `CAreaPortal` and has no such key.
+    "StartOpen",
+    // `CFuncAreaPortalWindow`'s, all read and none used — see the type.
+    "PortalVersion",
+    "FadeStartDist",
+    "FadeDist",
+    "TranslucencyLimit",
+    "BackgroundBModel",
+];
+
+pub static AREAPORTAL_INPUTS: InputDefs = &[
+    InputDef::new("Open", FieldType::Void),
+    InputDef::new("Close", FieldType::Void),
+    InputDef::new("Toggle", FieldType::Void),
+    // "TODO: obsolete! remove" says the datadesc, and the two are **crossed
+    // over**: `TurnOn` closes and `TurnOff` opens (`func_areaportal.cpp:65`).
+    InputDef::new("TurnOn", FieldType::Void),
+    InputDef::new("TurnOff", FieldType::Void),
+];
+
+impl AreaPortal {
+    pub(super) fn create() -> Box<dyn Behaviour> {
+        Box::new(AreaPortal {
+            portal_number: 0,
+            state: AREAPORTAL_OPEN,
+        })
+    }
+
+    /// What the engine reads back: the key and whether it is open.
+    pub fn state(&self) -> (u16, bool) {
+        (
+            u16::try_from(self.portal_number).unwrap_or(0),
+            self.state == AREAPORTAL_OPEN,
+        )
+    }
+}
+
+impl Behaviour for AreaPortal {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        if key.eq_ignore_ascii_case("portalnumber") {
+            self.portal_number = atoi(value);
+            return true;
+        }
+        if key.eq_ignore_ascii_case("StartOpen") {
+            self.state = match atoi(value) != 0 {
+                true => AREAPORTAL_OPEN,
+                false => 0,
+            };
+            return true;
+        }
+        // The window's own keys — the fade distances and the pane's model.
+        // Accepted so that they are not reported unhandled, and unused for the
+        // reason in the type's documentation.
+        AREAPORTAL_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+    }
+
+    /// `CAreaPortal::Spawn` plus `Precache`, which is where `UpdateState`
+    /// first tells the engine anything.
+    fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
+        // `AddEffects( EF_NORECEIVESHADOW | EF_NOSHADOW )`, and nothing else:
+        // it has no model, no movement and no solidity.
+        entity.solid = Solid::None;
+        SpawnResult::Ok
+    }
+
+    fn accept_input(
+        &mut self,
+        _entity: &mut EntityCore,
+        input: &Input<'_>,
+        _cx: &mut Context<'_>,
+    ) -> bool {
+        let is = |name: &str| input.name.eq_ignore_ascii_case(name);
+
+        if is("Open") || is("TurnOff") {
+            self.state = AREAPORTAL_OPEN;
+        } else if is("Close") || is("TurnOn") {
+            self.state = 0;
+        } else if is("Toggle") {
+            self.state = match self.state == AREAPORTAL_OPEN {
+                true => 0,
+                false => AREAPORTAL_OPEN,
+            };
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("portalnumber", self.portal_number.to_string()),
+            (
+                "state",
+                match self.state == AREAPORTAL_OPEN {
+                    true => "open".to_owned(),
+                    false => "closed".to_owned(),
+                },
+            ),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

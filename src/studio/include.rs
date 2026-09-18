@@ -58,7 +58,10 @@ const MAX_DEPTH: usize = 8;
 /// Taking a closure rather than a `Vfs` is what
 /// [`assemble`](super::assemble) does and for the same reason: this module
 /// then needs no filesystem and its tests need no game.
-pub(super) fn resolve(host: &mut Mdl, mut read: impl FnMut(&str) -> Option<Vec<u8>>) -> Vec<String> {
+pub(super) fn resolve(
+    host: &mut Mdl,
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> Vec<String> {
     let mut merged: Vec<String> = Vec::new();
 
     // `AppendModels` walks the list depth first and in order: the host's own
@@ -214,15 +217,15 @@ fn merge(host: &mut Mdl, included: Mdl) {
 /// the shipped game is in this case (`thigh_A_R_GRP`, in
 /// `models/eggbot_animations.mdl` against `eggbot.mdl`'s 119).
 fn remap(mut animation: Animation, master_bone: &[Option<usize>]) -> Animation {
-    animation.tracks.retain_mut(|track| {
-        match master_bone.get(track.bone).copied().flatten() {
+    animation.tracks.retain_mut(
+        |track| match master_bone.get(track.bone).copied().flatten() {
             Some(bone) => {
                 track.bone = bone;
                 true
             }
             None => false,
-        }
-    });
+        },
+    );
     animation
 }
 
@@ -406,7 +409,10 @@ mod tests {
 
         // The host's `idle` absorbed the include's; both `walk`s survived.
         assert_eq!(
-            host.animations.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            host.animations
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["idle", "walk", "walk"]
         );
         // Likewise both `walk` sequences, each on its own animation.

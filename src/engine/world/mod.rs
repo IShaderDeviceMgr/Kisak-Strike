@@ -38,6 +38,7 @@ pub mod entities;
 pub mod light;
 pub mod portals;
 pub mod props;
+pub mod vis;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -231,12 +232,48 @@ pub struct Batch {
     pub bounds: (Vec3, Vec3),
     vertices: VertexBuffer,
     indices: IndexBuffer,
+    /// Which `.bsp` face each run of [`indices`](Batch::indices) came from.
+    ///
+    /// Empty for a brush model's batches, because a brush entity is not in the
+    /// world's BSP tree and so has no per-face visibility to gather — it is
+    /// culled whole, by its bounding box, the way `R_DrawBrushModel` culls
+    /// one.
+    faces: Vec<FaceSpan>,
+    /// A CPU copy of [`indices`](Batch::indices), for
+    /// [`gather`](Batch::gather).
+    ///
+    /// Empty whenever [`faces`](Batch::faces) is. `sp_a1_intro1`'s world costs
+    /// 61 KB of this against the 1.86 ms its frame takes; the alternative is a
+    /// GPU readback, which is not an alternative.
+    index_data: Vec<u16>,
 }
 
 impl Batch {
     /// The centre of [`bounds`](Batch::bounds) — the sort key's input.
     pub fn center(&self) -> Vec3 {
         (self.bounds.0 + self.bounds.1) * 0.5
+    }
+
+    /// This batch's indices for the faces `visible` names, appended to `out`.
+    ///
+    /// Returns false when the batch cannot be gathered — a brush model, or a
+    /// set that contains everything — in which case the caller draws the whole
+    /// static buffer instead. This is `BuildIndicesForWorldSurfaces`
+    /// (`gl_rsurf.cpp:1168`) reduced to what it is: the visible surfaces'
+    /// indices, in one run, into a buffer that lives for this frame.
+    fn gather(&self, visible: &vis::VisibleSet, out: &mut Vec<u16>) -> bool {
+        if self.faces.is_empty() || visible.is_everything() {
+            return false;
+        }
+        out.clear();
+        for span in &self.faces {
+            if !visible.face(span.face as usize) {
+                continue;
+            }
+            let range = span.first as usize..(span.first + span.count) as usize;
+            out.extend_from_slice(&self.index_data[range]);
+        }
+        true
     }
 }
 
@@ -346,6 +383,14 @@ pub struct World {
     /// is built from the world's `.bsp` and dies with it — `CleanupLightmaps`
     /// (`cmatlightmaps.cpp:216`) is `Drop`.
     pub lightmaps: LightmapPages,
+    /// The map's visibility — the PVS, the areas, and which areaportals are
+    /// open.
+    ///
+    /// Here for the reason [`collision`](World::collision) is: derived from
+    /// this map's file and dead with it. Ask it for a
+    /// [`VisibleSet`](vis::VisibleSet) once a frame with
+    /// [`visible`](World::visible), and hand that to [`draw`](World::draw).
+    pub vis: vis::Visibility,
     /// The map's collision geometry — the brushes, arranged for tracing.
     ///
     /// Built from the same [`Bsp`] the geometry came from, and held here for
@@ -500,7 +545,7 @@ impl World {
         // nothing — which is most of them. Counted into their own stats block
         // so that "5,512 of 5,638 faces" stays a statement about the world.
         let mut brush_stats = WorldStats::default();
-        let brush_groups: Vec<BTreeMap<&str, Vec<&Face>>> = brush_models
+        let brush_groups: Vec<BTreeMap<&str, Vec<(u32, &Face)>>> = brush_models
             .iter()
             .map(|placed| {
                 if placed.render_mode == RENDER_NONE {
@@ -586,12 +631,12 @@ impl World {
 
         stats.lightmap_pages = lightmaps.page_count() as usize;
 
-        let batches = upload_batches(device, &meshes, &resolved);
+        let batches = upload_batches(device, &meshes, &resolved, true);
         let brush_model_geometry: Vec<BrushModelGeometry> = brush_model_geometry
             .into_iter()
             .map(|(placement, meshes)| BrushModelGeometry {
                 placement,
-                batches: upload_batches(device, &meshes, &resolved),
+                batches: upload_batches(device, &meshes, &resolved, false),
             })
             .collect();
 
@@ -649,6 +694,10 @@ impl World {
             // chain until the game has said what is solid.
             clip_models: Vec::new(),
             brush_model_geometry,
+            // Built from the same `Bsp`, and after the displacement patches
+            // have been proved to build — it reads their bounds to give each
+            // one the leaves `LUMP_LEAFFACES` never names.
+            vis: vis::Visibility::build(&bsp),
             collision,
             props,
             prop_models,
@@ -666,22 +715,36 @@ impl World {
     /// The model matrix is the identity: world geometry is already in world
     /// space, which is the whole difference between the world model and the
     /// brush models that are not drawn yet.
-    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32) {
-        self.draw_brushes(pass);
+    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32, visible: &vis::VisibleSet) {
+        self.draw_brushes(pass, visible);
         // Brush entities next: they are part of the level shell — a door in a
         // doorway, a panel in a wall — so they belong with the world rather
         // than with its furniture. `R_DrawBrushModel` (`gl_rsurf.cpp`) is
         // likewise a world-surface draw with a matrix, not a model draw.
-        self.draw_brush_models(pass);
+        self.draw_brush_models(pass, visible);
         // After the world, because a prop sits on top of the geometry it is
         // placed against and the depth test is cheaper when the near thing is
         // already there. `CStaticPropMgr::DrawStaticProps` runs in the same
         // opaque pass for the same reason.
-        self.prop_models.draw(pass, &self.props);
+        self.prop_models.draw(pass, &self.props, visible);
         // Last of the three, for the same reason props come after the world:
         // an entity's model sits on top of the level shell, and a button is
         // usually in a wall the world already drew.
-        self.entity_models.draw(pass, curtime);
+        self.entity_models.draw(pass, curtime, &|mins, maxs| {
+            self.box_visible(visible, mins, maxs)
+        });
+    }
+
+    /// What this view can see — ask once a frame, before opening a pass, and
+    /// hand the answer to [`draw`](World::draw) and the two passes after it.
+    ///
+    /// `eye` is the camera's world-space origin and `view_proj` is the matrix
+    /// everything this frame is drawn with, so the frustum cannot disagree
+    /// with the picture. `novis` is `r_novis`, and is also what the caller
+    /// passes when the camera is somewhere the PVS has no answer for — see
+    /// [`Visibility::mark`](vis::Visibility::mark).
+    pub fn visible(&self, eye: Vec3, view_proj: glam::Mat4, novis: bool) -> vis::VisibleSet {
+        self.vis.mark(eye, view_proj, novis)
     }
 
     /// Whether this map has anything that reads the frame it is drawn into,
@@ -719,9 +782,12 @@ impl World {
     /// the water surface) are not ported.
     ///
     /// [update]: crate::materials::context::RenderContext::update_refract_texture
-    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32) {
-        self.prop_models.draw_refracting(pass, &self.props);
-        self.entity_models.draw_refracting(pass, curtime);
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32, visible: &vis::VisibleSet) {
+        self.prop_models.draw_refracting(pass, &self.props, visible);
+        self.entity_models
+            .draw_refracting(pass, curtime, &|mins, maxs| {
+                self.box_visible(visible, mins, maxs)
+            });
     }
 
     /// Everything blended in this map, sorted back to front for this view.
@@ -739,10 +805,20 @@ impl World {
     ///
     /// [`Camera::eye`]: crate::materials::context::Camera::eye
     /// [`Camera::forward`]: crate::materials::context::Camera::forward
-    pub fn translucent_list(&self, eye: Vec3, forward: Vec3) -> TranslucentList {
+    pub fn translucent_list(
+        &self,
+        eye: Vec3,
+        forward: Vec3,
+        visible: &vis::VisibleSet,
+    ) -> TranslucentList {
         let mut list = TranslucentList::default();
         let key = |center: Vec3| (center - eye).dot(forward);
 
+        // The world's translucent batches are **not** culled here, only
+        // sorted: `draw_world_batch` gathers their visible faces the way it
+        // does for the opaque pass, and a batch with none left records no
+        // draw. Culling by the batch's bounds instead would be wrong in the
+        // other direction — a batch is the whole map's worth of one material.
         for (index, batch) in self.batches.iter().enumerate() {
             if GeometryPass::of(&batch.material) == GeometryPass::Translucent {
                 list.0
@@ -753,6 +829,10 @@ impl World {
         for (index, geometry) in self.brush_model_geometry.iter().enumerate() {
             let placed = &self.brush_models[geometry.placement];
             if !placed.visible {
+                continue;
+            }
+            let (mins, maxs) = self.brush_model_bounds(geometry.placement);
+            if !self.box_visible(visible, mins, maxs) {
                 continue;
             }
             let model_to_world = placed.model.model_to_world();
@@ -773,6 +853,11 @@ impl World {
 
         self.prop_models
             .collect_translucent(&self.props, &mut |center, model, batch, instance| {
+                if !visible
+                    .any_leaf(&self.props.leaves[self.props.instances[instance].leaves.clone()])
+                {
+                    return;
+                }
                 list.0.push((
                     key(center),
                     Translucent::Prop {
@@ -817,20 +902,31 @@ impl World {
     /// where the entities within one leaf were pre-sorted on
     /// `dot( boxCenter - viewOrigin, viewForward )`.
     ///
-    /// This port has no visibility, so there are no leaves to walk and the leaf
-    /// interleave has nothing to reduce to. What is left is the sort, applied
-    /// to everything at once — and applied to *world* batches too, which Valve
-    /// never sorts because its leaf walk had already ordered them.
+    /// This port has a PVS but no per-leaf renderable index — nothing keeps a
+    /// list of which entities are in which leaf, which is
+    /// `CClientLeafSystem`'s whole job — so there are still no leaves to walk
+    /// and the interleave has nothing to reduce to. What is left is the sort,
+    /// applied to everything at once, and applied to *world* batches too,
+    /// which Valve never sorts because its leaf walk had already ordered them.
     ///
     /// **A world batch is the whole map's worth of one material**, so its box
     /// centre is a poor sort key and two overlapping translucent world
-    /// materials can come out in the wrong order. That is the cost of having no
-    /// PVS, it is bounded by how few such materials a map has, and the fix is
-    /// the leaf walk rather than a finer sort.
-    pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList) {
+    /// materials can come out in the wrong order. Visibility does not fix
+    /// this: it decides *whether* a batch draws, not where in the order it
+    /// goes. The fix is the leaf walk, and that needs the leaf index.
+    pub fn draw_translucent(
+        &self,
+        pass: &mut Pass<'_>,
+        curtime: f32,
+        list: &TranslucentList,
+        visible: &vis::VisibleSet,
+    ) {
+        let mut gathered = Vec::new();
         for (_, item) in list.0.iter().rev() {
             match *item {
-                Translucent::World(batch) => self.draw_world_batch(pass, batch),
+                Translucent::World(batch) => {
+                    self.draw_world_batch(pass, batch, visible, &mut gathered)
+                }
                 Translucent::BrushModel { geometry, batch } => {
                     self.draw_brush_model_batch(pass, geometry, batch)
                 }
@@ -1015,13 +1111,17 @@ impl World {
     /// **The transform is asked for once per model and not cached**, so it can
     /// never disagree with what `trace/` collides against — see
     /// [`BrushModelGeometry`].
-    pub(crate) fn draw_brush_models(&self, pass: &mut Pass<'_>) {
+    pub(crate) fn draw_brush_models(&self, pass: &mut Pass<'_>, visible: &vis::VisibleSet) {
         for (index, geometry) in self.brush_model_geometry.iter().enumerate() {
             let placed = &self.brush_models[geometry.placement];
             // `EF_NODRAW`, which a `func_brush` toggles. The `rendermode 10`
             // test happened at load, because that one cannot change; this one
             // can, on any tick.
             if !placed.visible {
+                continue;
+            }
+            let (mins, maxs) = self.brush_model_bounds(geometry.placement);
+            if !self.box_visible(visible, mins, maxs) {
                 continue;
             }
             for batch in 0..geometry.batches.len() {
@@ -1056,18 +1156,39 @@ impl World {
         );
     }
 
-    pub(crate) fn draw_brushes(&self, pass: &mut Pass<'_>) {
+    pub(crate) fn draw_brushes(&self, pass: &mut Pass<'_>, visible: &vis::VisibleSet) {
+        // One scratch buffer for the whole pass, not one per batch: the
+        // gather writes it and the upload reads it before the next batch
+        // overwrites it.
+        let mut gathered = Vec::new();
         for (index, batch) in self.batches.iter().enumerate() {
             if GeometryPass::of(&batch.material) != GeometryPass::Opaque {
                 continue;
             }
-            self.draw_world_batch(pass, index);
+            self.draw_world_batch(pass, index, visible, &mut gathered);
         }
     }
 
     /// Records one of the world model's batches, at the identity.
-    fn draw_world_batch(&self, pass: &mut Pass<'_>, index: usize) {
+    fn draw_world_batch(
+        &self,
+        pass: &mut Pass<'_>,
+        index: usize,
+        visible: &vis::VisibleSet,
+        gathered: &mut Vec<u16>,
+    ) {
         let batch = &self.batches[index];
+        // **Static vertices, dynamic indices** — `GetDynamicMesh( false,
+        // g_WorldStaticMeshes[sortID] )` (`gl_rsurf.cpp:1168`), which is the
+        // shape `rustdocs/MATERIALS.md` says every real draw path in the
+        // engine has. The vertices were uploaded at load and never move; what
+        // this frame can see decides only which of them are named.
+        let indices = match batch.gather(visible, gathered) {
+            // Every face culled: no draw at all, not an empty one.
+            true if gathered.is_empty() => return,
+            true => pass.indices(gathered),
+            false => batch.indices.slice(),
+        };
         // `BindLightmapPage( pSortList->lightmapPageID )` before the batch
         // that reads it (`gl_rsurf.cpp:1150`). Cheap and unconditional:
         // batches are page-ordered within a material, so consecutive draws
@@ -1077,9 +1198,45 @@ impl World {
         pass.draw(
             &batch.material,
             &batch.vertices.slice(),
-            &batch.indices.slice(),
+            &indices,
             glam::Mat4::IDENTITY,
         );
+    }
+
+    /// One brush entity's bounding box in world space.
+    ///
+    /// The model lump's box, put through the placement — the same matrix the
+    /// geometry is drawn with and the trace sweeps against, so a door culled
+    /// here is culled where it actually is. A rotated box grows to the AABB of
+    /// its eight corners, which is what `R_DrawBrushModel`'s own
+    /// `CullBox( mins, maxs )` does after `RotatedAABBToAABB`.
+    fn brush_model_bounds(&self, placement: usize) -> (Vec3, Vec3) {
+        let placed = &self.brush_models[placement];
+        let model = &self.models[placed.index];
+        let matrix = placed.model.model_to_world();
+        let (mins, maxs) = (Vec3::from(model.mins), Vec3::from(model.maxs));
+        let mut bounds = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for corner in 0..8u32 {
+            let pick = |axis: usize| match corner >> axis & 1 {
+                0 => mins[axis],
+                _ => maxs[axis],
+            };
+            let point = matrix.transform_point3(Vec3::new(pick(0), pick(1), pick(2)));
+            bounds = (bounds.0.min(point), bounds.1.max(point));
+        }
+        bounds
+    }
+
+    /// Whether a box in world space survives this frame's visibility —
+    /// the test a brush entity, an entity model or anything else outside the
+    /// world's own face list is culled with.
+    ///
+    /// `CClientLeafSystem` keeps every renderable in a list per leaf and culls
+    /// them as it walks; this port has no such index, so a box is tested
+    /// against the tree directly. The two agree: a box is visible when some
+    /// leaf it reaches is, which is what leaf membership means.
+    pub fn box_visible(&self, visible: &vis::VisibleSet, mins: Vec3, maxs: Vec3) -> bool {
+        visible.is_everything() || self.vis.box_visible(visible, mins, maxs)
     }
 
     /// The centre of the world's bounding box — where the view goes when the
@@ -1106,7 +1263,8 @@ impl World {
              {}/{} brush models drawn ({} faces, {} triangles, {} lit); \
              {} static props from {} models ({}); \
              {} files in the map pak; \
-             collision: {}",
+             collision: {}; \
+             visibility: {}",
             self.name,
             self.bsp_version,
             self.bsp_revision,
@@ -1138,6 +1296,7 @@ impl World {
             self.prop_models.summary(),
             s.pak_files,
             self.collision.summary(),
+            self.vis.summary(),
         )
     }
 }
@@ -1163,7 +1322,26 @@ struct Mesh {
     material: String,
     vertices: MeshVertices,
     indices: Vec<u16>,
+    /// Which `.bsp` face each run of [`indices`](Mesh::indices) came from, in
+    /// index order. See [`FaceSpan`].
+    faces: Vec<FaceSpan>,
     lightmap_page: u32,
+}
+
+/// One face's triangles inside a batch's index buffer.
+///
+/// This is what makes per-face visibility possible without splitting a batch:
+/// the vertices stay where they are and a frame gathers the spans it wants.
+/// Valve needs no such record because it walks the leaves and appends each
+/// surface's indices as it meets them (`BuildIndicesForSurface`); the batches
+/// here are built once at load, so the mapping has to be kept.
+#[derive(Debug, Clone, Copy)]
+struct FaceSpan {
+    /// Index into `LUMP_FACES`, which is what
+    /// [`VisibleSet::face`](vis::VisibleSet::face) answers about.
+    face: u32,
+    first: u32,
+    count: u32,
 }
 
 /// A batch's vertices, in whichever layout its shader declared.
@@ -1266,10 +1444,14 @@ fn group_faces<'a>(
     bsp: &'a Bsp,
     model: &bsp::Model,
     stats: &mut WorldStats,
-) -> BTreeMap<&'a str, Vec<&'a Face>> {
-    let mut groups: BTreeMap<&str, Vec<&Face>> = BTreeMap::new();
+) -> BTreeMap<&'a str, Vec<(u32, &'a Face)>> {
+    let mut groups: BTreeMap<&str, Vec<(u32, &Face)>> = BTreeMap::new();
 
-    for face in bsp.model_faces(model) {
+    // The face's own index in `LUMP_FACES` travels with it, because that is
+    // what the visibility set answers questions about: a batch has to be able
+    // to say which of *its* triangles belong to face 4,217.
+    for (offset, face) in bsp.model_faces(model).iter().enumerate() {
+        let index = model.first_face as u32 + offset as u32;
         stats.faces_total += 1;
 
         // A displacement's geometry is a subdivided grid in
@@ -1305,7 +1487,7 @@ fn group_faces<'a>(
         if face.prim_count() > 0 {
             stats.faces_with_primitives += 1;
         }
-        groups.entry(material).or_default().push(face);
+        groups.entry(material).or_default().push((index, face));
     }
 
     groups
@@ -1320,6 +1502,7 @@ fn upload_batches(
     device: &wgpu::Device,
     meshes: &[Mesh],
     resolved: &BTreeMap<&str, (Arc<Material>, MaterialInfo)>,
+    cullable: bool,
 ) -> Vec<Batch> {
     meshes
         .iter()
@@ -1327,6 +1510,14 @@ fn upload_batches(
             material: Arc::clone(&resolved[mesh.material.as_str()].0),
             lightmap_page: mesh.lightmap_page,
             bounds: mesh.vertices.bounds(),
+            faces: match cullable {
+                true => mesh.faces.clone(),
+                false => Vec::new(),
+            },
+            index_data: match cullable {
+                true => mesh.indices.clone(),
+                false => Vec::new(),
+            },
             vertices: match &mesh.vertices {
                 MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
                 MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
@@ -1344,7 +1535,7 @@ fn upload_batches(
 /// (`CMatLightmaps::AllocateLightmap`, `cmatlightmaps.cpp:306`).
 fn build_meshes(
     bsp: &Bsp,
-    groups: &BTreeMap<&str, Vec<&Face>>,
+    groups: &BTreeMap<&str, Vec<(u32, &Face)>>,
     lightmaps: &mut LightmapAtlas,
     stats: &mut WorldStats,
     info: impl Fn(&str) -> MaterialInfo,
@@ -1362,8 +1553,8 @@ fn build_meshes(
         // splits than the minimum-height rule it replaced — and the lit-first
         // rule keeps the white-page surfaces in one run at the end, where they
         // become a single extra batch instead of interleaving.
-        let mut faces: Vec<&Face> = faces.clone();
-        faces.sort_by_key(|face| {
+        let mut faces: Vec<(u32, &Face)> = faces.clone();
+        faces.sort_by_key(|(_, face)| {
             let lit = bsp.face_lightmap_samples(face).is_some() && info.lighting.needs_lightmap();
             let (width, height) = Bsp::face_lightmap_size(face);
             (!lit, std::cmp::Reverse(width * height))
@@ -1371,11 +1562,14 @@ fn build_meshes(
 
         // Pack first, because a face's lightmap coordinates depend on where it
         // landed, and its *batch* depends on which page that was.
-        let mut placed: BTreeMap<u32, Vec<(&Face, Option<Allocation>)>> = BTreeMap::new();
-        for face in faces {
+        let mut placed: BTreeMap<u32, Vec<(u32, &Face, Option<Allocation>)>> = BTreeMap::new();
+        for (index, face) in faces {
             let allocation = place_lightmap(bsp, lightmaps, face, info.lighting, stats);
             let page = allocation.map_or(WHITE_PAGE, |a| a.page);
-            placed.entry(page).or_default().push((face, allocation));
+            placed
+                .entry(page)
+                .or_default()
+                .push((index, face, allocation));
         }
 
         for (page, faces) in placed {
@@ -1445,30 +1639,34 @@ fn build_page_meshes(
     material: &str,
     info: MaterialInfo,
     page: u32,
-    faces: &[(&Face, Option<Allocation>)],
+    faces: &[(u32, &Face, Option<Allocation>)],
     stats: &mut WorldStats,
     meshes: &mut Vec<Mesh>,
 ) {
     let page_size = lightmaps.page_size(page);
     let mut vertices = MeshVertices::empty(info.layout);
     let mut indices: Vec<u16> = Vec::new();
+    let mut spans: Vec<FaceSpan> = Vec::new();
 
-    let mut flush =
-        |vertices: &mut MeshVertices, indices: &mut Vec<u16>, stats: &mut WorldStats| {
-            if vertices.is_empty() {
-                return;
-            }
-            stats.vertices += vertices.len();
-            stats.triangles += indices.len() / 3;
-            meshes.push(Mesh {
-                material: material.to_owned(),
-                vertices: vertices.take(),
-                indices: std::mem::take(indices),
-                lightmap_page: page,
-            });
-        };
+    let mut flush = |vertices: &mut MeshVertices,
+                     indices: &mut Vec<u16>,
+                     spans: &mut Vec<FaceSpan>,
+                     stats: &mut WorldStats| {
+        if vertices.is_empty() {
+            return;
+        }
+        stats.vertices += vertices.len();
+        stats.triangles += indices.len() / 3;
+        meshes.push(Mesh {
+            material: material.to_owned(),
+            vertices: vertices.take(),
+            indices: std::mem::take(indices),
+            faces: std::mem::take(spans),
+            lightmap_page: page,
+        });
+    };
 
-    for &(face, allocation) in faces {
+    for &(index, face, allocation) in faces {
         let displaced = face.disp_info >= 0;
         let count = match displaced {
             true => disp::Displacement::vertex_count(bsp, face),
@@ -1479,10 +1677,11 @@ fn build_page_meshes(
         // the middle of one: a surface's vertices have to be contiguous for the
         // indices below to name them.
         if vertices.len() + count > MAX_BATCH_VERTICES {
-            flush(&mut vertices, &mut indices, stats);
+            flush(&mut vertices, &mut indices, &mut spans, stats);
         }
 
         let base = vertices.len() as u16;
+        let first_index = indices.len() as u32;
         let lightmap_offset = lightmap_block_offset(face, info.lighting, page_size);
 
         // A displacement replaces the face's winding with its own grid, and
@@ -1516,6 +1715,11 @@ fn build_page_meshes(
             // `front_face: Ccw` reason the fan below is reversed here.
             indices.extend(patch.indices.iter().map(|i| base + i));
             stats.triangles_displaced += patch.indices.len() / 3;
+            spans.push(FaceSpan {
+                face: index,
+                first: first_index,
+                count: indices.len() as u32 - first_index,
+            });
             continue;
         }
 
@@ -1575,9 +1779,14 @@ fn build_page_meshes(
         for i in 1..count as u16 - 1 {
             indices.extend_from_slice(&[base, base + i + 1, base + i]);
         }
+        spans.push(FaceSpan {
+            face: index,
+            first: first_index,
+            count: indices.len() as u32 - first_index,
+        });
     }
 
-    flush(&mut vertices, &mut indices, stats);
+    flush(&mut vertices, &mut indices, &mut spans, stats);
 }
 
 /// The lightmap coordinate for one vertex, normalized into its page.
@@ -2793,7 +3002,8 @@ mod tests {
         // Two views, so that the order is checked against a camera and not
         // against an accident of construction order.
         for forward in [Vec3::X, -Vec3::X] {
-            let list = world.translucent_list(world.center(), forward);
+            let list =
+                world.translucent_list(world.center(), forward, &vis::VisibleSet::everything());
             let (mut world_batches, mut brush, mut props) = (0, 0, 0);
             for (_, item) in &list.0 {
                 match item {
@@ -2834,7 +3044,7 @@ mod tests {
         // Every translucent brush entity with drawable geometry is in the
         // list — which is the assertion with teeth, because the geometry is
         // opaque and only the entity's alpha puts it there.
-        let list = world.translucent_list(world.center(), Vec3::X);
+        let list = world.translucent_list(world.center(), Vec3::X, &vis::VisibleSet::everything());
         for placed in &by_entity {
             let Some(geometry) = world
                 .brush_model_geometry

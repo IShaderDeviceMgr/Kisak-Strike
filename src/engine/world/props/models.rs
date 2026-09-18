@@ -36,6 +36,7 @@ use crate::materials::uniforms::ModelLighting;
 use crate::materials::{Material, MaterialCache};
 use crate::studio::{vhv, StudioModel, Vhv};
 
+use super::super::vis::VisibleSet;
 use super::super::GeometryPass;
 use super::Props;
 
@@ -192,11 +193,7 @@ impl PropModel {
     /// [`entities`](crate::engine::world::entities), which need the same
     /// buffers from the same files and differ only in where the instances come
     /// from and how they are posed.
-    pub fn upload(
-        device: &wgpu::Device,
-        model: StudioModel,
-        batches: Vec<PropBatch>,
-    ) -> PropModel {
+    pub fn upload(device: &wgpu::Device, model: StudioModel, batches: Vec<PropBatch>) -> PropModel {
         // See the module docs: the file's winding is the reverse of what this
         // port's `front_face` names. Reversing each triangle **in place**
         // leaves every batch's and every bone run's index range where it was.
@@ -471,8 +468,8 @@ impl PropModels {
     /// material's pipeline are bound once per model rather than once per prop.
     /// That is `CStaticPropMgr::DrawStaticProps`' grouping and the reason the
     /// dictionary exists.
-    pub fn draw(&self, pass: &mut Pass<'_>, props: &Props) {
-        self.record(pass, props, false);
+    pub fn draw(&self, pass: &mut Pass<'_>, props: &Props, visible: &VisibleSet) {
+        self.record(pass, props, false, visible);
     }
 
     /// The batches [`draw`](PropModels::draw) left out: the ones whose material
@@ -506,11 +503,11 @@ impl PropModels {
     /// available.
     ///
     /// [update]: crate::materials::context::RenderContext::update_refract_texture
-    pub fn draw_refracting(&self, pass: &mut Pass<'_>, props: &Props) {
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, props: &Props, visible: &VisibleSet) {
         if !self.refracts {
             return;
         }
-        self.record(pass, props, true);
+        self.record(pass, props, true, visible);
     }
 
     /// Offers every batch of every instance that belongs in the translucent
@@ -617,7 +614,7 @@ impl PropModels {
     /// in group 3, not lighting), so the second call's slots are wasted; that
     /// is a few hundred bytes of arena on the one map in the game that has any,
     /// against threading a flag through the loop.
-    fn record(&self, pass: &mut Pass<'_>, props: &Props, refracting: bool) {
+    fn record(&self, pass: &mut Pass<'_>, props: &Props, refracting: bool, visible: &VisibleSet) {
         if self.is_empty() {
             return;
         }
@@ -684,6 +681,13 @@ impl PropModels {
                 let indices = model.indices.range(batch.first_index, batch.index_count);
                 for &i in instances {
                     let prop = &props.instances[i];
+                    // `Map_AreAnyLeavesVisible( m_LeafList )` — the whole of
+                    // how `CStaticPropMgr` culls one (`staticpropmgr.cpp`),
+                    // and exact rather than a bounding-box guess because
+                    // `vbsp` wrote the leaf list per prop.
+                    if !visible.any_leaf(&props.leaves[prop.leaves.clone()]) {
+                        continue;
+                    }
                     // Per instance rather than per batch: a prop whose
                     // `m_DiffuseModulation` alpha is below 1 is translucent
                     // even where the material is not.
@@ -917,7 +921,11 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                world.prop_models.draw(&mut pass, &world.props);
+                world.prop_models.draw(
+                    &mut pass,
+                    &world.props,
+                    &crate::engine::world::vis::VisibleSet::everything(),
+                );
             }
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {

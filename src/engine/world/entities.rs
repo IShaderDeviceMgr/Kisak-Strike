@@ -131,6 +131,26 @@ pub struct SequenceRow<'a> {
     pub fade_out_time: f32,
 }
 
+/// Whether a world-space box is drawn this frame.
+///
+/// [`World::box_visible`](super::World::box_visible), handed in as a callback
+/// rather than resolved here: an entity model is culled by its bounds, the
+/// tree those bounds are tested against belongs to
+/// [`World`](super::World), and this module has no business knowing what a
+/// leaf is.
+pub(crate) type BoxVisible<'a> = &'a dyn Fn(Vec3, Vec3) -> bool;
+
+/// How far outside its bind-pose bounds an animated instance is allowed to
+/// reach before culling would be wrong.
+///
+/// The largest travel any of this port's posed models has is a
+/// `prop_testchamber_door`'s 53-unit slide, measured by
+/// `the_chamber_door_slides_out_of_the_way`. Padding by it makes the cull
+/// conservative for every model in the game without posing anything: a pose
+/// costs three `Mat4`s per instance and would have to run for entities that
+/// are then thrown away.
+const POSE_SLACK: f32 = 64.0;
+
 /// One placed instance, resolved against a loaded model.
 struct Instance {
     /// [`ModelEntity::id`], which is what a sync matches on.
@@ -457,16 +477,44 @@ impl EntityModels {
 
     /// Records the opaque half. `curtime` is the scene clock, which is what
     /// each instance's cycle is measured against.
-    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32) {
-        self.record(pass, curtime, false);
+    pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32, visible: BoxVisible<'_>) {
+        self.record(pass, curtime, false, visible);
     }
 
     /// Records the half whose material samples a copy of the scene — see
     /// [`World::draw_refracting`](super::World::draw_refracting).
-    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32) {
+    pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32, visible: BoxVisible<'_>) {
         if self.refracts {
-            self.record(pass, curtime, true);
+            self.record(pass, curtime, true, visible);
         }
+    }
+
+    /// One instance's bounding box in world space.
+    ///
+    /// The model's own `view_bbmin`/`view_bbmax` under the entity's transform,
+    /// **not under its pose** — the same approximation
+    /// [`collect_translucent`](EntityModels::collect_translucent) makes and for
+    /// the same reason, except that here it has to be *conservative* rather
+    /// than merely close, so the box is padded by the largest travel any of
+    /// this port's animated models has: a chamber door's 53-unit slide.
+    fn world_bounds(&self, instance: &Instance) -> (Vec3, Vec3) {
+        let model = &self.models[instance.model];
+        let (mins, maxs) = model.bounds;
+        let mut bounds = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for corner in 0..8u32 {
+            let pick = |axis: usize| match corner >> axis & 1 {
+                0 => mins[axis],
+                _ => maxs[axis],
+            };
+            let point = instance
+                .transform
+                .transform_point3(Vec3::new(pick(0), pick(1), pick(2)));
+            bounds = (bounds.0.min(point), bounds.1.max(point));
+        }
+        (
+            bounds.0 - Vec3::splat(POSE_SLACK),
+            bounds.1 + Vec3::splat(POSE_SLACK),
+        )
     }
 
     /// Offers every batch of every visible instance that belongs in the
@@ -546,13 +594,17 @@ impl EntityModels {
         }
     }
 
-    fn record(&self, pass: &mut Pass<'_>, curtime: f32, refracting: bool) {
+    fn record(&self, pass: &mut Pass<'_>, curtime: f32, refracting: bool, visible: BoxVisible<'_>) {
         let wanted = match refracting {
             true => GeometryPass::Refracting,
             false => GeometryPass::Opaque,
         };
         for instance in &self.instances {
             if !instance.visible {
+                continue;
+            }
+            let (mins, maxs) = self.world_bounds(instance);
+            if !visible(mins, maxs) {
                 continue;
             }
             let model = &self.models[instance.model];
@@ -786,8 +838,8 @@ mod tests {
 
         let mut materials = MaterialCache::new(&device, &queue);
         let map = std::env::var("KISAK_MAP").unwrap_or_else(|_| "sp_a1_intro1".to_owned());
-        let mut world = super::super::World::load(&vfs, &mut materials, &device, &map)
-            .expect("the map loads");
+        let mut world =
+            super::super::World::load(&vfs, &mut materials, &device, &map).expect("the map loads");
 
         // The game half: spawn the entities, then ask them what models they
         // place — the same two calls `Level::load` makes.
@@ -880,7 +932,7 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                models.draw(&mut pass, curtime);
+                models.draw(&mut pass, curtime, &|_, _| true);
             }
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -1033,7 +1085,10 @@ mod tests {
         let door = placements[0].clone();
         world.load_entity_models(&vfs, &mut materials, &device, std::slice::from_ref(&door));
         assert_eq!(world.entity_models.stats.models_missing, 0);
-        assert_eq!(world.entity_models.stats.models_not_rigid, 0, "it must pose");
+        assert_eq!(
+            world.entity_models.stats.models_not_rigid, 0,
+            "it must pose"
+        );
         assert_eq!(world.entity_models.instances.len(), 1);
         println!("{}", world.entity_models.summary());
 
@@ -1113,7 +1168,7 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                models.draw(&mut pass, curtime);
+                models.draw(&mut pass, curtime, &|_, _| true);
             }
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -1158,7 +1213,12 @@ mod tests {
             playback_rate: 0.0,
             ..door.clone()
         };
-        let drawn = |image: &[u8]| image.chunks_exact(4).filter(|p| p[0..3] != [0, 0, 0]).count();
+        let drawn = |image: &[u8]| {
+            image
+                .chunks_exact(4)
+                .filter(|p| p[0..3] != [0, 0, 0])
+                .count()
+        };
 
         // **The middle of the doorway.** A shut door covers it and an open one
         // does not — which no wrong pose gives, because the geometry that has

@@ -1377,7 +1377,6 @@ fn portal_refract_stage(vmt: &Vmt) -> i32 {
         .unwrap_or(0)
 }
 
-
 /// The value of a parameter, or the default an undefined one takes.
 ///
 /// `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:838`) in one
@@ -3361,7 +3360,6 @@ pub fn portal_refract_uniforms(vmt: &Vmt) -> PortalRefractUniforms {
     }
 }
 
-
 /// `GammaToLinear` applied to a colour parameter's `rgb`, leaving `w` alone.
 ///
 /// `CBaseVSShader::SetPixelShaderConstantGammaToLinear` (`BaseVSShader.cpp:138`)
@@ -3918,7 +3916,6 @@ fn portal_refract_render_state(mut state: RenderState) -> RenderState {
     state
 }
 
-
 /// `CBaseShader::TextureIsTranslucent( BASETEXTURE, true )`
 /// (`shaderlib/BaseShader.cpp:605`).
 ///
@@ -4105,13 +4102,13 @@ mod tests {
     #[test]
     fn the_portal_overlay_reads_its_open_amount_and_no_lighting() {
         let kind = ShaderKind::PortalRefract;
-        assert_eq!(
-            kind.context_binding(),
-            Some(ContextBinding::PortalOverlay)
-        );
+        assert_eq!(kind.context_binding(), Some(ContextBinding::PortalOverlay));
         let vmt = portal_refract_vmt(PORTAL_OVERLAY_1);
         assert_eq!(lighting(kind, &vmt), Lighting::None);
-        assert!(!needs_frame_buffer_copy(kind, &vmt), "stage 0's, not this one");
+        assert!(
+            !needs_frame_buffer_copy(kind, &vmt),
+            "stage 0's, not this one"
+        );
         // Position and one texture coordinate is all the stage-2 shader reads.
         assert_eq!(kind.vertex_layout(), VertexLayout::Simple);
         // Two textures, and **no `$basetexture`** — `fakeportalring_blue`
@@ -4119,8 +4116,16 @@ mod tests {
         let requests = texture_requests(kind, &vmt);
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|r| r.param != "$basetexture"));
-        assert_eq!(requests[0].color_space, super::super::ColorSpace::Linear, "a mask");
-        assert_eq!(requests[1].color_space, super::super::ColorSpace::Srgb, "a colour");
+        assert_eq!(
+            requests[0].color_space,
+            super::super::ColorSpace::Linear,
+            "a mask"
+        );
+        assert_eq!(
+            requests[1].color_space,
+            super::super::ColorSpace::Srgb,
+            "a colour"
+        );
     }
 
     /// `glass/container_window_warm`, the material three of `sp_a1_intro1`'s

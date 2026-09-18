@@ -2058,6 +2058,35 @@ impl Server {
             .collect()
     }
 
+    /// Every `func_areaportal`'s key and whether it is open —
+    /// `CAreaPortal::UpdateState`'s `engine->SetAreaPortalState` calls,
+    /// gathered instead of pushed.
+    ///
+    /// Pushed in the shipped game because the call crosses the game/engine DLL
+    /// boundary and the engine has no way to ask; gathered here because there
+    /// is no boundary and a pull cannot go stale. Two entities naming the same
+    /// `portalnumber` is legal and the last one wins, which is what a sequence
+    /// of pushes would also do.
+    ///
+    /// **Removed entities are skipped, not reported closed.** An areaportal
+    /// with no entity is open (see
+    /// [`AreaPortal`](classes::AreaPortal)), so a key that drops out of this
+    /// list keeps whatever state it last had rather than slamming shut.
+    pub fn area_portals(&self) -> Vec<(u16, bool)> {
+        self.entities
+            .iter()
+            .filter(|(_, e)| !e.core.removed)
+            .filter_map(|(_, entity)| {
+                Some(
+                    entity
+                        .behaviour
+                        .downcast_ref::<classes::AreaPortal>()?
+                        .state(),
+                )
+            })
+            .collect()
+    }
+
     /// `CProp_Portal::FindPortal( group, bPortal2, bCreateIfNothingFound )`
     /// (`prop_portal.cpp:892`) — the portal of that colour in that group,
     /// making one if the group has none.
@@ -2093,10 +2122,7 @@ impl Server {
         // the console runs between ticks.
         let class = classes::lookup("prop_portal")?;
         let mut entity = Entity::new(class);
-        if let Some(portal) = entity
-            .behaviour
-            .downcast_mut::<classes::PropPortal>()
-        {
+        if let Some(portal) = entity.behaviour.downcast_mut::<classes::PropPortal>() {
             portal.linkage_group = group;
             portal.is_portal2 = is_portal2;
         }

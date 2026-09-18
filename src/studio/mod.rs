@@ -60,12 +60,12 @@
 // Remove this when `engine::world` places props.
 #![allow(dead_code)]
 
+pub mod anim;
 mod build;
 #[cfg(test)]
 mod fixture;
 mod include;
 mod mdl;
-pub mod anim;
 pub mod vhv;
 mod vtx;
 mod vvd;
@@ -930,8 +930,14 @@ mod tests {
                     sequences += model.sequences.len();
                     merged += model.includes.len();
                     from_includes += model.sequences.len() - local_sequences;
-                    widest_animation = widest_animation
-                        .max(model.animations.iter().map(|a| a.frame_count).max().unwrap_or(0));
+                    widest_animation = widest_animation.max(
+                        model
+                            .animations
+                            .iter()
+                            .map(|a| a.frame_count)
+                            .max()
+                            .unwrap_or(0),
+                    );
                     if model.bones.len() > 1 {
                         multi_bone += 1;
                         if model.rigid_bones().is_none() {
@@ -1030,7 +1036,11 @@ mod tests {
         assert_eq!(declares, 25, "models that name a $includemodel");
         assert_eq!(merged, 24, "companions that could be read");
         assert_eq!(multi_bone, 420, "models with more than one bone");
-        assert_eq!(not_rigid.len(), 141, "models that share a vertex between bones");
+        assert_eq!(
+            not_rigid.len(),
+            141,
+            "models that share a vertex between bones"
+        );
         // Was 5,434 before the merge, and the difference is what every
         // `prop_dynamic` naming an `anim_wp/room_transform` sequence was
         // missing.
@@ -1069,7 +1079,10 @@ mod anim_depot_tests {
         let model = StudioModel::load(&vfs, "models/props/portal_button.mdl").expect("the model");
         println!("{}: {} vertices", model.path, model.vertices.len());
         for (i, bone) in model.bones.iter().enumerate() {
-            println!("  bone {i} {:?} parent={:?} pos={:?}", bone.name, bone.parent, bone.pos);
+            println!(
+                "  bone {i} {:?} parent={:?} pos={:?}",
+                bone.name, bone.parent, bone.pos
+            );
         }
         for (i, seq) in model.sequences.iter().enumerate() {
             let anim = &model.animations[seq.anim];
@@ -1187,7 +1200,9 @@ mod anim_depot_tests {
         assert_eq!(model.bones[5].name, "portal_door_right");
 
         let open = model.sequence("open").expect("an `open` sequence");
-        let close = model.sequence("CLOSE").expect("`close`, case insensitively");
+        let close = model
+            .sequence("CLOSE")
+            .expect("`close`, case insensitively");
         let anim = |s: usize| &model.animations[model.sequences[s].anim];
 
         // **`open` is 23 frames and `close` is 36.** They are not the same
@@ -1234,7 +1249,10 @@ mod anim_depot_tests {
         }
         println!("  vertices per bone: {counts:?}");
         assert_eq!(counts.iter().sum::<usize>(), model.vertices.len());
-        assert!(counts[4] > 0 && counts[5] > 0, "the leaves have no geometry");
+        assert!(
+            counts[4] > 0 && counts[5] > 0,
+            "the leaves have no geometry"
+        );
         // …and one material, so the whole door is five draws and not fifty.
         assert_eq!(model.batches.len(), 1);
         assert_eq!(model.batches[0].bones.len(), 5);
@@ -1372,7 +1390,10 @@ mod anim_depot_tests {
             travel(0.0, 1.0)
         );
         assert!(animation.frame_count > 1);
-        assert!(travel(0.0, 1.0) > 1.0, "nothing moved over the longest animation");
+        assert!(
+            travel(0.0, 1.0) > 1.0,
+            "nothing moved over the longest animation"
+        );
 
         // ------------------------------------------------------------------
         // The remap, checked against the animation in its own frame.
@@ -1444,5 +1465,4 @@ mod anim_depot_tests {
             assert!(!m.sequences.is_empty(), "{path} has no sequences");
         }
     }
-
 }

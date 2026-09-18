@@ -394,12 +394,7 @@ impl Behaviour for Player {
     /// > `CBaseEntity::Event_Killed`: a dead player is still in the entity
     /// > list, still has a position, and still falls over. Deleting it is what
     /// > the default does and what every other class wants.
-    fn event_killed(
-        &mut self,
-        entity: &mut EntityCore,
-        _info: &DamageInfo,
-        cx: &mut Context<'_>,
-    ) {
+    fn event_killed(&mut self, entity: &mut EntityCore, _info: &DamageInfo, cx: &mut Context<'_>) {
         // "don't let the status bar glitch for players with <0 health"
         // (`player.cpp:1814`) — and it is the *floor* that matters here, not
         // the status bar: `CGameMovement::IsDead` is `m_iHealth <= 0`, so a
@@ -457,8 +452,7 @@ impl Behaviour for Player {
                 // borrows are already in hand, which is exactly what the C++'s
                 // `TakeDamage( ... )` on `this` compiles to.
                 let me = entity.id();
-                let info =
-                    DamageInfo::new(Some(me), Some(me), delta, damage::DMG_GENERIC);
+                let info = DamageInfo::new(Some(me), Some(me), delta, damage::DMG_GENERIC);
                 self.on_take_damage(entity, &info, cx);
             }
             return true;

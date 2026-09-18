@@ -31,7 +31,7 @@
 
 use std::any::Any;
 
-use super::damage::{self, Damaged, DamageInfo, DamageMode, LifeState};
+use super::damage::{self, DamageInfo, DamageMode, Damaged, LifeState};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
 use super::movement::EF_NODRAW;
@@ -990,12 +990,7 @@ pub trait Behaviour: Any {
     /// nothing in the port overrides it (Valve's implementations are game
     /// stats and NPC bookkeeping), and dispatching into another entity from
     /// inside a handler is what [`Context::create_entity`] exists to avoid.
-    fn event_killed(
-        &mut self,
-        entity: &mut EntityCore,
-        _info: &DamageInfo,
-        _cx: &mut Context<'_>,
-    ) {
+    fn event_killed(&mut self, entity: &mut EntityCore, _info: &DamageInfo, _cx: &mut Context<'_>) {
         entity.take_damage = DamageMode::No;
         entity.life_state = LifeState::Dead;
         entity.remove();

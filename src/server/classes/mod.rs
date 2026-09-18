@@ -64,7 +64,7 @@ pub mod world;
 use crate::server::class::{ClassDef, InputDef, InputDefs, PointEntity};
 use crate::server::io::FieldType;
 
-pub use brush::{Brush, Button, Door, MoveLinear, Rotating};
+pub use brush::{AreaPortal, Brush, Button, Door, MoveLinear, Rotating};
 pub use env::TonemapController;
 pub use filter::{
     FilterClass, FilterDamageType, FilterModel, FilterMulti, FilterName, FilterPlayerHeld,
@@ -177,6 +177,24 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: BRUSH_INPUTS,
         outputs: &[],
         create: Brush::create,
+    },
+    // The two areaportal classnames share one behaviour: `vbsp` has already
+    // taken both brushes away, and what is left of each is a `portalnumber`
+    // and three inputs. See [`AreaPortal`](brush::AreaPortal) for what the
+    // window half does not do.
+    ClassDef {
+        name: "func_areaportal",
+        keys: brush::AREAPORTAL_KEYS,
+        inputs: brush::AREAPORTAL_INPUTS,
+        outputs: &[],
+        create: brush::AreaPortal::create,
+    },
+    ClassDef {
+        name: "func_areaportalwindow",
+        keys: brush::AREAPORTAL_KEYS,
+        inputs: brush::AREAPORTAL_INPUTS,
+        outputs: &[],
+        create: brush::AreaPortal::create,
     },
     ClassDef {
         name: "func_instance_io_proxy",
@@ -500,9 +518,8 @@ static BRANCH_INPUTS: InputDefs = &[
 
 /// `Branch01`…`Branch16`. Sixteen slots; the game uses ten.
 static BRANCH_LIST_KEYS: &[&str] = &[
-    "Branch01", "Branch02", "Branch03", "Branch04", "Branch05", "Branch06", "Branch07",
-    "Branch08", "Branch09", "Branch10", "Branch11", "Branch12", "Branch13", "Branch14",
-    "Branch15", "Branch16",
+    "Branch01", "Branch02", "Branch03", "Branch04", "Branch05", "Branch06", "Branch07", "Branch08",
+    "Branch09", "Branch10", "Branch11", "Branch12", "Branch13", "Branch14", "Branch15", "Branch16",
 ];
 
 /// All three are `FIELD_INPUT` in the datadesc — the value is passed through

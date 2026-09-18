@@ -59,6 +59,20 @@ const LUMP_LEAFS: usize = 10;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
+/// The visibility lumps. Read here for the same reason the collision lumps
+/// are, and consumed by [`vis`](crate::engine::world::vis), which turns them
+/// into the set of faces a frame actually draws. See
+/// `portdocs/ENGINE_WORLD_VIS.md`.
+///
+/// `LUMP_VISIBILITY` is kept as raw bytes because it is not an array: it is a
+/// header, then a pair of byte offsets per cluster, then run-length-encoded bit
+/// vectors those offsets point into. [`Bsp::pvs`] and [`Bsp::cluster_count`]
+/// are the whole of its interface.
+const LUMP_VISIBILITY: usize = 4;
+const LUMP_LEAFFACES: usize = 16;
+const LUMP_AREAS: usize = 20;
+const LUMP_AREAPORTALS: usize = 21;
+const LUMP_CLIPPORTALVERTS: usize = 41;
 /// The two worldlight lumps. Read here for the same reason the collision lumps
 /// are, and consumed by [`light`](crate::engine::world::light), which turns
 /// each one into a term of a model's lighting.
@@ -379,6 +393,46 @@ impl Leaf {
     }
 }
 
+/// `darea_t` (`public/bspfile.h:1037`), 8 bytes.
+///
+/// One per *area* — a region of the map `vbsp` separated from its neighbours
+/// with `func_areaportal` brushes. Its fields slice [`Bsp::area_portals`].
+///
+/// **Area 0 is not used.** `FloodAreaConnections` starts its loop at 1
+/// (`cmodel.cpp:3490`), and a leaf whose area is 0 is one `vbsp` never
+/// assigned — solid space, or a map with no areaportals at all, in which case
+/// every leaf is in area 0 and the whole mechanism is inert.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Area {
+    pub num_area_portals: i32,
+    pub first_area_portal: i32,
+}
+
+/// `dareaportal_t` (`public/bspfile.h:1021`), 12 bytes.
+///
+/// **Two records per areaportal brush, not one** — the areaportal between
+/// areas A and B appears in A's list naming B and in B's list naming A, and
+/// both carry the same [`key`](AreaPortal::key). That is why the depot holds
+/// 922 of these against 409 `func_areaportal*` entities.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AreaPortal {
+    /// `m_PortalKey` — what a `func_areaportal`'s `portalnumber` matches, and
+    /// what an open/closed state is stored against. **1-based**: key 0 is the
+    /// unused entry `vbsp` writes first.
+    pub key: u16,
+    /// The area on the far side of this window.
+    pub other_area: u16,
+    /// This window's outline, slicing [`Bsp::clip_portal_verts`] — the polygon
+    /// the renderer clips the view frustum down to.
+    pub first_clip_portal_vert: u16,
+    pub num_clip_portal_verts: u16,
+    /// Index into [`Bsp::planes`], facing **out of** `other_area`: the viewer
+    /// has to be in front of it to see through.
+    pub plane_num: i32,
+}
+
 /// `dbrush_t` (`public/bspfile.h:995`), 12 bytes.
 ///
 /// A convex volume: the intersection of the half-spaces named by its sides.
@@ -672,6 +726,29 @@ pub struct Bsp {
     pub leaves: Vec<Leaf>,
     /// `LUMP_LEAFBRUSHES` — the brush indices each leaf's range points into.
     pub leaf_brushes: Vec<u16>,
+    /// `LUMP_LEAFFACES` — the face indices each leaf's
+    /// [`first_leaf_face`](Leaf::first_leaf_face) range points into.
+    ///
+    /// **It does not name every face.** A displacement's face is in no leaf's
+    /// list at all — measured over the depot, **0 of the game's 1,181
+    /// displacement faces appear here** — because the shipped engine gives a
+    /// leaf a second, separately built list for them (`mleaf_t::dispListStart`,
+    /// filled by the loader rather than read from a lump). `vis` rebuilds that
+    /// association from each displacement's bounds; see
+    /// `portdocs/ENGINE_WORLD_VIS.md` §3.
+    pub leaf_faces: Vec<u16>,
+    /// `LUMP_VISIBILITY`, raw. See [`pvs`](Bsp::pvs).
+    ///
+    /// Empty for a map compiled without `vvis`, which is legal and means
+    /// everything sees everything. **Every one of Portal 2's 106 shipped maps
+    /// has one**, totalling 5.0 MB and at most 236 KB on
+    /// `sp_a3_portal_intro`.
+    pub visibility: Vec<u8>,
+    /// `LUMP_AREAS`, `LUMP_AREAPORTALS` and `LUMP_CLIPPORTALVERTS` — the
+    /// areaportal graph and the windows' outlines.
+    pub areas: Vec<Area>,
+    pub area_portals: Vec<AreaPortal>,
+    pub clip_portal_verts: Vec<[f32; 3]>,
     pub brushes: Vec<Brush>,
     pub brush_sides: Vec<BrushSide>,
     /// The displacement lumps: one [`DispInfo`] per displacement, and two flat
@@ -904,6 +981,11 @@ impl Bsp {
             nodes: reader.records(LUMP_NODES)?,
             leaves: reader.records(LUMP_LEAFS)?,
             leaf_brushes: reader.records(LUMP_LEAFBRUSHES)?,
+            leaf_faces: reader.records(LUMP_LEAFFACES)?,
+            visibility: reader.raw(LUMP_VISIBILITY).unwrap_or(&[]).to_vec(),
+            areas: reader.records(LUMP_AREAS)?,
+            area_portals: reader.records(LUMP_AREAPORTALS)?,
+            clip_portal_verts: reader.records(LUMP_CLIPPORTALVERTS)?,
             brushes: reader.records(LUMP_BRUSHES)?,
             brush_sides: reader.records(LUMP_BRUSHSIDES)?,
             disp_info: reader.records(LUMP_DISPINFO)?,
@@ -1062,6 +1144,62 @@ impl Bsp {
             }
         }
 
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            let first = leaf.first_leaf_face as usize;
+            let end = first + leaf.num_leaf_faces as usize;
+            if end > self.leaf_faces.len() {
+                return Err(corrupt(format!(
+                    "leaf {i} names leaffaces {first}..{end} of {}",
+                    self.leaf_faces.len()
+                )));
+            }
+        }
+
+        for (i, &face) in self.leaf_faces.iter().enumerate() {
+            if face as usize >= self.faces.len() {
+                return Err(corrupt(format!(
+                    "leafface {i} names face {face} of {}",
+                    self.faces.len()
+                )));
+            }
+        }
+
+        for (i, area) in self.areas.iter().enumerate() {
+            let first = area.first_area_portal.max(0) as usize;
+            let end = first + area.num_area_portals.max(0) as usize;
+            if end > self.area_portals.len() {
+                return Err(corrupt(format!(
+                    "area {i} names areaportals {first}..{end} of {}",
+                    self.area_portals.len()
+                )));
+            }
+        }
+
+        for (i, portal) in self.area_portals.iter().enumerate() {
+            if !self.areas.is_empty() && portal.other_area as usize >= self.areas.len() {
+                return Err(corrupt(format!(
+                    "areaportal {i} looks into area {} of {}",
+                    portal.other_area,
+                    self.areas.len()
+                )));
+            }
+            if portal.plane_num.max(0) as usize >= self.planes.len().max(1) {
+                return Err(corrupt(format!(
+                    "areaportal {i} names plane {} of {}",
+                    portal.plane_num,
+                    self.planes.len()
+                )));
+            }
+            let first = portal.first_clip_portal_vert as usize;
+            let end = first + portal.num_clip_portal_verts as usize;
+            if end > self.clip_portal_verts.len() {
+                return Err(corrupt(format!(
+                    "areaportal {i} names clip verts {first}..{end} of {}",
+                    self.clip_portal_verts.len()
+                )));
+            }
+        }
+
         for (i, &brush) in self.leaf_brushes.iter().enumerate() {
             if brush as usize >= self.brushes.len() {
                 return Err(corrupt(format!(
@@ -1154,6 +1292,82 @@ impl Bsp {
     }
 
     /// The faces belonging to `model`, in file order.
+    /// `dvis_t::numclusters` — how many PVS clusters `vvis` compiled the map
+    /// into.
+    ///
+    /// 0 when the map has no visibility lump, which is legal and means
+    /// everything sees everything (`CM_NullVis`, `cmodel.cpp:3312`). All 106
+    /// of Portal 2's shipped maps have one; the largest is
+    /// `sp_a3_portal_intro` at 1,037 clusters.
+    pub fn cluster_count(&self) -> usize {
+        if self.visibility.len() < 4 {
+            return 0;
+        }
+        i32::from_le_bytes(self.visibility[..4].try_into().unwrap()).max(0) as usize
+    }
+
+    /// How many bytes one decompressed visibility row occupies — one bit per
+    /// cluster, rounded up.
+    pub fn cluster_bytes(&self) -> usize {
+        self.cluster_count().div_ceil(8)
+    }
+
+    /// Decompresses one cluster's PVS row into `out`, which is resized to
+    /// [`cluster_bytes`](Bsp::cluster_bytes).
+    ///
+    /// `CM_DecompressVis` (`engine/cmodel.cpp:3335`). The encoding is Quake's:
+    /// a non-zero byte is eight clusters' bits verbatim, and a **zero** byte
+    /// introduces a run, whose length in bytes is the byte after it. There is
+    /// no escape for a literal zero because there never needs to be — a zero
+    /// byte is a run of at least one.
+    ///
+    /// A map with no visibility lump, or a cluster with no row, comes back all
+    /// ones: *everything is visible* is the safe answer, because it draws too
+    /// much rather than too little.
+    ///
+    /// **Two divergences from `CM_DecompressVis`, both bounds.** Its own check
+    /// is `cluster > numclusters`, which lets `cluster == numclusters` read one
+    /// entry past the end of `bitofs[numclusters][2]`; this uses `>=`. And a
+    /// run of length zero would spin its `do/while` forever on a corrupt lump,
+    /// where this stops. Neither can happen on shipped content.
+    pub fn pvs(&self, cluster: usize, out: &mut Vec<u8>) {
+        let clusters = self.cluster_count();
+        let bytes = clusters.div_ceil(8);
+        out.clear();
+
+        // `bitofs[numclusters][2]`: the PVS offset is the first of the pair,
+        // and the second is the PAS, which nothing in this port reads — the
+        // audible set belongs to sound, and there is no sound.
+        let entry = 4 + cluster * 8;
+        let offset = match cluster < clusters && entry + 4 <= self.visibility.len() {
+            true => i32::from_le_bytes(self.visibility[entry..entry + 4].try_into().unwrap()),
+            false => 0,
+        };
+        let mut read = offset.max(0) as usize;
+        if offset <= 0 || read >= self.visibility.len() {
+            out.resize(bytes, 0xFF);
+            return;
+        }
+
+        while out.len() < bytes {
+            let Some(&byte) = self.visibility.get(read) else {
+                break;
+            };
+            if byte != 0 {
+                out.push(byte);
+                read += 1;
+                continue;
+            }
+            let run = usize::from(self.visibility.get(read + 1).copied().unwrap_or(0));
+            read += 2;
+            if run == 0 {
+                break;
+            }
+            out.resize((out.len() + run).min(bytes), 0);
+        }
+        out.resize(bytes, 0);
+    }
+
     pub fn model_faces(&self, model: &Model) -> &[Face] {
         let first = model.first_face as usize;
         &self.faces[first..first + model.num_faces as usize]
@@ -2035,6 +2249,109 @@ mod tests {
         assert_eq!(size_of::<DispInfo>(), 176, "ddispinfo_t");
         assert_eq!(size_of::<DispVert>(), 20, "CDispVert");
         assert_eq!(size_of::<DispTri>(), 2, "CDispTri");
+    }
+
+    #[test]
+    fn visibility_lump_strides_match_the_file() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<Area>(), 8, "darea_t");
+        assert_eq!(size_of::<AreaPortal>(), 12, "dareaportal_t");
+    }
+
+    /// A `Bsp` carrying nothing but a hand-built visibility lump.
+    ///
+    /// `clusters` rows, each given as the bytes that follow its offset, laid
+    /// out the way `vvis` writes one: the count, then a `[PVS, PAS]` offset
+    /// pair per cluster, then the rows.
+    fn vis_bsp(clusters: usize, rows: &[&[u8]]) -> Bsp {
+        let mut lump = Vec::new();
+        lump.extend_from_slice(&(clusters as i32).to_le_bytes());
+        // `bitofs[numclusters][2]` — a pair for **every** cluster, whether or
+        // not a row was supplied. A cluster with no row gets offset 0, which
+        // is how a real lump says "no row" and what `CM_DecompressVis` treats
+        // as `CM_NullVis`.
+        let mut offset = 4 + clusters * 8;
+        let mut body = Vec::new();
+        for cluster in 0..clusters {
+            let (pvs, len) = match rows.get(cluster) {
+                Some(row) => (offset as i32, row.len()),
+                None => (0, 0),
+            };
+            lump.extend_from_slice(&pvs.to_le_bytes());
+            // The PAS offset, which this port never reads.
+            lump.extend_from_slice(&pvs.to_le_bytes());
+            if let Some(row) = rows.get(cluster) {
+                body.extend_from_slice(row);
+            }
+            offset += len;
+        }
+        lump.extend_from_slice(&body);
+
+        let mut bsp = Bsp::parse("vis.bsp".into(), &one_face_bsp()).expect("valid");
+        bsp.visibility = lump;
+        bsp
+    }
+
+    /// The run-length encoding: a non-zero byte is eight clusters, a zero byte
+    /// is a run whose length is the byte after it.
+    #[test]
+    fn a_pvs_row_decompresses_its_runs() {
+        // 24 clusters — three bytes a row.
+        let bsp = vis_bsp(
+            24,
+            &[
+                // 0xFF, then two zero bytes: everything in the first eight.
+                &[0xFF, 0x00, 0x02],
+                // A run of two, then one literal.
+                &[0x00, 0x02, 0x81],
+                // Longer than the row: truncated, not overrun.
+                &[0x00, 0xFF],
+            ],
+        );
+        assert_eq!(bsp.cluster_count(), 24);
+        assert_eq!(bsp.cluster_bytes(), 3);
+
+        let mut row = Vec::new();
+        bsp.pvs(0, &mut row);
+        assert_eq!(row, [0xFF, 0x00, 0x00]);
+        bsp.pvs(1, &mut row);
+        assert_eq!(row, [0x00, 0x00, 0x81]);
+        bsp.pvs(2, &mut row);
+        assert_eq!(row, [0x00, 0x00, 0x00]);
+    }
+
+    /// Two ways of having no answer, and both give *everything* — the safe
+    /// direction, because it draws too much rather than too little.
+    /// `CM_NullVis` (`cmodel.cpp:3312`).
+    #[test]
+    fn a_missing_row_sees_everything() {
+        let bsp = vis_bsp(16, &[&[0x01, 0x00, 0x01]]);
+        let mut row = Vec::new();
+
+        // Cluster 1: the lump says there are 16 clusters but only one row was
+        // written, so its offset entry is past the end.
+        bsp.pvs(1, &mut row);
+        assert_eq!(row, [0xFF, 0xFF]);
+        // Past the end entirely — `CM_DecompressVis`' own bounds check is
+        // `cluster > numclusters`, which would read one entry too far here.
+        bsp.pvs(16, &mut row);
+        assert_eq!(row, [0xFF, 0xFF]);
+
+        // And a map with no lump at all.
+        let bare = Bsp::parse("bare.bsp".into(), &one_face_bsp()).expect("valid");
+        assert_eq!(bare.cluster_count(), 0);
+        bare.pvs(0, &mut row);
+        assert!(row.is_empty(), "no clusters, so no bits");
+    }
+
+    /// A zero-length run would spin `CM_DecompressVis`' `do`/`while` forever.
+    /// This stops, and what it has read so far stands.
+    #[test]
+    fn a_zero_length_run_stops_rather_than_spinning() {
+        let bsp = vis_bsp(16, &[&[0x3C, 0x00, 0x00, 0x11]]);
+        let mut row = Vec::new();
+        bsp.pvs(0, &mut row);
+        assert_eq!(row, [0x3C, 0x00]);
     }
 
     /// The two counts nothing in the file records.

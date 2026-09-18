@@ -86,6 +86,19 @@ pub struct Engine<'a> {
     /// The engine's own handle to `fps_max`, per `ENGINE_CONSOLE.md` §6.1: a
     /// subsystem holds the one cvar it reads rather than a way to look one up.
     fps_max: Cvar,
+    /// `r_novis` — draw everything, PVS or no PVS.
+    r_novis: Cvar,
+    /// `r_lockpvs` — stop recomputing the visible set so the view can be flown
+    /// around it.
+    ///
+    /// Valve freezes the whole answer by returning early from `Map_VisMark`,
+    /// which leaves the *frustum* still tracking the camera because
+    /// `R_SetupAreaBits` runs separately. Freezing the eye instead gives the
+    /// same picture from the same code path, and it is the eye that the whole
+    /// answer is a function of.
+    r_lockpvs: Cvar,
+    /// Where the eye was when `r_lockpvs` was turned on.
+    locked_eye: Option<glam::Vec3>,
     /// What [`Cvar::changed`] was last told. `fps_max` had an
     /// `FnChangeCallback_t` in the original (`engine/sys_engine.cpp:78`); this
     /// counter is what replaces it.
@@ -213,6 +226,18 @@ impl<'a> Engine<'a> {
             "Frame rate limiter.",
         );
 
+        // Visibility's two cheats — `mod_vis.cpp:22`. Held here rather than in
+        // `world/` because the *view* is what they are about and the view is
+        // assembled here: `world/` is handed an eye and a matrix and does not
+        // know where they came from.
+        let r_novis = console.cvar("r_novis", "0", CvarFlags::CHEAT, "Turn off the PVS.");
+        let r_lockpvs = console.cvar(
+            "r_lockpvs",
+            "0",
+            CvarFlags::CHEAT,
+            "Lock the PVS so you can fly around and inspect what is being drawn.",
+        );
+
         // The game client's cvars — `sensitivity`, the mouse factors, the
         // movement speeds — are registered by the client itself, because it is
         // what reads them (`ENGINE_CONSOLE.md` §6.1). This is the line where
@@ -271,6 +296,14 @@ impl<'a> Engine<'a> {
             // `ClearBuffers` used as a bar chart (`viewpostprocess.cpp:1115`),
             // which is not worth rebuilding in `egui` to read six numbers.
             CommandSpec::new("tonemap", "Report what the exposure controller is doing."),
+            // Also this port's own. Valve's nearest equivalents are
+            // `r_ShowViewerArea`, `mat_leafvis` and `r_DrawPortals`, all of
+            // which draw rather than print; this prints, because the numbers
+            // are what tell you whether the PVS is doing anything.
+            CommandSpec::new(
+                "vis",
+                "Report what the PVS, the areas and the frustum left standing.",
+            ),
             // The game server's. `CON_COMMAND(report_entities, ...)`
             // (`game/server/entitylist.cpp:1944`) and
             // `ConCommand ent_dump(...)` (`game/server/baseentity.cpp:6103`),
@@ -341,6 +374,9 @@ impl<'a> Engine<'a> {
             host: Host::new(fps_max.float()),
             console,
             fps_max,
+            r_novis,
+            r_lockpvs,
+            locked_eye: None,
             scene: Scene {
                 vfs,
                 device: device.clone(),
@@ -694,6 +730,14 @@ impl<'a> Engine<'a> {
             // owns no uploaded geometry, so this replaces a list of at most
             // four rows.
             world.sync_portals(&portals(&self.scene.server, self.scene.curtime));
+            // …and the fourth, which changes nothing most ticks: which
+            // areaportals the map's `func_areaportal`s have opened.
+            // `CM_SetAreaPortalStates` (`cmodel.cpp:3517`) — one call for all
+            // of them, so the area graph is re-flooded once rather than per
+            // entity.
+            world
+                .vis
+                .set_area_portals(&self.scene.server.area_portals());
         }
 
         // `CL_Move` (`engine/cl_main.cpp:2734`), which is
@@ -886,6 +930,32 @@ impl<'a> Engine<'a> {
         context.set_exposure(tonemap.scale());
         let measure = tonemap.measuring().then(|| tonemap.exposure_region());
 
+        // **Visibility, once, before anything is drawn.** `Map_VisSetup` runs
+        // at the top of `CViewRender::RenderView` for the same reason: every
+        // pass below draws the same frame from the same place, so they must
+        // all be told the same thing about what is in it.
+        //
+        // `novis` is `r_novis` *or* the camera being outside the world with
+        // noclip on — `g_bNoClipEnabled` in `Map_VisMark` (`mod_vis.cpp:287`).
+        // Without that second term, flying out of a map through a wall would
+        // black the whole thing out, because a leaf out there has no cluster
+        // and a cluster of -1 sees nothing.
+        match self.r_lockpvs.bool() {
+            true => {
+                self.locked_eye.get_or_insert(camera.eye);
+            }
+            false => self.locked_eye = None,
+        }
+        let eye = self.locked_eye.unwrap_or(camera.eye);
+        let outside = world.vis.cluster_at(eye) < 0;
+        let visible = world.visible(
+            eye,
+            camera.view_proj(),
+            self.r_novis.bool()
+                || (outside
+                    && client.player().move_type == crate::client::player::MoveType::Noclip),
+        );
+
         // The block ends both borrows of `post` before `resolve` takes it
         // mutably.
         {
@@ -899,7 +969,7 @@ impl<'a> Engine<'a> {
                 &camera,
                 Load::Clear(CLEAR_COLOR),
             );
-            world.draw(&mut pass, curtime);
+            world.draw(&mut pass, curtime, &visible);
         }
 
         // `UpdateRefractTexture` and `DrawTranslucentRenderables`, in that
@@ -923,19 +993,19 @@ impl<'a> Engine<'a> {
                 // the first one left, against the depth buffer it left.
                 Load::Keep,
             );
-            world.draw_refracting(&mut pass, curtime);
+            world.draw_refracting(&mut pass, curtime, &visible);
         }
 
         // `DrawTranslucentRenderables`' own place in the frame: last, on top of
         // everything opaque, sorted back to front. Built before the pass is
         // opened so that a map with nothing blended pays neither the pass nor
         // the tile load and store it costs.
-        let translucent = world.translucent_list(camera.eye, camera.forward());
+        let translucent = world.translucent_list(camera.eye, camera.forward(), &visible);
         if !translucent.is_empty() {
             let scene = post.scene(frame.size());
             let mut pass =
                 context.target_pass(frame, materials.pipelines(), scene, &camera, Load::Keep);
-            world.draw_translucent(&mut pass, curtime, &translucent);
+            world.draw_translucent(&mut pass, curtime, &translucent, &visible);
         }
 
         post.resolve(frame, measure);
@@ -1088,8 +1158,14 @@ fn portals(server: &Server, curtime: f32) -> Vec<world::portals::Portal> {
 /// translation, which is the only line in the port that names both types.
 fn group_sequences<'a>(
     rows: impl Iterator<Item = world::entities::SequenceRow<'a>>,
-) -> Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> {
-    let mut out: Vec<(String, Vec<(String, crate::server::sequences::SequenceInfo)>)> = Vec::new();
+) -> Vec<(
+    String,
+    Vec<(String, crate::server::sequences::SequenceInfo)>,
+)> {
+    let mut out: Vec<(
+        String,
+        Vec<(String, crate::server::sequences::SequenceInfo)>,
+    )> = Vec::new();
     for row in rows {
         let info = crate::server::sequences::SequenceInfo {
             duration: row.duration,
@@ -1300,10 +1376,7 @@ impl Level for Scene<'_> {
         let placements = model_entities(&self.server);
         world.load_entity_models(vfs, &mut self.materials, &self.device, &placements);
         if !placements.is_empty() {
-            eprintln!(
-                "source-engine: world: {}",
-                world.entity_models.summary()
-            );
+            eprintln!("source-engine: world: {}", world.entity_models.summary());
         }
 
         // …and the answer back the other way. `server/` names no studio type,
@@ -1615,6 +1688,74 @@ fn portal_command(
 /// stage 1 — it asks the one question the module exists to answer, using only
 /// what already existed (a console, a player, a view). `client/` stage 4 is
 /// what turns the answer into movement.
+/// `vis`: what the three filters left standing, from where the player is.
+///
+/// Recomputed here rather than kept from the last frame, because the console
+/// is drained before the frame is drawn and holding one would report the
+/// previous view. The numbers are the same either way — the answer is a
+/// function of the eye and the matrix.
+fn vis_command(world: Option<&World>, client: &Client, cx: &mut ExecContext<'_>) {
+    let Some(world) = world else {
+        cx.print("vis: no map is loaded");
+        return;
+    };
+    if world.vis.is_empty() {
+        cx.print(&format!("vis: {} has no visibility data", world.name));
+        return;
+    }
+
+    let view = client.view(1, 1);
+    let (forward, _, up) = view.angles.vectors();
+    let camera = Camera::perspective(
+        view.origin,
+        glam::camera::rh::view::look_at_mat4(view.origin, view.origin + forward, up),
+        view.fov,
+        view.aspect,
+        view.z_near,
+        view.z_far,
+    );
+    let set = world.visible(camera.eye, camera.view_proj(), false);
+    let s = set.stats;
+    let percent = |part: usize, whole: usize| match whole {
+        0 => 0.0,
+        _ => 100.0 * part as f32 / whole as f32,
+    };
+
+    cx.print(&format!("vis: {}", world.vis.summary()));
+    cx.print(&format!(
+        "  eye at ({:.0} {:.0} {:.0}) in leaf {}, cluster {}, area {}",
+        camera.eye.x,
+        camera.eye.y,
+        camera.eye.z,
+        world.vis.leaf_at(camera.eye),
+        s.cluster,
+        world.vis.area_at(camera.eye),
+    ));
+    cx.print(&format!(
+        "  sees {} of {} clusters ({:.1}%), {} leaves, {} areas, {} nodes walked",
+        s.clusters,
+        world.vis.cluster_count(),
+        percent(s.clusters, world.vis.cluster_count()),
+        s.leaves,
+        s.areas,
+        s.nodes,
+    ));
+    cx.print(&format!(
+        "  {} of {} world faces ({:.1}%)",
+        s.faces,
+        world.stats.faces_total,
+        percent(s.faces, world.stats.faces_total),
+    ));
+
+    let closed: Vec<u16> = (0..world.vis.area_portal_count() as u16)
+        .filter(|&key| !world.vis.area_portal_is_open(key))
+        .collect();
+    cx.print(&match closed.is_empty() {
+        true => "  every areaportal is open".to_owned(),
+        false => format!("  areaportals closed: {closed:?}"),
+    });
+}
+
 fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut ExecContext<'_>) {
     let Some(world) = world else {
         cx.print("trace: no map is loaded");
@@ -1985,7 +2126,10 @@ impl CommandTarget for EngineCommands<'_> {
             }
             "hurtme" => {
                 let amount = cmd.arg(1).map_or(10.0, crate::server::keyvalue::atof);
-                if !self.server.hurt_player(amount, crate::server::damage::DMG_GENERIC) {
+                if !self
+                    .server
+                    .hurt_player(amount, crate::server::damage::DMG_GENERIC)
+                {
                     cx.print("hurtme: no player, or the damage was refused");
                 }
             }
@@ -2002,6 +2146,7 @@ impl CommandTarget for EngineCommands<'_> {
             "ent_fire" => self.server.ent_fire(cmd, cx),
             "dumpeventqueue" => self.server.dump_event_queue(cx),
             "tonemap" => tonemap_command(self.client, cx),
+            "vis" => vis_command(self.world, self.client, cx),
             "quit" => self.host.request_shutdown(),
             "restart" => self.host.request_restart(),
 
@@ -2723,5 +2868,4 @@ mod tests {
         assert_eq!(client.player().health, 0);
         assert_eq!(client.player().move_type, MoveType::FlyGravity);
     }
-
 }

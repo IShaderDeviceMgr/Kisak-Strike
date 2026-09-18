@@ -490,11 +490,9 @@ impl<'a> Tracer<'a> {
         }
 
         // Steps 4 and 5.
-        if let (Some(remote), Some(visits), Some(link)) = (
-            hole.wall.remote(),
-            hole.remote.as_mut(),
-            hole.wall.link(),
-        ) {
+        if let (Some(remote), Some(visits), Some(link)) =
+            (hole.wall.remote(), hole.remote.as_mut(), hole.wall.link())
+        {
             if let Some((far_ray, shift)) = hole.wall.remote_ray(ray, exit_extents) {
                 let mut far = sweep(remote, visits, &far_ray, 0, mask);
                 compute_trace_endpoints(&far_ray, &mut far);
@@ -1100,8 +1098,7 @@ fn fix_up_hull_start(ray: &Ray, trace: &mut Trace) {
 /// carve did not remove anything in the way, and a `>` there would throw the
 /// portal's answer away in precisely the case where the two are equivalent.
 fn better(real: &Trace, portal: &Trace, ray: &Ray) -> bool {
-    real.start_solid
-        || (!portal.start_solid && ray.is_swept && portal.fraction >= real.fraction)
+    real.start_solid || (!portal.start_solid && ray.is_swept && portal.fraction >= real.fraction)
 }
 
 /// Merges one more collideable's answer into a trace — the rule

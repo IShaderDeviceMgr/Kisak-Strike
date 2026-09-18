@@ -108,7 +108,16 @@ mod tests {
             wgpu::TextureFormat::Bgra8UnormSrgb,
             true,
         );
-        let eye = world.center();
+        // **The map's own spawn, not the centre of its bounding box.** The
+        // centre of a map is usually inside its geometry or in a sealed
+        // pocket, and a frame recorded from there measures nothing: the first
+        // run of this after visibility landed reported *one leaf* and 53
+        // faces, because `sp_a1_intro1`'s box centre is in an area with no
+        // areaportals into it.
+        let eye = world
+            .spawn
+            .map(|spawn| spawn.origin + Vec3::Z * 64.0)
+            .unwrap_or_else(|| world.center());
         let camera = Camera::perspective(
             eye,
             glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z),
@@ -166,14 +175,50 @@ mod tests {
             );
         };
 
+        // What this view can actually see. Timed here rather than inside the
+        // frame closures because it runs **once** per frame for every pass,
+        // and folding it into one of them would charge that pass for all of
+        // them.
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            std::hint::black_box(world.visible(eye, camera.view_proj(), false));
+        }
+        let marking = start.elapsed();
+        let visible = world.visible(eye, camera.view_proj(), false);
+        let everything = crate::engine::world::vis::VisibleSet::everything();
+        let s = visible.stats;
         println!("{map}:");
-        run("brushes only", &|pass| world.draw_brushes(pass));
-        run("brush models", &|pass| world.draw_brush_models(pass));
-        run("props only", &|pass| {
-            world.prop_models.draw(pass, &world.props)
+        println!(
+            "  {:<16} {:>7.3} ms/frame CPU  (cluster {}, {} of {} clusters, {} leaves, \
+             {} faces, {} areas, {} nodes)",
+            "visibility",
+            marking.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+            s.cluster,
+            s.clusters,
+            world.vis.cluster_count(),
+            s.leaves,
+            s.faces,
+            s.areas,
+            s.nodes,
+        );
+        run("brushes only", &|pass| world.draw_brushes(pass, &visible));
+        run("brush models", &|pass| {
+            world.draw_brush_models(pass, &visible)
         });
-        run("entity models", &|pass| world.entity_models.draw(pass, 0.0));
-        run("everything", &|pass| world.draw(pass, 0.0));
+        run("props only", &|pass| {
+            world.prop_models.draw(pass, &world.props, &visible)
+        });
+        run("entity models", &|pass| {
+            world.entity_models.draw(pass, 0.0, &|mins, maxs| {
+                world.box_visible(&visible, mins, maxs)
+            })
+        });
+        run("everything", &|pass| world.draw(pass, 0.0, &visible));
+        // The same frame with the PVS off, which is what every measurement in
+        // `rustdocs/ENGINE.md` before this was: the number to compare against.
+        run("everything, novis", &|pass| {
+            world.draw(pass, 0.0, &everything)
+        });
         drop(run);
 
         // The translucent half, which is a *third* pass and — unlike the two
@@ -182,7 +227,7 @@ mod tests {
         // separately for that reason: the number to watch is how the per-item
         // cost compares with the batched passes, not the absolute.
         {
-            let list = world.translucent_list(eye, Vec3::X);
+            let list = world.translucent_list(eye, Vec3::X, &visible);
             println!("  {:<16} {} draws", "translucent", list.len());
             let translucent_frame = |context: &mut RenderContext, materials: &mut MaterialCache| {
                 context.begin_frame();
@@ -195,7 +240,7 @@ mod tests {
                         &camera,
                         Load::Clear(wgpu::Color::BLACK),
                     );
-                    world.draw_translucent(&mut pass, 0.0, &list);
+                    world.draw_translucent(&mut pass, 0.0, &list, &visible);
                 }
                 queue.submit([encoder.finish()]);
             };
@@ -249,7 +294,7 @@ mod tests {
                     &camera,
                     Load::Clear(wgpu::Color::BLACK),
                 );
-                world.draw(&mut pass, 0.0);
+                world.draw(&mut pass, 0.0, &visible);
             }
             context.record_refract_texture(&mut encoder, &target);
             {
@@ -260,7 +305,7 @@ mod tests {
                     &camera,
                     Load::Keep,
                 );
-                world.draw_refracting(&mut pass, 0.0);
+                world.draw_refracting(&mut pass, 0.0, &visible);
             }
             queue.submit([encoder.finish()]);
         };

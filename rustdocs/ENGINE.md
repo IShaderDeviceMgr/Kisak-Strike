@@ -6,7 +6,7 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain and props done; no visibility, no 3D skybox |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain, props and **visibility** done; no 3D skybox |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
 | [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | complete — cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg`, the list commands and the `egui` dialog |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
@@ -225,11 +225,18 @@ A loaded map and the geometry it draws.
 ```rust
 pub fn load(vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device, name: &str)
     -> Result<World, WorldError>;
-pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
+/// What this view can see. Ask once a frame, before opening any pass, and hand
+/// the answer to all three draw calls below — they must agree about what is in
+/// the frame. `novis` is `r_novis`; see "Visibility".
+pub fn visible(&self, eye: Vec3, view_proj: Mat4, novis: bool) -> vis::VisibleSet;
+pub fn box_visible(&self, visible: &vis::VisibleSet, mins: Vec3, maxs: Vec3) -> bool;
+pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32, visible: &vis::VisibleSet);
 pub fn needs_frame_buffer_copy(&self) -> bool;
-pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
-pub fn translucent_list(&self, eye: Vec3, forward: Vec3) -> TranslucentList;
-pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList);
+pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32, visible: &vis::VisibleSet);
+pub fn translucent_list(&self, eye: Vec3, forward: Vec3, visible: &vis::VisibleSet)
+    -> TranslucentList;
+pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList,
+                        visible: &vis::VisibleSet);
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
@@ -346,7 +353,9 @@ nor the tile load and store it costs. `TranslucentList` is opaque; `is_empty()` 
 
 **What this is a reduction of.** `DrawTranslucentRenderables` walks the frame's leaves
 backwards, drawing each leaf's translucent *world* surfaces and then the translucent
-entities in that leaf. This port has no visibility, so there are no leaves and the
+entities in that leaf. This port has a PVS but **no per-leaf renderable index** —
+nothing keeps a list of which entities are in which leaf, which is
+`CClientLeafSystem`'s whole job — so there are still no leaves to walk and the
 interleave has nothing to reduce to; what is left is the sort, applied to everything at
 once — including world batches, which Valve never sorts because the leaf walk had already
 ordered them. **A world batch is the whole map's worth of one material**, so its box
@@ -555,13 +564,14 @@ each brush entity's batches are its own and live in
 [`BrushModelGeometry`](#brush-models--placedbrushmodel-and-brushmodelgeometry), because
 they are drawn under a different matrix.
 
-Every face sharing a material and a page, up to 65,536 vertices. Both halves are **static**, which
-is a deliberate difference from the engine: Valve keeps static vertices and gathers the
-*visible* faces' indices into a dynamic buffer each frame from the PVS
-(`gl_rsurf.cpp:1168`). There is no visibility here yet, so every face is drawn every
-frame and there is nothing per-frame to gather. When `mod_vis` lands the vertex buffers
-stay and the index buffers become dynamic — which is exactly why
-[`MATERIALS.md`](MATERIALS.md) makes `VertexSlice` and `IndexSlice` separate arguments.
+Every face sharing a material and a page, up to 65,536 vertices. **The vertices are static
+and the indices are gathered per frame**, which is Valve's own shape: static vertices, and
+the *visible* faces' indices written into a dynamic buffer each frame from the PVS
+(`gl_rsurf.cpp:1168`) — which is exactly why [`MATERIALS.md`](MATERIALS.md) makes
+`VertexSlice` and `IndexSlice` separate arguments. A world batch therefore also keeps a CPU
+copy of its indices and a span per `.bsp` face; a **brush model's** batches keep neither,
+because a brush entity is not in the world's tree and is culled whole. See
+[`world::vis`](#worldvis--what-a-frame-actually-draws).
 
 ### `Spawn` and `WorldStats`
 
@@ -1007,10 +1017,13 @@ half the lights in Portal 2 twice.
   not just a cache key. The condition that brings the cache back is the first model that
   moves far enough to be relit.
 - **The PVS reject.** `FastRejectLightSource` asks whether the light's cluster is in the
-  sample point's PVS before doing anything else, and there is no visibility here. Leaving
-  it out is safe rather than approximate: `vvis` is conservative, so a cluster it calls
-  invisible has no sight line and the occlusion trace rejects that light anyway. What it
-  costs is time, and the measurement above says the time is 13 ms a map.
+  sample point's PVS before doing anything else. Leaving it out is safe rather than
+  approximate: `vvis` is conservative, so a cluster it calls invisible has no sight line
+  and the occlusion trace rejects that light anyway. What it costs is time, and the
+  measurement above says the time is 13 ms a map. **There is now a PVS to ask** —
+  `Visibility::cluster_at` plus a row test is the whole of it — so this is no longer
+  blocked on anything, only unmeasured. It would want `World::load` to build the
+  visibility tree before it lights the props, which it currently does after.
 - **`emit_quakelight`.** It has no hardware form — "Can't do quake lights in hardware
   (x-r factor)" — so `to_hardware_light` returns `None` and a light that won a slot
   silently vanishes from the count, exactly as `R_SetNonAmbientLightingState` drops it.
@@ -1086,6 +1099,213 @@ Four rules here produce a plausible wrong picture rather than an error:
 The grid *positions* are `Bsp::disp_base_quad` + `Bsp::disp_grid`, **shared with
 `trace::disp`** rather than derived twice — if the two ever disagreed the map would be
 solid somewhere it is not drawn.
+
+### `world::vis` — what a frame actually draws
+
+Three filters, in the order they run, each strictly cheaper than the one before and each
+able to answer alone. `portdocs/ENGINE_WORLD_VIS.md` is the analysis; this is the API.
+
+1. **The areas.** Flow out of the area the eye is in, through the `func_areaportal`
+   windows that are open and facing the viewer, narrowing a screen-space rectangle at
+   each. `R_SetupAreaBits` / `R_FlowThroughArea`.
+2. **The PVS.** `vvis` wrote, per cluster, the set of clusters it can see. One bit test
+   per leaf. `Map_VisMark` / `VisCache_Build`.
+3. **The frustum.** A node or leaf whose box is entirely outside one of six planes is
+   skipped, with everything under it. `R_CullNode`.
+
+```rust
+pub struct Visibility;              // owned by `World`, built from the `Bsp` at load
+pub struct VisibleSet;              // one frame's answer, owned — safe to hold across a draw
+pub struct Frustum;                 // six planes, inward-facing
+pub struct VisStats { pub cluster: i32, pub clusters: usize, pub leaves: usize,
+                      pub faces: usize, pub areas: usize, pub nodes: usize }
+
+impl Visibility {
+    pub fn build(bsp: &Bsp) -> Visibility;
+    pub fn is_empty(&self) -> bool;                   // no tree: everything draws
+    pub fn mark(&self, eye: Vec3, view_proj: Mat4, novis: bool) -> VisibleSet;
+    pub fn box_visible(&self, set: &VisibleSet, mins: Vec3, maxs: Vec3) -> bool;
+    pub fn leaf_at(&self, point: Vec3) -> usize;      // CM_PointLeafnum
+    pub fn cluster_at(&self, point: Vec3) -> i32;     // -1 in solid space
+    pub fn area_at(&self, point: Vec3) -> u16;
+    pub fn set_area_portals(&mut self, states: &[(u16, bool)]);   // CM_SetAreaPortalStates
+    pub fn set_area_portal(&mut self, key: u16, open: bool);      // CM_SetAreaPortalState
+    pub fn area_portal_is_open(&self, key: u16) -> bool;
+    pub fn areas_connected(&self, a: u16, b: u16) -> bool;        // CM_AreasConnected
+    pub fn cluster_count(&self) -> usize;
+    pub fn area_count(&self) -> usize;
+    pub fn area_portal_count(&self) -> usize;
+    pub fn summary(&self) -> String;
+}
+
+impl VisibleSet {
+    pub fn everything() -> VisibleSet;                // r_novis, the benchmark, a test
+    pub fn is_everything(&self) -> bool;
+    pub fn face(&self, index: usize) -> bool;         // a `LUMP_FACES` index
+    pub fn leaf(&self, index: usize) -> bool;
+    pub fn any_leaf(&self, leaves: &[u16]) -> bool;   // Map_AreAnyLeavesVisible
+    pub fn frustum(&self) -> &Frustum;
+}
+// …and one public field, `stats: VisStats`, which the `vis` command and the
+// benchmark print.
+
+impl Frustum {
+    pub fn new(view_proj: Mat4) -> Frustum;
+    pub fn intersects(&self, mins: Vec3, maxs: Vec3) -> bool;
+}
+```
+
+**`mark` takes `&self`.** There is no cache to invalidate: every PVS row is decompressed
+once at load, and the marked leaf set is rebuilt each frame because doing so costs 0.004 ms
+on `sp_a1_intro1`. Valve caches it in an eight-entry `viscache` because `Map_VisSetup` runs
+up to eight times a frame — for water reflections, the 3D skybox and monitor cameras — and
+this port has one view.
+
+**Who is culled by what.** World faces by `VisibleSet::face`, gathered per batch. Static
+props by `any_leaf` over the leaf list `vbsp` wrote for each one, which is exact. Brush
+entities and entity models by `World::box_visible`, because neither is in the world's face
+list and there is no per-leaf renderable index. Portals are not culled at all — there are at
+most two.
+
+**The world's index buffers are gathered per frame.** `Batch` keeps its vertex buffer and a
+CPU copy of its indices plus a span per face; `draw_world_batch` appends the visible spans
+into the dynamic arena and draws that. Brush-model batches keep neither, because a brush
+entity is culled whole. This is `GetDynamicMesh( false, g_WorldStaticMeshes[sortID] )`
+(`gl_rsurf.cpp:1168`), and `DynamicBuffers` had no caller before it.
+
+**Who drives the areaportals.** `server::classes::AreaPortal` — `func_areaportal` and
+`func_areaportalwindow` — reports `(key, open)` through `Server::area_portals()`, and
+`Engine::frame` pushes the lot into `World::vis` once a tick beside the three other server
+seams. **They start open**, where the shipped engine starts them all closed and waits for
+every entity to open itself: 922 areaportal records in the depot answer to 409 entities, and
+one with no entity would otherwise never open. `StartOpen` is honoured on top, and 39 of the
+game's 206 `func_areaportal`s use it to start closed.
+
+**`r_novis` and `r_lockpvs`** are held by `Engine`, not by `world/`, because they are about
+the *view* and `world/` is handed an eye and a matrix. `r_lockpvs` freezes the eye rather
+than returning early from the mark, which gives the same picture from the same code path.
+The engine also passes `novis` on its own account when the camera is outside the world with
+noclip on — `g_bNoClipEnabled` in `Map_VisMark` (`mod_vis.cpp:287`) — because a leaf out
+there has no cluster and a cluster of -1 sees nothing.
+
+#### Invariants and gotchas (visibility)
+
+1. **`LUMP_LEAFFACES` names no displacement face.** Zero of the game's 1,181. The shipped
+   engine gives a leaf a second, loader-built list (`mleaf_t::dispListStart`);
+   `Visibility::build` rebuilds the same association from each displacement's built bounds
+   and appends it to the one list. Without it, all terrain in the game is invisible and
+   nothing else looks wrong.
+2. **A leaf can be thinner than the near plane**, and is then correctly culled while you
+   stand in it. `mp_coop_catapult_1`'s leaf 504 is 2 x 128 x 64; from its centre the far
+   face is one unit away and the near plane is seven. This is not a bug and
+   `CullNodeSIMD` does the same — it cost one wrong test assertion to learn.
+3. **`cluster < 0` and `contents & CONTENTS_SOLID` are different questions.** A leaf
+   outside the map's shell is not solid and still has no cluster. The first decides what the
+   PVS says (nothing); the second decides `g_bViewerInSolidSpace`, which offers every area
+   and uses the base frustum.
+4. **Area 0 is not an area.** `FloodAreaConnections` starts its loop at 1. A map with no
+   areaportals puts every leaf in area 0 and the whole mechanism is inert, which is why
+   `R_CullNode`'s test is `area > 0`.
+5. **A leaf in an area the flow never reached is culled**, even when the PVS says it is
+   visible — that is what areaportals are for. It also means a sealed area with no
+   areaportal into it only draws when you are standing in one of its leaves. Six of
+   `sp_a1_intro1`'s eleven areas are like that, and so is the container the player spawns
+   in.
+6. **`GetPortalScreenExtents` clips against four planes and this clips against five.**
+   Four planes through the eye bound a double cone, not a half-space, so a window corner
+   behind the eye survives and projects with a negative `w`. Adding the near plane cannot
+   lose anything.
+7. **`CM_DecompressVis`' bounds check is `cluster > numclusters`**, which lets
+   `cluster == numclusters` read one entry past `bitofs[numclusters][2]`. `Bsp::pvs` uses
+   `>=`, and also stops on a zero-length run where Valve's `do`/`while` would spin.
+8. **A missing row means *everything* is visible, and cluster -1 means *nothing*.** Two
+   different absences with opposite answers: `CM_NullVis` fills ones, `CM_Vis`' `cluster ==
+   -1` branch fills zeros. Getting them the wrong way round is either a black screen or no
+   culling at all.
+9. **`VisibleSet::any_leaf` answers *true* for an empty list.** A prop `vbsp` placed
+   outside the tree has no leaves; Valve's loop would return false, but Valve never asks,
+   because `CStaticPropMgr` inserts props into leaves itself. Hiding it would be a prop that
+   vanishes for a reason nobody could see.
+10. **The flood is ported and the renderer never consults it.** `R_FlowThroughArea` tests
+    the server's `m_chAreaBits` because in the shipped game the flood runs on the server and
+    reaches the client as a bit vector. One process here, and the flow already walks only
+    open windows, so the test could never fire. `areas_connected` is kept as the query
+    `CM_LeavesConnected` and the sound system ask.
+11. **A `func_areaportalwindow` never fades.** The distance fade needs a per-view update
+    inside the render loop and the translucent pane to stand in for what is behind it. Its
+    two fade inputs are reported unhandled (43 each) rather than accepted and ignored.
+
+#### Not implemented (visibility), and what each waits on
+
+| | |
+|---|---|
+| `OcclusionSystem.cpp` (2,999) | Nothing. **Portal 2 places no `func_occluder`**, so there is nothing for it to do. |
+| The PAS | Sound. `Bsp::pvs` reads the first of each `bitofs` pair and never the second. |
+| The viscache and the multi-origin merge | A second view — the recursive view or the 3D skybox. Both are `Map_VisSetup`'s array of origins. |
+| The per-leaf renderable index (`CClientLeafSystem`) | The translucent order. Culling does not need it; *sorting* translucent geometry per leaf does, and that divergence predates this. |
+| `debug_leafvis.cpp` (701) | Nothing. The `vis` command prints the same facts. |
+| `func_areaportalwindow`'s fade | A translucent pane and a per-view entity update. |
+
+#### Test coverage (visibility)
+
+`cargo test engine::world::vis` — 15, plus one depot-gated, none needing a GPU.
+
+Fourteen of the fifteen run against **`two_rooms`**, a hand-built tree of one splitting
+plane, two leaves, two clusters, two areas and one window between them. Its PVS is
+**deliberately asymmetric** — cluster 0 sees only itself, cluster 1 sees both — which
+`vvis` would never write and which is exactly what proves the right row is read rather
+than a symmetric guess.
+
+| Test | What it pins |
+|---|---|
+| `the_near_room_does_not_see_the_far_one` | The PVS alone: the far face is in front of the camera and inside the frustum, and is not drawn. |
+| `the_far_room_sees_them_both` | …and from the other side both draw, so the first test measures the PVS and not the frustum. |
+| `a_room_behind_the_camera_is_not_drawn` | The frustum alone, with the PVS saying yes to both. |
+| `turning_the_pvs_off_draws_the_far_room_too` | `r_novis`, including that `face()` answers for an index past the end of a set that has no bitset. |
+| `closing_an_areaportal_shuts_the_far_room_out` | The areas: the PVS still says visible and the far room is gone. |
+| `setting_the_portals_in_bulk_leaves_unnamed_keys_open` | `set_area_portals` leaves keys it is not told about alone — gotcha 10's other half. |
+| `the_flood_joins_areas_through_open_windows_only` | `CM_AreasConnected`, including an out-of-range area answering permissively. |
+| `a_box_is_visible_when_a_leaf_it_reaches_is` | `box_visible`, including a box straddling the plane. |
+| `any_leaf_answers_for_a_props_leaf_list` | `Map_AreAnyLeavesVisible`, including the empty list (gotcha 9). |
+| `a_point_lands_in_the_leaf_that_contains_it` | `CM_PointLeafnum_r`, including that exactly on the plane is the *front* side. |
+| `the_frustum_keeps_what_the_matrix_would_draw` | Gribb-Hartmann, and the near plane in particular — this port's depth range is `0..w`, so near is row 2 alone. |
+| `narrowing_to_half_the_screen_rejects_the_other_half` | `R_SetupVisibleAreaFrustums` as row combinations. |
+| `rectangles_intersect_or_do_not` | `GetRectIntersection`, including that touching is not overlapping. |
+| `a_map_with_no_tree_draws_everything` | The permissive default. |
+| `the_bitset_ignores_what_is_past_its_end` | `Bits`. |
+
+The run-length decoder is tested in `world::bsp` against a hand-built lump:
+`a_pvs_row_decompresses_its_runs`, `a_missing_row_sees_everything` (both absences —
+gotcha 8) and `a_zero_length_run_stops_rather_than_spinning` (gotcha 7).
+
+**`every_shipped_map_culls_most_of_itself`** is the acceptance test, depot-gated. It builds
+a tree for all 106 maps and asserts four things: every map has visibility data; **every one
+of the 1,181 displacement faces lands in at least one leaf** (gotcha 1); the PVS leaves
+under 60% of world faces standing from the maps' own spawns (measured: 6.9%); and the
+areaportal flow leaves the eye's own area on at least some spawns (measured: 13 of 103,
+reaching five areas at most) — without which a flow that never stepped through a window
+would look identical from every other viewpoint in the test.
+
+It also sweeps 379 leaves across twelve maps asserting that **standing in a leaf, that leaf
+draws**. That is the invariant that catches an over-aggressive cull, which is the failure
+mode with no symptom other than a hole in the world: every filter here can only remove, so
+nothing downstream would notice. It is also the test that found gotcha 2, by failing.
+
+#### The `vis` command
+
+```
+] vis
+vis: 559 clusters over 2038 leaves, 11 areas, 7 areaportals
+  eye at (-8674 1773 92) in leaf 1254, cluster 485, area 11
+  sees 62 of 559 clusters (11.1%), 23 leaves, 1 areas, 78 nodes walked
+  98 of 5638 world faces (1.7%)
+  every areaportal is open
+```
+
+This port's own, like `trace` and `tonemap`. Valve's nearest equivalents —
+`r_ShowViewerArea`, `mat_leafvis`, `r_DrawPortals` — all draw rather than print, and the
+numbers are what tell you whether the PVS is doing anything. The example is
+`sp_a1_intro1`'s spawn, which is inside the sealed starting container: 1.7% is right.
 
 ### `world::bsp`
 
@@ -3813,7 +4033,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-311 tests under `engine::`, 14 of them depot-gated; 971 in the crate. (Treat both as a scale rather than a
+355 tests under `engine::`, 17 of them depot-gated; 1,023 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
@@ -4194,6 +4414,17 @@ the pass itself rather than the draws: the 31-batch `brush models` line reads 0.
 the same run. It costs about 3x per draw what the batched passes do, which is what a
 back-to-front sort *is*: one draw per instance instead of one per batch, and Valve pays
 it too.
+**Visibility is the largest single change this benchmark has ever measured.** On
+`sp_a1_intro1`, `everything` went from **1.76 ms to 0.28 ms** — 6.3x — and computing the
+visible set costs **0.004 ms**, the same as the tone mapper's two passes. `everything,
+novis` is a seventh sub-benchmark recording exactly what the six above used to, so the
+comparison stays available. **Two caveats on the 6.3x.** The viewpoint is the map's own
+spawn, which is inside the sealed starting container and so unusually favourable; across
+the 103 shipped spawns the PVS leaves **6.9% of world faces** standing, facing one fixed
+direction. And the benchmark's eye *was* `world.center()` until visibility landed, which
+turned out to be inside an area with no areaportals into it — one leaf and 53 faces — so
+every figure above this paragraph was recorded from a different place than every figure
+below it.
 **The benchmark itself had to be fixed to see that**, and the fix is worth knowing about:
 `World::load` cannot read the models an entity places, because they are named by the
 entity lump it has just parsed — so `bench` now spawns a `Server` and calls
@@ -4212,7 +4443,7 @@ second is A/B/A, not A/B.
 > map — the numbers to re-measure after a change to the draw path or the entity
 > list, and the three materials that still do not resolve.
 
-There is a unit test suite (`cargo test`, 971 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 1,023 tests, plus 33 depot-gated), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -4276,6 +4507,17 @@ pieces, 980 more (53.7%) dropped as provably empty; and over the nine pairs the
 shipped maps form, **a player hull walked through six**, one was stopped by the
 geometry at the far end, and two had nowhere to stand in front of them. Carving
 a linked pair costs 0.09 ms.
+**And it stopped drawing the whole map.** Every face was drawn every frame
+until `world::vis` landed: now the areas, the PVS and the frustum between them
+decide what a frame contains, and `sp_a1_intro1` fell from **1.76 ms to
+0.28 ms** a frame. Across the 103 shipped spawns the PVS leaves **6.9% of world
+faces** standing. It brought two other things with it — `func_areaportal` and
+`func_areaportalwindow`, 409 entities and the first in this port whose whole
+effect is on what the renderer draws, and a `vis` console command that prints
+what each filter left. The finding that would have cost the game its terrain:
+**`LUMP_LEAFFACES` names none of the 1,181 displacement faces in the game**, so
+the leaf list a displacement belongs to has to be rebuilt from its bounds, the
+way the shipped loader builds `mleaf_t::dispListStart`.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it (a chamber door is
 walked through for the same reason) — but the boot path is

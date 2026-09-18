@@ -1249,7 +1249,10 @@ fn test_forces_a_branch_listener_to_report_and_an_empty_one_is_mixed() {
     server.accept_input(none, "Test", Variant::Void, None, None, 0);
     run(&mut server, 0.05);
     assert_eq!(
-        (counter_value(&server, "yes"), counter_value(&server, "mixed")),
+        (
+            counter_value(&server, "yes"),
+            counter_value(&server, "mixed")
+        ),
         (2.0, 1.0)
     );
 }
@@ -1438,8 +1441,15 @@ fn every_shipped_branch_listener_registers_and_shuts_the_doors_it_is_for() {
     // **The check.** A listener that never moved off `NOT_INIT` either failed
     // to register in `Activate` or was never told a branch had changed, and
     // either one is the bug that leaves a chamber door open for ever.
-    assert_eq!(reported, 158 - killed, "every live listener heard its branches");
-    assert_eq!(all_true, 56, "the rest were talked back down by their own map");
+    assert_eq!(
+        reported,
+        158 - killed,
+        "every live listener heard its branches"
+    );
+    assert_eq!(
+        all_true, 56,
+        "the rest were talked back down by their own map"
+    );
     // The payoff, and the reason the class was worth porting before anything
     // else: this is how a test chamber shuts behind you.
     // **99 of the game's 138 chamber doors are on one of these 46 maps** —
@@ -2394,6 +2404,10 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     // ten declare `func_door`'s. Mapper mistakes, now visible because the class
     // that carries them is implemented.
     ("onfizzled", 1),
+    // One `func_areaportal` in the game connects an `OnFullyClosed`, which
+    // `CAreaPortal` does not declare either — a `func_door`'s output left on a
+    // copy-pasted entity.
+    ("onfullyclosed", 1),
     ("onfullyopen", 10),
     ("onproxyrelay", 135),
     ("onstarttouchblueplayer", 1),
@@ -2668,8 +2682,18 @@ fn every_shipped_map_spawns_its_entities() {
     // and 4 together. `prop_testchamber_door` is 138 after it,
     // `logic_branch_listener` — the class that shuts those doors — is 158, and
     // `prop_portal` is 21.
-    assert_eq!(total.matched, 34_823);
-    assert_eq!(total.spawned, 27_951);
+    //
+    // **+409 for the two areaportal classnames** — 206 `func_areaportal` and
+    // 203 `func_areaportalwindow` — which arrived with `world/`'s visibility
+    // and are the first entities here whose whole effect is on what the
+    // renderer draws. Both spawn, because neither removes itself.
+    //
+    // `func_areaportalwindow`'s two fade inputs stay **unhandled** (43
+    // `SetFadeStartDistance` and 43 `SetFadeEndDistance`) rather than being
+    // declared and ignored: the distance fade is not ported, and an input
+    // that is accepted and does nothing is worse than one that is reported.
+    assert_eq!(total.matched, 35_232);
+    assert_eq!(total.spawned, 28_360);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -2685,8 +2709,10 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(total.outputs, 54_535);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
-    assert_eq!(total.unknown.len(), 159);
-    assert_eq!(total.unknown.values().sum::<usize>(), 26_102);
+    // **-2 and -409 again** for the two areaportal classnames, both of which
+    // every map that has them places.
+    assert_eq!(total.unknown.len(), 157);
+    assert_eq!(total.unknown.values().sum::<usize>(), 25_693);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -2755,7 +2781,11 @@ fn every_shipped_map_spawns_its_entities() {
     // `DynamicProp::is_plain_dynamic`.
     assert_eq!(per_class.get("prop_dynamic"), Some(&8_072));
     assert_eq!(per_class.get("prop_dynamic_override"), Some(&390));
-    assert_eq!(per_class.get("dynamic_prop"), None, "registered, never placed");
+    assert_eq!(
+        per_class.get("dynamic_prop"),
+        None,
+        "registered, never placed"
+    );
     assert_eq!(per_class.get("prop_dynamic_glow"), None);
     assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
     // `portdocs/PORTAL.md` stage 2. 21 across 10 maps, two of them on
@@ -2794,7 +2824,14 @@ fn every_shipped_map_spawns_its_entities() {
     // why this class deliberately does not take `DynamicProp`'s
     // cancel-when-idle divergence.
     assert_eq!(io.thinks, 7_318);
-    assert_eq!(io.no_target, 1_122);
+    // **-86 with the two areaportal classnames, and `accepted` does not
+    // move** — every one of the 86 is refused rather than accepted. They are
+    // `func_areaportalwindow`'s two fade inputs, fired at the *classname*
+    // rather than at a name, so before the class existed they found no target
+    // at all; now they find 203 windows that do not implement the distance
+    // fade. The 86 moved from `no_target` to `unhandled`, which is the list
+    // below.
+    assert_eq!(io.no_target, 1_036);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -2802,7 +2839,7 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The whole set of inputs that reach an implemented class and are refused.
     //
-    // **Eighteen names, and 1,103 of the 1,285 occurrences are the parenting
+    // **Twenty names, and 1,103 of the 1,371 occurrences are the parenting
     // family.** `func_brush` alone takes 883 `SetParentAttachmentMaintainOffset`
     // in the first two seconds of the game, because a Hammer instance parents
     // its clip brushes to a moving platform and the `logic_auto` bootstrap is
@@ -2822,6 +2859,14 @@ fn every_shipped_map_spawns_its_entities() {
         vec![
             ("!player_blue (no such player)", 37),
             ("!player_orange (no such player)", 37),
+            // The distance fade `CFuncAreaPortalWindow` does by itself, which
+            // needs a per-view update inside the render loop and the fogged
+            // pane to stand in for what is behind it. Neither exists, so the
+            // window is an areaportal that is simply open — it draws through
+            // one the shipped game would have shut, which is too much rather
+            // than too little. See `classes::AreaPortal`.
+            ("func_areaportalwindow.SetFadeEndDistance", 43),
+            ("func_areaportalwindow.SetFadeStartDistance", 43),
             ("func_brush.SetParent", 12),
             ("func_brush.SetParentAttachmentMaintainOffset", 883),
             ("info_target.SetParent", 1),
@@ -4118,14 +4163,12 @@ fn button_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
     ];
     pairs.extend_from_slice(extra);
     let mut button = block(&pairs);
-    button.pairs.push((
-        "OnPressed".to_owned(),
-        conn("down", "Add", "1", "0", "-1"),
-    ));
-    button.pairs.push((
-        "OnUnPressed".to_owned(),
-        conn("up", "Add", "1", "0", "-1"),
-    ));
+    button
+        .pairs
+        .push(("OnPressed".to_owned(), conn("down", "Add", "1", "0", "-1")));
+    button
+        .pairs
+        .push(("OnUnPressed".to_owned(), conn("up", "Add", "1", "0", "-1")));
 
     vec![
         block(&[("classname", "worldspawn")]),
@@ -4412,8 +4455,7 @@ fn every_shipped_floor_button_presses_when_stood_on() {
             // Put the player's *hull centre* on the pad's box centre, which is
             // a point inside the trigger whichever way the pad faces — some of
             // these are on walls. The feet are 36 units below it.
-            let centre = origin
-                + crate::math::angle_matrix(angles) * Vec3::new(0.0, 0.0, 7.0)
+            let centre = origin + crate::math::angle_matrix(angles) * Vec3::new(0.0, 0.0, 7.0)
                 - Vec3::new(0.0, 0.0, 36.0);
 
             server.spawn_player(player_at(centre + Vec3::new(0.0, 0.0, 4096.0)));
@@ -4466,9 +4508,10 @@ fn every_shipped_floor_button_presses_when_stood_on() {
 fn the_thing_standing_on_the_pad_is_the_activator() {
     let mut map = button_map(&[("origin", "0 0 0")]);
     // `OnPressed !activator:Kill`.
-    map[1]
-        .pairs
-        .push(("OnPressed".to_owned(), conn("!activator", "Kill", "", "0", "-1")));
+    map[1].pairs.push((
+        "OnPressed".to_owned(),
+        conn("!activator", "Kill", "", "0", "-1"),
+    ));
 
     let mut server = Server::new();
     server.level_init("test", &map, &[]);
@@ -4593,7 +4636,11 @@ fn a_lethal_trigger_kills_the_player_and_asks_for_the_level_back() {
     // > different amount of map logic than the game.
     let health = player_health(&server);
     run_touching(&mut server, &mut query, 2.0);
-    assert_eq!(counter_value(&server, "count"), 5.0, "1 + 2 seconds of them");
+    assert_eq!(
+        counter_value(&server, "count"),
+        5.0,
+        "1 + 2 seconds of them"
+    );
     assert_eq!(player_health(&server), health, "and takes nothing more");
 
     // `sp_fade_and_force_respawn` is 1: three seconds after the death, the
@@ -4748,14 +4795,12 @@ fn jumping_and_ducking_reach_the_player_proxy() {
         block(&[("classname", "math_counter"), ("targetname", "ducks")]),
         block(&[("classname", "math_counter"), ("targetname", "unducks")]),
     ];
-    map[1].pairs.push((
-        String::from("OnJump"),
-        conn("jumps", "Add", "1", "0", "-1"),
-    ));
-    map[1].pairs.push((
-        String::from("OnDuck"),
-        conn("ducks", "Add", "1", "0", "-1"),
-    ));
+    map[1]
+        .pairs
+        .push((String::from("OnJump"), conn("jumps", "Add", "1", "0", "-1")));
+    map[1]
+        .pairs
+        .push((String::from("OnDuck"), conn("ducks", "Add", "1", "0", "-1")));
     map[1].pairs.push((
         String::from("OnUnDuck"),
         conn("unducks", "Add", "1", "0", "-1"),
@@ -5127,9 +5172,7 @@ fn prop_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
 /// numbers and the whole point of this class is that the two sides agree on
 /// what they mean.
 fn prop_cycle(server: &Server, duration: f32) -> f32 {
-    let state = prop_of(server)
-        .model_state()
-        .expect("it draws a model");
+    let state = prop_of(server).model_state().expect("it draws a model");
     let elapsed = (server.time().curtime - state.anim_time).max(0.0);
     (state.cycle + elapsed * state.playback_rate / duration).clamp(0.0, 1.0)
 }
@@ -5191,7 +5234,10 @@ fn a_dynamic_prop_spawns_still_and_a_plain_one_is_promoted_to_an_obb() {
     assert_eq!(prop.move_type, crate::server::movement::MoveType::Push);
     assert_eq!(prop.health, 0);
     assert_eq!(prop.max_health, 1);
-    assert_eq!(prop.take_damage, crate::server::damage::DamageMode::EventsOnly);
+    assert_eq!(
+        prop.take_damage,
+        crate::server::damage::DamageMode::EventsOnly
+    );
     // A mover with no alarm is not in the simulation list — 8,462 props in the
     // game would otherwise be.
     assert!(!prop.will_simulate_game_physics());
@@ -5262,10 +5308,21 @@ fn set_animation_plays_a_sequence_and_fires_both_of_its_outputs() {
     server.level_init("test", &prop_map(&[]), &[]);
     server.set_sequences(panel_sequences());
     run(&mut server, 0.5);
-    assert_eq!(counter_value(&server, "begun"), 0.0, "nothing has begun yet");
+    assert_eq!(
+        counter_value(&server, "begun"),
+        0.0,
+        "nothing has begun yet"
+    );
 
     let prop_id = find_named(&server, "prop").id();
-    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    server.accept_input(
+        prop_id,
+        "SetAnimation",
+        Variant::String("open".to_owned()),
+        None,
+        None,
+        0,
+    );
     run(&mut server, 0.1);
 
     // `PropSetAnim` fires `OnAnimationBegun` and `FinishSetSequence` starts
@@ -5304,16 +5361,38 @@ fn a_finished_animation_reverts_to_the_default_unless_the_prop_holds_it() {
 
         // `Spawn`'s own `PropSetAnim( DefaultAnim )` — which ran against an
         // empty table and was believed anyway.
-        assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open_idle");
+        assert_eq!(
+            prop_of(&server)
+                .model_state()
+                .expect("it draws a model")
+                .sequence,
+            "open_idle"
+        );
 
         let prop_id = find_named(&server, "prop").id();
-        server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+        server.accept_input(
+            prop_id,
+            "SetAnimation",
+            Variant::String("open".to_owned()),
+            None,
+            None,
+            0,
+        );
         run(&mut server, 0.1);
-        assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open");
+        assert_eq!(
+            prop_of(&server)
+                .model_state()
+                .expect("it draws a model")
+                .sequence,
+            "open"
+        );
 
         run(&mut server, 1.2);
         assert_eq!(
-            prop_of(&server).model_state().expect("it draws a model").sequence,
+            prop_of(&server)
+                .model_state()
+                .expect("it draws a model")
+                .sequence,
             expected,
             "HoldAnimation {hold}"
         );
@@ -5344,7 +5423,14 @@ fn a_looping_sequence_never_finishes_and_stops_thinking() {
     // still fires. This is the one line of Valve's `else` branch that had to
     // survive the think being cancelled.
     let prop_id = find_named(&server, "prop").id();
-    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    server.accept_input(
+        prop_id,
+        "SetAnimation",
+        Variant::String("open".to_owned()),
+        None,
+        None,
+        0,
+    );
     run(&mut server, 1.3);
     assert_eq!(counter_value(&server, "done"), 1.0);
 }
@@ -5357,14 +5443,28 @@ fn set_playback_rate_rebases_the_pose_so_it_does_not_jump() {
     server.level_init("test", &prop_map(&[]), &[]);
     server.set_sequences(panel_sequences());
     let prop_id = find_named(&server, "prop").id();
-    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    server.accept_input(
+        prop_id,
+        "SetAnimation",
+        Variant::String("open".to_owned()),
+        None,
+        None,
+        0,
+    );
     run(&mut server, 0.5);
 
     // Half a second into a one-second sequence.
     let before = prop_cycle(&server, 1.0);
     assert!((before - 0.5).abs() < 0.05, "half way through: {before}");
 
-    server.accept_input(prop_id, "SetPlaybackRate", Variant::Float(-1.0), None, None, 0);
+    server.accept_input(
+        prop_id,
+        "SetPlaybackRate",
+        Variant::Float(-1.0),
+        None,
+        None,
+        0,
+    );
     // The pose is the same one instant later…
     let after = prop_cycle(&server, 1.0);
     assert!(
@@ -5499,9 +5599,22 @@ fn a_sequence_the_model_does_not_have_is_refused_once_the_models_are_loaded() {
     server.set_sequences(panel_sequences());
 
     let prop_id = find_named(&server, "prop").id();
-    server.accept_input(prop_id, "SetAnimation", Variant::String("open".to_owned()), None, None, 0);
+    server.accept_input(
+        prop_id,
+        "SetAnimation",
+        Variant::String("open".to_owned()),
+        None,
+        None,
+        0,
+    );
     run(&mut server, 0.1);
-    assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "open");
+    assert_eq!(
+        prop_of(&server)
+            .model_state()
+            .expect("it draws a model")
+            .sequence,
+        "open"
+    );
 
     server.accept_input(
         prop_id,
@@ -5514,7 +5627,13 @@ fn a_sequence_the_model_does_not_have_is_refused_once_the_models_are_loaded() {
     run(&mut server, 0.1);
     // `SetSequence( 0 )`, which here is the bind pose — and **no**
     // `OnAnimationBegun`, so the counter is still on the one from `open`.
-    assert_eq!(prop_of(&server).model_state().expect("it draws a model").sequence, "");
+    assert_eq!(
+        prop_of(&server)
+            .model_state()
+            .expect("it draws a model")
+            .sequence,
+        ""
+    );
     assert_eq!(counter_value(&server, "begun"), 1.0);
 }
 
@@ -5624,8 +5743,7 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
                                 sequence.label.clone(),
                                 sequences::SequenceInfo {
                                     duration,
-                                    loops: sequence.flags
-                                        & crate::studio::anim::STUDIO_LOOPING
+                                    loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING
                                         != 0,
                                     fade_out_time: sequence.fade_out_time,
                                 },
@@ -5687,7 +5805,10 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     }
 
     let unreadable = loaded.values().filter(|m| m.is_none()).count();
-    println!("\n{} maps, {maps_with_a_prop} of them with a prop_dynamic", names.len());
+    println!(
+        "\n{} maps, {maps_with_a_prop} of them with a prop_dynamic",
+        names.len()
+    );
     println!(
         "  {spawned} prop_dynamic* spawned, {props} alive after {RUN_SECONDS}s, \
          {} distinct models",
@@ -5783,7 +5904,10 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
         "models whose vertices are shared between bones"
     );
     assert_eq!(not_rigid, 290, "entities drawn in their bind pose");
-    assert_eq!(animatable, 3_323, "entities whose model the renderer can pose");
+    assert_eq!(
+        animatable, 3_323,
+        "entities whose model the renderer can pose"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5864,9 +5988,7 @@ fn door_at(server: &Server, id: EntityId) -> &classes::TestChamberDoor {
 
 /// The five numbers the renderer would be handed for that entity.
 fn pose_of(server: &Server, id: EntityId) -> class::ModelState<'_> {
-    door_at(server, id)
-        .model_state()
-        .expect("it draws a model")
+    door_at(server, id).model_state().expect("it draws a model")
 }
 
 /// The pose `engine::world::entities` would draw, worked out here from the
@@ -6042,7 +6164,11 @@ fn a_testchamber_door_refuses_an_input_it_is_already_obeying() {
     // Immediately, while it is still travelling.
     server.accept_input(id, "Open", Variant::Void, None, None, 0);
     run(&mut server, 0.2);
-    assert_eq!(counter_value(&server, "onopen"), 1.0, "the second is refused");
+    assert_eq!(
+        counter_value(&server, "onopen"),
+        1.0,
+        "the second is refused"
+    );
 }
 
 /// `Lock` refuses both doors until `Unlock`, and `LockOpen` is `Open`
@@ -6070,14 +6196,22 @@ fn a_locked_testchamber_door_refuses_everything_and_lockopen_gets_in_first() {
     run(&mut server, 2.0);
     server.accept_input(id, "LockOpen", Variant::Void, None, None, 0);
     run(&mut server, 0.2);
-    assert_eq!(counter_value(&server, "onopen"), 2.0, "the open got through");
+    assert_eq!(
+        counter_value(&server, "onopen"),
+        2.0,
+        "the open got through"
+    );
     assert!(door_of(&server).is_locked());
     assert!(door_of(&server).is_open());
 
     // …and now nothing moves it.
     server.accept_input(id, "Close", Variant::Void, None, None, 0);
     run(&mut server, 0.2);
-    assert_eq!(counter_value(&server, "onclose"), 1.0, "only the earlier one");
+    assert_eq!(
+        counter_value(&server, "onclose"),
+        1.0,
+        "only the earlier one"
+    );
 }
 
 /// **A door whose model nobody loaded opens, and never finishes opening.**
@@ -6124,7 +6258,11 @@ fn the_area_portal_keys_are_consumed_including_the_two_broken_ones() {
             .unwrap_or_default()
     };
     assert_eq!(field("area_portal_window"), "door_1-door_areaportal_window");
-    assert_eq!(field("area_portal_fade"), "500..0", "the second reads as zero");
+    assert_eq!(
+        field("area_portal_fade"),
+        "500..0",
+        "the second reads as zero"
+    );
 }
 
 /// **Every test chamber door in the game, opened and shut, with the real
@@ -6297,7 +6435,11 @@ fn every_shipped_testchamber_door_opens_and_shuts() {
             // Shut it. The cycle must come *down* from 1 rather than snap.
             server.accept_input(id, "Close", Variant::Void, None, None, 0);
             assert_eq!(rate(&server), -1.0, "{name}: {door_name}");
-            assert_eq!(pose_of(&server, id).cycle, 1.0, "{name}: {door_name} snapped");
+            assert_eq!(
+                pose_of(&server, id).cycle,
+                1.0,
+                "{name}: {door_name} snapped"
+            );
             run(&mut server, travel / 2.0);
             let half = cycle(&server);
             assert!(
@@ -6498,7 +6640,10 @@ fn the_intro_maps_door_opens_through_the_chain_its_map_built() {
     // `door_1-close_door_rl` fires `SetValue 0` at it in the same breath as
     // the door's `Close`, so the condition is consumed. The listener's own
     // verdict followed it back down to mixed.
-    assert!(!branch_value(&server, wants), "the chain consumed its own flag");
+    assert!(
+        !branch_value(&server, wants),
+        "the chain consumed its own flag"
+    );
     assert_eq!(
         branch_list_at(&server, listener).state(),
         "mixed",
@@ -6587,7 +6732,11 @@ fn a_portal_spawns_as_a_one_sided_box_trigger() {
     let blue = portal_at(&server, "portal_blue_0");
     assert!(!blue.activated, "all 21 shipped portals start switched off");
     assert!(blue.linked.is_none());
-    assert_eq!(blue.matrix, glam::Mat4::IDENTITY, "no partner, no transform");
+    assert_eq!(
+        blue.matrix,
+        glam::Mat4::IDENTITY,
+        "no partner, no transform"
+    );
     assert_eq!(blue.linkage_group, 0);
     assert_eq!(blue.half_width, portal::DEFAULT_HALF_WIDTH);
     assert_eq!(blue.half_height, portal::DEFAULT_HALF_HEIGHT);
@@ -6716,8 +6865,14 @@ fn deactivating_a_portal_hands_its_partner_on() {
 fn the_teleport_matrix_turns_a_point_around_the_exit() {
     use crate::server::classes::portal::teleport_matrix;
 
-    let entrance = (Vec3::new(-1264.0, 4112.0, 2728.0), Vec3::new(0.0, 90.0, 0.0));
-    let exit = (Vec3::new(-1137.0, 4352.0, 2762.0), Vec3::new(0.0, 180.0, 0.0));
+    let entrance = (
+        Vec3::new(-1264.0, 4112.0, 2728.0),
+        Vec3::new(0.0, 90.0, 0.0),
+    );
+    let exit = (
+        Vec3::new(-1137.0, 4352.0, 2762.0),
+        Vec3::new(0.0, 180.0, 0.0),
+    );
     let there = teleport_matrix(entrance, exit);
     let back = teleport_matrix(exit, entrance);
 
@@ -6755,7 +6910,10 @@ fn the_teleport_matrix_turns_a_point_around_the_exit() {
     let up = Vec3::Z;
     let right = Vec3::X;
     let offset = |v: Vec3| self_linked.transform_point3(entrance.0 + v) - entrance.0;
-    assert!((offset(up * 10.0) - up * 10.0).length() < 1e-2, "up survives");
+    assert!(
+        (offset(up * 10.0) - up * 10.0).length() < 1e-2,
+        "up survives"
+    );
     assert!(
         (offset(right * 10.0) + right * 10.0).length() < 1e-2,
         "right reverses"
@@ -6919,7 +7077,12 @@ fn every_shipped_portal_spawns_and_its_map_can_link_a_pair() {
             .filter(|(_, e)| e.behaviour.downcast_ref::<PropPortal>().is_some())
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids.len(), count, "{name}: {count} placed, {} spawned", ids.len());
+        assert_eq!(
+            ids.len(),
+            count,
+            "{name}: {count} placed, {} spawned",
+            ids.len()
+        );
         spawned += ids.len();
         for &id in &ids {
             let portal = server
@@ -6988,7 +7151,9 @@ fn every_shipped_portal_spawns_and_its_map_can_link_a_pair() {
                 .behaviour
                 .downcast_ref::<PropPortal>()
                 .expect("a PropPortal");
-            let Some(partner) = portal.linked else { continue };
+            let Some(partner) = portal.linked else {
+                continue;
+            };
             assert!(portal.activated, "{name}: an inactive portal kept a link");
             let back = server
                 .entities
@@ -7149,10 +7314,7 @@ fn every_shipped_portal_is_on_a_wall() {
             let core = &server.entities.get(id).expect("live").core;
             let (origin, forward) = (core.origin, PropPortal::forward(core));
             let label = core.debug_name().to_owned();
-            let moved_by_script = core
-                .name
-                .as_deref()
-                .is_some_and(is_a_new_location_target);
+            let moved_by_script = core.name.as_deref().is_some_and(is_a_new_location_target);
             checked += 1;
 
             let ray = Ray::line(origin + forward * AHEAD, origin + forward * BEHIND);
@@ -7195,7 +7357,10 @@ fn every_shipped_portal_is_on_a_wall() {
          and turn one at most {worst_angle:.2} degrees"
     );
     assert_eq!(checked, 21, "twenty-one portals in the game");
-    assert_eq!(floating, 4, "the four NewLocation targets, and nothing else");
+    assert_eq!(
+        floating, 4,
+        "the four NewLocation targets, and nothing else"
+    );
     assert!(
         worst_angle <= DEGREES,
         "a portal the snap would have re-oriented"

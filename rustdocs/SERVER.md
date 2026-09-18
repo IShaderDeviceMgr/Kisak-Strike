@@ -67,8 +67,8 @@ ovals work now**: you walk into one and come out of the other.
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
 **nothing pushes what is in its way** — a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why). **41 of the 200
-classnames the shipped maps place are implemented**, out of 46 registered — the
+than shoving it (`portdocs/SERVER.md` stage 3 says why). **43 of the 200
+classnames the shipped maps place are implemented**, out of 48 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -151,6 +151,13 @@ impl Server {
     pub fn brush_entity_count(&self) -> usize;
     pub fn tonemap_settings(&self) -> TonemapSettings;
     pub fn model_entities(&self) -> Vec<ModelEntityState>;
+    // Every `func_areaportal*`'s key and whether it is open. The fourth of the
+    // four seams `Engine::frame` pushes into the world each tick, and the only
+    // one whose effect is purely on what the renderer draws — it re-floods the
+    // area graph in `World::vis`. `CAreaPortal::UpdateState`'s
+    // `engine->SetAreaPortalState` calls, gathered instead of pushed, because
+    // there is no DLL boundary here and a pull cannot go stale.
+    pub fn area_portals(&self) -> Vec<(u16, bool)>;
     // What `studio/` says about those models. Filled in once, AFTER level_init.
     pub fn set_sequences(&mut self, sequences: SequenceTable);
 
@@ -1250,6 +1257,12 @@ pub struct MoveLinear { /* private */ }
 pub struct Button { /* private */ }
 pub struct Rotating { /* private */ }
 pub struct Brush { /* private; func_brush */ }
+/// `func_areaportal` and `func_areaportalwindow`, which share one behaviour
+/// because `vbsp` has already taken both brushes away: what reaches the game is
+/// a point entity whose whole content is a `portalnumber` and three inputs.
+/// `state()` is what `Server::area_portals` reports to `World::vis`.
+pub struct AreaPortal { /* private */ }
+impl AreaPortal { pub fn state(&self) -> (u16, bool); }
 // classes/trigger.rs — stage 4, and the first classes that notice the player
 pub struct BaseTrigger { /* private; held by all five, and by ButtonTrigger */ }
 /// What one `BaseTrigger::start_touch` did — `passed` is the filters,
@@ -1305,8 +1318,8 @@ impl PropPortal {
 pub fn teleport_matrix(entrance: (Vec3, Vec3), exit: (Vec3, Vec3)) -> Mat4;
 ```
 
-Forty-six classnames, **34,823 of the shipped game's 60,925 entity blocks**.
-**Forty-one of them are among the 200 classnames the maps place**; the other
+Forty-eight classnames, **35,232 of the shipped game's 60,925 entity blocks**.
+**Forty-three of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -1334,6 +1347,8 @@ because Valve registers them:
 | `func_movelinear` | `CFuncMoveLinear` | 196 |
 | `func_button` | `CBaseButton` | 64 |
 | `func_rotating` | `CFuncRotating` | 27 |
+| `func_areaportal` | `CAreaPortal` | 206 |
+| `func_areaportalwindow` | `CFuncAreaPortalWindow` | 203 |
 | `trigger_once` | `CTriggerOnce` | 1,476 |
 | `trigger_multiple` | `CTriggerMultiple` | 899 |
 | `trigger_hurt` | `CTriggerHurt` | 215 |
@@ -2413,11 +2428,11 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_portal -- --i
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 34,823 matched, 65
-created, 27,951 spawned, 6,937 lights deleted, 213 kept, 54,535 connections,
-159 unimplemented classnames, the full 48-name unhandled-key table, 5,787
-events dispatched, 3,932 inputs accepted, 7,318 thinks, 1,122 events that found
-no target, zero bad conversions, the 18-name unhandled-input table, a peak of
+server time**, and asserts exact totals: 60,925 blocks, 35,232 matched, 65
+created, 28,360 spawned, 6,937 lights deleted, 213 kept, 54,535 connections,
+157 unimplemented classnames, the full 49-name unhandled-key table, 5,787
+events dispatched, 3,932 inputs accepted, 7,318 thinks, 1,036 events that found
+no target, zero bad conversions, the 20-name unhandled-input table, a peak of
 215 entities in the simulation list at once, 2,341 live triggers, 105 maps with
 a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
@@ -3322,7 +3337,8 @@ to `0`, inside the same tick.
 `sp_a1_intro1`**, which makes this the rare module whose test bed is the map the
 port already loads by default. That takes the port to **46 registered classnames and
 34,823 of the game's 60,925 entity blocks** — 41 of them among the 200 the maps
-place. All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
+place. (The two areaportal classnames landed afterwards, with `world/`'s
+visibility, taking those figures to 48 and 35,232.) All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
 `HalfWidth`/`HalfHeight`, so the whole of shipped content is "two default-sized
 portals in group 0, switched on by map logic": **31 `SetActivatedState`, 4
 `NewLocation`, and exactly one output connection in the entire game**, which is

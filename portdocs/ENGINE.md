@@ -428,6 +428,11 @@ Spectator relay for competitive multiplayer. Not a Portal 2 concern.
 `replaydemo.cpp` (446), `replay.cpp` (211).
 
 ### 7.14 World / BSP / model loading — ~10,300 → `world/`
+**`mod_vis.cpp` (467) is ported** — with `r_areaportal.cpp` (623, §7.16), the areaportal
+half of `cmodel.cpp` and `R_RecursiveWorldNode`'s pruning — see `src/engine/world/vis.rs`
+and `portdocs/ENGINE_WORLD_VIS.md`. `debug_leafvis.cpp` (701) and
+`OcclusionSystem.cpp` (2,999) are **deleted**, the second because Portal 2 places no
+`func_occluder` at all.
 **Corrected:** this section used to count `cmodel.cpp` (4,067), `cmodel_bsp.cpp` (1,297)
 and `cmodel_disp.cpp` (603) here. **They are `trace/`'s** — `world/` reads lumps and draws
 faces and never wants a brush — and they are why §7.17's figure was low by the same 5,967.
@@ -660,7 +665,7 @@ reached.** Remaining, in dependency order:
 3. **`materialsystem` stage 5** (lightmaps) — no longer blocked; there is a `.bsp` to
    pack from, and `LightmappedGeneric` is what turns 62 of `sp_a1_intro1`'s 66 materials
    from checkerboard into content. **Highest visual return of anything on this list.**
-4. **The rest of `world/`** (§7.14, §7.15) — visibility (every face is drawn every frame
+4. **The rest of `world/`** (§7.14, §7.15) — ~~visibility~~ **done** (every face used to be drawn every frame
    today) and the 3D skybox, plus `trace/` (§7.17)'s remaining stages. **Static props,
    brush entities and displacements have landed**: the props are `portdocs/STUDIO.md`; the
    brush entities turned out to be the *existing* face-grouping and lightmap path run per

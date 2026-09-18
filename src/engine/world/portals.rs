@@ -275,9 +275,8 @@ fn quad(portal: &Portal) -> [SimpleVertex; 4] {
     // left-handed basis — see the module docs. The corners then run
     // `(-u,-v), (+u,-v), (+u,+v), (-u,+v)`, which is counter-clockwise seen
     // from in front of the portal.
-    let corner = |position: Vec3, texcoord: [f32; 2]| {
-        SimpleVertex::new(position.to_array(), texcoord)
-    };
+    let corner =
+        |position: Vec3, texcoord: [f32; 2]| SimpleVertex::new(position.to_array(), texcoord);
     [
         corner(origin - up - right, [1.0, 1.0]),
         corner(origin + up - right, [1.0, 0.0]),
@@ -448,7 +447,10 @@ mod rendered {
         // that could be silently wrong: the checkerboard draws a rectangle, and
         // every assertion below would still pass on "something drew".
         for (index, material) in portals.materials.iter().enumerate() {
-            println!("  overlay {index}: {} ({:?})", material.name, material.shader);
+            println!(
+                "  overlay {index}: {} ({:?})",
+                material.name, material.shader
+            );
             assert_eq!(
                 material.shader,
                 crate::materials::shader::ShaderKind::PortalRefract,
@@ -549,7 +551,12 @@ mod rendered {
                 }
             }
             let n = (pixels.len() / 4) as f64;
-            (sum[2] as f64 / n, sum[1] as f64 / n, sum[0] as f64 / n, drawn)
+            (
+                sum[2] as f64 / n,
+                sum[1] as f64 / n,
+                sum[0] as f64 / n,
+                drawn,
+            )
         };
 
         for is_portal2 in [false, true] {
@@ -585,7 +592,10 @@ mod rendered {
             // the end of it.
             match is_portal2 {
                 false => assert!(r < b, "the blue portal is not blue: ({r:.2} {g:.2} {b:.2})"),
-                true => assert!(b < r, "the orange portal is not orange: ({r:.2} {g:.2} {b:.2})"),
+                true => assert!(
+                    b < r,
+                    "the orange portal is not orange: ({r:.2} {g:.2} {b:.2})"
+                ),
             }
 
             // Half-open: a filled disc rather than a ring, because the static

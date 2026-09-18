@@ -498,7 +498,6 @@ impl Client {
         self.impulse = impulse;
     }
 
-
     /// `CViewRender::SetUpView` (`game/client/view.cpp:668`) plus the field-of-
     /// view scaling `CViewRender::Render` applies straight afterwards
     /// (`view.cpp:1084`).
