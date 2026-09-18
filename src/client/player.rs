@@ -152,6 +152,17 @@ pub struct Player {
     /// refuse a pogo stick and duck reads it for press and release edges —
     /// both of which are questions about the frame before this one.
     pub old_buttons: ButtonBits,
+
+    /// `m_hPortalEnvironment` — the portal this player is inside the influence
+    /// of, as an opaque key.
+    ///
+    /// Written at the end of every move by
+    /// [`handle_portalling`](super::movement::MoveData::portal_environment)'s
+    /// selection and read at the start of the next one, by `engine/`, to
+    /// decide which carved wall to trace against. `None` is the ordinary case:
+    /// the whole game has 21 scripted portals and 96 of its 106 maps place
+    /// none.
+    pub portal_environment: Option<u64>,
 }
 
 impl Player {
@@ -185,6 +196,7 @@ impl Player {
             ducking: false,
             duck_time_msecs: 0,
             old_buttons: ButtonBits::NONE,
+            portal_environment: None,
         }
     }
 

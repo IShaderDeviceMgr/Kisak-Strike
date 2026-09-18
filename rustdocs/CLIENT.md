@@ -209,6 +209,12 @@ pub struct Player {
     pub ducking: bool,             // mid-transition, either direction
     pub duck_time_msecs: i32,
     pub old_buttons: ButtonBits,   // what the PREVIOUS command held
+    /// `m_hPortalEnvironment` — the portal this player is inside the influence
+    /// of, as the same opaque key `PortalState::id` is. Written at the end of
+    /// each move by [the teleport](#the-teleport--handle_portalling) and read
+    /// at the start of the next by `engine/`, to decide which carved wall to
+    /// trace against. `None` is the ordinary case.
+    pub portal_environment: Option<u64>,
 }
 
 impl Player {
@@ -278,10 +284,31 @@ impl MoveVars { pub const PORTAL2: MoveVars; }
 pub struct MoveData { /* origin, velocity, angles, forwardmove, sidemove, upmove,
                         buttons, old_buttons, max_speed, move_type, ground,
                         surface_friction, ducked, ducking, duck_time_msecs,
-                        view_offset, speed_cropped */ }
+                        view_offset, speed_cropped,
+                        move_start, portal_environment, teleported */ }
 
-pub fn player_move(mv: &mut MoveData, tracer: Option<&mut Tracer<'_>>,
-                   vars: &MoveVars, dt: f32);
+/// What a teleport did, for the caller to finish — see "The teleport" below.
+pub struct Teleport {
+    pub matrix: Mat4,
+    pub entered: u64,
+    pub exit: u64,
+    pub forced_duck: bool,
+}
+impl Teleport {
+    /// `UTIL_Portal_AngleTransform`: an angle set taken through the portal.
+    pub fn turn(&self, angles: ViewAngles) -> ViewAngles;
+}
+
+/// `ShouldPortalTransitionCrouch` — does this pair turn the up axis far enough
+/// that an AABB cannot make the trip standing? `engine/` asks it to decide
+/// whether to give the tracer `with_exit_hull`.
+pub fn transition_crouches(matrix: Mat4) -> bool;
+
+/// `'a` is the portals' lifetime: the teleport re-attaches the tracer's hole to
+/// the **exit** portal before checking whether the player came out stuck.
+pub fn player_move<'a>(mv: &mut MoveData, tracer: Option<&mut Tracer<'a>>,
+                       portals: Option<&'a PortalHoles>,
+                       vars: &MoveVars, dt: f32, old_angles: ViewAngles);
 pub fn full_walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>,
                       vars: &MoveVars, dt: f32);
 pub fn full_noclip_move(mv: &mut MoveData, vars: &MoveVars, dt: f32);
@@ -323,6 +350,143 @@ Where Portal's override differs only by generalising world `+Z` to an arbitrary 
 normal" — its paint-gel gravity reorientation — the two are the same function with no
 paint, because `m_vGravityDirection = -stickNormal` and the stick normal is world up.
 Those are ported in the world-`+Z` form.
+
+### The teleport — `handle_portalling`
+
+`CPortalGameMovement::HandlePortalling` (`portal_gamemovement.cpp:2214`), which is
+`portdocs/PORTAL.md` §6 and the second half of its stage 4. It runs at the end of every
+move, for **every** move type including noclip, and it compares where the move *started*
+with where it ended.
+
+`MoveData` grows three fields for it, and `player_move` fills the first two in itself so
+that no caller has to remember to:
+
+| Field | Is |
+|---|---|
+| `move_start` | `m_vMoveStartPosition` — the feet before this move ran |
+| `portal_environment` | `m_hPortalEnvironment` — the portal this player is being traced against, as an opaque key |
+| `teleported` | `Some` when this move ended in one; cleared at the top of every move |
+
+#### Selecting the portal
+
+A swept hull against every **active linked** portal's trigger box, then three filters,
+then nearest-centre-wins. The filters are the interesting part and each one is a bug
+somebody had:
+
+- the **old** centre must have been in front of the plane — unless this portal was already
+  the player's environment, which is Valve's *"special exception if we were pushed past the
+  plane but did not move past it"*;
+- if the new centre is *behind* the plane it has to be over the quad, or walking into the
+  wall beside a portal would count;
+- if it is in *front*, the line from the centre to its most-penetrating extent has to pass
+  through the quad — *"avoids case where you can butt up against a portal side on an
+  angled panel"* — within `portal_player_interaction_quadtest_epsilon` (`-DIST_EPSILON`)
+  and a one-unit quad margin.
+
+**The sweep is approximated.** `CPortal_Base2D::TestCollision` is a box sweep against the
+OBB; this is the union of the hull at both ends against the same box, which can only
+answer `true` more often. Every filter then runs unchanged and the trigger is exact, so
+the approximation cannot teleport anyone who should not be — it can only put the player in
+a portal's environment a tick early, which is the direction that fails safe.
+
+**The selection runs whether or not anyone goes through**, because its other job is to
+write `portal_environment`, and that is what the *next* move is traced against. A player
+walking up to a portal is in its environment for several ticks before they cross.
+
+#### The trigger, and the frame split
+
+**The centre crossing the plane**, `< -FLT_EPSILON` against `m_plane_Origin` — not the
+hull's near face, and not the carve's shifted plane. The crossing happened part way
+through the frame, so:
+
+```text
+crossed_at      = old_plane_dist / (old_plane_dist - plane_dist)     // 0.5 if that is 0
+after_crossing  = (1 - crossed_at) * frametime
+```
+
+and the `0.5` fallback is Valve's, with the bug number attached: *"sometimes fOldPlaneDist
+is too [negative], some kind of physics penetration seems to be the cause (bugbait
+#61331)"*.
+
+#### The velocity
+
+Gravity is world-down on both sides of a portal, so the part applied *after* the crossing
+is taken out before the rotation and added back to the result at **1.008×** — *"Apply
+slightly more gravity on exit so that floor/floor portals trend towards decaying velocity.
+1.008 is a magic number found through experimentation."* At 1.0 an infinite floor-to-floor
+fall gains height every cycle.
+
+Then the exit speed range, which asks the **exit** portal
+(`prop_portal_shared.cpp:201`, `:267`):
+
+| Situation | Minimum |
+|---|---|
+| Player, exit facing up past 30° | **300** |
+| Player, exit not on the floor but `forward.z > 0.5` | solve a quadratic for the speed that perches the hull on the portal's bottom edge, capped at 300 |
+| anything else | none |
+
+Maximum is a flat 1000. **Below the minimum, speed is *added along the exit's forward***,
+not scaled — scaling would turn a sideways exit into a faster sideways exit. Above the
+maximum the whole vector is scaled. Then a per-axis `sv_maxvelocity` clamp, done quietly
+rather than through `CheckVelocity`.
+
+#### The forced duck, and the move
+
+`ShouldPortalTransitionCrouch` is `|m_matrixThisToLinked.m[2][2]| < cos 30°` — *"how much
+does zUp still look like zUp after going through this portal"*. An AABB cannot rotate, so
+a wall-to-floor transition has to curl the player into the duck hull **immediately**:
+`FinishDuck()` now, the duck timer set, and `vOriginToCenter` recomputed against the duck
+hull afterwards.
+
+That last recomputation is the point: **the transform preserves the box's *centre*, not
+its origin.** `mv.origin = matrix * centre - origin_to_center`, and reading the two the
+wrong way round drops the player by the difference between the hulls.
+`a_transition_that_turns_the_up_axis_ducks_the_player_as_they_cross` asserts the centre
+lands where the matrix says and nothing else.
+
+`ShouldMaintainFlingAssistCrouch` keeps that duck when leaving a portal that faces partly
+up at more than `PLAYER_FLING_HELPER_MIN_SPEED` (200), and there is a companion nudge that
+moves the exit centre toward the portal's axis so a flung player does not stub the hull
+corner on the exit lip — *"the real world equivalent of stubbing your toe on the exit hole
+results in flinging straight up."*
+
+#### Afterwards
+
+The environment is reassigned to the **exit** portal *before* the post-teleport
+`startsolid` check, not on the next frame's touch update, so the check runs against the
+right carved geometry — which is what `Tracer::set_hole` exists for. If the player did
+come out stuck, one recovery sweep is made in from the portal's own axis, which is the
+direction with the most room. Valve's third attempt,
+`UTIL_FindClosestPassableSpace_InPortal_CenterMustStayInFront`, is a 100-iteration search
+and is **not ported**.
+
+#### The angles are the caller's
+
+`MoveData` has no view angles — `CPlayerMove::FinishMove` does not write `mv->m_vecAngles`
+back either (`player_command.cpp:232`, commented out in the original) — so the transform
+comes out as `Teleport::matrix` and `Client::run_move` composes it. That is
+`portdocs/PORTAL.md` §6.5's *"the whole block of angle plumbing collapses to a single
+compose"*: Valve transforms four angle sets (the engine's, the prediction's, `pl.v_angle`
+and the entity's) and this port has one.
+
+It is a **compose**, not a fix-up of yaw: a pair can turn all three angles at once, and
+the only way to get that right is to go through a matrix and read it back with
+`crate::math::matrix_angles`. No pitch clamp — `ApplyMouse` clamps on the next command,
+which is Valve's order.
+
+#### What is not ported
+
+- **`GetImplicitVerticalStepSpeed`** — the vertical speed a player carries implicitly
+  while walking up a slope, since ground velocity is xy-only. Added before the rotation in
+  the original; nothing here tracks it and it is zero except on a slope.
+- **`bSkipRemoteTubeCheck`**, which a fling sets, and the **transition ramp**
+  (`m_bContactedPortalTransitionRamp`). Both need content this port cannot reach yet.
+- **`UnrollPredictedTeleportations`, `ApplyPredictedPortalTeleportation` and the
+  `EntityPortalled` user message** — all of them reconcile a predicting client with an
+  authoritative server, and this port is one process.
+- **The unstick pass when the environment goes back to `None`**, which Valve does because
+  *"we can't wait for it to opportunistically find a non-stuck case"*. Not reached in
+  practice; it is a floating-point recovery.
 
 ### `ViewSetup`
 
@@ -655,6 +819,36 @@ Same ordering: most likely to bite first.
   `rustdocs/ENGINE.md`'s trace gotcha 1, and every one of this module's ~14 traces goes
   through `trace_player_bbox`, which is the only place that pairing is written down.
 
+### The teleport's own, added by `portdocs/PORTAL.md` stage 4
+
+- **`portal_environment` lags one move, on purpose.** The hole a move is traced against is
+  the one the *previous* move ended touching, which is why the selection runs whether or
+  not anyone teleported. A caller that recomputed it from the player's current position
+  each tick would be tracing against the world the player has already left.
+
+- **The teleport trigger is the box's *centre* crossing the plane.** The hull's near face
+  is past the plane for several ticks first, and during those ticks the carve is what the
+  player is walking through. Testing the near face teleports them a hull-depth early.
+
+- **`FinishDuck` is called *during* the teleport, and `vOriginToCenter` is recomputed
+  after it.** The transform preserves the box's **centre**; the origin is derived back from
+  it afterwards. Conflating the two drops the player by the hull difference — 18 units
+  standing-to-ducked.
+
+- **`player_move` clears `portal_environment` when there are no portals**, rather than
+  leaving it. A level change would otherwise leave a stale id behind and the next map's
+  carve would be picked by it.
+
+- **The angles do not come back in `MoveData`, and the teleport is the reason that
+  matters.** Every other part of the move leaves them alone, so `Client::run_move`'s one
+  write — composing `Teleport::matrix` — is the only place in the port where the view turns
+  without the mouse. A caller that drops `mv.teleported` gets a player who comes out of the
+  exit portal facing the way they went in, which looks like the matrix is wrong.
+
+- **`select_portal` takes the nearest centre**, so on a map with two portals close together
+  the one you walked at is not necessarily the one you go through. Measured on shipped
+  content: it happens. That is Valve's rule, not a bug.
+
 ### Dying's own, added by `server/` stage 5
 
 - **`move_type`, `health` and `frozen` come *in* and never go out.** They are the
@@ -753,7 +947,8 @@ Same ordering: most likely to bite first.
 | `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | The landing sound and the landing animation need sound and animation. **Fall damage is neither deferred nor missing: Portal has none.** `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules agree in words. |
 | ~~Base velocity~~ | **Done** — `src/server/` stage 4's `trigger_push` writes it and the walk adds and subtracts it; see [`Player`](#player-and-movedata). What is still missing is the *conveyor* half: `FL_CONVEYOR` and `SetGroundEntity`'s velocity exchange, which need a ground **entity** rather than a ground plane. No Portal 2 entity sets `FL_CONVEYOR` — `CFuncMoveLinear::Spawn` has the one call commented out, with a name and a reason. |
 | `m_outWishVel`, `m_outJumpVel`, `m_outStepHeight` | Outputs for the view's step smoothing and the animation layer. Carrying fields nothing reads would be carrying fields nothing checks; `view.cpp`'s step smoothing is where `m_outStepHeight` attaches. |
-| Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint and portals. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. |
+| Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. **The teleport itself has landed** — see [the teleport](#the-teleport--handle_portalling) — and what is still missing from it is listed there. |
+| `GetImplicitVerticalStepSpeed`, the transition ramp, `bSkipRemoteTubeCheck` | [The teleport](#the-teleport--handle_portalling)'s own deferrals; each is zero except on a slope, on an angled portal, or during a fling. |
 | `player->m_surfaceFriction` from a real surface, `jumpFactor`, `maxSpeedFactor` | The physics surface-property database — `vphysics/`. Every surface reads as the default until then, and `surface_friction` still carries `CategorizePosition`'s 0.25. |
 | `env_fog_controller`'s `farz`, which overrides `GetZFar` when positive | Entities. |
 | `r_aspectratio`, and `AspectRatioInfo_t`'s non-square-pixel scalar | `r_aspectratio` is a *renderer* cvar (`gl_rmain.cpp:46`); registering it from the game client to read it in `screen_aspect` would put it in the wrong module. The pixel-shape scalar is the material system's. Both coincide with `width / height` on every square-pixel display, which is the only case this port supports. |
@@ -791,10 +986,12 @@ Same ordering: most likely to bite first.
 
 ## Which tests guard what
 
-`cargo test client::` — 77 tests, no window, no GPU, no game content. Stage 4's build a
-collision model with `engine::trace::fixture::Fixture` rather than loading a `.bsp`: a
-room with a floor, a 16-unit step, a wall nothing can climb and a ceiling only a crouched
-player fits under.
+`cargo test client::` — 85 tests, no window, no GPU, no game content, plus one
+depot-gated. Stage 4's build a collision model with `engine::trace::fixture::Fixture`
+rather than loading a `.bsp`: a room with a floor, a 16-unit step, a wall nothing can climb
+and a ceiling only a crouched player fits under. The teleport's use
+`fixture::portal_rooms`, which is two rooms a thousand units apart with a linked pair
+between them — see `rustdocs/ENGINE.md`.
 
 | Test | Guards |
 |---|---|
@@ -836,6 +1033,12 @@ player fits under.
 | `edge_friction_slows_a_player_near_a_ledge` | that it fires over a ledge and nowhere else |
 | `walking_into_things_never_ends_inside_them` | eight directions × 60 frames, asserting the hull is never in solid |
 | `a_walking_player_without_a_map_does_not_move` | the `Option<&mut Tracer>` contract |
+| `walking_into_a_portal_comes_out_of_the_other_one` | **the test that says stage 4 works**: one teleport, out of the partner, standing on the far room's floor, still walking, and looking the way that room faces |
+| `standing_in_a_portals_trigger_box_is_not_going_through_it` | the trigger being the *centre* crossing, with the hull's near face already past the plane and the environment set |
+| `a_portal_whose_far_side_is_blocked_cannot_be_walked_into` | the remote trace, as the property that matters: a barrier eight units in front of the exit stops the player eight units in front of the entrance. With the control — remove the barrier and the same walk goes through |
+| `a_transition_that_turns_the_up_axis_ducks_the_player_as_they_cross` | the forced duck, the duck timer, the environment handover, and that the transform preserves the box's **centre** |
+| `a_player_leaves_a_floor_portal_at_three_hundred_units_a_second` | `GetExitSpeedRange`'s four answers, including the perch quadratic and the `forward.z > 0.5` gate |
+| `the_quadratic_keeps_valves_degenerate_answers` | `SolveQuadratic`'s linear, all-zero and imaginary cases, which `perch_speed` relies on rather than guards against |
 | `a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration` | gotcha 7, and that `sv_noclipaccelerate 0` restores the old feel |
 | `holding_strafe_moves_with_the_mouse_instead_of_turning`, `lookstrafe_redirects_only_the_horizontal_axis` | `ApplyMouse`'s three cases and the asymmetry between the axes |
 | `cl_mouseenable_zero_drops_the_motion_rather_than_banking_it` | nothing arrives in one lump when it is turned back on |
@@ -877,6 +1080,38 @@ Added by `server/` stage 5:
 | `movement::a_dead_players_movement_basis_is_the_previous_commands` | the `m_vecOldAngles` pin, and that a live player is unaffected |
 | `server::tests::noclip_is_the_servers_and_survives_the_round_trip` | that the move type only travels one way |
 
+**`a_player_walks_through_every_shipped_portal_pair`** is the depot-gated acceptance test
+`portdocs/PORTAL.md` §11 asks for, and it is the strongest evidence stage 4 has:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release walks_through -- --ignored --nocapture
+```
+
+Every pair of `prop_portal`s the shipped maps place is linked with the real
+`teleport_matrix`, carved with the real `PortalHoles`, and walked into by a real player
+hull through the real `player_move` — with the portal plumbing `Engine::update_client`
+does around it, so the tracer's hole comes from the environment the previous move ended in
+and the view turns with the player.
+
+The pairing is by entity order within a map rather than through the server's linker,
+because what is under test is the movement; that every shipped pair spawns and links is
+`server::tests::every_shipped_portal_spawns_and_its_map_can_link_a_pair`'s job, and running
+the whole entity system here would make a failure ambiguous.
+
+**Measured: nine pairs across the shipped maps, six walked through.** One
+(`sp_a4_finale4`) is stopped short by the geometry at the far end and two
+(`sp_a1_intro6`, `sp_a4_finale1`) have nowhere to stand in front of them — the second of
+those being one of the four tractor-beam portals the map parks in mid-air. Nine pairs out
+of twenty-one portals is the content's arithmetic: `sp_a1_intro5` and `sp_a1_intro7` place
+a single `prop_portal` each and `sp_a1_intro4` places three. Between them the nine pairs
+hold **590 carved pieces, 72 tube slabs and 292 remote pieces**, and carving a linked pair
+takes **0.09 ms on average and 0.16 ms at worst**.
+
+**Either portal may be the entrance**, which the test had to be taught: some maps put the
+pair close enough together that a player walking at one is nearer the other, and the
+selection takes the nearest centre. What it asserts is that they came out of the
+*partner*, on that portal's room side of its plane.
+
 ---
 
 ## What has landed, and what each stage found
@@ -889,7 +1124,8 @@ Added by `server/` stage 5:
 > record of how they were arrived at.
 
 **`src/client/` — the game client, stages 1-4 of 5 ported, plus the dead
-player `server/` stage 5 brought** (`portdocs/CLIENT.md`,
+player `server/` stage 5 brought and the teleport `portdocs/PORTAL.md` stage 4
+brought** (`portdocs/CLIENT.md`,
 **`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
 tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
 **It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
@@ -983,6 +1219,42 @@ at anything is the fade. And **`check_parameters` needs the *previous*
 command's angles**, captured at the top of `create_move` before
 `adjust_angles` has moved them — taking them at `run_move` time gives the
 current ones and the pin becomes a no-op you cannot see.
+
+**The teleport landed after stage 4, with `portdocs/PORTAL.md` stage 4**
+(§6, and `handle_portalling` above is the reference). `CPortalGameMovement::HandlePortalling`
+is 614 lines in the original and about 200 here, because four fifths of it is prediction
+reconciliation and angle plumbing this port does not have: Valve transforms four angle sets
+where this has one, and `UnrollPredictedTeleportations` and friends exist to make a
+predicting client agree with an authoritative server. What is left is the part that is
+actually geometry — select the portal, split the frame at the crossing, rotate and clamp
+the velocity, force the duck, move the box's *centre* through the matrix — and it fits in
+`player_move`'s tail because that is where Valve calls it from
+(`portal_gamemovement.cpp:468`, between `PlayerMove` and `FinishMove`).
+
+Three things the portdoc's §5 and §6 did not predict, all of them found by writing the
+tests rather than by reading:
+
+1. **The far side is not usually what holds the player up.** §5 says the remote trace is
+   what keeps a player on the far room's floor while their box straddles the plane.
+   Measured: the wall *below* the hole is still solid and a swept AABB is supported by any
+   ledge it overlaps, so in the wall-to-wall case the near side catches them first. The
+   fixture had to put a ledge at the far end *16 units above the hole's own lip* before the
+   two answers differed at all. What the far side demonstrably does is **stop** you —
+   a portal whose exit is blocked cannot be walked into — and that is the test that was
+   written instead.
+2. **The remote set has nothing to say until the player is nearly through.** A point `d`
+   in front of the entrance images to `d` *behind* the exit, so while they approach, their
+   remote box is buried in the exit's wall where the World set holds nothing. The window is
+   about the hull's half-depth: one or two ticks.
+3. **`select_portal` takes the nearest centre, so the portal you walked at is not always
+   the one you go through.** Measured on shipped content, where a pair can be close enough
+   together for it, and the depot test had to be taught to accept either as the entrance.
+   Valve's rule, not a bug.
+
+Plus one correction to the reference tree rather than to the portdoc:
+**`CalculateExtentShift`'s comment does not describe its arithmetic.** It is ported as
+written and `rustdocs/ENGINE.md` gotcha 28 has the measurement; it is zero for every
+wall-to-wall transition anyway, which is almost all of them.
 
 **`client/tonemap.rs` landed alongside the five stages rather than inside them**
 (`portdocs/CLIENT_TONEMAP.md`, and it is `viewpostprocess.cpp`'s `CTonemapSystem`, not

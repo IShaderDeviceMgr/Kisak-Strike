@@ -54,13 +54,15 @@ of `CPortal_Base2D` — **21 entities across 10 of the 106 maps, two of them on
 third seam of its kind, after `PlayerState` and `ModelEntityState`),
 `Context::find_all_of_class`, and the `portal` console command's server half
 (`Server::place_portal`, `Server::fizzle_portals`). It links, it computes the
-matrix, and `engine::world::portals` draws a coloured oval where it is. **It
-does not teleport anybody (stage 4)**, and the class itself does not carve the
-wall either — stage 3 landed in `engine::trace::carve`, driven off the same
-`PortalState` this class already produced, which is what
-`portdocs/PORTAL.md` §12 meant by "the one thing stage 3 adds to the seam is
-nothing at all". So what you see is an oval on a wall you can walk *into*, and
-then fall out of the back of.
+matrix, and `engine::world::portals` draws a coloured oval where it is.
+
+**The class still does not carve the wall or teleport anybody, and it should
+not**: stages 3 and 4 landed in `engine::trace::carve` and
+`client::movement::handle_portalling`, both driven off the same `PortalState` this
+class already produced — which is what `portdocs/PORTAL.md` §12 meant by "the one
+thing stage 3 adds to the seam is nothing at all". Stage 4 asked for two more
+fields, `linked` as the partner's key and `matrix`, and nothing else. **So the
+ovals work now**: you walk into one and come out of the other.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
@@ -375,7 +377,10 @@ pub struct PortalState {
     pub half_height: f32,     // 56 — NOT 14; see gotcha 79
     pub is_portal2: bool,     // which of the two overlay materials
     pub opened_at: f32,       // the SERVER's clock, like ModelEntityState::anim_time
-    pub linked: bool,         // IsActivedAndLinked()
+    /// The partner's key when `IsActivedAndLinked()`, `None` otherwise.
+    pub linked: Option<u64>,
+    /// `m_matrixThisToLinked` — the identity while unlinked.
+    pub matrix: Mat4,
 }
 ```
 
@@ -386,9 +391,17 @@ inactive portal is filtered out rather than carried with a `visible` flag.
 `C_Portal_Base2D::ShouldDraw` refuses an inactive portal and
 `CPortalRender::AddPortal`/`RemovePortal` are gated on the same thing.
 
-**What it does not carry is the teleport matrix**, because nothing draws with
-it. Stage 2 is an oval on a wall, not a view through one; the matrix stays on
-`PropPortal::matrix` until stage 4 moves the player with it.
+**It carries the teleport matrix, and that arrived with stage 4 rather than
+stage 2.** Nothing *draws* with it — stage 2 was an oval on a wall, not a view
+through one — but the **carve** needs it: `trace::PortalLink` holds the matrix
+each way so that the same sweep can be asked again in the exit portal's space.
+It travels rather than being recomputed on the far side because
+`portdocs/PORTAL.md` §3.2's whole warning is that a second spelling of it can
+silently lose the 180° turn, and this way
+[`teleport_matrix`](#the-teleport-matrix) is the only place in the port that
+computes one. `linked` became the partner's *key* for the same reason: the carve
+has to know which other hole a hole leads to, and `World::sync_portals` resolves
+the pairing from this one list.
 
 `opened_at` is what the renderer turns into `$PortalOpenAmount` (0 to 1 over
 half a second) and `$PortalStatic` (1 to 0 over one second) —
@@ -3364,7 +3377,9 @@ holding more than four.
 **`portdocs/PORTAL.md` §12's "where does the carve live" is settled and the seam
 already exists**: `PortalState` goes `server/` → `engine/` → `world/` once a rendered
 frame, and stage 3's carve takes the same route into `trace/` — adding nothing to the
-seam, because the placement and the size are already in it.
+seam, because the placement and the size are already in it. **Stage 4 added exactly two
+fields to it**, `linked` (as the partner's key rather than a `bool`) and `matrix`, so that
+the teleport matrix is computed in one place and copied rather than spelled twice.
 And **the placement snap was deleted and the deletion was measured.**
 `CProp_Portal::ActivatePortal` re-traces and re-places a portal on activation; this
 port activates one where the map put it.

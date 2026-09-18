@@ -70,7 +70,7 @@ mod model;
 mod ray;
 mod result;
 
-pub use carve::{CarvedWall, PortalHole, PortalHoles, CARVE};
+pub use carve::{CarvedWall, LivePortal, PortalHole, PortalHoles, PortalLink, CARVE};
 pub use disp::disp_surf;
 pub use model::{BrushModel, CollisionBsp};
 pub use ray::{Contents, Ray};
@@ -246,7 +246,40 @@ pub struct Tracer<'a> {
     /// against the map's tens of thousands. Allocated once, when the hole is
     /// attached, for the reason the world's are: a `Tracer` is made once and
     /// kept.
-    hole: Option<(&'a CarvedWall, Visits)>,
+    hole: Option<Hole<'a>>,
+    /// Half the size of the box on the far side of the hole, when a transition
+    /// would change it — see [`with_exit_hull`](Tracer::with_exit_hull).
+    ///
+    /// Outside the hole entirely, so that setting it before or after
+    /// [`with_hole`](Tracer::with_hole) is the same thing.
+    exit_extents: Option<Vec3>,
+}
+
+/// One attached hole, with a set of visit stamps per model it sweeps.
+///
+/// Three models rather than one because the shipped engine has three
+/// collideables — the carved pieces, the tube and the exit's geometry — and
+/// each needs its own stamps, indexed by its own brush numbering.
+#[derive(Debug)]
+struct Hole<'a> {
+    wall: &'a CarvedWall,
+    pieces: Visits,
+    tube: Visits,
+    /// `None` when the portal is unlinked, which is when there is no remote
+    /// model to sweep.
+    remote: Option<Visits>,
+}
+
+impl<'a> Hole<'a> {
+    fn new(wall: &'a CarvedWall) -> Hole<'a> {
+        let stamps = |bsp: &CollisionBsp| Visits::new(bsp.brushes.len(), bsp.disps.len());
+        Hole {
+            pieces: stamps(wall.collision()),
+            tube: stamps(wall.tube()),
+            remote: wall.remote().map(stamps),
+            wall,
+        }
+    }
 }
 
 impl<'a> Tracer<'a> {
@@ -256,6 +289,7 @@ impl<'a> Tracer<'a> {
             visits: Visits::new(bsp.brushes.len(), bsp.disps.len()),
             entities: &[],
             hole: None,
+            exit_extents: None,
         }
     }
 
@@ -314,7 +348,9 @@ impl<'a> Tracer<'a> {
     ///
     /// A trace that hits nothing pays one comparison, which is Valve's guard
     /// and is why a player nowhere near a portal is unaffected. One that hits
-    /// pays a second descent over a few hundred brushes.
+    /// pays a second descent over a few hundred brushes, and — when the portal
+    /// is linked and that descent came out better than the real world — a
+    /// third over the geometry at the far end.
     ///
     /// **"Whichever went further" is only safe inside the carved region.** The
     /// carve holds the world within `vCollisionCloneExtents` of the portal
@@ -329,8 +365,39 @@ impl<'a> Tracer<'a> {
     /// the shipped engine's shape and is recorded rather than fixed —
     /// `rustdocs/ENGINE.md` gotcha 23.
     pub fn with_hole(mut self, wall: &'a CarvedWall) -> Tracer<'a> {
-        let pieces = wall.collision();
-        self.hole = Some((wall, Visits::new(pieces.brushes.len(), pieces.disps.len())));
+        self.set_hole(Some(wall));
+        self
+    }
+
+    /// The same, on a tracer already in hand.
+    ///
+    /// [`with_hole`](Tracer::with_hole) is how a caller that is *building* a
+    /// tracer attaches one; this is for the one caller that has to change it
+    /// mid-move — `HandlePortalling`, which teleports the player and then has
+    /// to check whether they came out inside something, against the geometry
+    /// at the **exit**.
+    ///
+    /// Allocates a set of visit stamps, so it is not something to call per
+    /// trace.
+    pub fn set_hole(&mut self, wall: Option<&'a CarvedWall>) {
+        self.hole = wall.map(Hole::new);
+    }
+
+    /// The box the player would have on the far side of a portal, when the
+    /// transition would change it.
+    ///
+    /// `vTeleportExtents` (`portal_gamemovement.cpp:1930`). A wall-to-floor
+    /// transition rotates the player's up axis, so `HandlePortalling` folds
+    /// them into the duck hull as they cross — and the remote trace has to ask
+    /// about the box they will *have*, not the one they have now, or it holds
+    /// them up on a floor their real hull would never have cleared.
+    ///
+    /// Left unset the remote box is the local one, which is what Valve uses
+    /// for every transition that does not force a crouch. **`trace/` cannot
+    /// name the duck hull** — it is `client/`'s — so the decision and the
+    /// numbers both come from the caller.
+    pub fn with_exit_hull(mut self, mins: Vec3, maxs: Vec3) -> Tracer<'a> {
+        self.exit_extents = Some((maxs - mins) * 0.5);
         self
     }
 
@@ -373,22 +440,85 @@ impl<'a> Tracer<'a> {
     ///   because a player standing in the hole *is* inside the wall as far as
     ///   the real world is concerned, and without this they would be shoved
     ///   out of it. A carved sweep that itself began solid never wins.
+    ///
+    /// # The far side
+    ///
+    /// Steps 4 and 5 are the rest of `portdocs/PORTAL.md` §5 and they are what
+    /// makes a portal a portal rather than a hole. The same sweep is asked
+    /// again in the **exit** portal's space — see
+    /// [`CarvedWall::remote_ray`] for what "the same sweep" means for a box
+    /// that cannot rotate — against the exit's own World geometry and the
+    /// entrance's tube. Anything it hits is something the player *would* be
+    /// hitting if they teleported this instant, so it is taken when it is
+    /// nearer, transformed back into the caller's frame, and the whole
+    /// reconciliation against the real world is then run **again**: a remote
+    /// hit that made the portal answer worse than the real one gives the real
+    /// one back. Valve's comment lists the three ways that happens and ends
+    /// *"if we switch over to portal traces, we have to commit 100%"*.
+    ///
+    /// The remote sweep is deliberately **world-only** in the shipped engine —
+    /// `sv_portal_new_player_trace_vs_remote_ents` defaults to 0, to avoid
+    /// *"the projected floor to wall dilemma where we can ledge walk in the
+    /// middle of the portal"* — and it is world-only here because the carve
+    /// holds brushes and nothing else.
     fn substitute(&mut self, ray: &Ray, mask: Contents, real: Trace) -> Trace {
         if !(real.start_solid || (ray.is_swept && real.fraction < 1.0)) {
             return real;
         }
-        let Some((wall, visits)) = self.hole.as_mut() else {
+        let exit_extents = self.exit_extents;
+        let Some(hole) = self.hole.as_mut() else {
             return real;
         };
 
-        let mut hole = sweep(wall.collision(), visits, ray, 0, mask);
-        compute_trace_endpoints(ray, &mut hole);
-        fix_up_hull_start(ray, &mut hole);
+        // Step 2: the portal's own geometry — the carved pieces and the tube
+        // that lines the hole, which is a separate collideable in the shipped
+        // engine and is one here.
+        let mut portal = sweep(hole.wall.collision(), &mut hole.pieces, ray, 0, mask);
+        keep_nearer(
+            &mut portal,
+            sweep(hole.wall.tube(), &mut hole.tube, ray, 0, mask),
+            ray,
+        );
+        compute_trace_endpoints(ray, &mut portal);
+        fix_up_hull_start(ray, &mut portal);
 
-        let better = real.start_solid
-            || (!hole.start_solid && ray.is_swept && hole.fraction >= real.fraction);
-        match better {
-            true => hole,
+        // Step 3, which is also the gate on doing any more work: if the carved
+        // answer is not already better than the real one, the far side cannot
+        // make it so — everything it can do is bring the fraction *down*.
+        if !better(&real, &portal, ray) {
+            return real;
+        }
+
+        // Steps 4 and 5.
+        if let (Some(remote), Some(visits), Some(link)) = (
+            hole.wall.remote(),
+            hole.remote.as_mut(),
+            hole.wall.link(),
+        ) {
+            if let Some((far_ray, shift)) = hole.wall.remote_ray(ray, exit_extents) {
+                let mut far = sweep(remote, visits, &far_ray, 0, mask);
+                compute_trace_endpoints(&far_ray, &mut far);
+                fix_up_hull_start(&far_ray, &mut far);
+
+                if far.start_solid || (ray.is_swept && far.fraction < portal.fraction) {
+                    let back = link.to_entrance;
+                    let point_on_plane = back.transform_point3(far.normal * far.plane_dist - shift);
+                    let normal = back.transform_vector3(far.normal);
+                    portal = Trace {
+                        // The sweep began where the *caller* said it did; only
+                        // the impact came from the far side.
+                        start: real.start,
+                        end: back.transform_point3(far.end - shift) + ray.offset,
+                        normal,
+                        plane_dist: normal.dot(point_on_plane),
+                        ..far
+                    };
+                }
+            }
+        }
+
+        match better(&real, &portal, ray) {
+            true => portal,
             false => real,
         }
     }
@@ -957,6 +1087,35 @@ fn fix_up_hull_start(ray: &Ray, trace: &mut Trace) {
     if !ray.is_ray {
         trace.start = ray.origin();
         trace.fraction_left_solid = 0.0;
+    }
+}
+
+/// Whether the portal's answer is the one to keep — `TracePortalPlayerAABB`'s
+/// test, which appears twice in the original and has to be the same both
+/// times.
+///
+/// Read it as: *the real world says the player is stuck, or the portal got at
+/// least as far without being stuck itself.* The `>=` rather than `>` is
+/// Valve's and is load-bearing — the two traces agree exactly whenever the
+/// carve did not remove anything in the way, and a `>` there would throw the
+/// portal's answer away in precisely the case where the two are equivalent.
+fn better(real: &Trace, portal: &Trace, ray: &Ray) -> bool {
+    real.start_solid
+        || (!portal.start_solid && ray.is_swept && portal.fraction >= real.fraction)
+}
+
+/// Merges one more collideable's answer into a trace — the rule
+/// `UTIL_Portal_TraceRay` (`portal_util_shared.cpp:638`) applies after every
+/// one of its sweeps.
+///
+/// Note what it is *not*: `ClipTraceToTrace`'s merge, which ORs the solid
+/// flags. This one replaces wholesale, so a nearer hit against something the
+/// ray did not start inside clears a `start_solid` an earlier model set. That
+/// is the shipped engine's, and the models it combines do not overlap.
+fn keep_nearer(into: &mut Trace, other: Trace, ray: &Ray) {
+    if (other.start_solid && !into.start_solid) || (ray.is_swept && other.fraction < into.fraction)
+    {
+        *into = other;
     }
 }
 

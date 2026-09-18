@@ -46,6 +46,44 @@ pub fn angle_matrix(angles: Vec3) -> Mat3 {
     Mat3::from_rotation_z(yaw) * Mat3::from_rotation_y(pitch) * Mat3::from_rotation_x(roll)
 }
 
+/// `MatrixAngles` (`mathlib/mathlib_base.cpp:217`) — the `QAngle` a rotation
+/// came from, which is [`angle_matrix`]'s inverse.
+///
+/// The columns are read the way Valve reads them: column 0 is forward, column
+/// 1 is **left**, column 2 is up — see [`angle_matrix`] for why this port's
+/// column-major `Mat3` and Valve's row-major `matrix3x4_t` index the same
+/// entries.
+///
+/// **This is not [`vector_angles`] with the basis read out of a matrix**, and
+/// the two deliberately disagree in the gimbal-locked case: `vector_angles`
+/// negates the yaw there, carrying Valve's own note that the copy taken from
+/// this function was 180° out. The general case agrees.
+///
+/// The caller is the teleport: an angle set goes through the portal matrix by
+/// being turned into a rotation, composed, and read back out — Valve's
+/// `UTIL_Portal_AngleTransform` (`portal_util_shared.cpp:1516`).
+pub fn matrix_angles(matrix: Mat3) -> Vec3 {
+    let forward = matrix.x_axis;
+    let left = matrix.y_axis;
+    // Only the z of up is needed, which is the comment in the original.
+    let up_z = matrix.z_axis.z;
+
+    let xy_dist = (forward.x * forward.x + forward.y * forward.y).sqrt();
+    let pitch = (-forward.z).atan2(xy_dist).to_degrees();
+
+    if xy_dist > 0.001 {
+        Vec3::new(
+            pitch,
+            forward.y.atan2(forward.x).to_degrees(),
+            left.z.atan2(up_z).to_degrees(),
+        )
+    } else {
+        // Forward is (nearly) the z axis: yaw comes off the left vector and
+        // roll is not recoverable, so it is assumed to be zero.
+        Vec3::new(pitch, (-left.x).atan2(left.y).to_degrees(), 0.0)
+    }
+}
+
 /// `VectorAngles( forward, pseudoup, angles )`
 /// (`mathlib/mathlib_base.cpp:1142`) — the inverse of [`angle_matrix`] for a
 /// direction plus a roll reference.
@@ -167,11 +205,7 @@ mod tests {
     /// the yaw absorbs it, which is the degree of freedom that was lost.
     #[test]
     fn a_straight_up_direction_keeps_its_forward_and_loses_its_roll() {
-        for (forward, up) in [
-            (Vec3::Z, Vec3::X),
-            (-Vec3::Z, Vec3::X),
-            (Vec3::Z, Vec3::Y),
-        ] {
+        for (forward, up) in [(Vec3::Z, Vec3::X), (-Vec3::Z, Vec3::X), (Vec3::Z, Vec3::Y)] {
             let angles = vector_angles(forward, up);
             assert_eq!(angles.z, 0.0, "roll is not recoverable here");
             let back = angle_matrix(angles) * Vec3::X;
@@ -187,5 +221,50 @@ mod tests {
         let v = Vec3::new(3.0, -7.0, 11.0);
         assert!((m.transpose() * (m * v) - v).length() < 1e-4);
         assert!((m * (m.transpose() * v) - v).length() < 1e-4);
+    }
+
+    /// [`matrix_angles`] undoes [`angle_matrix`] — which is what makes the
+    /// teleport's angle transform a *compose* rather than a special case per
+    /// axis.
+    ///
+    /// Sets that exercise all three components, including a pitch past
+    /// vertical and a roll, because the roll branch reads a different pair of
+    /// matrix entries from the yaw one.
+    #[test]
+    fn matrix_angles_reads_back_what_angle_matrix_wrote() {
+        let close = |a: Vec3, b: Vec3| {
+            let wrapped = |v: f32| (v + 180.0).rem_euclid(360.0) - 180.0;
+            let diff = Vec3::new(wrapped(a.x - b.x), wrapped(a.y - b.y), wrapped(a.z - b.z));
+            assert!(diff.length() < 1e-3, "{a} vs {b}");
+        };
+
+        for angles in [
+            Vec3::ZERO,
+            Vec3::new(0.0, 90.0, 0.0),
+            Vec3::new(0.0, 180.0, 0.0),
+            Vec3::new(-30.0, 45.0, 0.0),
+            Vec3::new(20.0, -120.0, 15.0),
+            Vec3::new(-75.0, 10.0, -60.0),
+        ] {
+            close(matrix_angles(angle_matrix(angles)), angles);
+        }
+    }
+
+    /// The gimbal-locked case, where one degree of freedom is gone: the roll is
+    /// *assumed zero* rather than recovered, and the yaw absorbs it.
+    ///
+    /// **This is where [`matrix_angles`] and [`vector_angles`] disagree on
+    /// purpose** — the original carries a note that the copy taken from
+    /// `MatrixAngles` was found to be 180° out — so neither is a drop-in for
+    /// the other.
+    #[test]
+    fn straight_up_loses_the_roll_and_keeps_the_direction() {
+        let straight_up = Vec3::new(-90.0, 30.0, 0.0);
+        let read_back = matrix_angles(angle_matrix(straight_up));
+        assert_eq!(read_back.z, 0.0);
+        assert!((read_back.x + 90.0).abs() < 1e-3, "{read_back}");
+        // The direction survives even though the angles do not have to.
+        let forward = |a: Vec3| angle_matrix(a) * Vec3::X;
+        assert!((forward(read_back) - forward(straight_up)).length() < 1e-4);
     }
 }

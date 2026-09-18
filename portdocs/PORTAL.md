@@ -40,10 +40,15 @@ A portal is four separable problems, and three of them are small:
 does not need a polyhedron library**, because this port's brush clip consumes planes
 and Valve's polyhedra exist only to be turned into `CPhysCollide`s. **That finding held**:
 §4 has landed in about 700 lines with `mathlib/polyhedron.cpp` and
-`staticcollisionpolyhedroncache.cpp` untouched. It needed one correction, which §4.3
+`staticcollisionpolyhedroncache.cpp` untouched, and §5's tube — which is the same plane
+treatment again — cost 40 more. It needed one correction, which §4.3
 carries: the *one* thing the polyhedron clip was doing that the plane list does not get
 for free is deciding that a piece came out empty, and a swept box cannot be left to work
 that out for itself.
+
+**Problems 1, 2, 3 and 4 have all landed** — stages 1 to 4 of §10. What is left of the
+module is §7's picture: the recursive view through the opening, which is the one part of a
+portal that is *only* drawing.
 
 ---
 
@@ -396,11 +401,18 @@ bevel planes per non-axial side that `vbsp` writes.
    tick's motion is a fraction of the distance to the edge — but a **long ray can**, and
    would pass through whatever the real world had out there. That is the shipped engine's
    shape and is ported rather than corrected; `rustdocs/ENGINE.md` gotcha 24 is the record.
-4. **The tube** (`CreateTubePolyhedrons`, `:3812-3917`), same plane treatment. **Still
-   open, and it belongs to stage 4** — a tube is the minimal volume an object must fit
-   inside to be eligible to pass, and what it is *for* is holding the player up on the far
-   room's floor through §5's remote trace. Without that there is nothing for it to do, and
-   stage 3's stated outcome is that you fall out of the back of the hole.
+4. **The tube** (`CreateTubePolyhedrons`, `:3812-3917`), same plane treatment. **LANDED
+   with stage 4** — `CarvedWall::tube`, its own `CollisionBsp` because it is its own
+   collideable in the shipped engine. What it physically is: a sleeve filling the tenth of
+   a unit between the hole's edge (`half + 0.1`) and where this section's slabs begin
+   (`half + 0.2`), one unit deep. So the opening is the portal's own size at the mouth and
+   a tenth wider behind it.
+
+   **And what it is *for* is not what this list said.** It is traced twice — once here, and
+   once transformed into the exit's space as half of §5's remote set — and the transformed
+   one lands in *front* of the exit plane, because the matrix's half turn maps "behind the
+   entrance" to "in front of the exit". That is why it cannot be replaced by the exit
+   portal's own tube even though a linked pair is always the same size.
 5. **Terrain and static props in the carve.** Neither is cut: a displacement near a portal
    is not in the carved set at all, so a substituted trace does not see it. Valve carries
    displacements in behind `sv_portal_trace_vs_displacements` with reject regions
@@ -409,7 +421,11 @@ bevel planes per non-axial side that `vbsp` writes.
 
 ---
 
-## 5. The remote-side trace
+## 5. The remote-side trace — **LANDED**
+
+`Tracer::with_hole`'s second half, `CarvedWall::remote_ray` and `CarvedWall::remote`;
+`rustdocs/ENGINE.md`, "The far side", is the reference. Three corrections to what follows
+are recorded at the end of this section.
 
 `TracePortalPlayerAABB` (`portal_gamemovement.cpp:1640`) is the reconciliation, and its
 shape is worth copying exactly:
@@ -438,16 +454,64 @@ slightly-angled portal transition present as a standable slope instead of an unc
 step. It needs an angled portal to matter and §2 says the content barely has one. Leave
 the hook and the `m_bContactedPortalTransitionRamp` flag out until a gun exists.
 
+### 5.1 Three things this section got wrong
+
+**1. "This is what holds the player up on the far room's floor" is not what it does.**
+The wall *below* the hole is still solid — the carve cuts a rectangle, and everything
+outside that rectangle is a ledge as deep as the wall — and a swept AABB is held up by any
+ledge it overlaps, because `clip_box_to_brush` pushes the ledge's planes out by the hull's
+extents. So in the wall-to-wall case the near side catches the player before the far side
+is consulted at all. The fixture written for this had to put a ledge at the far end **16
+units above the hole's own lip** before the two answers differed.
+
+What the remote trace demonstrably does is **stop** the player: a barrier eight units in
+front of the exit stops them eight units in front of the entrance, and the surface that
+stops them faces back out of the portal at them. *You cannot walk into a portal you cannot
+come out of.* That is `a_portal_whose_far_side_is_blocked_cannot_be_walked_into`, and it is
+the property worth having in the first place — it is also what Valve's own comment says the
+tube check is for: *"We need to test that the player will fit through the portal in both
+configurations."*
+
+**2. The window is one or two ticks, not "while approaching".** A point `d` in front of the
+entrance images to `d` *behind* the exit (§3.2's half turn), so while the player walks
+towards a portal their remote box is buried in the exit's wall, where the World set holds
+nothing. The remote set only has anything to say once `|d|` is inside about the hull's
+half-depth. That is what "while their box straddles the plane" means, and it is worth
+knowing before wondering why the far side answered nothing.
+
+**3. `CalculateExtentShift`'s comment does not describe its arithmetic.** The code is
+`exitNormal × (remoteRadius − localRadius)`; measured against this port's own matrix, that
+makes the remote box's near face land exactly on the exit plane when the local box has
+**fully passed** the entrance plane — its trailing face on it. The comment claims it holds
+when *"the local ray's foot is exactly on the portal plane"*, which is a different
+configuration and does not follow from the formula. **Ported as written**: it is zero for
+every pair with the same hull and the same kind of plane, which is every wall-to-wall
+transition, so a "fix" on a reading of the prose would change nothing that can be seen and
+everything that cannot.
+
+One thing this section got *right* and is worth repeating: step 2's guard is the whole
+performance story, and this port adds a second one. The carved pieces and the tube are
+swept when the real trace hit something; the remote set is swept only when the carved
+answer was already better than the real one, because everything the far side can do is
+bring the fraction down.
+
 ---
 
-## 6. `HandlePortalling`
+## 6. `HandlePortalling` — **LANDED**
+
+`client::movement::handle_portalling`; `rustdocs/CLIENT.md`, "The teleport", is the
+reference. About 200 lines where the original is 614, because four fifths of the original
+is the prediction reconciliation and angle plumbing §6.5 already predicted would go.
 
 `portal_gamemovement.cpp:2214-2827` — 614 lines, and the teleport. It runs at the end of
 the move, comparing where the move started to where it ended. In this port that is the
-tail of `client::movement::player_move` (`src/client/movement.rs:1566`).
+tail of `client::movement::player_move`.
 
-`MoveData` grows two fields: **the move's start position** (`m_vMoveStartPosition`) and
-**the portal environment** the player was last touching.
+`MoveData` grows **three** fields, not two: the move's start position
+(`m_vMoveStartPosition`), the portal environment (`m_hPortalEnvironment`), and
+`teleported` — a `Teleport` carrying the matrix out to the caller, because the angles are
+not in `MoveData` (§6.5) and somebody has to compose them. `player_move` fills the first
+two in itself so that no caller can forget to.
 
 ### 6.1 Selecting the portal
 
@@ -466,6 +530,19 @@ portal's OBB (`TestCollision`), and survivors must pass three filters:
 
 Nearest centre wins. Then the actual trigger is `planeDist < -FLT_EPSILON` against
 `m_plane_Origin` — **the centre crossing the plane**, not the near face.
+
+> **Two things about this loop that only show up once it runs.** `TestCollision` is a box
+> *sweep* against the OBB, and this port approximates it with the union of the hull at both
+> ends against the same box — which can only answer `true` more often, and every filter
+> then runs unchanged, so it can put the player in a portal's environment a tick early and
+> nothing worse. And **"nearest centre wins" means the portal you walked at is not always
+> the one you go through**: measured on shipped content, some maps place a pair close
+> enough together for the other one to be nearer, and the depot test had to be taught to
+> accept either as the entrance.
+>
+> The loop also runs **whether or not anyone teleports**, because its other job is to
+> write the environment — and that is what the *next* move is traced against. A player
+> walking up to a portal is in its environment for several ticks before they cross.
 
 ### 6.2 The frame split
 
@@ -760,6 +837,16 @@ lands.
     (§4.5's third item). Attach a hole to a tracer and then fire a long ray with it and
     the ray passes through the world beyond the carve. Movement steps cannot reach that
     far; anything else can.
+15. **A point in front of the entrance images to the same distance *behind* the exit**
+    (§3.2). Two things follow that a reader keeps rediscovering: the transformed **tube**
+    lands in front of the exit plane, so it is not the exit portal's own tube; and the
+    remote set answers nothing until the player is nearly through, because until then their
+    remote box is inside the exit's wall where the World set holds nothing.
+16. **`portal_environment` lags one move, on purpose.** The hole a move is traced against
+    is the one the *previous* move ended touching. Recomputing it from the player's current
+    position each tick traces them against the world they have already left.
+17. **`CalculateExtentShift`'s comment does not describe its arithmetic** (§5.1). Ported as
+    written; it is zero for every wall-to-wall transition anyway.
 
 ---
 
@@ -864,8 +951,37 @@ planes, 980 pieces (53.7%) dropped as provably empty**, 0.06 ms to carve one por
 0.27 ms at worst; 945 sampled points inside the holes all clear, 4,200 outside them all
 unchanged, and a player hull walked into all 18 of the 21 that had a wall in the way.
 
-**Stage 4 — the remote trace and the teleport.** §5 and §6 together; neither is testable
-without the other. **Outcome:** the module works.
+**Stage 4 — the remote trace and the teleport. LANDED.** §5 and §6 together, and they were
+indeed not testable apart. `src/engine/trace/carve.rs` gained the tube, the remote set,
+`PortalLink`/`LivePortal` and `CarvedWall::remote_ray`; `Tracer` gained the far-side half of
+`with_hole`, plus `set_hole` and `with_exit_hull`; `src/client/movement.rs` gained
+`handle_portalling` and the exit-speed, forced-duck and fling machinery around it;
+`PortalState` grew the partner and the matrix so the *one* teleport matrix in the port
+travels across the seam rather than being spelled twice.
+
+**Outcome, as predicted: the module works.** You walk into one oval and come out of the
+other, moving the way the exit faces, looking the way the exit faces, and standing on its
+floor. What is still missing is the *picture* — no view through, no reflection — which is
+§7's and was never stage 4's.
+
+Four things this stage found that §5 and §6 did not predict:
+
+1. **The far side is not what holds the player up** — §5.1 now says so at length. The wall
+   below the hole is a ledge, a swept AABB is held by any ledge it overlaps, and the near
+   side answers first. What the far side does is *stop* you, which is a better property and
+   is what the test asserts.
+2. **The remote window is one or two ticks**, because a point in front of the entrance
+   images to behind the exit. §5.1, and §9's invariant 15.
+3. **`CalculateExtentShift`'s comment contradicts its arithmetic.** Ported as written and
+   measured; §5.1.
+4. **"Nearest centre wins" is visible on shipped content** — the portal you walked at is
+   not always the one you go through. §6.1's note.
+
+Measured over the nine pairs the shipped maps form: **a player hull walked through six**,
+one was stopped by the geometry at the far end, and two had nowhere to stand in front of
+them. The nine pairs hold **590 carved pieces, 72 tube slabs and 292 remote pieces**
+between them, and carving a linked pair takes **0.09 ms on average, 0.16 ms at worst** — on
+placement, not per frame.
 
 **Stage 5 — polish, if wanted.** The transition ramp, `$PortalOpenAmount`'s open
 animation, `IsFloorPortal`'s special cases, `PunchAllPenetratingPlayers`.
@@ -887,8 +1003,8 @@ Both start off and are switched on by `SetActivatedState`. `portal_red_0` carrie
 only `prop_portal` output connection in the game —
 `OnPlayerTeleportFromMe → room_1_portal_deactivate_rl, Trigger`.
 
-Tests worth having, in the order they become possible. **Five of the seven are
-written**; the two that are not are stage 3's.
+Tests worth having, in the order they become possible. **All seven are written**, plus
+six the list did not ask for.
 
 - **Unit, no map:** the teleport matrix round-trips — a point through the matrix and back
   through the inverse is itself, and a portal linked to a *copy of itself at the same
@@ -936,10 +1052,37 @@ written**; the two that are not are stage 3's.
   from script, and which is also why neither map fires `SetActivatedState`. The assertion
   with teeth is the **angle**: not one of the 21 is more than 0.00 degrees off the surface
   behind it, so the deleted placement snap cannot re-orient a shipped portal.
-- **The one that says it works:** put the player in front of `sp_a1_intro1`'s
-  `portal_blue_0`, activate both, walk forward for two seconds of ticks, and assert the
-  origin is within the exit portal's forward half-space and the view angles have turned
-  by the matrix. Headless, no GPU.
+- **The one that says it works. WRITTEN, twice.** Unit:
+  `client::movement::tests::walking_into_a_portal_comes_out_of_the_other_one`, on a fixture
+  of two rooms a thousand units apart with a linked pair between them — deliberately built
+  so that neither carve can see the other's geometry, and at two different yaws so the
+  matrix is a real rotation. It asserts one teleport, out of the *partner*, standing on the
+  far room's floor, still walking, and looking the way that room faces.
+
+  Depot: **`a_player_walks_through_every_shipped_portal_pair`**, which does it against the
+  maps that ship — and it is a census rather than one map, because one map is one sample.
+  Measured: **nine pairs, six walked through**, one stopped short by the geometry at the far
+  end (`sp_a4_finale4`) and two with nowhere to stand in front of them (`sp_a1_intro6`,
+  `sp_a4_finale1`, the second being one of the four tractor-beam portals parked in mid-air).
+  The nine pairs come from twenty-one portals because `sp_a1_intro5` and `sp_a1_intro7`
+  place one each and `sp_a1_intro4` places three.
+
+  **It could not be done on `sp_a1_intro1` from a console, which is why it is a test.** The
+  map's two portals are some 7,000 units from the spawn and there is a
+  `TOOLS/TOOLSPLAYERCLIP` brush 127 units in front of the player; the live check that *is*
+  worth running confirms the plumbing rather than the walk — `ent_fire portal_blue_0
+  SetActivatedState 1` on both, then `trace`, prints the two carved holes at the placements
+  the entity lump gives them.
+- **Four more the list did not ask for, all stage 4's:**
+  `the_tube_lines_the_hole_and_stops_a_unit_in`,
+  `the_remote_ray_asks_the_exit_portal_about_the_same_sweep`,
+  `a_ledge_in_the_far_room_holds_a_player_up_through_the_portal` (with the control that
+  makes it mean something — see §5.1) and `finding_a_partner_recarves_the_portal`.
+- **And two about the teleport's arithmetic:**
+  `a_transition_that_turns_the_up_axis_ducks_the_player_as_they_cross`, which asserts the
+  transform preserves the box's *centre*, and
+  `a_player_leaves_a_floor_portal_at_three_hundred_units_a_second`, which covers all four
+  answers `GetExitSpeedRange` can give including the perch quadratic.
 - **Rendered, headless:** the oval draws — the same shape as
   `the_button_draws_and_moves_as_it_presses`, comparing a portal-off frame with a
   portal-on one.
@@ -969,6 +1112,12 @@ written**; the two that are not are stage 3's.
    The part that was *not* anticipated is the safety condition: taking the further trace
    is only right inside the carved region, and the carved region has to include the
    geometry in *front* of the plane (§4.5's second item) or the rule deletes the floor.
+
+   **Stage 4 made it three descents, and added a second guard.** The carved pieces and the
+   tube are swept when the real trace hit something; the remote set is swept only when the
+   carved answer was *already* better than the real one, because everything the far side
+   can do is bring the fraction down. Carving a linked pair — pieces, tube and the far
+   side's World set together — takes 0.09 ms, still on placement.
 2. **Where does the carve live? SETTLED IN STAGE 2, and the seam already exists.**
    `crate::server::PortalState` is "a portal exists here, this size, this angle,
    this long open", `Engine::frame` copies it across once a rendered frame, and
@@ -976,11 +1125,20 @@ written**; the two that are not are stage 3's.
    into `trace/`: the server still names no engine collision type, and the engine still
    names no server type. The one thing stage 3 adds to the seam is nothing at all — the
    placement and the size are already there.
-3. **Does `linked_portal_door` come first?** It is 6 entities in 2 maps, but it is a
-   permanently-linked pair with no gun, no fizzle and no placement — arguably a cleaner
-   first target for the teleport machinery. §8 rejects it on testability (`sp_a1_intro1`
-   has `prop_portal`s), but if stage 3 proves painful, the two classes share §4–§6
-   entirely and the decision is reversible at no cost.
+
+   **Stage 4 adds exactly two fields**, and both are there so that nothing is computed
+   twice: `PortalState::linked` (the partner's key, where there was a `bool`) and
+   `PortalState::matrix`. The matrix travels rather than being rederived in `trace/` because
+   §3.2's whole warning is that a second spelling of it can silently lose the 180°; this way
+   there is **one** teleport matrix in the port,
+   `server::classes::portal::teleport_matrix`, and `World::sync_portals` resolves the
+   pairing from the same list the oval is drawn from.
+3. **Does `linked_portal_door` come first? MOOT, and it is now nearly free.** It did not
+   come first, stage 3 was not painful, and §4–§6 have all landed against `prop_portal`.
+   What a `linked_portal_door` needs from here is a class that produces a `PortalState`
+   with a permanent partner — no gun, no fizzle, no placement — and the carve, the remote
+   trace and the teleport apply unchanged. 6 entities in 2 maps, and the cheapest thing on
+   the list.
 4. **The second colour. ANSWERED: two `Material`s.** `portalstaticoverlay_2.vmt` differs
    from `_1` only in its colour texture — a 1,669-byte gradient strip — and
    `MaterialCache` is keyed by name, so two entries cost two tiny uploads and nothing

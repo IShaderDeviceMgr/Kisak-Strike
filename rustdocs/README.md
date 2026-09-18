@@ -76,7 +76,9 @@ so they are recorded here:
   (`stuffcmds` and the `+<cvar>` default seeding). `value()` refuses a value beginning
   with `-` or `+`, matching `CCommandLine::ParmValue` (`tier1/commandline.cpp:646`) —
   without which `-window` swallows `+map`.
-- **`src/math.rs`** — `angle_matrix(angles: Vec3) -> Mat3`, and nothing else so far.
+- **`src/math.rs`** — `angle_matrix(angles: Vec3) -> Mat3`, its inverse
+  `matrix_angles(matrix: Mat3) -> Vec3` (`MatrixAngles`), and
+  `vector_angles(forward, pseudo_up) -> Vec3` (`VectorAngles`).
   `PORTING.md` replaces `mathlib` with `glam`, and almost all of it goes; what does not is
   the handful of places Valve fixed a *convention* rather than doing arithmetic. **A
   `QAngle` is pitch, yaw, roll in degrees** and composes as `Rz(yaw) · Ry(pitch) ·
@@ -89,6 +91,15 @@ so they are recorded here:
   `engine::world::props` (a prop's `model_to_world`) and `engine::trace` (a brush model's
   frame). `AngleVectors` — `client::view::ViewAngles::vectors` — is a *different* function
   and has stayed where its one caller is; move it here if it gets a second.
+
+  **`matrix_angles` and `vector_angles` are not interchangeable**, and they disagree on
+  purpose: `MatrixAngles` reads the basis out of a matrix and `VectorAngles` builds one
+  from a direction and a roll reference, and in the gimbal-locked case (forward is nearly
+  `±Z`) the second negates the yaw, carrying Valve's own note that the copy taken from the
+  first was found to be 180° out. The general case agrees, which
+  `matrix_angles_reads_back_what_angle_matrix_wrote` pins. `matrix_angles`' caller is the
+  portal teleport: an angle set goes through the pair's matrix by being turned into a
+  rotation, composed and read back out (`client::movement::Teleport::turn`).
 
 ## Why these exist
 

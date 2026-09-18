@@ -772,28 +772,44 @@ impl<'a> Engine<'a> {
         // `clip_models` the brush entities the game has said are solid — which
         // is what makes a shut door a wall and, because a trigger is
         // `FSOLID_NOT_SOLID`, leaves every trigger in the map walk-through.
-        // …and the portal's hole, when the player is standing in one's trigger
-        // box. **Substitutive rather than additive** — see
+        // …and the portal's hole. **Substitutive rather than additive** — see
         // [`Tracer::with_hole`] — so the selection matters: attaching a hole
-        // that is nowhere near lets the sweep pass through the world. The box
-        // is the player's hull where they are *now*, which is what Valve's
-        // `m_hPortalEnvironment` records from the previous move's touch.
+        // that is nowhere near lets the sweep pass through the world.
+        //
+        // The portal is the one the player's *previous* move ended touching —
+        // `m_hPortalEnvironment`, decided by
+        // `client::movement::handle_portalling`'s selection, which is the
+        // swept hull against every active linked portal's trigger box plus the
+        // three filters that say a teleport is plausible. That one-move lag is
+        // Valve's: the trace has to agree with the environment the move before
+        // it ended in.
+        //
+        // And the hull they would have on the far side, when the pair would
+        // turn their up axis far enough to make them duck on the way through —
+        // `trace/` cannot name the duck hull, so the decision is made here,
+        // once per move, where both halves are in scope.
         let player = self.scene.client.player();
-        let feet = player.origin;
-        let hull = (
-            feet + crate::client::movement::player_mins(player.ducked),
-            feet + crate::client::movement::player_maxs(player.ducked),
-        );
-        let mut tracer = self.scene.world.as_ref().map(|w| {
+        let environment = player.portal_environment;
+        let world = self.scene.world.as_ref();
+        let mut tracer = world.map(|w| {
             let tracer = w.collision.tracer().with_entities(w.clip_models());
-            match w.portal_holes.touching(hull.0, hull.1) {
-                Some(wall) => tracer.with_hole(wall),
-                None => tracer,
+            let Some(wall) = environment.and_then(|id| w.portal_holes.get(id)) else {
+                return tracer;
+            };
+            let tracer = tracer.with_hole(wall);
+            match wall.link().map(|link| link.to_exit) {
+                Some(matrix) if crate::client::movement::transition_crouches(matrix) => tracer
+                    .with_exit_hull(
+                        crate::client::movement::player_mins(true),
+                        crate::client::movement::player_maxs(true),
+                    ),
+                _ => tracer,
             }
         });
+        let portals = world.map(|w| &w.portal_holes);
         self.scene
             .client
-            .run_move(&command, seconds, tracer.as_mut());
+            .run_move(&command, seconds, tracer.as_mut(), portals);
 
         let mouse_look = mouse_look_after(self.input.mouse_look(), self.input.events());
         self.input.set_mouse_look(mouse_look);
@@ -1057,6 +1073,8 @@ fn portals(server: &Server, curtime: f32) -> Vec<world::portals::Portal> {
             half_height: portal.half_height,
             is_portal2: portal.is_portal2,
             open_for: (curtime - portal.opened_at).max(0.0),
+            linked: portal.linked,
+            matrix: portal.matrix,
         })
         .collect()
 }
@@ -1575,7 +1593,7 @@ fn portal_command(
     let linked = server
         .portals()
         .iter()
-        .filter(|portal| portal.linked)
+        .filter(|portal| portal.linked.is_some())
         .count();
     cx.print(&format!(
         "portal: {colour} at ({:.1} {:.1} {:.1}) angles ({:.1} {:.1} {:.1}); \
@@ -1767,10 +1785,19 @@ fn trace_portal_hole(world: &World, client: &Client, ray: &Ray, cx: &mut ExecCon
     let v = |v: glam::Vec3| format!("({:.1} {:.1} {:.1})", v.x, v.y, v.z);
 
     let player = client.player();
-    let Some(wall) = world
-        .portal_holes
-        .touching(player.origin + VEC_HULL_MIN, player.origin + VEC_HULL_MAX)
-    else {
+    // **`m_hPortalEnvironment` first, `touches` second.** The environment is
+    // what the player's own trace uses, and it is what a developer needs told;
+    // the geometric test is the fallback so that the line says something
+    // useful on the tick before the environment catches up.
+    let wall = player
+        .portal_environment
+        .and_then(|id| world.portal_holes.get(id))
+        .or_else(|| {
+            world
+                .portal_holes
+                .touching(player.origin + VEC_HULL_MIN, player.origin + VEC_HULL_MAX)
+        });
+    let Some(wall) = wall else {
         let carved = world
             .portal_holes
             .iter()
@@ -1778,7 +1805,7 @@ fn trace_portal_hole(world: &World, client: &Client, ray: &Ray, cx: &mut ExecCon
             .collect::<Vec<_>>()
             .join(", ");
         cx.print(&format!(
-            "  portal holes: {carved} — the player's hull is in none of them"
+            "  portal holes: {carved} — the player is in none of them"
         ));
         return;
     };
@@ -1790,6 +1817,10 @@ fn trace_portal_hole(world: &World, client: &Client, ray: &Ray, cx: &mut ExecCon
         v(wall.hole().forward),
         wall.summary(),
     ));
+    match player.portal_environment == Some(wall.id()) {
+        true => cx.print("    this is the player's portal environment"),
+        false => cx.print("    the player's hull is in it, but their environment is not set"),
+    }
     let hit = wall
         .collision()
         .tracer()
@@ -1798,6 +1829,37 @@ fn trace_portal_hole(world: &World, client: &Client, ray: &Ray, cx: &mut ExecCon
         false => cx.print("    the carved geometry stops nothing along this ray"),
         true => cx.print(&format!(
             "    fraction {:.6}  end {}  normal {}  startsolid {}",
+            hit.fraction,
+            v(hit.end),
+            v(hit.normal),
+            hit.start_solid,
+        )),
+    }
+
+    // The far side, which is the whole of stage 4: the same ray as the exit
+    // portal sees it, swept against the exit's geometry and this portal's tube.
+    let Some(link) = wall.link() else {
+        cx.print("    unlinked, so there is no far side to trace");
+        return;
+    };
+    let Some((far_ray, shift)) = wall.remote_ray(ray, None) else {
+        return;
+    };
+    cx.print(&format!(
+        "    exit {} at {} facing {}; the ray becomes {} -> {} (shift {})",
+        link.exit_id,
+        v(link.exit.center),
+        v(link.exit.forward),
+        v(far_ray.origin()),
+        v(far_ray.end()),
+        v(shift),
+    ));
+    let Some(remote) = wall.remote() else { return };
+    let hit = remote.tracer().trace(&far_ray, Contents::MASK_PLAYERSOLID);
+    match hit.did_hit() {
+        false => cx.print("    the far side stops nothing along this ray"),
+        true => cx.print(&format!(
+            "    far fraction {:.6}  end {}  normal {}  startsolid {}",
             hit.fraction,
             v(hit.end),
             v(hit.normal),

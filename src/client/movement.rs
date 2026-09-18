@@ -46,14 +46,14 @@
 //! `src/server/`, or a `pub(crate)` module — is deliberately not decided yet
 //! (`portdocs/CLIENT.md` §10).
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 
 use super::player::{
     MoveType, VEC_DEAD_VIEWHEIGHT, VEC_DUCK_HULL_MAX, VEC_DUCK_HULL_MIN, VEC_DUCK_VIEW,
     VEC_HULL_MAX, VEC_HULL_MIN, VEC_VIEW,
 };
 use super::{ButtonBits, ViewAngles};
-use crate::engine::trace::{Contents, Ray, Tracer};
+use crate::engine::trace::{CarvedWall, Contents, PortalHole, PortalHoles, Ray, Tracer};
 
 /// `sv_maxspeed` (`movevars_shared.cpp:29`) — the server's ceiling on any
 /// player's speed, not the speed a Portal 2 player walks at. See
@@ -180,6 +180,41 @@ const DUCK_SPEED_CROP: f32 = 1.0 / 3.0;
 /// Read once per command and passed down, rather than reached through cvar
 /// handles: this module compiles into a server too, and a cvar handle is a
 /// client-side convenience the shared code may not have. [`MoveVars::PORTAL2`]
+/// `COS_PI_OVER_SIX` (`portal_gamemovement.cpp:105`) — cos 30°.
+///
+/// Two different questions use it and it is worth knowing they are the same
+/// number: *is this portal on a floor* (`plane.normal.z > cos30`) and *does up
+/// still look like up after going through this pair* (`|m[2][2]| < cos30`).
+const COS_PI_OVER_SIX: f32 = 0.866_025_4;
+
+/// `PLAYER_FLING_HELPER_MIN_SPEED` (`portal_gamemovement.cpp:103`) — how fast
+/// you have to be leaving an upward-facing portal for the game to decide you
+/// are being flung and keep you crouched.
+const PLAYER_FLING_HELPER_MIN_SPEED: f32 = 200.0;
+
+/// `portal_player_interaction_quadtest_epsilon`
+/// (`portal_gamemovement.cpp:73`) — `-DIST_EPSILON`, and the comment above the
+/// original says exactly that.
+const QUADTEST_EPSILON: f32 = -DIST_EPSILON;
+
+/// The minimum speed a **player** leaves a portal on the floor at —
+/// `CProp_Portal::GetMinimumExitSpeed` (`prop_portal_shared.cpp:201`).
+///
+/// At zero every fling in the game dies on the exit, which is why this is one
+/// of the numbers `portdocs/PORTAL.md` §9 calls out.
+const EXIT_SPEED_MIN_FLOOR: f32 = 300.0;
+
+/// `CProp_Portal::GetMaximumExitSpeed` (`prop_portal_shared.cpp:267`), which
+/// is a flat 1000 and asks none of its four arguments.
+const EXIT_SPEED_MAX: f32 = 1000.0;
+
+/// *"Apply slightly more gravity on exit so that floor/floor portals trend
+/// towards decaying velocity. 1.008 is a magic number found through
+/// experimentation."* (`portal_gamemovement.cpp:2441`)
+///
+/// At 1.0 an infinite floor-to-floor fall gains height every cycle.
+const EXIT_GRAVITY_BOOST: f32 = 1.008;
+
 /// is the shipped set.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoveVars {
@@ -288,6 +323,81 @@ pub struct MoveData {
     /// `m_iSpeedCropped`'s `SPEED_CROPPED_DUCK` bit: the duck speed crop is
     /// applied at most once per command.
     pub speed_cropped: bool,
+
+    /// `m_vMoveStartPosition` (`portal_gamemovement.h:156`) — where the feet
+    /// were before this move ran.
+    ///
+    /// Written by [`player_move`] on the way in, so no caller has to remember
+    /// to. [`handle_portalling`] is the only reader: the teleport is decided
+    /// by comparing where the move *started* with where it ended, not by where
+    /// the player is now.
+    pub move_start: Vec3,
+    /// `m_hPortalEnvironment` — the portal whose carved geometry this player
+    /// is being traced against.
+    ///
+    /// Decided at the end of each move by [`handle_portalling`] and consumed
+    /// at the start of the next one, by the caller, to pick the
+    /// [`CarvedWall`] it attaches to the tracer. That one-move lag is Valve's
+    /// and is why the field is networked state rather than a local: the trace
+    /// has to agree with the environment the *previous* move ended in, or a
+    /// player crossing the plane is traced against the world they have already
+    /// left.
+    pub portal_environment: Option<u64>,
+    /// Set when this move ended in a teleport — see [`Teleport`].
+    ///
+    /// Reset to `None` at the top of every [`player_move`], so a caller reads
+    /// it after the call and never has to clear it.
+    pub teleported: Option<Teleport>,
+}
+
+/// What a teleport did, for the caller to finish.
+///
+/// Everything `HandlePortalling` does to the *movement* it does in place —
+/// the origin, the velocity, the hull. What it cannot do here is the
+/// **angles**: `client::ViewAngles` is not in [`MoveData`], because
+/// `CPlayerMove::FinishMove` does not write `mv->m_vecAngles` back either
+/// (`player_command.cpp:232`, commented out in the original). So the transform
+/// comes out and the caller composes it — which is `portdocs/PORTAL.md` §6.5's
+/// "the whole block of angle plumbing collapses to a single compose", because
+/// this port has one angle set where Valve has four.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Teleport {
+    /// `m_matrixThisToLinked` of the portal that was entered. Compose an angle
+    /// set with it through `crate::math::angle_matrix` and read the result
+    /// back with `crate::math::matrix_angles`.
+    pub matrix: Mat4,
+    /// The portal that was entered.
+    pub entered: u64,
+    /// The portal that was left — the same value
+    /// [`portal_environment`](MoveData::portal_environment) now holds.
+    pub exit: u64,
+    /// Whether the transition forced the player into the duck hull.
+    pub forced_duck: bool,
+}
+
+impl Teleport {
+    /// An angle set taken through the portal — `UTIL_Portal_AngleTransform`
+    /// (`portal_util_shared.cpp:1516`).
+    ///
+    /// Compose the matrix with the angles' own rotation and read the result
+    /// back out. Not a component-wise fix-up of yaw: a portal pair can turn
+    /// all three at once, and the only way to get that right is to go through
+    /// a matrix.
+    ///
+    /// **No pitch clamp.** The composed angles are wherever the pair put them
+    /// and `ApplyMouse` clamps on the next command, which is Valve's order.
+    pub fn turn(&self, angles: ViewAngles) -> ViewAngles {
+        let rotation = glam::Mat3::from_mat4(self.matrix)
+            * crate::math::angle_matrix(Vec3::new(angles.pitch, angles.yaw, angles.roll));
+        let turned = crate::math::matrix_angles(rotation);
+        let mut out = ViewAngles {
+            pitch: turned.x,
+            yaw: turned.y,
+            roll: turned.z,
+        };
+        out.normalize();
+        out
+    }
 }
 
 /// `GetPlayerMins`/`GetPlayerMaxs` (`gamemovement.cpp`) — the hull for the
@@ -1473,10 +1583,7 @@ fn push_entity(
 ///
 /// `MOVECOLLIDE_FLY_CUSTOM` is the fourth, and Valve's own comment on it is
 /// "Should this ever occur for players!?" over an `Assert(0)`.
-fn perform_fly_collision_resolution(
-    mv: &mut MoveData,
-    trace: &crate::engine::trace::Trace,
-) {
+fn perform_fly_collision_resolution(mv: &mut MoveData, trace: &crate::engine::trace::Trace) {
     // `MOVECOLLIDE_DEFAULT` → `backoff = 1`.
     let (velocity, _) = clip_velocity(mv.velocity, trace.normal, 1.0);
     mv.velocity = velocity;
@@ -1561,15 +1668,459 @@ fn full_toss_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, d
     }
 }
 
+// ---------------------------------------------------------------------------
+// The teleport — `CPortalGameMovement::HandlePortalling`
+// ---------------------------------------------------------------------------
+
+/// `ShouldPortalTransitionCrouch` (`portal_gamemovement.cpp:244`) — does this
+/// pair turn the player's up axis far enough that an AABB cannot make the trip
+/// standing?
+///
+/// Valve's whole test is `fabs( m_matrixThisToLinked.m[2][2] ) < COS_PI_OVER_SIX`,
+/// with its own comment: *"how much does zUp still look like zUp after going
+/// through this portal"*. `m[2][2]` is the z of the image of the z axis, which
+/// is the one element a row-major matrix and a column-major one agree on
+/// without any transposing.
+pub fn transition_crouches(matrix: Mat4) -> bool {
+    matrix.z_axis.z.abs() < COS_PI_OVER_SIX
+}
+
+/// `ShouldMaintainFlingAssistCrouch` (`portal_gamemovement.cpp:252`) — a
+/// player leaving a partly-upward portal fast stays crouched.
+///
+/// *"If player is already crouched, do NOT automatically uncrouch. You don't
+/// actually have to check that the player is exiting the portal, but we assume
+/// that's the intent."*
+fn should_maintain_fling_crouch(exit: &PortalHole, velocity: Vec3) -> bool {
+    (exit.forward.z > 0.1 && exit.forward.z < 0.9)
+        && velocity.z > 1.0
+        && velocity.dot(exit.forward) > PLAYER_FLING_HELPER_MIN_SPEED
+}
+
+/// `SolveQuadratic` (`mathlib/mathlib_base.cpp:1445`) — `a x² + b x + c = 0`,
+/// with Valve's degenerate cases kept because the caller relies on them.
+fn solve_quadratic(a: f32, b: f32, c: f32) -> Option<(f32, f32)> {
+    if a == 0.0 {
+        // No x² term: linear, or all zeroes, or no solution at all.
+        if b != 0.0 {
+            return Some((-c / b, -c / b));
+        }
+        return (c == 0.0).then_some((0.0, 0.0));
+    }
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    Some(((-b + root) / (2.0 * a), (-b - root) / (2.0 * a)))
+}
+
+/// The speed range a player may leave `exit` at —
+/// `CPortal_Base2D::GetExitSpeedRange` (`portal_base2d_shared.cpp:977`) with
+/// `CProp_Portal`'s overrides (`prop_portal_shared.cpp:201`, `:267`) folded in.
+///
+/// **It asks the exit portal, not the entrance.** Valve computes whether the
+/// *entrance* is on a floor as well, and then uses it only in the two branches
+/// that are not about players (225 and 50 for a physics object); with a player
+/// on the line the answer never depends on it, so it is not computed here.
+///
+/// The maximum is a flat [`EXIT_SPEED_MAX`]. Below the minimum, speed is
+/// *added along the exit's forward*, which is the caller's job; above the
+/// maximum the whole vector is scaled.
+fn exit_speed_range(
+    exit: &PortalHole,
+    center_at_exit: Vec3,
+    extents: Vec3,
+    gravity: f32,
+) -> (f32, f32) {
+    let minimum = if exit.forward.z > COS_PI_OVER_SIX {
+        // Out of the floor: the number that keeps every fling in the game
+        // alive.
+        EXIT_SPEED_MIN_FLOOR
+    } else if exit.forward.z > 0.5 {
+        // *"bExitOnFloor means the portal is facing almost entirely up, just
+        // because it's false doesn't mean the portal isn't facing
+        // significantly up."*
+        perch_speed(exit, center_at_exit, extents, gravity).unwrap_or(f32::NEG_INFINITY)
+    } else {
+        f32::NEG_INFINITY
+    };
+    (minimum, EXIT_SPEED_MAX)
+}
+
+/// The slowest a player can leave an upward-slanted portal and still land on
+/// its bottom edge rather than falling back in
+/// (`prop_portal_shared.cpp:217-260`).
+///
+/// *"Assuming our current velocity is zero. What's the minimum portal-forward
+/// velocity to perch the player on the bottom edge of the portal?"* — a
+/// projectile problem in the vertical plane through the portal's up axis,
+/// solved for the launch speed along `forward`, and capped at the floor
+/// portal's 300 so that a nearly-vertical portal does not ask for more than a
+/// vertical one.
+///
+/// `None` when there is no gravity or the quadratic has no positive root, both
+/// of which mean "do not touch the speed".
+fn perch_speed(exit: &PortalHole, center: Vec3, extents: Vec3, gravity: f32) -> Option<f32> {
+    if gravity == 0.0 {
+        return None;
+    }
+    // A point along the bottom edge of the portal, horizontally centred, and
+    // the bottom of the player's box at the exit.
+    let perch = exit.center - exit.up * exit.half_height;
+    let mut to_perch = perch - (center - Vec3::Z * extents.z);
+    // Projected onto the portal's vertical centre line, so that all of the
+    // horizontal distance is distance to the perch *line* rather than to one
+    // point on it.
+    to_perch -= to_perch.dot(exit.right) * exit.right;
+
+    let horizontal = to_perch.truncate().length();
+    let forward_horizontal = exit.forward.truncate().length();
+    let a = (exit.forward.z * -2.0)
+        * ((horizontal * forward_horizontal) - (to_perch.z * exit.forward.z));
+    let (first, second) = solve_quadratic(a, 0.0, horizontal * horizontal * gravity)?;
+
+    let best = first.max(second);
+    (best > 0.0).then(|| best.min(EXIT_SPEED_MIN_FLOOR))
+}
+
+/// `Sign` (`public/mathlib/mathlib.h:1154`) — **zero is positive**, which the
+/// two callers both depend on.
+fn sign(value: f32) -> f32 {
+    match value >= 0.0 {
+        true => 1.0,
+        false => -1.0,
+    }
+}
+
+/// Which portal, if any, the player is interacting with at the end of this
+/// move — `HandlePortalling`'s opening loop (`portal_gamemovement.cpp:2249`).
+///
+/// A swept hull against every active linked portal's trigger box, then three
+/// filters, then nearest-centre-wins. The filters are the interesting part and
+/// each one is a bug someone had:
+///
+/// - the **old** centre must have been in front of the plane — unless this
+///   portal was already the player's environment, which is Valve's *"special
+///   exception if we were pushed past the plane but did not move past it"*;
+/// - if the new centre is *behind* the plane it has to be over the quad, or
+///   walking into the wall beside a portal would count;
+/// - if it is in *front*, the line from the centre to its most-penetrating
+///   extent has to pass through the quad — *"avoids case where you can butt up
+///   against a portal side on an angled panel"*.
+///
+/// **The sweep is approximated.** `CPortal_Base2D::TestCollision` is a box
+/// sweep against the OBB; this is the union of the hull at both ends tested
+/// against the same box, which can only ever answer `true` more often. Every
+/// filter below then runs unchanged, and the trigger — the centre crossing the
+/// plane — is exact, so the approximation cannot teleport anyone who should
+/// not be; it can only put the player in a portal's environment a tick early,
+/// which is the direction that fails safe.
+fn select_portal<'a>(
+    holes: &'a PortalHoles,
+    environment: Option<u64>,
+    start: Vec3,
+    end: Vec3,
+    mins: Vec3,
+    maxs: Vec3,
+) -> Option<&'a CarvedWall> {
+    let origin_to_center = (mins + maxs) * 0.5;
+    let center = end + origin_to_center;
+    let previous = start + origin_to_center;
+    let extents = (maxs - mins) * 0.5;
+    let (lo, hi) = (
+        (start + mins).min(end + mins),
+        (start + maxs).max(end + maxs),
+    );
+
+    let mut best: Option<(&CarvedWall, f32)> = None;
+    for wall in holes.iter() {
+        // `IsActivedAndLinked`. An unlinked portal has a hole and nowhere to
+        // go, so it can never be a teleport and is never an environment.
+        if wall.link().is_none() {
+            continue;
+        }
+        let hole = wall.hole();
+        if !hole.touches(lo, hi) {
+            continue;
+        }
+
+        let dist = hole.forward.dot(hole.center);
+        let was_in_front = hole.forward.dot(previous) - dist > 0.0;
+        if !was_in_front && Some(wall.id()) != environment {
+            continue;
+        }
+
+        let ahead = hole.forward.dot(center) - dist;
+        let over_the_quad = |point: Vec3, margin: f32| {
+            let offset = point - hole.center;
+            let offset = offset - offset.dot(hole.forward) * hole.forward;
+            offset.dot(hole.right).abs() <= hole.half_width + margin
+                && offset.dot(hole.up).abs() <= hole.half_height + margin
+        };
+
+        let accepted = match ahead < 0.0 {
+            true => over_the_quad(center, 0.0),
+            false => {
+                // The most-penetrating corner of the box, which is the corner
+                // furthest *behind* the plane.
+                let test = center
+                    - Vec3::new(
+                        sign(hole.forward.x) * extents.x,
+                        sign(hole.forward.y) * extents.y,
+                        sign(hole.forward.z) * extents.z,
+                    );
+                let test_dist = hole.forward.dot(test) - dist;
+                let total = ahead - test_dist;
+                // Not penetrating at all, or the two distances are equal and
+                // there is no line to intersect: nothing to reject.
+                test_dist >= QUADTEST_EPSILON
+                    || total == 0.0
+                    || over_the_quad(test * (ahead / total) - center * (test_dist / total), 1.0)
+            }
+        };
+        if !accepted {
+            continue;
+        }
+
+        let distance = (hole.center - center).length_squared();
+        if best.is_none_or(|(_, nearest)| distance < nearest) {
+            best = Some((wall, distance));
+        }
+    }
+    best.map(|(wall, _)| wall)
+}
+
+/// *"The real world equivalent of stubbing your toe on the exit hole results
+/// in flinging straight up"* (`portal_gamemovement.cpp:2529`) — move a flung
+/// player's centre back towards the portal's axis so their hull corner clears
+/// the lip.
+///
+/// The corner tested is the one furthest from the axis, and the margin is five
+/// units inside the portal's own edge.
+fn fling_nudge(exit: &PortalHole, center: Vec3, extents: Vec3) -> Vec3 {
+    let to_center = center - exit.center;
+    let off_axis = to_center - to_center.dot(exit.forward) * exit.forward;
+    let corner = center
+        + Vec3::new(
+            extents.x * sign(off_axis.x),
+            extents.y * sign(off_axis.y),
+            extents.z * sign(off_axis.z),
+        );
+
+    let to_corner = corner - exit.center;
+    let (across, up) = (to_corner.dot(exit.right), to_corner.dot(exit.up));
+    let (width, height) = (exit.half_width - 5.0, exit.half_height - 5.0);
+
+    let pull = |along: f32, limit: f32, axis: Vec3| match along {
+        _ if along > limit => -axis * (along - limit),
+        _ if along < -limit => -axis * (along + limit),
+        _ => Vec3::ZERO,
+    };
+    pull(across, width, exit.right) + pull(up, height, exit.up)
+}
+
+/// `CPortalGameMovement::HandlePortalling` (`portal_gamemovement.cpp:2214`) —
+/// the teleport, run at the end of every move.
+///
+/// It compares where the move *started* with where it ended: if the player's
+/// box centre crossed an active linked portal's plane during this move, they
+/// come out of the other one. Everything else in the function is about making
+/// that survive an axis-aligned box that cannot rotate.
+///
+/// In order, and each is `portdocs/PORTAL.md` §6's numbered part:
+///
+/// 1. **Select the portal** ([`select_portal`]) — and record it as the
+///    player's environment whether or not they go through, because that is
+///    what the *next* move is traced against.
+/// 2. **The frame split**: the crossing happened part way through the frame,
+///    so the gravity applied after it is unwound before the rotation and put
+///    back after it at [`EXIT_GRAVITY_BOOST`].
+/// 3. **The velocity**: rotated, then clamped into
+///    [`exit_speed_range`], then clamped per axis the way `CheckVelocity`
+///    would — *"but be quiet about it"*.
+/// 4. **The forced duck**, when the transition turns the player's up axis.
+/// 5. **The move itself**, which preserves the box's **centre** and not its
+///    origin — conflating the two drops the player 18 units.
+///
+/// The angles are not touched here; see [`Teleport`].
+fn handle_portalling<'a>(
+    mv: &mut MoveData,
+    tracer: &mut Tracer<'a>,
+    holes: &'a PortalHoles,
+    vars: &MoveVars,
+    dt: f32,
+) {
+    let (mins, maxs) = (player_mins(mv.ducked), player_maxs(mv.ducked));
+    let mut origin_to_center = (mins + maxs) * 0.5;
+    let center = mv.origin + origin_to_center;
+    let previous = mv.move_start + origin_to_center;
+    let extents = (maxs - mins) * 0.5;
+
+    let selected = select_portal(
+        holes,
+        mv.portal_environment,
+        mv.move_start,
+        mv.origin,
+        mins,
+        maxs,
+    );
+    let Some(wall) = selected else {
+        mv.portal_environment = None;
+        return;
+    };
+    let (id, hole) = (wall.id(), *wall.hole());
+    let link = *wall
+        .link()
+        .expect("select_portal keeps only linked portals");
+    mv.portal_environment = Some(id);
+
+    // **The trigger is the centre crossing the plane** — `m_plane_Origin` and
+    // `< -FLT_EPSILON`, not the hull's near face and not the simulator's
+    // shifted plane. `IsMobile` is the other way in and this port has no
+    // moving portals.
+    let dist = hole.forward.dot(hole.center);
+    let plane_dist = hole.forward.dot(center) - dist;
+    if plane_dist >= -f32::EPSILON {
+        return;
+    }
+
+    let exit = link.exit;
+    let matrix = link.to_exit;
+
+    // §6.2 — when in this frame the crossing happened. `fOldPlaneDist` is
+    // *meant* to be positive and sometimes is not: *"some kind of physics
+    // penetration seems to be the cause (bugbait #61331)"*, and Valve's answer
+    // is to call it half way and move on.
+    let old_plane_dist = hole.forward.dot(previous) - dist;
+    let total = old_plane_dist - plane_dist;
+    let crossed_at = match total != 0.0 {
+        true => old_plane_dist / total,
+        false => 0.5,
+    };
+    let after_crossing = (1.0 - crossed_at) * dt;
+
+    let was_on_ground = mv.ground.is_some();
+    set_ground(mv, None);
+
+    // §6.3 — the velocity.
+    {
+        // Gravity is world-down on both sides of a portal, so it is taken out
+        // of the velocity *before* the rotation and added back to the result
+        // rather than rotated with it. A player who was on the ground had none
+        // applied to begin with.
+        //
+        // `GetImplicitVerticalStepSpeed` — the vertical speed a player carries
+        // implicitly while walking up a slope, since ground velocity is
+        // xy-only — is added before the rotation in the original. It is not
+        // ported: nothing in this port tracks it, and it is zero except on a
+        // slope.
+        let gravity = match was_on_ground {
+            true => Vec3::ZERO,
+            false => Vec3::new(0.0, 0.0, -vars.gravity * after_crossing),
+        };
+        let mut velocity =
+            matrix.transform_vector3(mv.velocity - gravity) + gravity * EXIT_GRAVITY_BOOST;
+
+        let (minimum, maximum) = exit_speed_range(
+            &exit,
+            matrix.transform_point3(center),
+            extents,
+            vars.gravity,
+        );
+        let along_exit = velocity.dot(exit.forward);
+        if along_exit < minimum {
+            // **Added along the exit forward, not scaled.** Scaling would turn
+            // a sideways exit into a faster sideways exit.
+            velocity += exit.forward * (minimum - along_exit);
+        } else {
+            let speed = velocity.length();
+            if speed > maximum && speed != 0.0 {
+                velocity *= maximum / speed;
+            }
+        }
+
+        // `CheckVelocity`'s per-axis clamp, done quietly.
+        mv.velocity = velocity.clamp(
+            Vec3::splat(-vars.maxvelocity),
+            Vec3::splat(vars.maxvelocity),
+        );
+    }
+
+    // §6.4 — the forced duck. An AABB cannot rotate, so a transition that
+    // turns the up axis has to curl the player into the duck hull *now*.
+    let duck_to_fit = transition_crouches(matrix);
+    let duck_to_fling = should_maintain_fling_crouch(&exit, mv.velocity);
+    let forced_duck = duck_to_fit || duck_to_fling;
+    if forced_duck && !mv.ducked {
+        // `m_bInDuckJump` has no field here — it exists to keep the duck-jump
+        // eye offset going, and the timer is what makes the duck a duck.
+        mv.duck_time_msecs = DUCK_TIME_MSECS;
+        finish_duck(mv, tracer, vars);
+        // **Recomputed against the duck hull**, so that the transform below
+        // preserves the *centre* of the box the player now has.
+        origin_to_center = (player_mins(true) + player_maxs(true)) * 0.5;
+    }
+
+    // §6.5 — the move. The centre goes through the matrix and the origin is
+    // derived back from it.
+    let mut exit_center = matrix.transform_point3(center);
+    if duck_to_fling
+        || (duck_to_fit && mv.velocity.dot(exit.forward) > PLAYER_FLING_HELPER_MIN_SPEED)
+    {
+        let duck_extents = (player_maxs(true) - player_mins(true)) * 0.5;
+        exit_center += fling_nudge(&exit, exit_center, duck_extents);
+    }
+    mv.origin = exit_center - origin_to_center;
+
+    // *"We need to trace against the new environment now instead of waiting
+    // for it to update naturally"* — the player is at the exit, so the carved
+    // geometry they are inside is the exit's.
+    tracer.set_hole(holes.get(link.exit_id));
+    if trace_player_bbox(mv, tracer, mv.origin, mv.origin).start_solid {
+        // *"AABB's going through portals are likely to cause weird collision
+        // bugs. Just try to get them close"*: sweep in from the portal's own
+        // axis, which is the direction with the most room.
+        let to_center = (mv.origin + origin_to_center) - exit.center;
+        let off_axis = to_center - to_center.dot(exit.forward) * exit.forward;
+        let pulled = trace_player_bbox(mv, tracer, mv.origin - off_axis, mv.origin);
+        if !pulled.start_solid {
+            mv.origin = pulled.end;
+        }
+        // Valve's third attempt,
+        // `UTIL_FindClosestPassableSpace_InPortal_CenterMustStayInFront`, is a
+        // 100-iteration search for a free spot and is **not ported**: it needs
+        // `UTIL_FindClosestPassableSpace`, which nothing else here wants yet.
+    }
+
+    mv.portal_environment = Some(link.exit_id);
+    mv.teleported = Some(Teleport {
+        matrix,
+        entered: id,
+        exit: link.exit_id,
+        forced_duck,
+    });
+}
+
 /// `CGameMovement::PlayerMove` (`gamemovement.cpp:4994`) — the per-command
 /// entry point, and the order everything else runs in.
-pub fn player_move(
+pub fn player_move<'a>(
     mv: &mut MoveData,
-    tracer: Option<&mut Tracer<'_>>,
+    tracer: Option<&mut Tracer<'a>>,
+    portals: Option<&'a PortalHoles>,
     vars: &MoveVars,
     dt: f32,
     old_angles: ViewAngles,
 ) {
+    // `m_vMoveStartPosition = mv->GetAbsOrigin()`
+    // (`portal_gamemovement.cpp:393`), which the original does in
+    // `ProcessMovement` just before this. Here rather than in the caller so
+    // that nothing can forget it, and so that
+    // [`handle_portalling`]'s comparison is always against the move that just
+    // ran.
+    mv.move_start = mv.origin;
+    mv.teleported = None;
+
     check_parameters(mv, old_angles);
     reduce_timers(mv, dt);
 
@@ -1607,12 +2158,24 @@ pub fn player_move(
         MoveType::Walk => full_walk_move(mv, tracer, vars, dt),
         MoveType::FlyGravity => full_toss_move(mv, tracer, vars, dt),
     }
+
+    // `HandlePortalling()` (`portal_gamemovement.cpp:468`), which the original
+    // calls between `PlayerMove` and `FinishMove` for **every** move type —
+    // including noclip, which is how you fly through a portal.
+    //
+    // With no portals in the level there is nothing to select and the field is
+    // cleared, which matters: a level change leaves a stale id behind
+    // otherwise, and the next map's carve would be picked by it.
+    match portals {
+        Some(portals) if !portals.is_empty() => handle_portalling(mv, tracer, portals, vars, dt),
+        _ => mv.portal_environment = None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::trace::fixture::Fixture;
+    use crate::engine::trace::fixture::{self, Fixture};
     use crate::engine::trace::CollisionBsp;
 
     const TICK: f32 = 1.0 / 60.0;
@@ -1672,6 +2235,9 @@ mod tests {
             duck_time_msecs: 0,
             view_offset: VEC_VIEW,
             speed_cropped: false,
+            move_start: origin,
+            portal_environment: None,
+            teleported: None,
         }
     }
 
@@ -1697,7 +2263,7 @@ mod tests {
             mv.speed_cropped = false;
             fill(mv);
             let angles = mv.angles;
-            player_move(mv, Some(&mut tracer), &MoveVars::PORTAL2, dt, angles);
+            player_move(mv, Some(&mut tracer), None, &MoveVars::PORTAL2, dt, angles);
         }
     }
 
@@ -2112,7 +2678,14 @@ mod tests {
                 mv.forwardmove = SV_SPEED_NORMAL;
                 mv.speed_cropped = false;
                 let angles = mv.angles;
-                player_move(&mut mv, Some(&mut tracer), &MoveVars::PORTAL2, TICK, angles);
+                player_move(
+                    &mut mv,
+                    Some(&mut tracer),
+                    None,
+                    &MoveVars::PORTAL2,
+                    TICK,
+                    angles,
+                );
 
                 let stuck = trace_player_bbox(&mv, &mut tracer, mv.origin, mv.origin);
                 assert!(!stuck.start_solid, "stuck at {:?} facing {yaw}", mv.origin);
@@ -2127,7 +2700,7 @@ mod tests {
         let mut mv = walker(Vec3::new(0.0, 0.0, 100.0));
         for _ in 0..60 {
             let angles = mv.angles;
-            player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, angles);
+            player_move(&mut mv, None, None, &MoveVars::PORTAL2, TICK, angles);
         }
         assert_eq!(mv.origin, Vec3::new(0.0, 0.0, 100.0));
     }
@@ -2237,14 +2810,554 @@ mod tests {
         mv.angles = ViewAngles::new(10.0, 90.0);
 
         let old = ViewAngles::new(0.0, 0.0);
-        player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, old);
+        player_move(&mut mv, None, None, &MoveVars::PORTAL2, TICK, old);
         assert_eq!(mv.angles.yaw, 0.0, "pinned to m_vecOldAngles");
         assert_eq!(mv.angles.pitch, 0.0);
 
         // …and a *live* player takes the command's angles unchanged.
         let mut mv = walker(Vec3::ZERO);
         mv.angles = ViewAngles::new(10.0, 90.0);
-        player_move(&mut mv, None, &MoveVars::PORTAL2, TICK, old);
+        player_move(&mut mv, None, None, &MoveVars::PORTAL2, TICK, old);
         assert_eq!(mv.angles.yaw, 90.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Portals — `portdocs/PORTAL.md` stage 4
+    // -----------------------------------------------------------------------
+
+    /// [`run`], with the portal plumbing `Engine::update_client` does around it.
+    ///
+    /// Two things happen per frame that the plain runner has no reason to do:
+    /// the tracer's hole is chosen from the environment the **previous** move
+    /// ended in, and the view turns with the player when one of them teleports.
+    /// Both are the engine's job in the real thing, and doing them here is what
+    /// makes these tests about the movement rather than about a harness.
+    ///
+    /// Returns every teleport that happened, because `player_move` clears the
+    /// field at the top of each command.
+    fn run_portals(
+        mv: &mut MoveData,
+        collision: &CollisionBsp,
+        holes: &PortalHoles,
+        frames: usize,
+        mut fill: impl FnMut(&mut MoveData),
+    ) -> Vec<Teleport> {
+        let mut teleports = Vec::new();
+        for _ in 0..frames {
+            mv.forwardmove = 0.0;
+            mv.sidemove = 0.0;
+            mv.upmove = 0.0;
+            mv.buttons = ButtonBits::NONE;
+            mv.speed_cropped = false;
+            fill(mv);
+
+            let mut tracer = collision.tracer();
+            if let Some(wall) = mv.portal_environment.and_then(|id| holes.get(id)) {
+                tracer = tracer.with_hole(wall);
+                let crouches = wall
+                    .link()
+                    .is_some_and(|link| transition_crouches(link.to_exit));
+                if crouches {
+                    tracer = tracer.with_exit_hull(player_mins(true), player_maxs(true));
+                }
+            }
+
+            let angles = mv.angles;
+            player_move(
+                mv,
+                Some(&mut tracer),
+                Some(holes),
+                &MoveVars::PORTAL2,
+                TICK,
+                angles,
+            );
+            if let Some(teleport) = mv.teleported {
+                mv.angles = teleport.turn(mv.angles);
+                teleports.push(teleport);
+            }
+        }
+        teleports
+    }
+
+    /// Blue's room, its portal, and a carved store for both of them.
+    fn rooms_and_holes() -> (fixture::PortalRooms, PortalHoles) {
+        let rooms = fixture::portal_rooms();
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &rooms.live());
+        (rooms, holes)
+    }
+
+    /// A player standing on blue's floor, sixty units in front of the portal,
+    /// facing it.
+    fn at_the_blue_portal(rooms: &fixture::PortalRooms, holes: &PortalHoles) -> MoveData {
+        // Dropped rather than placed, so that the same `CategorizePosition`
+        // that runs during the walk is what put them on the ground.
+        let mut mv = walker(Vec3::new(60.0, 0.0, fixture::PORTAL_ROOM_FLOOR + 20.0));
+        // Blue faces `+X` and the player walks into it, so they are looking
+        // along `-X`.
+        mv.angles = ViewAngles::new(0.0, 180.0);
+        let teleports = run_portals(&mut mv, &rooms.collision, holes, 40, |_| {});
+        assert!(teleports.is_empty(), "teleported while standing still");
+        assert!(mv.ground.is_some(), "not standing on the floor: {mv:#?}");
+        assert!(
+            (mv.origin.z - fixture::PORTAL_ROOM_FLOOR).abs() < 0.1,
+            "{}",
+            mv.origin
+        );
+        mv
+    }
+
+    /// **The test that says stage 4 works.** A player walks into one portal and
+    /// comes out of the other, standing on the far room's floor and facing the
+    /// way that room faces.
+    #[test]
+    fn walking_into_a_portal_comes_out_of_the_other_one() {
+        let (rooms, holes) = rooms_and_holes();
+        let mut mv = at_the_blue_portal(&rooms, &holes);
+
+        let teleports = run_portals(&mut mv, &rooms.collision, &holes, 60, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+        });
+
+        assert_eq!(teleports.len(), 1, "{teleports:#?}");
+        let teleport = teleports[0];
+        assert_eq!(teleport.entered, fixture::PortalRooms::BLUE_ID);
+        assert_eq!(teleport.exit, fixture::PortalRooms::ORANGE_ID);
+        assert!(!teleport.forced_duck, "both portals are on walls");
+
+        // Orange is at `(1000, 0, 0)` facing `+Y`, so its room is the `+Y` side
+        // and a player walking straight through comes out on its axis.
+        assert!(
+            (mv.origin.x - 1000.0).abs() < 1.0,
+            "came out at {}",
+            mv.origin
+        );
+        assert!(
+            mv.origin.y > 40.0,
+            "did not walk away from orange: {}",
+            mv.origin
+        );
+        assert!(
+            (mv.origin.z - fixture::PORTAL_ROOM_FLOOR).abs() < 0.1,
+            "not on the far room's floor: {}",
+            mv.origin
+        );
+        assert!(mv.ground.is_some(), "airborne in the far room");
+
+        // Still walking forward, which is now `+Y`.
+        assert!(mv.velocity.y > 100.0, "{}", mv.velocity);
+        // And looking that way: blue's `-X` became orange's `+Y`.
+        assert!((mv.angles.yaw - 90.0).abs() < 1e-2, "{}", mv.angles.yaw);
+        assert!(mv.angles.pitch.abs() < 1e-2 && mv.angles.roll.abs() < 1e-2);
+    }
+
+    /// The trigger is the box's **centre** crossing the plane, not its near
+    /// face touching it.
+    ///
+    /// A player walked up to the portal is in its environment — which is what
+    /// makes the next move traced against the carve — and has not gone
+    /// anywhere.
+    #[test]
+    fn standing_in_a_portals_trigger_box_is_not_going_through_it() {
+        let (rooms, holes) = rooms_and_holes();
+        let mut mv = at_the_blue_portal(&rooms, &holes);
+        assert_eq!(
+            mv.portal_environment,
+            Some(fixture::PortalRooms::BLUE_ID),
+            "sixty units out is inside the sixty-four-unit trigger box"
+        );
+
+        // Walk until the hull's near face is past the plane and stop there.
+        // A tick at a time rather than a fixed count, because the number of
+        // ticks the acceleration ramp takes is not what this test is about —
+        // the hull is sixteen units deep, so there are always several ticks
+        // between the face crossing and the centre.
+        let mut teleports = Vec::new();
+        for _ in 0..60 {
+            teleports.extend(run_portals(&mut mv, &rooms.collision, &holes, 1, |mv| {
+                mv.forwardmove = SV_SPEED_NORMAL;
+            }));
+            if mv.origin.x + player_mins(false).x < 0.0 {
+                break;
+            }
+        }
+        assert!(
+            mv.origin.x + player_mins(false).x < 0.0,
+            "the hull never reached the plane, so the test proves nothing: {}",
+            mv.origin
+        );
+        assert!(teleports.is_empty(), "teleported without crossing");
+        assert!(
+            mv.origin.x > 0.0,
+            "the centre crossed after all: {}",
+            mv.origin
+        );
+        assert_eq!(mv.portal_environment, Some(fixture::PortalRooms::BLUE_ID));
+    }
+
+    /// **A portal you cannot come out of is a portal you cannot walk into.**
+    ///
+    /// The whole point of the remote trace: a barrier eight units in front of
+    /// the *exit* stops the player eight units in front of the *entrance*, and
+    /// the surface they are stopped by faces back out of the portal at them.
+    #[test]
+    fn a_portal_whose_far_side_is_blocked_cannot_be_walked_into() {
+        // Across orange's opening, eight units out from its plane.
+        let barrier = (
+            Vec3::new(960.0, 8.0, fixture::PORTAL_ROOM_FLOOR),
+            Vec3::new(1040.0, 16.0, 56.0),
+        );
+        let rooms = fixture::portal_rooms_with(&[barrier]);
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &rooms.live());
+
+        let mut mv = at_the_blue_portal(&rooms, &holes);
+        let teleports = run_portals(&mut mv, &rooms.collision, &holes, 60, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+        });
+
+        assert!(teleports.is_empty(), "walked through a blocked portal");
+        assert!(
+            mv.origin.x > 4.0 && mv.origin.x < 12.0,
+            "stopped at {} rather than eight units short",
+            mv.origin
+        );
+        // The control: without the barrier the same walk goes through.
+        let (rooms, holes) = rooms_and_holes();
+        let mut mv = at_the_blue_portal(&rooms, &holes);
+        let teleports = run_portals(&mut mv, &rooms.collision, &holes, 60, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+        });
+        assert_eq!(teleports.len(), 1, "the barrier was not what stopped them");
+    }
+
+    /// A transition that turns the player's up axis curls them into the duck
+    /// hull as they cross, and puts the *centre* of the new hull where the
+    /// centre of the old one was.
+    #[test]
+    fn a_transition_that_turns_the_up_axis_ducks_the_player_as_they_cross() {
+        use crate::engine::trace::{LivePortal, PortalLink};
+        use crate::server::classes::portal::teleport_matrix;
+
+        let rooms = fixture::portal_rooms();
+        let hole = |(origin, angles): (Vec3, Vec3)| PortalHole::new(origin, angles, 32.0, 56.0);
+        // Blue where the fixture puts it, and a partner in the **floor** far
+        // away: pitch -90 faces a portal straight up.
+        let blue_at = (Vec3::ZERO, Vec3::ZERO);
+        let floor_at = (Vec3::new(1000.0, 0.0, 0.0), Vec3::new(-90.0, 0.0, 0.0));
+        let pair = |a: (Vec3, Vec3), b: (Vec3, Vec3), exit_id: u64| {
+            Some(PortalLink {
+                exit_id,
+                exit: hole(b),
+                to_exit: teleport_matrix(a, b),
+                to_entrance: teleport_matrix(b, a),
+            })
+        };
+        let live = [
+            LivePortal {
+                id: 1,
+                hole: hole(blue_at),
+                link: pair(blue_at, floor_at, 2),
+            },
+            LivePortal {
+                id: 2,
+                hole: hole(floor_at),
+                link: pair(floor_at, blue_at, 1),
+            },
+        ];
+        assert!(
+            transition_crouches(live[0].link.unwrap().to_exit),
+            "a wall to a floor is the transition that needs the duck"
+        );
+
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &live);
+
+        // Straddling blue's plane, standing: the move ended with the centre a
+        // unit past it.
+        let mut mv = walker(Vec3::new(-1.0, 0.0, fixture::PORTAL_ROOM_FLOOR));
+        mv.move_start = Vec3::new(2.0, 0.0, fixture::PORTAL_ROOM_FLOOR);
+        mv.portal_environment = Some(1);
+        mv.ground = Some(Vec3::Z);
+        let centre_before = mv.origin + (player_mins(false) + player_maxs(false)) * 0.5;
+
+        let mut tracer = rooms.collision.tracer();
+        handle_portalling(&mut mv, &mut tracer, &holes, &MoveVars::PORTAL2, TICK);
+
+        let teleport = mv.teleported.expect("the centre crossed the plane");
+        assert!(teleport.forced_duck);
+        assert!(mv.ducked, "the hull is still the standing one");
+        assert_eq!(mv.duck_time_msecs, DUCK_TIME_MSECS);
+        assert_eq!(mv.portal_environment, Some(2));
+
+        // **The centre is what the transform preserves**, not the origin:
+        // reading the two the wrong way round drops the player by the
+        // difference between the hulls.
+        let centre_after = mv.origin + (player_mins(true) + player_maxs(true)) * 0.5;
+        let expected = teleport.matrix.transform_point3(centre_before);
+        assert!(
+            (centre_after - expected).length() < 0.1,
+            "the centre moved to {centre_after} rather than {expected}"
+        );
+    }
+
+    /// `GetExitSpeedRange`: 300 out of a floor portal for a player, nothing
+    /// imposed out of a wall, and the perched solution in between.
+    #[test]
+    fn a_player_leaves_a_floor_portal_at_three_hundred_units_a_second() {
+        let extents = (player_maxs(false) - player_mins(false)) * 0.5;
+        let centre = Vec3::new(0.0, 0.0, 36.0);
+        let at = |pitch: f32| PortalHole::new(Vec3::ZERO, Vec3::new(pitch, 0.0, 0.0), 32.0, 56.0);
+
+        // Straight up: the number that keeps every fling in the game alive.
+        let (minimum, maximum) = exit_speed_range(&at(-90.0), centre, extents, SV_GRAVITY);
+        assert_eq!((minimum, maximum), (EXIT_SPEED_MIN_FLOOR, EXIT_SPEED_MAX));
+
+        // A wall imposes no minimum at all.
+        let (minimum, _) = exit_speed_range(&at(0.0), centre, extents, SV_GRAVITY);
+        assert_eq!(minimum, f32::NEG_INFINITY);
+
+        // Tilted 45° up: `bExitOnFloor` is false and `forward.z > 0.5` is true,
+        // so the speed comes from the quadratic and is capped at the floor's.
+        let (minimum, _) = exit_speed_range(&at(-45.0), centre, extents, SV_GRAVITY);
+        assert!(
+            minimum > 0.0 && minimum <= EXIT_SPEED_MIN_FLOOR,
+            "the perch solution came out {minimum}"
+        );
+
+        // …and 30° up is below the `forward.z > 0.5` gate, so nothing applies.
+        let (minimum, _) = exit_speed_range(&at(-29.0), centre, extents, SV_GRAVITY);
+        assert_eq!(minimum, f32::NEG_INFINITY);
+    }
+
+    /// `SolveQuadratic`'s degenerate cases, which the perch calculation relies
+    /// on rather than guarding against.
+    #[test]
+    fn the_quadratic_keeps_valves_degenerate_answers() {
+        assert_eq!(solve_quadratic(1.0, 0.0, -4.0), Some((2.0, -2.0)));
+        // No square term: one root, twice.
+        assert_eq!(solve_quadratic(0.0, 2.0, -6.0), Some((3.0, 3.0)));
+        // Nothing at all is a solution of nothing.
+        assert_eq!(solve_quadratic(0.0, 0.0, 0.0), Some((0.0, 0.0)));
+        assert_eq!(solve_quadratic(0.0, 0.0, 1.0), None);
+        // Imaginary.
+        assert_eq!(solve_quadratic(1.0, 0.0, 4.0), None);
+    }
+
+    /// **The acceptance test `portdocs/PORTAL.md` §11 asks for, on the maps
+    /// that ship.** Every pair of `prop_portal`s the game places is linked,
+    /// carved, and walked into by a player-sized hull; the assertion is that
+    /// the player comes out of the other one.
+    ///
+    /// The pairing is by entity order within a map rather than through the
+    /// server's linker, because what is under test is the *movement* — that
+    /// every shipped pair spawns and links is
+    /// `every_shipped_portal_spawns_and_its_map_can_link_a_pair`'s job, and
+    /// running the whole entity system here would make a failure ambiguous.
+    ///
+    /// A pair is **skipped** when the entrance has no floor within 300 units,
+    /// or when the player cannot stand 40 units in front of it — four of the
+    /// game's twenty-one portals are parked in mid-air by their map and moved
+    /// from script, and some of the rest face across a gap.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release walks_through -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn a_player_walks_through_every_shipped_portal_pair() {
+        use crate::engine::trace::{LivePortal, PortalLink, Ray};
+        use crate::engine::world::bsp::Bsp;
+        use crate::server::classes::portal::teleport_matrix;
+
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+
+        let number = |value: Option<&str>, or: f32| -> f32 {
+            value.and_then(|v| v.trim().parse().ok()).unwrap_or(or)
+        };
+        let vector = |value: Option<&str>| -> Vec3 {
+            let mut parts = value.unwrap_or("").split_whitespace();
+            let mut next = || parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            Vec3::new(next(), next(), next())
+        };
+
+        let (mut pairs, mut walked, mut skipped, mut blocked) = (0usize, 0usize, 0usize, 0usize);
+        let mut mismatched = 0usize;
+        let (mut carved, mut worst) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut pieces, mut tube, mut remote) = (0usize, 0usize, 0usize);
+        let mut report: Vec<String> = Vec::new();
+
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            let entities = bsp.entities();
+            let placed: Vec<_> = entities
+                .iter()
+                .filter(|e| e.classname() == Some("prop_portal"))
+                .collect();
+            if placed.len() < 2 {
+                continue;
+            }
+            let collision = CollisionBsp::build(&bsp);
+
+            for two in placed.chunks(2) {
+                let [entrance, exit] = two else { continue };
+                let place = |e: &crate::engine::world::bsp::Entity| {
+                    (vector(e.get("origin")), vector(e.get("angles")))
+                };
+                let (a, b) = (place(entrance), place(exit));
+                let size = |e: &crate::engine::world::bsp::Entity| {
+                    (
+                        number(e.get("HalfWidth"), 32.0),
+                        number(e.get("HalfHeight"), 56.0),
+                    )
+                };
+                if size(entrance) != size(exit) {
+                    // `UpdatePortalLinkage` will not pair two portals of
+                    // different sizes, so neither does this.
+                    mismatched += 1;
+                    continue;
+                }
+                let (half_width, half_height) = size(entrance);
+                let hole = |(origin, angles): (Vec3, Vec3)| {
+                    PortalHole::new(origin, angles, half_width, half_height)
+                };
+                let link = |from: (Vec3, Vec3), to: (Vec3, Vec3), exit_id: u64| {
+                    Some(PortalLink {
+                        exit_id,
+                        exit: hole(to),
+                        to_exit: teleport_matrix(from, to),
+                        to_entrance: teleport_matrix(to, from),
+                    })
+                };
+                pairs += 1;
+
+                let live = [
+                    LivePortal {
+                        id: 1,
+                        hole: hole(a),
+                        link: link(a, b, 2),
+                    },
+                    LivePortal {
+                        id: 2,
+                        hole: hole(b),
+                        link: link(b, a, 1),
+                    },
+                ];
+                let mut holes = PortalHoles::default();
+                let started = std::time::Instant::now();
+                holes.sync(&collision, &live);
+                let took = started.elapsed();
+                carved += took;
+                worst = worst.max(took);
+                for wall in holes.iter() {
+                    pieces += wall.pieces();
+                    tube += wall.tube_slabs();
+                    remote += wall.remote_pieces();
+                }
+                let blue = *holes.get(1).expect("carved").hole();
+
+                // Somewhere to stand: 40 units out in front, dropped onto
+                // whatever is below.
+                let from = blue.center + blue.forward * 40.0;
+                let mins = player_mins(false);
+                let maxs = player_maxs(false);
+                let down = Ray::hull(from, from - Vec3::Z * 300.0, mins, maxs);
+                let ground = collision.tracer().trace(&down, Contents::MASK_PLAYERSOLID);
+                if ground.start_solid || !ground.did_hit() {
+                    skipped += 1;
+                    report.push(format!("  {name}: nowhere to stand in front of the portal"));
+                    continue;
+                }
+
+                let mut mv = walker(ground.end + Vec3::Z * 2.0);
+                // Looking into the portal, which is the way its forward points
+                // back.
+                let into = -blue.forward;
+                mv.angles = ViewAngles::new(0.0, into.y.atan2(into.x).to_degrees());
+                let settle = run_portals(&mut mv, &collision, &holes, 30, |_| {});
+                if !settle.is_empty() || mv.ground.is_none() {
+                    skipped += 1;
+                    report.push(format!(
+                        "  {name}: the player would not settle in front of it"
+                    ));
+                    continue;
+                }
+
+                let teleports = run_portals(&mut mv, &collision, &holes, 180, |mv| {
+                    mv.forwardmove = SV_SPEED_NORMAL;
+                });
+                match teleports.first() {
+                    Some(teleport) => {
+                        walked += 1;
+                        // **Either portal may be the entrance.** Some maps put
+                        // the pair close enough together that a player walking
+                        // at one is nearer the other, and `select_portal` takes
+                        // the nearest centre — which is Valve's rule. What has
+                        // to hold is that they came out of the *partner*.
+                        assert_ne!(
+                            teleport.entered, teleport.exit,
+                            "{name}: a portal teleported into itself"
+                        );
+                        let exit = hole(match teleport.exit {
+                            1 => a,
+                            _ => b,
+                        });
+                        let centre = mv.origin + (mins + maxs) * 0.5;
+                        let ahead = exit.forward.dot(centre - exit.center);
+                        assert!(
+                            ahead > 0.0,
+                            "{name}: came out {ahead} units behind the exit plane"
+                        );
+                    }
+                    None => {
+                        blocked += 1;
+                        report.push(format!(
+                            "  {name}: walked {:.1} units and did not go through",
+                            (mv.origin - (ground.end + Vec3::Z * 2.0)).length()
+                        ));
+                    }
+                }
+            }
+        }
+
+        for line in &report {
+            println!("{line}");
+        }
+        println!(
+            "{pairs} portal pairs across the shipped maps: {walked} walked through, \
+             {blocked} stopped short, {skipped} with nowhere to stand; \
+             {mismatched} adjacent pairs were different sizes.\n  \
+             {pieces} carved pieces, {tube} tube slabs and {remote} remote pieces \
+             between them; carving a linked pair took {:.2} ms on average and \
+             {:.2} ms at worst.",
+            carved.as_secs_f32() * 1000.0 / pairs.max(1) as f32,
+            worst.as_secs_f32() * 1000.0,
+        );
+        // Nine pairs out of the game's twenty-one portals, and the arithmetic
+        // is the content's: `sp_a1_intro5` and `sp_a1_intro7` place a single
+        // `prop_portal` each and `sp_a1_intro4` places three, so three portals
+        // have no neighbour to pair with. No adjacent pair is mismatched in
+        // size, which is worth knowing because `UpdatePortalLinkage` would not
+        // have linked one that was.
+        assert_eq!(pairs, 9, "the pairing changed");
+        assert!(
+            walked >= 6,
+            "only {walked} of {pairs} shipped pairs could be walked through"
+        );
     }
 }

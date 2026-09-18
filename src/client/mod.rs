@@ -53,7 +53,7 @@ pub use view::{ViewAngles, ViewSetup};
 use glam::Vec3;
 
 use crate::engine::console::{Console, Cvar, CvarFlags};
-use crate::engine::trace::Tracer;
+use crate::engine::trace::{PortalHoles, Tracer};
 
 /// `default_fov` for Portal (`game/client/portal/clientmode_portal.cpp:32`).
 ///
@@ -863,7 +863,13 @@ impl Client {
     /// created. That is the whole difference from the original, and it is why
     /// this is a separate call from [`create_move`](Client::create_move):
     /// prediction wraps this function rather than rewriting it.
-    pub fn run_move(&mut self, cmd: &UserCmd, dt: f32, tracer: Option<&mut Tracer<'_>>) {
+    pub fn run_move<'a>(
+        &mut self,
+        cmd: &UserCmd,
+        dt: f32,
+        tracer: Option<&mut Tracer<'a>>,
+        portals: Option<&'a PortalHoles>,
+    ) {
         let mut mv = MoveData {
             origin: self.player.origin,
             velocity: self.player.velocity,
@@ -893,9 +899,20 @@ impl Client {
             duck_time_msecs: self.player.duck_time_msecs,
             view_offset: self.player.view_offset,
             speed_cropped: false,
+            // Filled in by `player_move` itself.
+            move_start: self.player.origin,
+            portal_environment: self.player.portal_environment,
+            teleported: None,
         };
 
-        movement::player_move(&mut mv, tracer, &self.move_vars(), dt, self.old_view_angles);
+        movement::player_move(
+            &mut mv,
+            tracer,
+            portals,
+            &self.move_vars(),
+            dt,
+            self.old_view_angles,
+        );
 
         // `FinishMove` — the results go back on the player.
         self.player.origin = mv.origin;
@@ -908,6 +925,19 @@ impl Client {
         self.player.duck_time_msecs = mv.duck_time_msecs;
         self.player.view_offset = mv.view_offset;
         self.player.old_buttons = mv.old_buttons;
+        self.player.portal_environment = mv.portal_environment;
+
+        // **The one thing the move cannot do to itself.** `MoveData` has no
+        // view angles — see [`movement::Teleport`] — so a teleport hands the
+        // transform back here and this is where the view turns round with the
+        // player. `portdocs/PORTAL.md` §6.5: Valve transforms four angle sets
+        // and this port has one, so the whole block collapses to one compose.
+        //
+        // No pitch clamp: the composed angles are wherever the portal pair put
+        // them, and `ApplyMouse` clamps on the next command.
+        if let Some(teleport) = mv.teleported {
+            self.player.angles = teleport.turn(self.player.angles);
+        }
         // **The angles deliberately do not come back.** `CheckParameters` pins
         // `mv->m_vecAngles` to the previous command's when `IsDead()`, and
         // `CPlayerMove::FinishMove` does *not* write them anywhere — the
@@ -1042,7 +1072,7 @@ mod tests {
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
         let cmd = frame(&mut client, (0.0, 0.0));
-        client.run_move(&cmd, 1.0 / 60.0, None);
+        client.run_move(&cmd, 1.0 / 60.0, None, None);
         let crawled = client.player.origin.x;
         assert!(
             (0.0..0.05).contains(&crawled),
@@ -1058,7 +1088,7 @@ mod tests {
         client.buttons_mut().apply("forward", true, Some(1));
         client.buttons_mut().apply("forward", false, Some(1));
         let cmd = frame(&mut client, (0.0, 0.0));
-        client.run_move(&cmd, 1.0 / 60.0, None);
+        client.run_move(&cmd, 1.0 / 60.0, None, None);
         // Straight to the wish velocity: 43.75 * 5 = 218.75 a second, which is
         // 3.65 units in a frame — two orders of magnitude past the crawl.
         assert!(client.player.origin.x > crawled + 3.0);
@@ -1079,7 +1109,7 @@ mod tests {
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0, None);
+            client.run_move(&cmd, 1.0 / 60.0, None, None);
         }
 
         let origin = client.player.origin;
@@ -1151,7 +1181,7 @@ mod tests {
         hold(&mut client, &["forward"]);
         for _ in 0..10 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0, None);
+            client.run_move(&cmd, 1.0 / 60.0, None, None);
         }
         assert!(client.player.velocity.length() > 0.0);
 
@@ -1261,7 +1291,7 @@ mod tests {
         hold(&mut client, &["forward"]);
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0, None);
+            client.run_move(&cmd, 1.0 / 60.0, None, None);
         }
         assert_eq!(client.player.origin, Vec3::ZERO);
 
@@ -1270,7 +1300,7 @@ mod tests {
         client.player_mut().move_type = MoveType::Noclip;
         for _ in 0..60 {
             let cmd = frame(&mut client, (0.0, 0.0));
-            client.run_move(&cmd, 1.0 / 60.0, None);
+            client.run_move(&cmd, 1.0 / 60.0, None, None);
         }
         assert!(client.player.origin.length() > 0.0);
     }

@@ -121,6 +121,18 @@ pub struct Portal {
     /// different modules: the instant is the *server's* tick clock and the
     /// elapsed time is measured against the *scene's*.
     pub open_for: f32,
+    /// The [`id`](Portal::id) of this portal's partner, if it has one.
+    ///
+    /// **Nothing in the draw reads it.** It is here because this list is also
+    /// what [`World::sync_portals`](super::World::sync_portals) carves from,
+    /// and the far side of a portal is half of what the carve has to know —
+    /// see `crate::engine::trace::PortalLink`.
+    #[allow(dead_code)]
+    pub linked: Option<u64>,
+    /// `m_matrixThisToLinked`, the identity while unlinked. Likewise the
+    /// carve's rather than the draw's.
+    #[allow(dead_code)]
+    pub matrix: glam::Mat4,
 }
 
 /// Every portal in the level, and the two materials they wear.
@@ -287,6 +299,8 @@ mod tests {
             half_height: 56.0,
             is_portal2: false,
             open_for: 1.0,
+            linked: None,
+            matrix: glam::Mat4::IDENTITY,
         }
     }
 
@@ -549,6 +563,8 @@ mod rendered {
                 half_height: 56.0,
                 is_portal2,
                 open_for: 10.0,
+                linked: None,
+                matrix: glam::Mat4::IDENTITY,
             };
 
             // Settled: the ring, a second after opening.

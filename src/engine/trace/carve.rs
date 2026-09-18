@@ -15,22 +15,35 @@
 //! carved set holding only the holed wall would let a player in a portal
 //! environment walk through the floor in front of it.
 //!
+//! Both also carry the **tube** ([`CarvedWall::tube`]) — the thin sleeve
+//! lining the hole that `CreateTubePolyhedrons` (`:3812`) builds, which is
+//! what an object has to fit inside to be eligible to pass — and, when the
+//! portal is linked, the **remote** set: the exit portal's World geometry plus
+//! this portal's tube moved into the exit's space, which is what the ray
+//! transformed through the pair is swept against. That is
+//! `portdocs/PORTAL.md` §5, and it is what holds a player up on the far room's
+//! floor while their box straddles the plane.
+//!
 //! **No polyhedron library.** Valve's `CPolyhedron`s exist to become
 //! `CPhysCollide`s and this port traces BSP brushes, so a carved piece is the
 //! original brush's planes plus the clip planes plus four side planes — no
-//! vertices generated, no hull built, and a piece that came out empty needs no
-//! detection, because an infeasible plane set produces `enterfrac > leavefrac`
-//! in [`brush::clip_box_to_brush`](super::brush) and reports a clean miss.
-//! That is `portdocs/PORTAL.md` §4.3, and it is what deletes
-//! `mathlib/polyhedron.cpp` and `staticcollisionpolyhedroncache.cpp`.
+//! vertices generated and no hull built. That is `portdocs/PORTAL.md` §4.3,
+//! and it is what deletes `mathlib/polyhedron.cpp` and
+//! `staticcollisionpolyhedroncache.cpp`.
+//!
+//! **An empty piece still has to be detected**, which §4.3 originally said it
+//! did not: an infeasible plane set does report a clean miss for a *point*,
+//! but a swept box pushes every plane out by `|normal · extents|` and turns
+//! two opposed planes with nothing between them into a solid slab. See
+//! [`Pieces::piece`].
 
 use std::collections::HashMap;
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 
 use super::model::{BrushSides, CBrush, CBrushSide, CPlane, CollisionBsp};
 use super::result::SURFACE_INDEX_INVALID;
-use super::{Contents, Surface, Tracer};
+use super::{Contents, Ray, Surface, Tracer};
 
 /// What the carve collects — the four brush sets' masks, unioned.
 ///
@@ -72,6 +85,31 @@ const WORLD_WALL_SEPARATION: f32 = 1.0 / 16.0;
 /// How far the four slabs run before they stop mattering — `fHalfWidth * 40`
 /// and `fHalfHeight * 40` (`portalsimulation.cpp:3598`).
 const FAR: f32 = 40.0;
+
+/// `PORTAL_WALL_TUBE_DEPTH` (`portalsimulation.cpp:66`) — how far back into
+/// the wall the sleeve reaches. One unit, and Valve's commented-out
+/// alternative was 1/128.
+const TUBE_DEPTH: f32 = 1.0;
+
+/// `PORTAL_WALL_TUBE_OFFSET` (`portalsimulation.cpp:67`) — how far *behind*
+/// the portal plane the sleeve starts, so that it never pokes out into the
+/// room.
+///
+/// Valve adds `VPHYSICS_SHRINK` (0.5) to this when the portal sits on a brush
+/// entity using `SOLID_VPHYSICS`, because VBSP shrinks those brushes by half a
+/// unit on the way to a physics model. **Not ported**: this module cuts BSP
+/// brushes, which are not shrunk, so there is nothing to match.
+const TUBE_OFFSET: f32 = 0.01;
+
+/// What the tube is made of.
+///
+/// The tube is generated geometry rather than a cut piece of the map, so it
+/// has no brush to take contents from. Valve's collideable has none either —
+/// a trace that stops on it is given the *portal's* surface properties, taken
+/// from the trace that placed it (`PS_SD_Static_SurfaceProperties_t`), which
+/// this port has no equivalent of. Plain `SOLID` is what every mask a player
+/// or a carve uses agrees on.
+const TUBE_CONTENTS: Contents = Contents::SOLID;
 
 /// How far in front of its own plane a portal's trigger box reaches —
 /// `GetLocalMaxs().x` (`portal_base2d.h:174`), the same 64 units
@@ -201,6 +239,67 @@ fn swept_box(origin: Vec3, f: Vec3, r: Vec3, u: Vec3) -> (Vec3, Vec3) {
     (center - extents, center + extents)
 }
 
+/// A portal's partner, and the transforms between the two.
+///
+/// `PS_PlacementData_t`'s `pLinkedPortal` half, reduced to what a trace needs:
+/// where the exit is, and the matrix each way. Both matrices are carried
+/// rather than one being inverted, because the partner has already computed
+/// the other one — they are each other's `m_matrixThisToLinked` — and two
+/// spellings of the same transform that disagree in the last bit would show up
+/// as a player drifting a hair every time they went through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalLink {
+    /// The exit portal's [`LivePortal::id`] — `m_hLinkedPortal`, as a key.
+    pub exit_id: u64,
+    /// Where the exit portal is.
+    pub exit: PortalHole,
+    /// `m_matrixThisToLinked` — a point at this portal, moved to the exit.
+    /// **The 180° turn about up is in it**; see
+    /// `server::classes::portal::teleport_matrix`, which is where this port
+    /// computes it and the only place it is computed.
+    pub to_exit: Mat4,
+    /// The exit's own `m_matrixThisToLinked`, which is [`to_exit`](Self::to_exit)
+    /// undone.
+    pub to_entrance: Mat4,
+}
+
+/// One portal, as [`PortalHoles::sync`] is told about it.
+///
+/// The whole input to the carve: a key, a placement, and a partner when there
+/// is one. An unlinked portal still carves — the hole in the wall is real
+/// whether or not anything is on the other side — it simply has no remote set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LivePortal {
+    /// [`PortalState::id`](crate::server::PortalState::id).
+    pub id: u64,
+    pub hole: PortalHole,
+    /// `m_hLinkedPortal`, if this portal found a partner.
+    pub link: Option<PortalLink>,
+}
+
+/// `CalculateExtentShift` (`portal_gamemovement.cpp:1587`) — how far along the
+/// exit normal the transformed box has to move so that its *near face* lands
+/// on the exit plane rather than its centre.
+///
+/// An AABB cannot rotate, so a box that is touching a wall portal with 16
+/// units of itself in front of the plane comes out of a floor portal with 36
+/// units of itself below it — 20 units into the floor. The shift is the
+/// difference between the two projected radii, along the exit normal, and
+/// without it the remote trace is asking about a box in the wrong place.
+///
+/// Valve's loop sums the per-axis products rather than taking the largest,
+/// which is the same thing for an axis-aligned normal and a deliberate
+/// over-estimate for any other.
+pub(super) fn extent_shift(
+    local_extents: Vec3,
+    local_normal: Vec3,
+    remote_extents: Vec3,
+    remote_normal: Vec3,
+) -> Vec3 {
+    let radius = |normal: Vec3, extents: Vec3| normal.abs().dot(extents.abs());
+    remote_normal * (radius(remote_normal, remote_extents) - radius(local_normal, local_extents))
+}
+
 /// One portal's collision, carved.
 ///
 /// The pieces are a [`CollisionBsp`] of their own with a **one-leaf tree**, so
@@ -213,7 +312,20 @@ pub struct CarvedWall {
     /// Which portal this belongs to — [`PortalState::id`](crate::server::PortalState::id).
     id: u64,
     hole: PortalHole,
+    /// The partner, when there is one — see [`PortalLink`].
+    link: Option<PortalLink>,
     pieces: CollisionBsp,
+    /// The sleeve lining the hole, as its own model.
+    ///
+    /// Separate from [`pieces`](Self::pieces) because it is separate in the
+    /// shipped engine (`Wall.Local.Tube` is its own collideable), because it
+    /// is generated rather than cut, and because the *remote* trace wants it
+    /// without the rest.
+    tube: CollisionBsp,
+    /// The exit portal's World geometry and this portal's tube, both in the
+    /// exit's space — what `ray_remote` is swept against. `None` while
+    /// unlinked.
+    remote: Option<CollisionBsp>,
     /// How many brushes went in, before the split into pieces — the two sets
     /// added together, so a brush that lands in both is counted twice.
     /// Reported by [`summary`](CarvedWall::summary) and by nothing else.
@@ -226,7 +338,12 @@ impl CarvedWall {
     /// `tracer` is only used to enumerate — [`Tracer::brushes_in_box`] — so it
     /// may be any tracer over the map being carved, and one shared across a
     /// whole [`PortalHoles::sync`] is the intended use.
-    pub fn build(tracer: &mut Tracer<'_>, id: u64, hole: &PortalHole) -> CarvedWall {
+    pub fn build(
+        tracer: &mut Tracer<'_>,
+        id: u64,
+        hole: &PortalHole,
+        link: Option<PortalLink>,
+    ) -> CarvedWall {
         let collision = tracer.collision();
 
         let (lo, hi) = hole.world_bounds();
@@ -255,11 +372,59 @@ impl CarvedWall {
             }
         }
 
+        // The tube, in this portal's own space.
+        let tube = {
+            let mut out = Pieces::default();
+            tube_pieces(
+                &mut out,
+                hole.center,
+                hole.forward,
+                hole.right,
+                hole.up,
+                hole,
+            );
+            CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces)
+        };
+
+        // The remote set: what the exit portal's simulator would answer for
+        // the transformed ray. Two halves, and both are Valve's — the *exit's*
+        // World brushes, traced with `bTraceHolyWall` false so the exit's own
+        // holed wall is deliberately not in it, and *this* portal's tube moved
+        // into the exit's space, which is what tests that the player fits
+        // through the hole in the configuration they would leave in.
+        //
+        // The transformed tube lands in *front* of the exit plane, not behind
+        // it: the matrix's half turn maps "behind the entrance" to "in front of
+        // the exit". That is the whole reason it cannot be the exit portal's
+        // own tube.
+        let remote = link.map(|link| {
+            let mut out = Pieces::default();
+            let clip = clip_planes(&mut out, &link.exit);
+            let (lo, hi) = link.exit.world_bounds();
+            for &index in &tracer.brushes_in_box(lo, hi, CARVE) {
+                let own = out.source_sides(collision, index);
+                out.piece(collision.brushes[index].contents, &own, &clip.world);
+            }
+            let moved = |v: Vec3| link.to_exit.transform_vector3(v);
+            tube_pieces(
+                &mut out,
+                link.to_exit.transform_point3(hole.center),
+                moved(hole.forward),
+                moved(hole.right),
+                moved(hole.up),
+                hole,
+            );
+            CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces)
+        });
+
         CarvedWall {
             id,
             hole: *hole,
+            link,
             sources: world.len() + wall.len(),
             pieces: CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces),
+            tube,
+            remote,
         }
     }
 
@@ -281,6 +446,59 @@ impl CarvedWall {
         &self.hole
     }
 
+    /// The sleeve lining the hole — see [`CarvedWall::tube`].
+    pub fn tube(&self) -> &CollisionBsp {
+        &self.tube
+    }
+
+    /// The exit portal's geometry, in the exit's space — `None` while
+    /// unlinked. Swept with the ray [`remote_ray`](CarvedWall::remote_ray)
+    /// builds and nothing else.
+    pub fn remote(&self) -> Option<&CollisionBsp> {
+        self.remote.as_ref()
+    }
+
+    /// This portal's partner and the transforms between them — `None` while
+    /// unlinked.
+    pub fn link(&self) -> Option<&PortalLink> {
+        self.link.as_ref()
+    }
+
+    /// The same sweep, as the exit portal sees it — `ray_remote`
+    /// (`portal_gamemovement.cpp:1943`), and the shift that built it.
+    ///
+    /// Three things happen to the ray and each one matters:
+    ///
+    /// - the **centre** goes through the matrix, so the box lands at the exit;
+    /// - the **delta** is rotated only, because it is a direction;
+    /// - the **extents stay axis-aligned**, because an AABB does not rotate
+    ///   when it goes through a portal — which is exactly why this trace is a
+    ///   different question from the local one rather than the same one in
+    ///   other coordinates.
+    ///
+    /// `exit_extents` is the half-size the box would have on the far side,
+    /// which differs from the local one only when the transition forces a
+    /// crouch; `None` means "the same box". The returned shift is needed again
+    /// to bring an answer back, so it is handed out rather than recomputed.
+    ///
+    /// `None` when this portal is unlinked, which is also when there is
+    /// nothing to sweep.
+    pub fn remote_ray(&self, ray: &Ray, exit_extents: Option<Vec3>) -> Option<(Ray, Vec3)> {
+        let link = self.link.as_ref()?;
+        self.remote.as_ref()?;
+
+        let extents = exit_extents.unwrap_or(ray.extents);
+        let shift = extent_shift(ray.extents, self.hole.forward, extents, link.exit.forward);
+        let centre = link.to_exit.transform_point3(ray.start) + shift;
+        let delta = link.to_exit.transform_vector3(ray.delta);
+
+        // `mins`/`maxs` symmetric about the start, so that the ray's centring
+        // offset is zero and its `start` *is* the box centre — which is what
+        // `TracePlayerBBox` builds by hand with
+        // `ray_remote.m_StartOffset = vec3_origin`.
+        Some((Ray::hull(centre, centre + delta, -extents, extents), shift))
+    }
+
     /// How many of the map's brushes went in, before the split into pieces —
     /// see [`CarvedWall::sources`] for what a brush in both sets counts as.
     pub fn sources(&self) -> usize {
@@ -293,13 +511,29 @@ impl CarvedWall {
         self.pieces.brushes.len()
     }
 
+    /// How many slabs the sleeve has — four, unless a degenerate placement
+    /// collapsed one.
+    pub fn tube_slabs(&self) -> usize {
+        self.tube.brushes.len()
+    }
+
+    /// How many pieces the far side holds, or zero while unlinked.
+    pub fn remote_pieces(&self) -> usize {
+        self.remote.as_ref().map_or(0, |set| set.brushes.len())
+    }
+
     /// Counts, for `status`-style reporting.
     pub fn summary(&self) -> String {
         format!(
-            "{} brushes carved into {} pieces, {} planes",
+            "{} brushes carved into {} pieces, {} planes, {} tube slabs{}",
             self.sources(),
             self.pieces(),
             self.pieces.planes.len(),
+            self.tube_slabs(),
+            match self.remote.is_some() {
+                true => format!(", {} remote pieces", self.remote_pieces()),
+                false => String::from(", unlinked"),
+            },
         )
     }
 }
@@ -323,26 +557,32 @@ impl PortalHoles {
     /// A portal not in `live` is dropped, one whose [`PortalHole`] is
     /// unchanged is kept as it is, and anything else is carved. Cheap to call
     /// every frame: with no portal moving it is one comparison each.
-    pub fn sync(&mut self, collision: &CollisionBsp, live: &[(u64, PortalHole)]) {
+    pub fn sync(&mut self, collision: &CollisionBsp, live: &[LivePortal]) {
         self.walls
-            .retain(|wall| live.iter().any(|(id, _)| *id == wall.id));
+            .retain(|wall| live.iter().any(|portal| portal.id == wall.id));
 
-        let stale = |walls: &[CarvedWall], id: u64, hole: &PortalHole| {
-            !walls.iter().any(|w| w.id == id && w.hole == *hole)
+        // **The link counts as part of the placement.** A portal that has not
+        // moved but has just found — or lost — a partner has no remote set or
+        // the wrong one, and the remote set is the half that makes the module
+        // work.
+        let stale = |walls: &[CarvedWall], portal: &LivePortal| {
+            !walls
+                .iter()
+                .any(|w| w.id == portal.id && w.hole == portal.hole && w.link == portal.link)
         };
-        if !live.iter().any(|(id, hole)| stale(&self.walls, *id, hole)) {
+        if !live.iter().any(|portal| stale(&self.walls, portal)) {
             return;
         }
 
         // One tracer for the whole rebuild: it allocates a visit stamp per
         // brush in the map, which is the only allocation the enumeration makes.
         let mut tracer = collision.tracer();
-        for (id, hole) in live {
-            if !stale(&self.walls, *id, hole) {
+        for portal in live {
+            if !stale(&self.walls, portal) {
                 continue;
             }
-            let wall = CarvedWall::build(&mut tracer, *id, hole);
-            match self.walls.iter().position(|w| w.id == *id) {
+            let wall = CarvedWall::build(&mut tracer, portal.id, &portal.hole, portal.link);
+            match self.walls.iter().position(|w| w.id == portal.id) {
                 Some(index) => self.walls[index] = wall,
                 None => self.walls.push(wall),
             }
@@ -350,11 +590,13 @@ impl PortalHoles {
     }
 
     /// The carved geometry for one portal.
-    // Stage 4's accessor: `m_hPortalEnvironment` is a handle to a *portal*,
-    // and once the player carries one this is how it becomes geometry.
-    // [`touching`](PortalHoles::touching) is the stand-in until then, and is
-    // what the engine calls today.
-    #[allow(dead_code)]
+    ///
+    /// **This is how `m_hPortalEnvironment` becomes geometry.** The player
+    /// carries the *portal* they are in, decided by
+    /// `client::movement::handle_portalling`'s selection at the end of each
+    /// move, and the engine turns it back into a carve here.
+    /// [`touching`](PortalHoles::touching) is the unswept, filterless version
+    /// of the same question and is what the `trace` command reports.
     pub fn get(&self, id: u64) -> Option<&CarvedWall> {
         self.walls.iter().find(|wall| wall.id == id)
     }
@@ -485,6 +727,85 @@ fn side_planes(out: &mut Pieces, hole: &PortalHole) -> [[u32; 4]; 4] {
             at(right, far_right),
         ]),
     ]
+}
+
+/// The four slabs that line the hole — `CreateTubePolyhedrons`
+/// (`portalsimulation.cpp:3812`), which is the same plane treatment
+/// [`side_planes`] does with one fewer degree of freedom.
+///
+/// A rectangular sleeve, [`WALL_MIN_THICKNESS`] thick, running from
+/// [`TUBE_OFFSET`] behind the plane to [`TUBE_DEPTH`] further back. It fills
+/// exactly the tenth of a unit between the hole's edge (`half + 0.1`) and
+/// where the carved wall's slabs begin (`half + 0.2`), so for the first unit
+/// of depth the opening is the portal's own size and after that it is a tenth
+/// wider. `portalsimulation.h:215` calls it *"a minimal tube, an object must
+/// fit inside this to be eligible for portaling"*.
+///
+/// The basis is passed in rather than read from `hole` because the remote set
+/// needs the same sleeve through the pair's matrix, and transforming a rigid
+/// basis is the whole of transforming the sleeve. `hole` supplies the two
+/// half-sizes and nothing else.
+fn tube_pieces(
+    out: &mut Pieces,
+    center: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    up: Vec3,
+    hole: &PortalHole,
+) {
+    let (back, left, down) = (-forward, -right, -up);
+    let half_width = hole.half_width + HOLE_MOD;
+    let half_height = hole.half_height + HOLE_MOD;
+    let (wide, tall) = (
+        half_width + WALL_MIN_THICKNESS,
+        half_height + WALL_MIN_THICKNESS,
+    );
+
+    let at = |normal: Vec3, distance: f32| cplane(normal, normal.dot(center) + distance);
+    // The first two planes never change: every slab is the same depth.
+    let depth = [
+        at(forward, -TUBE_OFFSET),
+        at(back, TUBE_DEPTH + TUBE_OFFSET),
+    ];
+
+    let slabs = [
+        // Upper, full width plus the thickness at each end.
+        [
+            at(up, tall),
+            at(down, -half_height),
+            at(left, wide),
+            at(right, wide),
+        ],
+        // Lower, the same.
+        [
+            at(up, -half_height),
+            at(down, tall),
+            at(left, wide),
+            at(right, wide),
+        ],
+        // Left, only as tall as the hole.
+        [
+            at(up, half_height),
+            at(down, half_height),
+            at(left, wide),
+            at(right, -half_width),
+        ],
+        // Right, the same on the other side.
+        [
+            at(up, half_height),
+            at(down, half_height),
+            at(left, -half_width),
+            at(right, wide),
+        ],
+    ];
+
+    for slab in slabs {
+        let mut planes = [0u32; 6];
+        for (slot, plane) in planes.iter_mut().zip(depth.iter().chain(slab.iter())) {
+            *slot = out.plane(*plane);
+        }
+        out.piece(TUBE_CONTENTS, &[], &planes);
+    }
 }
 
 /// A plane, with [`CPlane::axis`] filled in the way
@@ -687,7 +1008,7 @@ impl Pieces {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::trace::fixture::Fixture;
+    use crate::engine::trace::fixture::{self, Fixture};
     use crate::engine::trace::Ray;
 
     /// `PORTAL_HALF_WIDTH`, and the half-height this port settled on —
@@ -746,8 +1067,17 @@ mod tests {
         (collision, hole)
     }
 
+    /// One unlinked portal, as the store is told about it.
+    fn live(id: u64, hole: PortalHole) -> LivePortal {
+        LivePortal {
+            id,
+            hole,
+            link: None,
+        }
+    }
+
     fn carve(collision: &CollisionBsp, hole: &PortalHole) -> CarvedWall {
-        CarvedWall::build(&mut collision.tracer(), 1, hole)
+        CarvedWall::build(&mut collision.tracer(), 1, hole, None)
     }
 
     /// Whether a *point* is inside anything in this model.
@@ -1019,14 +1349,14 @@ mod tests {
         let mut holes = PortalHoles::default();
         assert!(holes.is_empty());
 
-        holes.sync(&collision, &[(7, hole)]);
+        holes.sync(&collision, &[live(7, hole)]);
         let carved = holes.get(7).expect("a portal that arrived was carved");
         assert!(carved.pieces() > 0, "{}", carved.summary());
         assert_eq!(carved.hole(), &hole);
         assert_eq!(carved.id(), 7);
 
         // Unchanged: the same placement, and nothing is asked of the map.
-        holes.sync(&collision, &[(7, hole)]);
+        holes.sync(&collision, &[live(7, hole)]);
         assert_eq!(holes.get(7).expect("still there").hole(), &hole);
 
         // `NewLocation`: the hole follows the portal.
@@ -1036,7 +1366,7 @@ mod tests {
             HALF_WIDTH,
             HALF_HEIGHT,
         );
-        holes.sync(&collision, &[(7, moved)]);
+        holes.sync(&collision, &[live(7, moved)]);
         assert_eq!(holes.get(7).expect("still there").hole(), &moved);
         let carved = holes.get(7).expect("still there");
         assert!(solid_at(carved.collision(), Vec3::new(-4.0, 0.0, 0.0)));
@@ -1082,6 +1412,202 @@ mod tests {
         let hit = carved.collision().tracer().trace(&through, CARVE);
         assert_eq!(hit.fraction, 1.0);
         assert!(!hit.start_solid && !hit.all_solid);
+    }
+
+    /// The tube is a sleeve, not a wall: it fills the tenth of a unit between
+    /// the hole's edge and the carved wall's, and only for the first unit of
+    /// depth.
+    ///
+    /// Three points a tenth of a unit apart decide it, which is why this is a
+    /// test and not a reading of the constants.
+    #[test]
+    fn the_tube_lines_the_hole_and_stops_a_unit_in() {
+        let (collision, hole) = wall(true);
+        let carved = carve(&collision, &hole);
+        let tube = carved.tube();
+
+        // Along `up`, half a unit behind the plane: inside the portal, in the
+        // seam, and past the seam.
+        let at = |up: f32, depth: f32| solid_at(tube, Vec3::new(-depth, 0.0, up));
+        assert!(!at(HALF_HEIGHT, 0.5), "the portal's own opening is blocked");
+        assert!(
+            at(HALF_HEIGHT + HOLE_MOD + WALL_MIN_THICKNESS * 0.5, 0.5),
+            "the seam between the hole and the wall is not lined"
+        );
+        assert!(
+            !at(HALF_HEIGHT + HOLE_MOD + WALL_MIN_THICKNESS * 2.0, 0.5),
+            "the sleeve is thicker than PORTAL_WALL_MIN_THICKNESS"
+        );
+
+        // And it is one unit deep, so past that the seam is open again — which
+        // is what makes it a *guide* rather than a narrower hole.
+        let seam = HALF_HEIGHT + HOLE_MOD + WALL_MIN_THICKNESS * 0.5;
+        assert!(at(seam, TUBE_OFFSET + TUBE_DEPTH * 0.5));
+        assert!(!at(seam, TUBE_OFFSET + TUBE_DEPTH * 2.0));
+        // Nothing in front of the plane at all.
+        assert!(!at(seam, -0.5));
+
+        // Four slabs, always.
+        assert_eq!(tube.brushes.len(), 4);
+    }
+
+    /// The remote ray puts the player's box at the **exit** portal, with the
+    /// delta rotated and the extents left alone.
+    #[test]
+    fn the_remote_ray_asks_the_exit_portal_about_the_same_sweep() {
+        let rooms = fixture::portal_rooms();
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &rooms.live());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+
+        // A hull standing in blue's hole, sweeping two units down.
+        let feet = Vec3::new(-4.0, 0.0, fixture::PORTAL_ROOM_FLOOR);
+        let ray = walk(feet, feet - Vec3::Z * 2.0);
+        let (far, shift) = blue.remote_ray(&ray, None).expect("a linked portal");
+
+        // Both portals are on walls and the hull is the same, so nothing has to
+        // shift along the exit normal.
+        assert_eq!(shift, Vec3::ZERO);
+        // Four units behind blue's plane becomes four units in front of
+        // orange's, and orange faces `+Y`.
+        let centre = feet + Vec3::new(0.0, 0.0, 36.0);
+        assert!(
+            (far.origin() - Vec3::new(1000.0, 4.0, centre.z)).length() < 1e-3,
+            "the box landed at {}",
+            far.origin()
+        );
+        // Down is still down: both portals' up is world up.
+        assert!((far.delta - Vec3::new(0.0, 0.0, -2.0)).length() < 1e-3);
+        assert_eq!(far.extents, ray.extents);
+    }
+
+    /// **The whole of stage 4's first half.** A box straddling the portal
+    /// plane is held up by a ledge in the room at the *other* end, and the
+    /// answer comes back in this room's frame.
+    ///
+    /// The ledge is higher than anything on this side, which is what makes the
+    /// test mean something: **the bottom of the hole is itself a ledge** — the
+    /// wall below the portal is still solid — so a carve with no far side
+    /// catches the player too, just lower down. Two answers that differ only
+    /// in the last decimal place would prove nothing, which is why this fixture
+    /// puts a platform at the far end 16 units above the hole's own lip.
+    #[test]
+    fn a_ledge_in_the_far_room_holds_a_player_up_through_the_portal() {
+        // In orange's room, over where a player entering blue comes out, with
+        // its top well above blue's hole lip.
+        const LEDGE_TOP: f32 = -40.0;
+        let ledge = (
+            Vec3::new(960.0, 0.0, LEDGE_TOP - 8.0),
+            Vec3::new(1040.0, 60.0, LEDGE_TOP),
+        );
+        let rooms = fixture::portal_rooms_with(&[ledge]);
+
+        // Straddling: the box's centre is a unit past blue's plane, so half of
+        // it is in the tunnel and half still in the room. Dropped from well
+        // above the hole's lip so that both answers are real fractions.
+        let feet = Vec3::new(-1.0, 0.0, -10.0);
+        let ray = walk(feet, feet - Vec3::Z * 60.0);
+
+        let real = rooms
+            .collision
+            .tracer()
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+        assert!(
+            real.start_solid,
+            "the fixture's wall is not where it thinks"
+        );
+
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &rooms.live());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        let landed = rooms
+            .collision
+            .tracer()
+            .with_hole(blue)
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+
+        // The normal came back through the matrix: both portals' up is world
+        // up, so a floor at the far end is still a floor here.
+        assert!(
+            (landed.normal - Vec3::Z).length() < 1e-3,
+            "{}",
+            landed.normal
+        );
+        // And the endpoint is in the **caller's** frame — the player's feet, on
+        // this side of the portal, at the height of the far room's ledge.
+        assert!(
+            (landed.end - Vec3::new(feet.x, 0.0, LEDGE_TOP)).length() < 0.1,
+            "the player ended at {}",
+            landed.end
+        );
+
+        // The control: the same carve with the pair broken. **This** room's
+        // floor still catches them — the box is straddling, so half of it is
+        // still over it — 16 units lower and later.
+        let mut unlinked = PortalHoles::default();
+        unlinked.sync(&rooms.collision, &rooms.unlinked());
+        let alone = unlinked.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        let fell = rooms
+            .collision
+            .tracer()
+            .with_hole(alone)
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+        assert!(
+            fell.fraction > landed.fraction + 0.1,
+            "the far room's ledge was not preferred: {} against {}",
+            landed.fraction,
+            fell.fraction
+        );
+        assert!(
+            (fell.end.z - fixture::PORTAL_ROOM_FLOOR).abs() < 0.1,
+            "the unlinked carve stopped at {} rather than on this room's floor",
+            fell.end.z
+        );
+    }
+
+    /// A portal that finds or loses a partner is recarved, because the far side
+    /// is part of what was carved.
+    #[test]
+    fn finding_a_partner_recarves_the_portal() {
+        let rooms = fixture::portal_rooms();
+        let mut holes = PortalHoles::default();
+
+        holes.sync(&rooms.collision, &rooms.unlinked());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        assert!(blue.remote().is_none() && blue.link().is_none());
+        let alone = blue.pieces();
+
+        holes.sync(&rooms.collision, &rooms.live());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        let remote = blue.remote().expect("the far side was carved");
+        assert_eq!(
+            blue.link().map(|link| link.exit_id),
+            Some(fixture::PortalRooms::ORANGE_ID)
+        );
+        // The pieces on *this* side did not change — only the far set arrived.
+        assert_eq!(blue.pieces(), alone);
+        // The far room's floor, plus the four slabs of the moved tube.
+        assert!(
+            remote.brushes.len() > 4,
+            "the remote set is only the tube: {}",
+            blue.summary()
+        );
+
+        // …and the moved tube is in *front* of the exit plane, not behind it,
+        // which is the half turn in the matrix and the reason this cannot be
+        // the exit portal's own tube.
+        let seam = 32.0 + HOLE_MOD + WALL_MIN_THICKNESS * 0.5;
+        let front = Vec3::new(1000.0 + seam, TUBE_OFFSET + TUBE_DEPTH * 0.5, 0.0);
+        let behind = Vec3::new(1000.0 + seam, -(TUBE_OFFSET + TUBE_DEPTH * 0.5), 0.0);
+        assert!(solid_at(remote, front), "the moved tube is not in front");
+        assert!(!solid_at(remote, behind), "the moved tube is behind");
+
+        holes.sync(&rooms.collision, &rooms.unlinked());
+        assert!(holes
+            .get(fixture::PortalRooms::BLUE_ID)
+            .expect("carved")
+            .remote()
+            .is_none());
     }
 
     /// Every `prop_portal` the game places, carved against the map it is on:
@@ -1166,7 +1692,8 @@ mod tests {
                 );
 
                 let started = std::time::Instant::now();
-                let carved = CarvedWall::build(&mut collision.tracer(), portals as u64, &hole);
+                let carved =
+                    CarvedWall::build(&mut collision.tracer(), portals as u64, &hole, None);
                 let took = started.elapsed();
                 worst = worst.max(took);
                 total += took;

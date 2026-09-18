@@ -6830,7 +6830,7 @@ fn placing_a_pair_by_hand_creates_and_links_two_portals() {
     assert!(server.place_portal(false, Vec3::new(0.0, 0.0, 64.0), Vec3::ZERO));
     let portals = server.portals();
     assert_eq!(portals.len(), 1, "one active portal");
-    assert!(!portals[0].linked, "nobody to link to yet");
+    assert!(portals[0].linked.is_none(), "nobody to link to yet");
     assert_eq!(portals[0].half_height, portal::DEFAULT_HALF_HEIGHT);
 
     assert!(server.place_portal(
@@ -6840,7 +6840,10 @@ fn placing_a_pair_by_hand_creates_and_links_two_portals() {
     ));
     let portals = server.portals();
     assert_eq!(portals.len(), 2);
-    assert!(portals.iter().all(|p| p.linked), "a pair, both ways");
+    assert!(
+        portals.iter().all(|p| p.linked.is_some()),
+        "a pair, both ways"
+    );
     assert_eq!(
         portals.iter().filter(|p| p.is_portal2).count(),
         1,

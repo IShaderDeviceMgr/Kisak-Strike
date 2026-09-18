@@ -44,7 +44,9 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
-use crate::engine::trace::{BrushModel, CollisionBsp, Contents, PortalHole, PortalHoles, Ray};
+use crate::engine::trace::{
+    BrushModel, CollisionBsp, Contents, LivePortal, PortalHole, PortalHoles, PortalLink, Ray,
+};
 use crate::filesystem::mount::pak::PakMount;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
@@ -911,13 +913,28 @@ impl World {
         // `PortalHoles::sync` compares each placement against the one it
         // carved, so a portal standing still costs one comparison and a map
         // with no portal costs nothing.
-        let live: Vec<(u64, PortalHole)> = portals
+        //
+        // **The pairing is resolved here**, from the same list, which is what
+        // makes a portal's hole and its partner's hole two halves of one
+        // answer: a link is only carried across when *both* sides of it are in
+        // the list, so a portal naming a partner that is not here carves as an
+        // unlinked one rather than as one pointing at nothing.
+        let hole = |p: &Portal| PortalHole::new(p.origin, p.angles, p.half_width, p.half_height);
+        let live: Vec<LivePortal> = portals
             .iter()
-            .map(|p| {
-                (
-                    p.id,
-                    PortalHole::new(p.origin, p.angles, p.half_width, p.half_height),
-                )
+            .map(|portal| LivePortal {
+                id: portal.id,
+                hole: hole(portal),
+                link: portal
+                    .linked
+                    .and_then(|id| portals.iter().find(|other| other.id == id))
+                    .map(|exit| PortalLink {
+                        exit_id: exit.id,
+                        exit: hole(exit),
+                        to_exit: portal.matrix,
+                        // The partner's own matrix, which is this one undone.
+                        to_entrance: exit.matrix,
+                    }),
             })
             .collect();
         self.portal_holes.sync(&self.collision, &live);

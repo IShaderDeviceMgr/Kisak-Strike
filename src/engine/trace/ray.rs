@@ -76,6 +76,15 @@ impl Ray {
         self.start + self.offset
     }
 
+    /// Where the sweep ends, in the same frame [`origin`](Ray::origin) is in.
+    ///
+    /// For reporting a ray that something else built — the `trace` command
+    /// prints the transformed ray a portal pair produces, and reconstructing
+    /// its far end from the private fields is not the caller's business.
+    pub fn end(&self) -> Vec3 {
+        self.origin() + self.delta
+    }
+
     /// `Ray_t::InvDelta` — reciprocals with a sentinel for the zero axes,
     /// because the slab test multiplies by these rather than dividing.
     pub(super) fn inv_delta(&self) -> Vec3 {

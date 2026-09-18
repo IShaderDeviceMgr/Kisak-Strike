@@ -8,6 +8,7 @@
 
 use glam::Vec3;
 
+use super::carve::{LivePortal, PortalHole, PortalLink};
 use super::{CollisionBsp, Contents};
 use crate::engine::world::bsp::{
     Brush, BrushSide, Bsp, DispInfo, DispTri, DispVert, Edge, Face, Leaf, Model, Node, Plane,
@@ -454,5 +455,159 @@ impl Fixture {
             disp_verts: self.disp_verts,
             disp_tris: self.disp_tris,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two rooms and a linked pair
+// ---------------------------------------------------------------------------
+
+/// Where the floor of both rooms is, so that a test can stand a player on it:
+/// the top of the slab, and also exactly the bottom edge of both portals.
+///
+/// A portal's centre is at `z = 0` and its half-height is 56, so a player
+/// standing here walks straight into the hole with no step up.
+pub(crate) const PORTAL_ROOM_FLOOR: f32 = -56.0;
+
+/// How thick both rooms' walls are.
+///
+/// Thick enough that a player hull standing in the middle of the hole is out
+/// of reach of *this* room's floor even after the box sweep's plane expansion
+/// — 16 units of hull plus room to spare. A thin slab would leave the near
+/// floor catching the player at exactly the height the far floor does, and a
+/// test that cannot tell the two apart proves nothing.
+pub(crate) const PORTAL_ROOM_WALL: f32 = 40.0;
+
+/// Two rooms with a linked portal pair between them — the fixture every
+/// stage-4 test walks through.
+///
+/// Shared between `trace::carve`'s tests and `client::movement`'s because the
+/// two halves of the teleport are only meaningful against the same geometry:
+/// one asserts that the far room's floor holds the player up, the other that
+/// they come out standing on it.
+pub(crate) struct PortalRooms {
+    pub(crate) collision: CollisionBsp,
+    /// On a wall through `x = 0`, facing `+X`, with the room in front of it.
+    pub(crate) blue: LivePortal,
+    /// A thousand units away on a wall through `y = 0`, facing `+Y`.
+    ///
+    /// **A different yaw on purpose.** With both portals facing the same way
+    /// the pair's matrix rotates vectors by nothing at all and every sign
+    /// error in the teleport passes.
+    pub(crate) orange: LivePortal,
+}
+
+impl PortalRooms {
+    pub(crate) const BLUE_ID: u64 = 1;
+    pub(crate) const ORANGE_ID: u64 = 2;
+
+    /// Both portals, as [`PortalHoles::sync`](super::PortalHoles::sync) wants
+    /// them.
+    pub(crate) fn live(&self) -> [LivePortal; 2] {
+        [self.blue, self.orange]
+    }
+
+    /// The same, with neither portal knowing about the other — the control for
+    /// every test about the far side.
+    pub(crate) fn unlinked(&self) -> [LivePortal; 2] {
+        [
+            LivePortal {
+                link: None,
+                ..self.blue
+            },
+            LivePortal {
+                link: None,
+                ..self.orange
+            },
+        ]
+    }
+}
+
+/// Builds [`PortalRooms`].
+///
+/// Each room is a wall with the portal on its face, a floor 56 units below the
+/// portal's centre, and nothing else. The two are far enough apart that
+/// neither one's carve can see the other's geometry, which is what makes a
+/// trace that finds the far room's floor proof that it went through the
+/// matrix.
+pub(crate) fn portal_rooms() -> PortalRooms {
+    portal_rooms_with(&[])
+}
+
+/// The same, plus `extra` boxes — whatever the test wants to put in one of the
+/// two rooms.
+///
+/// Every stage-4 test is about the geometry at the *far* end being taken into
+/// account, so every one of them needs something at the far end that the near
+/// end does not have. Passing it in keeps the two rooms themselves identical
+/// between tests.
+pub(crate) fn portal_rooms_with(extra: &[(Vec3, Vec3)]) -> PortalRooms {
+    // `teleport_matrix` rather than a second derivation: there is **one**
+    // teleport matrix in this port, the server computes it, and a fixture that
+    // spelled it again could agree with a wrong carve. `fixture` is
+    // `#[cfg(test)]`, so naming `server/` from `trace/` here costs the port no
+    // layering.
+    use crate::server::classes::portal::teleport_matrix;
+
+    let blue_at = (Vec3::ZERO, Vec3::ZERO);
+    let orange_at = (Vec3::new(1000.0, 0.0, 0.0), Vec3::new(0.0, 90.0, 0.0));
+    let hole = |(origin, angles): (Vec3, Vec3)| PortalHole::new(origin, angles, 32.0, 56.0);
+
+    let mut fixture = Fixture::default();
+    let solid = |fixture: &mut Fixture, mins: Vec3, maxs: Vec3| {
+        fixture.add_box(mins, maxs, Contents::SOLID, true);
+    };
+    // Blue's room: the wall it is on, and the floor in front of it. The wall
+    // is [`PORTAL_ROOM_WALL`] thick rather than a slab, so that the hole
+    // through it is a *tunnel* a hull can be wholly inside — which is the only
+    // place the far room's floor is the one thing holding the player up.
+    solid(
+        &mut fixture,
+        Vec3::new(-PORTAL_ROOM_WALL, -256.0, -256.0),
+        Vec3::new(0.0, 256.0, 256.0),
+    );
+    solid(
+        &mut fixture,
+        Vec3::new(0.0, -200.0, PORTAL_ROOM_FLOOR - 20.0),
+        Vec3::new(200.0, 200.0, PORTAL_ROOM_FLOOR),
+    );
+    // Orange's, on a wall the other way round.
+    solid(
+        &mut fixture,
+        Vec3::new(872.0, -PORTAL_ROOM_WALL, -256.0),
+        Vec3::new(1128.0, 0.0, 256.0),
+    );
+    solid(
+        &mut fixture,
+        Vec3::new(900.0, 0.0, PORTAL_ROOM_FLOOR - 20.0),
+        Vec3::new(1100.0, 200.0, PORTAL_ROOM_FLOOR),
+    );
+
+    for &(mins, maxs) in extra {
+        solid(&mut fixture, mins, maxs);
+    }
+
+    PortalRooms {
+        collision: fixture.single_leaf(),
+        blue: LivePortal {
+            id: PortalRooms::BLUE_ID,
+            hole: hole(blue_at),
+            link: Some(PortalLink {
+                exit_id: PortalRooms::ORANGE_ID,
+                exit: hole(orange_at),
+                to_exit: teleport_matrix(blue_at, orange_at),
+                to_entrance: teleport_matrix(orange_at, blue_at),
+            }),
+        },
+        orange: LivePortal {
+            id: PortalRooms::ORANGE_ID,
+            hole: hole(orange_at),
+            link: Some(PortalLink {
+                exit_id: PortalRooms::BLUE_ID,
+                exit: hole(blue_at),
+                to_exit: teleport_matrix(orange_at, blue_at),
+                to_entrance: teleport_matrix(blue_at, orange_at),
+            }),
+        },
     }
 }

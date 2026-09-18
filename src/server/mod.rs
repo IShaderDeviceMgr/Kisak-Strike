@@ -434,14 +434,24 @@ pub struct PortalState {
     /// [`ModelEntityState::anim_time`] is: a 64 Hz tick would step an effect
     /// that has to be smooth.
     pub opened_at: f32,
-    /// Whether this portal found a partner.
+    /// The partner this portal found, if it found one — the same key
+    /// [`id`](PortalState::id) is.
     ///
-    /// Nothing in the draw reads it yet — an active portal wears its oval
-    /// linked or not, which is Valve's, because `ShouldDraw` asks only about
-    /// `IsActive()`. It is here because it is the one thing about a portal a
-    /// developer wants the console to tell them, and `ent_dump` is on the
-    /// other side of the seam.
-    pub linked: bool,
+    /// Nothing in the *draw* reads it: an active portal wears its oval linked
+    /// or not, which is Valve's, because `ShouldDraw` asks only about
+    /// `IsActive()`. The collision does — a portal with no partner cuts its
+    /// hole and has nothing on the far side of it — and so does the console,
+    /// because it is the one thing about a portal a developer wants told and
+    /// `ent_dump` is on the other side of the seam.
+    pub linked: Option<u64>,
+    /// `m_matrixThisToLinked` — where a point at this portal comes out.
+    ///
+    /// **The identity while unlinked**, which is what `CPortal_Base2D`'s own
+    /// field is. Carried across the seam rather than recomputed on the far
+    /// side so that there is exactly one teleport matrix in the port and no
+    /// second spelling of the 180° that can be missing from it; see
+    /// [`teleport_matrix`](classes::portal::teleport_matrix).
+    pub matrix: glam::Mat4,
 }
 
 /// A [`TouchQuery`] that never reports anything.
@@ -2038,7 +2048,11 @@ impl Server {
                     half_height: portal.half_height,
                     is_portal2: portal.is_portal2,
                     opened_at: portal.opened_at,
-                    linked: portal.is_active_and_linked(),
+                    linked: portal
+                        .is_active_and_linked()
+                        .then(|| portal.linked.map(|id| id.to_int()))
+                        .flatten(),
+                    matrix: portal.matrix,
                 })
             })
             .collect()
