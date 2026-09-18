@@ -256,8 +256,16 @@ impl Material {
             // The only shader here whose block does not depend on `resolved`
             // *or* on the textures: it reads two of them and asks neither for
             // its size or its alpha channel.
-            ShaderKind::PortalRefract => {
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => {
                 let block = shader::portal_refract_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
+            // The clear shader's only parameter is a colour it never writes.
+            // Built rather than skipped because a bind group must supply every
+            // entry its layout declares, and every layout here declares a
+            // block at `BINDING_MATERIAL_UNIFORMS`.
+            ShaderKind::BufferClearObeyStencil => {
+                let block = shader::buffer_clear_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
         };
@@ -503,6 +511,62 @@ impl MaterialCache {
     /// studio models take this.
     pub fn error_model_material(&self) -> Arc<Material> {
         Arc::clone(&self.error_model)
+    }
+
+    /// Builds a material from a `.vmt` written in code rather than read from
+    /// the game.
+    ///
+    /// `CMaterialSystem::CreateMaterial( name, KeyValues * )`, which is how
+    /// every material the *engine* needs and content does not provide comes to
+    /// exist: the error checkerboard (`CreateDebugMaterials`), the eight
+    /// `BufferClearObeyStencil` variants, `___depthwrite`, the water
+    /// reflection materials. Only the first two are ported.
+    ///
+    /// Cached under `name` like any other, so a caller may ask on every frame.
+    /// **Give it a name content cannot collide with** — the convention here is
+    /// Valve's, a leading `___`.
+    ///
+    /// # Panics
+    ///
+    /// If `source` is not valid `KeyValues` or does not resolve to a ported
+    /// shader. Both are programming errors in a literal in this binary, not
+    /// data errors, and answering with the checkerboard would hide them.
+    pub fn synthetic(&mut self, name: &str, source: &str) -> Arc<Material> {
+        if let Some(material) = self.materials.get(name) {
+            return Arc::clone(material);
+        }
+        let document = keyvalues::parse(name, source)
+            .unwrap_or_else(|err| panic!("{name} is a literal in this binary: {err}"));
+        let vmt = Vmt::from_keyvalues(name, &document)
+            .unwrap_or_else(|err| panic!("{name} is a literal in this binary: {err}"));
+
+        let MaterialCache {
+            device,
+            queue,
+            textures,
+            pipelines,
+            ..
+        } = self;
+        let fallback = TextureFallbacks {
+            white: textures.white_texture(),
+            error: textures.error_texture(),
+            black_cube: textures.black_cube_texture(),
+        };
+        let material = Material::new(
+            device,
+            queue,
+            pipelines.layouts(),
+            name,
+            &vmt,
+            &fallback,
+            // A synthetic material names no texture; if one ever did, this is
+            // where a `Vfs` would have to be threaded in.
+            |_, _, _| Arc::clone(&fallback.white),
+        )
+        .unwrap_or_else(|| panic!("{name} names a shader this port does not have"));
+        let material = Arc::new(material);
+        self.materials.insert(name.to_owned(), Arc::clone(&material));
+        material
     }
 
     /// Loads `materials/<name>.vmt`, or returns the error material.

@@ -97,6 +97,42 @@ mod tests {
             .collect();
         world.load_entity_models(&vfs, &mut materials, &device, &placements);
         println!("{}", world.entity_models.summary());
+
+        // **A linked pair in front of the camera**, so that the recursive view
+        // has something to recurse through. Placed in open air rather than on
+        // a wall for the reason `portalview`'s rendered test gives: a trace out
+        // of this spawn goes through the container the player wakes up in, and
+        // a portal behind an opaque surface costs nothing to draw.
+        //
+        // Both at one point, sixty degrees apart — the angle is what decides
+        // whether the *second* level has anything to draw, and this is the
+        // case that costs the most.
+        let bench_eye = world
+            .spawn
+            .map(|spawn| spawn.origin + Vec3::Z * 64.0)
+            .unwrap_or_else(|| world.center());
+        let portal = |id: u64, yaw: f32, is_portal2: bool, matrix: glam::Mat4| {
+            crate::engine::world::portals::Portal {
+                id,
+                origin: bench_eye + Vec3::X * 96.0,
+                angles: Vec3::new(0.0, yaw, 0.0),
+                half_width: 32.0,
+                half_height: 54.0,
+                is_portal2,
+                open_for: 10.0,
+                linked: Some(1 - id),
+                matrix,
+            }
+        };
+        let (entrance, exit) = (
+            (bench_eye + Vec3::X * 96.0, Vec3::new(0.0, 180.0, 0.0)),
+            (bench_eye + Vec3::X * 96.0, Vec3::new(0.0, -60.0, 0.0)),
+        );
+        use crate::server::classes::portal::teleport_matrix;
+        world.sync_portals(&[
+            portal(0, 180.0, false, teleport_matrix(entrance, exit)),
+            portal(1, -60.0, true, teleport_matrix(exit, entrance)),
+        ]);
         let world = world;
 
         let mut context = RenderContext::new(&device, &queue, materials.pipelines());
@@ -219,6 +255,23 @@ mod tests {
         run("everything, novis", &|pass| {
             world.draw(pass, 0.0, &everything)
         });
+        // **The recursive view, at each depth the cvar allows by default.**
+        // Whole frames including the world, so the number to read is the
+        // difference from `everything`: one level is one more world draw from
+        // somewhere else, and the marginal cost of the second is what says
+        // whether the rectangle narrowing and the PVS are doing their job.
+        for depth in 1..=crate::engine::world::portalview::DEFAULT_RECURSION {
+            let setup = crate::engine::world::portalview::PortalViewSetup {
+                curtime: 0.0,
+                max_depth: depth,
+                viewport: (SIZE, SIZE),
+                novis: false,
+            };
+            run(&format!("+ portal depth {depth}"), &|pass| {
+                world.draw(pass, 0.0, &visible);
+                world.draw_portal_views(pass, &setup, &camera, &visible);
+            });
+        }
         drop(run);
 
         // The translucent half, which is a *third* pass and — unlike the two

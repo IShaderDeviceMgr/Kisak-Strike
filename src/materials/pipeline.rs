@@ -52,6 +52,16 @@ pub struct RenderState {
     pub depth_write: bool,
     pub depth_func: DepthFunc,
     pub depth_bias: DepthBias,
+    /// Whether the colour channels of the render target are written.
+    ///
+    /// `EnableColorWrites`, on by default. Two shaders turn it off and both
+    /// exist to touch nothing but depth and stencil:
+    /// [`BufferClearObeyStencil`](super::shader::ShaderKind::BufferClearObeyStencil)
+    /// always, and the portal's stencil hole on its *second* draw, where it
+    /// restores the depth a portal view overwrote — see
+    /// `portdocs/PORTAL_RENDER.md` §6.3, which is also why `writez` never
+    /// needed porting.
+    pub write_color: bool,
     /// Whether the alpha channel of the render target is written.
     ///
     /// Off by default, which is Valve's default and surprising:
@@ -60,6 +70,25 @@ pub struct RenderState {
     /// opaque materials so that the frame's alpha channel can hold something
     /// else — depth, for the underwater fog pass.
     pub write_alpha: bool,
+    /// The stencil test and its three operations, or `None` for "disabled" —
+    /// which is `ShaderStencilState_t::m_bEnable` and is what every material in
+    /// the game asks for.
+    ///
+    /// **Nothing in a `.vmt` reaches this.** Valve set the stencil on
+    /// `IMatRenderContext`, never in a shadow phase, because it is a property
+    /// of *what is being drawn for* and not of the material: the same wall
+    /// material draws with four different stencil states in the course of one
+    /// portal view. So this is written only by
+    /// [`StateOverride::stencil`](super::context::StateOverride::stencil), and
+    /// [`render_state`](super::shader::render_state) leaves it `None`.
+    ///
+    /// It is in the *pipeline* key because `wgpu` puts it there. Only the
+    /// reference value is dynamic state
+    /// ([`Pass::set_stencil`](super::context::Pass::set_stencil) issues it);
+    /// the compare function, the three operations and the two masks are baked,
+    /// which is why the portal view costs four pipelines per shader it draws
+    /// with rather than four state changes.
+    pub stencil: Option<Stencil>,
     /// `EnableAlphaToCoverage`, for `$allowalphatocoverage`. Needs a
     /// multisampled target to do anything.
     pub alpha_to_coverage: bool,
@@ -76,8 +105,101 @@ impl Default for RenderState {
             depth_write: true,
             depth_func: DepthFunc::NearerOrEqual,
             depth_bias: DepthBias::None,
+            write_color: true,
             write_alpha: false,
+            stencil: None,
             alpha_to_coverage: false,
+        }
+    }
+}
+
+/// `ShaderStencilState_t` (`public/shaderapi/ishaderapi.h`), minus the enable
+/// flag — an absent [`RenderState::stencil`] is the disabled state.
+///
+/// Both faces get the same settings. D3D9's two-sided stencil is off unless
+/// `D3DRS_TWOSIDEDSTENCILMODE` is set, and `CShaderAPIDx8::SetStencilState`
+/// never sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Stencil {
+    /// `m_CompareFunc`, against the reference value
+    /// [`Pass::set_stencil`](super::context::Pass::set_stencil) supplies.
+    pub compare: StencilFunc,
+    /// `m_PassOp` — what happens when both the stencil and the depth test pass.
+    pub pass_op: StencilOp,
+    /// `m_FailOp` — the stencil test failed.
+    pub fail_op: StencilOp,
+    /// `m_ZFailOp` — the stencil test passed and the depth test did not.
+    pub depth_fail_op: StencilOp,
+    /// `m_nTestMask`, ANDed into both sides of the comparison.
+    pub read_mask: u8,
+    /// `m_nWriteMask`.
+    pub write_mask: u8,
+}
+
+impl Stencil {
+    fn state(self) -> wgpu::StencilState {
+        let face = wgpu::StencilFaceState {
+            compare: self.compare.into(),
+            fail_op: self.fail_op.into(),
+            depth_fail_op: self.depth_fail_op.into(),
+            pass_op: self.pass_op.into(),
+        };
+        wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: u32::from(self.read_mask),
+            write_mask: u32::from(self.write_mask),
+        }
+    }
+}
+
+/// `ShaderStencilFunc_t`. The three the portal view uses; the enum has eight
+/// and the other five have no caller in the tree's Portal 2 paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StencilFunc {
+    /// `SHADER_STENCILFUNC_ALWAYS`.
+    Always,
+    /// `SHADER_STENCILFUNC_EQUAL`.
+    Equal,
+    /// `SHADER_STENCILFUNC_NOTEQUAL`.
+    NotEqual,
+}
+
+impl From<StencilFunc> for wgpu::CompareFunction {
+    fn from(func: StencilFunc) -> Self {
+        match func {
+            StencilFunc::Always => wgpu::CompareFunction::Always,
+            StencilFunc::Equal => wgpu::CompareFunction::Equal,
+            StencilFunc::NotEqual => wgpu::CompareFunction::NotEqual,
+        }
+    }
+}
+
+/// `ShaderStencilOp_t`, the four the portal view uses.
+///
+/// `SET_TO_REFERENCE` is `wgpu`'s `Replace` — the same operation under the name
+/// D3D9 gave it, `D3DSTENCILOP_REPLACE`. The clamping increment and decrement
+/// are what make `portdocs/PORTAL_RENDER.md` §2.1's scheme work at any depth:
+/// a level marks its hole by adding one and unmarks it by taking one away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StencilOp {
+    /// `SHADER_STENCILOP_KEEP`.
+    Keep,
+    /// `SHADER_STENCILOP_SET_TO_REFERENCE`.
+    SetToReference,
+    /// `SHADER_STENCILOP_INCREMENT_CLAMP`.
+    IncrementClamp,
+    /// `SHADER_STENCILOP_DECREMENT_CLAMP`.
+    DecrementClamp,
+}
+
+impl From<StencilOp> for wgpu::StencilOperation {
+    fn from(op: StencilOp) -> Self {
+        match op {
+            StencilOp::Keep => wgpu::StencilOperation::Keep,
+            StencilOp::SetToReference => wgpu::StencilOperation::Replace,
+            StencilOp::IncrementClamp => wgpu::StencilOperation::IncrementClamp,
+            StencilOp::DecrementClamp => wgpu::StencilOperation::DecrementClamp,
         }
     }
 }
@@ -233,6 +355,7 @@ pub struct BindLayouts {
     phong_material: wgpu::BindGroupLayout,
     refract_material: wgpu::BindGroupLayout,
     portal_refract_material: wgpu::BindGroupLayout,
+    buffer_clear_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
     model_lighting: wgpu::BindGroupLayout,
     frame_buffer_copy: wgpu::BindGroupLayout,
@@ -416,6 +539,25 @@ impl BindLayouts {
             // object would make it look as though a portal could be handed a
             // model's ambient cube.
             portal_overlay: uniform_layout(device, "portal overlay"),
+            // One entry, and it is there because every pipeline declares a
+            // group 1: the clear shader has no textures and reads its block
+            // from a pixel whose colour is masked away. See
+            // `ShaderKind::BufferClearObeyStencil`.
+            buffer_clear_material: device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material: BufferClearObeyStencil"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: BINDING_MATERIAL_UNIFORMS,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                },
+            ),
             portal_refract_material: device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
                     label: Some("material: PortalRefract"),
@@ -482,7 +624,14 @@ impl BindLayouts {
             // exponent map and the two warps, so the two sets are not nested.
             ShaderKind::Phong => &self.phong_material,
             ShaderKind::Refract => &self.refract_material,
-            ShaderKind::PortalRefract => &self.portal_refract_material,
+            // One layout for two variants, the way `LightmappedGeneric` and
+            // `WorldVertexTransition` share one: the two stages declare the
+            // same parameters and the same two samplers, and stage 1 simply
+            // does not read them.
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => {
+                &self.portal_refract_material
+            }
+            ShaderKind::BufferClearObeyStencil => &self.buffer_clear_material,
         }
     }
 
@@ -700,10 +849,11 @@ impl PipelineCache {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: key.target.color,
                         blend: state.blend.state(),
-                        write_mask: if state.write_alpha {
-                            wgpu::ColorWrites::ALL
-                        } else {
-                            wgpu::ColorWrites::COLOR
+                        write_mask: {
+                            let mut mask = wgpu::ColorWrites::empty();
+                            mask.set(wgpu::ColorWrites::COLOR, state.write_color);
+                            mask.set(wgpu::ColorWrites::ALPHA, state.write_alpha);
+                            mask
                         },
                     })],
                     compilation_options: Default::default(),
@@ -731,7 +881,17 @@ impl PipelineCache {
                     } else {
                         wgpu::CompareFunction::Always
                     }),
-                    stencil: wgpu::StencilState::default(),
+                    // `StencilState::default()` is write mask 0 and compare
+                    // `Always`, which is how WebGPU spells "no stencil" — and
+                    // which is compatible with a pass that declared the aspect
+                    // read-only. A pipeline that writes stencil against such a
+                    // pass is a validation error, which is why
+                    // `RenderContext::open` gives every depth attachment
+                    // stencil operations. `portdocs/PORTAL_RENDER.md` §8's
+                    // invariant 7.
+                    stencil: state
+                        .stencil
+                        .map_or_else(wgpu::StencilState::default, Stencil::state),
                     bias: state.depth_bias.state(),
                 }),
                 multisample: wgpu::MultisampleState {
@@ -773,8 +933,60 @@ mod tests {
         assert!(state.depth_write);
         assert_eq!(state.depth_func, DepthFunc::NearerOrEqual);
         assert_eq!(state.depth_bias, DepthBias::None);
+        assert!(state.write_color, "EnableColorWrites( true )");
         assert!(!state.write_alpha, "EnableAlphaWrites( false )");
         assert!(!state.alpha_to_coverage);
+        assert_eq!(state.stencil, None, "the stencil is never a material's");
+    }
+
+    /// The stencil translation, op by op, because every one of them is a name
+    /// change rather than a concept change and a swapped pair would be silent:
+    /// `SET_TO_REFERENCE` is `Replace` and the clamping pair is what
+    /// `portdocs/PORTAL_RENDER.md` §2.1's depth scheme is built on.
+    #[test]
+    fn the_stencil_ops_are_d3d9s_under_wgpus_names() {
+        use wgpu::{CompareFunction, StencilOperation};
+
+        assert_eq!(
+            wgpu::CompareFunction::from(StencilFunc::Always),
+            CompareFunction::Always
+        );
+        assert_eq!(
+            wgpu::CompareFunction::from(StencilFunc::Equal),
+            CompareFunction::Equal
+        );
+        assert_eq!(
+            wgpu::CompareFunction::from(StencilFunc::NotEqual),
+            CompareFunction::NotEqual
+        );
+        assert_eq!(
+            wgpu::StencilOperation::from(StencilOp::SetToReference),
+            StencilOperation::Replace,
+            "D3DSTENCILOP_REPLACE under its other name"
+        );
+        assert_eq!(
+            wgpu::StencilOperation::from(StencilOp::IncrementClamp),
+            StencilOperation::IncrementClamp
+        );
+        assert_eq!(
+            wgpu::StencilOperation::from(StencilOp::DecrementClamp),
+            StencilOperation::DecrementClamp
+        );
+
+        // Both faces, the same: D3D9's two-sided stencil is off unless
+        // `D3DRS_TWOSIDEDSTENCILMODE` is set and nothing sets it.
+        let stencil = Stencil {
+            compare: StencilFunc::Equal,
+            pass_op: StencilOp::IncrementClamp,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            read_mask: 0xFF,
+            write_mask: 0xFF,
+        }
+        .state();
+        assert_eq!(stencil.front, stencil.back);
+        assert_eq!(stencil.read_mask, 0xFF);
+        assert_eq!(stencil.write_mask, 0xFF);
     }
 
     #[test]

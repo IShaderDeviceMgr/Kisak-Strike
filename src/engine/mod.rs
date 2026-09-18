@@ -88,6 +88,8 @@ pub struct Engine<'a> {
     fps_max: Cvar,
     /// `r_novis` — draw everything, PVS or no PVS.
     r_novis: Cvar,
+    /// `r_portal_stencil_depth` — how many views within views a portal shows.
+    r_portal_stencil_depth: Cvar,
     /// `r_lockpvs` — stop recomputing the visible set so the view can be flown
     /// around it.
     ///
@@ -237,6 +239,21 @@ impl<'a> Engine<'a> {
             CvarFlags::CHEAT,
             "Lock the PVS so you can fly around and inspect what is being drawn.",
         );
+        // `portalrender.cpp:43`, default and flags both. Bounded here where
+        // Valve bounds it at the call site: `MIN( r_portal_stencil_depth,
+        // MIN( MAX_PORTAL_RECURSIVE_VIEWS, 1 << StencilBufferBits() ) - 1 )`.
+        // Eight stencil bits put that second term far above the first, so the
+        // limit that bites is `MAX_PORTAL_RECURSIVE_VIEWS` and it is a taste
+        // judgement — *"5 is extremely choppy under best conditions and is
+        // barely visible"*.
+        let r_portal_stencil_depth = console.cvar_bounded(
+            "r_portal_stencil_depth",
+            &world::portalview::DEFAULT_RECURSION.to_string(),
+            CvarFlags::ARCHIVE,
+            "When using stencil views, this changes how many views within views we see.",
+            Some(0.0),
+            Some(f32::from(world::portalview::MAX_RECURSION)),
+        );
 
         // The game client's cvars — `sensitivity`, the mouse factors, the
         // movement speeds — are registered by the client itself, because it is
@@ -376,6 +393,7 @@ impl<'a> Engine<'a> {
             fps_max,
             r_novis,
             r_lockpvs,
+            r_portal_stencil_depth,
             locked_eye: None,
             scene: Scene {
                 vfs,
@@ -877,7 +895,14 @@ impl<'a> Engine<'a> {
     /// draws straight to the back buffer and is never measured.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let camera = self.camera(frame.size());
+        let size = frame.size();
         let curtime = self.scene.curtime;
+        // Read here because `frame` is borrowed by the pass that wants it and
+        // `self` by the scene that owns the world.
+        let portal_depth = self
+            .r_portal_stencil_depth
+            .int()
+            .clamp(0, i32::from(world::portalview::MAX_RECURSION)) as u8;
         // `gpGlobals->frametime`, which is what the exposure is smoothed
         // against. Read before the split borrow below, since it is the host's.
         let frametime = self.host.frame_time();
@@ -948,13 +973,9 @@ impl<'a> Engine<'a> {
         }
         let eye = self.locked_eye.unwrap_or(camera.eye);
         let outside = world.vis.cluster_at(eye) < 0;
-        let visible = world.visible(
-            eye,
-            camera.view_proj(),
-            self.r_novis.bool()
-                || (outside
-                    && client.player().move_type == crate::client::player::MoveType::Noclip),
-        );
+        let novis = self.r_novis.bool()
+            || (outside && client.player().move_type == crate::client::player::MoveType::Noclip);
+        let visible = world.visible(eye, camera.view_proj(), novis);
 
         // The block ends both borrows of `post` before `resolve` takes it
         // mutably.
@@ -970,6 +991,31 @@ impl<'a> Engine<'a> {
                 Load::Clear(CLEAR_COLOR),
             );
             world.draw(&mut pass, curtime, &visible);
+
+            // `DrawRecursivePortalViews()`' own place in the frame
+            // (`CBaseWorldView::DrawExecute`, `viewrender.cpp:8021`): after
+            // the opaque world and its entities, before anything translucent
+            // — and **in the same pass**, because a portal view is a stencil
+            // state and a second camera rather than a second target. See
+            // `portdocs/PORTAL_RENDER.md` §2.3.
+            //
+            // The pass is handed back with its stencil disabled, its scissor
+            // reset and this camera bound again, so nothing below needs to
+            // know it ran.
+            world.draw_portal_views(
+                &mut pass,
+                &world::portalview::PortalViewSetup {
+                    curtime,
+                    max_depth: portal_depth,
+                    viewport: size,
+                    // The debug switch has to mean the same thing inside a
+                    // portal as outside one, or `r_novis` turns every portal
+                    // into a window on the whole map.
+                    novis,
+                },
+                &camera,
+                &visible,
+            );
         }
 
         // `UpdateRefractTexture` and `DrawTranslucentRenderables`, in that

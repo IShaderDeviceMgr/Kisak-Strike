@@ -37,6 +37,7 @@ pub mod entities;
 /// The light cache — what lights a model standing at a point.
 pub mod light;
 pub mod portals;
+pub mod portalview;
 pub mod props;
 pub mod vis;
 

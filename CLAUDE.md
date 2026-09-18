@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,023 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,032 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -91,6 +91,8 @@ doing, and `report_entities`/`ent_dump`/`ent_fire`/`dumpeventqueue` inspect the
 entity list. `portal 1` and `portal 2` place a blue and an orange oval on
 whatever you are looking at and `portal off` fizzles them — the portal gun minus
 the gun and minus every placement rule, so nothing refuses a surface.
+`r_portal_stencil_depth` is how many levels of portal-in-portal are drawn: 2 by
+default, 0 for a flat oval with no view through, 10 at most.
 
 Verification is otherwise still mostly against the reference: read `legacy/`, compare
 behavior, reason it through. There is no hybrid binary to run.
@@ -147,8 +149,8 @@ before calling into a module.** This table is the index.
 |---|---|---|
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
-| `src/materials/` | **stages 1-6 of 8**, plus 7 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract`. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport — input→command→movement→view, `CPortalGameMovement`'s walk, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning** | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the two areaportals — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
@@ -161,18 +163,22 @@ models all draw, lit the way the shipped game lights them and auto-exposed to
 the map's own limits. The entity logic runs on a 64 Hz tick: doors and panels
 move, triggers fire, a floor button presses when you stand on it, a chamber
 door opens as you approach and shuts behind you, and a `trigger_hurt` can kill
-you. Two portals draw as coloured ovals — **and they work**. **And only what
-you can see is drawn**: the areas, the PVS and the frustum between them took
-the frame from 1.76 ms to 0.28 ms.
+you. Two portals draw as coloured ovals — **and they work, and you can see
+through them**. **And only what you can see is drawn**: the areas, the PVS and
+the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
+what makes a portal's second camera affordable.
 
 **It is not a runnable game**: no sound, no netcode, no weapon, no skybox, and
 a door moves *through* the player rather than shoving one.
-**The portals teleport** — `portdocs/PORTAL.md` stages 3 and 4 have landed — so
-you walk into one oval and come out of the other, rotated, with your velocity
-rotated and clamped and your view turned with you. What is still missing is the
-*picture*: there is no view through and no reflection, so an oval is flat until
-you are inside it. Measured over the nine pairs the shipped maps form, a player
-hull walked through six.
+**The portals work, and you can see through them.** `portdocs/PORTAL.md` stages
+3 and 4 landed the teleport — you walk into one oval and come out of the other,
+rotated, with your velocity rotated and clamped and your view turned with you;
+measured over the nine pairs the shipped maps form, a player hull walked through
+six. `portdocs/PORTAL_RENDER.md` then landed the **picture**: an oval is a hole
+with the room behind its partner in it, two levels deep by default and up to ten
+under `r_portal_stencil_depth`. What is still missing is the *warp* — a portal's
+surface does not refract what is behind it and it has no opening animation, both
+of which are `PortalRefract`'s `$Stage 0`.
 
 **Visibility has landed** — `portdocs/ENGINE_WORLD_VIS.md`. `mod_vis.cpp`,
 `r_areaportal.cpp`, the areaportal half of `cmodel.cpp` and
@@ -214,23 +220,23 @@ window is one or two ticks rather than the whole approach, and
 
 **Only stage 5 of `portdocs/PORTAL.md` is left, and it is polish** — the transition ramp,
 `$PortalOpenAmount`'s open animation, `IsFloorPortal`'s special cases,
-`PunchAllPenetratingPlayers`. The big remaining portal work is not on that plan at all: it
-is §7's **recursive view**, the one part of a portal that is purely drawing, and it needs a
-second camera and a stencil pass. Nothing else in the module is blocked on it.
+`PunchAllPenetratingPlayers`.
 
-**Visibility was the thing to do before the recursive view, and it is done.** A portal's
-second camera draws the world again from somewhere else, and without a PVS that was a
-second whole-map frame — two levels of recursion would have been three times 1.76 ms, and
-it is now three times 0.28. What the recursive view still needs, in order: a **stencil**,
-which `materials/` chose `Depth24PlusStencil8` for and then never wired (`pipeline.rs`
-hardcodes `StencilState::default()`, passes leave `stencil_ops: None`); `PortalRefract`'s
-`$Stage 0` and `$Stage 1`, which `ShaderKind::resolve` deliberately answers `None` for;
-the recursion itself with oblique near-plane clipping; and
-`c_portalghostrenderable.cpp` (980) for the half of an entity that sticks out of the other
-portal. `Engine::render` builds its `Camera` from one call site, so making the view a
-parameter is a refactor rather than a rewrite, and `VisibleSet::frustum` is already the
-shape a second camera wants. It would want its own `portdocs/PORTAL_RENDER.md` first —
-`portdocs/PORTAL.md` §7 was only ever written to justify leaving it out.
+**The recursive view is done** — `portdocs/PORTAL_RENDER.md`, all four of its stages. The
+stencil landed in `materials/` (`RenderState::stencil`, `write_color`,
+`Pass::set_stencil`, stencil ops on every depth attachment), `Pass::set_camera` made the
+view a mid-pass parameter, `vis::ViewPoint` measures a sub-scene from the exit portal's
+corners, and `engine/world/portalview.rs` is the four-step loop with an oblique near
+plane. **The whole recursion is one render pass** — no render target per level — and each
+level costs one more world draw: 0.27 ms on `sp_a1_intro1`, where the same draw before
+visibility landed was 1.81. That is why `portdocs/ENGINE_WORLD_VIS.md` went first.
+
+What the portal path still does not draw is `PortalRefract`'s **`$Stage 0`** — the
+opening warp, deferred for a concrete reason rather than for scope: it samples a copy of
+the scene taken part way through the frame, which cannot happen inside a `wgpu` render
+pass — and `c_portalghostrenderable.cpp` (980) for the half of an entity that sticks out
+of the other portal, which nothing but the player passes through and the player is not
+drawn.
 
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
@@ -260,10 +266,11 @@ shape a second camera wants. It would want its own `portdocs/PORTAL_RENDER.md` f
   discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
-  geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and left one thing
-  behind for it**: `Map_VisSetup` takes an *array* of origins and ORs their PVS rows
+  geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view
+  built the seam**: `Map_VisSetup` takes an *array* of origins and ORs their PVS rows
   together precisely so that a skybox camera and the world share one visible set, and
-  this port has one origin. The other consumer of that array is the recursive view.
+  `vis::ViewPoint` / `Visibility::mark_view` is now that array. A skybox camera is its
+  second consumer.
 - **Bloom**, now that there is a scene target and a presenting pass to put it between.
   `Generate8BitBloomTexture`'s downsample/blur chain plus `BloomAdd`, three quarter-size
   render targets. It is the most visible thing still missing from the post chain and

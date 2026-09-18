@@ -17,7 +17,7 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | Lines | ~20,600 Rust including tests, plus ~2,600 of WGSL |
 | Tests | 231 (`cargo test materials`) — 52 of them run on a real GPU, one of which builds a pipeline for every shader; plus one depot-gated census over the whole game |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, `PortalRefract`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
+| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question and the stencil the recursive view needed.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
 
 ```
 src/materials/
@@ -44,6 +44,8 @@ src/materials/
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
   shaders/modellighting.wgsl       group 3 for the model shaders: the ambient cube and four lights
   shaders/portalrefract.wgsl       the coloured oval a portal wears — PortalRefract's $Stage 2
+  shaders/portalhole.wgsl          the recursive view's stencil punch — PortalRefract's $Stage 1
+  shaders/bufferclear.wgsl         a partial depth clear, written as a full-screen draw
   shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
   shaders/phong.wgsl               models with a specular highlight, a rim light and an envmap
   shaders/refract.wgsl             glass: a screen-space warp of a copy of the scene
@@ -491,6 +493,7 @@ shader system.
 ```rust
 pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> MaterialCache;
 pub fn load(&mut self, vfs: &Vfs, name: &str) -> Arc<Material>;
+pub fn synthetic(&mut self, name: &str, source: &str) -> Arc<Material>;
 pub fn error_material(&self) -> Arc<Material>;
 pub fn pipelines(&mut self) -> &mut PipelineCache;
 pub fn queue(&self) -> &wgpu::Queue;
@@ -506,6 +509,14 @@ layouts. They are immutable, unlike `pipelines`, so a caller can hold both at on
 malformed one, an unresolvable patch chain and an unknown shader all resolve to the error
 material and a line on stderr, because a map with one bad material still has to load.
 `CMaterialSystem::FindMaterial` (`cmaterialsystem.cpp:3032`) is the same function.
+
+**`synthetic` is `CMaterialSystem::CreateMaterial`**: a `.vmt` written as a string
+literal in code rather than read from the game, cached by `name` like any other and with
+its textures resolved to white. It exists because the original builds materials in code
+too — `CMatRenderContext::GetBufferClearObeyStencil` builds eight — and because a material
+that has no file cannot be shipped in a repo with no game content in it. Unlike `load` it
+**panics** on a bad literal: the literal is ours, so a failure is a programming error and
+falling back to the checkerboard would hide it.
 
 `name` is normalized as `FindMaterial` normalizes it — lowercased, forward slashes,
 extension stripped — so `Metal\Wall01.vmt` and `metal/wall01` are one entry. The path
@@ -707,7 +718,9 @@ pub enum ShaderKind {
     VertexLitGeneric,
     Phong,                   // no .vmt names this one
     Refract,
-    PortalRefract,           // only its `$Stage 2` resolves
+    PortalRefract,           // `$Stage 2` — the coloured oval
+    PortalRefractHole,       // `$Stage 1` — the recursive view's stencil punch
+    BufferClearObeyStencil,  // no .vmt in the game names this one either
 }
 
 pub fn resolve(vmt: &Vmt) -> Option<ShaderKind>;   // what will draw it
@@ -720,7 +733,7 @@ pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Seven variants, six implementations, **six names**. `UnlitGeneric` is sprites, tool
+Nine variants, eight implementations, **seven names**. `UnlitGeneric` is sprites, tool
 textures and anything whose colour is entirely in its texture; `LightmappedGeneric` is
 world brush surfaces — 62 of `sp_a1_intro1`'s 66 world materials — and multiplies a base
 texture by a baked lightmap, flat or radiosity-normal-mapped; `VertexLitGeneric` is
@@ -728,12 +741,21 @@ models, and the name is the largest shader in the shipped game — 1,135 of the 
 game's 3,555 materials write it, including 1,012 of the 1,096 under `materials/models/`;
 `Phong` is the 317 of those that ask for a specular highlight; `Refract` is glass, 37
 materials, 29 of them on models; `PortalRefract` is the coloured oval a portal wears, 7
-materials of which 5 resolve.
+materials of which 6 resolve; `PortalRefractHole` is the sixth of those, the stencil punch
+the recursive view marks its opening with; and `BufferClearObeyStencil` is a partial depth
+clear written as a draw, which is the only way to clear part of an attachment.
 
 **Call `resolve`, not `from_name`.** `from_name` answers "what did the `.vmt` say", which
 is what a diagnostic wants. `resolve` answers "what will draw it", which is what
 everything else wants, and the two differ in **both directions**: `Phong` is a shader no
-`.vmt` names, and `PortalRefract` is a name two `.vmt`s write that resolves to nothing.
+`.vmt` names, `PortalRefract` is one name over two `ShaderKind`s picked by `$Stage`, and
+one `.vmt` in the game (`portal_refract_1`, stage 0) still resolves to nothing.
+
+**`from_name` answers `BufferClearObeyStencil` even though no shipped `.vmt` writes it**,
+and that is load-bearing rather than tidy: the material is built in code, the way Valve
+builds its eight (`CMatRenderContext::GetBufferClearObeyStencil`), but
+[`MaterialCache::synthetic`](#materialcache) parses that literal through the same `.vmt`
+path as a file on disk. Leaving the name out made the first map load panic.
 
 **`Refract` is structurally unlike the other four, and that is the thing to know about it.**
 It has no lighting at all — no lightmap, no ambient cube, no diffuse term — and what it
@@ -783,19 +805,24 @@ It shares `VertexLitGeneric`'s vertex layout, its group 3 and its parameter *tab
 differs in the pixel shader and in what it reads: a specular exponent map, a diffuse
 (light) warp and a specular (phong) warp, and **no envmap mask**.
 
-**`PortalRefract` is one shader name over three unrelated pixel shaders, and only the
-third is here.** `$Stage` picks between the see-through warp (0), the stencil punch (1)
-and the coloured oval (2); the first two exist to make `CPortalRenderable_FlatBasic`'s
-recursive view composite, which `portdocs/PORTAL.md` puts out of scope. So `resolve`
-answers `Some` only for stage 2 and `None` for the other two, whose materials get the
-error material — which is the honest answer and is what keeps the depot census truthful.
+**`PortalRefract` is one shader name over three unrelated pixel shaders, and two of the
+three are here.** `$Stage` picks between the see-through warp (0), the stencil punch (1)
+and the coloured oval (2). Stage 2 is `ShaderKind::PortalRefract` and stage 1 is
+`ShaderKind::PortalRefractHole` — two `ShaderKind`s rather than one with a branch, because
+the fork is in the blend state, the depth writes and the alpha reference as well as in the
+pixel shader. Both answer `"PortalRefract"` from `name()`, which is what keeps the depot
+census truthful.
 
-Measured over the mounted game: **7 materials name it and 5 are stage 2** — the three
-`models/portals/portalstaticoverlay_*` and the two `effects/fakeportalring_*`, which reach
-stage 2 through `$UseOnStaticProp` rather than through `$Stage`
-(`portal_refract_helper.cpp:79` overrides the stage *after* reading it). The other two are
-`portal_refract_1` (stage 0) and `portal_stencil_hole` (stage 1), and nothing in this port
-draws either.
+**Stage 0 still resolves to `None`**, and for a concrete reason rather than for scope: it
+samples a copy of the scene taken *part way through the frame*, which cannot happen inside
+a `wgpu` render pass, and it is the portal's opening animation rather than its
+see-through. `portdocs/PORTAL_RENDER.md` §7.
+
+Measured over the mounted game: **7 materials name it, 5 are stage 2 and 1 is stage 1** —
+the three `models/portals/portalstaticoverlay_*` and the two `effects/fakeportalring_*`
+reach stage 2 through `$UseOnStaticProp` rather than through `$Stage`
+(`portal_refract_helper.cpp:79` overrides the stage *after* reading it),
+`portal_stencil_hole` is stage 1, and `portal_refract_1` is the one stage 0.
 
 Three things about it are unlike every other shader in the set:
 
@@ -1174,8 +1201,18 @@ pub struct RenderState {
     pub depth_write: bool,
     pub depth_func: DepthFunc,  // Nearer | NearerOrEqual
     pub depth_bias: DepthBias,  // None | Decal
+    pub write_color: bool,      // EnableColorWrites; true by default
     pub write_alpha: bool,
+    pub stencil: Option<Stencil>,   // None = disabled; no .vmt reaches it
     pub alpha_to_coverage: bool,
+}
+pub struct Stencil {
+    pub compare: StencilFunc,       // Always | Equal | NotEqual
+    pub pass_op: StencilOp,         // Keep | SetToReference | IncrementClamp | DecrementClamp
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub read_mask: u8,
+    pub write_mask: u8,
 }
 pub struct PipelineKey { pub shader: ShaderKind, pub state: RenderState, pub target: TargetFormat }
 pub struct TargetFormat { pub color: TextureFormat, pub depth: Option<TextureFormat>, pub samples: u32 }
@@ -1203,6 +1240,18 @@ that the frame's alpha channel is free to hold depth for the underwater pass. Tw
 orderings inside `render_state` are the original's and look wrong out of context —
 `write_alpha` is decided *before* `$multiply` replaces the blend mode, and
 `EnableAlphaBlending` turns depth writes off as a side effect of turning blending on.
+
+**The stencil is in the pipeline key because `wgpu` puts it there.** `ShaderStencilState_t`
+was render-context state in the original and never part of a shadow phase, which is right:
+the stencil is a property of *what is being drawn for*, not of the material — the same wall
+material draws under four different stencil states in the course of one portal view. So no
+`.vmt` reaches `RenderState::stencil`; only [`Pass::set_stencil`](#passa) does. The
+consequence is that a portal view costs four *pipelines* per shader it draws with rather
+than four state changes, because only the reference value is dynamic state in WebGPU.
+
+`write_color` is `EnableColorWrites`, and two shaders turn it off — both exist to touch
+nothing but depth and stencil. See `BufferClearObeyStencil` and `PortalRefract`'s
+`$Stage 1` under [the material path](#the-material-path).
 
 `get` returns an `Arc` on purpose — asking the cache borrows it mutably and recording a
 pass borrows the frame, so the pipeline has to outlive the lookup.
@@ -1681,6 +1730,8 @@ pub fn set_depth_range(&mut self, x: f32, y: f32, width: f32, height: f32,
                        near: f32, far: f32);
 pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 pub fn set_state_override(&mut self, overrides: StateOverride);
+pub fn set_stencil(&mut self, stencil: Option<Stencil>, reference: u8);
+pub fn set_camera(&mut self, camera: &Camera);
 pub fn bind_lightmap_page(&mut self, page: &LightmapPage);
 pub fn set_model_lighting(&mut self, lighting: &ModelLighting);
 pub fn push_model_lighting(&mut self, lighting: &ModelLighting) -> LightingSlot;
@@ -1738,12 +1789,29 @@ pub struct StateOverride {
     pub cull: Option<bool>,          // CullMode / FlipCullMode
     pub depth_test: Option<bool>,    // OverrideDepthEnable
     pub depth_write: Option<bool>,
+    pub write_color: Option<bool>,   // EnableColorWrites
+    pub stencil: Option<Stencil>,    // set through Pass::set_stencil, never by hand
 }
 ```
 
-`Load::Clear` clears colour *and* depth — `ClearBuffers( true, true )`. `None` fields of a
-`StateOverride` leave the material's own choice alone; it applies from the call to the end
-of the pass. `FlipCullMode` is not a debug feature: a mirror or a portal view flips the
+`Load::Clear` clears colour, depth **and stencil** — `ClearBuffers( true, true )`. Every
+depth attachment a pass opens carries stencil operations whether or not anything uses the
+stencil, because a pipeline that writes a stencil value against a pass that declared the
+aspect read-only is a validation error. `None` fields of a `StateOverride` leave the
+material's own choice alone; it applies from the call to the end of the pass.
+
+**`set_stencil` and `set_state_override` are independent, and that asymmetry is
+deliberate.** `set_state_override` replaces every field *except* `stencil`, which it
+carries forward — otherwise a draw that sets its own cull or depth override would silently
+turn the stencil test and the stencil write off, which is a wrong picture and not an
+error. Set the stencil through `set_stencil`, which also issues the reference value; never
+by building a `StateOverride` with the field filled in.
+
+**`set_camera` rebinds group 0 in the middle of an open pass**, by pushing a second
+`FrameUniforms` slot into the arena the pass already owns. It is what makes a portal view
+possible without a second render target: the recursion draws the world again from
+somewhere else inside the pass it is already recording. It costs one uniform slot per
+call. `FlipCullMode` is not a debug feature: a mirror or a portal view flips the
 view matrix horizontally, reversing every triangle's winding, and without the flip the
 whole reflected world is back-face culled.
 
@@ -2369,12 +2437,12 @@ Ordered by how likely each is to bite.
     `rustdocs/ENGINE.md`'s "world::light" is the cache. Until the local lights landed a
     phong prop had no highlight at all, because the term needs a light.
 46. **`PortalRefract` is one shader name over three unrelated pixel shaders, and
-    `resolve` answers `None` for two of them.** It is the only place in the module where
+    `resolve` answers `None` for one of them.** It is the only place in the module where
     a name `from_name` knows resolves to nothing, and it is the mirror image of `Phong`:
-    that one is a shader no `.vmt` names, this one is a name two `.vmt`s write that
-    nothing can draw. `$Stage 0` is the see-through warp and `$Stage 1` is the stencil
-    punch; both exist only to make `CPortalRenderable_FlatBasic`'s recursive view
-    composite. **`$UseOnStaticProp 1` forces the stage to 2**, and it overrides an
+    that one is a shader no `.vmt` names, this one is a name one `.vmt` writes that
+    nothing can draw. `$Stage 0` is the see-through warp — the portal's opening
+    animation, which needs a copy of the scene taken mid-pass; `$Stage 1` is the stencil
+    punch and **is** ported, as `ShaderKind::PortalRefractHole`. **`$UseOnStaticProp 1` forces the stage to 2**, and it overrides an
     explicit `$Stage` rather than defaulting one (`portal_refract_helper.cpp:79` runs
     after the read) — which is what makes the two `effects/fakeportalring_*` materials
     stage-2 materials.
@@ -2442,7 +2510,7 @@ Each of these changes what the engine does, and each names the thing that revers
 | `$phongwarptexture`'s iridescence is a 2D table lookup with no content to check it against | **one** Portal 2 material has one (`models/props/reflecto_cube_iridescence`), so the branch is implemented from the reference and verified only by the pipeline building. Its effect is also what takes the fresnel multiply away from the specular result, which is the part worth knowing | — |
 | **The frame-buffer copy is taken once a frame, not once per refractor** | on PC Valve calls `UpdateRefractTexture` before *each* refracting renderable in the back-to-front translucent list (`viewrender.cpp:6195`), so glass behind glass sees the nearer pane's result. One copy is one full-screen blit and one extra pass; a copy per refractor is a pass per refractor. Overlapping refractors here show the scene behind both rather than through each other, and nothing in Portal 2's single-player maps stacks two in one view | call `RenderContext::update_refract_texture` between draws rather than before them |
 | **A refracting prop is split per *batch*, where Valve splits per renderable** | Valve sorts whole renderables into the opaque and translucent lists, so a prop with one refracting material among several draws entirely in the translucent pass. Mixing is the normal case and not the corner one: of the 66 models in the depot wearing a frame-buffer-refracting material, **60 also wear something else** — every `props_destruction/glass_*` pane is a refracting sheet plus an opaque `glass_fracture_*_inner` edge. The per-batch split is the one that is right without a depth sort, which this port does not have | `PropModels::record`, once translucency sorting exists |
-| `PortalRefract`'s `$Stage` 0 and 1 materials draw as the error checkerboard | they are the recursive view's two halves and `portdocs/PORTAL.md` puts it out of scope. Nothing in this port binds either: they are drawn by `CPortalRenderable_FlatBasic`, which does not exist here, so the checkerboard is never on screen. Counting them as drawable would be the dishonest option | `ShaderKind::resolve`, plus the other two branches of `shaders/portalrefract.wgsl` |
+| `PortalRefract`'s `$Stage 0` material draws as the error checkerboard | it is the portal's opening warp, and it samples a copy of the scene taken *part way through the frame* — which cannot happen inside a `wgpu` render pass, the same wall `update_refract_texture` runs into. Nothing in this port binds it, so the checkerboard is never on screen; counting it as drawable would be the dishonest option. `$Stage 1` is no longer in this row — it is `ShaderKind::PortalRefractHole` | `ShaderKind::resolve`, plus stage 0's branch of `shaders/portalrefract.wgsl` |
 | `PortalRefract` reads one vertex layout where Valve declares two | `$UseOnStaticProp` picks between position + normal + 2 texcoords + a tangent, and position + 1 texcoord. The stage-2 pixel shader reads neither the normal, the tangent nor the second texcoord — the first two are stage 0's screen-space warp and the third is a constant `(0.25, 0)` nothing samples — so `VertexLayout::Simple` serves both. Taking `Model` instead would oblige a portal draw to bind a baked-static-light stream for a shader with no lighting | `ShaderKind::vertex_layout` |
 | `Refract` is drawn with `VertexLayout::Model` even for a brush surface | Valve declares two vertex formats and picks on `$model`. 29 of the game's 37 materials set it and all eight that do not are under `materials/particle/`, drawn by the unported particle system; **no brush face or displacement in the shipped game names this shader** | `ShaderKind::vertex_layout`, plus a tangent on a `SimpleVertex` when particles land |
 | `Refract`'s secondary normal map, `$masked`, `$magnifyenable` and `$vertexcolormodulate` are not implemented | **zero** Portal 2 materials set any of them, and the secondary-normal path is broken where Valve implements it: it binds `$normalmap2` to sampler 1 and then samples sampler 3 with the second coordinate set (`refract_ps2x.fxc:143`). `$masked` additionally wants a blend mode `BlendMode` does not have | `REFRACT_PARAMS`, and a `BlendMode::MaskedRefract` |
@@ -2453,8 +2521,9 @@ Each of these changes what the engine does, and each names the thing that revers
 Stage 6 is `VertexLitGeneric` and is done; `Refract` and `Phong` are the first two of
 §7.8's remaining shader set, and paint maps and GPU morph (stages 7-8) are not started.
 The set is five implementations under five names, plus `Phong` (a sixth implementation
-under *no* name) and `PortalRefract` (a seventh, under a name whose other two stages
-resolve to nothing) — so a `.vmt` naming any of the other 160-odd still resolves to the
+under *no* name), `PortalRefract` and `PortalRefractHole` (a seventh and an eighth, under
+one name whose remaining stage resolves to nothing) and `BufferClearObeyStencil` (a ninth,
+under a name only code writes) — so a `.vmt` naming any of the other 160-odd still resolves to the
 error material. Measured against the mounted game by
 [`every_shipped_material_of_a_ported_shader_builds_a_pipeline`](#test-coverage), that is
 **603 of 3,555**. Also deliberately absent, and listed so nobody looks for them:
@@ -2758,12 +2827,13 @@ The 603 that fall back are dominated by six unported shaders — `SpriteCard` (1
 `Portal` 9, `ScreenSpace_General` 7, `Sky` 6) and, at the end, a handful of `.vmt` files
 that name a texture or an `include` the depot does not contain.
 
-**Two of them name a shader this port *has*.** `models/portals/portal_refract_1` and
-`models/portals/portal_stencil_hole` are `PortalRefract` at `$Stage` 0 and 1, and
-`ShaderKind::resolve` answers `None` for both: they are the see-through warp and the
-stencil punch, and both belong to the recursive view. That is the only place in the census
-where a known shader name falls back, and it is deliberate — the alternative is counting
-two materials as drawable that would draw the wrong thing.
+**One of them names a shader this port *has*.** `models/portals/portal_refract_1` is
+`PortalRefract` at `$Stage 0`, and `ShaderKind::resolve` answers `None` for it: it is the
+see-through warp, and it samples a copy of the scene taken part way through the frame.
+That is the only place in the census where a known shader name falls back, and it is
+deliberate — the alternative is counting a material as drawable that would draw the wrong
+thing. (`models/portals/portal_stencil_hole` was the second until the recursive view
+landed; it is `$Stage 1` and now resolves to `ShaderKind::PortalRefractHole`.)
 
 **End to end, on a real GPU** (53 — 38 in `preview.rs`, 7 in `histogram.rs`, 5 in
 `post.rs`, 2 in `ui.rs` and 1 in `pipeline.rs`) — a `.vmt` and a `.vtf`, through the
@@ -3110,3 +3180,49 @@ And **the exposure is applied to the oval's *alpha* as well as its colour**, aft
 `FinalOutput` rather than inside it, over Valve's comment *"let it drop down to 0 in case
 we're fading"* — which is why a portal fades out in a bright room instead of turning
 grey.
+
+### The stencil, and the two shaders the recursive view needed
+
+`portdocs/PORTAL_RENDER.md` stages 1 and 4. Not a stage of
+`portdocs/MATERIALSYSTEM.md`'s eight — it is `engine/world/portalview.rs` asking for
+three things this module did not have.
+
+**`RenderState` grew `stencil` and `write_color`, and `StateOverride` grew both.**
+`ShaderStencilState_t` was `IMatRenderContext` state in the original and never part of a
+shadow phase; here it has to be in the pipeline key because `wgpu` puts it there, so no
+`.vmt` reaches it and `render_state` always leaves it `None`. Only
+`Pass::set_stencil` writes it, and only the reference value is dynamic — a portal view
+therefore costs four *pipelines* per shader it draws with rather than four state changes.
+`Depth24PlusStencil8` had been the depth format since stage 1 of the module and was never
+wired; `RenderContext::open` now gives every depth attachment stencil operations, which it
+must, because a pipeline that writes a stencil value against a pass that declared the
+aspect read-only is a validation error.
+
+**`set_state_override` preserves the stencil where it replaces everything else**, and that
+asymmetry was a real bug before it was a rule: the near-plane cap sets its own cull and
+depth override, `StateOverride` is one struct, and replacing the whole of it turned the
+stencil test *and* the write off for the one draw whose job is to patch the mark. A wrong
+picture, not an error.
+
+**`Pass::set_camera` rebinds group 0 mid-pass**, by pushing a second `FrameUniforms` slot
+into the arena the pass already owns. That is the whole of what made the recursion fit in
+one render pass instead of one render target per level.
+
+**Two shaders, both of which exist to touch depth and stencil rather than colour.**
+`PortalRefractHole` is `PortalRefract`'s `$Stage 1` — the same material block and the same
+vertex layout, a different pixel shader, and three forks in the shadow block that are the
+reason it is a second `ShaderKind` rather than a flag: no alpha blending, depth writes
+**on** where stage 2 turns them off, and an alpha reference of 0.5 rather than 1/255.
+`BufferClearObeyStencil` is a partial depth clear written as a full-screen draw in clip
+space, because a graphics API can only clear a whole attachment.
+
+**`MaterialCache::synthetic` is `CMaterialSystem::CreateMaterial`**, and the one thing it
+found is worth repeating: its `.vmt` literal goes through the same resolver as a file, so
+`ShaderKind::from_name` has to answer `BufferClearObeyStencil` even though nothing in the
+game writes that name. Leaving it out panicked on the first map load, and no unit test
+would have caught it — the running binary did, immediately.
+
+**`writez` still does not need porting**, which stage 1 of `portdocs/PORTAL.md` had left
+open. `$Stage 1` with colour writes off restores the wall's depth at step 4 of a portal
+view, and the stencil test has already named the exact pixels, so the depth-only shader
+`models/portals/portal1.mdl` wears has nothing left to do.

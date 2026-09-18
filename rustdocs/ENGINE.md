@@ -6,7 +6,7 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain, props and **visibility** done; no 3D skybox |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain, props, **visibility** and the **recursive portal view** done; no 3D skybox |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
 | [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | complete — cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg`, the list commands and the `egui` dialog |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
@@ -18,8 +18,7 @@ by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` th
 surfaces with real lighting across 13 atlas pages — plus 26 of its 78 brush entities and
 1,080 static props — and **WASD and the mouse walk through it**.
 What is still missing is listed under
-[Known limits](#known-limits-of-what-is-drawn); the largest items are visibility (every
-face is drawn every frame), displacements and the 3D skybox.
+[Known limits](#known-limits-of-what-is-drawn); the largest item is the 3D skybox.
 
 ---
 
@@ -66,13 +65,14 @@ RedrawRequested  -> Engine::frame(now)         -> None: too early, return and wa
                                                -> Some(Continue): carry on
                  -> apply_capture()            -> the cursor grab follows the engine
                  -> Renderer::begin_frame()    -> None: back off SKIP_RETRY
-                 -> Engine::render(&mut frame) -> the world, then the refractors
+                 -> Engine::render(&mut frame) -> the world, the portal views,
+                                                  then the refractors
                  -> Context::run_ui(|| Engine::run_ui())
                  -> UiRenderer::draw(&mut frame, …)  -> the console, over the top
                  -> Frame::present()
 ```
 
-Eight orderings in there are load-bearing:
+Nine orderings in there are load-bearing:
 
 1. **`Engine::frame` runs before the surface is acquired.** A frame the clock refuses
    costs no acquisition, and a frame that loads a map does not hold a swap-chain image
@@ -96,7 +96,13 @@ Eight orderings in there are load-bearing:
    `Load::Keep` pass records `World::draw_refracting`. The middle step is why the first
    pass has to end: a pass cannot sample its own attachment. Skipped entirely when
    `World::needs_frame_buffer_copy` is false.
-8. **The UI is built and drawn inside the acquired frame**, after the world. `egui`'s
+8. **The portal views are recorded *inside* the opaque pass**, after `World::draw` and
+   before that pass ends — `DrawRecursivePortalViews()`' own place in
+   `CBaseWorldView::DrawExecute`. They are not a pass of their own and they need no
+   render target of their own: the recursion is a stencil, a scissor and a
+   `Pass::set_camera` per level. See
+   [`world::portalview`](#worldportalview--the-view-through-one).
+9. **The UI is built and drawn inside the acquired frame**, after the world. `egui`'s
    `TexturesDelta` must be applied by whoever built it (`epaint` asserts on drop that it
    was), so a pass built for a frame that then found no swap-chain image would leave an
    upload owed to nobody. A skipped frame therefore skips `egui` entirely and its events
@@ -771,6 +777,19 @@ pub struct Portal {
     pub half_height: f32,     // 56 — not 14; `rustdocs/SERVER.md` gotcha 79
     pub is_portal2: bool,     // which of the two overlay materials
     pub open_for: f32,        // how long it has been open, in seconds
+    pub linked: Option<u64>,  // the partner's `id`
+    pub matrix: Mat4,         // m_matrixThisToLinked; the identity while unlinked
+}
+
+/// One linked pair, from the entrance's point of view. Built by `pairs`.
+pub struct PortalPair {
+    pub index: usize, pub id: u64, pub partner_id: u64,
+    pub matrix: Mat4,
+    pub origin: Vec3, pub forward: Vec3, pub right: Vec3, pub up: Vec3,
+    pub half_width: f32, pub half_height: f32,
+    pub corners: [Vec3; 4],
+    pub exit_origin: Vec3, pub exit_forward: Vec3, pub exit_forward_origin: Vec3,
+    pub exit_vis_origins: [Vec3; 5],
 }
 
 pub struct Portals { /* private */ }
@@ -778,8 +797,16 @@ pub struct Portals { /* private */ }
 impl Portals {
     pub fn load(materials: &mut MaterialCache, vfs: &Vfs) -> Portals;
     pub fn sync(&mut self, portals: &[Portal]);
+    pub fn pairs(&self) -> Vec<PortalPair>;
     pub fn centers(&self) -> impl Iterator<Item = (usize, Vec3)> + '_;
     pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize);
+
+    // The recursive view's three draws — see `world::portalview`.
+    pub fn draw_hole(&self, pass: &mut Pass<'_>, curtime: f32, index: usize);
+    pub fn draw_hole_cap(&self, pass: &mut Pass<'_>, curtime: f32, index: usize, cap: &[Vec3]);
+    pub fn clear_depth(&self, pass: &mut Pass<'_>);
+    #[cfg(test)] pub fn hole_material(&self) -> &Material;
+    #[cfg(test)] pub fn clear_material(&self) -> &Material;
 }
 ```
 
@@ -792,13 +819,16 @@ with no geometry of its own anywhere in the game's files —
 `CPortalRenderable_FlatBasic::DrawSimplePortalMesh` with
 `models/portals/portalstaticoverlay_1.vmt` bound.
 
-`portdocs/PORTAL.md` **stage 4 of five**, so **what you see is a coloured oval
-on a wall you can walk into and come out of the other one**: the hole is real
-collision, the far side is traced, and the teleport runs. What is still missing
-is the *picture* — there is no view through and no reflection of the room on the
-other side, so you walk into a flat oval and arrive somewhere else. That is the
-deliberate output of that document's scope and is worth saying out loud before
-anyone reports it as a bug. The collision is `trace/`'s and is
+`portdocs/PORTAL.md` **stage 4 of five**, plus `portdocs/PORTAL_RENDER.md` whole,
+so **what you see is the room behind the other portal, framed by a coloured
+oval, and you can walk into it**: the hole is real collision, the far side is
+traced, the teleport runs, and the picture in the opening is the world drawn
+again from somewhere else. The picture is
+[`world::portalview`](#worldportalview--the-view-through-one); this module owns
+the oval, and owns the two draws that view reaches back for. What is still
+missing is the *warp* — a portal's surface does not refract what is behind it,
+and it has no opening animation, both of which are `PortalRefract`'s `$Stage 0`
+(`portdocs/PORTAL_RENDER.md` §7). The collision is `trace/`'s and is
 [`PortalHoles`](#the-hole--portalhole-carvedwall-portalholes-and-with_hole); the
 teleport is `client/`'s `handle_portalling`; `World::sync_portals` keeps all
 three in step from this one list, and it is also where the **pairing** is
@@ -825,7 +855,9 @@ Three things here produce a plausible wrong picture rather than an error.
   shader that punches a depth hole for the recursive view. `prop_portal`
   reports no `ModelState`, so it never reaches `EntityModels` — and `writez` is
   not a shader this port has, so a material lookup would put a magenta
-  rectangle across the wall.
+  rectangle across the wall. **It is still not needed now that the recursive
+  view is here**: step 4 restores the wall's depth with `$Stage 1` and colour
+  writes off, and the stencil has already named the exact pixels.
 - **The quad's winding comes from `up × right == forward`.** Source's
   `(forward, right, up)` basis is left-handed — at yaw 0 they are `+X`, `-Y`,
   `+Z` — so the pair satisfying `u × v == n` is `(up, right)` and not
@@ -834,6 +866,11 @@ Three things here produce a plausible wrong picture rather than an error.
 - **`uv.y` is 0 at the *top*.** The shader's bottom-to-top brightness shift
   reads `abs(uv.y)`, so building the quad the other way up inverts the gradient
   — and an upside-down gradient on a symmetric oval looks deliberate.
+- **`draw_hole` draws at exactly the oval's place, with no forward offset.**
+  The depth it restores at step 4 of a portal view is the depth the oval is then
+  tested against, so a hole pushed even a quarter of a unit off the wall cuts the
+  ring out of its own opening. `PORTAL_OFFSET` exists in `portalview` and applies
+  to the near-plane cap alone.
 
 `open_for` is where the two curves come from: `$PortalOpenAmount` climbs to 1
 over half a second and `$PortalStatic` decays to 0 over one, which is
@@ -841,6 +878,118 @@ over half a second and `$PortalStatic` decays to 0 over one, which is
 time rather than the instant because the instant is on the server's tick clock
 and the elapsed time is measured against the scene's; `Engine::frame` does the
 subtraction, clamped at zero.
+
+### `world::portalview` — the view through one
+
+```rust
+pub const MAX_RECURSION: u8 = 10;       // r_portal_stencil_depth's ceiling
+pub const DEFAULT_RECURSION: u8 = 2;    // its default
+
+pub struct PortalViewSetup {
+    pub curtime: f32,
+    pub max_depth: u8,          // already clamped to MAX_RECURSION
+    pub viewport: (u32, u32),   // the target's size, for the scissor
+    pub novis: bool,            // r_novis, forwarded to every sub-view
+}
+
+impl World {
+    pub fn draw_portal_views(&self, pass: &mut Pass<'_>, setup: &PortalViewSetup,
+                             camera: &Camera, visible: &VisibleSet);
+}
+
+// The pieces, public because the tests and the benchmark reach for them.
+pub struct PortalCameras { pub cull: Camera, pub draw: Camera }
+pub fn portal_cameras(camera: &Camera, base_projection: Mat4,
+                      pair: &PortalPair, rect: NdcRect) -> PortalCameras;
+pub fn oblique_near_plane(projection: Mat4, view: Mat4, plane_world: Vec4) -> Mat4;
+pub fn near_plane_cap(pair: &PortalPair, camera: &Camera) -> Option<Vec<Vec3>>;
+
+pub struct NdcRect { /* private; -1..1 on both axes, y up */ }
+impl NdcRect {
+    pub const FULL: NdcRect;
+    pub fn of(corners: &[Vec3; 4], view_proj: Mat4) -> Option<NdcRect>;
+    pub fn intersect(self, other: NdcRect) -> NdcRect;
+    pub fn is_empty(self) -> bool;
+    pub fn narrow(self, projection: Mat4) -> Mat4;
+    pub fn scissor(self, viewport: (u32, u32)) -> Option<(u32, u32, u32, u32)>;
+}
+```
+
+`portdocs/PORTAL_RENDER.md`, whole. `CPortalRender::DrawPortalsUsingStencils_Old`
+plus `CPortalRenderable_FlatBasic`'s camera and clip plane — the *older* of the
+two stencil schemes that ship, because the fast path asserts at most two levels
+and at most four portals and this one is general in the depth.
+
+**Call it inside the opaque pass**, after [`World::draw`](#world) and before the
+frame-buffer copy, which is `DrawRecursivePortalViews()`' own place in
+`CBaseWorldView::DrawExecute`. It leaves the pass exactly as it found it — stencil
+disabled, scissor reset, `camera` bound again — so the caller need not know it ran,
+and it costs one iteration over a list of at most two when the map has no linked
+portal, which is 96 of the game's 106.
+
+#### One level, in four steps
+
+Per visible pair, at stencil reference `n` for level `n`:
+
+1. **Mark the opening.** Draw the hole quad with `Equal(n) / IncrementClamp`, so
+   the stencil reads `n+1` exactly inside the oval. Plus the near-plane cap, if
+   the portal straddles the near plane.
+2. **Reset the depth inside it.** `Equal(n+1)`, a full-screen quad in clip space
+   wearing `BufferClearObeyStencil` — a graphics API can only clear a whole
+   attachment, so a partial clear is a draw.
+3. **Draw the scene again from the other side**, under the virtual camera, with
+   the sub-view's own visible set — and then recurse.
+4. **Put the wall's depth and the stencil back.** The same hole quad with colour
+   writes off, depth test off, `Equal(n+1) / DecrementClamp`.
+
+**The whole recursion is one render pass**, with a scissor and a `set_camera` per
+level rather than a render target per level. That is the single decision the
+module is built on.
+
+#### Three things that are not obvious
+
+**The virtual camera is two cameras.** `PortalCameras::cull` carries the
+projection narrowed to the opening's screen rectangle, which is what visibility
+is measured against; `PortalCameras::draw` carries the *sheared* projection whose
+near plane is the exit portal's plane, which is what pixels are drawn with. One
+matrix cannot be both: the shear is Lengyel's oblique near-plane trick, and it
+destroys the frustum the cull wants. The shear is applied to the **pristine**
+perspective at every level rather than composed down the recursion, because Valve
+pops the parent's clip plane before pushing its own.
+
+**A `NdcRect` narrows the *projection*, not the frustum.** `CalcFrustumThroughPolygon`
+builds one plane per edge of the portal's clipped silhouette; a rectangle is
+strictly weaker and, for a portal seen head-on, the same answer. Narrowing the
+projection means the same rectangle feeds the scissor, the frustum and
+`mark_view` without any of the three learning about portals.
+
+**The near-plane cap is what makes walking through one work.** When the portal
+quad crosses the near plane the opening is clipped away and the stencil mark
+vanishes, so the last step before a portal shows the wall. `near_plane_cap`
+clips the quad to the frustum's near plane and reprojects the remainder onto it,
+as a triangle fan drawn with culling off — the winding after reprojection depends
+on which corners were cut. Every cap vertex carries texture coordinate
+`(0.5, 0.5)`, the centre of the portal, where the `$Stage 1` alpha test passes at
+any open amount; the quad's real coordinates would cut an oval out of the patch
+and leave a hole in the hole.
+
+#### One divergence from Valve, recorded
+
+`exit_clip_plane`'s degeneracy guard measures the **virtual** eye's distance from
+the exit plane. Valve measures `DotProduct( cameraView.origin, vRemotePortalForward )`
+— the *real* camera's origin against the *exit* portal's normal, which are two
+different rooms and not a meaningful distance. That spelling only ever ran where
+`UseFastClipping()` was false; here the shear is the only path there is, so the
+guard fires every time the player is within two units of a portal, which is every
+time they walk through one.
+
+#### Cost
+
+`r_portal_stencil_depth` (archived, 0 to 10, default 2). Each level is one more
+world draw. On `sp_a1_intro1`, measured by `engine::world::bench` with a linked
+pair in front of the camera: **0.27 ms for the frame, 0.53 at depth 1, 0.81 at
+depth 2** — against 1.81 ms for one `r_novis` frame, which is what a level would
+have cost before `world::vis`.
 
 ### `world::light` — the light cache
 
@@ -1124,6 +1273,7 @@ impl Visibility {
     pub fn build(bsp: &Bsp) -> Visibility;
     pub fn is_empty(&self) -> bool;                   // no tree: everything draws
     pub fn mark(&self, eye: Vec3, view_proj: Mat4, novis: bool) -> VisibleSet;
+    pub fn mark_view(&self, view: &ViewPoint<'_>, view_proj: Mat4, novis: bool) -> VisibleSet;
     pub fn box_visible(&self, set: &VisibleSet, mins: Vec3, maxs: Vec3) -> bool;
     pub fn leaf_at(&self, point: Vec3) -> usize;      // CM_PointLeafnum
     pub fn cluster_at(&self, point: Vec3) -> i32;     // -1 in solid space
@@ -1152,8 +1302,27 @@ impl VisibleSet {
 impl Frustum {
     pub fn new(view_proj: Mat4) -> Frustum;
     pub fn intersects(&self, mins: Vec3, maxs: Vec3) -> bool;
+    pub fn planes(&self) -> &[Plane; 6];              // FRUSTUM_NEARZ indexes the near one
 }
+
+/// Where a view is measured from, when that is not one point.
+pub struct ViewPoint<'a> {
+    pub eye: Vec3,          // the camera, for the frustum and the area walk
+    pub origins: &'a [Vec3],// the clusters whose PVS rows are ORed together
+    pub leaf: Option<Vec3>, // ForceViewLeaf: which leaf the walk starts in
+}
+impl ViewPoint<'_> { pub fn at(eye: Vec3) -> ViewPoint<'static>; }
 ```
+
+**`mark_view` is `mark` with the eye split into three questions**, and it exists because
+a portal view asks them of three different points. `Map_VisSetup` takes an *array* of
+origins and ORs their PVS rows precisely so that one visible set can serve several
+cameras; `ViewCustomVisibility_t::ForceViewLeaf` names the leaf the walk starts in.
+`mark(eye, …)` is `mark_view(&ViewPoint::at(eye), …)`. The one caller that needs the
+general form is [`world::portalview`](#worldportalview--the-view-through-one), whose
+virtual eye is **inside solid geometry** — cluster −1, an empty PVS row, a black hole —
+so it asks from the exit portal's five corner origins instead, having dropped any that
+`cluster_at` says is in solid.
 
 **`mark` takes `&self`.** There is no cache to invalidate: every PVS row is decompressed
 once at load, and the marked leaf set is rebuilt each frame because doing so costs 0.004 ms
@@ -1180,6 +1349,9 @@ seams. **They start open**, where the shipped engine starts them all closed and 
 every entity to open itself: 922 areaportal records in the depot answer to 409 entities, and
 one with no entity would otherwise never open. `StartOpen` is honoured on top, and 39 of the
 game's 206 `func_areaportal`s use it to start closed.
+
+**`r_novis` reaches a portal view too**, through `PortalViewSetup::novis`, so the debug
+switch means the same thing inside a portal as outside one.
 
 **`r_novis` and `r_lockpvs`** are held by `Engine`, not by `world/`, because they are about
 the *view* and `world/` is handed an eye and a matrix. `r_lockpvs` freezes the eye rather
@@ -3671,13 +3843,14 @@ Not bugs; each names what it waits on.
 |---|---|
 | Shaders this port has not ported | 3 of `sp_a1_intro1`'s 76 materials name one — `SolidEnergy` (the fizzler field), `Black`, and a `.vmt` the game does not ship. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
-| Tone mapping | HDR lightmaps arrive in `[0..16]` and reach the shader with `cLightScale` at 1.0, so a map is as bright as `vrad` left it rather than as bright as the shipped game, which auto-exposes. |
+| A portal's *warp* | The view through a portal is drawn (`world::portalview`), but its surface does not refract what is behind it and it has no opening animation. Both are `PortalRefract`'s `$Stage 0`, which samples a copy of the scene taken part way through the frame — impossible inside a `wgpu` render pass. `portdocs/PORTAL_RENDER.md` §7. |
+| An entity half-way through a portal | `c_portalghostrenderable.cpp` (980 lines): the part of a model that sticks out of the *other* portal is a second, clipped draw. Nothing but the player passes through a portal in this port, and the player is not drawn. |
 | Displacement `$seamless_scale` | Terrain **draws** now (`world/disp/`), but seamless mapping is a triplanar projection blended by the world normal, and a `WorldVertex` has none. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` underground maps and **none in `sp_a1_intro1`**; they draw with the texinfo's ordinary planar mapping — the right texture at the wrong scale. It is the feature that will force `LightmappedGeneric`'s second vertex layout. |
 | The *leaf order* of translucent geometry | The translucent pass exists and sorts by box centre; what is missing is `DrawTranslucentRenderables`' leaf walk, which interleaves each leaf's translucent world surfaces with the entities in it. With no PVS there are no leaves. A world batch is a whole map's worth of one material, so two overlapping translucent world materials can sort wrongly. |
 | The two glow render modes | `kRenderGlow` and `kRenderWorldGlow` additionally switch the depth test off (`IgnoresZBuffer()`), which needs a per-draw state override. **No brush entity and no `prop_dynamic` in the shipped game sets one** — they are `env_sprite`'s and `point_spotlight`'s, and neither class is ported. |
 | Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
 | The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
-| Visibility (PVS), area portals | `mod_vis.cpp`. **Every face in the map is drawn every frame.** Fine at 14.5k triangles; not fine on a real level. It is also possible to noclip *out* of the level and look back in, which nothing culls. |
+| ~~Visibility (PVS), area portals~~ | Landed — `world::vis`, `portdocs/ENGINE_WORLD_VIS.md`. Kept as a row because the figures above this paragraph in "Frame cost, measured" were recorded without it. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
 | Prop collision | `trace/` covers the world's brushes, the brush models and the displacements; `.phy`/vcollide is its stage 5. |
 | Simulation, sound, netcode | Not started. `State_Run` has no `Host_RunFrame` to call. There is a player who walks, falls and is stopped by the world, and nothing else is simulated at all. |
@@ -4430,7 +4603,13 @@ below it.
 entity lump it has just parsed — so `bench` now spawns a `Server` and calls
 `load_entity_models`, the same two calls `Level::load` makes. Before that it was silently
 measuring a frame with the largest thing in it missing.
-Run the six sub-benchmarks on their own — back to back they share thermal
+**The recursive view is the eighth and ninth sub-benchmarks**, and they measure whole
+frames including the world so that the *difference* is the number: `everything` 0.27 ms,
+`+ portal depth 1` 0.53, `+ portal depth 2` 0.81. **Each recursion level is one more world
+draw**, which is what it is; the row to read it against is `everything, novis` at 1.81 ms,
+which is what one level would have cost before visibility landed. That is the whole reason
+`portdocs/ENGINE_WORLD_VIS.md` went first.
+Run the sub-benchmarks on their own — back to back they share thermal
 state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
 **redundant pipeline and bind-group state is elided** — the correctness hazard for the
@@ -4443,7 +4622,7 @@ second is A/B/A, not A/B.
 > map — the numbers to re-measure after a change to the draw path or the entity
 > list, and the three materials that still do not resolve.
 
-There is a unit test suite (`cargo test`, 1,023 tests, plus 33 depot-gated), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 1,032 tests, plus 34 depot-gated), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -4518,6 +4697,17 @@ what each filter left. The finding that would have cost the game its terrain:
 **`LUMP_LEAFFACES` names none of the 1,181 displacement faces in the game**, so
 the leaf list a displacement belongs to has to be rebuilt from its bounds, the
 way the shipped loader builds `mleaf_t::dispListStart`.
+**And now you can see through a portal.** `portdocs/PORTAL_RENDER.md` took the
+stencil, the opening and the recursion: an oval is no longer a picture of the
+wall it is on but a hole with the room behind its partner in it, drawn two levels
+deep by default and up to ten under `r_portal_stencil_depth`. It is one render
+pass — a stencil mark, a partial depth clear written as a draw, the world drawn
+again under a sheared projection whose near plane is the exit portal's, and the
+wall's depth put back — and it needed the PVS to be affordable: each level is one
+more world draw at **0.27 ms**, where the same draw before visibility landed was
+1.81. What it still does not do is *warp*: a portal's surface does not refract
+what is behind it and it has no opening animation, both of which are
+`PortalRefract`'s `$Stage 0`.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it (a chamber door is
 walked through for the same reason) — but the boot path is
@@ -4562,6 +4752,8 @@ binds no key to `+moveup`. `trace` in the console reports what is under and in f
 the player.
 
 `portal 1` and `portal 2` put a blue and an orange oval on whatever you are looking at,
-and `portal off` fizzles every portal in the map. Placing both links them. It is the
-portal gun minus the gun and minus every placement rule, so nothing refuses a surface and
-nothing stops the two ending up in the same place.
+and `portal off` fizzles every portal in the map. Placing both links them, and you can
+then see and walk through both. It is the portal gun minus the gun and minus every
+placement rule, so nothing refuses a surface and nothing stops the two ending up in the
+same place. `r_portal_stencil_depth` sets how many levels of portal-in-portal are drawn:
+2 by default, 0 to switch the view through off entirely and leave a flat oval, 10 at most.

@@ -216,6 +216,43 @@ pub enum ShaderKind {
     /// rewritten by proxies. See
     /// [`PortalOverlay`](super::uniforms::PortalOverlay).
     PortalRefract,
+
+    /// `PortalRefract`'s **`$Stage 1`** — the hole a portal punches in the
+    /// stencil buffer. `models/portals/portal_stencil_hole.vmt`, and nothing
+    /// else in the game.
+    ///
+    /// The same `IShader` as [`PortalRefract`](ShaderKind::PortalRefract) and
+    /// the same `.fxc` file; a separate variant here because a
+    /// [`PipelineKey`](super::pipeline::PipelineKey) is a `ShaderKind` plus
+    /// state and what differs is the pixel shader. It shares stage 2's group 1
+    /// layout, parameter table, uniform block, vertex layout and group 3 — the
+    /// cost of the split is an enum variant and twenty lines of WGSL.
+    ///
+    /// **[`name`](ShaderKind::name) answers `"PortalRefract"` for this too**,
+    /// on purpose: the depot census counts materials by the shader that draws
+    /// them, and `portal_stencil_hole.vmt` really is a `PortalRefract`
+    /// material. The cost is that two pipelines carry the same debug label.
+    ///
+    /// `portdocs/PORTAL_RENDER.md` §6.1 for what it does and §2.2 for the two
+    /// draws it makes.
+    PortalRefractHole,
+
+    /// `stdshaders/BufferClearObeyStencil_dx9.cpp` — a clear that a stencil
+    /// test can mask.
+    ///
+    /// **No `.vmt` names it and none can**: Valve builds its eight variants in
+    /// code (`CMatRenderContext::GetBufferClearObeyStencil`) and this port
+    /// builds one, through
+    /// [`MaterialCache::synthetic`](super::material::MaterialCache::synthetic).
+    /// So [`from_name`](ShaderKind::from_name) does not answer it, which makes
+    /// it the third thing in the port that `from_name` and the shader table
+    /// disagree about — see [`Phong`](ShaderKind::Phong) for the first.
+    ///
+    /// It exists because a graphics API's clear covers the whole attachment
+    /// and a portal view needs the depth buffer reset inside one oval. The
+    /// vertices it takes are **already in clip space**;
+    /// `portdocs/PORTAL_RENDER.md` §6.2.
+    BufferClearObeyStencil,
 }
 
 /// What a shader binds in group 3, if anything.
@@ -292,6 +329,16 @@ impl ShaderKind {
             n if n.eq_ignore_ascii_case("VertexLitGeneric") => Some(ShaderKind::VertexLitGeneric),
             n if n.eq_ignore_ascii_case("Refract") => Some(ShaderKind::Refract),
             n if n.eq_ignore_ascii_case("PortalRefract") => Some(ShaderKind::PortalRefract),
+            // **No shipped `.vmt` names this one** — the depot has none, and
+            // the original has none either, because the eight materials that
+            // use it are built in code from a `KeyValues` whose shader name is
+            // this string (`CMatRenderContext::GetBufferClearObeyStencil`).
+            // This port does the same, through
+            // [`MaterialCache::synthetic`](super::material::MaterialCache::synthetic),
+            // and that literal comes through here like any other.
+            n if n.eq_ignore_ascii_case("BufferClearObeyStencil") => {
+                Some(ShaderKind::BufferClearObeyStencil)
+            }
             _ => None,
         }
     }
@@ -316,14 +363,21 @@ impl ShaderKind {
         if kind == ShaderKind::VertexLitGeneric && wants_phong(vmt) {
             return Some(ShaderKind::Phong);
         }
-        // The *other* direction: a name this port knows, on a material it
-        // cannot draw. `PortalRefract`'s three stages are three unrelated
-        // pixel shaders and only the third is ported, so a stage-0 or stage-1
-        // material resolves to nothing and gets the error material — which is
-        // the honest answer and is what keeps the depot census truthful. See
-        // [`portal_refract_stage`].
-        if kind == ShaderKind::PortalRefract && portal_refract_stage(vmt) != 2 {
-            return None;
+        // The *other* direction, and it is the same dispatch-one-layer-down
+        // that Phong is: `PortalRefract`'s three stages are three unrelated
+        // pixel shaders, so `$Stage` picks between two `ShaderKind`s and
+        // rejects the third. See [`portal_refract_stage`].
+        if kind == ShaderKind::PortalRefract {
+            return match portal_refract_stage(vmt) {
+                2 => Some(ShaderKind::PortalRefract),
+                1 => Some(ShaderKind::PortalRefractHole),
+                // **Stage 0 is still not ported**, and the reason is not that
+                // it is hard: it samples a copy of the scene taken *part way
+                // through the frame*, which cannot happen inside a `wgpu`
+                // render pass, and it is the portal's opening animation rather
+                // than its see-through. `portdocs/PORTAL_RENDER.md` §7.
+                _ => None,
+            };
         }
         Some(kind)
     }
@@ -343,7 +397,11 @@ impl ShaderKind {
             ShaderKind::VertexLitGeneric => "VertexLitGeneric",
             ShaderKind::Phong => "Phong",
             ShaderKind::Refract => "Refract",
-            ShaderKind::PortalRefract => "PortalRefract",
+            // One name for two variants — see `PortalRefractHole`, and see
+            // `WorldVertexTransition` for the same relationship the other way
+            // round, two names sharing one module.
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => "PortalRefract",
+            ShaderKind::BufferClearObeyStencil => "BufferClearObeyStencil",
         }
     }
 
@@ -429,7 +487,13 @@ impl ShaderKind {
             // simplification: adding them would mean binding a second
             // vertex stream ([`VertexLayout::Model`] takes the baked static
             // light in slot 1) for a shader with no lighting at all.
-            ShaderKind::PortalRefract => VertexLayout::Simple,
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => VertexLayout::Simple,
+            // `VERTEX_POSITION|VERTEX_COLOR` with one texture coordinate
+            // (`BufferClearObeyStencil_dx9.cpp:62`), which is
+            // [`VertexLayout::Simple`] exactly. The position is read as clip
+            // space rather than model space, which is the shader's business
+            // and not the layout's.
+            ShaderKind::BufferClearObeyStencil => VertexLayout::Simple,
         }
     }
 
@@ -457,7 +521,15 @@ impl ShaderKind {
             // has none.
             ShaderKind::Phong => (VERTEX_LIT_GENERIC_PARAMS, PHONG_PARAMS),
             ShaderKind::Refract => (REFRACT_PARAMS, &[]),
-            ShaderKind::PortalRefract => (PORTAL_REFRACT_PARAMS, &[]),
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => {
+                (PORTAL_REFRACT_PARAMS, &[])
+            }
+            // `CLEARCOLOR`, `CLEARALPHA`, `CLEARDEPTH` and `RELOADZCULL` are
+            // this shader's declared parameters; all four decide *shadow
+            // state*, which here is a `RenderState` the one caller builds
+            // rather than four `.vmt` keys nobody can write. So the table is
+            // the standard one alone — see [`BUFFER_CLEAR_PARAMS`].
+            ShaderKind::BufferClearObeyStencil => (BUFFER_CLEAR_PARAMS, &[]),
         };
         STANDARD_PARAMS.iter().chain(own).chain(extra)
     }
@@ -484,8 +556,17 @@ impl ShaderKind {
             // render context is the frame it is being drawn into.
             ShaderKind::Refract => Some(ContextBinding::FrameBufferCopy),
             // Nor lighting: a portal's oval is emissive and is lit by nothing.
-            // What it reads is its own open amount, which is per instance.
-            ShaderKind::PortalRefract => Some(ContextBinding::PortalOverlay),
+            // What it reads is its own open amount, which is per instance —
+            // and the hole reads the same block for the same reason, since the
+            // radius of the hole and the radius of the ring around it are the
+            // same number.
+            ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => {
+                Some(ContextBinding::PortalOverlay)
+            }
+            // The one shader that reads nothing at all: its vertices are
+            // already in clip space and its output is thrown away by the
+            // colour write mask.
+            ShaderKind::BufferClearObeyStencil => None,
         }
     }
 
@@ -511,6 +592,8 @@ impl ShaderKind {
             ShaderKind::Phong => include_str!("shaders/phong.wgsl"),
             ShaderKind::Refract => include_str!("shaders/refract.wgsl"),
             ShaderKind::PortalRefract => include_str!("shaders/portalrefract.wgsl"),
+            ShaderKind::PortalRefractHole => include_str!("shaders/portalhole.wgsl"),
+            ShaderKind::BufferClearObeyStencil => include_str!("shaders/bufferclear.wgsl"),
         };
         // A second shared fragment, narrower than the prelude: group 3's
         // *layout* is per shader, so a `@group(3)` declaration cannot live in
@@ -1285,6 +1368,24 @@ const REFRACT_PARAMS: &[ShaderParam] = &[
 /// nothing: neither `.fxc` declares `cModulationColor` at all. `$alpha` still
 /// reaches [`render_state`] through `IsAlphaModulating`, and there it changes
 /// nothing, because this shader blends unconditionally.
+/// `BufferClearObeyStencil`'s declared parameters, all four of which are
+/// **not** declared here.
+///
+/// `CLEARCOLOR`, `CLEARALPHA`, `CLEARDEPTH` and `RELOADZCULL`
+/// (`BufferClearObeyStencil_dx9.cpp:23-26`) are read in the shadow block and
+/// nowhere else: they pick which of the eight materials
+/// `CMatRenderContext::GetBufferClearObeyStencil` hands back, and each of those
+/// is a different combination of `EnableColorWrites`/`EnableAlphaWrites`/
+/// `EnableDepthWrites`. Here that is a [`RenderState`] built by the one caller
+/// and there is no `.vmt` to write a key into, so the table is empty and the
+/// standard parameters `CBaseShader` contributes are the whole of it.
+///
+/// It exists as a named constant rather than an inline `&[]` so that the
+/// *absence* is a statement rather than an oversight — `ShaderKind::params` is
+/// the port's answer to "what may content set", and for this shader the answer
+/// is "content cannot reach it at all".
+const BUFFER_CLEAR_PARAMS: &[ShaderParam] = &[];
+
 const PORTAL_REFRACT_PARAMS: &[ShaderParam] = &[
     ShaderParam {
         name: "$stage",
@@ -1910,7 +2011,15 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
         // 2. Requesting it would upload an image no pixel reads and would put
         // it in front of [`render_state`]'s translucency test, where this
         // shader's answer is fixed.
-        ShaderKind::PortalRefract => vec![
+        // **The hole asks for the same two and samples neither.** Sharing
+        // stage 2's list rather than answering `vec![]` is what keeps the two
+        // variants on one group-1 bind group layout, which is the whole reason
+        // the split costs an enum variant and not a layout: a bind group must
+        // supply every entry its layout declares, so a stage-1 material with
+        // no texture requests could not be built against stage 2's layout.
+        // Both resolve to the white texture on the shipped material, whose own
+        // definitions are inside a `<DX90>` block.
+        ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => vec![
             TextureRequest {
                 param: "$PortalMaskTexture",
                 binding: BINDING_PORTAL_MASK_TEXTURE,
@@ -1924,6 +2033,9 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
                 dimension: TextureDimension::D2,
             },
         ],
+        // Four samplers in the original, all of them for the colour path this
+        // port's one caller has turned off.
+        ShaderKind::BufferClearObeyStencil => Vec::new(),
     }
 }
 
@@ -2179,7 +2291,9 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         // `PortalRefract` is not lit either: a portal's oval is emissive, and
         // `$PortalColorScale` of 4 is what makes it brighter than anything
         // around it.
-        | ShaderKind::PortalRefract => Lighting::None,
+        | ShaderKind::PortalRefract
+        | ShaderKind::PortalRefractHole
+        | ShaderKind::BufferClearObeyStencil => Lighting::None,
         ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -3249,6 +3363,36 @@ impl PortalRefractFlags {
     pub const TINTED: u32 = 1 << 1;
 }
 
+/// `BufferClearObeyStencil`'s material block — group 1, binding 0.
+///
+/// One colour, which `DrawClearBufferQuad` passes on the *vertex* in the
+/// original (`meshBuilder.Color4ub( r, g, b, a )`) because its eight material
+/// variants differ only in write masks and it would be wasteful to have eight
+/// more for eight colours. Here it is a uniform, because this port builds one
+/// variant and gives it one colour — and because the colour is masked away
+/// before it reaches the target anyway ([`buffer_clear_render_state`] turns
+/// colour writes off). It exists so that the block is not zero-sized.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct BufferClearUniforms {
+    /// The clear colour, in the target's own space. Never written while
+    /// `CLEARCOLOR` is 0, which is the only variant this port builds.
+    pub color: [f32; 4],
+}
+
+/// Builds the material block for the `BufferClearObeyStencil` material.
+///
+/// `$color` is read because `CBaseShader` declares it on every material and
+/// because the day something wants a *colour* clear obeying the stencil — the
+/// water pass is the candidate — it is the key it will write.
+pub fn buffer_clear_uniforms(vmt: &Vmt) -> BufferClearUniforms {
+    let kind = ShaderKind::BufferClearObeyStencil;
+    let color = param_value(kind, vmt, "$color")
+        .map(|var| var.as_vec4())
+        .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+    BufferClearUniforms { color }
+}
+
 /// `PortalRefract`'s material block — group 1, binding 0.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
@@ -3703,6 +3847,14 @@ fn render_state_with_modulation(
     if kind == ShaderKind::PortalRefract {
         return portal_refract_render_state(state);
     }
+    // Stage 1 of the same shader, and it diverges from stage 2 in every field
+    // that matters — see [`portal_refract_hole_render_state`].
+    if kind == ShaderKind::PortalRefractHole {
+        return portal_refract_hole_render_state(state);
+    }
+    if kind == ShaderKind::BufferClearObeyStencil {
+        return buffer_clear_render_state(state);
+    }
 
     // --- EvaluateBlendRequirements ---------------------------------------
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
@@ -3916,6 +4068,68 @@ fn portal_refract_render_state(mut state: RenderState) -> RenderState {
     state
 }
 
+/// `DrawPortalRefract`'s shadow block again, taking the `nStage == 1` branch
+/// everywhere it forks — and it forks in three places, which is most of why
+/// this is a second [`ShaderKind`] rather than a second blend mode.
+///
+/// | | stage 2 | stage 1 |
+/// |---|---|---|
+/// | `EnableAlphaBlending` | `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` | **not called** |
+/// | `EnableDepthWrites` | `false` | **`true`** |
+/// | `AlphaFunc` | `> 1/255` | `> 0.5` |
+///
+/// *"Disable z-writes for all passes"* says the comment at
+/// `portal_refract_helper.cpp:144`; the `if ( nStage != 1 )` under it says
+/// otherwise, and the exception is the point. This is the one draw in a portal
+/// view whose job includes leaving a depth value behind.
+///
+/// The alpha reference is not a field here because nothing in this port's
+/// pipeline state carries one: alpha testing is a `discard` in the fragment
+/// shader, and `shaders/portalhole.wgsl` has the 0.5 written into it.
+///
+/// **Depth bias `Decal` is kept**, from `EnablePolyOffset( SHADER_POLYOFFSET_DECAL )`
+/// at `:159`, and it is doing real work rather than being inherited: the hole
+/// is coplanar with the wall the portal is mounted on, and without the bias the
+/// depth test at step 1 is a coin flip per pixel.
+fn portal_refract_hole_render_state(mut state: RenderState) -> RenderState {
+    state.blend = BlendMode::None;
+    state.depth_test = true;
+    state.depth_write = true;
+    state.write_alpha = false;
+    state.depth_bias = DepthBias::Decal;
+    state
+}
+
+/// The one variant of `BufferClearObeyStencil` this port builds: depth only.
+///
+/// `CLEARDEPTH 1`, `CLEARCOLOR 0`, `CLEARALPHA -1` (which copies `CLEARCOLOR`),
+/// which is `GetBufferClearObeyStencil( 4 )` in
+/// `CMatRenderContext::DrawClearBufferQuad`'s index arithmetic
+/// (`bClearColor + (bClearAlpha << 1) + (bClearDepth << 2)`).
+///
+/// `DepthFunc( SHADER_DEPTHFUNC_ALWAYS )` (`:57`, taking the non-PS3 branch) is
+/// the interesting one and it is not optional: the quad is at the *far* plane
+/// and the depth values it is replacing are nearer, so an ordinary depth test
+/// would reject every pixel of it. Here "always" is spelled `depth_test:
+/// false`, which is what [`RenderState`] turns into
+/// `CompareFunction::Always`.
+fn buffer_clear_render_state(mut state: RenderState) -> RenderState {
+    state.blend = BlendMode::None;
+    state.depth_test = false;
+    state.depth_write = true;
+    state.write_color = false;
+    state.write_alpha = false;
+    // **A divergence, and a deliberate one.** The original sets no cull mode,
+    // so its quad is drawn with whatever the render context last had — which
+    // works because `DrawClearBufferQuad` emits its four corners in the one
+    // order that survives `D3DCULL_CCW`. The quad here is built in clip space
+    // by its caller, where "which way round is front" is a question with no
+    // useful answer, and a back-facing full-screen clear is a portal that
+    // draws the wall. Turning culling off costs nothing: it is two triangles.
+    state.cull = false;
+    state
+}
+
 /// `CBaseShader::TextureIsTranslucent( BASETEXTURE, true )`
 /// (`shaderlib/BaseShader.cpp:605`).
 ///
@@ -3986,10 +4200,12 @@ mod tests {
         "$time" "0.0"
     "#;
 
-    /// **Only `$Stage 2` resolves**, and the two that do not are the whole
-    /// reason `resolve` can answer `None` for a name `from_name` knows.
+    /// **`$Stage` picks between two `ShaderKind`s and rejects the third**,
+    /// which is the second place in the port where `resolve` answers something
+    /// `from_name` cannot (the first is `Phong`, and it disagrees the other
+    /// way).
     #[test]
-    fn portal_refract_resolves_only_its_third_stage() {
+    fn portal_refract_resolves_two_of_its_three_stages() {
         assert_eq!(
             ShaderKind::from_name("PortalRefract"),
             Some(ShaderKind::PortalRefract),
@@ -3999,17 +4215,22 @@ mod tests {
             ShaderKind::resolve(&portal_refract_vmt(PORTAL_OVERLAY_1)),
             Some(ShaderKind::PortalRefract)
         );
-        // `portal_refract_1.vmt` and `portal_stencil_hole.vmt`: the two
-        // materials in the game that belong to the recursive view.
+        // `portal_stencil_hole.vmt`, which the recursive view punches the
+        // opening with.
+        assert_eq!(
+            ShaderKind::resolve(&portal_refract_vmt("\"$Stage\" \"1\"")),
+            Some(ShaderKind::PortalRefractHole),
+        );
+        // Both variants report the name content wrote, so the depot census
+        // counts `portal_stencil_hole.vmt` as the `PortalRefract` material it
+        // is.
+        assert_eq!(ShaderKind::PortalRefractHole.name(), "PortalRefract");
+        // `portal_refract_1.vmt`, the opening animation's warp — the one stage
+        // still unported, and `portdocs/PORTAL_RENDER.md` §7 says why.
         assert_eq!(
             ShaderKind::resolve(&portal_refract_vmt("\"$Stage\" \"0\"")),
             None,
-            "the see-through warp reads the scene and is not ported"
-        );
-        assert_eq!(
-            ShaderKind::resolve(&portal_refract_vmt("\"$Stage\" \"1\"")),
-            None,
-            "the stencil punch needs a stencil"
+            "the see-through warp reads a copy of the scene taken mid-pass"
         );
         // An undefined `$Stage` is 0, which `InitParamsPortalRefract` writes
         // back into the parameter.

@@ -486,8 +486,10 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   has ended before the pass sampling it begins; and **per-draw constants are
   bump-allocated with dynamic offsets**, because `Queue::write_buffer` stages its copy
   ahead of the whole command buffer and a rewritten uniform would reach every draw in the
-  frame. Not yet: MSAA, stencil, exclusive fullscreen modes, `mat_picmip`, and texture
-  streaming.
+  frame. **The stencil landed later**, with the recursive portal view
+  (`portdocs/PORTAL_RENDER.md`): it is in the *pipeline* key because `wgpu` puts it there,
+  no `.vmt` reaches it, and `Pass::set_stencil` is the only writer. Not yet: MSAA,
+  exclusive fullscreen modes, `mat_picmip`, and texture streaming.
 - **`materialsystem` stages 5 and 6 — done; stages 7-8 documented, not started.**
   A faithful `CImagePacker` port, `Rgba16Float` atlas pages holding linear radiance, the
   `ColorRGBExp32` decode and the bumped-lightmap correction, and `LightmappedGeneric` in

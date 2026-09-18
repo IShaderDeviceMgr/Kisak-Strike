@@ -11,15 +11,21 @@
 //! (`game/client/portal/portalrenderable_flatbasic.cpp:1212`) with
 //! `models/portals/portalstaticoverlay_1.vmt` bound — which is one of the three
 //! draws `C_Prop_Portal::DrawPortal` makes, and the only one
-//! `portdocs/PORTAL.md` takes. The other two are the see-through warp and the
-//! stencil punch, and both belong to the recursive view.
+//! `portdocs/PORTAL.md` takes. Of the other two, the **stencil punch** is here
+//! as well ([`Portals::draw_hole`]), driven by
+//! [`portalview`](super::portalview); the see-through warp — `$Stage 0` — is
+//! not, and `portdocs/PORTAL_RENDER.md` §7 says why.
 //!
 //! # What you see, and what you do not
 //!
-//! **A coloured oval on an unbroken wall.** No hole, no view through, no
-//! reflection of the room on the other side. That is the deliberate output of
-//! `portdocs/PORTAL.md`'s scope and is worth saying out loud before anyone
-//! reports it as a bug.
+//! **A coloured oval, and the room behind the other portal inside it.** The
+//! oval is this module; the picture in the opening is
+//! [`World::draw_portal_views`](super::World::draw_portal_views), which reaches
+//! back here for [`draw_hole`](Portals::draw_hole),
+//! [`draw_hole_cap`](Portals::draw_hole_cap) and
+//! [`clear_depth`](Portals::clear_depth). What is still missing is the *warp* —
+//! a portal's surface does not refract what is behind it, and it has no opening
+//! animation.
 //!
 //! # Three things here that produce a plausible wrong picture rather than an
 //! error
@@ -71,6 +77,50 @@ const OVERLAY_MATERIALS: [&str; 2] = [
     "models/portals/portalstaticoverlay_2",
 ];
 
+/// `models/portals/portal_stencil_hole.vmt` — `PortalRefract`'s `$Stage 1`,
+/// the shape of the opening.
+///
+/// One material for both colours, because the hole is not coloured. It is
+/// drawn twice per portal per frame by
+/// [`draw_portal_views`](super::World::draw_portal_views): once to mark the
+/// opening in the stencil buffer and once to take the mark away and put the
+/// wall's depth back. `portdocs/PORTAL_RENDER.md` §6.1.
+const HOLE_MATERIAL: &str = "models/portals/portal_stencil_hole";
+
+/// The `BufferClearObeyStencil` material, written in code because Valve writes
+/// its eight in code too (`CMatRenderContext::GetBufferClearObeyStencil`).
+///
+/// This is variant 4 of the eight: depth only, no colour, no alpha —
+/// `ClearBuffersObeyStencil( false, true )`, which is what step 2 of a portal
+/// view asks for. The three `$clear*` keys are the shader's declared
+/// parameters and are written here for the record; nothing reads them, because
+/// the write masks they would pick are
+/// [`buffer_clear_render_state`](crate::materials::shader) constants.
+const CLEAR_MATERIAL_NAME: &str = "___bufferclearobeystencil_depth";
+const CLEAR_MATERIAL: &str = r#"
+"BufferClearObeyStencil"
+{
+    "$clearcolor" "0"
+    "$clearalpha" "0"
+    "$cleardepth" "1"
+}
+"#;
+
+/// The full-screen quad [`Portals::clear_depth`] draws, in normalized device
+/// coordinates with `z` at the far plane.
+///
+/// `CMatRenderContext::DrawClearBufferQuad` (`cmatrendercontext.cpp:2443`),
+/// including the `1.1` — *"1.1 instead of 1.0 to fix small borders around the
+/// edges in full screen with anti-aliasing enabled"*. `z` is
+/// [`CLEAR_DEPTH`](crate::materials::target), the value a depth clear writes,
+/// because resetting the depth inside the opening is exactly what this is.
+const CLEAR_QUAD: [[f32; 3]; 4] = [
+    [-1.1, -1.1, 1.0],
+    [-1.1, 1.1, 1.0],
+    [1.1, 1.1, 1.0],
+    [1.1, -1.1, 1.0],
+];
+
 /// How fast `$PortalOpenAmount` climbs, in units per second.
 ///
 /// `m_fOpenAmount += gpGlobals->frametime * ( 2.0f / flSlowdown )`
@@ -99,12 +149,14 @@ const TIME_WRAP: f32 = 1000.0;
 /// `Engine::frame` copies one into the other once a rendered frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Portal {
-    /// An opaque, stable key from whoever made the list. Not read here yet:
-    /// unlike a model instance a portal owns no uploaded geometry, so there is
-    /// nothing to match a sync against — the list is simply rebuilt. It is
-    /// carried because the seam on the other side is keyed and a one-way
-    /// asymmetry is a thing to explain twice.
-    #[allow(dead_code)]
+    /// An opaque, stable key from whoever made the list.
+    ///
+    /// Nothing about *drawing* a portal reads it — unlike a model instance a
+    /// portal owns no uploaded geometry, so there is nothing to match a sync
+    /// against and the list is simply rebuilt. What reads it is
+    /// [`linked`](Portal::linked), which names a partner by it, and the
+    /// recursive view, which uses it to refuse to re-enter the portal it came
+    /// out of.
     pub id: u64,
     pub origin: Vec3,
     /// Pitch, yaw, roll.
@@ -123,15 +175,19 @@ pub struct Portal {
     pub open_for: f32,
     /// The [`id`](Portal::id) of this portal's partner, if it has one.
     ///
-    /// **Nothing in the draw reads it.** It is here because this list is also
-    /// what [`World::sync_portals`](super::World::sync_portals) carves from,
-    /// and the far side of a portal is half of what the carve has to know —
-    /// see `crate::engine::trace::PortalLink`.
-    #[allow(dead_code)]
+    /// Two readers, and they arrived a stage apart:
+    /// [`World::sync_portals`](super::World::sync_portals) carves from this
+    /// list and the far side of a portal is half of what the carve has to know
+    /// (`crate::engine::trace::PortalLink`), and
+    /// [`Portals::pairs`] turns it into the recursive view's candidate list.
+    /// The *oval* still reads neither.
     pub linked: Option<u64>,
-    /// `m_matrixThisToLinked`, the identity while unlinked. Likewise the
-    /// carve's rather than the draw's.
-    #[allow(dead_code)]
+    /// `m_matrixThisToLinked`, the identity while unlinked.
+    ///
+    /// The carve's and the recursive view's; the oval is drawn in world space
+    /// and never needs it. It travels rather than being rederived because
+    /// there is exactly one teleport matrix in the port and a second spelling
+    /// of it can silently lose the 180° about up — `portdocs/PORTAL.md` §3.2.
     pub matrix: glam::Mat4,
 }
 
@@ -146,6 +202,10 @@ pub struct Portals {
     /// `MaterialCache` entry: the cache owns the material and hands out
     /// shares of it.
     materials: [Arc<Material>; 2],
+    /// [`HOLE_MATERIAL`], the recursive view's stencil punch.
+    hole: Arc<Material>,
+    /// [`CLEAR_MATERIAL`], the recursive view's depth reset.
+    clear: Arc<Material>,
     live: Vec<Portal>,
 }
 
@@ -165,8 +225,53 @@ impl Portals {
     pub fn load(materials: &mut MaterialCache, vfs: &crate::filesystem::Vfs) -> Portals {
         Portals {
             materials: OVERLAY_MATERIALS.map(|name| materials.load(vfs, name)),
+            hole: materials.load(vfs, HOLE_MATERIAL),
+            clear: materials.synthetic(CLEAR_MATERIAL_NAME, CLEAR_MATERIAL),
             live: Vec::new(),
         }
+    }
+
+    /// Every linked portal, paired with what is on the other side of it.
+    ///
+    /// The recursive view's candidate list —
+    /// `CPortalRender::m_ActivePortals` reduced to the two conditions that
+    /// matter here: a portal draws a view only if it has a partner, and only
+    /// the *entrance* side of the relationship is needed, since the partner
+    /// contributes nothing but its plane and its five visibility points.
+    ///
+    /// A `Vec` rather than an iterator because the caller holds `&World`
+    /// across a recursive call that borrows it again, and because the longest
+    /// it can be is two.
+    pub fn pairs(&self) -> Vec<PortalPair> {
+        self.live
+            .iter()
+            .enumerate()
+            .filter_map(|(index, portal)| {
+                let partner = portal.linked?;
+                let exit = self.live.iter().find(|other| other.id == partner)?;
+                Some(PortalPair::new(index, portal, exit))
+            })
+            .collect()
+    }
+
+    /// [`HOLE_MATERIAL`], for the one test that has to know it is not the
+    /// error checkerboard.
+    ///
+    /// A fallback material draws a magenta rectangle, which through a stencil
+    /// hole is a picture like any other — so this is the seam that lets
+    /// `portalview`'s rendered test rule that out before it compares pixels.
+    /// `#[cfg(test)]` because that is its only caller and nothing in a running
+    /// frame has any business asking which material a portal's hole wears.
+    #[cfg(test)]
+    pub fn hole_material(&self) -> &Material {
+        &self.hole
+    }
+
+    /// [`CLEAR_MATERIAL`], for the same reason as
+    /// [`hole_material`](Portals::hole_material).
+    #[cfg(test)]
+    pub fn clear_material(&self) -> &Material {
+        &self.clear
     }
 
     /// Replaces the list with what the game says is active now.
@@ -189,20 +294,19 @@ impl Portals {
             .map(|(index, portal)| (index, portal.origin))
     }
 
-    /// Records one portal's quad.
+    /// Binds one portal's three per-instance numbers for the draws that
+    /// follow.
     ///
-    /// `curtime` is the scene clock, and it reaches the shader twice: once as
-    /// the noise scroll and once, through
-    /// [`Portal::open_for`], as the two curves.
-    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize) {
-        let Some(portal) = self.live.get(index) else {
-            return;
-        };
-
-        // `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`), integrated
-        // in closed form. Both are clamped at both ends because `open_for` is
-        // an elapsed time and a level that has just restarted can hand over a
-        // negative one.
+    /// `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`), integrated in
+    /// closed form. Both curves are clamped at both ends because `open_for` is
+    /// an elapsed time and a level that has just restarted can hand over a
+    /// negative one.
+    ///
+    /// Shared by the oval and the hole, and they must not disagree: the hole's
+    /// radius and the ring's radius are the same expression of the same open
+    /// amount, so a ring drawn from one block and a hole from another would
+    /// stop being concentric.
+    fn bind_overlay(&self, pass: &mut Pass<'_>, curtime: f32, portal: &Portal) {
         let open_amount = (portal.open_for * OPEN_RATE).clamp(0.0, 1.0);
         let static_amount = (1.0 - portal.open_for * STATIC_RATE).clamp(0.0, 1.0);
         pass.set_portal_overlay(&PortalOverlay {
@@ -214,6 +318,87 @@ impl Portals {
             time: curtime - (curtime / TIME_WRAP).floor() * TIME_WRAP,
             _padding: 0.0,
         });
+    }
+
+    /// Records one portal's opening, for the stencil.
+    ///
+    /// `$Stage 1`. Drawn twice per portal per frame with different state — see
+    /// [`draw_portal_views`](super::World::draw_portal_views), which is the
+    /// only caller, and `portdocs/PORTAL_RENDER.md` §2.2. The geometry is
+    /// [`quad`], the same four vertices the oval uses, **at the same place**:
+    /// the depth this restores at step 4 is the depth the oval is then tested
+    /// against, so a hole pushed even a quarter of a unit off the wall would
+    /// cut the ring out of its own opening.
+    pub fn draw_hole(&self, pass: &mut Pass<'_>, curtime: f32, index: usize) {
+        let Some(portal) = self.live.get(index) else {
+            return;
+        };
+        self.bind_overlay(pass, curtime, portal);
+        let vertices = quad(portal);
+        let vertices = pass.vertices(&vertices);
+        let indices = pass.indices(&QUAD_INDICES);
+        pass.draw(&self.hole, &vertices, &indices, Mat4::IDENTITY);
+    }
+
+    /// Records the near-plane cap, as a triangle fan over a polygon
+    /// [`near_plane_cap`](super::portalview::near_plane_cap) built in world
+    /// space.
+    ///
+    /// **Every vertex carries texture coordinate `(0.5, 0.5)`** — the centre
+    /// of the portal, where the stage-1 alpha test passes for any open amount.
+    /// The cap is unconditionally inside the opening, which is what it is for;
+    /// giving it the quad's real coordinates would cut an oval out of the
+    /// patch and leave a hole in the hole.
+    pub fn draw_hole_cap(&self, pass: &mut Pass<'_>, curtime: f32, index: usize, cap: &[Vec3]) {
+        let Some(portal) = self.live.get(index) else {
+            return;
+        };
+        if cap.len() < 3 {
+            return;
+        }
+        self.bind_overlay(pass, curtime, portal);
+
+        let vertices: Vec<SimpleVertex> = cap
+            .iter()
+            .map(|point| SimpleVertex::new(point.to_array(), [0.5, 0.5]))
+            .collect();
+        let mut indices = Vec::with_capacity((cap.len() - 2) * 3);
+        for triangle in 0..cap.len() - 2 {
+            indices.extend_from_slice(&[0, triangle as u16 + 1, triangle as u16 + 2]);
+        }
+        let vertices = pass.vertices(&vertices);
+        let indices = pass.indices(&indices);
+        pass.draw(&self.hole, &vertices, &indices, Mat4::IDENTITY);
+    }
+
+    /// Resets the depth buffer wherever the stencil test lets it.
+    ///
+    /// `ClearBuffersObeyStencil( false, true )`. The caller sets the stencil
+    /// and, for anything but a debug frame, a scissor — without one this is a
+    /// full-screen draw, which is what `DrawClearBufferQuad` always is.
+    ///
+    /// The quad is in **clip space**: [`CLEAR_QUAD`], straight through the
+    /// vertex shader. `portdocs/PORTAL_RENDER.md` §6.2.
+    pub fn clear_depth(&self, pass: &mut Pass<'_>) {
+        let vertices: Vec<SimpleVertex> = CLEAR_QUAD
+            .iter()
+            .map(|position| SimpleVertex::new(*position, [0.0, 0.0]))
+            .collect();
+        let vertices = pass.vertices(&vertices);
+        let indices = pass.indices(&QUAD_INDICES);
+        pass.draw(&self.clear, &vertices, &indices, Mat4::IDENTITY);
+    }
+
+    /// Records one portal's quad.
+    ///
+    /// `curtime` is the scene clock, and it reaches the shader twice: once as
+    /// the noise scroll and once, through
+    /// [`Portal::open_for`], as the two curves.
+    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize) {
+        let Some(portal) = self.live.get(index) else {
+            return;
+        };
+        self.bind_overlay(pass, curtime, portal);
 
         let vertices = quad(portal);
         let vertices = pass.vertices(&vertices);
@@ -229,6 +414,116 @@ impl Portals {
             Mat4::IDENTITY,
         );
     }
+}
+
+/// One linked portal and everything the recursive view needs to know about
+/// the other side of it.
+///
+/// Gathered once per level from [`Portals::pairs`] rather than looked up
+/// repeatedly, because the *exit* half of it is what
+/// `CPortalRenderable_FlatBasic::PortalMoved`
+/// (`portalrenderable_flatbasic.cpp:63`) precomputes and caches: five points
+/// that are all a unit in front of the exit plane, and the plane itself.
+#[derive(Debug, Clone, Copy)]
+pub struct PortalPair {
+    /// Index into [`Portals`]' live list, for the draws.
+    pub index: usize,
+    /// This portal's key.
+    pub id: u64,
+    /// The partner's key — what the recursion must not follow back.
+    pub partner_id: u64,
+    /// `m_matrixThisToLinked`, entrance to exit.
+    pub matrix: Mat4,
+    pub origin: Vec3,
+    /// The portal's basis, as unit vectors. `right` is the **negation** of the
+    /// angle matrix's second column, which is Valve's `m_vRight = -m_vRight`
+    /// (`portal_base2d.cpp:1213`) — column 1 is *left*.
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub half_width: f32,
+    pub half_height: f32,
+    /// The four world corners of this portal's own quad, for the screen
+    /// rectangle and the frustum test. **On the portal's plane**, not the unit
+    /// in front the PVS points sit at: this rectangle has to bound the pixels
+    /// the opening actually covers.
+    pub corners: [Vec3; 4],
+    /// The exit portal's plane, for the oblique near plane.
+    pub exit_origin: Vec3,
+    pub exit_forward: Vec3,
+    /// `m_ptForwardOrigin` of the exit portal — one unit in front of it, and
+    /// the point whose leaf the area flood is forced to start from.
+    pub exit_forward_origin: Vec3,
+    /// The five points the exit portal contributes to the PVS: its
+    /// `m_ptForwardOrigin` and its four `m_ptCorners`, all a unit in front of
+    /// its plane. See [`ViewPoint`](super::vis::ViewPoint) for why the virtual
+    /// camera's own position is useless here.
+    pub exit_vis_origins: [Vec3; 5],
+}
+
+impl PortalPair {
+    fn new(index: usize, entrance: &Portal, exit: &Portal) -> PortalPair {
+        let (forward, right, up) = basis(entrance);
+        let (exit_forward, exit_right, exit_up) = basis(exit);
+        let exit_forward_origin = exit.origin + exit_forward;
+        let exit_across = exit_right * exit.half_width;
+        let exit_upward = exit_up * exit.half_height;
+
+        PortalPair {
+            index,
+            id: entrance.id,
+            partner_id: exit.id,
+            matrix: entrance.matrix,
+            origin: entrance.origin,
+            forward,
+            right,
+            up,
+            half_width: entrance.half_width,
+            half_height: entrance.half_height,
+            corners: {
+                let across = right * entrance.half_width;
+                let upward = up * entrance.half_height;
+                [
+                    entrance.origin - across + upward,
+                    entrance.origin + across + upward,
+                    entrance.origin + across - upward,
+                    entrance.origin - across - upward,
+                ]
+            },
+            exit_origin: exit.origin,
+            exit_forward,
+            exit_forward_origin,
+            exit_vis_origins: [
+                exit_forward_origin,
+                exit_forward_origin + exit_across + exit_upward,
+                exit_forward_origin - exit_across + exit_upward,
+                exit_forward_origin - exit_across - exit_upward,
+                exit_forward_origin + exit_across - exit_upward,
+            ],
+        }
+    }
+
+    /// The axis-aligned bounds of this portal's quad, for the frustum test.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        self.corners.iter().fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(mins, maxs), corner| (mins.min(*corner), maxs.max(*corner)),
+        )
+    }
+}
+
+/// A portal's `(forward, right, up)`, as unit vectors.
+///
+/// The same expression [`quad`] uses, factored out because the recursive view
+/// wants the directions without the sizes. See [`PortalPair::right`] for the
+/// negation.
+fn basis(portal: &Portal) -> (Vec3, Vec3, Vec3) {
+    let rotation = angle_matrix(portal.angles);
+    (
+        rotation * Vec3::X,
+        -(rotation * Vec3::Y),
+        rotation * Vec3::Z,
+    )
 }
 
 /// Two triangles over four corners, wound counter-clockwise seen from `+n` —
@@ -266,9 +561,9 @@ fn quad(portal: &Portal) -> [SimpleVertex; 4] {
     // The portal's basis. **`right` is the negation of the angle matrix's
     // second column**, which is Valve's `m_vRight = -m_vRight`
     // (`portal_base2d.cpp:1213`) — column 1 is *left*.
-    let rotation = angle_matrix(portal.angles);
-    let right = -(rotation * Vec3::Y) * portal.half_width;
-    let up = (rotation * Vec3::Z) * portal.half_height;
+    let (_, right, up) = basis(portal);
+    let right = right * portal.half_width;
+    let up = up * portal.half_height;
     let origin = portal.origin;
 
     // `u = up`, `v = right`, because `up × right == forward` in Source's

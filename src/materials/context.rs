@@ -72,7 +72,7 @@ use glam::{Mat4, Vec3};
 
 use super::material::Material;
 use super::mesh::{DynamicBuffers, IndexSlice, VertexSlice};
-use super::pipeline::{PipelineCache, PipelineKey, RenderState, TargetFormat};
+use super::pipeline::{PipelineCache, PipelineKey, RenderState, Stencil, TargetFormat};
 use super::renderer::Frame;
 use super::shader::ContextBinding;
 use super::target::{RenderTarget, CLEAR_DEPTH};
@@ -233,6 +233,26 @@ pub struct StateOverride {
     pub depth_test: Option<bool>,
     /// The other half of `OverrideDepthEnable`.
     pub depth_write: Option<bool>,
+    /// `EnableColorWrites`, for the draws that exist to touch depth and
+    /// stencil only — `portdocs/PORTAL_RENDER.md` §6.3's second draw of the
+    /// portal hole. `None` leaves the material's own choice alone.
+    pub write_color: Option<bool>,
+    /// `IMatRenderContext::SetStencilState`, minus the reference value, which
+    /// is dynamic state and travels with
+    /// [`Pass::set_stencil`](Pass::set_stencil) instead.
+    ///
+    /// **`None` means "whatever the material said", and every material says
+    /// disabled** — so there is no way to spell "force the stencil off" here
+    /// and none is needed: `set_stencil(None, ..)` clears the override, which
+    /// is the same thing. Valve's stencil state has an explicit `m_bEnable`
+    /// because its state was a stack with no material underneath it.
+    ///
+    /// **Set it through [`Pass::set_stencil`] and not by building a
+    /// `StateOverride`**, which is the only field here that is true of: the
+    /// reference value has to be issued alongside it, and
+    /// [`Pass::set_state_override`] deliberately preserves this field rather
+    /// than replacing it.
+    pub stencil: Option<Stencil>,
 }
 
 impl StateOverride {
@@ -245,6 +265,12 @@ impl StateOverride {
         }
         if let Some(write) = self.depth_write {
             state.depth_write = write;
+        }
+        if let Some(write) = self.write_color {
+            state.write_color = write;
+        }
+        if self.stencil.is_some() {
+            state.stencil = self.stencil;
         }
         state
     }
@@ -607,8 +633,9 @@ impl RenderContext {
             &self.queue,
             bytemuck::bytes_of(&frame_uniforms),
         );
-        // One slot per pass, so there is nothing to batch: flushed here rather
-        // than in `Pass::drop` because the pass does not hold this arena.
+        // One slot per pass — flushed here so that a pass which never calls
+        // `set_camera` behaves exactly as it did before the arena became the
+        // pass's to write into.
         self.frames.flush(&self.queue);
 
         // Every pass starts with one fullbright lighting slot, so that a model
@@ -641,9 +668,18 @@ impl RenderContext {
             }),
         );
 
-        let (color_load, depth_load) = match load {
-            Load::Clear(color) => (wgpu::LoadOp::Clear(color), wgpu::LoadOp::Clear(CLEAR_DEPTH)),
-            Load::Keep => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
+        // Read before the arena is borrowed mutably below. It is a refcounted
+        // handle, and `Pass::set_camera` takes a fresh one when it pushes —
+        // the arena can be replaced mid-pass by a growth.
+        let frame_bind_group = self.frames.bind_group().clone();
+
+        let (color_load, depth_load, stencil_load) = match load {
+            Load::Clear(color) => (
+                wgpu::LoadOp::Clear(color),
+                wgpu::LoadOp::Clear(CLEAR_DEPTH),
+                wgpu::LoadOp::Clear(0),
+            ),
+            Load::Keep => (wgpu::LoadOp::Load, wgpu::LoadOp::Load, wgpu::LoadOp::Load),
         };
 
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -663,11 +699,23 @@ impl RenderContext {
                     load: depth_load,
                     store: wgpu::StoreOp::Store,
                 }),
-                // `None` is a read-only stencil aspect, which is what the
-                // pipelines' `StencilState::default()` declares. See
-                // `target::DEPTH_FORMAT` for why the format has a stencil at
-                // all when nothing writes it yet.
-                stencil_ops: None,
+                // **Always writable**, which is what lets a pipeline carry a
+                // non-zero stencil write mask: `None` here is a *read-only*
+                // stencil aspect, and `wgpu` rejects the pipeline rather than
+                // drawing it wrong (`portdocs/PORTAL_RENDER.md` §8's invariant
+                // 7). It costs nothing on a pass that writes no stencil,
+                // because `StencilState::default()`'s write mask is zero.
+                //
+                // Cleared with the depth, which is `ClearBuffers`' own
+                // pairing: D3D9's `D3DCLEAR_ZBUFFER` and `D3DCLEAR_STENCIL`
+                // are set together whenever the format has both
+                // (`shaderapidx8.cpp:14638`). A frame therefore starts with
+                // every stencil value at 0, which is the recursion's level-0
+                // reference.
+                stencil_ops: Some(wgpu::Operations {
+                    load: stencil_load,
+                    store: wgpu::StoreOp::Store,
+                }),
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -678,13 +726,16 @@ impl RenderContext {
             pass,
             device: &self.device,
             queue: &self.queue,
+            frames: &mut self.frames,
+            size,
+            exposure: self.exposure,
             draws: &mut self.draws,
             lights: &mut self.lights,
             lighting_offset,
             portals: &mut self.portals,
             portal_offset,
             dynamic: &mut self.dynamic,
-            frame_bind_group: self.frames.bind_group().clone(),
+            frame_bind_group,
             frame_offset,
             pipelines,
             target,
@@ -810,6 +861,17 @@ pub struct Pass<'a> {
     pass: wgpu::RenderPass<'a>,
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
+    /// The per-pass arena, held so that [`set_camera`](Pass::set_camera) can
+    /// take a second slot out of it. A pass that never calls it uses the one
+    /// slot `RenderContext::open` allocated and this is never touched again.
+    frames: &'a mut UniformArena,
+    /// The target's size in pixels, for `cScreenSize`. Remembered because
+    /// [`set_camera`](Pass::set_camera) has to rebuild the whole block.
+    size: (u32, u32),
+    /// `m_LastSetToneMapScale`, likewise — and it is deliberately *not* a
+    /// parameter of `set_camera`: a portal view must be exposed exactly the
+    /// way the scene around it is, or the seam shows.
+    exposure: f32,
     draws: &'a mut UniformArena,
     /// The model-lighting arena, group 3 for the shaders that read one.
     lights: &'a mut UniformArena,
@@ -886,9 +948,10 @@ struct BoundState {
     indices: Option<(wgpu::Buffer, u64, u32)>,
 }
 
-// Viewport, scissor and depth range are per-pass state the engine sets and
-// nothing in this binary does yet: split screen, the view model's compressed
-// depth range, and `m_ScissorRectStack`'s users respectively.
+// Viewport and depth range are per-pass state the engine sets and nothing in
+// this binary does yet: split screen and the view model's compressed depth
+// range respectively. `set_scissor` has a caller — the portal view bounds
+// steps 2 and 4 to the portal's screen rectangle.
 #[allow(dead_code)]
 impl Pass<'_> {
     /// Restricts drawing to part of the target. `IMatRenderContext::Viewport`.
@@ -1038,8 +1101,73 @@ impl Pass<'_> {
     ///
     /// See [`StateOverride`]. Applies from here to the end of the pass or the
     /// next call, whichever comes first.
+    /// Sets the stencil test every subsequent draw in this pass uses.
+    ///
+    /// `IMatRenderContext::SetStencilState( ShaderStencilState_t )`, split the
+    /// way `wgpu` splits it: the compare function, the three operations and
+    /// the two masks are pipeline state and go through
+    /// [`StateOverride::stencil`], while `m_nReferenceValue` is dynamic state
+    /// and is issued here and now.
+    ///
+    /// `None` puts the stencil back to whatever the material asks for, which
+    /// for every material in the game is "disabled".
+    ///
+    /// Independent of [`set_state_override`](Pass::set_state_override), which
+    /// leaves the stencil alone — the two may be called in either order.
+    pub fn set_stencil(&mut self, stencil: Option<Stencil>, reference: u8) {
+        self.overrides.stencil = stencil;
+        self.pass.set_stencil_reference(u32::from(reference));
+    }
+
+    /// Draws the rest of this pass from somewhere else.
+    ///
+    /// `render->Push3DView( pRenderContext, portalView, ... )`, reduced to the
+    /// one thing it changes that this port has: group 0's view-projection
+    /// matrix and eye position. A portal view is the whole reason it exists —
+    /// the second camera `portdocs/PORTAL_RENDER.md` §9's stage 2 asks for —
+    /// and the 3D skybox and water reflections are the next two callers.
+    ///
+    /// The exposure and the target size come from the pass rather than from
+    /// `camera`, because both are properties of the frame and not of the view:
+    /// a portal view exposed differently from the room around it has a visible
+    /// seam at the oval's edge.
+    ///
+    /// A pass may call this any number of times; each call costs one slot in
+    /// the frame arena, which is sized for 64 passes and grows.
+    pub fn set_camera(&mut self, camera: &Camera) {
+        let uniforms = FrameUniforms::new(
+            uniforms::from_mat4(camera.view_proj()),
+            camera.eye.to_array(),
+            self.size,
+            self.exposure,
+        );
+        self.frame_offset = self
+            .frames
+            .push(self.device, self.queue, bytemuck::bytes_of(&uniforms));
+        // Re-read rather than kept: pushing may have grown the arena, which
+        // replaces the buffer *and* the bind group over it.
+        self.frame_bind_group = self.frames.bind_group().clone();
+        self.frames.flush(self.queue);
+        // `BoundState::frame` is the only entry that is normally set once for
+        // a whole pass, so the next draw has to be told to look again.
+        self.bound.frame = None;
+    }
+
+    /// Replaces the depth, cull and colour-write overrides every subsequent
+    /// draw in this pass applies.
+    ///
+    /// **The stencil is not part of what this replaces.** It is set by
+    /// [`set_stencil`](Pass::set_stencil), it changes far less often than the
+    /// rest — a portal view holds one across a whole sub-scene while that
+    /// sub-scene sets and clears depth overrides inside it — and an ordering
+    /// hazard between two setters of one struct is exactly the kind of bug
+    /// that draws a plausible wrong picture. So the two are independent and
+    /// may be called in either order.
     pub fn set_state_override(&mut self, overrides: StateOverride) {
-        self.overrides = overrides;
+        self.overrides = StateOverride {
+            stencil: self.overrides.stencil,
+            ..overrides
+        };
     }
 
     /// The format every pipeline used in this pass must be built for.
@@ -1280,6 +1408,7 @@ impl Drop for Pass<'_> {
     /// pass rather than per frame keeps a context that never opens another
     /// pass from holding a frame's writes indefinitely.
     fn drop(&mut self) {
+        self.frames.flush(self.queue);
         self.draws.flush(self.queue);
         self.lights.flush(self.queue);
         self.portals.flush(self.queue);

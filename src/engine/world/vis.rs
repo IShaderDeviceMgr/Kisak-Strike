@@ -76,9 +76,9 @@ const MAX_PORTAL_VERTS: usize = 32;
 /// is one sign test. [`accepts_box`](Plane::accepts_box) is written for the
 /// second kind; [`distance`](Plane::distance) serves both.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Plane {
-    normal: Vec3,
-    dist: f32,
+pub struct Plane {
+    pub normal: Vec3,
+    pub dist: f32,
 }
 
 impl Plane {
@@ -102,7 +102,7 @@ impl Plane {
         }
     }
 
-    fn distance(&self, point: Vec3) -> f32 {
+    pub fn distance(&self, point: Vec3) -> f32 {
         self.normal.dot(point) - self.dist
     }
 
@@ -121,6 +121,11 @@ impl Plane {
 /// The four side planes of a [`Frustum`], in `FRUSTUM_*` order
 /// (`mathlib.h:85`): right, left, top, bottom. Near and far follow them.
 const SIDES: usize = 4;
+
+/// `FRUSTUM_NEARZ`. The fifth plane, which
+/// [`portalview`](super::portalview) clips a polygon against; the sixth is
+/// `FRUSTUM_FARZ`.
+pub const FRUSTUM_NEARZ: usize = 4;
 
 /// Six planes bounding what a view can see.
 ///
@@ -166,6 +171,17 @@ impl Frustum {
                 dist: f32::NEG_INFINITY,
             }; 6],
         }
+    }
+
+    /// The six planes, in `FRUSTUM_*` order: right, left, top, bottom, near,
+    /// far, all pointing inwards.
+    ///
+    /// `CViewRender::GetFrustum()`, which the portal view reads for two
+    /// separate jobs: the near plane is what the near-plane cap is projected
+    /// onto, and the four sides are what its polygon is clipped by
+    /// (`portdocs/PORTAL_RENDER.md` §5).
+    pub fn planes(&self) -> &[Plane; 6] {
+        &self.planes
     }
 
     /// Whether any part of the box is inside all six planes.
@@ -352,6 +368,61 @@ pub struct Visibility {
     /// Each area's flood number — `carea_t::floodnum`. Areas with the same one
     /// are reachable from each other through open windows.
     flood: Vec<u16>,
+}
+
+/// Where a view measures its visibility from, as opposed to where its camera
+/// is.
+///
+/// `ViewCustomVisibility_t` (`viewrender.h`) reduced to the three fields a
+/// portal view actually sets. For an ordinary view all three collapse to the
+/// eye and [`ViewPoint::at`] is the whole of it.
+///
+/// # Why a portal view needs every field
+///
+/// The virtual camera of a portal view sits **behind the exit portal's plane,
+/// inside the wall it is mounted on** — that follows from
+/// `portdocs/PORTAL.md` §9's invariant 15, that a point in front of the
+/// entrance images to the same distance behind the exit. A solid leaf's
+/// cluster is -1, its PVS row is empty and its area is 0, so asking the plain
+/// [`mark`](Visibility::mark) about that point answers *nothing at all* and the
+/// portal draws a black hole. `AddToVisAsExitPortal`
+/// (`portalrenderable_flatbasic.cpp:634`) is Valve's answer and it is two
+/// separate corrections, which are this type's second and third fields.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewPoint<'a> {
+    /// The camera's own world-space origin.
+    ///
+    /// **Still the camera's, even for a portal view**, because what it is used
+    /// for is the area-portal windows: `R_FlowThroughArea` clips each window's
+    /// rectangle in *this* view's screen space, and a rectangle measured from
+    /// anywhere else would not correspond to the picture.
+    pub eye: Vec3,
+    /// The points whose PVS rows are ORed together. Empty means "the view
+    /// leaf's own row", which is the ordinary case.
+    ///
+    /// `Map_VisSetup` takes an array precisely so that a view can see the
+    /// union of what several points see. A portal view passes the exit
+    /// portal's four corners and its forward origin, all five a unit in front
+    /// of the exit plane and so in real space; a 3D skybox will pass the sky
+    /// camera's origin alongside the player's.
+    pub origins: &'a [Vec3],
+    /// The point whose leaf the area-portal flood starts from, if not
+    /// [`eye`](ViewPoint::eye) — `ForceViewLeaf`.
+    ///
+    /// A portal view passes the exit portal's forward origin, which is the
+    /// same point `PortalMoved` computes `m_iViewLeaf` from.
+    pub leaf: Option<Vec3>,
+}
+
+impl ViewPoint<'_> {
+    /// An ordinary view: everything measured from the camera.
+    pub fn at(eye: Vec3) -> ViewPoint<'static> {
+        ViewPoint {
+            eye,
+            origins: &[],
+            leaf: None,
+        }
+    }
 }
 
 impl Visibility {
@@ -662,13 +733,32 @@ impl Visibility {
     /// `novis` is `r_novis`, and also what a caller passes when the view is
     /// somewhere the PVS cannot answer for — noclipping outside the world.
     /// See [`VisibleSet::everything`].
+    ///
+    /// For a view whose camera is not where its visibility should be measured
+    /// from — a portal view, and later a 3D skybox — use
+    /// [`mark_view`](Visibility::mark_view).
     pub fn mark(&self, eye: Vec3, view_proj: Mat4, novis: bool) -> VisibleSet {
+        self.mark_view(&ViewPoint::at(eye), view_proj, novis)
+    }
+
+    /// [`mark`](Visibility::mark) for a view that measures visibility from
+    /// somewhere other than its own camera.
+    ///
+    /// `Map_VisSetup( ..., Vector const *pVisOrigins, int nVisOrigins, ... )`
+    /// plus `ViewCustomVisibility_t`'s `ForceViewLeaf`. See [`ViewPoint`] for
+    /// what the three parts are and why a portal view needs all of them.
+    pub fn mark_view(&self, view: &ViewPoint<'_>, view_proj: Mat4, novis: bool) -> VisibleSet {
         if self.is_empty() || novis {
             return VisibleSet::everything();
         }
 
+        let eye = view.eye;
         let frustum = Frustum::new(view_proj);
-        let view_leaf = self.leaf_at(eye);
+        // **Not the leaf at the eye**, when the caller says otherwise:
+        // `ForceViewLeaf`. A portal view's camera is inside the wall behind
+        // the exit portal, which is a solid leaf in area 0 with nothing to
+        // flow out of — see [`ViewPoint`].
+        let view_leaf = self.leaf_at(view.leaf.unwrap_or(eye));
         let leaf = &self.leaves[view_leaf];
 
         // `g_bViewerInSolidSpace` (`r_areaportal.cpp:529`): a camera inside the
@@ -723,14 +813,22 @@ impl Visibility {
         }
         set.stats.areas = set.areas.count();
 
-        // Phase two, the PVS: mark every leaf the view cluster can see, then
+        // Phase two, the PVS: mark every leaf the view clusters can see, then
         // walk each one's ancestors so that a subtree with nothing visible
         // under it can be skipped whole. `VisCache_Build` (`mod_vis.cpp:180`).
         //
         // **Kept apart from `set.leaves`**, which is the answer *after* the
         // frustum has had its say: a prop asking `any_leaf` must not be told
         // its leaf is visible when the walk never reached it.
-        let row = self.row(leaf.cluster);
+        //
+        // One origin borrows its row; several OR theirs together, which is
+        // `Map_VisMark`'s loop over `pVisOrigins` (`mod_vis.cpp:243`) and is
+        // the whole of what `ViewPoint::origins` buys.
+        let merged = self.merged_row(view.origins);
+        let row: &[u8] = match &merged {
+            Some(merged) => merged,
+            None => self.row(leaf.cluster),
+        };
         let mut pvs_leaves = Bits::new(self.leaves.len());
         let mut node_visible = Bits::new(self.nodes.len());
         for (index, leaf) in self.leaves.iter().enumerate() {
@@ -751,6 +849,32 @@ impl Visibility {
         set.stats.leaves = set.leaves.count();
         set.stats.faces = set.faces.count();
         set
+    }
+
+    /// Several origins' PVS rows, ORed — or `None` when there are none to
+    /// merge and the caller should take the view leaf's own row.
+    ///
+    /// `Map_VisMark` ORs `CM_Vis` over every origin it is given
+    /// (`mod_vis.cpp:243`). Origins in solid space contribute nothing, which
+    /// is the same thing Valve's caller achieves by not adding them:
+    /// `AddToVisOrigin` is guarded by `GetLeafContainingPoint(...) != -1`
+    /// (`portalrenderable_flatbasic.cpp:641`), and [`row`](Visibility::row)
+    /// answers with an empty slice for a cluster of -1 either way.
+    ///
+    /// Allocating is deliberate and is not on the one-origin path: the merged
+    /// row is `cluster_bytes` long, which on the largest shipped map is under
+    /// a kilobyte, and it is built once per view rather than once per leaf.
+    fn merged_row(&self, origins: &[Vec3]) -> Option<Vec<u8>> {
+        if origins.is_empty() {
+            return None;
+        }
+        let mut merged = vec![0u8; self.cluster_bytes];
+        for origin in origins {
+            for (byte, bits) in merged.iter_mut().zip(self.row(self.cluster_at(*origin))) {
+                *byte |= bits;
+            }
+        }
+        Some(merged)
     }
 
     /// One cluster's PVS row. An out-of-range cluster — solid space — sees

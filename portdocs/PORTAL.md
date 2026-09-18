@@ -5,9 +5,16 @@ The portal itself: a pair of linked holes you can walk through. Scoped deliberat
 through a portal, with a coloured oval on it, and walking into it will put you out of
 the other one facing the right way.
 
-**Status: stages 1 and 2 of §10's five have landed.** The blended pass, then the class
-and its oval. Sizes and line numbers are from `legacy/`; every count of entities, models
-or materials is measured against the 106 shipped maps or the mounted game, not estimated.
+**That scope has since been overtaken.** The recursive view is in, on its own plan
+(`portdocs/PORTAL_RENDER.md`), so the picture through a portal is now the room on the
+other side rather than the wall. Everything this document says about *why* the recursive
+view was left out was true when it was written and is the reason that second document
+exists; the places it matters are marked below.
+
+**Status: stages 1 to 4 of §10's five have landed**, plus the recursive view. The
+blended pass, the class and its oval, the hole in the wall, and the teleport. Sizes and
+line numbers are from `legacy/`; every count of entities, models or materials is measured
+against the 106 shipped maps or the mounted game, not estimated.
 
 > **What stage 2 corrected in this document is recorded where it belongs** — §7.2's
 > "two ways to draw it" is settled in §10, and §12's four open questions are answered
@@ -46,9 +53,11 @@ carries: the *one* thing the polyhedron clip was doing that the plane list does 
 for free is deciding that a piece came out empty, and a swept box cannot be left to work
 that out for itself.
 
-**Problems 1, 2, 3 and 4 have all landed** — stages 1 to 4 of §10. What is left of the
-module is §7's picture: the recursive view through the opening, which is the one part of a
-portal that is *only* drawing.
+**Problems 1, 2, 3 and 4 have all landed** — stages 1 to 4 of §10 — and so has §7's
+picture, the recursive view through the opening, on the separate plan
+`portdocs/PORTAL_RENDER.md`. What is left of the module is stage 5, which is polish: the
+transition ramp, `$PortalOpenAmount`'s open animation, `IsFloorPortal`'s special cases and
+`PunchAllPenetratingPlayers`.
 
 ---
 
@@ -744,6 +753,12 @@ With stage 2 only and no stencil, no refraction and no recursive view: a **colou
 on an unbroken wall**, and walking into it teleports you. That is the deliberate output
 of this doc's scope and is worth saying out loud before anyone reports it as a bug.
 
+**LANDED, and no longer what you see.** `portdocs/PORTAL_RENDER.md` took the stencil, the
+hole and the recursion; a portal now shows the room behind its partner, two levels deep by
+default and up to ten under `r_portal_stencil_depth`. What is still missing from the
+picture is that list's §7: `$Stage 0`'s opening animation, refracting geometry *inside* a
+portal view, and `c_portalghostrenderable.cpp`'s half-through entity.
+
 ---
 
 ## 8. Deleted, with the numbers
@@ -771,10 +786,17 @@ Each of these is a decision, not an omission, and each names what would reverse 
   path (`c_portalghostrenderable.cpp`, 980). This is the module's whole visual identity
   and it is explicitly out of scope; it also wants a second camera and render target per
   recursion level, which is `world/`'s 3D skybox work with a harder ordering problem.
+  **Reversed** — `portdocs/PORTAL_RENDER.md`, which took `portalrender.cpp`'s older
+  stencil scheme and needed **no** render target per level: the whole recursion fits in
+  one pass. The depth doubler and `c_portalghostrenderable.cpp` stay deleted, for the
+  reasons that document's §7 gives.
 - **PVS extension** (`pvs_extender.cpp`, 158, plus `ComputeSubVisibility` and
   `ComputeFrustumThroughPolygon`). The port has no visibility system; every face is drawn
   every frame. **Reversed by:** `world/`'s PVS landing, at which point a portal must
-  extend it or the far room vanishes.
+  extend it or the far room vanishes. **Reversed** — `portdocs/ENGINE_WORLD_VIS.md` landed
+  the PVS and `portdocs/PORTAL_RENDER.md` §4 the extension, as `vis::ViewPoint` over the
+  exit portal's five origins. `ComputeFrustumThroughPolygon`'s plane-per-edge frustum is
+  still deleted, replaced by a screen rectangle — that document's §4.2.
 - **Sound** — the `CEnvMicrophone`/`CSpeaker` pair a portal creates to carry sound
   through itself, and `Portal.ambient_loop`. No audio system.
 - **`linked_portal_door`** (6 entities, 2 maps) — `prop_linked_portal_door.cpp` (982) is
@@ -962,7 +984,8 @@ travels across the seam rather than being spelled twice.
 **Outcome, as predicted: the module works.** You walk into one oval and come out of the
 other, moving the way the exit faces, looking the way the exit faces, and standing on its
 floor. What is still missing is the *picture* — no view through, no reflection — which is
-§7's and was never stage 4's.
+§7's and was never stage 4's. **That has since landed too**, on its own plan:
+`portdocs/PORTAL_RENDER.md`.
 
 Four things this stage found that §5 and §6 did not predict:
 
@@ -985,6 +1008,15 @@ placement, not per frame.
 
 **Stage 5 — polish, if wanted.** The transition ramp, `$PortalOpenAmount`'s open
 animation, `IsFloorPortal`'s special cases, `PunchAllPenetratingPlayers`.
+
+**Out of order, and out of this document: the recursive view. LANDED.**
+`portdocs/PORTAL_RENDER.md`, which §7 was only ever written to justify leaving out. Four
+stages — stencil state in `materials/`, a second camera inside one pass, visibility from
+the exit portal, and the recursion itself with an oblique near plane. It needed no
+polyhedron library, no render target per level and no second pass; what it needed was the
+PVS, which is why it waited for `portdocs/ENGINE_WORLD_VIS.md`. Each recursion level costs
+one more world draw — 0.27 ms on `sp_a1_intro1`, against the 1.81 ms it would have cost
+without the PVS.
 
 ---
 
