@@ -159,9 +159,26 @@ struct Scene<'a> {
     /// and names no material type, which is what keeps `server/` testable
     /// without a window.
     server: Server,
-    /// Seconds of simulated time since startup — `gpGlobals->curtime`,
-    /// accumulated from the host's frame times rather than read from the clock,
-    /// so that it advances with the game and not with the wall.
+    /// Seconds of simulated time **since this level started** —
+    /// `gpGlobals->curtime`, accumulated from the host's frame times rather
+    /// than read from the clock, so that it advances with the game and not
+    /// with the wall.
+    ///
+    /// > **Level-relative, not since startup**, and reset by
+    /// > [`unload`](Level::unload) in step with `Server::level_shutdown`'s
+    /// > `ServerClock::reset`. Valve's is `sv.GetTime()`
+    /// > (`engine/baseserver.cpp:2836`), which is `m_nTickCount *
+    /// > m_flTickInterval` and therefore restarts with the map; anything that
+    /// > compares this against a time the *server* stamped — an entity's
+    /// > `anim_time`, a portal's `opened_at` — needs both to share an origin.
+    ///
+    /// It is deliberately **not** derived from the server's clock, which would
+    /// make the two agree exactly: `ServerClock::accumulate` drops the surplus
+    /// of a clamped frame rather than banking it, so a clock read back out of
+    /// it would step backwards after a stall, and this one has to be monotonic
+    /// for material animation. The residue is one frame's worth — the load
+    /// frame is charged here and not to the server — which is what Valve's
+    /// unported `m_flShortFrameTime` exists to remove.
     curtime: f32,
 }
 
@@ -1293,6 +1310,20 @@ impl Level for Scene<'_> {
         // `LevelShutdownPreEntity` runs before the engine frees the model in
         // the original too.
         self.server.level_shutdown();
+
+        // **And the scene clock with it**, because `level_shutdown` resets the
+        // server's. The two are one quantity — `gpGlobals->curtime` — kept in
+        // two places so that animation can be smooth where the tick is
+        // stepped, and a reset of one without the other silently breaks every
+        // *non-looping* animation in the level: a cycle derived from a
+        // `curtime` in one frame of reference and an `anim_time` in the other
+        // is offset by however long the previous level ran, and
+        // `clamp( 0, 1 )` pins it at the far end on the first frame. A looping
+        // sequence is immune, because `rem_euclid` turns a constant offset
+        // into a phase shift — which is exactly why a spinning fan kept
+        // working while every door and button in the game snapped between two
+        // poses. See `EntityModels::cycle`.
+        self.curtime = 0.0;
         if let Some(world) = self.world.take() {
             eprintln!("source-engine: world: unloaded {}", world.name);
         }

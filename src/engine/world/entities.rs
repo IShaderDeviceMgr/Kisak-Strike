@@ -610,11 +610,36 @@ impl EntityModels {
             return instance.cycle;
         }
         let elapsed = (curtime - instance.anim_time).max(0.0);
-        let cycle = instance.cycle + elapsed * instance.playback_rate / duration;
-        match model.sequences[sequence].flags & crate::studio::anim::STUDIO_LOOPING != 0 {
-            true => cycle.rem_euclid(1.0),
-            false => cycle.clamp(0.0, 1.0),
-        }
+        let loops = model.sequences[sequence].flags & crate::studio::anim::STUDIO_LOOPING != 0;
+        advance_cycle(
+            instance.cycle,
+            elapsed,
+            instance.playback_rate,
+            duration,
+            loops,
+        )
+    }
+}
+
+/// `m_flCycle` advanced by `elapsed` seconds — the arithmetic half of
+/// [`EntityModels::cycle`], split out because it is where one bug lives and it
+/// needs no GPU to test.
+///
+/// > **`elapsed` is a difference between two clocks and they must share an
+/// > origin.** `curtime` is the scene's and `anim_time` is stamped by the
+/// > server, and `Scene::curtime` is reset with the level precisely so that
+/// > they do. Get that wrong and this function is where it shows: a
+/// > **non-looping** sequence is pinned at whichever end `clamp` reaches on
+/// > the first frame, so it snaps between two poses, while a **looping** one
+/// > is unharmed because `rem_euclid` turns a constant offset into a phase
+/// > shift. That asymmetry is the whole diagnostic — a level where the fans
+/// > spin and the doors teleport between open and shut is this, and nothing
+/// > else.
+fn advance_cycle(base: f32, elapsed: f32, rate: f32, duration: f32, loops: bool) -> f32 {
+    let cycle = base + elapsed * rate / duration;
+    match loops {
+        true => cycle.rem_euclid(1.0),
+        false => cycle.clamp(0.0, 1.0),
     }
 }
 
@@ -653,6 +678,64 @@ mod tests {
     use crate::server::Server;
 
     const SIZE: u32 = 256;
+
+    /// A button's `down` is 0.4167 s and a chamber door's `open` 0.9167 s.
+    /// Both are non-looping, so both ramp — and both are pinned at the far end
+    /// by a clock offset of a second or more.
+    const BUTTON_DOWN: f32 = 11.0 / 24.0;
+
+    #[test]
+    fn a_non_looping_sequence_ramps_across_its_duration() {
+        let at = |t: f32| advance_cycle(0.0, t, 1.0, BUTTON_DOWN, false);
+        assert_eq!(at(0.0), 0.0);
+        assert!((at(BUTTON_DOWN / 2.0) - 0.5).abs() < 1e-6, "{}", at(0.229));
+        assert_eq!(at(BUTTON_DOWN), 1.0);
+        // …and holds at the end rather than wrapping.
+        assert_eq!(at(BUTTON_DOWN * 3.0), 1.0);
+    }
+
+    /// **The regression that made every door and button in the game snap
+    /// between two poses, and the asymmetry that identifies it.**
+    ///
+    /// `Scene::curtime` used to be reset at startup and never again, while
+    /// `Server::level_shutdown` reset the server's clock with every map — so
+    /// after one level change the two disagreed by however long the previous
+    /// level had run (measured: 0.115 s on the first map, **15.03 s** one
+    /// reload later). Every `anim_time` the server stamps is in its frame of
+    /// reference and every `curtime` the renderer reads is in the other.
+    ///
+    /// A looping sequence survives that untouched, which is why a spinning fan
+    /// looked perfect in the same room as a door that teleported open.
+    #[test]
+    fn a_stale_clock_pins_a_non_looping_sequence_and_a_looping_one_shrugs_it_off() {
+        // One level's worth of skew, from the measurement that found this.
+        const SKEW: f32 = 15.028;
+
+        // The button never shows a middle pose again: it is at the end on the
+        // first frame it is drawn.
+        assert_eq!(advance_cycle(0.0, SKEW, 1.0, BUTTON_DOWN, false), 1.0);
+        // …and played backwards it is pinned at the other end just as hard,
+        // which is a door told to `Close`.
+        assert_eq!(advance_cycle(1.0, SKEW, -1.0, BUTTON_DOWN, false), 0.0);
+
+        // The fan is merely at a different phase, which nobody can see.
+        let spun = advance_cycle(0.0, SKEW, 1.0, BUTTON_DOWN, true);
+        assert!((0.0..1.0).contains(&spun), "{spun}");
+        // And it still *advances*: a later frame is a different pose.
+        let later = advance_cycle(0.0, SKEW + 0.05, 1.0, BUTTON_DOWN, true);
+        assert!((spun - later).abs() > 1e-3, "{spun} vs {later}");
+    }
+
+    /// With the clocks sharing an origin the offset is one frame's worth, and
+    /// a button is still part-way through its press rather than finished.
+    #[test]
+    fn a_levels_worth_of_reset_leaves_the_press_visible() {
+        // The residue after the fix, measured: the load frame is charged to
+        // the scene clock and not to the server's.
+        const RESIDUE: f32 = 0.116;
+        let cycle = advance_cycle(0.0, RESIDUE, 1.0, BUTTON_DOWN, false);
+        assert!(cycle > 0.0 && cycle < 1.0, "{cycle}");
+    }
 
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance =

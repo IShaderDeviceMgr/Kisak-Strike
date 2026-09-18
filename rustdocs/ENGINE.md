@@ -2852,6 +2852,28 @@ Found while implementing, and recorded because the plan is otherwise the referen
 Ordered by how likely each is to bite. Input has its own list, with the module:
 [`input`'s invariants](#invariants-and-gotchas-input).
 
+0. **`Scene::curtime` is level-relative, and it and the server's clock must be
+   reset together.** They are one quantity — `gpGlobals->curtime`, which Valve
+   computes as `sv.GetTime()` = `m_nTickCount * m_flTickInterval`
+   (`engine/baseserver.cpp:2836`) — kept in two places so that animation can be
+   smooth where the tick is stepped. `Server::level_shutdown` resets the
+   server's; `Scene::unload` resets this one, immediately after it and for that
+   reason. **Reset one without the other and every non-looping animation in the
+   game breaks, silently, one map change later**: an entity's `anim_time` is
+   stamped by the server and `EntityModels::cycle` subtracts it from the
+   scene's, so the difference is however long the *previous* level ran, and
+   `clamp( 0, 1 )` pins the cycle at whichever end it reaches on the first
+   frame. Measured before the fix: 0.115 s on the first map (harmless) and
+   **15.03 s one reload later** — against a button's 0.4167 s `down` and a
+   chamber door's 0.9167 s `open`, so both teleported between two poses.
+   **A looping sequence is immune**, because `rem_euclid` turns a constant
+   offset into a phase shift, and that asymmetry is the diagnostic: a room where
+   the fans spin correctly and the doors snap open is this bug and nothing else.
+   Pinned by `entities::tests::a_stale_clock_pins_a_non_looping_sequence_and_a_looping_one_shrugs_it_off`.
+   The residue after the reset is one frame — the load frame is charged here and
+   not to the server — which is what Valve's unported `m_flShortFrameTime`
+   (`host/mod.rs`, `State_Run`'s doc) exists to remove; it is now unblocked,
+   because the server it needed exists.
 1. **World triangles are emitted with their winding reversed, and this is not optional.**
    In file order every world surface is back-facing here, and the map draws as an empty
    clear colour — measured on `sp_a1_intro1`. The chain: Valve sets
