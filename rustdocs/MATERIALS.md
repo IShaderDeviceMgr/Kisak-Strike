@@ -2826,3 +2826,287 @@ planes the wrong way round, which had inverted the depth comparison for every 2D
 
 **They skip, printing why, when no adapter with BC support is available**, so a machine
 with no GPU still gets a green `cargo test`.
+
+---
+
+## What has landed, and what each stage found
+
+> Moved here from `CLAUDE.md`, which had grown to 2,126 lines by accumulating a
+> paragraph per landed stage. This is the narrative history of the module: what
+> was ported, in what order, what it cost and what the measurements said.
+> `CLAUDE.md` keeps a one-line summary and points here. **The invariants and
+> gotchas above are the normative part of this document**; this section is the
+> record of how they were arrived at.
+
+**`src/materials/` — stages 1-6 of 8 ported, plus the first two shaders of §7.8's remainder.** `Renderer` owns `wgpu`'s
+instance/adapter/device/queue/surface and exposes one frame boundary
+(`begin_frame` → record passes → `present`). The `IShaderDevice`/`IShaderAPI` tower is
+deleted, not ported, so `shaderapidx9`, `glmgr`, `ps3gcm`, `shaderapiempty` and `togl`
+have no counterpart. Stage 2 added the texture path: `Vtf` (`.vtf` 7.0-7.5),
+`ImageFormat` (Valve's format table, the mip-offset arithmetic, and the CPU conversions
+for formats `wgpu` lacks), and `TextureCache` (name → `Texture`, falling back to the
+error checkerboard). Stage 3 added the material path: `Vmt` (`.vmt` parsing, patch
+chains, conditional keys, flags), `MaterialVar` (the value grammar and Valve's
+coercions), `ShaderKind` (`UnlitGeneric`, rewritten in WGSL over the §7.4 constant ABI
+and the §7.5 prelude), `PipelineCache` (replacing `StateSnapshot_t` and deleting
+`TransitionTable.cpp`), and `MaterialCache` (name → `Material`, falling back to the
+error material). Stage 4 added geometry and the render context: `mesh` (typed
+`#[repr(C)]` vertex structs replacing `CMeshBuilder`, static buffers, and a per-frame
+bump arena for dynamic ones), `target` (`DepthBuffer`, `RenderTarget`) and `context`
+(`RenderContext`, `Pass`, `Camera`). **Valve's matrix, render-target and scissor stacks
+are deleted rather than ported** — a `wgpu` render pass already *is* the state they
+saved and restored, so a target, a camera and a viewport are the arguments to opening
+one, and nesting becomes sequencing. `glam` arrives here as the `mathlib` substitution.
+`-vmt <name>` draws two cubes and a ground quad; that switch and
+`preview.rs` hold the nineteen GPU tests and stay until something else can run them
+against real pixels. Stage 5 added lightmaps: `lightmap` (a faithful `CImagePacker`
+port, `Rgba16Float` atlas pages of linear radiance, the `ColorRGBExp32` decode and the
+bumped-lightmap correction), `mesh::WorldVertex`, a fourth bind group holding the atlas
+page, and `LightmappedGeneric` in WGSL — flat and radiosity-normal-mapped.
+**API: `rustdocs/MATERIALS.md`** — read it before calling in, in particular for the five
+conventions that produce a plausible wrong picture rather than an error: **matrices are
+column-major and multiply on the left** (Valve's are the reverse on both counts); **a
+lightmap sample decodes with `TexLightToLinear`, not `ColorRGBExp32ToVector`**, which is
+the same thing times 255 and gives a uniformly white screen; **`ColorSpace` is a
+load-time decision the shader makes**, because Valve made it per-sampler in the shader;
+**per-draw constants need distinct arena slots**, because `Queue::write_buffer` stages
+its copy ahead of the whole command buffer and a rewritten uniform would reach every
+draw in the frame; and **`glam`'s `near`/`far` are distances along `-z`**, so a
+hand-built projection can silently invert the depth comparison.
+Plan: `portdocs/MATERIALSYSTEM.md`.
+Stage 5 also brought `src/materials/ui.rs` with the console — `UiRenderer`, an
+`egui_wgpu::Renderer` over the frame's encoder. **It is not part of the material
+system**: `egui` owns its own pipeline, font atlas and vertex format, and it lives in
+`materials/` only because `Frame::parts` is `pub(super)` and opening a pass belongs on
+this side of that boundary.
+**Stage 6 is `VertexLitGeneric`, and it is done** — the shader every model wears, and
+the largest in the shipped game: 1,135 of the mounted game's 3,555 materials name it,
+1,012 of them under `materials/models/`. Landed as `ShaderKind::VertexLitGeneric` with
+`shaders/vertexlitgeneric.wgsl`, `mesh::ModelVertex`, `uniforms::{Light, ModelLighting}`
+— the ambient cube and up to four local lights that `engine/lightcache.cpp`'s
+`LightcacheGetStatic`/`Mod_LeafAmbientColorAtPos` fill (**there is no
+`R_StudioSetupLighting` in this tree**; earlier drafts of this file named one) — a
+second shape for bind group 3, and the cubemap half of the texture path. **Every one of
+those materials loads and builds a pipeline against the real game** — 818 here in 14
+pipelines and the other 317 in `Phong`'s 7 — which answers §10's "how many variants
+survive" with a measurement.
+**`Refract` and `Phong` are the first two of §7.8's remaining set and have landed**
+(below); the rest of it and stages 7-8 (paint maps, GPU morph) are not started.
+
+Six things about it that a reader will otherwise rediscover the hard way:
+**a `.vmt` naming `VertexLitGeneric` does not always reach it** — `WantsPhongShader`
+sends 317 of the 1,135 to `DrawPhong_DX9`, which **is ported now** (below), so the
+resolution from a `.vmt` to a shader is `ShaderKind::resolve` and not
+`ShaderKind::from_name`; **group 3 is now "where this
+shader's lighting comes from"**, a lightmap page for brushes or a `ModelLighting` block
+for models, so `reads_lightmap()` became `lighting_binding()`; **the unbumped path
+lights per vertex and the bumped path per pixel**, because they are two files in the
+original and unifying them would silently reshade every prop; **a bumped model gets no
+baked vertex light at all**, which is Valve's asymmetry and not an omission; and
+**`$envmap "env_cubemap"` names no file** — it is a request for the render instance's
+local cubemap, so those 78 materials reflect a black cube; the pak lump is mounted now,
+but the per-instance cubemap lookup that would resolve them is not written; and
+**`$envmaptint` is gamma-decoded on the CPU, with `GammaToLinearFullRange` and not the
+table** — `pow( x, 2.2 )` flat, where every other tint in the module takes
+`GammaToLinear`'s 256-entry table with its `>= 0.95` clamp and its `> 1` passthrough.
+That is `SetEnvMapTintPixelShaderDynamicStateGammaToLinear` and it is
+`VertexLitGeneric`'s alone: `LightmappedGeneric` calls the *other* overload and sends
+its tint through in gamma space, which is Valve's asymmetry and not a bug to fix. It
+matters because **every one of the 57 materials in the game with a resolvable `$envmap`
+writes a dark tint** — `[0.05 0.05 0.05]` on twenty of them, which is 0.0014 linear, a
+factor of 36, and `[0.01 0.01 0.01]` on five more, which is 4.0e-5 and means "no
+reflection" rather than "a faint one". Skipping the decode does not error; it makes
+every reflective prop in the game shine. 57 of the 106 maps place a static prop wearing
+one. **Two CS:GO-shaped defaults were found here and reversed**: `bHalfLambert` is
+hard-coded `false` in the CS:GO tree over a commented-out read of the material flag, and
+`SoftenCosineTerm` (`// For CS:GO`) changes the diffuse falloff of every lit surface.
+Portal 2 has neither. (`Phong` brought a third of the same kind — see below.)
+
+**`post.rs` and `histogram.rs` landed with the tone mapper, and they close half of §10's
+HDR question.** `PostProcess` is `_rt_FullFrameFB` plus the final pass of
+`DoEnginePostProcessing`: the scene is drawn into an offscreen target in the back
+buffer's exact format, measured, and blitted forward. `Histogram` is a compute dispatch
+that bins a frame's pixels by luminance and reads the counts back without ever blocking
+— replacing sixteen occlusion queries issued one per frame. **No float render target was
+needed**, because Valve applies the exposure scalar in `FinalOutput` before the sRGB
+write in *both* HDR modes, so this port's 8-bit sRGB frame buffer already is
+`HDR_TYPE_INTEGER`'s; what was needed was for the scene to stop going straight to the
+back buffer, since a swap-chain image cannot be sampled. Two rules there produce a
+plausible wrong answer rather than an error: **`RenderContext::set_exposure` takes effect
+on the next pass *opened*, not one already open**, and **`PostProcess::measurement` must
+be called once a frame unconditionally** — it arms the previous frame's readback as well
+as returning it, so a frame that returns early strands a staging buffer and the exposure
+silently stops adapting for ever.
+
+**`Refract` has landed too, and it is the first of §7.8's *remaining* shader set** — the
+screen-space refraction shader, which is what every pane of glass in Portal 2 wears. 37
+materials name it, 29 of them on models, and **all 37 load and build a pipeline** (7 of
+them). Landed as `ShaderKind::Refract`, `shaders/refract.wgsl`, `shader::RefractUniforms`
+and a **third shape for bind group 3** — `ContextBinding::FrameBufferCopy`, which is why
+`ShaderKind::lighting_binding` is now `context_binding`: group 3 was "where this shader's
+lighting comes from" and is now "whichever piece of render-context state this shader
+reads", because a copy of the frame buffer belongs in the same slot for the same reason
+a lightmap page does.
+
+**It is the first shader in the port that reads the frame it is being drawn into**, and
+that cost a structural change rather than a shader. `RenderContext::update_refract_texture`
+is `UpdateRefractTexture` plus `SetFrameBufferCopyTexture` — a `copy_texture_to_texture`
+off the scene target and the group-3 bind group over the copy — and because a render pass
+cannot sample its own attachment, `Engine::render` now runs **two passes**: the opaque
+scene, the copy, then `World::draw_refracting` under `Load::Keep`. That is Valve's own
+opaque-list / `UpdateRefractTexture` / translucent-list ordering, made explicit because
+`wgpu` enforces what D3D9 left undefined. 71 of the game's 106 maps need the second pass;
+the other 35 pay neither it nor the copy.
+
+Five things about it a reader will otherwise rediscover the hard way.
+**A `Refract` material's `$basetexture` is not a surface texture** — it is an alternative
+*image to warp*, bound to the sampler the frame-buffer copy would occupy, and
+`$localrefract` is what says a material has one; six of the 37 take that branch and need
+no copy of the frame at all, including five of the six in `sp_a1_intro1`. **It has no
+lighting**, so `lighting()` is `None` and group 3 is free for the frame copy. **Its
+blending comes from the `$normalmap` and only when there is no `$envmap`** — and all 29
+`$model 1` materials have an envmap, so every piece of glass in the game draws *opaque*,
+showing the copy it sampled rather than blending with the frame it is writing.
+**`$bluramount` is declared an integer and content writes fractions into it** (sixteen
+materials say `".3"`), so `GetIntValue()`'s truncation is what decides whether the blur
+runs — 26 of the 37 get none. And **the "aspect fixup" is an integer division**:
+`float( nHeight / nWidth )` with both operands `int`, so `glass/refract_light_color`
+being 128x512 makes it **4** for five glass materials, and a wider-than-tall source
+would make it 0.
+**One Valve bug is reproduced deliberately**: `refract_ps2x.fxc:338` reflects the
+environment map along a *tangent-space* eye vector beside a world-space normal, which is
+what decides what every pane of glass in the game reflects; the line is marked in the
+WGSL.
+Four of the pixel shader's static axes are pinned off **on a content measurement rather
+than a capability** — `SECONDARY_NORMAL`, `MASKED`, `MAGNIFY` and `COLORMODULATE`, which
+no Portal 2 material sets — and the first of those is broken in the original anyway
+(it binds sampler 1 and samples sampler 3).
+
+**`Refract` also brought the census that says a shader is finished**:
+`materials::material::tests::every_shipped_material_of_a_ported_shader_builds_a_pipeline`
+is depot-gated (`KISAK_GAME_DIR`), walks every `.vmt` in the mounted game, loads it
+through the real `MaterialCache` and asks the real `PipelineCache` for a pipeline with
+`on_uncaptured_error` latching any validation failure. Running it prints the whole
+picture: **2,952 of the mounted game's 3,555 materials draw with a real shader, in 58
+pipelines** — 956 `UnlitGeneric`, 818 `VertexLitGeneric`, 801 `LightmappedGeneric`,
+317 `Phong`, 37 `Refract`, 18 `WorldVertexTransition`, 5 `PortalRefract`, and 603 on
+the error material.
+That is the standing answer to §10's "how many variants actually survive".
+
+**`Phong` has landed too, and it is the second of §7.8's *remaining* set** — the model
+shader with a specular highlight, and **the first shader in the port that no `.vmt`
+names**. There is no `SHADER( Phong )` in `stdshaders/` at all:
+`phong_dx9_helper.cpp` is reached only from `DrawVertexLitGeneric_DX9`, which hands the
+material over when `WantsPhongShader` says so — so `ShaderKind::from_name( "Phong" )`
+is `None` and the redirect lives in a new **`ShaderKind::resolve( vmt )`**, which is
+what `Material::new` calls and what anything holding a `.vmt` should call.
+**317 materials reach it**, 301 under `materials/models/`, all 317 build a pipeline,
+and the whole set needs 7. **104 of the game's 106 maps place a static prop wearing
+one**, including 11 in `sp_a1_intro1` and 20 in `sp_a3_portal_intro` — so unlike the
+`$envmaptint` fix this one is visible on the default map.
+
+Six things about it that read as bugs until you check the reference.
+**Half-Lambert is on by default and `$halflambert` does nothing** — the switch is
+`$phongdisablehalflambert`, and this is the **third** CS:GO-shaped default of the kind
+above: `bPhongHalfLambert` is hard-coded `false` over a commented-out read of the
+parameter, whose own declaration says half-Lambert "has always been forced on in
+phong". The content settles it: 26 of the 317 write the parameter and **20 write `1`**,
+a no-op against an off-by-default.
+**`$envmaptint` is *not* gamma-decoded here**, which makes three shaders with three
+answers — `VertexLitGeneric` uses `GammaToLinearFullRange`, `Refract` the 256-entry
+table, `Phong` and `LightmappedGeneric` none — so making them agree would be a
+divergence and a factor of 36.
+**A Phong model gets no baked vertex light**, because it is always a per-pixel shader
+(`bStaticLight = false`); the CS:GO `STATICLIGHT3` work exists because of it. That same
+fact is what `DrawModelExStaticProp` calls `bStaticLighting`, and **`world/light.rs`
+now acts on it**: a phong or bumped prop's `.vhv` is never opened and the light cache
+is its whole lighting, ambient cube *and* local lights, so the specular term has
+something to work with. Until that landed a Phong prop had no highlight at all,
+because the term needs a light.
+**The envmap mask is base alpha whether the material asked or not**, so
+`$basealphaenvmapmask` is inert and `$envmapmask` is not even sampled.
+**`$phongexponent` unset is a sentinel**, not a default: zero means "read the exponent
+from `$phongexponenttexture`'s red channel", remapped onto 1..150, and 71 of the 317
+take that path.
+And **one register is the detail blend factor *or* `$phongalbedoboost`** — Valve's own
+name for it is `flBlendFactorOrPhongAlbedoBoost`.
+Pinned off on *content* rather than capability: wrinkle maps, `$decaltexture`,
+`$tintmasktexture` and `$rimmask`, none of which any Portal 2 material sets.
+**Also found here and deliberately left alone**: the pixel shaders' modulation colour
+should be *linear* for the two model shaders and gamma for the world one
+(`shaderapidx8.cpp:8664`), and `modulation_color` returns gamma for all of them. It
+moves every tinted model, so it wants its own change; 48 materials set
+`$color`/`$color2`, 8 of them on a model shader.
+
+**The translucent pass landed here too, as `portdocs/PORTAL.md` §10 stage 1**, and it
+is the smallest change in this module with the widest reach: **1,217 of the game's
+2,952 drawable materials are translucent** — 1,042 `Blend`, 71 `BlendAdd`, 35 `Add`,
+0 `Multiply` and 69 that are `$translucent` over a texture with no alpha channel and so
+blend nothing at all. What the plan called for was "a blend state in `PipelineCache`",
+and **that half was already there**: the cache has honoured `BlendMode` since stage 3,
+so all but the portal's five have always drawn blended — with no *order*, recorded in batch order and
+composited under whatever came after them. What was actually missing is two things.
+**A material now carries two `RenderState`s**, which is Valve's up-to-eight
+`StateSnapshot_t`s reduced to the one modulation flag this port can reach:
+`Material::state_for( alpha )` picks `state_alpha_modulated` when the product of the
+material's modulation and the instance's is not exactly 1, which is
+`bIsAlphaModulating` (`shaderapidx8.cpp:4944`) — and it is the *only* way an entity's
+render mode reaches the GPU, because **a render mode does not pick a blend equation**.
+That was GoldSrc; in Source the equation is the material's and the mode survives as
+"is this transparent", "how transparent", and `IgnoresZBuffer()` for the two glow modes,
+which nothing ported sets. The second snapshot is the shadow phase *re-run*, not the
+first with blending switched on — `$additive` still forks it, `$multiply` still
+replaces it, depth writes still go off.
+And **`Material::is_translucent` is `CMaterial::IsTranslucent`**, whose
+`m_pShader->IsTranslucent( params )` term is the one the blend mode does not imply:
+`$translucent` over an opaque texture is classified translucent and draws with blending
+off, and Valve sorts it into the translucent list anyway.
+
+§10's "how are variants expressed" question is **closed**: seven shaders in, none
+needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
+module with a uniform branch, `WorldVertexTransition` is a second *name* on
+`LightmappedGeneric`'s module rather than a variant of it, and `Phong`'s nineteen
+static axes produced none at all — so the prelude is prepended by string concatenation
+and `naga_oil`, `override` constants and a build-time preprocessor are all declined on
+evidence. **`Phong` did add one degree of freedom without changing the mechanism**: it
+shares `VertexLitGeneric`'s group 3, so the `@group(3)` declaration and the two
+lighting terms both shaders compute identically moved into
+`shaders/modellighting.wgsl`, prepended for exactly the shaders whose
+`ContextBinding` is `ModelLighting`. The *diffuse* term deliberately did not move —
+`DiffuseTerm` and `CosineTermInternal` are two different functions in the original.
+**`LightmappedGeneric` was expected to force the second vertex layout and did not**
+(bumped and unbumped share one, because the bumped diffuse path never leaves tangent
+space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
+one, because the tangent is in the `.vvd` either way — and `Phong` asks for the tangent
+unconditionally, so for its 317 one layout is not even a simplification.
+
+**`PortalRefract` is the seventh shader and `portdocs/PORTAL.md`'s stage 2** — the
+coloured oval a portal wears, and the first thing in this port that is neither a
+surface nor a model: **four vertices built from four numbers every frame**, wearing a
+material with no geometry of its own anywhere in the game's files. 7 materials name it,
+**5 of them draw**, and the five need **one pipeline** between them — the fewest of any
+shader here, because its render state is a literal.
+
+Four things about it a reader will otherwise rediscover the hard way.
+**It is one shader name over three unrelated pixel shaders, and only the third is
+ported** — `$Stage` picks between the see-through warp (0), the stencil punch (1) and
+the oval (2), and the first two exist to make the recursive view composite. So
+`ShaderKind::resolve` answers `None` for a name `from_name` knows, which is the mirror
+image of `Phong` and the only place in the census where that happens. (`$UseOnStaticProp 1`
+**forces** the stage to 2 and overrides an explicit `$Stage`, which is what makes the
+two `effects/fakeportalring_*` materials stage-2 materials.)
+**It brought a fourth shape for group 3 and the port's first material *instance*
+parameter** — `ContextBinding::PortalOverlay`, three floats bound with a dynamic offset
+the way `ModelLighting` is. In the shipped game they are material *vars* rewritten
+before every draw by three proxies the `.vmt` declares; the proxy system is unported and
+group 1 is baked at load, so three numbers that differ between two portals wearing one
+material have nowhere else to live. `portdocs/PORTAL.md` §12 called this "the thin end
+of the proxy system", and the thin end cost one arena, one bind group layout and one
+`Pass` setter.
+**`g_flPortalActive` is `1 - $PortalStatic`**, not `$PortalStatic` — pass the parameter
+straight through and a settled portal is a solid disc of colour while a freshly opened
+one is an empty ring, which is the effect exactly inverted.
+And **the exposure is applied to the oval's *alpha* as well as its colour**, after
+`FinalOutput` rather than inside it, over Valve's comment *"let it drop down to 0 in case
+we're fading"* — which is why a portal fades out in a bright room instead of turning
+grey.

@@ -16,6 +16,16 @@ two are deliberately separate:
 A module gets a `rustdocs/` entry once it has a public API other subsystems will call.
 Naming matches `portdocs/`: `src/filesystem/` → `rustdocs/FILESYSTEM.md`.
 
+**Each of the five larger docs ends with "What has landed, and what each stage
+found"** — the narrative of what was ported in what order, what it cost and what
+the measurements said. That history used to live in `CLAUDE.md`, which had grown
+to 2,126 lines and become too large to be useful as an orientation file; it now
+keeps a status table and points here. The invariants-and-gotchas lists are the
+normative part of each document, and those stayed where they were.
+`ENGINE.md` also holds two things that are nobody's module in particular:
+**"Frame cost, measured"** and **"What the binary does, and what `sp_a1_intro1`
+draws"** — the standing census of the default map.
+
 ## Current docs
 
 - [`FILESYSTEM.md`](FILESYSTEM.md) — `src/filesystem/`. `Vfs`, `PathId`, mounts,

@@ -2553,3 +2553,839 @@ all-true.**
 > assertion wrong: after driving `sp_a1_intro1`'s close chain the branch reads
 > `false` and the listener reads `mixed`, which is indistinguishable from a
 > chain that never arrived. Check the **door**.
+
+---
+
+## What has landed, and what each stage found
+
+> Moved here from `CLAUDE.md`, which had grown to 2,126 lines by accumulating a
+> paragraph per landed stage. This is the narrative history of the module: what
+> was ported, in what order, what it cost and what the measurements said.
+> `CLAUDE.md` keeps a one-line summary and points here. **The invariants and
+> gotchas above are the normative part of this document**; this section is the
+> record of how they were arrived at.
+
+**`src/server/` — all five stages of `portdocs/SERVER.md` ported, plus
+`prop_floor_button` and `prop_dynamic`**, and with them the map's **entity logic
+runs, its brush entities move, it notices the player, a pad you stand on
+presses, the models it places draw and animate — and the player can be hurt,
+and can die**. Valve's `server.so` — 446,861 lines, of which the framework is
+~29,800 and is the module. `Server::level_init` turns the `.bsp`'s entity lump into
+entities: `ClassDef` chooses the class, `CBaseEntity::KeyValue`'s ladder and the class's
+own `key_value` parse the keys, and the three-pass spawn runs — hierarchy depth, then
+`SortSpawnListByHierarchy`, then `Spawn` and `Activate` over the whole list — with
+`UTIL_Remove`'s deferred deletion under it. `EntityId` is `CBaseHandle` as a generational
+index. **API: `rustdocs/SERVER.md`** — read it before calling in.
+Scoped by **measuring the shipped maps rather than the tree**: 106 maps place
+**60,925 entities of exactly 200 classnames**, the top 25 of which are 79.8% of them,
+while the whole 122,298-line `ai_*`/`nav_*` tree serves **293 `npc_*` instances of 6
+classnames**. Sixteen classnames are implemented and they cover **19,229 of the 60,925
+blocks**: `logic_relay` (8,082, the commonest entity in the game), the light family
+(7,150), `func_instance_io_proxy` (1,184), `logic_auto` (1,112), `logic_branch` (601),
+`info_target`, `logic_timer`, `info_player_start`, `env_tonemap_controller`,
+`worldspawn`, `math_counter` and `logic_case`. `sp_a1_intro1` spawns 163 entities from
+598 blocks.
+The one piece of stage-1 *behaviour* is `CLight::Spawn`, and it is load-bearing:
+**an unnamed light deletes itself**, which is 6,937 of the game's 7,150, because `vrad`
+has already baked its whole contribution — a port that skipped that one `if` would carry
+eleven per cent of the entity list as garbage and every other number would still look
+right. 213 named lights survive.
+Four findings from writing it. **Inheritance became composition**: `SERVER.md` §7.3
+planned a `parent` pointer so `KeyValue` could walk the `baseMap` chain, and there is
+nothing for the walk to do — `CEnvLight : public CLight` is an `EnvLight` that *holds* a
+`Light` and ends its `key_value` by calling the contained one's. **The FGD is not an
+oracle**: the four shipped `.fgd` files describe 199 of the 200 classnames and are the
+best reference for what a key is called, but they are not a superset of the datadesc
+(`world_mins` is `vbsp`'s, `defaultstyle` is internal, the FGD's `OnProxyRelay` is the
+server's `OnProxyRelay1`-`30`), so the check with teeth is against **map data** — every
+declared key must be consumed, and the 106-map depot test pins the exact set of key
+names nothing consumes. **`names_match`'s `*` does not have to be trailing** whatever
+`baseentity.cpp`'s comment says — `"*door"` matches everything — though all 234 wildcard
+targets in the shipped maps are plain trailing ones. And **"unhandled key" is not
+"unimplemented"**: of the 29 key names in the whole game that nothing consumes, 17 are
+the *map compiler's* (`_light`, `_quadratic_attn` and the falloff family are `vrad`'s and
+have no run-time consumer in Valve's engine either) and 6 are mapper mistakes shipped in
+the game.
+**The module names no GPU type** — not `wgpu`, not `materials`, not `studio` — so all 78
+of its unit tests run without a window, the way `host/`, `trace/` and `input/` do. An
+entity holds a model *name*.
+
+**Stage 2 is entity I/O, the event queue and thinks, and it is what makes a map do
+anything.** `CEventAction`/`CBaseEntityOutput`/`CEventQueue`, `AcceptInput` with
+`variant_t`'s coercion table, the think schedule and the `SimThink` list, the frame
+order from `CServerGameDLL::GameFrame`, six more classes, and `ent_fire`/`dumpeventqueue`
+beside the two stage-1 commands. **The visible outcome is the exposure**:
+`sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default of 2, through
+`logic_relay`'s `OnSpawn` → two exposure relays → `env_tonemap_controller`, and now gets
+it. Measured over the depot: **two seconds of server time on each of the 106 maps is
+5,763 events dispatched, 2,070 inputs accepted and 1,197 thinks**, with zero values
+that would not convert and a peak of 43 entities thinking at once.
+
+**The tick decision (`portdocs/SERVER.md` §5) is taken: the server is fixed-tick and the
+client is not.** `ServerClock` accumulates the rendered frame's time and runs zero or
+more 1/64 s ticks inside it; the client keeps moving the player on the rendered frame,
+which is Valve's own split. It is forced rather than chosen — `SetNextThink` quantises
+to ticks, so a schedule built on a variable `dt` is a different schedule at every frame
+rate. **The rate is one constant and is still unverified**: 1/64 is
+`DEFAULT_TICK_INTERVAL_PC`, which is CS:GO's number, and Portal 2's real
+`interval_per_tick` is not in the tree, the maps, or the depot, which ships only
+`vbsp`/`vvis`/`vrad`. `-tickrate` overrides it, quantised to `N/512` and clamped to
+20.48–128 Hz as `GetTickInterval` does.
+
+Seven rules here produce a plausible wrong answer rather than an error, and the first
+two are the ones that decide whether a map runs at all. **The server's `curtime` is not
+`Scene::curtime`** — the server's is `tick * interval` and moves in steps, the scene's
+is the accumulated wall clock. **`SetNextThink` rounds to the nearest tick and a think
+tick of zero never runs**, so `curtime + 0.01` is next tick at 64 Hz and *never* at
+30 Hz — and `logic_auto`'s 0.2-second bootstrap, which every map in the game starts
+through, lives on that edge. **The event queue restarts from the head after every
+event**, so a chain of eight zero-delay relays completes in one tick and not eight; get
+it wrong and every map runs its logic in slow motion. **An output's connections fire in
+*reverse* lump order**, because `AddEventAction` prepends. **A `variant_t` accessor
+returns zero unless the value already is that type**, so a handler is only safe because
+`AcceptInput` converted against the type `ClassDef::inputs` declared — a wrong
+declaration there is a silent zero, not a compile error. **The think schedule is
+cleared before the think runs**, so anything recurring re-arms on the way out. And
+**a per-action parameter override silently discards the caller's extra delay**, which
+is Valve's bug at `cbase.cpp:280` against `:289` and is reproduced.
+
+Two findings worth carrying to stage 3. **`SERVER.md` §10.3's borrow risk is not one**:
+`FireOutput` appends to the queue rather than calling the target, so nothing in the
+subsystem is re-entrant and a behaviour's `Context` does not hold the entity list at
+all — the condition that changes that is `logic_branch_listener`, the first class in
+the game that must read *another* entity during dispatch. **It landed, and it did not
+change the shape**: stage 4's `Server::dispatch` lifting the dispatched entity out of
+the list was already enough. And **`CUniformRandomStream`
+was ported rather than replaced by a crate**, one of the few places `PORTING.md`'s
+"prefer the crate" rule points the other way: `ran1`'s rejection sampling and its lossy
+seed convention (0, 1 and -1 are one stream) are behaviour a dependency would silently
+replace, and `logic_case` is what would change.
+
+**Stage 3 is `MOVETYPE_PUSH`, and it is the first time anything in a map moves.**
+`src/server/movement.rs` is `CBaseToggle`'s two moves — set a velocity, set an
+arrival alarm — plus `PerformPush` with the blocker always null, and
+`src/server/classes/brush.rs` is six classes: `func_brush` (2,502), `func_door_rotating`
+(346), `func_door` (275), `func_movelinear` (196), `func_button` (64) and
+`func_rotating` (27), **3,410 entities**, taking the port to 22 classnames and 22,639
+of the game's 60,925 blocks. Pushing the player is deliberately absent —
+`CPhysicsPushedEntities` is ~1,000 lines of speculative push and rollback that want
+`ENGINE_TRACE.md` stage 4 underneath them — so a door moves *through* a player rather
+than shoving one.
+Measured over the depot: two seconds of each of the 106 maps now moves **67 brush
+entities off their spawn placement, 34 of them still travelling** when the clock stops.
+Before stage 3 that number was zero. **To see it, load a co-op map**: no
+single-player map moves a brush entity in its first twenty seconds — a Portal 2
+chamber starts shut and waits for the player, which is why `sp_a1_intro1` looks
+identical to before — while `mp_coop_fan` spins `brush_fan` and opens two doors at map
+spawn and `mp_coop_lobby_2` slides eleven `func_movelinear` screen panels.
+
+Four findings. **The scope of "brush entities" is not the mover census**: §4.7 counted
+1,164 movers and the six classes are 3,410 entities, because `func_brush` is 2,502 of
+them, does not move at all, and is where **`StartDisabled` finally comes home** — 337
+of them start switched off and until this stage `world/` drew every one. **The join
+between the game and the renderer is the `"*N"` model index**, and that is a
+measurement rather than a convention: 106 maps place 11,635 `(map, "*N")` pairs and
+**not one** is claimed by two entities, so `BrushModel`'s placement is refreshed once a
+frame by index — `Engine::frame` does it between the server's ticks and the player's
+trace — and `world/` and `server/` still name no type of each other's.
+**`CSimThinkManager` is two questions in one list** and stage 2 only saw one: an entity
+is in it when it will think *or* when it is a mover with a live alarm, and a mover is
+stored with a tick of **zero** so that it is handed out every tick and refuses its own
+think — which makes `PhysicsRunSpecificThink`'s tick guard load-bearing rather than
+defensive. And **a mover needs one number that is not in the entity lump**: a door's
+travel is the size of its own brushes, which `SetModel` reads out of the `.bsp`'s model
+lump, so `level_init` grew a `&[bsp::Model]` argument.
+
+Nine more rules produce a plausible wrong answer rather than an error, and the first
+three are the ones that decide whether a door works at all. **The arrival alarm is not
+the think schedule** — it is a second timer with its own field, it is *not* quantised
+to a tick, and it runs on the entity's own `local_time`; a `func_door` uses it for both
+the travel and the wait. **`SetMoveDoneTime(0)` arms an alarm that can never fire**,
+because `PerformPush` tests the absolute alarm with `> 0` and `WillSimulateGamePhysics`
+then drops the entity out of the simulation list entirely — which is why the four
+`func_door_rotating`s in the shipped game with `wait 0` stand open for ever, and why
+`CBaseButton::Spawn`'s apparently pointless substitution of `wait 1` for `wait 0` is
+load-bearing for 14 of the game's 64 buttons. **A class holding a `Toggle` must call
+`Toggle::move_done` first**, because that call *is* `CBaseToggle::MoveDone` and it is
+what snaps the mover onto its exact destination. **`linear_move` returning `false` means
+"already there" and the caller must run `move_done` itself, *before* firing any
+output** — in the C++ that call happens inside `LinearMove`, so a zero-length open
+queues `OnFullyOpen` before `OnOpen`. **`speed` is `CBaseEntity`'s**, not the mover's,
+because `func_rotating` uses it as its current rotation rate. **`DotProductAbs` is not
+`|a·b|`**, and a door's travel subtracts two units for the bbox expansion before the
+lip. **`AngleVectors` of a right angle is not exact**, so a door travelling 64 units
+straight up also travels 2.8 millionths of a unit sideways — Valve's residue too.
+**The `Use` input's *type* is the connection's serial number, cast**
+(`InputUse` passes `(USE_TYPE)inputdata.nOutputID`), which is why an I/O `Use` does
+nothing on a `func_movelinear` and works on a `func_button`. And **a parented mover
+moves in world space**, where Valve moves it in the parent's frame — 174 of the game's
+1,164 movers name a parent, and the missing local/abs pair is the same thing that keeps
+the `SetParent` family unimplemented (**1,078 of the depot's 1,081 unhandled inputs**).
+
+One find worth keeping for its own sake: **`inputfilter` is declared by `base.fgd` for
+`func_brush`, written onto 2,497 of them by Hammer, and consumed by nothing anywhere in
+`legacy/`** — not in `game/server/`, not in the engine, not in the tools. The sharpest
+example yet of `portdocs/SERVER.md` §1.4's "the FGD is a reference, not an oracle".
+
+**Stage 4 is triggers and touch, and it is the first time the map responds to
+the player.** `src/server/touch.rs` is `touchlink_t` and the four
+`CBaseEntity::Physics*Touch*` functions; `classes/trigger.rs` is `CBaseTrigger`
+plus `trigger_once` (1,476), `trigger_multiple` (899), `trigger_hurt` (215),
+`trigger_push` (192) and `trigger_teleport` (110); `classes/filter.rs` is the
+six `filter_*` classes (302) they consult; `classes/point.rs` is
+`point_teleport` (128); and `classes/player.rs` is the player. **Twelve
+classnames, taking the port to 34 and to 25,961 of the game's 60,925 entity
+blocks.** On the engine side it brought `trace/` stage 4's clip chain,
+`World::clip_models`, `World::brush_models_touching` and base velocity in
+`client/`'s walk.
+
+**The player had to become an entity here, not at stage 5, and that contradicts
+the plan.** A touch is a fact about *two* entities:
+`PassesTriggerFilters` tests `FL_CLIENT` on the toucher, `CTriggerHurt` picks
+its output by `IsPlayer()`, `CFilterName` special-cases the literal string
+`!player`, and **121 of the game's 128 `point_teleport`s target `!player`**.
+So `classes::Player` is sixty lines — a box with `FL_CLIENT` set, holding no
+`client/` type and moving under nobody's power — and the two halves exchange a
+plain `server::PlayerState` that `Engine::frame` copies in before the ticks
+and out after them, the same seam `world/` already had for brush placements
+pointing the other way. Stage 5 is still most of `CBasePlayer`: the movement,
+`noclip`'s home, health, death, the weapon, the view.
+
+Three more findings. **§10.3's borrow question reopened exactly where stage 2
+said it would** — "a handler that must *read* another entity during dispatch",
+and stage 4 has three of them — **and the answer stage 2 wrote down was
+right**: `Server::dispatch` lifts the entity it is about to run *out* of the
+list, so `Context` can carry the rest of it. No `RefCell`, no `unsafe`, one new
+rule (`cx.entity(self.id())` is `None` inside your own handler). **The
+engine/game split at `SolidMoved` is worth keeping**: the engine answers "what
+does this swept box overlap" and the game decides what it means, which here is
+one trait (`TouchQuery`) and is what lets the whole touch system be tested with
+no map — and two properties of the answer are Valve's and load-bearing, that it
+sweeps the trigger's **real brushes** rather than its bounding box and that it
+is **not** filtered to triggers, because `FSOLID_TRIGGER` is the game's live
+state and an engine-side copy would be a frame stale. And **`trigger_hurt` arrived with
+complete timing and no damage**, which was the honest shape for a stage with
+no health anywhere: it fired `OnHurt`/`OnHurtPlayer` on exactly the schedule
+the shipped game does and took nothing away. Stage 5 supplied the missing
+line.
+
+Twelve more rules produce a plausible wrong answer rather than an error
+(`rustdocs/SERVER.md` gotchas 35-46), and three decide whether a trigger works
+at all: **a trigger is `SOLID_BSP` *and* `FSOLID_NOT_SOLID` *and*
+`FSOLID_TRIGGER`**, and reading only the bit makes every trigger a wall while
+reading only the type makes every point entity one; **only one side of a touch
+owes an `EndTouch`**, and it is the trigger's; and **an entity that deletes
+itself fires no `EndTouch` of its own**, which is why none of the game's 1,476
+`trigger_once`s ever does. Two more are worth having in hand: **a Portal 2
+single-player `trigger_push` is twice as strong as the map says**
+(`CTriggerPush::Activate`'s `DIRTY HACK TO FOLLOW` — the game was tuned with
+`sv_alternateticks` on and ships with it off), and **a teleport discards the
+swept-from point**, without which a teleport fires every trigger between the
+two ends.
+
+**One bug the tests could not have found, and it is worth the paragraph.**
+`EntityCore::solid` arrived at stage 4 with a `SOLID_NONE` default and the
+five stage-3 brush classes were never given one, so `is_solid()` was false
+for every door in the game and `World::clip_models` came back empty — the
+clip chain silently collided with nothing, with every unit test passing,
+because they all build a `PlacedBrushModel` by hand. What found it was
+loading the game and reading one number the `trace` command prints:
+*"78 placed, **0** in the clip chain"*. **Adding a field with a `Default` is
+the same class of change as adding an enum variant and the compiler does not
+help**; `tests::every_brush_class_is_solid_unless_it_says_otherwise` now
+spawns each class through `Server::level_init` and asserts on the entity.
+
+The measurement that says it works is
+`server::tests::every_shipped_maps_triggers_notice_the_player`: for **every one
+of the game's 2,255 live triggers** it reloads the level, finds a point inside
+the trigger's *actual brushes* that a 32×32×72 hull fits in, puts a player
+there and runs two ticks through the same `ClipRayToCollideable` sweep the
+running game uses. **2,246 notice, 1,888 dispatch something, 3 have no point a
+standing player fits in, 6 are switched off or deleted by the map's own
+bootstrap.** (Nine of that 1,888 are a floor button, below: 21 of the probe
+points also stand on a pad, and twelve of those were already firing.)
+
+**`prop_floor_button` landed after stage 4 rather than inside it, and it is
+the first class in the port from `game/server/portal2/`.** The big red pad you
+stand on — **65 across 47 of the 106 maps, one of them on `sp_a1_intro1`** —
+with 227 output connections on them. `src/server/classes/prop.rs` is
+`CPropFloorButton` and `CPortalButtonTrigger`, taking the port to **36
+classnames and 26,026 of the game's 60,925 entity blocks**.
+
+It is small and what it *cost* is not, because a button is **two entities**:
+the prop collides with nothing, and what notices the player is a second entity
+the prop creates in its own `Spawn` — a `trigger_portal_button`, 40×40×14
+units, centred on the pad and turned to match it. Three pieces of framework
+came with that, and each is reusable:
+
+- **`Context::create_entity`** — `CreateEntityByName` + `DispatchSpawn`, the
+  first entities in this port that are not in a `.bsp`. The spawn is
+  **deferred by one dispatch**, exactly the way `UTIL_Remove` defers a
+  deletion, because `Server::dispatch` has lifted the *creator* out of the
+  entity list and nothing can dispatch into it while a handler runs.
+  `LevelStats::created` is the new term that makes `spawned +
+  removed_on_spawn` differ from `matched`.
+- **`Solid::Obb` and `src/server/obb.rs`** — `IntersectRayWithOBB`, the first
+  trigger in the port whose shape is a *box* rather than a brush model. It
+  lives in `server/` and not in `engine/trace/` because there is no map data
+  in it to ask the engine about — and that is where Valve keeps it too, in
+  `public/collisionutils.cpp`, compiled into both game DLLs. Two paths, chosen
+  by an **exact** comparison against zero angles: a slab clip for the 42
+  buttons at `angles "0 0 0"`, and a fifteen-plane separating-axis sweep for
+  the 23 that are turned — including `sp_a1_intro1`'s, which is at yaw 90.
+- **`Touched`** — `OnStartTouchAll` and `OnEndTouchAll` are virtuals and until
+  now no class overrode either, so `BaseTrigger::start_touch` reports them
+  back to whatever contains it.
+
+**The model draws and the plate animates**, which took the two pieces the
+port did not have. **`src/studio/anim.rs`** is the bone list, the sequence
+table and the RLE animation blocks — `bone_decode.cpp`'s `ExtractAnimValue`,
+`CalcBoneQuaternion`, `CalcBonePosition`, the `Quaternion48`/`Quaternion64`/
+`Vector48` compressed types, and the slice of `R_StudioSetupBones` that turns
+a (sequence, cycle) into one matrix per bone. **`src/engine/world/entities.rs`**
+is the third kind of geometry in a level shell: `.mdl` geometry the *game*
+places, where world faces are `.bsp` geometry with a matrix and static props
+are `.mdl` geometry the *compiler* placed.
+Measured on the real file: `portal_button.mdl` is **3 bones, 4 sequences
+(`BindPose`, `up`, `idledown`, `down`), 11 frames at 24 fps**, and the plate
+travels **7.29 units**, with `up` retracing `down` exactly.
+
+Four decisions there are worth knowing.
+**There is no skinning, and that is a substitution rather than a gap — with a
+measured expiry date.** Every vertex of every model the port *draws* answers
+to exactly one bone — a button's 7,929 split 7,263 on the body and 666 on the
+plate — so each batch's triangles are sorted by bone at load and each bone's
+contiguous run is drawn under its own matrix. That needs no change to the
+vertex format, the shaders or the bind groups, and it is **exact** for this
+data. It does **not** generalise: across the game 420 of 2,017 models have
+more than one bone and **141 of those share a vertex between two** (the
+`a4_destruction` set), so `StudioModel::rigid_bones` checks the precondition
+rather than assuming it, a model that fails it is drawn in its bind pose and
+counted, and those 141 are the condition that makes real skinning worth
+writing. **`prop_dynamic` cashed that condition in.** It places models rather
+than static props, so it reaches them: **74 of the 591 readable models the
+game's props name share a vertex between bones, and 290 entities wear one**,
+drawn in their bind pose instead of animating. Seven of those models are on
+`sp_a1_intro1` — the `models/container_ride/finedebris_part*` set — so it is
+visible on the map this port loads by default rather than only in a census.
+With `$includemodel` merged, skinning is now the **largest** gap in the model
+path — and it gates the next one, because the six include hosts whose
+animation is in an `.ani` are all models it cannot pose anyway.
+**The RLE stream is expanded at load, not walked at draw**, because a whole
+button model's animation is a few hundred bytes — the game's longest is
+**4,050 frames**, which is the matching bound on that decision.
+**The join with the game is a sequence *name***: the server says `"down"` and
+when it started, and the engine looks the label up and computes the cycle from
+the scene clock — Valve's own server/client split, and what keeps the
+animation smooth where a 64 Hz tick would step it.
+And **`AnimateThink` is still not scheduled**, which is now a saving rather
+than an absence: its body is `StudioFrameAdvance`, which the renderer does for
+itself.
+
+**One bug this found that nothing else would have.** Bone **255 terminates**
+an animation's bone chain — `studiomdl` writes it (`write.cpp:1182`) and the
+decoder reads `while (panim && panim->bone < 255)` (`bone_decode.cpp:1395`).
+Reading it as a bone index refused 15 of the models `sp_a1_intro1` places, and
+**every one of them still parsed as a file**; only loading the real game
+showed it.
+
+Six things about it that read as bugs until you check the reference.
+**A button is pressed by an *input*, not by a call**: the trigger posts
+`PressIn` at its owner where Valve calls `m_pOwnerButton->TriggerStartTouch`
+directly, because a handler cannot dispatch into another class. It costs one
+extra event and **no tick** — the queue restarts from the head, so the chain
+lands inside the tick the touch happened in. **The rest of `CDynamicProp`
+is still absent**: bone followers, `VPhysicsInitStatic`, prop data, LOS
+blocking and fade distances, none of which has anything here to drive it —
+and `m_nSkin`, which is parsed and printed by `ent_dump` and not drawn,
+because skin families are `portdocs/STUDIO.md` stage 6's.
+**`SetSkin( button_off_skin )` runs after
+the `skin` key is read**, so a map cannot choose the starting skin — which is
+why all 18 shipped `skin` keys are `0`. **`SetParent` on the trigger is
+skipped** and nothing is lost: not one of the 65 has a `parentname` and none
+is a mover. **`UpdateOnRemove` is skipped too**, so a killed button orphans
+its trigger — and no connection in any shipped map fires `Kill` at one; an
+orphan does nothing, because its owner handle stops resolving and its filter
+then refuses everything. And **the three sibling classes are deliberately not
+here**: `prop_floor_cube_button` and `prop_floor_ball_button` accept *only*
+cubes and balls, and `prop_weighted_cube` is not ported, so in this port they
+would be furniture nothing could ever press.
+
+The measurement that says *this* works is
+`server::tests::every_shipped_floor_button_presses_when_stood_on` — the
+`SOLID_OBB` half of the trigger test, needing no collision data at all. For
+every button in the game it reloads the level, puts the player's hull centre
+on the pad's box centre (which is inside it whichever way the pad faces, and
+some are on walls) and then walks away. **65 press, 65 release.**
+The measurement that says the *model* works is
+`engine::world::entities::tests::the_button_draws_and_moves_as_it_presses`,
+which renders `sp_a1_intro1`'s button headlessly from four feet away: 24,889
+of 65,536 pixels drawn, **11,467 of them different between the two ends of
+`down`**, and the held-`up` image pixel-identical to `down` at cycle 0 —
+which is what says the pose reaches the right geometry rather than just some
+geometry. To watch one
+do something, load **`sp_a1_intro5`**, where `button_1-button` drives a
+`func_door` (`stair_ramp_door`) open and shut through a
+`func_instance_io_proxy` and a pair of `logic_relay`s; `sp_a1_intro1`'s drives
+an `env_texturetoggle`, which is not ported, so there the chain runs and
+nothing moves.
+
+**Stage 5 is the player as a whole entity, and its headline is that
+`trigger_hurt` kills.** `src/server/damage.rs` is `CTakeDamageInfo`, the
+`DMG_*` table, `m_takedamage`, `m_lifeState` and the health arithmetic;
+`classes/player.rs` is `CBasePlayer`'s damage and death path plus
+`logic_playerproxy` (9) and `player_loadsaved` (9). **38 classnames, 26,044
+of the game's 60,925 entity blocks** — continuing the count the stages above
+use, which is every class registered bar `player`; **36 of them are among the
+200 classnames the shipped maps actually place**, the other two being
+`trigger_portal_button` (created by a `prop_floor_button`) and `light_glspot`
+(registered because Valve registers it). `noclip` moved here from `src/client/`
+and brought `god`, `kill` and `hurtme` with it — they are its neighbours in
+`game/server/client.cpp` — and `client/` gained the dead player's movement:
+`MOVETYPE_FLYGRAVITY`, `FullTossMove`, and an eye that drops from 64 units to
+14.
+
+The measurement is
+`server::tests::every_shipped_trigger_hurt_kills_the_player_standing_in_it`:
+for **every one of the game's 215 `trigger_hurt`s** it reloads the level,
+finds a point inside the trigger's actual brushes that a 32×32×72 hull fits
+in, puts a player there and runs sixteen seconds without moving it. **138
+kill**, the fastest on the first tick and the slowest after 9.78 seconds —
+the one `damage 10` trigger in the game — and all 138 reach `RespawnPlayer`
+and ask the engine for the level back. The other 77 are each accounted for:
+72 are never touched (73 carry `StartDisabled 1`), 4 are touched and refused
+(no `SF_TRIGGER_ALLOW_CLIENTS`, or a filter), and 1 has nowhere to stand.
+
+**The two-clocks question is answered and the answer is no.** The plan lists
+"the movement moving to the server"; §5 of the same document already contains
+the argument against it — `CPlayerMove::RunCommand` runs the movement on the
+fixed tick and `CPrediction` re-runs *the same code* on the client, so a
+one-process port with no `net/` already has the client half, and moving it
+would buy a 64 Hz camera with no interpolation and nothing else. **What was
+wrong was the *authority*.** Four fields of `PlayerState` became the server's
+— `move_type`, `health`, `life_state` and `flags` — and `set_player_state`
+now ignores what arrives in them, which is what makes `noclip`, damage and
+death possible at all: each is a value the client would otherwise overwrite
+on the next rendered frame.
+
+Six findings. **Damage had to be deferred by one dispatch**, and the shape
+was already in the module: `Context::take_damage` queues exactly the way
+`create_entity` queues a spawn and `EntityCore::remove` queues a deletion,
+because applying damage runs the *victim's* virtuals and the hurter has been
+lifted out of the entity list. It costs no tick, and the two gates a caller
+branches on are still evaluated synchronously — three deferral mechanisms now
+share one shape.
+**`logic_playerproxy` is the payoff and all of it is on the default map**:
+nine in the game, and **every one of the five output connections in the
+entire game is on `sp_a1_intro1`** — three `OnJump`, one `OnDuck`, one
+`OnUnDuck` — so jumping there now fires three relays. Two things about it are
+measurements rather than omissions: every input it has in Portal 2 is a
+portal-gun or grab-controller input (`RequestPlayerHealth`/`SetPlayerHealth`
+are `#if defined HL2_EPISODIC && !defined( PORTAL2 )`), so the class accepts
+**none** and its `PlayerHealth` output cannot fire at all — and **`PlayerDied`
+is declared and fired by nothing** anywhere in the tree; the one textual hit
+is a Squirrel function name.
+**Portal 2 has two ways of dying and only one is damage**: `player_loadsaved`
+is what happens when you fall into the abyss in `sp_a3_portal_intro`, where
+there is no `trigger_hurt` at all — the map freezes the player, fades the
+screen and reloads. Nine entities, 11 `Reload` connections, seven named some
+variation of `fade_to_death`.
+**Fall damage is deleted rather than deferred, and the tree says so in
+words**: `CPortalGameRules::FlPlayerFallDamage` is
+`{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`).
+Nothing in Portal 2 can be killed by landing, which is exactly why 34 of the
+215 `trigger_hurt`s carry `DMG_FALL` — the pit does the killing and the
+damage type is a label.
+**The `health` key is carried by 682 entities and every one writes `0`** —
+346 `func_door_rotating`, 272 `func_door`, 64 `func_button`, the three ported
+classes whose `Spawn` makes them shootable above zero — so the whole
+shootable-brush path is dead in Portal 2 and the key leaves the depot test's
+unhandled table by being *consumed* rather than by being implemented.
+And **one number in the damage path is not recoverable**:
+`CPortal_Player::OnTakeDamage` multiplies every hit by `sk_dmg_take_scale1`,
+which is declared `extern` here, defined in an `hl2_gamerules.cpp` this tree
+does not contain, and set by no `.cfg` and no VPK in the depot. It is 1, with
+one definition site — and it barely matters, because the weakest
+`trigger_hurt` in the game deals 10 a second against 100 health and 202 of
+the 215 deal 100 or more, so any scale between about 0.1 and 10 kills the
+player in the same place.
+
+Eight more rules produce a plausible wrong answer rather than an error
+(`rustdocs/SERVER.md` gotchas 52-59), and three decide whether anything dies:
+**`Context::take_damage` aimed at yourself is silently dropped**, because the
+dispatched entity is not in the list the queue resolves against — hurting
+yourself calls `self.on_take_damage` directly, which is what the C++
+compiles to anyway; **`EntityCore::is_alive` is the life state and
+`CGameMovement::IsDead` is the health**, and they disagree for exactly the one
+dispatch between the subtraction and `Event_Killed`, which is why
+`PlayerState` carries the health; and **`m_flDamage` is per second and a dose
+is per think** (`m_flDamage * dt`, `dt` 0.5), so dealing the key's value per
+dose doubles the lethality of every `trigger_hurt` in the game.
+
+**One behaviour that reads as a bug and is Valve's:** a `trigger_hurt` keeps
+firing `OnHurtPlayer` at a corpse, every half second until the level reloads —
+six more times. The dead player going `FSOLID_NOT_SOLID` only stops the
+*player* testing triggers and a stationary trigger never re-tests its own, so
+the link survives; `m_takedamage` stays `DAMAGE_YES`, because
+`CBaseCombatCharacter::Event_Killed` does **not** chain to
+`CBaseEntity::Event_Killed`; and `TakeDamage` returns `void`, so `HurtEntity`
+cannot see the refusal. It is bounded, and it is also why `god` mode leaves a
+scripted chamber usable rather than wedged.
+
+**`sp_a1_intro1` places no `trigger_hurt` at all**, so the default map cannot
+kill you — `sp_a1_intro5` is the nearest that can, and is already the map to
+load for the floor button. What `sp_a1_intro1` does have is the
+`logic_playerproxy`.
+
+Not implemented, and each is a class or a subsystem: the weapon
+(`weapon_portalgun`, 3 placed, and it needs the portal system), the armour
+(Portal has none), drowning, the HEV suit, and everything else that can hurt
+you — turrets, crushers, `prop_physics`. `trigger_hurt` is the whole damage
+surface the shipped maps reach.
+
+**`prop_dynamic` landed after stage 5, and it is the biggest class in the
+game.** `CDynamicProp` across its four classnames — `prop_dynamic` (8,072),
+`prop_dynamic_override` (390), and `dynamic_prop`/`prop_dynamic_glow`, which
+Valve registers and no map places — is **8,462 entities across 105 of the 106
+maps**, ten short of `logic_relay` and ahead of everything else. It carries
+**5,311 `SetAnimation` connections**, more than any other input in the game
+reaches an implemented class, and 1,141 distinct sequence names. That takes
+the port to **43 registered classnames and 34,506 of the game's 60,925 entity
+blocks** — 38 of them among the 200 the maps place. **`sp_a1_intro1` gains 90
+of them from 52 models**, so the default map's signage, pipework and panels
+draw for the first time.
+
+The plan's "Beyond" list had it as *"needs `studio/` stage 6 and skin
+families"* and **that was wrong**: skin families decide which texture a model
+wears, `m_nSkin` is `0` on 7,808 of the 8,462, and what the class needed was
+what `studio/` already had after `prop_floor_button` — bones, sequences and
+the RLE animation blocks.
+
+Six findings.
+**The classname is behaviour, and a rename two statements later hides it.**
+`CDynamicProp::Spawn` promotes a `SOLID_NONE` prop to `SOLID_OBB` only
+`if ( FClassnameIs( this, "prop_dynamic" ) )` — and *then* renames
+`prop_dynamic_override` to `prop_dynamic`. So 2,622 props take the promotion
+and **211 `_override`s with the identical `solid 0` do not**.
+`CBaseProp::KeyValue` asks the same question about `health`, swallowing the
+key for everything but an `_override`; all 344 shipped keys write `0`.
+**`GotoSequence` deletes on a measurement.** The sequence *transition graph*
+— `$node`/`$transition`, which walks an NPC from "stand" to "crouch" through
+an intermediate — opens with "bail if we're going to or from a node 0", and
+across the **2,597 sequences of the 606 models the game's props name, not one
+has a non-zero entry or exit node and not one has `nodeflags`**. So no other
+branch is reachable, `m_iTransitionDirection` is `+1` everywhere, and every
+sequence starts playing *forwards* — which is why the 427 `SetPlaybackRate
+-1` connections in the game violate Valve's own `Assert` in `AnimThink`.
+**The server needed a fact from a `.mdl` and the answer is a table, not a
+call.** `AnimThink` fires `OnAnimationDone` (181 connections, **10 of them on
+`sp_a1_intro1`**) and reverts a finished animation to `DefaultAnim` (2,416
+props); both need the sequence's duration, and `server/` names no `studio`
+type. `src/server/sequences.rs` holds the *answers* — a duration and a loop
+flag per model and label — and `Engine::load_level` fills it in from the
+models `World::load_entity_models` has just read. Same shape as `world/`'s
+`Placement`, pointing the other way.
+**It forced a third answer onto that lookup.** A level loads `World::load` →
+`Server::level_init` → `World::load_entity_models`, and it cannot load in any
+other order, because the models an entity places are named by the entities.
+So **every `Spawn` in the game runs against an empty table**, and "nobody has
+loaded this model" has to be told apart from "it is loaded and has no such
+sequence": `Lookup::Unknown` succeeds where `LookupSequence` would have and
+yields no duration, so an animation with no model never finishes.
+**`ParsePropData` is a deletion, and it costs twelve entities.** A plain
+`prop_dynamic` whose model carries a `prop_data` block is removed at load by
+the shipped game with a `DevWarning`; an `_override` is not, which is what
+that classname is *for*. 15 of the 606 models have such a block and 106
+entities wear one — but **94 of the 106 are `prop_dynamic_override`**, so not
+porting the whole propdata system leaves **12 entities across three maps**
+drawn that the shipped game deletes.
+And **`$includemodel` was the measured gap, it belonged to `studio/`, and it
+is done** (above): nine of the 606 models keep their sequences in a companion
+`*_animation.mdl` and **926 entities wear one**. Of the game's 2,416
+`DefaultAnim` keys 2,233 name a sequence that exists somewhere — **849 only
+through an include**, which is what the merge bought — and **183 name one
+that is in no model at all**, Valve's own map errors, which the shipped game
+answers with a `Warning`. A second-order effect came with it: an animation
+that can now *end* fires `OnAnimationDone`, so the game's 5,311
+`SetAnimation` connections start more props animating than the maps'
+`DefaultAnim` keys alone do — 2,738 props are playing a sequence two seconds
+in, where 2,563 were.
+
+Six more rules produce a plausible wrong answer rather than an error
+(`rustdocs/SERVER.md` gotchas 60-65). **A prop's playback rate starts at
+zero, not one** — `CBaseProp::Spawn` sets it and only `ResetSequenceInfo`
+puts it back to 1, which is what makes the 6,046 props with no `DefaultAnim`
+stand perfectly still rather than looping their first sequence. And two
+divergences follow from the port *deriving* the cycle instead of accumulating
+it: **`AnimThink` cancels itself** once its sequence cannot end (looping,
+zero-length, or a model that never loaded) where Valve re-arms it at 10 Hz
+for the rest of the level, and **`SetPlaybackRate` re-bases `m_flCycle` and
+`m_flAnimTime`**, which Valve does not touch — without it each of those 427
+`-1`s would snap its prop to a different frame before running it backwards.
+And the one that was a real bug on the default map: **an empty sequence label
+is `m_nSequence`'s zero, not "no animation"** — the seam carries a *label*
+where Valve networks an `int`, and an `int` starts at 0 where a label starts
+empty. `Spawn` calls `PropSetAnim` only for a prop with a `DefaultAnim`, and
+`PropSetAnim` answers a name the model does not have with an explicit
+`SetSequence( 0 )`, so **every prop in the game is posed by some sequence**
+and the bind pose belongs to a model with none.
+
+**That matters because a bind pose is not a pose anybody ever looked at.**
+For most models it happens to equal sequence 0 frame 0; for **20 of
+`sp_a1_intro1`'s 91 entity models** it does not.
+`props_motel/hotel_container_furniture01`-`03` — the intro room's dresser,
+wardrobe and desk — bind at `rot_x(+90)` against a `poseToBone` of
+`rot_x(-90)`, whose product is the identity, while their `idle` holds
+`Quaternion64(0.5, 0.5, 0.5, 0.5)`, a 120° turn about `(1,1,1)`, which
+against the same `poseToBone` is `rot_z(+90)`. Drawn from the bind pose all
+three came out a quarter turn wrong and standing inside the bed — and the bed
+is `hotel_container_furniture04`, a **static prop** at the same anchor and
+the same yaw, on a path that never looks at a sequence, so it stayed put and
+the three around it did not. The `.mdl` says so without rendering anything:
+`hull_min`/`hull_max` and the `.vvd`'s own vertex bounds differ by exactly
+that quarter turn.
+
+It changed three things outside the class. `ModelEntityState`/`ModelEntity`
+are **keyed on an opaque id and carry `visible`**, where they were positional
+and `EF_NODRAW`-filtered — forced by the 556 `Kill` connections aimed at a
+prop and the 1,000 props that are `StartDisabled`. `ModelState::sequence` is
+a `&str` rather than a `&'static str`, because a prop's comes out of the map.
+And `CBaseEntity` gained the `solid` key — measured: **only the prop family
+writes it** — and the `DisableDraw`/`EnableDraw` inputs, whose 206 shipped
+connections are **all** aimed at a `prop_dynamic`.
+
+**`prop_testchamber_door` landed after it, and it is the door itself** —
+the big round one at both ends of every test chamber. `CPropTestChamberDoor`
+(`game/server/portal2/prop_testchamber_door.cpp`) is **138 entities across
+71 of the 106 maps, two of them on `sp_a1_intro1`**, carrying 247 output
+connections and 296 input ones. That took the port to **44 registered
+classnames and 34,644 of the game's 60,925 entity blocks** — 39 of them
+among the 200 the maps place.
+
+**Despite the classname it is not a prop**: it derives straight from
+`CBaseAnimating`, so it has no `DefaultAnim`, no `SetAnimation`, no
+propdata, no `StartDisabled` and none of `CDynamicProp`'s fifteen inputs. It
+is five inputs, four outputs and a playback rate, and it lives in
+`classes/prop.rs` only because what it needs — a model name, a sequence
+label and the five `ModelState` fields — is what that file already has.
+
+**The whole class is one sequence played in two directions.** `Spawn` resets
+it to cycle 0 of `open` at rate **zero**, which is the shut pose held still;
+`Open` sets the rate to `+1` and `Close` to `-1`. `close`,
+`idleopen` and `idleclose` are looked up into three fields that **nothing in
+the tree ever reads** — and the model says that is deliberate rather than an
+oversight, because `open` is 23 frames and `close` is **36**, so shutting a
+door with `close` would take 1.46 seconds where the shipped game takes 0.92.
+
+**It is the first thing in the port that needed `fadeouttime`.**
+`IsSequenceFinished()` is what `OnFullyOpen` waits on, and
+`GetLastVisibleCycle` calls a non-looping sequence finished
+`fadeouttime * cycleRate * playbackRate` **before** it ends — so the door's
+0.9167-second `open` is "finished" at cycle 0.782, 0.717 seconds in. Worth
+carrying rather than assuming, and measured: **10,664 of the shipped game's
+10,666 sequences write 0.2 and the other two write 0.5**, so the term never
+folds away. `studio::anim::Sequence`, `server::sequences::SequenceInfo` and
+the `world/` → `server/` seam each grew the field, and the seam's four-tuple
+became a `SequenceRow`.
+
+Five things about it read as bugs until you check the reference, and the
+first is the big one.
+
+**`m_bSequenceFinished` is sticky, so only a door's *first* opening reports
+its own end.** Nothing clears the flag but `ResetSequenceInfo`, and this
+class calls `ResetSequence` exactly once, in `Spawn`. So the first
+`OnFullyOpen` waits for the animation — 0.797 seconds on the tick grid — and
+**every later `OnFullyOpen` and every `OnFullyClosed` fires on the first
+think after the input**, 0.094 seconds in, while the door is still visibly
+moving. It is reproduced deliberately: 150 of the game's 247 door output
+connections are `OnFullyClosed` and were authored against it — 29 disable a
+`func_clip_vphysics` and 25 enable a fizzler — so a "correct" door would
+delay every one of them by three quarters of a second. Both numbers are
+identical for all 138 doors, because the whole schedule is quantised.
+**`IsOpen()` is where the door is *going*, not where it is** — it is set the
+instant `Open` is accepted — so a second `Open` during the travel is refused,
+and `LockOpen` opens *and then* locks, in that order, so the open itself gets
+through.
+**`AnimateThink` re-arms unconditionally and this class deliberately does
+*not* take `CDynamicProp::AnimThink`'s cancel-when-idle divergence.** That
+divergence is worth it for 8,462 props; there are 138 doors, two per map, and
+what re-arming buys is the exact 0.1-second grid that decides when those 181
+"fully" connections fire. The cost is one depot number: **`io.thinks` went
+from 4,420 to 7,318, and all 2,898 of those are doors.**
+**`Open`/`Close` must re-base the derived cycle**, the same way
+`SetPlaybackRate` does for a `prop_dynamic` — skip it and a door told to
+`Close` computes its position from the moment it spawned.
+And **the area portal window is parsed and does nothing**: 84 doors name a
+`func_areaportalwindow` and 94 write the fade triple, but all
+`AreaPortalOpen`/`Close` do is write two fade distances on a class that
+belongs to the engine's unported visibility system. The two call sites are
+marked so wiring them up later is one line each.
+
+Also absent: the bone followers, which *are* a chamber door's whole collision
+in the shipped game — so like every other model in this port it is drawn and
+walked through — and the two sounds.
+
+**What it looks like** is two rings and two leaves in two acts: the spinner
+rings turn about their own axes over the first 62% of `open`, *inside* the
+door's thickness, and only then do the two halves slide 53 units apart. So
+the first two thirds of the animation draw pixel-identically from outside and
+the doorway clears all at once. That is the model rather than the port, and
+it is what makes the door the test that says the per-bone draw split
+generalises: a floor button is two bone runs with one moving, a door is
+**five with three moving**.
+
+**To watch one, load `sp_a1_intro1` and walk into the first chamber.** Both
+of its doors are driven by `trigger_once` → `func_instance_io_proxy` →
+`logic_relay` → the door, which is ported end to end, and **130 of the
+game's 138 doors are opened by a chain in their own map** (five of the other
+eight carry no `targetname` at all and three are named and never fired at —
+Valve's dead map data, shut in the shipped game too). **And they shut again**,
+now that `logic_branch_listener` is ported — see below.
+
+**`logic_branch_listener` landed after it, and it is what shuts those doors.**
+`CLogicBranchList` (`logicentities.cpp:3026`) is **158 entities across 46 of the
+106 maps**, and it is an AND gate over a handful of `logic_branch`es: `Branch01`
+is "the map wants this door shut" and `Branch02` is "the player is not standing
+in the doorway", and when both go true `OnAllTrue` fires the relay that sends the
+door `Close`. That takes the port to **45 registered classnames and 34,802 of the
+game's 60,925 entity blocks** — 40 of them among the 200 the maps place.
+
+It is small — one `Activate`, one three-way test and three outputs — and what it
+cost was one framework addition and one field. `Context::find_all_by_name` is the
+`while ( pEntity = FindEntityGeneric( pEntity, … ) )` loop that
+`find_by_name`'s first-match form cannot express, and `logic_branch` grew a
+**listener list**: this is the first class in the port where one entity
+*registers* with another rather than sending it an input, which is
+`Context::behaviour_mut` doing exactly what it was written for. The branch then
+posts `_OnLogicBranchChanged` back at each listener when its value moves — an
+ordinary queued input, zero delay, so the whole chain lands inside one tick.
+`portdocs/SERVER.md` §10.3 named this class as the condition that would change
+the borrow shape and **it did not**: stage 4's answer was already enough.
+
+Three things about it read as bugs until you check the reference.
+**It reports nothing at level start**, because `Spawn` is empty, `Activate` only
+registers and `m_eLastState` begins `NOT_INIT` — so the first output comes from
+the first branch *change*, never from the first evaluation. Every door in the
+game depends on that: both branches of a door's listener read "shut me" at spawn,
+and a listener that tested itself on the way up would slam every door in the map
+closed on tick one. **`SetValue` fires no output of its own and still reaches a
+listener**, because the notification is guarded by the value having changed and
+the output by the input being a `*Test` form — two independent guards, and
+conflating them is silent either way: fold the notification under the output and
+no door in the game ever shuts (1,175 of the 1,601 connections into a branch are
+`SetValue`), or drop the change guard and `Test`'s 308 connections make every
+listener re-report. And **an empty branch list is `OnMixed`**, because neither
+`bOneTrue` nor `bOneFalse` gets set and `DoTest` falls through into the `else`.
+
+One Valve bug is **not** reproduced, because reproducing it would take more code
+than not: `CLogicBranch::UpdateOnRemove` walks its listener list and then posts
+`_OnLogicBranchRemoved` at *itself* rather than at the listener it just looked up,
+so no listener in the shipped game has ever received one and a dead branch is
+counted as false for the rest of the level. This port reaches the same state by
+having no removal hook at all. **No shipped map fires `Kill` at a `logic_branch`**,
+so the two are indistinguishable.
+
+**The class is invisible to the 106-map census**, and that is the finding worth
+carrying: in the first two seconds of a level **not one `logic_branch` in the game
+changes value** — a chamber door shuts after the player has walked through it,
+which is minutes in — so every event, input and think total in
+`every_shipped_map_spawns_its_entities` is *identical* with the class registered
+and with it disabled. Its own depot test drives the maps instead: per map it opens
+every chamber door, sets every `logic_branch` true and reads back what each
+listener reported. **350 `Branch*` keys written and 350 resolved; 157 of the 157
+listeners that survive their map's bootstrap report a verdict; and 79 of the 99
+chamber doors on those 46 maps are shut again by one going all-true.** Only 56 end
+up all-true, and that is the map logic rather than a fault — a door's
+`OnAllTrue → logic_relay` chain ends by setting the branch that asked for it back
+to `0`, inside the same tick.
+
+**`prop_portal` landed after it, and it is `portdocs/PORTAL.md` stage 2 of five.**
+`CProp_Portal` (`game/server/portal/prop_portal.cpp`) and the *placement* half of
+`CPortal_Base2D` — **21 entities across 10 of the 106 maps, two of them on
+`sp_a1_intro1`**, which makes this the rare module whose test bed is the map the
+port already loads by default. That takes the port to **46 registered classnames and
+34,823 of the game's 60,925 entity blocks** — 41 of them among the 200 the maps
+place. All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
+`HalfWidth`/`HalfHeight`, so the whole of shipped content is "two default-sized
+portals in group 0, switched on by map logic": **31 `SetActivatedState`, 4
+`NewLocation`, and exactly one output connection in the entire game**, which is
+`sp_a1_intro1`'s `portal_red_0.OnPlayerTeleportFromMe`.
+
+It links to its partner, computes the teleport matrix, and `engine::world::portals`
+draws the oval. **It does not carve the wall (stage 3) and it does not teleport
+anybody (stage 4)** — so what you get is a coloured oval on an unbroken wall that
+you walk into and stop.
+
+Six things about it read as bugs until you check the reference, and the first two
+decide whether a pair ever forms.
+
+**Linkage is by group and size, never by `PortalTwo` — and `PortalTwo` is
+*overwritten* by linking.** `UpdatePortalLinkage` takes the first portal in the group
+that is active, unlinked and exactly the same size, and the base class then assigns
+`m_bIsPortal2 = !m_hLinkedPortal->m_bIsPortal2`. The key decides colour and nothing
+else, which `portal_base2d.h:38` says in as many words; reading it as the pairing key
+looks right on all 21 shipped portals, because every one is already the opposite of
+its partner.
+**The portal that activates *second* keeps its colour**, because the forcing line runs
+on the partner first through the recursion at `prop_portal.cpp:584` — so a map that
+switched on two blues would turn the *first* one orange.
+**The teleport matrix has a 180° turn about up baked into it**, and a point in *front*
+of the entrance therefore maps to *behind* the exit. Both read as bugs and neither is:
+without the half turn you come out facing back the way you came, and the
+front-to-back relationship is what makes the same matrix a camera transform for the
+view through a portal — the teleport is consistent with it because the player crosses
+the *plane*, so the point being transformed is a hair behind it.
+**A portal's `right` is the negation of its angle matrix's second column**
+(`m_vRight = -m_vRight`, `portal_base2d.cpp:1213`), because Valve's `matrix3x4_t`
+column 1 is *left*; repeating the negation mirrors the quad, the corners and the
+matrix together.
+**The default half-height is 56 and the reference tree says 14** — a CEG anti-tamper
+decoy, `0.25 * DEFAULT_PORTAL_HALF_HEIGHT`, under a comment that says exactly what it
+is. The shipped portal is 64 x 112 units.
+And **`prop_portal` draws no model, and drawing one would be a magenta rectangle
+across the wall**: `portal1.mdl` is four vertices wearing `writez`, a depth-only
+shader that punches a hole for the recursive view, and `writez` is not a shader this
+port has. `PropPortal::model_state` answers `None`.
+
+Four decisions worth knowing.
+**The linkage recursion collapses to one level.** `UpdatePortalLinkage` recurses in
+three places and two of them do no work; the third — a deactivating portal handing its
+partner on — is the only one that can find a *third* portal, and it is written out.
+That matters because this module cannot recurse: `Server::dispatch` has lifted the
+entity out of the list, so a partner is reachable as data and never as code.
+**`Context::find_all_of_class` replaces `s_PortalLinkageGroups[256]`** — a `static`
+cannot hold per-`Server` state, the scan is in spawn order either way because
+`AddToLinkageGroup` runs in `Spawn`, and the whole game has 21 portals with no map
+holding more than four.
+**`portdocs/PORTAL.md` §12's "where does the carve live" is settled and the seam
+already exists**: `PortalState` goes `server/` → `engine/` → `world/` once a rendered
+frame, and stage 3's carve takes the same route into `trace/` — adding nothing to the
+seam, because the placement and the size are already in it.
+And **the placement snap was deleted and the deletion was measured.**
+`CProp_Portal::ActivatePortal` re-traces and re-places a portal on activation; this
+port activates one where the map put it.
+`every_shipped_portal_is_on_a_wall` runs Valve's own trace against all 21 and
+classifies: **15 flush, 2 proud of their wall** (`sp_a1_intro1`'s own `portal_red_0`
+by 1.97 units and `sp_a1_intro4`'s by 3.50) **and 4 floating** — and those four are
+exactly the `NewLocation` targets in `sp_a4_finale1`/`2`, which the map parks in
+mid-air and moves from script, and which is also why neither map fires
+`SetActivatedState`. The assertion with teeth is the angle: **not one of the 21 is
+more than 0.00 degrees off the surface behind it**, so the snap cannot re-orient a
+shipped portal and the matrix this port computes is the one the shipped game computes.
+
+The measurement that says the class works is
+`server::tests::every_shipped_portal_spawns_and_its_map_can_link_a_pair`: **21
+portals across 10 maps, 17 switched on by their own logic, 6 maps forming a pair.**
+"Exactly one pair" was the plan's assertion and is wrong — `sp_a1_intro2` places
+*four* portals in group 0, and firing every `SetActivatedState 1` in its lump at once
+(which the running map never does, because they belong to different rooms) forms
+**two**. What the test asserts instead is the invariant: every linked portal's partner
+links back, the two are opposite colours, no portal is claimed twice, and every linked
+portal has a non-identity matrix.
+The measurement that says the *oval* works is
+`engine::world::portals::rendered::the_portal_overlay_draws_in_two_colours_and_opens`,
+and it needs **no map** — what a portal draws does not depend on where it is. At
+256x256: **19,039 pixels for the blue and 18,718 for the orange**, mean rgb
+(0.19 14.34 31.66) and (31.17 17.33 0.00) — which is what says the 256x1 gradient
+strip is sampled on its one row — and ~24,700 pixels differ between a settled oval and
+a half-open one, which is what says group 3 reaches the shader at all.

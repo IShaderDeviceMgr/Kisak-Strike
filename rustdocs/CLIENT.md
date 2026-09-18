@@ -876,3 +876,184 @@ Added by `server/` stage 5:
 | `movement::the_dead_view_drops_to_the_floor_and_duck_does_not_lift_it_back` | `VEC_DEAD_VIEWHEIGHT`, and the write order against `Duck()` |
 | `movement::a_dead_players_movement_basis_is_the_previous_commands` | the `m_vecOldAngles` pin, and that a live player is unaffected |
 | `server::tests::noclip_is_the_servers_and_survives_the_round_trip` | that the move type only travels one way |
+
+---
+
+## What has landed, and what each stage found
+
+> Moved here from `CLAUDE.md`, which had grown to 2,126 lines by accumulating a
+> paragraph per landed stage. This is the narrative history of the module: what
+> was ported, in what order, what it cost and what the measurements said.
+> `CLAUDE.md` keeps a one-line summary and points here. **The invariants and
+> gotchas above are the normative part of this document**; this section is the
+> record of how they were arrived at.
+
+**`src/client/` — the game client, stages 1-4 of 5 ported, plus the dead
+player `server/` stage 5 brought** (`portdocs/CLIENT.md`,
+**`rustdocs/CLIENT.md`** — read that before calling in). The first *game* module in the
+tree, and a sibling of `src/engine/` because `client.so` was a sibling of `engine.so`.
+**It is not `ENGINE.md` §7.5**, which is the client *connection* (`CClientState`,
+snapshot parsing), lands at `src/engine/client/` and is blocked on `net/`; the two share
+a name and nothing else. Stage 1 is the input→command→movement→view spine: `UserCmd`,
+`kbutton_t`'s two-holder set **with its fractional `KeyState`** (the half `input/`
+deliberately refused to build against a camera), the 22 `+`/`-` buttons and their `IN_*`
+bits, `FullNoClipMove` and `Accelerate`, a `Player` in `MOVETYPE_NOCLIP`, and ~19 cvars
+with Valve's names, defaults, bounds and flags. **Valve's own
+`// FIXME, move entirely to client .dll`** (`engine/cdll_engine_int.cpp:1048`) is taken:
+the view angles are the client's and the engine never gets a copy.
+Stage 2 is `CViewRender::SetUpView`: a `ViewSetup`, `GetZNear`'s mega-wide branch,
+`GetZFar` from `r_farz`/`r_mapextents`, and `Engine::camera` reduced to a
+`ViewSetup` → `Camera` conversion. **It also fixed a field of view that had been
+quietly too narrow since the camera existed** — Source quotes FOV *horizontally at
+4:3* and scales it by `aspect / (4/3)` before projecting (`view.cpp:1084`), which the
+port was not doing, so 16:9 was showing a 46.7° vertical FOV where the shipped game
+shows 59.8°.
+Stage 3 is keyboard look — `AdjustAngles`/`AdjustYaw`/`AdjustPitch`, `cl_yawspeed`,
+`cl_pitchspeed`, `cl_anglespeedkey`, `cl_mouselook` — plus `IN_SetSampleTime`'s budget.
+**`ExtraMouseSample` is deliberately not ported**, and the plan was wrong to assume it
+would be: the latency it recovers is not lost here (`update_client` runs immediately
+before `render`, with nothing between), and `winit` gives one batch of events per frame
+where Valve re-polls the OS mid-frame, so a second drain would return nothing. Revisit
+when simulation lands between input and rendering.
+**Stage 4 is walking**, and its headline finding is that the reference is
+**`CPortalGameMovement`, not `CGameMovement`**: Portal 2 overrides two dozen of the base
+class's methods and ten of the overrides change behaviour that has nothing to do with
+portals. Jump height is **45 units, not 21**; the air-control cap is **60, not 30**;
+ducking takes **400 ms, not CS:GO's 200**; gravity is **600, not 800**; jumping while
+ducked is **refused** where the base class allows it; **edge friction** doubles friction
+over a ledge and the base class has none; and walking into a standable slope **slides up
+it** rather than stepping. Where Portal's override only generalises world `+Z` to a
+paint-gel "stick normal", the two are the same function with no paint and the world-`+Z`
+form is what is ported. Stage 4 also **found a live stage-1 bug**: a Portal 2 player's
+max speed is `min(sv_maxspeed, MaxSpeed())` = **175**, not `sv_maxspeed`'s 320, so noclip
+had been flying at 1600 where the shipped game flies at 875. Not ported and documented:
+water, base velocity, the unstick passes — and **ladders, the duck-jump state
+machine and fall damage are deleted rather than deferred**, because
+`GameHasLadders()` is `false` for Portal, `CheckJumpButton` sets
+`bSetDuckJump = false` over a Valve FIXME, and
+`CPortalGameRules::FlPlayerFallDamage` is
+`{ return 0.0f; } //no fall damage in portal` — so every branch that reads
+them is unreachable and **nothing in Portal 2 can be killed by landing,
+whatever the height**.
+Seven rules that produce a plausible wrong answer rather than an error:
+**`ViewSetup::fov` is horizontal and already width-ratio scaled**, so anything reading
+`default_fov` for a projection is reintroducing that bug; **`set_sample_time` must be
+called once per frame before `create_move`** or keyboard look silently does nothing for
+ever; **`cl_mouselook 0` does not turn the mouse off** — it *adds* keyboard pitch, and
+`cl_mouseenable 0` is the switch it gets mistaken for;
+**`KeyState` is destructive and the read order matters** — the movement axes are
+computed before the button bits, so a tap shorter than a frame reaches `forwardmove` and
+*not* `IN_FORWARD`, and reversing them is a difference a server would see; **the first
+frame after a press is worth half a frame**, so a movement number wrong by a factor of
+two is usually this working correctly; **`Player::origin` is the feet** and `eye()` is
+64 units higher, so conflating them reads as a level built slightly wrong; and **a `dt`
+of 1.0 does not move the player at all**, because the friction bleed scales with the
+frame time and a one-second step removes more speed than a second of acceleration adds.
+Stage 4 adds four more: **`mv.max_speed` is 175 and not `sv_maxspeed`**, which bounds
+noclip as well as walking; **`old_buttons` lives on the `Player`**, because jump and duck
+both ask about the *previous* command and a `MoveData` built fresh each frame has to
+round-trip it; **`speed_cropped` must start false every command** or a crouched player
+moves at full speed; and **`full_walk_move` zeroes a grounded player's vertical velocity
+before anything else**, so `CategorizePosition`'s "rising too fast to be on the ground"
+test is only ever reachable from the air.
+
+**The dead player landed with `server/` stage 5**, which is the one piece of
+movement this module gained after stage 4. `MoveType::FlyGravity` is
+`CGameMovement::FullTossMove` — gravity, one swept move and a stop, with no
+clip-and-retry and no stair stepping, which is what makes a corpse feel like
+a dropped object — and `check_parameters` grew the two `if`s that read the
+server's state. They overlap and are **not** the same test:
+`FL_FROZEN || IsDead()` zeroes the three move axes and nothing else, so a
+corpse that was falling keeps falling, while `IsDead()` *alone* pins the
+movement basis to the previous command's angles and drops the eye to
+`VEC_DEAD_VIEWHEIGHT`.
+Five rules there produce a plausible wrong answer rather than an error, and
+the first two are the ones that decide whether death looks right.
+**`IsDead()` is `m_iHealth <= 0`, not the life state** — they disagree for
+exactly one server dispatch, which is why `PlayerState` carries the health.
+**The dead view offset is written twice a command and the second one is
+load-bearing**, because `Duck()` runs between them and would otherwise lift
+the eye back out of the corpse over 400 ms.
+**`VEC_DEAD_VIEWHEIGHT` is 14, not 60** — the 60 is the *multiplayer* table,
+annotated "previously 14", and single-player Portal 2 overrides no view
+vectors. **The angle pin does not stick**, and that is Valve's:
+`CPlayerMove::FinishMove`'s `SetLocalAngles` line is commented out, so a dead
+Portal 2 player really can still turn the camera and what stops them looking
+at anything is the fade. And **`check_parameters` needs the *previous*
+command's angles**, captured at the top of `create_move` before
+`adjust_angles` has moved them — taking them at `run_move` time gives the
+current ones and the pin becomes a no-op you cannot see.
+
+**`client/tonemap.rs` landed alongside the five stages rather than inside them**
+(`portdocs/CLIENT_TONEMAP.md`, and it is `viewpostprocess.cpp`'s `CTonemapSystem`, not
+the input-and-view layer `portdocs/CLIENT.md` plans). It is the **policy** half of auto
+exposure — bucket boundaries, the percentile search, the moving average, the rate
+limiting and twelve `mat_*` cvars — and **it names no GPU type**, the way
+`materials/histogram.rs` names no cvar; the two meet only in `Engine::render`. The
+finding that decides the whole calibration is that **the histogram measures linear
+light, not gamma**: `dev/lumcompare.vmt` leaves `$LINEARREAD_BASETEXTURE` unset so
+`screenspace_general` reads the frame buffer through an sRGB sampler, and Valve's own
+comment at `IssueQuery` says the opposite and is stale — reading the boundaries as gamma
+puts the 65% target at 0.32 linear and halves every scene. Four more that produce a
+plausible wrong answer rather than an error: **the measurement is of an
+already-exposed frame**, so the result is a *correction* to the current scale and
+multiplying is what makes the loop converge rather than oscillate; **the moving-average
+weights are `|i - 5| / 5`**, so the oldest sample counts most and the middle one counts
+for nothing, which is absurd and is what every Source game has been smoothed with;
+**the step is capped per frame and not per second**, which makes adaptation frame-rate
+dependent above ~128 fps and renders `mat_accelerate_adjust_exposure_down` inert below
+it; and **`mat_dynamic_tonemapping 0` freezes the exposure where it is** rather than
+resetting it to 1. Deleted rather than deferred: `mat_tonemap_algorithm 0` (selected by
+a game-directory match against `{dod, cstrike, lostcoast}`, so unreachable),
+`SetOverrideTonemapScale`, and `DisplayHistogram`'s 200-line bar chart — the `tonemap`
+console command prints the same numbers. **`env_tonemap_controller` was its one
+measured gap and `server/` stage 2 closed it**: the thirteen file-scope globals
+`GetTonemapSettingsFromEnvTonemapController` writes became
+`client::tonemap::TonemapSettings`, which the server fills in and `Engine::render`
+hands over once a frame — 105 of Portal 2's 106 maps place a controller, and
+`sp_a1_intro1` now gets the ceiling of 1.5 it asks for. **One Valve bug deliberately
+not reproduced**: the no-controller fallback resets every custom flag *except*
+`g_bUseCustomAutoExposureMin`, so a custom minimum is sticky for the rest of the level;
+`TonemapSettings::default` resets all of them.
+
+---
+
+## Warts that were resolved, and what resolved them
+
+> Moved here from `CLAUDE.md`'s "Known warts" list, which is for *live*
+> compromises. These three are closed: they are kept because each records a
+> decision that would otherwise be re-litigated, and the last one records a real
+> divergence that the move fixed. The third is `console/`'s rather than this
+> module's and is kept with the other two because all three are the same story —
+> a thing living in the wrong module until the right one existed.
+
+**Resolved:** the **view angles and the free-fly camera** used to live in
+`src/engine/input/view.rs`, to be moved "to `client/` when it exists". `client/` stage 1
+is that, and the file is deleted rather than moved: `ViewAngles` is the client's,
+`MoveButtons` became `Buttons` with the fractional `KeyState` the wart said not to build
+against a camera, and `FlyCamera` became a `Player` in `MOVETYPE_NOCLIP` moved by
+`FullNoClipMove`. **The one placeholder that outlived it is also gone**: `+jump` and
+`+duck` used to drive the vertical axis, because `ComputeUpwardMove` reads
+`+moveup`/`+movedown` and Portal 2 binds neither, so without the hack a noclip player
+could not rise. Stage 4 made walking real, which makes jump and duck buttons; a noclip
+player now flies up the way the shipped game does it, by looking up and holding forward.
+`bind SPACE +moveup` brings the axis back.
+
+**Resolved:** **`noclip` used to be registered by the game client and it is a *server*
+command.** Move type is server state that gets networked down, so `ConCommand noclip`
+lives in `game/server/` in the original; with one process and no server it had to live
+somewhere, and `src/client/` was where the move type was. The condition this wart
+recorded was exact — "`portdocs/SERVER.md` stage 5, where the move type becomes the
+server's state rather than a field on `client::Player`" — and that is what happened.
+`Server::toggle_noclip` is the command, `PlayerState::move_type` carries the answer back
+*to* the client, and `Client::toggle_noclip` is deleted. `god`, `kill` and `hurtme` came
+with it, because they are its neighbours in `game/server/client.cpp`. The other half of
+the prediction — "where the movement itself moves" — deliberately did **not** happen; see
+`portdocs/SERVER.md` stage 5 for why.
+
+**Resolved:** `CommandLine` used to live in `src/launcher/` and be read from
+`src/engine/window/`, to be moved "when a third subsystem needs it". `console/` was that
+third subsystem — `stuffcmds` and the `+<cvar>` default seeding both read it — so it now
+lives at `src/cmdline.rs`. The move also fixed a real divergence: `CCommandLine::ParmValue`
+refuses a value beginning with `-` or `+` (`tier0/commandline.cpp:646`) and the port's
+`value()` did not, which would have had `-window` swallow `+map`.

@@ -3342,3 +3342,458 @@ material — is a GPU test and lives with the material system:
 
 Anything touching `winit` or `wgpu` needs a display and a GPU, so the frame loop and the
 world draw are verified by running the binary — see [Quick start](#quick-start).
+
+---
+
+## What has landed, and what each stage found
+
+> Moved here from `CLAUDE.md`, which had grown to 2,126 lines by accumulating a
+> paragraph per landed stage. This is the narrative history of the module: what
+> was ported, in what order, what it cost and what the measurements said.
+> `CLAUDE.md` keeps a one-line summary and points here. **The invariants and
+> gotchas above are the normative part of this document**; this section is the
+> record of how they were arrived at.
+
+**`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
+lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5), `input/` (stages 1-4
+of 5), and `console/` (all five stages, complete)**
+(`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
+Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
+its own module, 14 surviving, ~45,700 lines deleted outright.
+`host/` is `CHostState`'s state machine (eight states become five, keeping the
+invariant that every path to a new level goes *through* `GameShutdown`) plus
+`FilterTime`'s policy; it depends on `std` alone, because loading a level is a `Level`
+trait, and is tested without a GPU. **`CEngine`'s outer `m_nDLLState`/`m_nQuitting`
+machine is deleted** — quit-vs-restart is a return value that reaches the launcher as
+`window::RunOutcome`. `world/` reads the `.bsp` lumps the renderer walks, packs each
+surface's baked light into the material system's lightmap atlas, and groups faces into
+per-(material, page) batches at load — which is exactly what Valve's *sort ID* was.
+**`World::draw` is now three calls and not one**: `draw` records the opaque scene,
+`draw_refracting` records the geometry whose material samples a copy of it, with
+`RenderContext::update_refract_texture` between them and the first pass *ended* — a
+render pass cannot read its own attachment — and `draw_translucent` records everything
+blended, last and back to front. `needs_frame_buffer_copy` says whether the second pass
+is needed at all, and 71 of the game's 106 maps say yes; `translucent_list(..).is_empty()`
+says the same about the third, which matters for the same reason — every GPU this port
+runs on is tile-based, so an empty pass is a full tile load and store for nothing.
+`engine::world::GeometryPass` is the three-way decision and **refracting wins over
+translucent** when a material is both; nothing in Portal 2 is.
+The list is `CClientLeafSystem::SortEntities`' key —
+`dot( center - eye, forward )`, ascending — walked in reverse, which is
+`DrawTranslucentRenderables` counting down from the end of its array. What is *not*
+ported is the leaf walk it interleaves with: Valve draws each leaf's translucent world
+surfaces between the entities in it, and with no PVS there are no leaves, so world
+batches are sorted by box centre along with everything else. **A world batch is the
+whole map's worth of one material**, so that key is poor for them and the fix is the
+leaf walk rather than a finer sort. Measured on `sp_a1_intro1`: **36 translucent
+draws**, 4 of 79 world batches, 0 of 31 brush-model batches and 32 of 1,080 props.
+The refracting split is per
+*batch* rather than per prop, which diverges from Valve on purpose: 60 of the 66 models
+in the game that wear a refracting material also wear an opaque one, and without a
+translucency sort the opaque half belongs in the opaque pass.
+**Brush entities draw**, which closed the one place this port had collision ahead of
+rendering: model 0 is the world and models 1.. are the doors, panels and platforms, each
+built by the *same* face-grouping and lightmap-packing path and drawn with the entity's
+matrix in place of the identity (`R_DrawBrushModel`). Three measurements made that
+small: a brush model's faces are in its own frame like a static prop's (4,088 of 4,309
+displaced models match their model box exactly, **none** matches it offset); the
+existing `SURF_*` filter is the whole of the visibility question, so every `trigger_*`
+class drops out with no per-classname rule (11,635 brush entities in the game, 2,697
+with a drawable face — `trigger_portal_cleanser` keeps its, because a fizzler really is
+visible); and where a brush model *is* comes from the entity, never from
+`Model::origin`. **The transform is `BrushModel::model_to_world` and is not cached**, so
+what is drawn and what `trace_model` collides with cannot drift apart — and **the
+placement is live now**: `World::sync_brush_models` takes it from the game server once a
+frame, keyed by the `"*N"` model index, which is why doors open. **The render modes are
+all honoured now**, since the blended pass landed:
+`PlacedBrushModel::modulation` is `GetColorModulation` plus
+`ComputeRenderAlpha`, and an alpha below 1 sends the entity's whole geometry to
+`World::draw_translucent`. Measured, and **correcting a number this file used to give
+as five**: of the game's 11,635 brush entities, 11,538 are `kRenderNormal`, 94 are
+`kRenderNone` and **three** set a translucent mode — one in `mp_coop_teambts` at
+`rendermode 1 renderamt 200` and two in `sp_a3_00` at `rendermode 5 renderamt 10`. No
+brush entity sets a *glow* mode, which is the only one that would need more than four
+numbers. `rendermode 10` is honoured for the separate reason that it
+is the one mode `C_BaseEntity::ShouldDraw` refuses — 94 entities; and `StartDisabled`
+**is** honoured for `func_brush`, which is the class whose `Spawn` reads it — 337 of
+the game's 2,502 start invisible and non-solid, where before `server/` stage 3 all of
+them drew.
+**Materials are resolved before the geometry**, because a surface's vertex layout comes
+from its shader and how wide a lightmap block it reserves comes from whether its
+material has a `$bumpmap`; neither is answerable from the `.bsp`. The **`winit` control-flow inversion is
+resolved**: `FilterTime` split into policy (`host::FrameClock`) and mechanism
+(`window`'s `ControlFlow::WaitUntil`), and neither half may sleep.
+`input/` is stages 1-4 of `portdocs/ENGINE_INPUT.md`'s five: `Button`'s flat dense
+space with Valve's shipped key names, an event queue **pushed between ticks and
+drained once per tick** inside `Engine::frame`, bindings, and UI precedence. **The
+movement layer that lived here as a placeholder is gone** — `input::view` is deleted and
+its contents are `src/client/`'s. It names no `winit` type, no `egui` type and no client
+type —
+`window/` translates, `input/` decides — so it is tested without a window, which is
+also what leaves room for `gilrs` at stage 5. **Stage 4 is `FilterKey`'s key-up latch**
+(`keys.cpp:1189`): the target that consumed a *press* is recorded per button and the
+matching *release* goes there and nowhere else, whoever wants it by then. That is a
+correctness fix rather than polish — without it, clicking and then opening the console
+leaves `+attack` held forever, which is what every stuck-key bug in a Source-like
+engine is. `console/` stage 4 is the `egui` dialog it pairs with: `Console::complete`
+is `RebuildCompletionList` (a question about the registry, not about a widget) and
+`ConsoleUi` is the dialog, naming `egui` and nothing else, so it is unit-tested against
+a headless `egui::Context` with no window and no GPU. **`console/` stage 5 finishes the
+module**: the six list commands, all built-ins because they need the registry and the
+log and nothing else, plus `console/describe.rs` — the one implementation of
+`ConVar_PrintDescription`, replacing the shortened copy stage 1 had inlined and
+collapsing the *three* tables the C++ spells the same six flags in. One rule there
+produces a plausible wrong answer rather than an error: **`Cvar::string` is stale for an
+`FCVAR_NEVER_AS_STRING` cvar**, so anything comparing or displaying a value goes through
+`describe::value`/`describe::is_at_default` — otherwise `differences` reports every such
+cvar as unchanged for ever.
+`trace/` is stages 1-3 of `portdocs/ENGINE_TRACE.md`: `CM_BoxTrace` and everything under
+it — the recursive hull check, the brush clip, box brushes, the position test,
+`point_contents` and the leaf lookup — over six new collision lumps read by the
+*existing* `bsp.rs` rather than by a second reader, which is a duplication Valve only had
+because collision could not see `modelloader.cpp`'s allocations. **Stage 2 adds brush
+models** — `CM_TransformedBoxTrace`, which is the whole of `ClipRayToBSP`: the ray moves
+into the model's frame, the ordinary sweep runs against the model's *own* head node, and
+the normal turns back out. Doors, platforms and the moving parts of a test chamber are
+now solid, `world/` draws them, and since `server/` stage 3 **they move** — the
+placement is `BrushModel::set_placement`, written once a frame from the entity.
+Where a brush model *is* does not come from the model lump (`Model::origin`
+is "for sounds and lights, not a render transform") but from the entity that names it as
+`"*N"`, so `World::brush_models` resolves the entity lump at load — **placements, not
+policy**: triggers are carried too, because a trigger's brushes are `CONTENTS_SOLID` in
+the file and what makes them non-solid is `FSOLID_TRIGGER`, set by a game DLL that does
+not exist. Measured on the depot: **106 maps place 11,635 brush models, 5,115 of them
+rotated** — the rotated path is 44% of them and not a corner case — and `sp_a1_intro1`
+has 78. **Stage 3 is displacements, and terrain is now solid**: `CDispCollTree` and the
+parts of `builddisp.cpp` that turn a `ddispinfo_t` into geometry, plus the per-leaf
+displacement lists, `CM_TraceToDispList`, the box-versus-triangle position test and the
+stab. Three more lumps in the *same* `bsp.rs`, and a `Trace::disp_flags` carrying VBSP's
+per-triangle `DISPSURF_*` tags — a non-zero value is `IsDispSurface()`, and
+`disp_surf::WALKABLE` is VBSP's compile-time verdict rather than `CategorizePosition`'s
+runtime one. Measured: **1,181 displacements across 29 of Portal 2's 106 maps, all
+1,181 built**, 904 at power 2 / 202 at 3 / 75 at 4, over 14,190 leaf references;
+building `sp_a3_end`'s 201 costs 1-3 ms and a ground probe on it 0.2 µs.
+**`parry` was reconsidered here, as `ENGINE_TRACE.md` §5.5 said to, and declined** —
+of `CDispCollTree`'s 1,565 lines about 120 are the tree walk a `Qbvh` would replace and
+the rest is displacement semantics. Entities and props are stages 4-5.
+`spatialpartition.cpp` is not ported and will not be — `parry`'s `Qbvh` replaces it when
+entities land, and `rapier` replaces `vphysics/`; `ENGINE_TRACE.md` §5 is the full
+evaluation of where those two crates do and do not fit, and the world brush trace is one
+of the places they do not. Three rules there produce a plausible wrong answer rather than
+an error: **`Ray`'s start is the centre of the box and `Trace`'s is not** — 36 units
+apart for a player, so conflating them floats them a hull-height up; **`fraction` stops
+`DIST_EPSILON`, 1/32 unit, short of the surface on purpose**, and stair stepping, ground
+probes and `TryPlayerMove`'s clip-and-retry are all written around that gap; and **a
+leaf's `contents` describes its own volume, not the OR of its brush list**, so an empty
+leaf beside a wall has contents 0 — reading it the other way makes every position test in
+open air report `all_solid`. Stage 2 adds three more: **`trace` and `trace_model` are
+separate questions and neither includes the other**, so a door is invisible to a world
+trace and combining them is the caller's job until stage 4; **a brush model's `normal`
+comes back in world space and its `plane_dist` does not**, which is Valve's asymmetry and
+is pinned by a test so nobody "fixes" it; and **the swept box is not rotated into the
+model's frame**, so the obvious symmetry test — turn the model and the query together,
+expect the answer to turn — holds for a ray and not for a hull.
+Stage 3 adds four, and the first two are the ones that make terrain terrain:
+**every displacement test is one-sided** — a query travelling along the triangle's
+normal is rejected, so walk under a hillside and nothing stops you coming back out
+through it — and the normal is `(v2 - v0) × (v1 - v0)` over a base quad whose own is
+`(p3 - p0) × (p1 - p0)`, both the reverse of the obvious order and both pointing *out*
+of the solid; **a ray stops *on* a displacement and `DIST_EPSILON` short of a brush**,
+because the displacement ray path has no epsilon pullback (a hull sweep stops short of
+both); **a *point* inside terrain is reported as not solid**, because the box-versus-
+triangle test is what decides "inside" and the stab, which is all that is left for a
+point, fires along the one direction nothing can be hit in — Valve's, pinned by a test;
+and **two switches hidden in `ddispinfo_t::minTess` take a patch out of half the
+queries**, which 51 of Portal 2's use for hulls and 44 for rays.
+**The module's one deliberate divergence is also stage 3's:** Valve writes
+`dispFlags` in two places and clears it in none, so a brush that beats a displacement
+keeps the displacement's flags and `IsDispSurface()` calls a wall terrain — 45 of 2,362
+depot traces. This port clears them where `m_bDispHit` is cleared; `rustdocs/ENGINE.md`
+gotcha 17 names the two lines to delete to get Valve's behaviour back.
+**Stage 4 is the clip chain, and it landed with `server/` stage 4**:
+`Tracer::trace` is `CEngineTrace::TraceRay` now — the world, then every brush
+model a `Tracer::with_entities` was handed, nearest wins, fractions rescaled
+onto the original ray — so a shut door is a wall and, because a trigger is
+`FSOLID_NOT_SOLID`, a trigger is not. Two things the plan asked for turned out
+not to be needed: **the trace filter**, because the candidates arrive as a list
+the caller assembles and `ITraceFilter`'s decision has therefore already been
+made one step earlier; and **the broadphase**, because a map has a few hundred
+brush entities (78 on `sp_a1_intro1`) and each is rejected by the
+bounding-box test at the top of its own BSP descent. What *is* the whole
+difficulty is **which entities are in the chain**: the game's 11,635 brush
+entities include 2,383 `func_portal_bumper`s you walk straight through and
+this port has classes for 6,302 of them, so `World::clip_models` requires
+`PlacedBrushModel::owned` **and** `solid` and a model the game has not
+answered for is left *out* rather than assumed in. Defaulting the other way
+fills every chamber with invisible walls, silently.
+Not implemented: simulation, visibility, the skybox, dynamic lights and
+lightstyle animation. **The static world lights are** — `world/light.rs`,
+below. Brush entities are solid, drawn, **moved and collided
+with**. **Displacements are solid and drawn** —
+`world/disp/` has landed, below.
+**`world/disp/` is the rendering half of `trace/` stage 3's lumps, and terrain now
+draws** (`portdocs/ENGINE_WORLD_DISP.md`, `rustdocs/ENGINE.md`). ~9,100 lines of C++
+across `engine/disp*.cpp`, `public/builddisp.cpp`, `disp_powerinfo.cpp` and
+`disp_tesselate.h`; about 350 have a counterpart, because the LOD tree, decals,
+neighbour stitching and `SetupAllowedVerts` all delete — the last because `vbsp` already
+wrote its answer into the lump. **There is no separate terrain draw path**: a
+displacement is selected, materialed, lightmapped, batched by `(material, page)` and
+split at 65,536 vertices by the *same* pipeline an ordinary face is, and the only
+difference is that `build_page_meshes` asks the patch for its grid instead of fanning the
+face's winding. That is also Valve's `DispInfo_CreateMaterialGroups`. Measured rather
+than assumed: **all 1,181 shipped displacements are in model 0**, so brush entities need
+no change, and all 1,181 have a four-cornered base face.
+Four rules here produce a plausible wrong picture rather than an error. **Texture
+coordinates are bilinear over the base face's four *flat* corners**, not the projection
+evaluated at the displaced position — the two agree on a flat patch and diverge with the
+displacement, so the wrong one looks right until you stand next to a cliff. **Lightmap
+coordinates are not the base face's at all**: `vrad` bakes against the *grid*, so
+`BuildDispSurfInit` computes the face's luxel corners and then overwrites them with a
+canonical square, collapsing to `(0.5 + w·j/n, 0.5 + h·i/n)` where `w`,`h` are the
+*extents* and not the block size. **The render tessellation is not the collision one** —
+it is a quadtree walk that skips any vertex `vbsp` disallowed, which is what stops a
+power-4 patch cracking against a power-2 neighbour (100 of the 1,181, and **none in
+`sp_a1_intro1`**, so only the depot test reaches it) — and yet for a patch with nothing
+disallowed the two coincide **exactly**, which is the unit test that makes the walk
+checkable at all. And **terrain triangles are reversed like every other piece of
+Valve-authored geometry**; this port's own portdoc argued they should not be, and the
+depot test caught it on its first run. That anchor is worth copying: the sum of a
+patch's rendered triangle normals must agree in sign with the *rendered* normal of the
+base face it was carved from — 1,181 of 1,181 agree, 1,181 of 1,181 disagree without the
+reversal, and it is taken per patch rather than per triangle because 131 of 92,622
+individual triangles genuinely overhang.
+**`WorldVertexTransition` landed with it, and it is `LightmappedGeneric`.** 937 of the
+game's 1,181 displacement faces name it — including all 11 of `sp_a1_intro1`'s — so
+without it this module's output was eleven magenta checkerboards.
+`worldvertextransition.cpp` forwards to `DrawLightmappedGeneric_DX9` and nothing else, so
+the WGSL, the vertex layout, the lighting binding and the bind group layout are shared;
+only `name()` and the parameter table differ. Measured: **zero** non-displacement faces
+in the game name it. What it added to the shader is `$basetexture2` blended by the vertex
+alpha, `$blendmodulatetexture`, `$bumpmap2` — and **`$ssbump`, which was a live bug in
+the world path all along**: a self-shadowed bump map is three positive coefficients, not
+a signed normal, so both the `2t-1` decode and the `saturate(dot(n,basis))²` weighting
+are wrong for it, and **128,139 of Portal 2's 288,250 drawable world faces** wear one.
+Deferred and measured: `$seamless_scale` (553 displacement faces, all in `sp_a3_*`, none
+in `sp_a1_intro1`) and `$envmap` — which are now **the** reason `LightmappedGeneric` will
+eventually need a second vertex layout, since both want a world-space normal that a
+`WorldVertex` does not carry. `MATERIALSYSTEM.md` §10 expected bumpedness to force that
+and it did not.
+A gap closed on the way past: **nothing in `cargo test` had ever compiled
+`lightmappedgeneric.wgsl`**, because `preview.rs`'s GPU tests draw `UnlitGeneric` and
+`VertexLitGeneric` only. `materials::pipeline`'s
+`every_shader_compiles_and_builds_a_pipeline` now builds a real pipeline for every
+`ShaderKind`, which also checks the thing a WGSL author gets wrong most often — that the
+bind group layout and the `@group`/`@binding` declarations agree.
+**`world/light.rs` is the light cache, and with it every model in a level is lit the
+way the shipped game lights it.** `engine/lightcache.cpp`'s static half —
+`LightcacheGetStatic` and everything under it — plus the
+`dworldlight_t`-to-hardware-light conversion out of `engine/l_studio.cpp`. It absorbed
+`props/light.rs`, which held the ambient-cube half and was in the wrong directory once
+entity models started using it too. `bsp.rs` reads `LUMP_WORLDLIGHTS_HDR` (version 1 on
+all 106 maps, so version 0 is refused rather than widened) and the module does the
+selection: the grid-cell cull, the falloff, the angular term, **one trace per light**,
+the `MIN( MaxNumLights(), r_worldlights )` slots and the fold-the-rest-into-the-cube
+step. Measured: **14,246 world lights across the game, 7,302 surviving the load-time
+filters, and 1.4 s to light all 56,955 static props** — 13 ms a map, against 0.25 s for
+`sp_a1_intro1`'s collision model, which is why `FastRejectLightSource`'s PVS test is
+left out. The frame cost did not move; all of this is load-time.
+**The finding that mattered most was not about lights at all: the two lighting terms
+do not add together.** `StudioSetupLighting` asks `LightcacheGetStatic` *without*
+`LIGHTCACHEFLAGS_STATIC` for a prop that wears `vrad`'s per-vertex bake, so that prop's
+ambient cube and local lights come back **zeroed** and the bake is everything; a prop
+that is bumped or phong is lit per pixel, never has its `.vhv` opened at all, and gets
+the cache instead. This port had been adding the leaf ambient cube on top of the bake
+since `studio/` stage 5, which double-counts a prop's indirect light. The predicate is
+`STUDIOHDR_FLAGS_USES_BUMPMAPPING` — `$bumpmap`, **or `$phong` non-zero on its own**,
+which is a wider net than `WantsPhongShader` casts — and it now lives on
+`Material::uses_bumpmapping`. On `sp_a1_intro1`: **816 baked, 246 per-pixel, 18 with no
+file at all**, where before all 1,062 with a file took both.
+Three more rules produce a plausible wrong picture rather than an error, and the first
+decides whether half the lights in Portal 2 are counted twice.
+**The ambient cube this port uses is not the one a static prop gets.** Valve gathers a
+static prop's by firing 162 rays at the lightmaps and everything else's from `vrad`'s
+baked leaf cubes — and the two carry the same energy by different routes, because
+`vrad`'s cube already contains the dim `emit_surface` lights and the runtime gather does
+not. That is `bAddedLeafAmbientCube`, and it is what `AddStaticLighting`'s first
+`continue` reads. This port uses the leaf cube for everything, so the flag is *true*
+here and the `DWL_FLAGS_INAMBIENTCUBE` lights are dropped at load: **6,731 of the
+14,246**.
+**`1 / (thetaDot - phiDot)` is 1 when the two cone cosines are equal, not 0** — "hard
+falloff instead of divide by zero". `WorldLightToMaterialLight` turns every
+`emit_surface` light, 7,073 of the game's 14,246, into a 180-degree spotlight with both
+cosines 0, and the shader reads a 0 there as "this light is off". `uniforms::Light::spot`
+had the other answer and no callers; it has Valve's now.
+And **`r_worldlights` is 2 because this port is POSIX** — the tree offers 4 as designed,
+3 "Changed from 4 to 3 for L4D!", and 2 under `#ifdef POSIX` with "JasonM GL - capping
+at 2 world lights at the moment". It is the least certain constant in the module, it
+binds almost everywhere (**44,421 of the game's 56,955 props fill both slots**), and
+raising it is one edit because everything downstream already carries four. What it buys
+is directionality rather than brightness: a light that misses a slot is folded into the
+ambient cube rather than discarded.
+**One `egui` rule that produces a plausible wrong behavior rather than an error:** the
+key bound to `toggleconsole` is never shown to `egui` at all, on either edge
+(`keys.cpp:1319`'s `KEY_BACKQUOTE` bypass). Drop it and the key that opens the console
+cannot close it, and types a backquote into the entry on the way.
+**The one divergence that will bite:** world triangles are emitted with their **winding
+reversed**, because Valve's `D3DCULL_CCW` and this port's `front_face: Ccw` read
+identically and are not the same thing (GL's framebuffer is Y-up, WebGPU's is Y-down,
+and facing is decided after the flip). In file order a map draws as an empty clear
+colour. `rustdocs/ENGINE.md` gotcha #1 has the evidence and the open question about
+fixing it in `PipelineCache` instead.
+
+### Frame cost, measured
+
+**Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
+`--ignored`) loads a real map, records real passes against a real device with no window in
+the way, and times the CPU. **`engine::exposure` is its sibling** — same shape, same
+gating — and answers the other headless question: where the exposure settles on a real map
+and what the histogram looks like when it gets there. On `sp_a1_intro1` at 1280x720 the
+two passes the tone mapper added cost **0.004 ms of CPU a frame** against 0.64 ms for the
+scene draw they sit around — read as a ratio rather than as absolutes, because both move
+together with thermal state (an earlier run read 0.008 against 1.21). Reach for it before and after any change to the draw path —
+the running game cannot be profiled from outside, because macOS stops delivering redraws
+to an occluded window and `sample` only ever shows a main thread parked in `mach_msg`.
+`sp_a1_intro1` records a whole frame in **1.86 ms** (release, 2.14 with the refracting
+pass) / 6.6 ms (debug); it was 12.7 ms when static props first drew, and
+`portdocs/STUDIO.md` §11.8 has what the three causes were. Terrain did not move that
+number: it added 2 batches and 1,408 triangles to a frame whose cost is 1,080 prop draws.
+**`Refract` did move it, and it is the copy rather than the draw** — one full-screen
+`copy_texture_to_texture` and one extra pass recording a single prop, which is why
+`needs_frame_buffer_copy` gates both and 35 of the game's 106 maps pay neither.
+**`prop_dynamic` moved it more than anything since static props**: the five
+sub-benchmarks are now 0.25 ms of world brushes, 0.10 of brush models, 1.01 of static
+props and **0.72 of entity models**, so the class costs about 60% of what all 1,080
+static props do — for 91 instances, because they carry **355,469 triangles against the
+props' 224,924** and each bone run is its own draw.
+**`prop_testchamber_door` barely moved it**, and the exact numbers are the ones to
+quote rather than the timings: 91 instances became 93, 52 models 54, and 355,469
+triangles **361,072** — one more model and ten more draws, because a door is five bone
+runs and there are two of them. The timed share of the entity-model pass against the
+static-prop pass went from 0.71 to 0.76 in a back-to-back run where every figure was
+about 3x high, which is the thermal inflation the note below is about.
+**The translucent pass is the sixth sub-benchmark and the cheapest so far.** On
+`sp_a1_intro1` it is **39 draws for 0.22 ms** — the 36 above plus the three its entity
+models add, which `World::load` alone does not see — against 2.74 ms for `everything`
+in the same back-to-back (thermally inflated) run — about 8% — and most of that 0.22 is
+the pass itself rather than the draws: the 31-batch `brush models` line reads 0.19 ms in
+the same run. It costs about 3x per draw what the batched passes do, which is what a
+back-to-front sort *is*: one draw per instance instead of one per batch, and Valve pays
+it too.
+**The benchmark itself had to be fixed to see that**, and the fix is worth knowing about:
+`World::load` cannot read the models an entity places, because they are named by the
+entity lump it has just parsed — so `bench` now spawns a `Server` and calls
+`load_entity_models`, the same two calls `Level::load` makes. Before that it was silently
+measuring a frame with the largest thing in it missing.
+Run the six sub-benchmarks on their own — back to back they share thermal
+state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
+**uniform writes are staged and flushed once per pass, not queued per draw**, and
+**redundant pipeline and bind-group state is elided** — the correctness hazard for the
+second is A/B/A, not A/B.
+
+### What the binary does, and what `sp_a1_intro1` draws
+
+> Moved here from `CLAUDE.md`. The first half is the running history of what the
+> binary became, stage by stage; the second is the standing census of the default
+> map — the numbers to re-measure after a change to the draw path or the entity
+> list, and the three materials that still do not resolve.
+
+There is a unit test suite (`cargo test`, 971 tests), and the binary now **runs, loads a
+map, lets you fly around it and has a working developer console**: it mounts the game
+filesystem, opens a window, runs an
+engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
+`cfg/valve.rc` and boots through them**, reads a Portal 2 `.bsp`, packs its baked lightmaps into an atlas,
+draws its world geometry **lit**, moves the view with WASD and the mouse, and drops an
+`egui` console over the top of it on `` ` `` — scrollback, history, tab completion, the
+list commands (`cvarlist`, `help`, `find`, `differences`, `toggle`, `incrementvar`), the
+entity commands (`report_entities`, `ent_dump`, `ent_fire`, `dumpeventqueue`), and
+every cvar and command the port has registered. **There is now a player who walks.** A real one, in
+`MOVETYPE_WALK`, built from a `CUserCmd` and moved by `FullWalkMove`: it falls under
+gravity, stands on the floor, is stopped by walls and slides along them, climbs stairs
+under `sv_stepsize`, jumps 45 units, and crouches under things it does not fit past.
+`noclip` still flies. **The map's entity logic now runs**: entities spawn, fire outputs
+at each other through one event queue and think on a fixed 64 Hz server tick, so a map
+bootstraps itself the way the shipped game does — **and the brush entities move**, so
+doors open and shut, panels slide, buttons press in and come back out and fans spin up.
+**And the map notices you.** Triggers fire when you walk into them, filters
+decide who counts, `trigger_push` blows you across a room, `trigger_teleport`
+and `point_teleport` move you, and **doors are walls** — brush entities are in
+the player's clip chain now, so a shut door stops you and a trigger does not.
+**Standing on a floor button presses it** — and **you can see it happen**: the
+button's model draws and its plate animates down under you, which is the first
+studio *animation* and the first entity-placed model in the port.
+**And the map can kill you.** The player has health, a `trigger_hurt` takes it
+away at the rate the map asked for, and at zero the body drops, the camera
+falls to fourteen units off the floor, and three seconds later the level starts
+again — which is what single-player Portal 2 does, minus the save.
+**And the map is furnished**: `prop_dynamic` is 8,462 entities across 105 of
+the game's 106 maps — the second commonest classname in Portal 2 — so the
+signs, pipes, panel arms and machinery a chamber is built out of now draw,
+and they *animate*, on the sequence the map names and for as long as the map
+says.
+**And the chamber doors open, and shut behind you.**
+`prop_testchamber_door` is 138 entities
+across 71 maps, two of them on `sp_a1_intro1`: the big round door draws,
+its two rings spin and then its two halves part, and 130 of the 138 are
+driven by a chain — `trigger_once` → `func_instance_io_proxy` →
+`logic_relay` → the door — that is now ported end to end, so walking into
+a chamber opens its door. The way *back* out runs through
+`logic_branch_listener` (158 across 46 maps), an AND gate over a pair of
+`logic_branch`es that says "the map wants this shut" and "the player is
+not in the doorway" — so the door waits for you to be clear of it and
+then closes.
+**And there are portals in it — as ovals.** `prop_portal` is 21 entities across
+10 maps, **two of them on `sp_a1_intro1`**, and they now spawn, link to their
+partner by group and size, compute the transform that will one day teleport you,
+and draw the coloured oval the shipped game draws — through a real port of
+`PortalRefract`'s `$Stage 2`, noise, gradient strip, opening animation and all.
+A `portal` console command places and links a pair wherever you are looking,
+because 21 scripted portals is not enough to develop against.
+**There is no hole**: that is `portdocs/PORTAL.md` stage 3, and until it lands
+you walk into the wall and stop.
+It is **still not a runnable game** — no sound, no netcode, no weapon, and
+a door moves *through* the player rather than shoving it (a chamber door is
+walked through for the same reason) — but the boot path is
+continuous from `main` to a rendered, lit, self-starting level you can walk
+around, interact with and die in.
+
+**`sp_a1_intro1` draws lit**: 5,523 of 5,638 world faces, 73 of its 76 materials
+resolving, 4,857 surfaces with real baked lighting over 13 atlas pages, and **1,080 static
+props from 136 models** on top of that. **Its terrain draws too** — 11 displacements,
+1,408 triangles — which is the last of the big absences in the level shell. The `maps/<map>/…` cubemap patches that used to draw as the magenta error checkerboard
+now resolve, because the `.bsp`'s embedded pak lump is mounted (`portdocs/STUDIO.md`
+stage 4); 3 of its 76 world materials still do not. Two name shaders this port has not
+ported — `SolidEnergy` (the fizzler field) and `Black` (`tools/toolsblack_noportal_skybox`)
+— and the third is a **missing file**: `models/props_trainstation/trainstation_clock_glass001`,
+which exists in none of `portal2`, `portal2_dlc1` or `portal2_dlc2`, so the map ships a
+dangling reference. (An earlier draft of this file named `Refract` as the third. That was
+wrong: nothing in the map's world materials names it. `Refract` *is* in the map, on three
+static props, and it is ported now — so the container's observation window and its two
+light covers refract instead of drawing as checkerboards, and that window is why the map
+takes the second, frame-buffer-copy pass.) **26 of its 78 brush
+entities draw too**, on top of the world: doors, panels and fizzlers, 148 faces and 308
+triangles, each under the placement its entity gives it — and since `prop_dynamic`
+landed, **so do 90 entity-placed models from 52 more `.mdl`s**, which is the furniture
+the map is made of rather than the shell it sits in.
+**Every model in it is lit the way the shipped game lights it**, now that the light
+cache has its local half: **39 of the map's 43 world lights** reach props through
+`AddStaticLighting`, and the 246 props whose materials are bumped or phong are lit per
+pixel by them instead of by `vrad`'s per-vertex bake — which is what gives a phong prop a
+specular highlight at all.
+**The scene is auto-exposed**: it is drawn into an
+offscreen target, a compute pass bins its pixels by luminance, and a port of
+`CTonemapSystem` picks the scalar the lit shaders multiply by — `tonemap` in the console
+reports what it is doing. **The map's own exposure limits apply too**, now that entities run: 105 of the game's
+106 maps place an `env_tonemap_controller`, and `sp_a1_intro1` asks for — and gets — a
+ceiling of 1.5 where the cvar default is 2.
+The view is the **player's eye**: WASD to walk, space to jump, left control to
+crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor**.
+`noclip` toggles a real `MOVETYPE_NOCLIP` rather than a camera pretending to be one — so
+**it has momentum**, because `sv_noclipaccelerate` is 5 and not 0; set
+`sv_noclipaccelerate 0` for an instant stop, and fly up by looking up, because Portal 2
+binds no key to `+moveup`. `trace` in the console reports what is under and in front of
+the player.
+
+`portal 1` and `portal 2` put a blue and an orange oval on whatever you are looking at,
+and `portal off` fizzles every portal in the map. Placing both links them. It is the
+portal gun minus the gun and minus every placement rule, so nothing refuses a surface and
+nothing stops the two ending up in the same place.

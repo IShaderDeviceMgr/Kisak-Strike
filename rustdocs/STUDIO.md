@@ -680,3 +680,92 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release -- --ignored --nocapture
   > entity placed was one floor button; now it is 91 instances and 355,469
   > triangles on the default map — more than all 1,080 static props — so a
   > stopwatch that skipped them would be measuring the wrong frame.
+
+---
+
+## What has landed, and what each stage found
+
+> Moved here from `CLAUDE.md`, which had grown to 2,126 lines by accumulating a
+> paragraph per landed stage. This is the narrative history of the module: what
+> was ported, in what order, what it cost and what the measurements said.
+> `CLAUDE.md` keeps a one-line summary and points here. **The invariants and
+> gotchas above are the normative part of this document**; this section is the
+> record of how they were arrived at.
+
+**`src/studio/` — stages 1-5 of `portdocs/STUDIO.md`'s six ported, plus animation**,
+and with them **static props draw, lit the way the shipped game lights them, and an
+entity's model animates**. `.mdl`/`.vvd`/`.dx90.vtx` become a `StudioModel`: one vertex
+buffer, one index buffer, per-material `Batch`es. The instances are
+`src/engine/world/props/` — the `sprp` game lump, `AngleMatrix` transforms, one upload
+per distinct model and one draw per instance, lit by `world/light.rs`'s light cache.
+`sp_a1_intro1` now draws **1,080 props from 136 models, 224,924 triangles** on top of
+the world's 14,546, **816 of them wearing `vrad`'s per-vertex bake and 246 lit per
+pixel by the world lights instead** (18 have neither and take the cache too). Stage 4
+also mounted the `.bsp`'s `LUMP_PAKFILE` as a search path, which is what the `.vhv`
+files live in and **which also fixed the 8 `maps/<map>/…` cubemap materials** that used
+to draw as checkerboards — one change, two subsystems, as predicted. Not done: LOD
+selection (stage 6) and `.phy` collision (that is `ENGINE_TRACE.md`'s). **`studio/anim.rs` landed later, with `prop_floor_button`** — bones,
+sequences and the RLE animation blocks, plus the `R_StudioSetupBones` slice that poses
+them; skinning is *replaced* by a per-bone draw split rather than deferred, which is
+exact for every model the port draws. See `src/server/`, below.
+**`prop_dynamic` measured two gaps in that half, and the larger one is now closed.**
+**`studio/include.rs` is `$includemodel`** — `CStudioHdr::ResolveIncludedModels` and
+the `virtualmodel_t` under it: 9 of the 606 models the game's props name keep their
+sequences in a companion `*_animation.mdl`, **926 entities wear one**, and until it
+landed those 926 stood in their bind pose. Valve keeps the included headers separate
+and hops through a per-group remap table on every access, because they are cache
+entries that can be evicted; a `StudioModel` is an owned value, so the merge happens
+**once, at load**, and `masterSeq`, `boneMap`, the attachment/pose/node tables and
+`CModelLookupContext` all delete. What does not delete is `masterBone`: an included
+animation's track names a bone of the *included* model, and the two skeletons are the
+same bones **in a different order** in eight of the nine — so a merge without the
+remap bends a panel arm at the wrong joint, which is a wrong picture and not an
+error. Measured on the running maps: of the 2,738 props playing a sequence two
+seconds into their level, the labels that resolve went from 1,666 to **2,556** and
+the ones that do not from 897 to **182** — and that remainder is Valve's own map
+errors rather than a gap. `portdocs/STUDIO.md` §12 has the anatomy; the rest of the
+measurements are there too, including the one that made it simple (**host and include
+bind poses agree to 4e-6**, so `boneMap` buys nothing) and the one that bounds it
+(**nothing nests**, and `STUDIO_OVERRIDE` is set on 0 of the game's 7,885 sequences).
+**`.ani` animation blocks are the binding constraint now**: the nine models name
+eight distinct companions (both panel arms share one) and only two are inline —
+`arm64x64_interior_animation`, all 1,350 of them, and `personality_sphere_animation`,
+313 of 318 — while the other six keep almost all of theirs in a companion `.ani`, so
+their labels resolve and their poses are empty. Every model but the two panel arms is
+one this port draws in its bind pose for want of skinning anyway, so skinning comes
+first and the arms are the whole visible payoff: **898 of the 926**.
+And **flex deltas stop being academic**: the 16 models the reader
+refuses are `models/props_destruction/toxin*`, 15 of them are placed as
+`prop_dynamic`s by **41 entities**, and those 41 draw nothing. The "absent from the
+data" claim below is about *static props* and is still exactly true; `prop_dynamic`
+is the first thing in the port that places a model that is not one. `CMDLCache`'s eviction, budgets and async queues are
+**deleted rather than deferred**, and so are skinning, flexes and sub-d — which are
+absent from the *data*: all 968 models Portal 2 places as static props have one bone,
+trilist strips and no flex deltas. **API: `rustdocs/STUDIO.md`** — read it before
+calling in, in particular for the gotchas that produce a plausible wrong picture rather
+than an error: **`sizeof(StaticPropLumpV9_t)` is 72 and not 69**, because Valve's prop
+structs are the only ones on this path not `#pragma pack(1)`, and at 69 every prop
+after the first drifts; **the ambient cube decodes with `ColorRGBExp32ToVector` and the
+lightmap with `TexLightToLinear`**, which is the *opposite* of `rustdocs/MATERIALS.md`'s
+rule and 255× either way (measured: 0.0249 against 0.0002 mean luminance on
+`sp_a1_intro1`); **a `QAngle` is pitch, yaw, roll** composed `Rz·Ry·Rx`, so props with
+only a yaw look right under any other reading and tilted ones do not; and **a leaf with
+zero ambient samples and a non-zero `first_sample` is a solid leaf whose `first_sample`
+is a *leaf* index**, which is what keeps a prop embedded in geometry lit.
+Two more gotchas arrived with stage 4, and the first is the worst in the module:
+**a `.vhv` is in *hardware* vertex order, not `.vvd` pool order** — Valve's runtime
+compacts a model's vertices per LOD and bakes against that numbering, this port does
+not compact, and reading the block as a run over the pool mislights 125 of
+`sp_a1_intro1`'s 1,080 props **while appearing to work for the other 955**
+(`HardwareMesh` carries the mapping); and **`vrad` writes no block for an empty mesh**,
+so a model's empty meshes must be dropped before the lists are matched. The `.vhv`
+checksum is **counted, not enforced**, because `r_ignoreStaticColorChecksum` defaults to
+1 and 24 of the game's 56,801 files need it to.
+Two verifications run against the real depot behind `KISAK_GAME_DIR` and `--ignored`:
+**2,017 of the 2,041 shipped models parse** (all 1,444 flagged `STATIC_PROP`; the 16
+refusals are animated flex-delta models and are correct), and **all 106 shipped maps
+place their props — 56,955 of them — with all 56,801 `.vhv` files describing the model
+they are for**. The first of those found two wrong `.vtx` field offsets that **every
+synthetic test had passed**, because the fixture had been written from the reader
+instead of from `optimize.h`; the second found the hardware-order rule.
+`portdocs/STUDIO.md` §11 has both.
