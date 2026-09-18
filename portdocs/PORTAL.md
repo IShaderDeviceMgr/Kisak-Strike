@@ -5,9 +5,14 @@ The portal itself: a pair of linked holes you can walk through. Scoped deliberat
 through a portal, with a coloured oval on it, and walking into it will put you out of
 the other one facing the right way.
 
-**Status: written before the port.** Nothing here has landed. Sizes and line numbers
-are from `legacy/`; every count of entities, models or materials is measured against
-the 106 shipped maps or the mounted game, not estimated.
+**Status: stages 1 and 2 of §10's five have landed.** The blended pass, then the class
+and its oval. Sizes and line numbers are from `legacy/`; every count of entities, models
+or materials is measured against the 106 shipped maps or the mounted game, not estimated.
+
+> **What stage 2 corrected in this document is recorded where it belongs** — §7.2's
+> "two ways to draw it" is settled in §10, and §12's four open questions are answered
+> there. The rest of §3–§9 was accurate; the notes marked **LANDED** below say which
+> parts of it are now code.
 
 This is the first module in the port that is Portal-specific rather than Source-generic,
 and the first that touches `trace/`, `client/`, `server/` and `materials/` in one piece
@@ -521,13 +526,15 @@ PortalRefract
 `portalstaticoverlay_2.vmt` is the same with `portal-orange-color`. Both colour textures
 are **1,669 bytes** — a tiny gradient strip — and the mask is a 256×256 noise blur.
 
-Two ways to draw it, and the cheap one is honest:
+Two ways to draw it, and **the first is what landed** (§10 stage 2):
 
 - **Port `PortalRefract`'s stage-2 branch** — `portal_refract.cpp` (99) +
   `portal_refract_helper.cpp` (284) + the two `.fxc` (422), minus the stage 0/1
   branches. Gets `$PortalOpenAmount`'s open animation for free.
-- **Substitute `UnlitGeneric`** with the mask as `$basetexture` and the colour texture
-  tinted in. Loses the open animation and the noise, keeps the oval.
+- ~~**Substitute `UnlitGeneric`** with the mask as `$basetexture` and the colour texture
+  tinted in. Loses the open animation and the noise, keeps the oval.~~ Declined: the
+  depot census counts materials *by shader*, so calling `portalstaticoverlay_1` an
+  `UnlitGeneric` would put an untrue number in it.
 
 The three proxies (`CurrentTime`, `PortalOpenAmount`, `PortalStatic`) are the material
 *proxy* system, which is entirely unported. `$time` can come from the scene clock;
@@ -680,12 +687,56 @@ which defaults to `sp_a3_00`.
 > `kRenderTransTexture` and 6 `kRenderTransColor`, and they are honoured now too because
 > `server/` already parsed all three keys.
 
-**Stage 2 — the class, drawn.** §3 and §7: `prop_portal` with `Activated`, `PortalTwo`,
-`LinkageGroupID`, the five inputs, the five outputs, the linkage group, the teleport
-matrix, `Solid::Obb`, and a stage-2 oval. Plus a `portal` console command that places and
-links a pair, because 21 scripted portals is not enough to develop against. **Outcome:**
-two coloured ovals on `sp_a1_intro1` that do nothing. The matrix is testable in isolation
-— a point transformed through a portal and back is itself.
+**Stage 2 — the class, drawn. LANDED.** `src/server/classes/portal.rs` is `CProp_Portal`
+and the placement half of `CPortal_Base2D`: `Activated`, `PortalTwo`, `LinkageGroupID`,
+`HalfWidth`/`HalfHeight`, the five inputs, the five outputs, the linkage group, the
+teleport matrix and `Solid::Obb`. `src/engine/world/portals.rs` is the oval.
+`src/materials/` gained `ShaderKind::PortalRefract` — a real port of
+`portal_refract_ps2x.fxc`'s `$Stage 2` branch, not an `UnlitGeneric` substitution — and
+with it `ContextBinding::PortalOverlay`, the port's first material *instance* parameter.
+The `portal` console command places and links a pair.
+
+**Outcome: two coloured ovals on `sp_a1_intro1` that do nothing**, exactly as predicted.
+
+Six decisions worth carrying forward:
+
+1. **`PortalRefract` was ported rather than substituted**, which §7.2 left open. The
+   deciding argument is the census: `every_shipped_material_of_a_ported_shader_builds_a_pipeline`
+   counts materials *by shader*, and calling `portalstaticoverlay_1` an `UnlitGeneric`
+   would put a number in that table that is not true. It cost ~250 lines of WGSL and one
+   new group-3 shape. The census now reads **2,952 of 3,555 materials in 58 pipelines**,
+   and `PortalRefract`'s five need **one** between them — the fewest of any shader,
+   because its render state is a literal.
+2. **Only `$Stage 2` resolves.** `ShaderKind::resolve` answers `None` for the stage-0 and
+   stage-1 materials, which are the see-through warp and the stencil punch and belong to
+   the recursive view. That is the only place in the census where a shader name the port
+   knows falls back to the error material, and it is deliberate.
+3. **§12's open questions are all answered.** (2) *Where does the carve live* — settled
+   by the seam that already exists: `PortalState` goes `server/` → `engine/` → `world/`
+   once a rendered frame, keyed by nothing, and stage 3's carve will take the same route
+   into `trace/`. (4) *One material or two* — **two**, because they differ only in a
+   1,669-byte gradient strip and `MaterialCache` is keyed by name; the instance parameter
+   that §12 predicted exists, and it carries the three numbers that genuinely change per
+   frame rather than a texture that never changes. (1) and (3) are stage 3's and untouched.
+4. **The linkage recursion collapses to one level.** `UpdatePortalLinkage` recurses in
+   three places and two of them do no work; the third — a deactivating portal handing its
+   partner on — is the only one that can find a third portal, and it is written out.
+   That matters because this module cannot recurse: `Server::dispatch` has lifted the
+   entity out of the list, so a partner is reachable as data and never as code.
+5. **`Context::find_all_of_class` replaces `s_PortalLinkageGroups[256]`.** A `static`
+   cannot hold per-`Server` state, the scan is in spawn order either way because
+   `AddToLinkageGroup` runs in `Spawn`, and the whole game has 21 portals with no map
+   holding more than four.
+6. **The placement snap was deleted and the deletion was measured.**
+   `CProp_Portal::ActivatePortal` re-traces and re-places a portal on activation; this
+   port activates one where the map put it. `every_shipped_portal_is_on_a_wall` runs
+   Valve's own trace against all 21 and classifies: **15 flush, 2 proud of their wall
+   (`sp_a1_intro1/portal_red_0` by 1.97 units and `sp_a1_intro4/section_2_portal_a1_rm3a`
+   by 3.50), and 4 floating** — and those four are exactly the `NewLocation` targets in
+   `sp_a4_finale1`/`2`, which the map parks in mid-air and moves from script. **Not one
+   of the 21 is more than 0.00 degrees off the surface behind it**, so the snap cannot
+   re-orient a shipped portal and the teleport matrix this port computes is the one the
+   shipped game computes.
 
 **Stage 3 — the hole.** §4: the AABB brush enumerator, the carve, the carved store, and
 `Tracer`'s substitutive path. **Outcome:** you can walk *into* the wall and stand in the
@@ -715,11 +766,13 @@ Both start off and are switched on by `SetActivatedState`. `portal_red_0` carrie
 only `prop_portal` output connection in the game —
 `OnPlayerTeleportFromMe → room_1_portal_deactivate_rl, Trigger`.
 
-Tests worth having, in the order they become possible:
+Tests worth having, in the order they become possible. **Five of the seven are
+written**; the two that are not are stage 3's.
 
 - **Unit, no map:** the teleport matrix round-trips — a point through the matrix and back
   through the inverse is itself, and a portal linked to a *copy of itself at the same
   place* transforms a point to its 180°-rotated self.
+  **`the_teleport_matrix_turns_a_point_around_the_exit`.**
 - **Unit, fixture map:** a carved wall. Build a box brush, carve a hole in it, sweep a
   hull through the middle (must pass) and through the rim (must stop). `trace::fixture`
   already builds brushes from planes, which is exactly the shape a carved piece has.
@@ -730,10 +783,25 @@ Tests worth having, in the order they become possible:
   exactly one linked pair in group 0 once every `SetActivatedState 1` in the map has
   been fired. Cheap — it is `Server::level_init` plus dispatch, the shape
   `every_shipped_map_spawns_its_entities` already has.
+  **`every_shipped_portal_spawns_and_its_map_can_link_a_pair`, and "exactly one pair" is
+  wrong**: `sp_a1_intro2` places *four* portals in group 0 and firing every
+  `SetActivatedState 1` in its lump at once — which the running map never does, because
+  they belong to different rooms — legitimately forms **two** pairs. What the test asserts
+  instead is the invariant: every linked portal's partner links back to it, the two are
+  opposite colours, no portal is claimed twice, and every linked portal has a non-identity
+  matrix. Measured: **21 portals across 10 maps, 17 switched on by their own logic, 6 maps
+  forming a pair.**
 - **Depot, `--ignored`:** for each of the 21, the portal's origin is within some small
   distance of a solid surface along `-forward` — i.e. every scripted portal really is on
   a wall, which is what makes the carve meaningful. `NewLocation`'s four targets are the
   interesting exceptions to check.
+  **`every_shipped_portal_is_on_a_wall`, and the four exceptions are exactly the four
+  predicted.** It runs Valve's own trace (one unit in front to eight behind) and
+  classifies: **15 flush, 2 proud of their wall, 4 floating** — the floating four being
+  `sp_a4_finale1`/`2`'s tractor-beam portals, which the map parks in mid-air and moves
+  from script, and which is also why neither map fires `SetActivatedState`. The assertion
+  with teeth is the **angle**: not one of the 21 is more than 0.00 degrees off the surface
+  behind it, so the deleted placement snap cannot re-orient a shipped portal.
 - **The one that says it works:** put the player in front of `sp_a1_intro1`'s
   `portal_blue_0`, activate both, walk forward for two seconds of ticks, and assert the
   origin is within the exit portal's forward half-space and the view angles have turned
@@ -741,6 +809,14 @@ Tests worth having, in the order they become possible:
 - **Rendered, headless:** the oval draws — the same shape as
   `the_button_draws_and_moves_as_it_presses`, comparing a portal-off frame with a
   portal-on one.
+  **`the_portal_overlay_draws_in_two_colours_and_opens`, and it needs no map**: what a
+  portal draws does not depend on where it is, so it mounts the game for the two materials
+  and places two portals by hand. It compares a *settled* oval with a *half-open* one
+  rather than on with off, which catches more: a zeroed group-3 block would draw the same
+  thing twice. Measured at 256x256: **19,039 pixels for the blue and 18,718 for the
+  orange, mean rgb (0.19 14.34 31.66) and (31.17 17.33 0.00)** — the colour assertion is
+  what says the 256x1 gradient strip is sampled on its one row — and ~24,700 pixels differ
+  between the two ends of the opening animation.
 
 ---
 
@@ -752,17 +828,23 @@ Tests worth having, in the order they become possible:
    teaching `box_trace` to skip brushes — but it costs a second full descent whenever
    the player is near a portal. Measure it before optimising; the environment box is
    small and `engine::world::bench` is the harness.
-2. **Where does the carve live?** The geometry is `trace/`'s, the *decision* to carve is
-   the game's, and `server/` names no engine collision type today. The `Placement` seam
-   (`server/` → `world/`, once a frame, keyed by model index) is the precedent, and a
-   portal is the same shape: the server says "a portal exists here, this size, this
-   angle", and `trace/` carves. Worth settling in stage 2, before stage 3 needs it.
+2. **Where does the carve live? SETTLED IN STAGE 2, and the seam already exists.**
+   `crate::server::PortalState` is "a portal exists here, this size, this angle,
+   this long open", `Engine::frame` copies it across once a rendered frame, and
+   `engine::world::portals::Portal` is the far side. Stage 3's carve takes the same route
+   into `trace/`: the server still names no engine collision type, and the engine still
+   names no server type. The one thing stage 3 adds to the seam is nothing at all — the
+   placement and the size are already there.
 3. **Does `linked_portal_door` come first?** It is 6 entities in 2 maps, but it is a
    permanently-linked pair with no gun, no fizzle and no placement — arguably a cleaner
    first target for the teleport machinery. §8 rejects it on testability (`sp_a1_intro1`
    has `prop_portal`s), but if stage 3 proves painful, the two classes share §4–§6
    entirely and the decision is reversible at no cost.
-4. **The second colour.** `portalstaticoverlay_2.vmt` differs from `_1` only in its
-   colour texture. Two `Material`s, or one with a swapped texture? This is the first
-   place the port would want a material *instance* parameter, which is what
-   `$PortalOpenAmount` will also want, and which is the thin end of the proxy system.
+4. **The second colour. ANSWERED: two `Material`s.** `portalstaticoverlay_2.vmt` differs
+   from `_1` only in its colour texture — a 1,669-byte gradient strip — and
+   `MaterialCache` is keyed by name, so two entries cost two tiny uploads and nothing
+   else. The material *instance* parameter this question predicted does exist, and it is
+   `uniforms::PortalOverlay` in group 3: it carries `$PortalOpenAmount`, `$PortalStatic`
+   and `$time`, which are the three values that genuinely differ between two portals
+   wearing one material. The thin end of the proxy system turned out to cost one arena,
+   one bind group layout and one `Pass` setter.

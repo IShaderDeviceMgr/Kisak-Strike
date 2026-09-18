@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-There is a unit test suite (`cargo test`, 954 tests), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 971 tests), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -102,6 +102,15 @@ a chamber opens its door. The way *back* out runs through
 `logic_branch`es that says "the map wants this shut" and "the player is
 not in the doorway" — so the door waits for you to be clear of it and
 then closes.
+**And there are portals in it — as ovals.** `prop_portal` is 21 entities across
+10 maps, **two of them on `sp_a1_intro1`**, and they now spawn, link to their
+partner by group and size, compute the transform that will one day teleport you,
+and draw the coloured oval the shipped game draws — through a real port of
+`PortalRefract`'s `$Stage 2`, noise, gradient strip, opening animation and all.
+A `portal` console command places and links a pair wherever you are looking,
+because 21 scripted portals is not enough to develop against.
+**There is no hole**: that is `portdocs/PORTAL.md` stage 3, and until it lands
+you walk into the wall and stop.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it (a chamber door is
 walked through for the same reason) — but the boot path is
@@ -157,6 +166,11 @@ crouch, left shift to walk slowly, mouse to look, **Escape to release the cursor
 `sv_noclipaccelerate 0` for an instant stop, and fly up by looking up, because Portal 2
 binds no key to `+moveup`. `trace` in the console reports what is under and in front of
 the player.
+
+`portal 1` and `portal 2` put a blue and an orange oval on whatever you are looking at,
+and `portal off` fizzles every portal in the map. Placing both links them. It is the
+portal gun minus the gun and minus every placement rule, so nothing refuses a surface and
+nothing stops the two ending up in the same place.
 
 `` ` `` opens the console (Escape or `` ` `` closes it), which releases the cursor for as
 long as it is up. Tab and the arrow keys cycle completions; an empty entry cycles history
@@ -369,9 +383,10 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   is depot-gated (`KISAK_GAME_DIR`), walks every `.vmt` in the mounted game, loads it
   through the real `MaterialCache` and asks the real `PipelineCache` for a pipeline with
   `on_uncaptured_error` latching any validation failure. Running it prints the whole
-  picture: **2,947 of the mounted game's 3,555 materials draw with a real shader, in 57
+  picture: **2,952 of the mounted game's 3,555 materials draw with a real shader, in 58
   pipelines** — 956 `UnlitGeneric`, 818 `VertexLitGeneric`, 801 `LightmappedGeneric`,
-  317 `Phong`, 37 `Refract`, 18 `WorldVertexTransition`, and 608 on the error material.
+  317 `Phong`, 37 `Refract`, 18 `WorldVertexTransition`, 5 `PortalRefract`, and 603 on
+  the error material.
   That is the standing answer to §10's "how many variants actually survive".
 
   **`Phong` has landed too, and it is the second of §7.8's *remaining* set** — the model
@@ -420,12 +435,12 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `$color`/`$color2`, 8 of them on a model shader.
 
   **The translucent pass landed here too, as `portdocs/PORTAL.md` §10 stage 1**, and it
-  is the smallest change in this module with the widest reach: **1,212 of the game's
-  2,947 drawable materials are translucent** — 1,037 `Blend`, 71 `BlendAdd`, 35 `Add`,
+  is the smallest change in this module with the widest reach: **1,217 of the game's
+  2,952 drawable materials are translucent** — 1,042 `Blend`, 71 `BlendAdd`, 35 `Add`,
   0 `Multiply` and 69 that are `$translucent` over a texture with no alpha channel and so
   blend nothing at all. What the plan called for was "a blend state in `PipelineCache`",
   and **that half was already there**: the cache has honoured `BlendMode` since stage 3,
-  so those 1,212 have always drawn blended — with no *order*, recorded in batch order and
+  so all but the portal's five have always drawn blended — with no *order*, recorded in batch order and
   composited under whatever came after them. What was actually missing is two things.
   **A material now carries two `RenderState`s**, which is Valve's up-to-eight
   `StateSnapshot_t`s reduced to the one modulation flag this port can reach:
@@ -443,7 +458,7 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   `$translucent` over an opaque texture is classified translucent and draws with blending
   off, and Valve sorts it into the translucent list anyway.
 
-  §10's "how are variants expressed" question is **closed**: six shaders in, none
+  §10's "how are variants expressed" question is **closed**: seven shaders in, none
   needed a source-text variant — `VertexLitGeneric` merges two Valve *files* into one
   module with a uniform branch, `WorldVertexTransition` is a second *name* on
   `LightmappedGeneric`'s module rather than a variant of it, and `Phong`'s nineteen
@@ -460,6 +475,37 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   space); `VertexLitGeneric` genuinely has two in Valve's engine and this port still keeps
   one, because the tangent is in the `.vvd` either way — and `Phong` asks for the tangent
   unconditionally, so for its 317 one layout is not even a simplification.
+
+  **`PortalRefract` is the seventh shader and `portdocs/PORTAL.md`'s stage 2** — the
+  coloured oval a portal wears, and the first thing in this port that is neither a
+  surface nor a model: **four vertices built from four numbers every frame**, wearing a
+  material with no geometry of its own anywhere in the game's files. 7 materials name it,
+  **5 of them draw**, and the five need **one pipeline** between them — the fewest of any
+  shader here, because its render state is a literal.
+
+  Four things about it a reader will otherwise rediscover the hard way.
+  **It is one shader name over three unrelated pixel shaders, and only the third is
+  ported** — `$Stage` picks between the see-through warp (0), the stencil punch (1) and
+  the oval (2), and the first two exist to make the recursive view composite. So
+  `ShaderKind::resolve` answers `None` for a name `from_name` knows, which is the mirror
+  image of `Phong` and the only place in the census where that happens. (`$UseOnStaticProp 1`
+  **forces** the stage to 2 and overrides an explicit `$Stage`, which is what makes the
+  two `effects/fakeportalring_*` materials stage-2 materials.)
+  **It brought a fourth shape for group 3 and the port's first material *instance*
+  parameter** — `ContextBinding::PortalOverlay`, three floats bound with a dynamic offset
+  the way `ModelLighting` is. In the shipped game they are material *vars* rewritten
+  before every draw by three proxies the `.vmt` declares; the proxy system is unported and
+  group 1 is baked at load, so three numbers that differ between two portals wearing one
+  material have nowhere else to live. `portdocs/PORTAL.md` §12 called this "the thin end
+  of the proxy system", and the thin end cost one arena, one bind group layout and one
+  `Pass` setter.
+  **`g_flPortalActive` is `1 - $PortalStatic`**, not `$PortalStatic` — pass the parameter
+  straight through and a settled portal is a solid disc of colour while a freshly opened
+  one is an empty ring, which is the effect exactly inverted.
+  And **the exposure is applied to the oval's *alpha* as well as its colour**, after
+  `FinalOutput` rather than inside it, over Valve's comment *"let it drop down to 0 in case
+  we're fading"* — which is why a portal fades out in a bright room instead of turning
+  grey.
 - **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
   lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5), `input/` (stages 1-4
   of 5), and `console/` (all five stages, complete)**
@@ -1683,6 +1729,97 @@ Full rationale for each of these is in `PORTING.md`; this is the short form.
   up all-true, and that is the map logic rather than a fault — a door's
   `OnAllTrue → logic_relay` chain ends by setting the branch that asked for it back
   to `0`, inside the same tick.
+
+  **`prop_portal` landed after it, and it is `portdocs/PORTAL.md` stage 2 of five.**
+  `CProp_Portal` (`game/server/portal/prop_portal.cpp`) and the *placement* half of
+  `CPortal_Base2D` — **21 entities across 10 of the 106 maps, two of them on
+  `sp_a1_intro1`**, which makes this the rare module whose test bed is the map the
+  port already loads by default. That takes the port to **46 registered classnames and
+  34,823 of the game's 60,925 entity blocks** — 41 of them among the 200 the maps
+  place. All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
+  `HalfWidth`/`HalfHeight`, so the whole of shipped content is "two default-sized
+  portals in group 0, switched on by map logic": **31 `SetActivatedState`, 4
+  `NewLocation`, and exactly one output connection in the entire game**, which is
+  `sp_a1_intro1`'s `portal_red_0.OnPlayerTeleportFromMe`.
+
+  It links to its partner, computes the teleport matrix, and `engine::world::portals`
+  draws the oval. **It does not carve the wall (stage 3) and it does not teleport
+  anybody (stage 4)** — so what you get is a coloured oval on an unbroken wall that
+  you walk into and stop.
+
+  Six things about it read as bugs until you check the reference, and the first two
+  decide whether a pair ever forms.
+
+  **Linkage is by group and size, never by `PortalTwo` — and `PortalTwo` is
+  *overwritten* by linking.** `UpdatePortalLinkage` takes the first portal in the group
+  that is active, unlinked and exactly the same size, and the base class then assigns
+  `m_bIsPortal2 = !m_hLinkedPortal->m_bIsPortal2`. The key decides colour and nothing
+  else, which `portal_base2d.h:38` says in as many words; reading it as the pairing key
+  looks right on all 21 shipped portals, because every one is already the opposite of
+  its partner.
+  **The portal that activates *second* keeps its colour**, because the forcing line runs
+  on the partner first through the recursion at `prop_portal.cpp:584` — so a map that
+  switched on two blues would turn the *first* one orange.
+  **The teleport matrix has a 180° turn about up baked into it**, and a point in *front*
+  of the entrance therefore maps to *behind* the exit. Both read as bugs and neither is:
+  without the half turn you come out facing back the way you came, and the
+  front-to-back relationship is what makes the same matrix a camera transform for the
+  view through a portal — the teleport is consistent with it because the player crosses
+  the *plane*, so the point being transformed is a hair behind it.
+  **A portal's `right` is the negation of its angle matrix's second column**
+  (`m_vRight = -m_vRight`, `portal_base2d.cpp:1213`), because Valve's `matrix3x4_t`
+  column 1 is *left*; repeating the negation mirrors the quad, the corners and the
+  matrix together.
+  **The default half-height is 56 and the reference tree says 14** — a CEG anti-tamper
+  decoy, `0.25 * DEFAULT_PORTAL_HALF_HEIGHT`, under a comment that says exactly what it
+  is. The shipped portal is 64 x 112 units.
+  And **`prop_portal` draws no model, and drawing one would be a magenta rectangle
+  across the wall**: `portal1.mdl` is four vertices wearing `writez`, a depth-only
+  shader that punches a hole for the recursive view, and `writez` is not a shader this
+  port has. `PropPortal::model_state` answers `None`.
+
+  Four decisions worth knowing.
+  **The linkage recursion collapses to one level.** `UpdatePortalLinkage` recurses in
+  three places and two of them do no work; the third — a deactivating portal handing its
+  partner on — is the only one that can find a *third* portal, and it is written out.
+  That matters because this module cannot recurse: `Server::dispatch` has lifted the
+  entity out of the list, so a partner is reachable as data and never as code.
+  **`Context::find_all_of_class` replaces `s_PortalLinkageGroups[256]`** — a `static`
+  cannot hold per-`Server` state, the scan is in spawn order either way because
+  `AddToLinkageGroup` runs in `Spawn`, and the whole game has 21 portals with no map
+  holding more than four.
+  **`portdocs/PORTAL.md` §12's "where does the carve live" is settled and the seam
+  already exists**: `PortalState` goes `server/` → `engine/` → `world/` once a rendered
+  frame, and stage 3's carve takes the same route into `trace/` — adding nothing to the
+  seam, because the placement and the size are already in it.
+  And **the placement snap was deleted and the deletion was measured.**
+  `CProp_Portal::ActivatePortal` re-traces and re-places a portal on activation; this
+  port activates one where the map put it.
+  `every_shipped_portal_is_on_a_wall` runs Valve's own trace against all 21 and
+  classifies: **15 flush, 2 proud of their wall** (`sp_a1_intro1`'s own `portal_red_0`
+  by 1.97 units and `sp_a1_intro4`'s by 3.50) **and 4 floating** — and those four are
+  exactly the `NewLocation` targets in `sp_a4_finale1`/`2`, which the map parks in
+  mid-air and moves from script, and which is also why neither map fires
+  `SetActivatedState`. The assertion with teeth is the angle: **not one of the 21 is
+  more than 0.00 degrees off the surface behind it**, so the snap cannot re-orient a
+  shipped portal and the matrix this port computes is the one the shipped game computes.
+
+  The measurement that says the class works is
+  `server::tests::every_shipped_portal_spawns_and_its_map_can_link_a_pair`: **21
+  portals across 10 maps, 17 switched on by their own logic, 6 maps forming a pair.**
+  "Exactly one pair" was the plan's assertion and is wrong — `sp_a1_intro2` places
+  *four* portals in group 0, and firing every `SetActivatedState 1` in its lump at once
+  (which the running map never does, because they belong to different rooms) forms
+  **two**. What the test asserts instead is the invariant: every linked portal's partner
+  links back, the two are opposite colours, no portal is claimed twice, and every linked
+  portal has a non-identity matrix.
+  The measurement that says the *oval* works is
+  `engine::world::portals::rendered::the_portal_overlay_draws_in_two_colours_and_opens`,
+  and it needs **no map** — what a portal draws does not depend on where it is. At
+  256x256: **19,039 pixels for the blue and 18,718 for the orange**, mean rgb
+  (0.19 14.34 31.66) and (31.17 17.33 0.00) — which is what says the 256x1 gradient
+  strip is sampled on its one row — and ~24,700 pixels differ between a settled oval and
+  a half-open one, which is what says group 3 reaches the shader at all.
 - **Everything else is unported** and lives in `legacy/`.
 
 **Frame cost is measurable and has been measured.** `engine::world::bench` (depot-gated,
@@ -1745,12 +1882,25 @@ when it runs out.
 next steps are individual classes and subsystems rather than a staged plan.
 `client/` stage 5 and everything below it needs `net/`, which is a long way from here.
 
-**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stage 1 of its five
-is done**: the blended pass, which is not portal work and is what §7's coloured oval was
-gated on. Stage 2 is the class drawn, stage 3 the hole in the wall's collision, stage 4
-the remote trace and the teleport. The other candidates, in the order they are worth
-doing:
+**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stages 1 and 2 of its
+five are done**: the blended pass, then **the class, drawn**. Stage 3 is the hole in the
+wall's collision and stage 4 the remote trace and the teleport — and stage 3 is the one
+everything else is inert without, because with no hole the player walks into the wall,
+never reaches the portal plane, and the teleport can never fire however correct it is.
+The other candidates, in the order they are worth doing:
 
+- **`portdocs/PORTAL.md` stage 3 — the hole.** §4: an AABB brush enumerator over
+  `CollisionBsp`, the four-slab carve, the carved store, and a substitutive path
+  in `Tracer`. The finding that makes it tractable is already written down and is
+  worth repeating: **the carve does not need a polyhedron library.** Valve's
+  `CPolyhedron`s exist only to become `CPhysCollide`s, and this port traces BSP
+  brushes — so **a carved piece is the original brush's planes plus four side
+  planes at four distances**, no vertices generated and no hull built, and an
+  infeasible plane set reports a clean miss through the existing loop. That
+  deletes `mathlib/polyhedron.cpp` (3,895 lines) and
+  `staticcollisionpolyhedroncache.cpp` (586) outright. The seam it needs already
+  exists: `PortalState` carries the placement and the size, and stage 3 adds
+  nothing to it.
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
   `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker

@@ -15,9 +15,9 @@ one (`src/materials/`). Same subject, two names, on purpose.
 |---|---|
 | Module | `crate::materials` |
 | Lines | ~20,600 Rust including tests, plus ~2,600 of WGSL |
-| Tests | 224 (`cargo test materials`) — 52 of them run on a real GPU, one of which builds a pipeline for every shader; plus one depot-gated census over the whole game |
+| Tests | 231 (`cargo test materials`) — 52 of them run on a real GPU, one of which builds a pipeline for every shader; plus one depot-gated census over the whole game |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
+| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, `PortalRefract`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
 
 ```
 src/materials/
@@ -43,6 +43,7 @@ src/materials/
   shaders/unlitgeneric.wgsl        base texture, modulation, alpha test
   shaders/lightmappedgeneric.wgsl  base texture x baked lightmap, flat and bumped
   shaders/modellighting.wgsl       group 3 for the model shaders: the ambient cube and four lights
+  shaders/portalrefract.wgsl       the coloured oval a portal wears — PortalRefract's $Stage 2
   shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
   shaders/phong.wgsl               models with a specular highlight, a rim light and an envmap
   shaders/refract.wgsl             glass: a screen-space warp of a copy of the scene
@@ -706,6 +707,7 @@ pub enum ShaderKind {
     VertexLitGeneric,
     Phong,                   // no .vmt names this one
     Refract,
+    PortalRefract,           // only its `$Stage 2` resolves
 }
 
 pub fn resolve(vmt: &Vmt) -> Option<ShaderKind>;   // what will draw it
@@ -718,18 +720,20 @@ pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Six variants, five implementations, **five names**. `UnlitGeneric` is sprites, tool
+Seven variants, six implementations, **six names**. `UnlitGeneric` is sprites, tool
 textures and anything whose colour is entirely in its texture; `LightmappedGeneric` is
 world brush surfaces — 62 of `sp_a1_intro1`'s 66 world materials — and multiplies a base
 texture by a baked lightmap, flat or radiosity-normal-mapped; `VertexLitGeneric` is
 models, and the name is the largest shader in the shipped game — 1,135 of the mounted
 game's 3,555 materials write it, including 1,012 of the 1,096 under `materials/models/`;
 `Phong` is the 317 of those that ask for a specular highlight; `Refract` is glass, 37
-materials, 29 of them on models.
+materials, 29 of them on models; `PortalRefract` is the coloured oval a portal wears, 7
+materials of which 5 resolve.
 
 **Call `resolve`, not `from_name`.** `from_name` answers "what did the `.vmt` say", which
 is what a diagnostic wants. `resolve` answers "what will draw it", which is what
-everything else wants, and the two differ for `Phong` — see below.
+everything else wants, and the two differ in **both directions**: `Phong` is a shader no
+`.vmt` names, and `PortalRefract` is a name two `.vmt`s write that resolves to nothing.
 
 **`Refract` is structurally unlike the other four, and that is the thing to know about it.**
 It has no lighting at all — no lightmap, no ambient cube, no diffuse term — and what it
@@ -779,6 +783,37 @@ It shares `VertexLitGeneric`'s vertex layout, its group 3 and its parameter *tab
 differs in the pixel shader and in what it reads: a specular exponent map, a diffuse
 (light) warp and a specular (phong) warp, and **no envmap mask**.
 
+**`PortalRefract` is one shader name over three unrelated pixel shaders, and only the
+third is here.** `$Stage` picks between the see-through warp (0), the stencil punch (1)
+and the coloured oval (2); the first two exist to make `CPortalRenderable_FlatBasic`'s
+recursive view composite, which `portdocs/PORTAL.md` puts out of scope. So `resolve`
+answers `Some` only for stage 2 and `None` for the other two, whose materials get the
+error material — which is the honest answer and is what keeps the depot census truthful.
+
+Measured over the mounted game: **7 materials name it and 5 are stage 2** — the three
+`models/portals/portalstaticoverlay_*` and the two `effects/fakeportalring_*`, which reach
+stage 2 through `$UseOnStaticProp` rather than through `$Stage`
+(`portal_refract_helper.cpp:79` overrides the stage *after* reading it). The other two are
+`portal_refract_1` (stage 0) and `portal_stencil_hole` (stage 1), and nothing in this port
+draws either.
+
+Three things about it are unlike every other shader in the set:
+
+- **Its pipeline state is a constant.** `render_state` has its own arm that consults no
+  texture and no flag: `EnableAlphaBlending( SRC_ALPHA, ONE_MINUS_SRC_ALPHA )`, depth
+  writes off, alpha writes off, `SHADER_POLYOFFSET_DECAL`. So it is the first shader whose
+  `state_alpha_modulated` is *identical* to its `state` — `SHADER_USING_ALPHA_MODULATION`
+  only turns blending on, and it is already on. The decal bias is load-bearing: a portal's
+  quad is drawn exactly on the wall it is stuck to.
+- **Its group 3 is neither lighting nor a copy of the frame**, but three numbers that
+  differ between two portals wearing the same material —
+  [`ContextBinding::PortalOverlay`](#portaloverlay). See below.
+- **It takes `VertexLayout::Simple`**, the smallest in the set, where Valve declares two
+  formats keyed on `$UseOnStaticProp`. One serves both because the stage-2 pixel shader
+  reads neither the normal, the tangent nor the second texture coordinate. That is a
+  reduction rather than a simplification: `VertexLayout::Model` would mean binding a second
+  vertex stream — the baked static light — for a shader with no lighting at all.
+
 Replaces `CShaderSystem::FindShader`'s `CUtlDict`, filled by whichever `shaderapi.so` had
 been `dlopen`ed. There is no registration step and no way to fail to be registered.
 
@@ -802,6 +837,7 @@ pub fn lightmapped_uniforms(kind: ShaderKind, vmt: &Vmt) -> LightmappedUniforms;
 pub fn vertex_lit_uniforms(vmt: &Vmt) -> VertexLitUniforms;
 pub fn phong_uniforms(vmt: &Vmt) -> PhongUniforms;
 pub fn refract_uniforms(vmt: &Vmt, textures: ResolvedTextures) -> RefractUniforms;
+pub fn portal_refract_uniforms(vmt: &Vmt) -> PortalRefractUniforms;
 
 /// What the shadow phase asks a texture that is already loaded.
 pub struct TextureFacts { pub width: u32, pub height: u32, pub translucent: bool }
@@ -1001,11 +1037,13 @@ Valve's register map is really a *frequency* map, and that frequency is the bind
 | 2 | `DrawUniforms` | once a draw | VS `c4..c7`, `c47` |
 | 3 | *the render-context state this shader reads* — see below | once a batch, once a model, or once a pass | PS `s1` (`TEXTURE_LIGHTMAP`), PS `s2` (`TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0`); VS `c21..c26` + `c27..c46` |
 
-**Group 3 is whichever piece of render-context state the shader reads**, not skinning as
-stage 4 reserved it for. It has three shapes:
+<a id="portaloverlay"></a>
+
+**Group 3 is whichever piece of per-shader state the shader reads**, not skinning as
+stage 4 reserved it for. It has four shapes:
 
 ```rust
-pub enum ContextBinding { LightmapPage, ModelLighting, FrameBufferCopy }
+pub enum ContextBinding { LightmapPage, ModelLighting, FrameBufferCopy, PortalOverlay }
 ```
 
 | Shader | Group 3 | Set by | Rate |
@@ -1014,23 +1052,48 @@ pub enum ContextBinding { LightmapPage, ModelLighting, FrameBufferCopy }
 | `LightmappedGeneric` | a lightmap atlas page: texture + sampler | `Pass::bind_lightmap_page` | per batch |
 | `VertexLitGeneric` | `ModelLighting`: ambient cube + 4 lights, dynamic offset | `Pass::set_model_lighting` | per model instance |
 | `Refract` | a readable copy of the scene: texture + sampler | `RenderContext::update_refract_texture` | per pass |
+| `PortalRefract` | `PortalOverlay`: open amount, settledness, time; dynamic offset | `Pass::set_portal_overlay` | per portal |
 
-All three are things Valve also kept out of the material: `BindLightmapPage`,
+The first three are things Valve also kept out of the material: `BindLightmapPage`,
 `PI_SetVertexShaderAmbientLightCube` and `SetFrameBufferCopyTexture` are render-context
 state that neither the material nor the draw call owns. A pipeline layout is per shader, so
 declaring group 3 everywhere would oblige every draw of every shader to bind something
 there; a shader that reads none of it declares no group 3 at all. Skinning takes the next
 free group when `studiorender` lands.
 
+**`PortalOverlay` is the exception, and it is the port's first material *instance*
+parameter.** In the shipped game its three values are material **vars** rewritten before
+every draw by three proxies that `portalstaticoverlay_1.vmt` declares — `CurrentTime`,
+`PortalOpenAmount` and `PortalStatic`. The proxy system is unported and group 1 is baked
+once per material at load, so three numbers that differ between two portals wearing the
+*same* material have nowhere else to live. Group 3 is already the per-shader, per-instance
+slot — that is what `ModelLighting` is — so they go there.
+
+```rust
+pub struct PortalOverlay {
+    pub open_amount: f32,     // $PortalOpenAmount: 0 -> 1 over half a second
+    pub portal_active: f32,   // 1 - $PortalStatic: 0 -> 1 over one second
+    pub time: f32,            // $time, wrapped to 1000 seconds
+    pub _padding: f32,
+}
+```
+
+`portdocs/PORTAL.md` §12 predicted this — *"the thin end of the proxy system"* — and it is
+worth saying what the thin end costs: one arena, one bind group layout and one `Pass`
+setter. A general proxy system would be a way to run arbitrary per-frame code against a
+material's var table, and nothing else in the port has asked for one.
+
 **It was called `LightingBinding` until `Refract` landed**, because the first two shapes
 were both lighting. Nothing else about it changed, and a copy of the frame buffer sits in
 the same slot for the same reason the other two do.
 
-The three layouts are `BindLayouts::lightmap()`, `::model_lighting()` and
-`::frame_buffer_copy()`. The first and the third are *structurally identical* — a
-filterable 2D texture at binding 0 and a filtering sampler at binding 1 — and are
-deliberately separate objects, because group 3's meaning is per shader and a shared layout
-would invite the question of whether a refractor could be handed a lightmap page.
+The four layouts are `BindLayouts::lightmap()`, `::model_lighting()`,
+`::frame_buffer_copy()` and `::portal_overlay()`. Two pairs of them are *structurally
+identical* — the first and the third are a filterable 2D texture at binding 0 and a
+sampler at binding 1, the second and the fourth are a dynamic-offset uniform at binding 0
+— and all four are deliberately separate objects, because group 3's meaning is per shader
+and a shared layout would invite the question of whether a refractor could be handed a
+lightmap page.
 
 Group 1's *layout* is the shader's, which is the one thing that genuinely differs between
 shaders; groups 0 and 2 are shared, which is what makes them worth being groups.
@@ -1620,20 +1683,26 @@ pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 pub fn set_state_override(&mut self, overrides: StateOverride);
 pub fn bind_lightmap_page(&mut self, page: &LightmapPage);
 pub fn set_model_lighting(&mut self, lighting: &ModelLighting);
+pub fn push_model_lighting(&mut self, lighting: &ModelLighting) -> LightingSlot;
+pub fn set_model_lighting_slot(&mut self, slot: LightingSlot);
+pub fn set_portal_overlay(&mut self, overlay: &PortalOverlay);
 pub fn target_format(&self) -> TargetFormat;
 ```
 
-`bind_lightmap_page` is `IMatRenderContext::BindLightmapPage( lightmapPageID )` and
+`bind_lightmap_page` is `IMatRenderContext::BindLightmapPage( lightmapPageID )`,
 `set_model_lighting` is `R_StudioSetupLighting` plus the two per-instance commands it
-feeds. Both are the two halves of group 3, both are pass state like `set_state_override`,
-both apply from the call to the end of the pass, and a draw of a shader that does not read
-that half ignores it.
+feeds, and `set_portal_overlay` is the three material proxies a portal's overlay declares.
+All three set a shape of group 3, all three are pass state like `set_state_override`, all
+three apply from the call to the end of the pass, and a draw of a shader that does not
+read that shape ignores it.
 
-Neither has to be called. A lit brush draw with no page bound gets the 1x1 white page,
-which is what `AllocateWhiteLightmap` hands unlit surfaces anyway; a model draw with no
-lighting set gets `ModelLighting::fullbright` — a white ambient cube and no lights — which
-every pass allocates for itself when it opens. Both are visible-and-wrong rather than a
-validation error or a read of whatever the previous instance left behind.
+None of them has to be called. A lit brush draw with no page bound gets the 1x1 white
+page, which is what `AllocateWhiteLightmap` hands unlit surfaces anyway; a model draw with
+no lighting set gets `ModelLighting::fullbright` — a white ambient cube and no lights; and
+a portal draw with no overlay set gets a **shut** portal, which draws nothing and is the
+right answer to "nobody said". Every pass allocates the last two for itself when it opens.
+All three are visible-and-wrong rather than a validation error or a read of whatever the
+previous instance left behind.
 
 **`set_model_lighting` takes an arena slot per call**, so setting it, drawing, setting it
 again and drawing again within one pass is the intended shape — which is what a scene of
@@ -2299,6 +2368,32 @@ Ordered by how likely each is to bite.
     has lights to work with; `Material::uses_bumpmapping` is the predicate and
     `rustdocs/ENGINE.md`'s "world::light" is the cache. Until the local lights landed a
     phong prop had no highlight at all, because the term needs a light.
+46. **`PortalRefract` is one shader name over three unrelated pixel shaders, and
+    `resolve` answers `None` for two of them.** It is the only place in the module where
+    a name `from_name` knows resolves to nothing, and it is the mirror image of `Phong`:
+    that one is a shader no `.vmt` names, this one is a name two `.vmt`s write that
+    nothing can draw. `$Stage 0` is the see-through warp and `$Stage 1` is the stencil
+    punch; both exist only to make `CPortalRenderable_FlatBasic`'s recursive view
+    composite. **`$UseOnStaticProp 1` forces the stage to 2**, and it overrides an
+    explicit `$Stage` rather than defaulting one (`portal_refract_helper.cpp:79` runs
+    after the read) — which is what makes the two `effects/fakeportalring_*` materials
+    stage-2 materials.
+47. **`g_flPortalActive` is `1 - $PortalStatic`**, not `$PortalStatic`
+    (`portal_refract_helper.cpp:216`), and passing the parameter straight through inverts
+    the whole effect: a settled portal becomes a solid disc of colour and a freshly opened
+    one an empty ring. `PortalOverlay::portal_active` holds the register's value and is
+    named for it.
+48. **`$PortalColorScale`'s runtime default is 1 and its declared default is `"0.0"`.**
+    `kDefaultPortalColorScale` wins, as `Refract`'s `$localrefractdepth` does; a 0 would
+    make every portal black. All three `portalstaticoverlay_*` materials write it anyway
+    — 4.0 for the two colours and 1.0 for the tinted co-op one — so the default is
+    reachable only from a hand-written `.vmt`.
+49. **The oval's exposure is applied to its *alpha* as well as its colour.** The stage-2
+    pixel shader ends `FinalOutput( ..., TONEMAP_SCALE_NONE ) * saturate( LINEAR_LIGHT_SCALE )`
+    — the whole `float4`, after the output rather than inside it — over Valve's comment
+    *"let it drop down to 0 in case we're fading"*. It is why a portal fades out in a
+    bright room instead of turning grey, and folding the scalar into `FinalOutput`'s
+    tonemap argument would lose exactly that.
 
 ## Deliberate divergences from Valve's behavior
 
@@ -2347,6 +2442,8 @@ Each of these changes what the engine does, and each names the thing that revers
 | `$phongwarptexture`'s iridescence is a 2D table lookup with no content to check it against | **one** Portal 2 material has one (`models/props/reflecto_cube_iridescence`), so the branch is implemented from the reference and verified only by the pipeline building. Its effect is also what takes the fresnel multiply away from the specular result, which is the part worth knowing | — |
 | **The frame-buffer copy is taken once a frame, not once per refractor** | on PC Valve calls `UpdateRefractTexture` before *each* refracting renderable in the back-to-front translucent list (`viewrender.cpp:6195`), so glass behind glass sees the nearer pane's result. One copy is one full-screen blit and one extra pass; a copy per refractor is a pass per refractor. Overlapping refractors here show the scene behind both rather than through each other, and nothing in Portal 2's single-player maps stacks two in one view | call `RenderContext::update_refract_texture` between draws rather than before them |
 | **A refracting prop is split per *batch*, where Valve splits per renderable** | Valve sorts whole renderables into the opaque and translucent lists, so a prop with one refracting material among several draws entirely in the translucent pass. Mixing is the normal case and not the corner one: of the 66 models in the depot wearing a frame-buffer-refracting material, **60 also wear something else** — every `props_destruction/glass_*` pane is a refracting sheet plus an opaque `glass_fracture_*_inner` edge. The per-batch split is the one that is right without a depth sort, which this port does not have | `PropModels::record`, once translucency sorting exists |
+| `PortalRefract`'s `$Stage` 0 and 1 materials draw as the error checkerboard | they are the recursive view's two halves and `portdocs/PORTAL.md` puts it out of scope. Nothing in this port binds either: they are drawn by `CPortalRenderable_FlatBasic`, which does not exist here, so the checkerboard is never on screen. Counting them as drawable would be the dishonest option | `ShaderKind::resolve`, plus the other two branches of `shaders/portalrefract.wgsl` |
+| `PortalRefract` reads one vertex layout where Valve declares two | `$UseOnStaticProp` picks between position + normal + 2 texcoords + a tangent, and position + 1 texcoord. The stage-2 pixel shader reads neither the normal, the tangent nor the second texcoord — the first two are stage 0's screen-space warp and the third is a constant `(0.25, 0)` nothing samples — so `VertexLayout::Simple` serves both. Taking `Model` instead would oblige a portal draw to bind a baked-static-light stream for a shader with no lighting | `ShaderKind::vertex_layout` |
 | `Refract` is drawn with `VertexLayout::Model` even for a brush surface | Valve declares two vertex formats and picks on `$model`. 29 of the game's 37 materials set it and all eight that do not are under `materials/particle/`, drawn by the unported particle system; **no brush face or displacement in the shipped game names this shader** | `ShaderKind::vertex_layout`, plus a tangent on a `SimpleVertex` when particles land |
 | `Refract`'s secondary normal map, `$masked`, `$magnifyenable` and `$vertexcolormodulate` are not implemented | **zero** Portal 2 materials set any of them, and the secondary-normal path is broken where Valve implements it: it binds `$normalmap2` to sampler 1 and then samples sampler 3 with the second coordinate set (`refract_ps2x.fxc:143`). `$masked` additionally wants a blend mode `BlendMode` does not have | `REFRACT_PARAMS`, and a `BlendMode::MaskedRefract` |
 | `$time` and `$fresnelreflection` are not declared on `Refract` at all | both are dead in Valve's shader: `$time` reaches a register no `.fxc` reads, and `$fresnelreflection` is never written to one — `refract.cpp` and its helper each carry the comment *"FIXME: doesn't support Fresnel!"* | — |
@@ -2355,11 +2452,12 @@ Each of these changes what the engine does, and each names the thing that revers
 
 Stage 6 is `VertexLitGeneric` and is done; `Refract` and `Phong` are the first two of
 §7.8's remaining shader set, and paint maps and GPU morph (stages 7-8) are not started.
-The set is five implementations under five names — plus `Phong`, which is a sixth
-implementation under *no* name — so a `.vmt` naming any of the other 160-odd still
-resolves to the error material. Measured against the mounted game by
+The set is five implementations under five names, plus `Phong` (a sixth implementation
+under *no* name) and `PortalRefract` (a seventh, under a name whose other two stages
+resolve to nothing) — so a `.vmt` naming any of the other 160-odd still resolves to the
+error material. Measured against the mounted game by
 [`every_shipped_material_of_a_ported_shader_builds_a_pipeline`](#test-coverage), that is
-**608 of 3,555**. Also deliberately absent, and listed so nobody looks for them:
+**603 of 3,555**. Also deliberately absent, and listed so nobody looks for them:
 
 - **Everything `LightmappedGeneric` can do past a base texture, a bump map, a lightmap and
   the two-layer blend.** `$detail`, `$envmap`/`$envmapmask`, **`$seamless_scale`**,
@@ -2610,28 +2708,35 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --igno
 3555 .vmt files under materials/
     801 LightmappedGeneric  (9 pipelines)
     317 Phong  (7 pipelines)
+      5 PortalRefract  (1 pipelines)
      37 Refract  (7 pipelines)
     956 UnlitGeneric  (19 pipelines)
     818 VertexLitGeneric  (14 pipelines)
      18 WorldVertexTransition  (1 pipelines)
-    608 <the error material>
-57 pipelines for the whole set
+    603 <the error material>
+58 pipelines for the whole set
 345 materials define $envmaptint
-1212 materials draw in the translucent pass:
+1217 materials draw in the translucent pass:
      35 blend Add
-   1037 blend Blend
+   1042 blend Blend
      71 blend BlendAdd
      69 $translucent with no blending
 ```
 
-**1,212 of those materials are translucent** — 41% of everything the port draws — which
+**1,217 of those materials are translucent** — 41% of everything the port draws — which
 is the measurement that says the translucent pass is not a corner case. No shipped material
 reaches `BlendMode::Multiply`, and the 69 with no blending at all are `$translucent` over
 a texture with no alpha channel: `CMaterial::IsTranslucent`'s one term that the blend mode
 does not imply, and they are sorted into the pass for the same reason Valve sorts them.
 
-So **2,947 of the mounted game's 3,555 materials draw with a real shader**, and the whole
-set needs 57 pipelines — which is the standing answer to
+**`PortalRefract`'s five need one pipeline between them**, which is the fewest of any
+shader here and is a consequence of its render state being a literal: the pipeline key is
+`(shader, RenderState, TargetFormat)` and this shader does not vary the middle one. Its
+`TINTED` axis is a uniform branch, so `portalstaticoverlay_tinted` shares the pipeline with
+the other four.
+
+So **2,952 of the mounted game's 3,555 materials draw with a real shader**, and the whole
+set needs 58 pipelines — which is the standing answer to
 `portdocs/MATERIALSYSTEM.md` §10's "how many variants actually survive". The assertions
 are floors rather than exact counts, so mounting the language DLCs does not fail the test.
 
@@ -2647,11 +2752,18 @@ than a census: none of those 345 materials may write a negative component, becau
 into a NaN in a uniform buffer. It is what makes reproducing that exactly safe, and it
 fails with the offending material names if a mounted DLC ever adds one.
 
-The 608 that fall back are dominated by six unported shaders — `SpriteCard` (143),
+The 603 that fall back are dominated by six unported shaders — `SpriteCard` (143),
 `DecalModulate` (101), `Water` (59), `SubRect` (57), `Sprite` (35) and `UnlitTwoTexture`
 (23) — with a long tail behind them (`SolidEnergy` 14, `Wireframe` 12, `Modulate` 8,
-`Portal`/`Portal_Refract` 14, `ScreenSpace_General` 7, `Sky` 6) and, at the end, a handful
-of `.vmt` files that name a texture or an `include` the depot does not contain.
+`Portal` 9, `ScreenSpace_General` 7, `Sky` 6) and, at the end, a handful of `.vmt` files
+that name a texture or an `include` the depot does not contain.
+
+**Two of them name a shader this port *has*.** `models/portals/portal_refract_1` and
+`models/portals/portal_stencil_hole` are `PortalRefract` at `$Stage` 0 and 1, and
+`ShaderKind::resolve` answers `None` for both: they are the see-through warp and the
+stencil punch, and both belong to the recursive view. That is the only place in the census
+where a known shader name falls back, and it is deliberate — the alternative is counting
+two materials as drawable that would draw the wrong thing.
 
 **End to end, on a real GPU** (53 — 38 in `preview.rs`, 7 in `histogram.rs`, 5 in
 `post.rs`, 2 in `ui.rs` and 1 in `pipeline.rs`) — a `.vmt` and a `.vtf`, through the

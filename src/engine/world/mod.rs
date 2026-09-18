@@ -36,6 +36,7 @@ pub mod disp;
 pub mod entities;
 /// The light cache — what lights a model standing at a point.
 pub mod light;
+pub mod portals;
 pub mod props;
 
 use std::collections::BTreeMap;
@@ -55,6 +56,7 @@ use crate::materials::{Material, MaterialCache};
 use bsp::{Bsp, BspError, Face};
 use entities::{EntityModels, ModelEntity};
 use light::LightCache;
+use portals::{Portal, Portals};
 use props::{PropModels, Props};
 
 /// Where a batch has to be split.
@@ -179,6 +181,9 @@ enum Translucent {
         instance: usize,
         batch: usize,
     },
+    /// An index into [`World::portals`]. One draw, one quad, no batches: a
+    /// portal's oval is not built from anything the map ships.
+    Portal(usize),
 }
 
 /// Anything that stops a map from loading.
@@ -398,6 +403,13 @@ pub struct World {
     /// cannot run inside [`load`](World::load): which entities draw a model is
     /// the game's to say and the game has not spawned them yet.
     pub entity_models: EntityModels,
+    /// The ovals the map's active portals wear — `portdocs/PORTAL.md` stage 2.
+    ///
+    /// Not built from the `.bsp` at all: a portal's whole geometry is four
+    /// numbers the game hands over, and this holds the two materials plus
+    /// whatever [`sync_portals`](World::sync_portals) was last told. Empty
+    /// on 96 of the game's 106 maps, which place no `prop_portal`.
+    pub portals: Portals,
     /// The map's lighting — baked ambient cubes and world lights — kept after
     /// the `.bsp` is dropped.
     ///
@@ -629,6 +641,7 @@ impl World {
             props,
             prop_models,
             entity_models: EntityModels::default(),
+            portals: Portals::load(materials, vfs),
             lighting,
             entities,
             stats,
@@ -761,6 +774,13 @@ impl World {
                 list.0
                     .push((key(center), Translucent::Entity { instance, batch }))
             });
+        // Every active portal, unconditionally: the overlay material is
+        // `BlendMode::Blend` whatever its `.vmt` says, because
+        // `portal_refract_helper.cpp`'s shadow state is a literal. So there is
+        // no opaque half to split off and no `GeometryPass` question to ask.
+        for (index, center) in self.portals.centers() {
+            list.0.push((key(center), Translucent::Portal(index)));
+        }
 
         // Ascending along the view direction, which is `SortEntities`' order;
         // `DrawTranslucentRenderables` then counts *down* from the end, so the
@@ -811,6 +831,7 @@ impl World {
                 Translucent::Entity { instance, batch } => {
                     self.entity_models.draw_one(pass, curtime, instance, batch)
                 }
+                Translucent::Portal(index) => self.portals.draw_one(pass, curtime, index),
             }
         }
     }
@@ -864,6 +885,18 @@ impl World {
     ///
     /// `world/` names no server type: the caller converts, which is the same
     /// split `engine/mod.rs` already makes between `console/` and `input/`.
+    /// Takes the game's list of active portals, once a rendered frame.
+    ///
+    /// The third of the three seams `Engine::frame` drives between the server
+    /// and the renderer, after
+    /// [`sync_brush_models`](World::sync_brush_models) and
+    /// [`sync_entity_models`](World::sync_entity_models) — and the simplest,
+    /// because a portal owns no uploaded geometry: the list is replaced rather
+    /// than matched.
+    pub fn sync_portals(&mut self, portals: &[Portal]) {
+        self.portals.sync(portals);
+    }
+
     pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>) {
         sync_placements(&mut self.brush_models, placement);
         rebuild_clip_models(&self.brush_models, &mut self.clip_models);
@@ -2725,6 +2758,9 @@ mod tests {
                     Translucent::BrushModel { .. } => brush += 1,
                     Translucent::Prop { .. } => props += 1,
                     Translucent::Entity { .. } => {}
+                    // A depot load places no portal: all 21 in the game start
+                    // `Activated 0` and nothing has fired an input yet.
+                    Translucent::Portal(_) => {}
                 }
             }
             println!(

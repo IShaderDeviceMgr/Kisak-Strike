@@ -511,6 +511,74 @@ impl ModelLighting {
     }
 }
 
+/// What one portal instance is drawing — group 3, binding 0, for
+/// [`PortalRefract`](super::shader::ShaderKind::PortalRefract).
+///
+/// # This is the port's first material *instance* parameter
+///
+/// In the shipped game these three numbers are material **vars**, rewritten
+/// before every draw by three material proxies that
+/// `models/portals/portalstaticoverlay_1.vmt` declares:
+///
+/// ```text
+///     Proxies { CurrentTime { resultVar $time }
+///               PortalOpenAmount { resultVar $PortalOpenAmount }
+///               PortalStatic { resultVar $PortalStatic } }
+/// ```
+///
+/// The proxy system is unported and this port's group 1 is baked once per
+/// material at load, so three values that differ between two portals wearing
+/// the *same* material have nowhere in that scheme to live. Group 3 is where
+/// they go, for the same reason [`ModelLighting`] is there: it is per-instance
+/// shader-specific state bound with a dynamic offset, and a shader that does
+/// not want it declares no group 3 at all.
+///
+/// `portdocs/PORTAL.md` §12 predicted this — *"the first place the port would
+/// want a material instance parameter … the thin end of the proxy system"* —
+/// and it is worth saying what the thin end costs: one arena, one bind group
+/// layout and one `Pass` setter. A general proxy system would be a way to run
+/// arbitrary per-frame code against a material's var table, and nothing else
+/// in the port has asked for one.
+///
+/// # Both curves are derived, not accumulated
+///
+/// `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`) integrates them:
+/// `m_fOpenAmount += frametime * 2` clamped at 1, `m_fStaticAmount -=
+/// frametime` clamped at 0, both reset by `OnActiveStateChanged`. So a portal
+/// opens over **half a second** and its static clears over **one second**, and
+/// both are pure functions of how long ago it was switched on — which is what
+/// lets `server::PortalState` carry the instant and `world/` compute the pair.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct PortalOverlay {
+    /// `$PortalOpenAmount`, PS `c4.x` and VS `c3.x`. 0 the instant the portal
+    /// opens, 1 half a second later.
+    ///
+    /// The pixel shader puts it through `smoothstep` and then squares it to
+    /// get the hole's radius, so the oval grows from nothing rather than
+    /// fading in.
+    pub open_amount: f32,
+    /// `g_flPortalActive`, PS `c4.y` — and it is **`1 - $PortalStatic`**, not
+    /// `$PortalStatic` (`portal_refract_helper.cpp:216`). 0 the instant the
+    /// portal opens, 1 a second later.
+    ///
+    /// Passing the static amount straight through inverts the whole effect:
+    /// a settled portal would be a solid disc of colour and a freshly opened
+    /// one an empty ring.
+    pub portal_active: f32,
+    /// `$time`, VS `c0` — the scene clock, which is what scrolls the noise.
+    ///
+    /// **Wrapped to 1000 seconds**, which is the helper's own
+    /// `flTime -= floor( flTime / 1000 ) * 1000` (`:180`) and is not
+    /// cosmetic: the noise coordinate is `time * 0.0275`, and at `f32`
+    /// precision an unwrapped clock quantises the scroll into visible steps
+    /// after a few hours.
+    pub time: f32,
+    /// Padding to 16 bytes. A uniform block's stride is a multiple of 16
+    /// whatever its fields say.
+    pub _padding: f32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

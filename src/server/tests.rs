@@ -2665,10 +2665,11 @@ fn every_shipped_map_spawns_its_entities() {
     // `point_teleport` — are 3,322 more again, `prop_floor_button` is 65,
     // stage 5's two — `logic_playerproxy` and `player_loadsaved` — are 9 each,
     // and **`prop_dynamic` is 8,462 on its own**, which is more than stages 3
-    // and 4 together. `prop_testchamber_door` is 138 after it, and
-    // `logic_branch_listener` — the class that shuts those doors — is 158.
-    assert_eq!(total.matched, 34_802);
-    assert_eq!(total.spawned, 27_930);
+    // and 4 together. `prop_testchamber_door` is 138 after it,
+    // `logic_branch_listener` — the class that shuts those doors — is 158, and
+    // `prop_portal` is 21.
+    assert_eq!(total.matched, 34_823);
+    assert_eq!(total.spawned, 27_951);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -2677,9 +2678,15 @@ fn every_shipped_map_spawns_its_entities() {
     // `OnFullyOpen` (31). **No shipped map connects an `OnClose`.**
     // +307 for the branch listeners, and they are as lopsided: `OnAllTrue`
     // (272), `OnAllFalse` (19), `OnMixed` (16).
-    assert_eq!(total.outputs, 54_534);
-    assert_eq!(total.unknown.len(), 160);
-    assert_eq!(total.unknown.values().sum::<usize>(), 26_123);
+    // **+1 for the portals**, and that is the whole of `prop_portal`'s output
+    // surface in the shipped game: `sp_a1_intro1`'s
+    // `portal_red_0.OnPlayerTeleportFromMe`. The other four outputs the class
+    // declares are connected by no map.
+    assert_eq!(total.outputs, 54_535);
+    // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
+    // only one of the five names the class table gained that any map places.
+    assert_eq!(total.unknown.len(), 159);
+    assert_eq!(total.unknown.values().sum::<usize>(), 26_102);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -2751,6 +2758,10 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("dynamic_prop"), None, "registered, never placed");
     assert_eq!(per_class.get("prop_dynamic_glow"), None);
     assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
+    // `portdocs/PORTAL.md` stage 2. 21 across 10 maps, two of them on
+    // `sp_a1_intro1` — the map this port loads by default, which makes this
+    // the rare class whose test bed is already on screen.
+    assert_eq!(per_class.get("prop_portal"), Some(&21));
     // …and **no `player`**: the class is registered because Valve registers
     // it, and no shipped map places one. The 106 in the list are the ones
     // `spawn_player` put there, counted after this loop.
@@ -2772,7 +2783,10 @@ fn every_shipped_map_spawns_its_entities() {
     // more than half for the same reason: most events used to reach nothing
     // because most *targets* were props.
     assert_eq!(io.dispatched, 5_787);
-    assert_eq!(io.accepted, 3_930);
+    // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
+    // `SetActivatedState` a map used to aim at a classname nothing answered
+    // for now lands. Only two of the game's 31 are fired inside two seconds.
+    assert_eq!(io.accepted, 3_932);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -2780,7 +2794,7 @@ fn every_shipped_map_spawns_its_entities() {
     // why this class deliberately does not take `DynamicProp`'s
     // cancel-when-idle divergence.
     assert_eq!(io.thinks, 7_318);
-    assert_eq!(io.no_target, 1_124);
+    assert_eq!(io.no_target, 1_122);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -2857,7 +2871,13 @@ fn every_shipped_map_spawns_its_entities() {
     // of the 2,255 and `every_shipped_floor_button_presses` stands one on each
     // of the 65 — the two halves of the same claim, split because they are
     // answered by different code.
-    assert_eq!(triggers, 2_320);
+    //
+    // **`prop_portal` takes it to 2,341**, and those 21 are the third kind:
+    // `SOLID_OBB` like a floor button's trigger, but the entity the map placed
+    // rather than one made at spawn. They are live whether or not the portal
+    // is `Activated` — `CPortal_Base2D::Spawn` sets `FSOLID_TRIGGER`
+    // unconditionally — which is what stage 4's teleport will hang off.
+    assert_eq!(triggers, 2_341);
 
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
@@ -6493,5 +6513,688 @@ fn the_intro_maps_door_opens_through_the_chain_its_map_built() {
     println!(
         "sp_a1_intro1: both chamber doors open through their own map logic, \
          and door_1 shuts again through its logic_branch_listener"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// prop_portal — `portdocs/PORTAL.md` stage 2
+// ---------------------------------------------------------------------------
+
+use crate::server::classes::portal::{self, PropPortal};
+
+/// A `prop_portal` block, as the shipped maps write one.
+fn portal_block(name: &str, origin: &str, angles: &str, portal_two: &str) -> bsp::Entity {
+    block(&[
+        ("classname", "prop_portal"),
+        ("targetname", name),
+        ("origin", origin),
+        ("angles", angles),
+        ("Activated", "0"),
+        ("PortalTwo", portal_two),
+    ])
+}
+
+fn portal_at<'a>(server: &'a Server, name: &str) -> &'a PropPortal {
+    find_named(server, name)
+        .behaviour
+        .downcast_ref::<PropPortal>()
+        .expect("a PropPortal")
+}
+
+/// Switches a portal on or off the way a map does — through the input, so that
+/// the whole `SetActive` / `UpdatePortalLinkage` path runs.
+fn set_activated(server: &mut Server, name: &str, on: bool) {
+    let id = find_named(server, name).id();
+    server.accept_input(id, "SetActivatedState", Variant::Bool(on), None, None, 0);
+}
+
+/// `sp_a1_intro1`'s two portals, verbatim from its entity lump.
+fn intro1_portals() -> Vec<bsp::Entity> {
+    vec![
+        portal_block("portal_blue_0", "-1264 4112 2728", "0 90 0", "0"),
+        portal_block("portal_red_0", "-1137 4352 2762", "0 180 0", "1"),
+    ]
+}
+
+/// Spawn: the model name, the one-sided trigger box, and the default size —
+/// which is **56 half-height and not 14**, the number the reference tree's own
+/// file-scope initializer gets deliberately wrong.
+#[test]
+fn a_portal_spawns_as_a_one_sided_box_trigger() {
+    let mut server = Server::new();
+    server.level_init("test", &intro1_portals(), &[]);
+
+    let entity = find_named(&server, "portal_blue_0");
+    assert_eq!(entity.core.solid, movement::Solid::Obb);
+    assert!(entity.core.is_solid_flag_set(movement::FSOLID_TRIGGER));
+    assert!(entity.core.is_solid_flag_set(movement::FSOLID_NOT_SOLID));
+    assert!(!entity.core.is_solid(), "a portal is not a wall");
+    assert_eq!(entity.core.move_type, movement::MoveType::None);
+    assert_eq!(entity.core.model.as_deref(), Some(portal::MODEL_PORTAL_1));
+
+    // `GetLocalMins()` .. `GetLocalMaxs()`: nothing behind the plane, 64 units
+    // in front of it.
+    assert_eq!(
+        entity.core.model_bounds.mins,
+        Vec3::new(0.0, -32.0, -56.0),
+        "the box starts at the portal plane"
+    );
+    assert_eq!(
+        entity.core.model_bounds.maxs,
+        Vec3::new(portal::OBB_DEPTH, 32.0, 56.0)
+    );
+
+    let blue = portal_at(&server, "portal_blue_0");
+    assert!(!blue.activated, "all 21 shipped portals start switched off");
+    assert!(blue.linked.is_none());
+    assert_eq!(blue.matrix, glam::Mat4::IDENTITY, "no partner, no transform");
+    assert_eq!(blue.linkage_group, 0);
+    assert_eq!(blue.half_width, portal::DEFAULT_HALF_WIDTH);
+    assert_eq!(blue.half_height, portal::DEFAULT_HALF_HEIGHT);
+
+    // The second model, from the second colour.
+    assert_eq!(
+        find_named(&server, "portal_red_0").core.model.as_deref(),
+        Some(portal::MODEL_PORTAL_2)
+    );
+
+    // **The model is never drawn**, which is the whole of `writez` — see
+    // `PropPortal::model_state`. Nothing in the seam, so nothing for
+    // `world/entities` to resolve into a magenta checkerboard.
+    assert!(
+        server.model_entities().is_empty(),
+        "a portal's model is depth-only and must not reach the renderer"
+    );
+}
+
+/// Two portals link when both are on, and **the colour is an output of
+/// linking** rather than an input to it.
+#[test]
+fn two_active_portals_in_a_group_find_each_other() {
+    let mut server = Server::new();
+    server.level_init("test", &intro1_portals(), &[]);
+
+    set_activated(&mut server, "portal_blue_0", true);
+    assert!(
+        portal_at(&server, "portal_blue_0").linked.is_none(),
+        "one active portal has nobody to link to"
+    );
+
+    set_activated(&mut server, "portal_red_0", true);
+    let blue = find_named(&server, "portal_blue_0").id();
+    let red = find_named(&server, "portal_red_0").id();
+    assert_eq!(portal_at(&server, "portal_blue_0").linked, Some(red));
+    assert_eq!(portal_at(&server, "portal_red_0").linked, Some(blue));
+    assert!(portal_at(&server, "portal_blue_0").is_active_and_linked());
+
+    // They were already opposite, so nothing moved — but the colours must
+    // still *be* opposite, which is the invariant the forcing line keeps.
+    assert!(!portal_at(&server, "portal_blue_0").is_portal2);
+    assert!(portal_at(&server, "portal_red_0").is_portal2);
+}
+
+/// `m_bIsPortal2 = !m_hLinkedPortal->m_bIsPortal2` — and it runs on the
+/// partner first, so **the portal that activates second keeps its colour**.
+#[test]
+fn linking_two_portals_of_one_colour_flips_the_first() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            portal_block("first", "0 0 0", "0 0 0", "0"),
+            portal_block("second", "256 0 0", "0 180 0", "0"),
+        ],
+        &[],
+    );
+
+    set_activated(&mut server, "first", true);
+    set_activated(&mut server, "second", true);
+
+    assert!(
+        portal_at(&server, "first").is_portal2,
+        "the first was turned orange by the second"
+    );
+    assert!(
+        !portal_at(&server, "second").is_portal2,
+        "the second keeps the colour its map gave it"
+    );
+}
+
+/// Deactivating unlinks both sides, and the partner **looks for somebody
+/// else** — the one real recursion in `UpdatePortalLinkage`, which needs three
+/// portals to be visible at all.
+#[test]
+fn deactivating_a_portal_hands_its_partner_on() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            portal_block("a", "0 0 0", "0 0 0", "0"),
+            portal_block("b", "256 0 0", "0 180 0", "1"),
+            portal_block("c", "0 256 0", "0 270 0", "1"),
+        ],
+        &[],
+    );
+
+    set_activated(&mut server, "a", true);
+    set_activated(&mut server, "b", true);
+    let (a, b, c) = (
+        find_named(&server, "a").id(),
+        find_named(&server, "b").id(),
+        find_named(&server, "c").id(),
+    );
+    assert_eq!(portal_at(&server, "a").linked, Some(b));
+
+    // A third portal switching on finds nobody: both of the others are taken.
+    set_activated(&mut server, "c", true);
+    assert_eq!(portal_at(&server, "c").linked, None);
+    assert_eq!(portal_at(&server, "a").linked, Some(b));
+
+    // Now switch `b` off. `a` is orphaned and must be handed to `c`.
+    set_activated(&mut server, "b", false);
+    assert_eq!(portal_at(&server, "b").linked, None);
+    assert_eq!(portal_at(&server, "a").linked, Some(c));
+    assert_eq!(portal_at(&server, "c").linked, Some(a));
+    assert_ne!(
+        portal_at(&server, "a").matrix,
+        glam::Mat4::IDENTITY,
+        "the new pair's matrices were recomputed"
+    );
+    assert_eq!(
+        portal_at(&server, "b").matrix,
+        glam::Mat4::IDENTITY,
+        "a portal with no partner teleports nothing"
+    );
+}
+
+/// The teleport matrix, against the two things it must do.
+///
+/// It is `portdocs/PORTAL.md` §11's first test: a point through the matrix and
+/// back through the inverse is itself, and a portal linked to a copy of itself
+/// at the same place turns a point around.
+#[test]
+fn the_teleport_matrix_turns_a_point_around_the_exit() {
+    use crate::server::classes::portal::teleport_matrix;
+
+    let entrance = (Vec3::new(-1264.0, 4112.0, 2728.0), Vec3::new(0.0, 90.0, 0.0));
+    let exit = (Vec3::new(-1137.0, 4352.0, 2762.0), Vec3::new(0.0, 180.0, 0.0));
+    let there = teleport_matrix(entrance, exit);
+    let back = teleport_matrix(exit, entrance);
+
+    // A round trip is the identity: the two matrices are each other's inverse,
+    // which is what `UTIL_Portal_ComputeMatrix` computing both ends buys.
+    let point = Vec3::new(-1200.0, 4200.0, 2740.0);
+    let round = back.transform_point3(there.transform_point3(point));
+    assert!((round - point).length() < 1e-2, "{round} vs {point}");
+
+    // **A point just behind the entrance comes out just in front of the
+    // exit**, which is the whole teleport. The entrance faces `+Y` and the
+    // exit `-X`.
+    let entrance_forward = Vec3::Y;
+    let exit_forward = -Vec3::X;
+    let crossing = entrance.0 - entrance_forward * 4.0;
+    let arrived = there.transform_point3(crossing);
+    assert!(
+        (arrived - exit.0).dot(exit_forward) > 3.9,
+        "{arrived} is not in front of the exit"
+    );
+
+    // …and a velocity *into* the entrance comes out *out of* the exit, which
+    // is the 180° turn about up. Leave it out and the player backs into the
+    // wall behind the exit.
+    let velocity = -entrance_forward * 200.0;
+    let exited = there.transform_vector3(velocity);
+    assert!(
+        (exited - exit_forward * 200.0).length() < 1e-2,
+        "{exited} should be 200 along {exit_forward}"
+    );
+
+    // A portal linked to a copy of itself, in the same place: the transform is
+    // the half turn about its own up and nothing else.
+    let self_linked = teleport_matrix(entrance, entrance);
+    let up = Vec3::Z;
+    let right = Vec3::X;
+    let offset = |v: Vec3| self_linked.transform_point3(entrance.0 + v) - entrance.0;
+    assert!((offset(up * 10.0) - up * 10.0).length() < 1e-2, "up survives");
+    assert!(
+        (offset(right * 10.0) + right * 10.0).length() < 1e-2,
+        "right reverses"
+    );
+    assert!(
+        (offset(entrance_forward * 10.0) + entrance_forward * 10.0).length() < 1e-2,
+        "forward reverses"
+    );
+}
+
+/// `NewLocation` moves a portal **and switches it on**, which is the side
+/// effect that makes the console command one call rather than two.
+#[test]
+fn new_location_moves_a_portal_and_activates_it() {
+    let mut server = Server::new();
+    server.level_init("test", &intro1_portals(), &[]);
+
+    let id = find_named(&server, "portal_blue_0").id();
+    server.accept_input(
+        id,
+        "NewLocation",
+        Variant::String("64 128 256 0 45 0".to_owned()),
+        None,
+        None,
+        0,
+    );
+
+    let entity = find_named(&server, "portal_blue_0");
+    assert_eq!(entity.core.origin, Vec3::new(64.0, 128.0, 256.0));
+    assert_eq!(entity.core.angles, Vec3::new(0.0, 45.0, 0.0));
+    assert!(
+        portal_at(&server, "portal_blue_0").activated,
+        "`SetActive( true )` is in the middle of the base class's NewLocation"
+    );
+}
+
+/// `Resize` unlinks a pair that no longer matches, because the partner search
+/// compares both half-extents exactly.
+#[test]
+fn resizing_one_portal_of_a_pair_unlinks_it() {
+    let mut server = Server::new();
+    server.level_init("test", &intro1_portals(), &[]);
+    set_activated(&mut server, "portal_blue_0", true);
+    set_activated(&mut server, "portal_red_0", true);
+    assert!(portal_at(&server, "portal_blue_0").linked.is_some());
+
+    let id = find_named(&server, "portal_blue_0").id();
+    server.accept_input(
+        id,
+        "Resize",
+        Variant::String("16 28".to_owned()),
+        None,
+        None,
+        0,
+    );
+
+    let blue = portal_at(&server, "portal_blue_0");
+    assert_eq!(blue.half_width, 16.0);
+    assert_eq!(blue.half_height, 28.0);
+    assert!(blue.linked.is_none(), "different sizes cannot link");
+    assert!(portal_at(&server, "portal_red_0").linked.is_none());
+}
+
+/// The `portal` console command's server half: two calls make a linked pair,
+/// out of nothing, on a map that places no `prop_portal` at all.
+#[test]
+fn placing_a_pair_by_hand_creates_and_links_two_portals() {
+    let mut server = Server::new();
+    server.level_init("test", &[block(&[("classname", "info_target")])], &[]);
+    assert!(server.portals().is_empty());
+
+    assert!(server.place_portal(false, Vec3::new(0.0, 0.0, 64.0), Vec3::ZERO));
+    let portals = server.portals();
+    assert_eq!(portals.len(), 1, "one active portal");
+    assert!(!portals[0].linked, "nobody to link to yet");
+    assert_eq!(portals[0].half_height, portal::DEFAULT_HALF_HEIGHT);
+
+    assert!(server.place_portal(
+        true,
+        Vec3::new(256.0, 0.0, 64.0),
+        Vec3::new(0.0, 180.0, 0.0)
+    ));
+    let portals = server.portals();
+    assert_eq!(portals.len(), 2);
+    assert!(portals.iter().all(|p| p.linked), "a pair, both ways");
+    assert_eq!(
+        portals.iter().filter(|p| p.is_portal2).count(),
+        1,
+        "one of each colour"
+    );
+
+    // Placing the same colour again moves the portal that is already there
+    // rather than making a third — `FindPortal` prefers an active match.
+    assert!(server.place_portal(false, Vec3::new(0.0, 128.0, 64.0), Vec3::ZERO));
+    assert_eq!(server.portals().len(), 2, "moved, not multiplied");
+
+    assert_eq!(server.fizzle_portals(), 2);
+    assert!(
+        server.portals().is_empty(),
+        "an inactive portal is not drawn"
+    );
+    assert_eq!(server.fizzle_portals(), 0, "nothing left to fizzle");
+}
+
+/// **Every one of the game's 21 `prop_portal`s spawns, and every map that
+/// places a pair produces exactly one linked pair once its own
+/// `SetActivatedState 1` connections have been fired.**
+///
+/// `portdocs/PORTAL.md` §11's fourth test. It does not wait for the map's own
+/// logic to reach the portals — most of the 31 connections are minutes into a
+/// chamber — so it fires each connection's input by hand and then checks the
+/// linkage the class produced.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_portal -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_portal_spawns_and_its_map_can_link_a_pair() {
+    use crate::engine::world::bsp::Bsp;
+    use crate::filesystem::Vfs;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut maps, mut spawned, mut activated, mut linked_maps) = (0, 0, 0, 0);
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let entities = bsp.entities();
+        let count = entities
+            .iter()
+            .filter(|e| e.classname() == Some("prop_portal"))
+            .count();
+        if count == 0 {
+            continue;
+        }
+        maps += 1;
+
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+
+        let ids: Vec<EntityId> = server
+            .entities
+            .iter()
+            .filter(|(_, e)| e.behaviour.downcast_ref::<PropPortal>().is_some())
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids.len(), count, "{name}: {count} placed, {} spawned", ids.len());
+        spawned += ids.len();
+        for &id in &ids {
+            let portal = server
+                .entities
+                .get(id)
+                .expect("live")
+                .behaviour
+                .downcast_ref::<PropPortal>()
+                .expect("a PropPortal");
+            assert!(!portal.activated, "{name}: every shipped portal starts off");
+            assert_eq!(portal.linkage_group, 0, "{name}: no map writes the key");
+        }
+
+        // Switch on whatever the map's own logic would switch on. A portal
+        // with no `SetActivatedState 1` aimed at it stays off, which is what
+        // `sp_a4_finale1`'s `NewLocation` pair does instead.
+        //
+        // Every value in the lump is scanned for a connection, rather than
+        // only the keys that look like output names: `AddOutput` and the
+        // instance proxies mean an output can be spelled anything, and a
+        // connection is recognisable by its own shape — five fields separated
+        // by `\x1b`.
+        let fires_on = |target: &str| {
+            entities.iter().any(|block| {
+                block.pairs.iter().any(|(_, value)| {
+                    let mut fields = value.split('\u{1b}');
+                    let to = fields.next();
+                    let input = fields.next();
+                    let parameter = fields.next();
+                    fields.count() == 2
+                        && to.is_some_and(|to| to.eq_ignore_ascii_case(target))
+                        && input.is_some_and(|i| i.eq_ignore_ascii_case("SetActivatedState"))
+                        && parameter.is_some_and(|p| p.trim() == "1")
+                })
+            })
+        };
+        let wanted: Vec<EntityId> = ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                server
+                    .entities
+                    .get(id)
+                    .and_then(|e| e.core.name.clone())
+                    .is_some_and(|name| fires_on(&name))
+            })
+            .collect();
+        for &id in &wanted {
+            server.accept_input(id, "SetActivatedState", Variant::Bool(true), None, None, 0);
+        }
+        activated += server.portals().len();
+
+        // **The linkage is well formed**, which is the property with teeth and
+        // is not "exactly one pair": `sp_a1_intro2` places *four* portals, and
+        // firing every `SetActivatedState 1` in the lump at once — which the
+        // running map never does, because its portals belong to different
+        // rooms — legitimately forms two pairs. So what is asserted is the
+        // invariant: every linked portal's partner links back to it, and no
+        // portal is claimed twice.
+        let mut partners: Vec<(EntityId, EntityId)> = Vec::new();
+        for &id in &ids {
+            let Some(entity) = server.entities.get(id) else {
+                continue;
+            };
+            let portal = entity
+                .behaviour
+                .downcast_ref::<PropPortal>()
+                .expect("a PropPortal");
+            let Some(partner) = portal.linked else { continue };
+            assert!(portal.activated, "{name}: an inactive portal kept a link");
+            let back = server
+                .entities
+                .get(partner)
+                .and_then(|e| e.behaviour.downcast_ref::<PropPortal>())
+                .and_then(|p| p.linked);
+            assert_eq!(back, Some(id), "{name}: the link is one-way");
+            assert_ne!(
+                portal.is_portal2,
+                server
+                    .entities
+                    .get(partner)
+                    .and_then(|e| e.behaviour.downcast_ref::<PropPortal>())
+                    .expect("a partner")
+                    .is_portal2,
+                "{name}: a linked pair must be two colours"
+            );
+            assert_ne!(
+                portal.matrix,
+                glam::Mat4::IDENTITY,
+                "{name}: a linked portal has a real transform"
+            );
+            partners.push((id, partner));
+        }
+        let linked = partners.len();
+        let mut claimed: Vec<EntityId> = partners.iter().map(|&(_, to)| to).collect();
+        claimed.sort_by_key(|id| id.to_int());
+        let before = claimed.len();
+        claimed.dedup();
+        assert_eq!(before, claimed.len(), "{name}: a portal was claimed twice");
+
+        println!(
+            "{name}: {} portals, {} switched on by its own logic, {linked} linked ({} pairs)",
+            ids.len(),
+            server.portals().len(),
+            linked / 2,
+        );
+        if linked > 0 {
+            linked_maps += 1;
+        }
+    }
+
+    println!(
+        "{spawned} prop_portals across {maps} maps; {activated} activate from map logic, \
+         {linked_maps} maps form a pair"
+    );
+    assert_eq!(maps, 10, "ten maps place a portal");
+    assert_eq!(spawned, 21, "twenty-one portals in the game");
+    assert!(linked_maps > 0, "no map managed to link a pair");
+}
+
+/// **The placement snap would never turn a shipped portal, and would move only
+/// four of the twenty-one** — which is what makes skipping it a divergence with
+/// a bounded consequence rather than an unknown one.
+///
+/// `portdocs/PORTAL.md` §11's fifth test, and it justifies a *deletion* rather
+/// than checking an implementation. `CProp_Portal::ActivatePortal`
+/// (`prop_portal.cpp:700`) traces **one unit in front of the portal to eight
+/// units behind it**, takes the surface normal as the portal's new forward and
+/// re-places itself at the hit point. This port activates a portal where the
+/// map put it, so what has to be true is that the trace would not have changed
+/// anything that matters.
+///
+/// The three outcomes, and all three are the map's doing rather than the
+/// port's:
+///
+/// - **Flush** — a surface within a unit, parallel to the portal. The snap is a
+///   no-op.
+/// - **Proud** — a surface further back than a unit but still parallel, because
+///   the mapper placed the portal standing off its wall. The snap would pull it
+///   in; nothing about the portal's frame changes, so a teleport through it
+///   lands in the same place facing the same way.
+/// - **Floating** — no surface within nine units at all, which is every one of
+///   the **four `NewLocation` targets**: `sp_a4_finale1` and `sp_a4_finale2`
+///   each park two tractor-beam portals in mid-air at spawn and move them onto
+///   a wall from script. §11 names these as the interesting exceptions and they
+///   are exactly that — and it is also why neither map switches a portal on
+///   with `SetActivatedState`.
+///
+/// The assertion with teeth is the **angle**: not one of the 21 is more than a
+/// degree off the surface behind it, so the snap cannot re-orient a shipped
+/// portal, and the teleport matrix a map's own placement produces is the one
+/// the shipped game computes.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_portal_is_on_a_wall -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_portal_is_on_a_wall() {
+    use crate::engine::trace::{CollisionBsp, Contents, Ray};
+    use crate::engine::world::bsp::Bsp;
+
+    /// `UTIL_TraceLine( vOrigin + vForward, vOrigin + vForward * -8.0f, ... )`.
+    const AHEAD: f32 = 1.0;
+    const BEHIND: f32 = -8.0;
+    /// How far the snap may move a portal before it counts as *proud* rather
+    /// than flush, and how far it may turn one before the divergence stops
+    /// being free.
+    const FLUSH: f32 = 1.0;
+    const DEGREES: f32 = 1.0;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+        .expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut checked, mut flush, mut proud, mut floating) = (0, 0, 0, 0);
+    let (mut worst_distance, mut worst_angle) = (0.0f32, 0.0f32);
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let entities = bsp.entities();
+        if !entities
+            .iter()
+            .any(|e| e.classname() == Some("prop_portal"))
+        {
+            continue;
+        }
+        let collision = CollisionBsp::build(&bsp);
+
+        // Which portals the map moves from script rather than placing. All four
+        // are expected to be floating, and nothing else is.
+        let is_a_new_location_target = |target: &str| {
+            entities.iter().any(|block| {
+                block.pairs.iter().any(|(_, value)| {
+                    let mut fields = value.split('\u{1b}');
+                    let to = fields.next();
+                    let input = fields.next();
+                    fields.count() == 3
+                        && to.is_some_and(|to| to.eq_ignore_ascii_case(target))
+                        && input.is_some_and(|i| i.eq_ignore_ascii_case("NewLocation"))
+                })
+            })
+        };
+
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+        let ids: Vec<EntityId> = server
+            .entities
+            .iter()
+            .filter(|(_, e)| e.behaviour.downcast_ref::<PropPortal>().is_some())
+            .map(|(id, _)| id)
+            .collect();
+
+        for id in ids {
+            let core = &server.entities.get(id).expect("live").core;
+            let (origin, forward) = (core.origin, PropPortal::forward(core));
+            let label = core.debug_name().to_owned();
+            let moved_by_script = core
+                .name
+                .as_deref()
+                .is_some_and(is_a_new_location_target);
+            checked += 1;
+
+            let ray = Ray::line(origin + forward * AHEAD, origin + forward * BEHIND);
+            let hit = collision.tracer().trace(&ray, Contents::MASK_SHOT_PORTAL);
+            if !hit.did_hit() {
+                floating += 1;
+                println!("  {name}/{label}: floating, moved by NewLocation: {moved_by_script}");
+                assert!(
+                    moved_by_script,
+                    "{name}/{label}: nothing behind it and no script to move it"
+                );
+                continue;
+            }
+
+            // How far the snap would have moved it, and how far it would have
+            // turned it.
+            let distance = (hit.end - origin).length();
+            let angle = forward.dot(hit.normal).clamp(-1.0, 1.0).acos().to_degrees();
+            worst_distance = worst_distance.max(distance);
+            worst_angle = worst_angle.max(angle);
+            assert!(
+                angle <= DEGREES,
+                "{name}/{label}: the snap would turn it {angle:.2} degrees, \
+                 so this port's teleport matrix is not the shipped game's"
+            );
+            match distance <= FLUSH {
+                true => flush += 1,
+                false => {
+                    proud += 1;
+                    println!("  {name}/{label}: proud of its wall by {distance:.3} units");
+                }
+            }
+        }
+    }
+
+    println!(
+        "{checked} shipped portals: {flush} flush, {proud} proud of their wall, \
+         {floating} floating (moved by NewLocation); \
+         the snap would move one at most {worst_distance:.3} units \
+         and turn one at most {worst_angle:.2} degrees"
+    );
+    assert_eq!(checked, 21, "twenty-one portals in the game");
+    assert_eq!(floating, 4, "the four NewLocation targets, and nothing else");
+    assert!(
+        worst_angle <= DEGREES,
+        "a portal the snap would have re-oriented"
     );
 }

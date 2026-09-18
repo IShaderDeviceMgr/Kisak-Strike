@@ -76,7 +76,7 @@ use super::pipeline::{PipelineCache, PipelineKey, RenderState, TargetFormat};
 use super::renderer::Frame;
 use super::shader::ContextBinding;
 use super::target::{RenderTarget, CLEAR_DEPTH};
-use super::uniforms::{self, DrawUniforms, FrameUniforms, ModelLighting};
+use super::uniforms::{self, DrawUniforms, FrameUniforms, ModelLighting, PortalOverlay};
 
 /// Where a camera is and what it sees.
 ///
@@ -266,6 +266,15 @@ pub struct RenderContext {
     /// One slot per `set_model_lighting`. Group 3 for the shaders that light a
     /// model rather than sample a lightmap page.
     lights: UniformArena,
+    /// One slot per `set_portal_overlay`. Group 3 for the one shader that
+    /// draws a portal's oval.
+    ///
+    /// Its own arena rather than a second tenant of `lights`, and the reason
+    /// is the binding *window*: a `UniformArena` binds exactly `size` bytes,
+    /// so sharing one would declare a 432-byte view over a 16-byte struct and
+    /// spend a 256-byte slot on each of them. Two portals is the most a map
+    /// has, which is why [`INITIAL_PORTALS`] is what it is.
+    portals: UniformArena,
     dynamic: DynamicBuffers,
     /// What every pass opened from here multiplies its lit output by:
     /// `CMatRenderContext::m_LastSetToneMapScale` (`cmatrendercontext.cpp:171`).
@@ -357,6 +366,13 @@ impl RenderContext {
                 size_of::<ModelLighting>() as u64,
                 INITIAL_LIGHTING,
             ),
+            portals: UniformArena::new(
+                device,
+                "portal overlay",
+                layouts.portal_overlay(),
+                size_of::<PortalOverlay>() as u64,
+                INITIAL_PORTALS,
+            ),
             dynamic: DynamicBuffers::new(device),
             // `CMatRenderContext::BeginRender`'s starting value, and what a
             // context with no tone mapper keeps for ever: as bright as `vrad`
@@ -402,6 +418,7 @@ impl RenderContext {
         self.frames.begin_frame(&self.device, &self.queue);
         self.draws.begin_frame(&self.device, &self.queue);
         self.lights.begin_frame(&self.device, &self.queue);
+        self.portals.begin_frame(&self.device, &self.queue);
         self.dynamic.begin_frame(&self.device);
     }
 
@@ -603,6 +620,26 @@ impl RenderContext {
             &self.queue,
             bytemuck::bytes_of(&ModelLighting::fullbright()),
         );
+        // …and one shut portal, for the same reason: a `PortalRefract` draw
+        // before `set_portal_overlay` must read something well defined.
+        //
+        // **These are the material's own declared defaults** —
+        // `$PortalOpenAmount "0.0"` and `$PortalStatic "0.0"`, the second of
+        // which reaches the shader as `1 - x` — so "nobody said" is what the
+        // `.vmt` would have said, and it draws nothing. Getting the second one
+        // backwards is not neutral: at `portal_active` 0 the fade-in term goes
+        // to 1 and a single pixel at the exact centre of the quad survives,
+        // which is the kind of artefact nobody would look for.
+        let portal_offset = self.portals.push(
+            &self.device,
+            &self.queue,
+            bytemuck::bytes_of(&PortalOverlay {
+                open_amount: 0.0,
+                portal_active: 1.0,
+                time: 0.0,
+                _padding: 0.0,
+            }),
+        );
 
         let (color_load, depth_load) = match load {
             Load::Clear(color) => (wgpu::LoadOp::Clear(color), wgpu::LoadOp::Clear(CLEAR_DEPTH)),
@@ -644,6 +681,8 @@ impl RenderContext {
             draws: &mut self.draws,
             lights: &mut self.lights,
             lighting_offset,
+            portals: &mut self.portals,
+            portal_offset,
             dynamic: &mut self.dynamic,
             frame_bind_group: self.frames.bind_group().clone(),
             frame_offset,
@@ -774,6 +813,9 @@ pub struct Pass<'a> {
     draws: &'a mut UniformArena,
     /// The model-lighting arena, group 3 for the shaders that read one.
     lights: &'a mut UniformArena,
+    portals: &'a mut UniformArena,
+    /// The slot every subsequent `PortalRefract` draw reads.
+    portal_offset: u32,
     /// The slot in it that subsequent model draws bind. Set by
     /// [`set_model_lighting`](Pass::set_model_lighting); starts at the
     /// fullbright block this pass allocated when it opened.
@@ -972,6 +1014,26 @@ impl Pass<'_> {
         self.lighting_offset = slot.0;
     }
 
+    /// Sets the three numbers every subsequent
+    /// [`PortalRefract`](super::shader::ShaderKind::PortalRefract) draw reads:
+    /// how far open this portal is, how settled it is, and what time it is.
+    ///
+    /// The three material proxies
+    /// `models/portals/portalstaticoverlay_1.vmt` declares, which in the
+    /// shipped game rewrite the *material's* own vars before each draw. See
+    /// [`PortalOverlay`](super::uniforms::PortalOverlay) for why they cannot
+    /// live in the material here.
+    ///
+    /// Applies from here to the end of the pass or the next call, like
+    /// [`set_model_lighting`](Pass::set_model_lighting) — so the call order is
+    /// set, draw, set, draw, and a pass that draws two portals takes two
+    /// slots. Draws of any other shader ignore it.
+    pub fn set_portal_overlay(&mut self, overlay: &PortalOverlay) {
+        self.portal_offset = self
+            .portals
+            .push(self.device, self.queue, bytemuck::bytes_of(overlay));
+    }
+
     /// Overrides part of every subsequent draw's pipeline state.
     ///
     /// See [`StateOverride`]. Applies from here to the end of the pass or the
@@ -1148,6 +1210,16 @@ impl Pass<'_> {
                     self.bound.context = Some((group.clone(), 0));
                 }
             }
+            // Read after any `set_portal_overlay` in this pass, for the reason
+            // the lighting arm above is.
+            Some(ContextBinding::PortalOverlay) => {
+                let group = self.portals.bind_group();
+                let wanted = (group, self.portal_offset);
+                if self.bound.context.as_ref().map(|(g, o)| (g, *o)) != Some(wanted) {
+                    self.pass.set_bind_group(3, group, &[self.portal_offset]);
+                    self.bound.context = Some((group.clone(), self.portal_offset));
+                }
+            }
         }
 
         let (buffer, offset, count) = vertices.identity();
@@ -1210,6 +1282,7 @@ impl Drop for Pass<'_> {
     fn drop(&mut self) {
         self.draws.flush(self.queue);
         self.lights.flush(self.queue);
+        self.portals.flush(self.queue);
     }
 }
 
@@ -1220,6 +1293,10 @@ const INITIAL_DRAWS: u64 = 4096;
 /// One per model instance rather than per draw — `R_StudioSetupLighting` runs
 /// once and every mesh of that model is drawn under it.
 const INITIAL_LIGHTING: u64 = 1024;
+/// One per portal drawn. A shipped map places at most **four** `prop_portal`s
+/// and can have at most two of them active at once; the slack is for the
+/// `portal` console command, which can make as many pairs as it is asked for.
+const INITIAL_PORTALS: u64 = 16;
 
 /// A uniform buffer sub-allocated a slot at a time, bound with a dynamic
 /// offset.

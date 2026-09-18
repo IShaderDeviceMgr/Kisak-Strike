@@ -543,6 +543,34 @@ impl<'a> Context<'a> {
         name::find_by_name(self.entities, query).collect()
     }
 
+    /// `gEntList.FindEntityByClassname( NULL, classname )`, every match, in
+    /// list order — which is spawn order.
+    ///
+    /// The one caller is `prop_portal`'s linkage group. Valve does not scan
+    /// for that: `CProp_Portal` keeps `s_PortalLinkageGroups[256]`, a
+    /// file-scope array of vectors maintained by `AddToLinkageGroup` and the
+    /// destructor. A `static` cannot hold per-[`Server`](super::Server) state
+    /// here — every test in this module builds its own server — and the scan
+    /// costs a string compare per entity against a game that has **21
+    /// portals**, none of whose maps holds more than four. The condition for
+    /// giving the class a real registry is a class that wants one *per tick*
+    /// rather than per activation.
+    ///
+    /// **Exact, not `names_match`**: a classname is not a targetname and
+    /// `FindEntityByClassname`'s wildcard form is `FindEntityByClassnameNearest`
+    /// and friends, which nothing here uses. The comparison is
+    /// case-insensitive for the reason [`super::classes::lookup`] is.
+    ///
+    /// As with every `Context` lookup, **the entity being dispatched is not in
+    /// the list** and so never comes back from this.
+    pub fn find_all_of_class(&self, classname: &str) -> Vec<EntityId> {
+        self.entities
+            .iter()
+            .filter(|(_, entity)| entity.core.classname().eq_ignore_ascii_case(classname))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// `gEntList.FindEntityByName( NULL, name, pSearching, pActivator,
     /// pCaller )` — the first match, procedural names included.
     ///

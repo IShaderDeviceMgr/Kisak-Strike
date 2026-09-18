@@ -336,6 +336,20 @@ impl RenderContext {
             &camera,
             Load::Clear(super::renderer::CLEAR_COLOR),
         );
+        // A portal's overlay reads group 3, and the pass's default is a *shut*
+        // portal — which is what the `.vmt` itself declares and which draws
+        // nothing at all. An inspector that shows nothing for a valid material
+        // is not an inspector, so `-vmt models/portals/portalstaticoverlay_1`
+        // gets a settled one: fully open, no interference, and the scene clock
+        // so the noise scrolls.
+        if material.shader == super::shader::ShaderKind::PortalRefract {
+            pass.set_portal_overlay(&super::uniforms::PortalOverlay {
+                open_amount: 1.0,
+                portal_active: 1.0,
+                time: seconds,
+                _padding: 0.0,
+            });
+        }
         preview.draw(&mut pass, material);
     }
 }

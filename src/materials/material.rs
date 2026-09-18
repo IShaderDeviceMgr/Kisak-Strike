@@ -253,6 +253,13 @@ impl Material {
                 let block = shader::refract_uniforms(vmt, resolved);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
             }
+            // The only shader here whose block does not depend on `resolved`
+            // *or* on the textures: it reads two of them and asks neither for
+            // its size or its alpha channel.
+            ShaderKind::PortalRefract => {
+                let block = shader::portal_refract_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
         };
         entries.push(wgpu::BindGroupEntry {
             binding: shader::BINDING_MATERIAL_UNIFORMS,

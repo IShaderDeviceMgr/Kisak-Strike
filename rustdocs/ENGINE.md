@@ -239,6 +239,10 @@ pub fn load_entity_models(
     entities: &[entities::ModelEntity],
 );
 pub fn sync_entity_models(&mut self, entities: &[entities::ModelEntity]);
+/// The active portals, once a rendered frame. The third and simplest of the
+/// three server seams — a portal owns no uploaded geometry, so the list is
+/// replaced rather than matched.
+pub fn sync_portals(&mut self, portals: &[portals::Portal]);
 pub fn center(&self) -> Vec3;
 pub fn summary(&self) -> String;
 
@@ -319,7 +323,8 @@ if !translucent.is_empty() {
 
 `translucent_list` is `CClientLeafSystem::BuildRenderablesList` plus `SortEntities`
 (`clientleafsystem.cpp:1985`): every batch of every instance whose material blends, or
-whose *entity* is alpha-modulated, with a sort key of
+whose *entity* is alpha-modulated — **plus every active portal's oval**, which is in the
+list unconditionally because `PortalRefract`'s blending is a literal — with a sort key of
 `dot( boxCenter - viewOrigin, viewForward )`. The list comes back **ascending**, which is
 Valve's order, and `draw_translucent` walks it in reverse — farthest first — which is
 `DrawTranslucentRenderables`' countdown from the end of the array.
@@ -734,6 +739,81 @@ Six things about it are worth knowing.
   **travels**, and `prop_dynamic` is not quite it: a prop that *animates* is re-posed every frame but its origin does not
   move, and 2,355 of them name a `parentname` whose transform this port does not
   apply anyway (`rustdocs/SERVER.md` gotcha 34).
+
+### `world::portals` — the oval a portal wears
+
+```rust
+pub struct Portal {
+    pub id: u64,              // opaque and stable, though nothing matches on it
+    pub origin: Vec3,
+    pub angles: Vec3,         // pitch, yaw, roll
+    pub half_width: f32,      // 32
+    pub half_height: f32,     // 56 — not 14; `rustdocs/SERVER.md` gotcha 79
+    pub is_portal2: bool,     // which of the two overlay materials
+    pub open_for: f32,        // how long it has been open, in seconds
+}
+
+pub struct Portals { /* private */ }
+
+impl Portals {
+    pub fn load(materials: &mut MaterialCache, vfs: &Vfs) -> Portals;
+    pub fn sync(&mut self, portals: &[Portal]);
+    pub fn centers(&self) -> impl Iterator<Item = (usize, Vec3)> + '_;
+    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize);
+}
+```
+
+**The fourth kind of geometry in a level, and the first that is not in any
+file.** World faces are `.bsp` geometry with the identity, brush models are
+`.bsp` geometry with a matrix, static props are `.mdl` geometry the *compiler*
+placed and entity models are `.mdl` geometry the *game* places. A portal's oval
+is **four vertices built from four numbers, every frame**, wearing a material
+with no geometry of its own anywhere in the game's files —
+`CPortalRenderable_FlatBasic::DrawSimplePortalMesh` with
+`models/portals/portalstaticoverlay_1.vmt` bound.
+
+`portdocs/PORTAL.md` **stage 2 of five**, so **what you see is a coloured oval
+on an unbroken wall**: no hole, no view through, no reflection of the room on
+the other side. That is the deliberate output of that document's scope and is
+worth saying out loud before anyone reports it as a bug.
+
+There is no per-instance load step and nothing to keep alive across an absence,
+which is why `sync` *replaces* the list where
+[`EntityModels::sync`](#worldentities--the-models-a-game-entity-places) matches
+on `id`. Each portal is one draw with no batches, so it joins
+[`World::translucent_list`](#world) directly as `Translucent::Portal(index)`;
+the overlay material blends unconditionally, so there is no opaque half to split
+off and no `GeometryPass` question to ask.
+
+**The two materials load on every map**, including the 96 of 106 that place no
+`prop_portal`. That is Valve's — `c_prop_portal.cpp:75` precaches both through
+`PRECACHE( MATERIAL, … )`, per level, asking nothing about the entity list — and
+it costs two `.vmt`s and three `.vtf`s: a 256x256 DXT1 noise field shared between
+them and a 256x1 gradient strip each, 45 KB in all.
+
+Three things here produce a plausible wrong picture rather than an error.
+
+- **The portal *model* draws nothing and must not be drawn.**
+  `models/portals/portal1.mdl` is four vertices wearing `writez`, a depth-only
+  shader that punches a depth hole for the recursive view. `prop_portal`
+  reports no `ModelState`, so it never reaches `EntityModels` — and `writez` is
+  not a shader this port has, so a material lookup would put a magenta
+  rectangle across the wall.
+- **The quad's winding comes from `up × right == forward`.** Source's
+  `(forward, right, up)` basis is left-handed — at yaw 0 they are `+X`, `-Y`,
+  `+Z` — so the pair satisfying `u × v == n` is `(up, right)` and not
+  `(right, up)`. The other way round back-face-culls the oval and the portal is
+  simply invisible.
+- **`uv.y` is 0 at the *top*.** The shader's bottom-to-top brightness shift
+  reads `abs(uv.y)`, so building the quad the other way up inverts the gradient
+  — and an upside-down gradient on a symmetric oval looks deliberate.
+
+`open_for` is where the two curves come from: `$PortalOpenAmount` climbs to 1
+over half a second and `$PortalStatic` decays to 0 over one, which is
+`C_Prop_Portal::ClientThink` integrating both. The seam carries the *elapsed*
+time rather than the instant because the instant is on the server's tick clock
+and the elapsed time is measured against the scene's; `Engine::frame` does the
+subtraction, clamped at zero.
 
 ### `world::light` — the light cache
 
@@ -3083,7 +3163,42 @@ is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut In
 disjoint from the rest).
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
-`trace`, `tonemap`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
+`trace`, `tonemap`, `portal`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
+
+<a id="the-portal-command"></a>
+
+**The `portal` command** is this port's own, and `portdocs/PORTAL.md` §10 asks for it by
+name: twenty-one scripted portals across ten maps is not enough to develop against, and
+nineteen of them are at axis-aligned yaws.
+
+```text
+portal 1 | blue      place the blue portal where you are looking
+portal 2 | orange    place the orange portal
+portal off           fizzle every portal in the map
+```
+
+It is `CWeaponPortalgun::TraceFirePortal` with the gun, the multi-segment trace, the
+fizzle taxonomy and every placement rule removed — so no surface is refused, nothing is
+checked for overlap, and a `func_noportal_volume` means nothing. What is left is the three
+lines that decide *where*: trace along the view with `MASK_SHOT_PORTAL`, take the surface
+normal as the new forward through `math::vector_angles`, and hand the pair to
+`Server::place_portal`, which is `FindPortal` plus `NewLocation`. Placing both colours
+links them, because `NewLocation` activates the portal it moves and an activating portal
+looks for a partner.
+
+**One rule from the gun is here**: a portal on a floor or a ceiling is rolled to face the
+player. `TraceFirePortal` builds a pseudo-up of world `+Z` and replaces it with the shot
+direction when the surface normal is vertical to within a thousandth — *"If we're upright,
+then the top of the portal should be away from us"*. Without it every floor portal comes
+out at yaw 0 regardless of where you stood, which is confusing to debug a teleport
+against.
+
+**Nothing stops the two ending up in the same place.** Typing `portal 1` and `portal 2`
+without moving gives two coincident ovals linked to each other, whose transform is the
+half turn about their own shared up axis.
+`VerifyPortalPlacementAndFizzleBlockingPortals` is what refuses that in the shipped game,
+and it is the gun's — so this is the most visible consequence of deleting the placement
+rules, and it is the command working as specified rather than a fault.
 
 ### `Engine::render` — the frame, in six steps
 
@@ -3094,7 +3209,7 @@ post.measurement()        drain the readback, feed client.tonemap  DoTonemapping
 context.set_exposure(..)  BEFORE the scene, never after           UpdateMaterialSystemTonemapScalar
 world.draw(post.scene)    the opaque scene, offscreen             DrawWorld + DrawOpaqueRenderables
 update_refract_texture    the copy, then draw_refracting          UpdateRefractTexture
-world.draw_translucent    everything blended, back to front       DrawTranslucentRenderables
+world.draw_translucent    everything blended (portals included)     DrawTranslucentRenderables
 post.resolve(frame, ..)   measure it, then put it on the screen   DoEnginePostProcessing
 ```
 
@@ -3162,8 +3277,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-321 tests under `engine::`, 13 of them depot-gated; 980 in the crate. (Both counts had
-gone stale — they last read 229 and 456 — so treat them as a scale rather than a
+311 tests under `engine::`, 14 of them depot-gated; 971 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
@@ -3194,6 +3308,10 @@ behaviour against a headless `egui::Context` (`engine::console::ui`), and the
 | `a_face_naming_a_vertex_that_is_not_there_is_caught_at_load` | gotcha #7 |
 | `texture_coordinates_are_divided_by_the_texture_size` | gotcha #6 |
 | `a_translucent_render_mode_is_what_reads_renderamt` | `ComputeRenderAlpha`'s substitution: that `kRenderNormal` ignores `renderamt` entirely, that a translucent mode at 255 is opaque, that `rendercolor` fills rgb and `renderamt` then overwrites the alpha, and that the colour applies at every mode |
+| `the_quad_faces_out_of_the_wall` | that a portal's oval is not back-face culled, over five shipped angle triples including the one at no right angle at all. Checked as a cross product rather than by rendering, because the failure is silent: the oval is simply not there |
+| `the_texture_coordinates_are_valves_way_round` | `u` from the portal's right edge to its left and `v` from its top to its bottom — `DrawSimplePortalMesh`'s own table. The `v` half is what the shader's bottom-to-top brightness shift reads |
+| `the_quad_is_the_portals_size` | two corners half a width apart across and half a height apart up, centred on the origin |
+| `the_portal_overlay_draws_in_two_colours_and_opens` (`--ignored`, GPU) | the whole draw path, and it needs no map: that both overlay materials resolve to `PortalRefract` rather than the checkerboard, that a blue oval is blue and an orange one orange (which is what says the 256x1 gradient strip is sampled on its one row), and that a settled oval differs from a half-open one (which is what says group 3 reaches the shader at all) |
 | `a_shipped_maps_translucent_list_is_sorted_and_holds_its_blended_geometry` (`--ignored`) | the translucent list against a real map, both ways round: that it comes back ascending along the view direction, and that every brush entity made translucent by its *entity* rather than its materials is in it. Defaults to `sp_a3_00`, the only map in the game with two of those |
 
 The composite itself — that a modulation alpha below 1 really blends an opaque

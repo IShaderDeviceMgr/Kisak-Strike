@@ -31,7 +31,8 @@ use super::shader::{
     BINDING_LIGHTMAP_SAMPLER, BINDING_LIGHTMAP_TEXTURE, BINDING_LIGHTWARP_SAMPLER,
     BINDING_LIGHTWARP_TEXTURE, BINDING_MATERIAL_UNIFORMS, BINDING_PHONGWARP_SAMPLER,
     BINDING_PHONGWARP_TEXTURE, BINDING_PHONG_EXPONENT_SAMPLER, BINDING_PHONG_EXPONENT_TEXTURE,
-    BINDING_REFRACT_SOURCE_SAMPLER, BINDING_REFRACT_SOURCE_TEXTURE, BINDING_REFRACT_TINT_SAMPLER,
+    BINDING_PORTAL_COLOR_SAMPLER, BINDING_PORTAL_COLOR_TEXTURE, BINDING_PORTAL_MASK_SAMPLER,
+    BINDING_PORTAL_MASK_TEXTURE, BINDING_REFRACT_SOURCE_SAMPLER, BINDING_REFRACT_SOURCE_TEXTURE, BINDING_REFRACT_TINT_SAMPLER,
     BINDING_REFRACT_TINT_TEXTURE, BINDING_SELFILLUM_MASK_SAMPLER, BINDING_SELFILLUM_MASK_TEXTURE,
 };
 
@@ -230,9 +231,11 @@ pub struct BindLayouts {
     vertex_lit_material: wgpu::BindGroupLayout,
     phong_material: wgpu::BindGroupLayout,
     refract_material: wgpu::BindGroupLayout,
+    portal_refract_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
     model_lighting: wgpu::BindGroupLayout,
     frame_buffer_copy: wgpu::BindGroupLayout,
+    portal_overlay: wgpu::BindGroupLayout,
 }
 
 impl BindLayouts {
@@ -406,6 +409,37 @@ impl BindLayouts {
                 ],
             }),
             model_lighting: uniform_layout(device, "model lighting"),
+            // Structurally identical to `model_lighting` and deliberately its
+            // own object, for the reason `frame_buffer_copy` below is: a
+            // pipeline declares one group-3 *meaning*, and sharing the layout
+            // object would make it look as though a portal could be handed a
+            // model's ambient cube.
+            portal_overlay: uniform_layout(device, "portal overlay"),
+            portal_refract_material: device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material: PortalRefract"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: BINDING_MATERIAL_UNIFORMS,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Two textures and no `$basetexture` — the smallest
+                        // material layout in the set. A stage-2 material's
+                        // base texture is never sampled; see
+                        // `shader::texture_requests`.
+                        texture_entry(BINDING_PORTAL_MASK_TEXTURE),
+                        sampler_entry(BINDING_PORTAL_MASK_SAMPLER),
+                        texture_entry(BINDING_PORTAL_COLOR_TEXTURE),
+                        sampler_entry(BINDING_PORTAL_COLOR_SAMPLER),
+                    ],
+                },
+            ),
             // Structurally identical to `lightmap` and deliberately its own
             // object: group 3's *meaning* is per shader
             // (`shader::ContextBinding`), and a shared layout would make the
@@ -447,6 +481,7 @@ impl BindLayouts {
             // exponent map and the two warps, so the two sets are not nested.
             ShaderKind::Phong => &self.phong_material,
             ShaderKind::Refract => &self.refract_material,
+            ShaderKind::PortalRefract => &self.portal_refract_material,
         }
     }
 
@@ -480,12 +515,24 @@ impl BindLayouts {
         &self.frame_buffer_copy
     }
 
+    /// Group 3, for the one shader that reads
+    /// [`PortalOverlay`](super::uniforms::PortalOverlay).
+    ///
+    /// A dynamic-offset uniform like
+    /// [`model_lighting`](BindLayouts::model_lighting), and per instance for
+    /// the same reason: two portals on one wall wear one material and differ
+    /// in how far open they are.
+    pub fn portal_overlay(&self) -> &wgpu::BindGroupLayout {
+        &self.portal_overlay
+    }
+
     /// Group 3's layout for a shader, or `None` if it declares no group 3.
     fn context(&self, shader: ShaderKind) -> Option<&wgpu::BindGroupLayout> {
         match shader.context_binding()? {
             ContextBinding::LightmapPage => Some(&self.lightmap),
             ContextBinding::ModelLighting => Some(&self.model_lighting),
             ContextBinding::FrameBufferCopy => Some(&self.frame_buffer_copy),
+            ContextBinding::PortalOverlay => Some(&self.portal_overlay),
         }
     }
 }
@@ -849,6 +896,7 @@ mod tests {
             ShaderKind::VertexLitGeneric,
             ShaderKind::Phong,
             ShaderKind::Refract,
+            ShaderKind::PortalRefract,
         ] {
             // **Every** blend mode, not just two: the translucent pass made all
             // five reachable, and a `ColorTargetState` whose factors a backend

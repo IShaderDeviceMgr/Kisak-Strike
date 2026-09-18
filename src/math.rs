@@ -46,6 +46,50 @@ pub fn angle_matrix(angles: Vec3) -> Mat3 {
     Mat3::from_rotation_z(yaw) * Mat3::from_rotation_y(pitch) * Mat3::from_rotation_x(roll)
 }
 
+/// `VectorAngles( forward, pseudoup, angles )`
+/// (`mathlib/mathlib_base.cpp:1142`) — the inverse of [`angle_matrix`] for a
+/// direction plus a roll reference.
+///
+/// The `QAngle` that would make [`angle_matrix`]'s first column `forward`, with
+/// the roll chosen so that the result's up is as close to `pseudo_up` as the
+/// remaining freedom allows. Its caller in this port is the `portal` console
+/// command, which is `CProp_Portal::ActivatePortal`'s
+/// `VectorAngles( tr.plane.normal, vUp, qAngles )`: put a portal flat on
+/// whatever surface was hit, rolled to stand up the way the player is standing.
+///
+/// Three things about it that are Valve's and not arithmetic:
+///
+/// - **`left` is `pseudo_up × forward`**, which is the same handedness
+///   [`angle_matrix`]'s second column has. Taking the cross the other way round
+///   rolls every result 180°.
+/// - **Pitch is negated**, `atan2( -forward.z, xy )` — the comment in the
+///   original says the engine's own sign is the opposite and that the game DLL
+///   always negates it back.
+/// - **Straight up or straight down loses roll entirely.** Below the `0.001`
+///   guard yaw is read off `left` instead, and roll is *assumed zero* because
+///   one degree of freedom has gone. The yaw branch there carries Valve's own
+///   note that it was copied from `MatrixAngles`, found to be 180° out, and
+///   negated — so the two functions disagree on purpose in exactly that case.
+///
+/// `pseudo_up` need not be perpendicular to `forward`; it only has to be
+/// non-parallel, which is what "pseudo" means here.
+pub fn vector_angles(forward: Vec3, pseudo_up: Vec3) -> Vec3 {
+    let left = pseudo_up.cross(forward).normalize_or_zero();
+    let xy_dist = (forward.x * forward.x + forward.y * forward.y).sqrt();
+    let pitch = (-forward.z).atan2(xy_dist).to_degrees();
+
+    if xy_dist > 0.001 {
+        let yaw = forward.y.atan2(forward.x).to_degrees();
+        let up_z = left.y * forward.x - left.x * forward.y;
+        let roll = left.z.atan2(up_z).to_degrees();
+        Vec3::new(pitch, yaw, roll)
+    } else {
+        // Gimbal lock: forward is (nearly) the z axis, so yaw comes off the
+        // left vector and roll is not recoverable.
+        Vec3::new(pitch, (-left.x).atan2(left.y).to_degrees(), 0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +130,53 @@ mod tests {
             m * Vec3::Z,
             Vec3::new(cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp),
         );
+    }
+
+    /// [`vector_angles`] is [`angle_matrix`]'s inverse for the pair it is
+    /// given, for every orientation that has a roll to recover.
+    ///
+    /// The round trip is the test that catches a sign in either function: an
+    /// angle triple goes to a matrix, its forward and up come back out, and
+    /// the angles rebuilt from those two must rotate the same way. Pitches at
+    /// ±90 are excluded because roll genuinely is not recoverable there —
+    /// which is the `xyDist > 0.001` branch, and is checked separately below.
+    #[test]
+    fn vector_angles_inverts_angle_matrix() {
+        for &(pitch, yaw, roll) in &[
+            (0.0, 0.0, 0.0),
+            (0.0, 90.0, 0.0),
+            (0.0, 180.0, 0.0),
+            (-0.5, 0.0, 0.0),
+            (30.0, 45.0, 60.0),
+            (-75.4673, 21.1748, 6.802),
+            (-5.5, 0.0, 0.0),
+            (89.0, 12.0, -170.0),
+        ] {
+            let m = angle_matrix(Vec3::new(pitch, yaw, roll));
+            let (forward, up) = (m * Vec3::X, m * Vec3::Z);
+            let back = angle_matrix(vector_angles(forward, up));
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let (a, b) = (m * axis, back * axis);
+                assert!((a - b).length() < 1e-4, "{pitch} {yaw} {roll}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// The gimbal-lock branch: a portal on the floor or the ceiling. The
+    /// forward axis still has to come back exactly; the roll is discarded and
+    /// the yaw absorbs it, which is the degree of freedom that was lost.
+    #[test]
+    fn a_straight_up_direction_keeps_its_forward_and_loses_its_roll() {
+        for (forward, up) in [
+            (Vec3::Z, Vec3::X),
+            (-Vec3::Z, Vec3::X),
+            (Vec3::Z, Vec3::Y),
+        ] {
+            let angles = vector_angles(forward, up);
+            assert_eq!(angles.z, 0.0, "roll is not recoverable here");
+            let back = angle_matrix(angles) * Vec3::X;
+            assert!((back - forward).length() < 1e-5, "{back} vs {forward}");
+        }
     }
 
     /// The transpose is the inverse — which is what `VectorIRotate` assumes

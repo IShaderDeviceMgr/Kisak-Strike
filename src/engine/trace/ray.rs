@@ -155,6 +155,14 @@ impl Contents {
     /// Everything normally solid, minus entities — world and brush models only.
     pub const MASK_SOLID_BRUSHONLY: Contents =
         Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::WINDOW.0 | Self::GRATE.0);
+    /// `MASK_SHOT_PORTAL` (`public/bspflags.h:138`) — what a portal may be
+    /// placed against.
+    ///
+    /// [`MASK_SOLID`](Contents::MASK_SOLID) minus `GRATE`, which is the whole
+    /// difference and is the point: you cannot shoot a portal through a grate,
+    /// and you can shoot one *at* a window.
+    pub const MASK_SHOT_PORTAL: Contents =
+        Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::WINDOW.0 | Self::MONSTER.0);
     pub const MASK_WATER: Contents = Contents(Self::WATER.0 | Self::MOVEABLE.0 | Self::SLIME.0);
     /// Everything that blocks lighting.
     pub const MASK_OPAQUE: Contents = Contents(Self::SOLID.0 | Self::MOVEABLE.0 | Self::OPAQUE.0);

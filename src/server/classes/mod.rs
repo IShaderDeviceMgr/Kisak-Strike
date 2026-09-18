@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Forty-five classnames, 34,802 of the shipped game's 60,925 entity
-//! blocks.** Five of the 45 are placed by no map: `player` (the engine makes
+//! **Forty-six classnames, 34,823 of the shipped game's 60,925 entity
+//! blocks.** Five of the 46 are placed by no map: `player` (the engine makes
 //! it when a client connects), `trigger_portal_button` (a `prop_floor_button`
 //! makes it in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **40 of
+//! `light_glspot`, each registered because Valve registers it — so **41 of
 //! the 200 classnames the maps place** are implemented.
 //!
 //! Stage 1 brought ten of them — `worldspawn`, the light family,
@@ -30,7 +30,10 @@
 //! and its three siblings — 8,462 entities, more than stages 3 and 4 together
 //! — and `prop_testchamber_door`, which is 138 across 71 maps and is the
 //! chamber door itself. `logic_branch_listener` (158, across 46 maps) came
-//! after it, because it is what shuts those doors again.
+//! after it, because it is what shuts those doors again. `prop_portal` (21,
+//! across 10 maps) is the newest, and is `portdocs/PORTAL.md` stage 2: it
+//! links to its partner and computes the teleport matrix, but carves no hole
+//! and teleports nobody.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -53,6 +56,7 @@ pub mod light;
 pub mod logic;
 pub mod player;
 pub mod point;
+pub mod portal;
 pub mod prop;
 pub mod trigger;
 pub mod world;
@@ -69,6 +73,7 @@ pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Relay, Timer};
 pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
 pub use point::PointTeleport;
+pub use portal::PropPortal;
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
@@ -435,6 +440,17 @@ pub(super) static CLASSES: &[ClassDef] = &[
         outputs: prop::TESTCHAMBER_DOOR_OUTPUTS,
         create: TestChamberDoor::create,
     },
+    // …and the third, which is `portdocs/PORTAL.md` stage 2. 21 across 10
+    // maps, **two of them on `sp_a1_intro1`**. It draws no model — see
+    // [`PropPortal::model_state`] — and what you see where one is, is
+    // `engine::world::portals`' overlay quad.
+    ClassDef {
+        name: "prop_portal",
+        keys: portal::PORTAL_KEYS,
+        inputs: PORTAL_INPUTS,
+        outputs: portal::PORTAL_OUTPUTS,
+        create: PropPortal::create,
+    },
     // Never in an entity lump: one is created by every `prop_floor_button`'s
     // `Spawn`. It is in the table because the table is the *factory*, and
     // `Context::create_entity` goes through it.
@@ -547,6 +563,7 @@ static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
 static FLOOR_BUTTON_INPUTS: InputDefs = prop::FLOOR_BUTTON_INPUTS;
 static DYNAMIC_PROP_INPUTS: InputDefs = prop::DYNAMIC_PROP_INPUTS;
 static TESTCHAMBER_DOOR_INPUTS: InputDefs = prop::TESTCHAMBER_DOOR_INPUTS;
+static PORTAL_INPUTS: InputDefs = portal::PORTAL_INPUTS;
 /// `CBaseTrigger`'s two keys, which a `trigger_portal_button` is never offered
 /// — it is built from code — but which its `key_value` forwards, so they are
 /// declared. The invariant test checks the declaration against the code, not

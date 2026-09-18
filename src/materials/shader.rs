@@ -187,6 +187,35 @@ pub enum ShaderKind {
     /// [`needs_frame_buffer_copy`] for which materials actually want the copy
     /// and which supply their own `$basetexture` instead.
     Refract,
+
+    /// The coloured oval a portal wears — `portdocs/PORTAL.md` §7.
+    ///
+    /// `stdshaders/portal_refract.cpp` through `portal_refract_helper.cpp`,
+    /// `portal_refract_vs20.fxc` and `portal_refract_ps2x.fxc`.
+    ///
+    /// **One shader name, three unrelated pixel shaders, and this variant is
+    /// the third.** `$Stage` picks between the see-through warp (0), the
+    /// stencil punch (1) and the oval (2), and the first two exist only to
+    /// make `CPortalRenderable_FlatBasic`'s recursive view composite — which
+    /// is out of scope. So [`resolve`](ShaderKind::resolve) answers this
+    /// variant **only for `$Stage 2`** and `None` for the other two, which is
+    /// the second thing in the port that `from_name` and `resolve` disagree
+    /// about (the first is [`Phong`](ShaderKind::Phong), and it disagrees the
+    /// other way).
+    ///
+    /// Measured over the mounted game: **7 materials name `PortalRefract`, 5
+    /// of them stage 2** — the three `models/portals/portalstaticoverlay_*`
+    /// and the two `effects/fakeportalring_*`, which reach stage 2 through
+    /// `$UseOnStaticProp` rather than through `$Stage`. The other two are
+    /// `portal_refract_1` (stage 0) and `portal_stencil_hole` (stage 1), and
+    /// nothing in this port draws either.
+    ///
+    /// It is the first shader here whose group 3 is neither lighting nor a
+    /// copy of the frame: three numbers that differ between two portals
+    /// wearing the same material, which in the shipped game are material vars
+    /// rewritten by proxies. See
+    /// [`PortalOverlay`](super::uniforms::PortalOverlay).
+    PortalRefract,
 }
 
 /// What a shader binds in group 3, if anything.
@@ -220,6 +249,18 @@ pub enum ContextBinding {
     /// (`cmatrendercontext.cpp:456`) and filled by
     /// [`RenderContext::update_refract_texture`](super::context::RenderContext::update_refract_texture).
     FrameBufferCopy,
+    /// [`PortalOverlay`](super::uniforms::PortalOverlay), bound with a dynamic
+    /// offset the way [`ModelLighting`](ContextBinding::ModelLighting) is.
+    /// [`Pass::set_portal_overlay`](super::context::Pass::set_portal_overlay).
+    ///
+    /// **The one shape here that is not render-context state in the original**,
+    /// and it is here because there is nowhere else: it is per-*instance*
+    /// material data, which Valve carries in the material's own var table and
+    /// rewrites with a proxy before each draw. Group 1 is baked at load in this
+    /// port, so two portals wearing one material could not differ. Group 3 is
+    /// already the per-shader, per-instance slot — that is what
+    /// `ModelLighting` is — so it goes there.
+    PortalOverlay,
 }
 
 impl ShaderKind {
@@ -250,6 +291,7 @@ impl ShaderKind {
             }
             n if n.eq_ignore_ascii_case("VertexLitGeneric") => Some(ShaderKind::VertexLitGeneric),
             n if n.eq_ignore_ascii_case("Refract") => Some(ShaderKind::Refract),
+            n if n.eq_ignore_ascii_case("PortalRefract") => Some(ShaderKind::PortalRefract),
             _ => None,
         }
     }
@@ -274,6 +316,15 @@ impl ShaderKind {
         if kind == ShaderKind::VertexLitGeneric && wants_phong(vmt) {
             return Some(ShaderKind::Phong);
         }
+        // The *other* direction: a name this port knows, on a material it
+        // cannot draw. `PortalRefract`'s three stages are three unrelated
+        // pixel shaders and only the third is ported, so a stage-0 or stage-1
+        // material resolves to nothing and gets the error material — which is
+        // the honest answer and is what keeps the depot census truthful. See
+        // [`portal_refract_stage`].
+        if kind == ShaderKind::PortalRefract && portal_refract_stage(vmt) != 2 {
+            return None;
+        }
         Some(kind)
     }
 
@@ -292,6 +343,7 @@ impl ShaderKind {
             ShaderKind::VertexLitGeneric => "VertexLitGeneric",
             ShaderKind::Phong => "Phong",
             ShaderKind::Refract => "Refract",
+            ShaderKind::PortalRefract => "PortalRefract",
         }
     }
 
@@ -361,6 +413,23 @@ impl ShaderKind {
             // arrives, and it will want a tangent on a `SimpleVertex` rather
             // than the world one.
             ShaderKind::Refract => VertexLayout::Model,
+            // `PortalRefract` declares two formats as well, and unlike
+            // `Refract`'s the axis is not content: `$UseOnStaticProp` picks
+            // between `VERTEX_POSITION | VERTEX_NORMAL` with two texture
+            // coordinates and four floats of user data, and
+            // `VERTEX_POSITION | VERTEX_FORMAT_COMPRESSED` with one texture
+            // coordinate and none (`portal_refract_helper.cpp:88`).
+            //
+            // **One layout serves both, and it is the smaller one**, because
+            // the stage-2 pixel shader reads neither the normal, the tangent
+            // nor the second texture coordinate — the normal and tangent are
+            // stage 0's screen-space warp and the second coordinate is a
+            // constant `(0.25, 0)` that `DrawSimplePortalMesh` writes and
+            // nothing samples. That is a *reduction* rather than a
+            // simplification: adding them would mean binding a second
+            // vertex stream ([`VertexLayout::Model`] takes the baked static
+            // light in slot 1) for a shader with no lighting at all.
+            ShaderKind::PortalRefract => VertexLayout::Simple,
         }
     }
 
@@ -388,6 +457,7 @@ impl ShaderKind {
             // has none.
             ShaderKind::Phong => (VERTEX_LIT_GENERIC_PARAMS, PHONG_PARAMS),
             ShaderKind::Refract => (REFRACT_PARAMS, &[]),
+            ShaderKind::PortalRefract => (PORTAL_REFRACT_PARAMS, &[]),
         };
         STANDARD_PARAMS.iter().chain(own).chain(extra)
     }
@@ -413,6 +483,9 @@ impl ShaderKind {
             // Not lighting: `Refract` has none. What it reads out of the
             // render context is the frame it is being drawn into.
             ShaderKind::Refract => Some(ContextBinding::FrameBufferCopy),
+            // Nor lighting: a portal's oval is emissive and is lit by nothing.
+            // What it reads is its own open amount, which is per instance.
+            ShaderKind::PortalRefract => Some(ContextBinding::PortalOverlay),
         }
     }
 
@@ -437,6 +510,7 @@ impl ShaderKind {
             ShaderKind::VertexLitGeneric => include_str!("shaders/vertexlitgeneric.wgsl"),
             ShaderKind::Phong => include_str!("shaders/phong.wgsl"),
             ShaderKind::Refract => include_str!("shaders/refract.wgsl"),
+            ShaderKind::PortalRefract => include_str!("shaders/portalrefract.wgsl"),
         };
         // A second shared fragment, narrower than the prelude: group 3's
         // *layout* is per shader, so a `@group(3)` declaration cannot live in
@@ -1183,6 +1257,127 @@ const REFRACT_PARAMS: &[ShaderParam] = &[
     },
 ];
 
+/// `PortalRefract`'s own parameters (`stdshaders/portal_refract.cpp:11`), all
+/// eleven of them.
+///
+/// Nothing is left out, which makes this the only shader table in the module
+/// that is a straight transliteration — the declaration is small, and every
+/// entry either reaches the shader or decides which stage it is.
+///
+/// Four of them are worth a note.
+///
+/// - **`$Stage` is not a parameter the shader reads**, it is which of three
+///   shaders runs. See [`portal_refract_stage`] and
+///   [`ShaderKind::resolve`](ShaderKind::resolve).
+/// - **`$UseOnStaticProp` forces the stage to 2** whatever `$Stage` says
+///   (`portal_refract_helper.cpp:79`), and changes the vertex format, which is
+///   why the two `effects/fakeportalring_*` materials are stage-2 materials
+///   without saying so.
+/// - **`$PortalStatic` is inverted on the way to the shader.** The register is
+///   `g_flPortalActive = 1 - $PortalStatic` (`:216`), so the parameter means
+///   "how much interference" and the shader reads "how settled".
+/// - **`$PortalOpenAmount`, `$PortalStatic` and `$time` are per *instance*
+///   here**, not per material: content drives all three from material proxies
+///   and this port has none, so they come from group 3. See
+///   [`PortalOverlay`](super::uniforms::PortalOverlay).
+///
+/// `$color`, `$color2` and `$alpha` are declared by `CBaseShader` and read by
+/// nothing: neither `.fxc` declares `cModulationColor` at all. `$alpha` still
+/// reaches [`render_state`] through `IsAlphaModulating`, and there it changes
+/// nothing, because this shader blends unconditionally.
+const PORTAL_REFRACT_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$stage",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "Stage of portal rendering (0, 1, 2)",
+    },
+    ShaderParam {
+        name: "$portalopenamount",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "Portal open amount 0.0-1.0",
+    },
+    ShaderParam {
+        name: "$portalstatic",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "Portal static amount 0.0-1.0",
+    },
+    ShaderParam {
+        name: "$portalmasktexture",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "Mask texture",
+    },
+    ShaderParam {
+        name: "$texturetransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "Texcoord transform",
+    },
+    ShaderParam {
+        name: "$portalcolortexture",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "Color texture",
+    },
+    ShaderParam {
+        name: "$portalcolorgradientdark",
+        kind: ParamKind::Color,
+        declared_default: "[0.0 0.0 0.0]",
+        help: "The dark end of a tint gradient if not using a color texture",
+    },
+    ShaderParam {
+        name: "$portalcolorgradientlight",
+        kind: ParamKind::Color,
+        declared_default: "[1.0 1.0 1.0]",
+        help: "The light end of a tint gradient if not using a color texture",
+    },
+    ShaderParam {
+        name: "$portalcolorscale",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "Portal color scale",
+    },
+    ShaderParam {
+        name: "$time",
+        kind: ParamKind::Float,
+        declared_default: "0.0",
+        help: "Needs CurrentTime Proxy",
+    },
+    ShaderParam {
+        name: "$useonstaticprop",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "Activate special mode to use this shader on a static prop",
+    },
+];
+
+/// Which of `PortalRefract`'s three shaders a `.vmt` asks for.
+///
+/// `int nStage = IS_PARAM_DEFINED( m_nStage ) ? params[m_nStage]->GetIntValue() : 0;`
+/// followed by `if ( bUseOnStaticProp ) { nStage = 2; }`
+/// (`portal_refract_helper.cpp:71,79`) — **in that order**, so
+/// `$UseOnStaticProp` overrides an explicit `$Stage` rather than defaulting
+/// one. Both `effects/fakeportalring_*` materials write `$Stage 2` as well, so
+/// no shipped material distinguishes the two readings; a material that wrote
+/// `$Stage 0 $UseOnStaticProp 1` would be stage 2.
+///
+/// `InitParamsPortalRefract` also *writes* the default back into the parameter
+/// when it is undefined (`:26`), which is why an undefined `$Stage` is 0 here
+/// rather than "unknown".
+fn portal_refract_stage(vmt: &Vmt) -> i32 {
+    let kind = ShaderKind::PortalRefract;
+    if param_value(kind, vmt, "$useonstaticprop").is_some_and(|var| var.as_bool()) {
+        return 2;
+    }
+    param_value(kind, vmt, "$stage")
+        .map(|var| var.as_f32() as i32)
+        .unwrap_or(0)
+}
+
+
 /// The value of a parameter, or the default an undefined one takes.
 ///
 /// `CShaderSystem::InitShaderParameters` (`shadersystem.cpp:838`) in one
@@ -1297,6 +1492,22 @@ pub const BINDING_LIGHTWARP_SAMPLER: u32 = 24;
 /// `((N·H)^k, fresnel)`, for iridescence. One Portal 2 material has one.
 pub const BINDING_PHONGWARP_TEXTURE: u32 = 25;
 pub const BINDING_PHONGWARP_SAMPLER: u32 = 26;
+
+/// `PortalRefract`'s two.
+///
+/// `$PortalMaskTexture` is the noise the flames are made of —
+/// `models/portals/noise-blur-256x256`, a 256x256 DXT1 image, **not sRGB**
+/// because it is a mask (`EnableSRGBRead( SHADER_SAMPLER1, false )`,
+/// `portal_refract_helper.cpp:128`). Its parameter is named for the
+/// *stage-0/1* use it no longer has; in stage 2 it is a noise field.
+pub const BINDING_PORTAL_MASK_TEXTURE: u32 = 27;
+pub const BINDING_PORTAL_MASK_SAMPLER: u32 = 28;
+/// `$PortalColorTexture` — **a 256x1 gradient strip**, sampled with `tex1D` in
+/// the original and here at `v = 0.5`, the same way `$lightwarptexture` is.
+/// sRGB, and the whole of a portal's colour: `portal-blue-color.vtf` and
+/// `portal-orange-color.vtf` are 1,669 bytes each and differ in nothing else.
+pub const BINDING_PORTAL_COLOR_TEXTURE: u32 = 29;
+pub const BINDING_PORTAL_COLOR_SAMPLER: u32 = 30;
 
 /// Where the lightmap page is bound, in group **3**.
 ///
@@ -1688,6 +1899,32 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
                 dimension: TextureDimension::Cube,
             },
         ],
+        // `InitPortalRefract` (`portal_refract_helper.cpp:51`) — two textures,
+        // and it loads them **only for stage 2**, which is the only stage this
+        // port resolves. `LoadTexture( m_nPortalMaskTexture )` with no flags
+        // and `LoadTexture( m_nPortalColorTexture, TEXTUREFLAGS_SRGB )`, and
+        // the shadow phase agrees with both.
+        //
+        // A stage-2 material's **`$basetexture` is never sampled** and is
+        // therefore not requested: `effects/fakeportalring_blue` writes one
+        // (`models\portals\dummy-blue`) and stage 2 binds only samplers 1 and
+        // 2. Requesting it would upload an image no pixel reads and would put
+        // it in front of [`render_state`]'s translucency test, where this
+        // shader's answer is fixed.
+        ShaderKind::PortalRefract => vec![
+            TextureRequest {
+                param: "$PortalMaskTexture",
+                binding: BINDING_PORTAL_MASK_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$PortalColorTexture",
+                binding: BINDING_PORTAL_COLOR_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+        ],
     }
 }
 
@@ -1714,6 +1951,14 @@ pub fn needs_frame_buffer_copy(kind: ShaderKind, vmt: &Vmt) -> bool {
         ShaderKind::Refract => {
             !param_value(kind, vmt, "$localrefract").is_some_and(|var| var.as_bool())
         }
+        // **`PortalRefract` falls through to `false`, and its own answer says
+        // so twice.** `NeedsPowerOfTwoFrameBufferTexture` returns `true`
+        // unconditionally when asked at load — "For setting model flag at load
+        // time" — and the *per-frame* question it is really asking,
+        // `bCheckSpecificToThisFrame`, is `params[STAGE] == 0`
+        // (`portal_refract.cpp:44`). Stage 0 is the shader that reads the
+        // scene and it is not ported; stage 2 reads nothing but its own two
+        // textures.
         _ => false,
     }
 }
@@ -1931,7 +2176,11 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         ShaderKind::UnlitGeneric
         | ShaderKind::VertexLitGeneric
         | ShaderKind::Phong
-        | ShaderKind::Refract => Lighting::None,
+        | ShaderKind::Refract
+        // `PortalRefract` is not lit either: a portal's oval is emissive, and
+        // `$PortalColorScale` of 4 is what makes it brighter than anything
+        // around it.
+        | ShaderKind::PortalRefract => Lighting::None,
         ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -2986,6 +3235,133 @@ pub fn refract_uniforms(vmt: &Vmt, textures: ResolvedTextures) -> RefractUniform
     }
 }
 
+/// Flags in [`PortalRefractUniforms::flags`]. Bucket 2 of `PortalRefract`'s
+/// combo split — see [`portal_refract_uniforms`].
+#[allow(dead_code)]
+pub struct PortalRefractFlags;
+
+impl PortalRefractFlags {
+    /// `$nofog`, which `CBaseShader::DefaultFog` honours. No shipped
+    /// `PortalRefract` material sets it.
+    pub const NO_FOG: u32 = 1 << 0;
+    /// The `TINTED` static combo: the gradient comes from
+    /// `$PortalColorGradientDark`/`Light` rather than from
+    /// `$PortalColorTexture`.
+    pub const TINTED: u32 = 1 << 1;
+}
+
+/// `PortalRefract`'s material block — group 1, binding 0.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct PortalRefractUniforms {
+    /// `$TextureTransform`, VS `SHADER_SPECIFIC_CONST_1`, as two rows.
+    ///
+    /// **Only `.xy` of each row is read**, so the translation column does
+    /// nothing — see the vertex shader. No shipped material sets the
+    /// parameter, so all five get the identity.
+    pub texture_transform: [[f32; 4]; 2],
+    /// `g_vGradientDark`, PS `c7`. `w` is unused.
+    pub gradient_dark: [f32; 4],
+    /// `g_vGradientLight`, PS `c8`.
+    pub gradient_light: [f32; 4],
+    /// `x` is `g_flPortalColorScale`, PS `c4.z`. The rest is padding: the two
+    /// registers beside it, `g_flPortalOpenAmount` and `g_flPortalActive`, are
+    /// per instance and live in [`PortalOverlay`](super::uniforms::PortalOverlay).
+    pub params: [f32; 4],
+    /// [`PortalRefractFlags`].
+    pub flags: u32,
+    pub _padding: [u32; 3],
+}
+
+/// Builds the material block for a stage-2 `PortalRefract` `.vmt`.
+///
+/// # The combo bucketing
+///
+/// `portal_refract_vs20.fxc` declares 3 axes and `portal_refract_ps2x.fxc`
+/// declares 4, and after the stage split there is almost nothing left.
+///
+/// **Bucket 1 — pinned, axis deleted.** `STAGE`, pinned to 2 by
+/// [`ShaderKind::resolve`] — the other two values are two different shaders,
+/// not two variants of one, and neither is ported. `USEONSTATICPROP`, which
+/// only picks a vertex format, and whose two formats this port answers with
+/// one (see [`ShaderKind::vertex_layout`]). `COMPRESSED_VERTS`, which the
+/// port's vertex structs are not. `SHADER_SRGB_READ`, false off the 360.
+/// `D_NVIDIA_STEREO`, which has no counterpart here — and note the sampler it
+/// binds, `SHADER_SAMPLER3`, is enabled in the shadow state *unconditionally*
+/// and bound only when stereo is active, so the shipped shader has a sampler
+/// slot it usually leaves dangling.
+///
+/// **Bucket 2 — a uniform branch**, and it is one bit: `TINTED`, plus the fog
+/// mode every shader here carries. `TINTED` is `(nStage == 2) &&
+/// !IS_PARAM_DEFINED( m_nPortalColorTexture )`, so it is decided by the
+/// *absence* of a texture rather than by a switch — and exactly one material
+/// in the game takes it.
+///
+/// **Bucket 3 — a real pipeline variant.** [`RenderState`], which for this
+/// shader is a constant: see [`portal_refract_render_state`].
+///
+/// So `PortalRefract` needs **one** pipeline for the game's five stage-2
+/// materials, which is the fewest of any shader here — `WorldVertexTransition`
+/// is the only other one-pipeline shader and it has 18 materials. `TINTED` is a
+/// uniform branch rather than a variant, and the pipeline key is
+/// `(shader, RenderState, TargetFormat)` with a `RenderState` this shader does
+/// not vary.
+///
+/// # `$PortalColorScale` is 4, and that is why an oval is bright
+///
+/// It multiplies the gradient after the lookup — Valve's comment is "Brighten
+/// colors to make it look more emissive" — so a portal's colour leaves the
+/// shader well above 1 and is then scaled back by the exposure. Both shipped
+/// colours use 4.0; the tinted co-op material uses 1.0 and a gradient that
+/// tops out at 0.3, which is a quarter of the brightness and is deliberate.
+pub fn portal_refract_uniforms(vmt: &Vmt) -> PortalRefractUniforms {
+    let kind = ShaderKind::PortalRefract;
+
+    let mut flags = 0;
+    if param_value(kind, vmt, "$nofog").is_some_and(|var| var.as_bool()) {
+        flags |= PortalRefractFlags::NO_FOG;
+    }
+    // `int nTinted = ((nStage == 2) && !IS_PARAM_DEFINED( info.m_nPortalColorTexture )) ? 1 : 0;`
+    // (`portal_refract_helper.cpp:73`). The stage is 2 by construction here.
+    let has_color_texture = vmt
+        .var("$portalcolortexture")
+        .and_then(|var| var.as_str())
+        .is_some_and(|name| !name.is_empty());
+    if !has_color_texture {
+        flags |= PortalRefractFlags::TINTED;
+    }
+
+    PortalRefractUniforms {
+        texture_transform: {
+            // `SetVertexShaderTextureTransform( CONST_1, m_nTextureTransform )`
+            // — the same 2x4 every other shader here uploads, and the vertex
+            // shader reads two of the four components. See the WGSL.
+            let rows = param_value(kind, vmt, "$texturetransform")
+                .map(|var| var.as_matrix())
+                .unwrap_or(super::var::IDENTITY);
+            [rows[0], rows[1]]
+        },
+        // `kDefaultPortalColorGradientDark`/`Light`
+        // (`portal_refract_helper.h:20`), which agree with the declared
+        // defaults for once.
+        gradient_dark: init_vec(vmt, "$portalcolorgradientdark", [0.0, 0.0, 0.0, 1.0]),
+        gradient_light: init_vec(vmt, "$portalcolorgradientlight", [1.0, 1.0, 1.0, 1.0]),
+        params: [
+            // `kDefaultPortalColorScale` is **1.0** and the declared default is
+            // `"0.0"` — the two disagree and the code wins, as it does for
+            // `Refract`'s `$localrefractdepth`. A 0 here would make every
+            // portal black.
+            init_float(vmt, "$portalcolorscale", 1.0),
+            0.0,
+            0.0,
+            0.0,
+        ],
+        flags,
+        _padding: [0; 3],
+    }
+}
+
+
 /// `GammaToLinear` applied to a colour parameter's `rgb`, leaving `w` alone.
 ///
 /// `CBaseVSShader::SetPixelShaderConstantGammaToLinear` (`BaseVSShader.cpp:138`)
@@ -3323,6 +3699,12 @@ fn render_state_with_modulation(
     if kind == ShaderKind::Refract {
         return refract_render_state(vmt, textures, state, alpha_modulating);
     }
+    // And so does `PortalRefract`, for the opposite reason: where `Refract`'s
+    // blending is decided by content, this shader's is decided by nothing at
+    // all. See [`portal_refract_render_state`].
+    if kind == ShaderKind::PortalRefract {
+        return portal_refract_render_state(state);
+    }
 
     // --- EvaluateBlendRequirements ---------------------------------------
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
@@ -3492,6 +3874,51 @@ fn refract_render_state(
     state
 }
 
+/// `PortalRefract`'s half of the shadow phase, after `SetInitialShadowState`
+/// has run — and it takes **no arguments but the state**, because nothing
+/// about it depends on the material.
+///
+/// `DrawPortalRefract`'s `SHADOW_STATE` block (`portal_refract_helper.cpp:83`)
+/// for `nStage == 2`, which is four unconditional calls:
+///
+/// | | |
+/// |---|---|
+/// | `EnableAlphaBlending( SRC_ALPHA, ONE_MINUS_SRC_ALPHA )` | [`BlendMode::Blend`] |
+/// | `EnableDepthWrites( false )` | for every stage but 1 |
+/// | `EnableAlphaWrites( false )` | already the default state's |
+/// | `EnablePolyOffset( SHADER_POLYOFFSET_DECAL )` | [`DepthBias::Decal`] |
+///
+/// # Two things this does *not* do that every other shader here does
+///
+/// **It never asks a texture whether it is translucent.**
+/// `EvaluateBlendRequirements` is not called at all — the blend is a literal —
+/// so `$translucent`, `$additive`, `$vertexalpha`, `$alpha` and the base
+/// texture's alpha channel all reach nothing. `effects/fakeportalring_blue`
+/// writes `$translucent 1` and gets exactly the state it would have got
+/// without it.
+///
+/// **So [`render_state_modulated`] is identical to [`render_state`] here**,
+/// which makes this the first shader in the port whose two snapshots are the
+/// same object. That is not a shortcut: `SHADER_USING_ALPHA_MODULATION`'s only
+/// effect anywhere is to turn blending on, and it is already on.
+///
+/// # The polygon offset is load-bearing
+///
+/// A portal's quad is drawn **exactly on** the wall it is stuck to —
+/// `DrawSimplePortalMesh` takes a `fForwardOffsetModifier` and then throws it
+/// away, over a comment that says the offset moved into the shaders
+/// (`portalrenderable_flatbasic.cpp:1226`). Without the decal bias the quad
+/// z-fights with the wall; with it, and with depth writes off, it wins
+/// everywhere and writes nothing.
+fn portal_refract_render_state(mut state: RenderState) -> RenderState {
+    state.blend = BlendMode::Blend;
+    state.depth_write = false;
+    state.write_alpha = false;
+    state.depth_bias = DepthBias::Decal;
+    state
+}
+
+
 /// `CBaseShader::TextureIsTranslucent( BASETEXTURE, true )`
 /// (`shaderlib/BaseShader.cpp:605`).
 ///
@@ -3542,6 +3969,158 @@ mod tests {
         let text = format!("\"Refract\" {{ {body} }}");
         let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
         Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
+    }
+
+    fn portal_refract_vmt(body: &str) -> Vmt {
+        let text = format!("\"PortalRefract\" {{ {body} }}");
+        let document = keyvalues::parse("test.vmt", &text).expect("valid keyvalues");
+        Vmt::from_keyvalues("test.vmt", &document).expect("a shader block")
+    }
+
+    /// `models/portals/portalstaticoverlay_1.vmt`, verbatim from the shipped
+    /// file minus its `<DX90` fallback block and its three proxies.
+    const PORTAL_OVERLAY_1: &str = r#"
+        "$Stage" "2"
+        "$PortalOpenAmount" "0.0"
+        "$PortalStatic" "0.0"
+        "$PortalMaskTexture" "models/portals/noise-blur-256x256"
+        "$PortalColorTexture" "models/portals/portal-blue-color"
+        "$PortalColorScale" "4.0"
+        "$time" "0.0"
+    "#;
+
+    /// **Only `$Stage 2` resolves**, and the two that do not are the whole
+    /// reason `resolve` can answer `None` for a name `from_name` knows.
+    #[test]
+    fn portal_refract_resolves_only_its_third_stage() {
+        assert_eq!(
+            ShaderKind::from_name("PortalRefract"),
+            Some(ShaderKind::PortalRefract),
+            "content names it, unlike Phong"
+        );
+        assert_eq!(
+            ShaderKind::resolve(&portal_refract_vmt(PORTAL_OVERLAY_1)),
+            Some(ShaderKind::PortalRefract)
+        );
+        // `portal_refract_1.vmt` and `portal_stencil_hole.vmt`: the two
+        // materials in the game that belong to the recursive view.
+        assert_eq!(
+            ShaderKind::resolve(&portal_refract_vmt("\"$Stage\" \"0\"")),
+            None,
+            "the see-through warp reads the scene and is not ported"
+        );
+        assert_eq!(
+            ShaderKind::resolve(&portal_refract_vmt("\"$Stage\" \"1\"")),
+            None,
+            "the stencil punch needs a stencil"
+        );
+        // An undefined `$Stage` is 0, which `InitParamsPortalRefract` writes
+        // back into the parameter.
+        assert_eq!(ShaderKind::resolve(&portal_refract_vmt("")), None);
+        // **`$UseOnStaticProp` forces stage 2**, whatever `$Stage` says — and
+        // it is what makes `effects/fakeportalring_*` stage-2 materials.
+        assert_eq!(
+            ShaderKind::resolve(&portal_refract_vmt(
+                "\"$Stage\" \"0\" \"$UseOnStaticProp\" \"1\""
+            )),
+            Some(ShaderKind::PortalRefract)
+        );
+    }
+
+    /// The oval's pipeline state is a **constant**: no texture is consulted, no
+    /// flag reaches it, and the modulated snapshot is the same object.
+    #[test]
+    fn the_portal_overlay_blends_whatever_its_vmt_says() {
+        let kind = ShaderKind::PortalRefract;
+        let none = ResolvedTextures {
+            base: None,
+            normal_map: None,
+        };
+        for body in [
+            PORTAL_OVERLAY_1,
+            // `effects/fakeportalring_blue`'s flags, which would change any
+            // other shader's blending.
+            "\"$Stage\" \"2\" \"$translucent\" \"1\" \"$basetexture\" \"models/portals/dummy-blue\"",
+            "\"$Stage\" \"2\" \"$additive\" \"1\" \"$alpha\" \"0.25\"",
+        ] {
+            let vmt = portal_refract_vmt(body);
+            let state = render_state(kind, &vmt, none);
+            assert_eq!(state.blend, BlendMode::Blend, "{body}");
+            assert!(!state.depth_write, "depth writes are off for every stage");
+            assert!(!state.write_alpha);
+            assert_eq!(
+                state.depth_bias,
+                DepthBias::Decal,
+                "the quad is flush with the wall it is stuck to"
+            );
+            assert!(state.cull, "a portal is one-sided");
+            assert_eq!(
+                render_state_modulated(kind, &vmt, none),
+                state,
+                "SHADER_USING_ALPHA_MODULATION only turns blending on, and it is on"
+            );
+        }
+    }
+
+    /// `TINTED` is decided by the *absence* of `$PortalColorTexture`, and
+    /// `$PortalColorScale`'s runtime default is 1 where its declared default
+    /// is 0 — which would make every portal black.
+    #[test]
+    fn the_portal_overlays_gradient_comes_from_a_texture_or_two_colours() {
+        let with_texture = portal_refract_uniforms(&portal_refract_vmt(PORTAL_OVERLAY_1));
+        assert_eq!(with_texture.flags & PortalRefractFlags::TINTED, 0);
+        assert_eq!(with_texture.params[0], 4.0, "$PortalColorScale");
+
+        // `portalstaticoverlay_tinted.vmt`: no colour texture outside its
+        // `<DX90` block, which this port does not read.
+        let tinted = portal_refract_uniforms(&portal_refract_vmt(
+            r#"
+            "$Stage" "2"
+            "$PortalMaskTexture" "models/portals/noise-blur-256x256"
+            "$PortalColorGradientDark" "[0.0 0.0 0.0]"
+            "$PortalColorGradientLight" "[0.3 0.3 0.3]"
+            "$PortalColorScale" "1.0"
+            "#,
+        ));
+        assert_ne!(tinted.flags & PortalRefractFlags::TINTED, 0);
+        assert_eq!(tinted.gradient_light[0..3], [0.3, 0.3, 0.3]);
+        assert_eq!(tinted.params[0], 1.0);
+
+        // Nothing written at all: the *code's* default, not the table's.
+        let bare = portal_refract_uniforms(&portal_refract_vmt("\"$Stage\" \"2\""));
+        assert_eq!(
+            bare.params[0], 1.0,
+            "kDefaultPortalColorScale is 1, and the declared default of 0 would be black"
+        );
+        assert_eq!(
+            bare.texture_transform,
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            "the identity transform, as two rows"
+        );
+    }
+
+    /// It reads its own three numbers out of group 3, and nothing else: no
+    /// lighting, no copy of the frame, and the smallest vertex layout in the
+    /// set.
+    #[test]
+    fn the_portal_overlay_reads_its_open_amount_and_no_lighting() {
+        let kind = ShaderKind::PortalRefract;
+        assert_eq!(
+            kind.context_binding(),
+            Some(ContextBinding::PortalOverlay)
+        );
+        let vmt = portal_refract_vmt(PORTAL_OVERLAY_1);
+        assert_eq!(lighting(kind, &vmt), Lighting::None);
+        assert!(!needs_frame_buffer_copy(kind, &vmt), "stage 0's, not this one");
+        // Position and one texture coordinate is all the stage-2 shader reads.
+        assert_eq!(kind.vertex_layout(), VertexLayout::Simple);
+        // Two textures, and **no `$basetexture`** — `fakeportalring_blue`
+        // names one and stage 2 never samples it.
+        let requests = texture_requests(kind, &vmt);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.param != "$basetexture"));
+        assert_eq!(requests[0].color_space, super::super::ColorSpace::Linear, "a mask");
+        assert_eq!(requests[1].color_space, super::super::ColorSpace::Srgb, "a colour");
     }
 
     /// `glass/container_window_warm`, the material three of `sp_a1_intro1`'s

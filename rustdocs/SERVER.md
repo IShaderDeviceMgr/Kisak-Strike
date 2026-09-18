@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic` and `prop_testchamber_door`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open** — and **the player can be hurt, and die**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener` and `prop_portal`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, and **a portal links to its partner and draws an oval**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 179 unit tests + seven depot tests over all 106 shipped maps |
+| Tests | 191 unit tests + ten depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -47,11 +47,22 @@ the borrow shape, and it did not: stage 4's answer — `Server::dispatch` lifts
 the dispatched entity out of the list, so `Context` can carry the rest of it —
 was already enough.
 
+**What `prop_portal` added** (after `logic_branch_listener`, and it is
+`portdocs/PORTAL.md` **stage 2 of five**): `CProp_Portal` and the placement half
+of `CPortal_Base2D` — **21 entities across 10 of the 106 maps, two of them on
+`sp_a1_intro1`** — the linkage group, the teleport matrix, `PortalState` (the
+third seam of its kind, after `PlayerState` and `ModelEntityState`),
+`Context::find_all_of_class`, and the `portal` console command's server half
+(`Server::place_portal`, `Server::fizzle_portals`). It links, it computes the
+matrix, and `engine::world::portals` draws a coloured oval where it is. **It
+does not carve the wall (stage 3) and it does not teleport anybody (stage 4)**,
+so what you see is an oval on an unbroken wall that you walk into and stop.
+
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
 **nothing pushes what is in its way** — a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why). **40 of the 200
-classnames the shipped maps place are implemented**, out of 45 registered — the
+than shoving it (`portdocs/SERVER.md` stage 3 says why). **41 of the 200
+classnames the shipped maps place are implemented**, out of 46 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -348,6 +359,37 @@ one) and a filtered-out entity is one whose model was never uploaded.
 > because the server's is the scene's quantised down; the renderer clamps a
 > negative elapsed time to zero, so the worst case is one frame of an animation
 > not having started yet.
+
+### `PortalState` (`mod.rs`)
+
+```rust
+pub struct PortalState {
+    pub id: u64,              // EntityId::to_int — opaque and stable
+    pub origin: Vec3,
+    pub angles: Vec3,         // pitch, yaw, roll
+    pub half_width: f32,      // 32 for every portal in the game
+    pub half_height: f32,     // 56 — NOT 14; see gotcha 79
+    pub is_portal2: bool,     // which of the two overlay materials
+    pub opened_at: f32,       // the SERVER's clock, like ModelEntityState::anim_time
+    pub linked: bool,         // IsActivedAndLinked()
+}
+```
+
+Every **active** portal, as the renderer needs one — `Server::portals()`. The
+third seam of this shape, and the simplest: a portal owns no uploaded geometry,
+so the list is *replaced* every frame rather than matched on `id`, and an
+inactive portal is filtered out rather than carried with a `visible` flag.
+`C_Portal_Base2D::ShouldDraw` refuses an inactive portal and
+`CPortalRender::AddPortal`/`RemovePortal` are gated on the same thing.
+
+**What it does not carry is the teleport matrix**, because nothing draws with
+it. Stage 2 is an oval on a wall, not a view through one; the matrix stays on
+`PropPortal::matrix` until stage 4 moves the player with it.
+
+`opened_at` is what the renderer turns into `$PortalOpenAmount` (0 to 1 over
+half a second) and `$PortalStatic` (1 to 0 over one second) —
+`C_Prop_Portal::ClientThink` integrates both and this port derives them, the
+same split `anim_time` already has and for the same reason.
 
 ### `LevelStats` (`mod.rs`)
 
@@ -1222,10 +1264,32 @@ impl TestChamberDoor {
 // classes/player.rs — stage 5's two
 pub struct LogicPlayerProxy;
 pub struct RevertSaved { /* private; player_loadsaved */ }
+// classes/portal.rs — `portdocs/PORTAL.md` stage 2
+pub struct PropPortal {
+    pub activated, old_activated, is_portal2: bool,
+    pub linkage_group: u8,                  // 255 is LINKAGE_GROUP_INVALID
+    pub half_width, half_height: f32,       // 32 and 56
+    pub linked: Option<EntityId>,
+    pub matrix: Mat4,                       // m_matrixThisToLinked; identity while unlinked
+    pub opened_at: f32,
+}
+impl PropPortal {
+    pub fn forward(entity: &EntityCore) -> Vec3;   // +X of the angle matrix
+    pub fn right(entity: &EntityCore) -> Vec3;     // NEGATED column 1 — gotcha 81
+    pub fn up(entity: &EntityCore) -> Vec3;
+    pub fn plane(entity: &EntityCore) -> (Vec3, f32);        // m_plane_Origin
+    pub fn corners(&self, entity: &EntityCore) -> [Vec3; 4]; // UpdateCorners
+    pub fn is_floor_portal(entity: &EntityCore, threshold: f32) -> bool;
+    pub fn is_active_and_linked(&self) -> bool;
+    pub fn new_location(&mut self, entity, origin, angles, cx);
+}
+/// `UTIL_Portal_ComputeMatrix_ForReal` — see gotcha 80 before using it.
+/// Both arguments are `(origin, angles)`.
+pub fn teleport_matrix(entrance: (Vec3, Vec3), exit: (Vec3, Vec3)) -> Mat4;
 ```
 
-Forty-five classnames, **34,802 of the shipped game's 60,925 entity blocks**.
-**Forty of them are among the 200 classnames the maps place**; the other
+Forty-six classnames, **34,823 of the shipped game's 60,925 entity blocks**.
+**Forty-one of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -1273,6 +1337,7 @@ because Valve registers them:
 | `prop_floor_button` | `CPropFloorButton` | 65, in 47 maps |
 | `prop_testchamber_door` | `CPropTestChamberDoor` | 138, in 71 maps |
 | `trigger_portal_button` | `CPortalButtonTrigger` | **0 placed** — one per button, 65 |
+| `prop_portal` | `CProp_Portal` | 21, in 10 maps |
 | `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
 
 ---
@@ -1933,6 +1998,63 @@ entity built is not there start at 47, and if something will not die start at
     keys in the game resolve, to exactly one entity each — and the arm a
     reimplementation gets backwards.
 
+74. **Linkage is by group and size, never by `PortalTwo` — and `PortalTwo` is
+    *overwritten* by linking.** `UpdatePortalLinkage` takes the first portal in
+    the group that is active, unlinked and exactly the same size, and the base
+    class then assigns `m_bIsPortal2 = !m_hLinkedPortal->m_bIsPortal2`. The key
+    decides colour and nothing else — `portal_base2d.h:38` says so in as many
+    words. Reading it as the pairing key looks right on all 21 shipped portals,
+    because every one of them is already the opposite of its partner.
+
+75. **The portal that activates *second* keeps its colour.** The forcing line
+    runs on the *partner* first, through the recursion at `prop_portal.cpp:584`,
+    and on the activating portal second — by which time the partner is already
+    the opposite, so the second assignment is a no-op. A map that switched on
+    two blues would turn the **first** one orange.
+
+76. **A `prop_portal` draws no model, and drawing one would be a magenta
+    rectangle across the wall.** `portal1.mdl` is four vertices wearing
+    `writez`, a depth-only shader that exists to punch a hole for the recursive
+    view. `PropPortal::model_state` therefore answers `None`, which keeps it out
+    of `ModelEntityState` entirely — and `writez` is not a shader this port has,
+    so a material lookup would fall back to the error checkerboard. What you
+    see where a portal is, is `engine::world::portals`' quad.
+
+77. **`NewLocation` switches a portal on.** `SetActive( true )` sits in the
+    middle of `CPortal_Base2D::NewLocation`, which is what lets the `portal`
+    console command place and activate in one call — and is why all four
+    shipped `NewLocation` connections are aimed at portals that are already on.
+
+78. **A portal's trigger box is one-sided.** `GetLocalMins()`..`GetLocalMaxs()`
+    is `(0, -hw, -hh)`..`(**64**, hw, hh)` in the portal's own frame: the room
+    in front of it and nothing inside the wall. A symmetric box would make the
+    portal notice things behind the surface it is stuck to.
+
+79. **The default half-height is 56 and the reference tree says 14.**
+    `prop_portal_shared.cpp:167` initializes it to `0.25 *
+    DEFAULT_PORTAL_HALF_HEIGHT` under a comment that says exactly what it is —
+    *"default to sane-looking but incorrect portal height for CEG - Updated in
+    constructor"* — and the constructor overwrites it from an anti-tamper macro
+    whose value is not in this tree. The `#define` is, and the shipped game's
+    portal is 64 x 112 units.
+
+80. **The teleport matrix has a 180° turn about *up* baked into it**, and a
+    point in *front* of the entrance therefore maps to *behind* the exit. Both
+    halves read as bugs and neither is. Without the half turn you come out of
+    the exit facing back the way you came, which looks like a mirrored portal;
+    and the front-to-back relationship is what makes the same matrix serve as a
+    camera transform for the view through a portal, and is consistent for the
+    teleport because the player crosses the entrance *plane* — so the point
+    being transformed is a hair behind it and lands a hair in front of the
+    exit.
+
+81. **A portal's `right` is the negation of its angle matrix's second column.**
+    `UpdatePortalTeleportMatrix` reads the three columns out and immediately
+    writes `m_vRight = -m_vRight`, because Valve's `matrix3x4_t` column 1 is
+    *left*. `PropPortal::right` does the negation once; anything that repeats it
+    mirrors the quad, the corners and the matrix together, which is a picture
+    that looks plausible until you walk through.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2250,6 +2372,16 @@ case values.
 | `tests::test_forces_a_branch_listener_to_report_and_an_empty_one_is_mixed` | gotcha 73, and `InputTest`'s `NOT_INIT` reset |
 | `tests::the_intro_maps_door_opens_through_the_chain_its_map_built` | the default map's own `trigger → proxy → relay → door` chain, **both ways** — the `Close` half runs through a `logic_branch_listener` |
 | `tests::every_shipped_branch_listener_registers_and_shuts_the_doors_it_is_for` | **every branch listener in the game, registered and driven** |
+| `tests::a_portal_spawns_as_a_one_sided_box_trigger` | gotchas 76, 78 and 79 — the model that must not be drawn, the box that reaches forward only, and the half-height that is 56 |
+| `tests::two_active_portals_in_a_group_find_each_other` | the linkage, both ways, and that the colours end up opposite |
+| `tests::linking_two_portals_of_one_colour_flips_the_first` | gotchas 74 and 75 — `PortalTwo` overwritten, and *which* of the two keeps its colour |
+| `tests::deactivating_a_portal_hands_its_partner_on` | the one real recursion in `UpdatePortalLinkage`, which needs three portals to be visible at all |
+| `tests::the_teleport_matrix_turns_a_point_around_the_exit` | gotcha 80 — the round trip, the crossing, the velocity, and a portal linked to a copy of itself |
+| `tests::new_location_moves_a_portal_and_activates_it` | gotcha 77, the activation hidden in the middle of `NewLocation` |
+| `tests::resizing_one_portal_of_a_pair_unlinks_it` | that the partner search compares both half-extents exactly |
+| `tests::placing_a_pair_by_hand_creates_and_links_two_portals` | the `portal` command's server half: `FindPortal` preferring an active match, and `fizzle_portals` |
+| `tests::every_shipped_portal_spawns_and_its_map_can_link_a_pair` | **all 21 portals in the game, switched on by their own maps' logic** |
+| `tests::every_shipped_portal_is_on_a_wall` | **the deleted placement snap, measured**: 15 flush, 2 proud, 4 floating — and not one more than 0.00 degrees off its surface |
 
 Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
 
@@ -2260,17 +2392,31 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release floor_button_presses -- --i
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release testchamber_door -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_intro_maps_door -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release branch_listener -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_portal -- --ignored --nocapture
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 34,802 matched, 65
-created, 27,930 spawned, 6,937 lights deleted, 213 kept, 54,534 connections,
-160 unimplemented classnames, the full 49-name unhandled-key table, 5,787
-events dispatched, 3,930 inputs accepted, 7,318 thinks, 1,124 events that found
+server time**, and asserts exact totals: 60,925 blocks, 34,823 matched, 65
+created, 27,951 spawned, 6,937 lights deleted, 213 kept, 54,535 connections,
+159 unimplemented classnames, the full 48-name unhandled-key table, 5,787
+events dispatched, 3,932 inputs accepted, 7,318 thinks, 1,122 events that found
 no target, zero bad conversions, the 18-name unhandled-input table, a peak of
-215 entities in the simulation list at once, 105 maps with a master tone
-mapper — and that `sp_a1_intro1` ends up asking for an exposure ceiling of
-**1.5**.
+215 entities in the simulation list at once, 2,341 live triggers, 105 maps with
+a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
+ceiling of **1.5**.
+
+> **`prop_portal` moved six of those and every one of them is the same 21
+> entities.** `matched` and `spawned` rose by 21 and the unimplemented set lost
+> its one portal classname, taking 26,123 occurrences to 26,102. `outputs` rose
+> by **one**, which is the whole of the class's output surface in the shipped
+> game — `sp_a1_intro1`'s `portal_red_0.OnPlayerTeleportFromMe`, connected by
+> no other map. `accepted` rose by 2 and `no_target` fell by the same 2, which
+> is a `SetActivatedState` that used to be aimed at a classname nothing
+> answered for; only two of the game's 31 are fired inside two seconds, because
+> a portal is switched on when the player reaches the room. And the live-trigger
+> total went from 2,320 to **2,341**: a portal is `FSOLID_TRIGGER` from
+> `Spawn`, whether or not it is `Activated`. The unhandled-key table did *not*
+> move, because an unmatched block's keys were never in it.
 
 > **Four of those numbers moved a long way with `prop_dynamic` and each says
 > something.** `accepted` and `thinks` rose because a prop that is given an
@@ -2312,7 +2458,8 @@ are live triggers two ticks into the map**: the 2,892 the maps place minus the
 637 that are `StartDisabled`, including 107 of the game's 110
 `trigger_teleport`s. `prop_floor_button` then took the live-trigger total to
 **2,320**, because the other 65 are `SOLID_OBB` and have no brush model at
-all.
+all, and `prop_portal` takes it to **2,341** for the same reason — a portal is
+a `SOLID_OBB` trigger from `Spawn`, active or not.
 
 `every_shipped_maps_triggers_notice_the_player` is the one that could not be
 faked. Per map it builds the real collision, and then, **for every one of

@@ -396,6 +396,54 @@ pub struct ModelEntityState {
     pub modulation: [f32; 4],
 }
 
+/// One active portal, as the renderer needs to see it.
+///
+/// The third seam of this shape, after [`PlayerState`] and
+/// [`ModelEntityState`]: `world/` names no server type and `server/` names no
+/// GPU type, so the vocabulary between them is a plain struct that
+/// `Engine::frame` copies across once a rendered frame.
+///
+/// **What it does not carry is the teleport matrix**, because nothing draws
+/// with it: `portdocs/PORTAL.md`'s stage 2 is an oval on a wall, not a view
+/// through it. The matrix stays on
+/// [`PropPortal::matrix`](classes::PropPortal::matrix) until stage 4 moves the
+/// player with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalState {
+    /// [`EntityId::to_int`] — an opaque, stable key, for the reason
+    /// [`ModelEntityState::id`] is one.
+    pub id: u64,
+    pub origin: Vec3,
+    /// Pitch, yaw, roll. The quad's own basis comes out of this, and the
+    /// **right** vector it needs is the negation of the angle matrix's second
+    /// column — see [`PropPortal::right`](classes::PropPortal::right).
+    pub angles: Vec3,
+    /// `m_fNetworkHalfWidth` — 32 for every portal in the shipped game.
+    pub half_width: f32,
+    /// `m_fNetworkHalfHeight` — 56, not 14; see
+    /// [`portal::DEFAULT_HALF_HEIGHT`](classes::portal::DEFAULT_HALF_HEIGHT).
+    pub half_height: f32,
+    /// Which of the two overlay materials to wear. Blue is `false`.
+    pub is_portal2: bool,
+    /// The server clock when this portal was switched on or moved.
+    ///
+    /// The renderer turns it into `$PortalOpenAmount` and `$PortalStatic`,
+    /// which `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`) runs up
+    /// from 0 and down from 1 at fixed rates. Carried as the instant rather
+    /// than as the two curves for the reason
+    /// [`ModelEntityState::anim_time`] is: a 64 Hz tick would step an effect
+    /// that has to be smooth.
+    pub opened_at: f32,
+    /// Whether this portal found a partner.
+    ///
+    /// Nothing in the draw reads it yet — an active portal wears its oval
+    /// linked or not, which is Valve's, because `ShouldDraw` asks only about
+    /// `IsActive()`. It is here because it is the one thing about a portal a
+    /// developer wants the console to tell them, and `ent_dump` is on the
+    /// other side of the seam.
+    pub linked: bool,
+}
+
 /// A [`TouchQuery`] that never reports anything.
 ///
 /// What a server with no map loaded — or a unit test with no collision —
@@ -1957,6 +2005,157 @@ impl Server {
     /// How many brush entities this map placed that the port has a class for.
     pub fn brush_entity_count(&self) -> usize {
         self.brush_models.len()
+    }
+
+    // -----------------------------------------------------------------------
+    // portals
+    // -----------------------------------------------------------------------
+
+    /// Every portal the renderer should draw an oval for, as `world/` wants to
+    /// see it.
+    ///
+    /// **Active ones only**, which is `C_Portal_Base2D::ShouldDraw`
+    /// (`c_portal_base2d.cpp:544`): *"if ( !IsActive() ... ) return false"*, and
+    /// `CPortalRender::AddPortal`/`RemovePortal` are gated on the same thing.
+    ///
+    /// Filtering here rather than carrying a `visible` flag the way
+    /// [`ModelEntityState`] does, and the difference is real: a model entity
+    /// that vanishes from this list has *uploaded geometry* the renderer must
+    /// not throw away, where a portal's whole geometry is the four numbers
+    /// below rebuilt every frame. So there is nothing to keep alive across an
+    /// absence.
+    pub fn portals(&self) -> Vec<PortalState> {
+        self.entities
+            .iter()
+            .filter(|(_, e)| !e.core.removed)
+            .filter_map(|(id, entity)| {
+                let portal = entity.behaviour.downcast_ref::<classes::PropPortal>()?;
+                portal.activated.then(|| PortalState {
+                    id: id.to_int(),
+                    origin: entity.core.origin,
+                    angles: entity.core.angles,
+                    half_width: portal.half_width,
+                    half_height: portal.half_height,
+                    is_portal2: portal.is_portal2,
+                    opened_at: portal.opened_at,
+                    linked: portal.is_active_and_linked(),
+                })
+            })
+            .collect()
+    }
+
+    /// `CProp_Portal::FindPortal( group, bPortal2, bCreateIfNothingFound )`
+    /// (`prop_portal.cpp:892`) — the portal of that colour in that group,
+    /// making one if the group has none.
+    ///
+    /// **An active portal of the right colour wins over an inactive one**, and
+    /// the loop keeps looking after it finds an inactive match rather than
+    /// returning it — which is what lets the gun re-place the portal you can
+    /// see rather than a spare.
+    ///
+    /// The one caller is the [`place_portal`](Server::place_portal) console
+    /// command; in the shipped game it is the portal gun.
+    fn find_portal(&mut self, group: u8, is_portal2: bool, create: bool) -> Option<EntityId> {
+        let mut inactive = None;
+        for (id, entity) in self.entities.iter() {
+            let Some(portal) = entity.behaviour.downcast_ref::<classes::PropPortal>() else {
+                continue;
+            };
+            if portal.linkage_group != group || portal.is_portal2 != is_portal2 {
+                continue;
+            }
+            match portal.activated {
+                true => return Some(id),
+                false => inactive = Some(id),
+            }
+        }
+        if inactive.is_some() || !create {
+            return inactive;
+        }
+
+        // `CreateEntityByName` + `DispatchSpawn`, with the two fields set in
+        // between — the same order [`class::Context::create_entity`] documents,
+        // and reachable *directly* here because nothing is being dispatched:
+        // the console runs between ticks.
+        let class = classes::lookup("prop_portal")?;
+        let mut entity = Entity::new(class);
+        if let Some(portal) = entity
+            .behaviour
+            .downcast_mut::<classes::PropPortal>()
+        {
+            portal.linkage_group = group;
+            portal.is_portal2 = is_portal2;
+        }
+        let id = self.entities.insert(entity);
+        self.dispatch(id, |core, behaviour, cx| {
+            behaviour.spawn(core, cx);
+        });
+        Some(id)
+    }
+
+    /// Put a portal somewhere. **This port's console command, and the gun's
+    /// path through the shipped game minus its rules.**
+    ///
+    /// `CWeaponPortalgun::FirePortal` ends in `FindPortal( group, bPortal2,
+    /// true )` followed by `PlacePortal`; this is that pair with
+    /// `CProp_Portal::NewLocation` in place of `PlacePortal`, which is the
+    /// branch the *map* uses — `InputNewLocation`'s own comment calls it
+    /// "skipping placement rules" (`prop_portal.cpp:799`). What is skipped is
+    /// `VerifyPortalPlacementAndFizzleBlockingPortals`: whether the surface is
+    /// portalable, whether the oval fits on it, whether a bumper or a
+    /// no-portal volume forbids it, and whether it overlaps the other portal.
+    /// All of that is `portal_placement.cpp`, which needs the gun
+    /// (`portdocs/PORTAL.md` §8).
+    ///
+    /// `NewLocation` activates the portal, so placing both colours links them.
+    /// Returns whether a portal was placed, which is `false` only with no map
+    /// loaded.
+    pub fn place_portal(&mut self, is_portal2: bool, origin: Vec3, angles: Vec3) -> bool {
+        let Some(id) = self.find_portal(0, is_portal2, true) else {
+            return false;
+        };
+        self.dispatch(id, |core, behaviour, cx| {
+            if let Some(portal) = behaviour.downcast_mut::<classes::PropPortal>() {
+                portal.new_location(core, origin, angles, cx);
+            }
+        });
+        true
+    }
+
+    /// Switch every portal in the map off — `Fizzle` at each, which is what
+    /// walking through a fizzler does to both ends of a pair.
+    ///
+    /// Returns how many were on. Also this port's console command.
+    pub fn fizzle_portals(&mut self) -> usize {
+        let portals: Vec<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e.behaviour.downcast_ref::<classes::PropPortal>().is_some())
+            .map(|(id, _)| id)
+            .collect();
+        let mut fizzled = 0;
+        for id in portals {
+            let was_active = self
+                .entities
+                .get(id)
+                .and_then(|e| e.behaviour.downcast_ref::<classes::PropPortal>())
+                .is_some_and(|portal| portal.activated);
+            if !was_active {
+                continue;
+            }
+            fizzled += 1;
+            self.dispatch(id, |core, behaviour, cx| {
+                let input = Input {
+                    name: "Fizzle",
+                    value: Variant::Void,
+                    activator: None,
+                    caller: None,
+                    output_id: 0,
+                };
+                behaviour.accept_input(core, &input, cx);
+            });
+        }
+        fizzled
     }
 
     // -----------------------------------------------------------------------

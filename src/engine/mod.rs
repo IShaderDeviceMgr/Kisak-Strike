@@ -270,6 +270,14 @@ impl<'a> Engine<'a> {
                 "Usage: ent_fire <target> [input] [value] [delay]",
             ),
             CommandSpec::new("dumpeventqueue", "List the pending entity I/O events."),
+            // **This port's own**, and `portdocs/PORTAL.md` §10 asks for it by
+            // name: "21 scripted portals is not enough to develop against".
+            // It is `CWeaponPortalgun::FirePortal` minus the gun and minus the
+            // placement rules — see [`Server::place_portal`].
+            CommandSpec::new(
+                "portal",
+                "Usage: portal <1|2|off> — place a portal where you are looking.",
+            ),
         ] {
             console
                 .register_command(spec)
@@ -665,6 +673,10 @@ impl<'a> Engine<'a> {
             // 65 of them and no map more than four — so it is unconditional
             // rather than dirty-flagged.
             world.sync_entity_models(&model_entities(&self.scene.server));
+            // …and the third of the three, which is the cheapest: a portal
+            // owns no uploaded geometry, so this replaces a list of at most
+            // four rows.
+            world.sync_portals(&portals(&self.scene.server, self.scene.curtime));
         }
 
         // `CL_Move` (`engine/cl_main.cpp:2734`), which is
@@ -985,6 +997,35 @@ fn model_entities(server: &Server) -> Vec<world::entities::ModelEntity> {
             anim_time: entity.anim_time,
             playback_rate: entity.playback_rate,
             modulation: entity.modulation,
+        })
+        .collect()
+}
+
+/// Every active portal, as `world/` wants it.
+///
+/// The same two-field translation [`model_entities`] is, plus the one
+/// subtraction neither module can make for itself: the server says *when* a
+/// portal opened, on its own tick clock, and the renderer wants *how long ago*,
+/// against the scene's.
+///
+/// **The two clocks are not the same** — `rustdocs/SERVER.md` gotcha 1 — and
+/// the difference is up to one tick, 15.6 ms. It cannot matter here: both
+/// curves the difference feeds are clamped into `0..1` over half a second and a
+/// second, so a tick of error moves the opening animation by three per cent of
+/// one frame of it. The subtraction is still clamped at zero, because a level
+/// that has just restarted can hand over a portal opened in the future.
+fn portals(server: &Server, curtime: f32) -> Vec<world::portals::Portal> {
+    server
+        .portals()
+        .into_iter()
+        .map(|portal| world::portals::Portal {
+            id: portal.id,
+            origin: portal.origin,
+            angles: portal.angles,
+            half_width: portal.half_width,
+            half_height: portal.half_height,
+            is_portal2: portal.is_portal2,
+            open_for: (curtime - portal.opened_at).max(0.0),
         })
         .collect()
 }
@@ -1374,6 +1415,136 @@ fn tonemap_command(client: &Client, cx: &mut ExecContext<'_>) {
 /// usefully be.
 const MAX_TRACE_LENGTH: f32 = 1.732_050_8 * 2.0 * 16384.0;
 
+/// The `portal` command: put a portal on the surface the player is looking at.
+///
+/// **This port's own**, and `portdocs/PORTAL.md` §10 asks for it by name:
+/// twenty-one scripted portals across ten maps is not enough to develop
+/// against, and nineteen of them are at axis-aligned yaws.
+///
+/// It is `CWeaponPortalgun::TraceFirePortal` (`weapon_portalgun_shared.cpp:1213`)
+/// with the gun, the multi-segment trace, the fizzle taxonomy and every
+/// placement rule taken out — `portdocs/PORTAL.md` §8 is why. What is left is
+/// exactly the three lines that decide *where*: trace, take the surface
+/// normal as the new forward, and hand the pair to
+/// [`Server::place_portal`](crate::server::Server::place_portal), which is
+/// `FindPortal` plus `NewLocation`.
+///
+/// ```text
+///   portal 1 | blue      place the blue portal
+///   portal 2 | orange    place the orange portal
+///   portal off           fizzle every portal in the map
+/// ```
+///
+/// Placing both colours links them, because `NewLocation` activates the portal
+/// it moves and an activating portal looks for a partner.
+///
+/// **Nothing stops the two ending up in the same place**, which is the most
+/// visible consequence of deleting the rules: type `portal 1` and `portal 2`
+/// without moving and you get two coincident ovals linked to each other, whose
+/// transform is the half turn about their own shared up axis.
+/// `VerifyPortalPlacementAndFizzleBlockingPortals` is what refuses that in the
+/// shipped game, and it is the gun's.
+///
+/// # The one rule from the gun that *is* here
+///
+/// **A portal on the floor or the ceiling is rolled to face the player.**
+/// `TraceFirePortal` builds a pseudo-up of world `+Z` and then, when the
+/// surface normal is vertical to within a thousandth, replaces it with the
+/// direction the shot travelled — "If we're upright, then the top of the
+/// portal should be away from us" (`:1348`). Without it every floor portal in
+/// the game comes out at yaw 0 regardless of where you stood, which is both
+/// wrong and confusing to debug a teleport against.
+///
+/// The `m_StickNormal` branch beside it is for a player standing on a
+/// paint-gel wall, and there is no paint.
+fn portal_command(
+    world: Option<&World>,
+    client: &Client,
+    server: &mut Server,
+    cmd: &Command,
+    cx: &mut ExecContext<'_>,
+) {
+    let usage = "portal <1|2|off> : place a portal where you are looking";
+    let Some(argument) = cmd.arg(1) else {
+        cx.print(usage);
+        return;
+    };
+    let argument = argument.trim();
+
+    if argument.eq_ignore_ascii_case("off") {
+        let fizzled = server.fizzle_portals();
+        cx.print(&format!("portal: fizzled {fizzled} portal(s)"));
+        return;
+    }
+
+    let is_portal2 = match argument {
+        "1" => false,
+        "2" => true,
+        a if a.eq_ignore_ascii_case("blue") => false,
+        a if a.eq_ignore_ascii_case("orange") || a.eq_ignore_ascii_case("red") => true,
+        _ => {
+            cx.print(usage);
+            return;
+        }
+    };
+
+    let Some(world) = world else {
+        cx.print("portal: no map is loaded");
+        return;
+    };
+    if world.collision.is_empty() {
+        cx.print(&format!("portal: {} has no collision tree", world.name));
+        return;
+    }
+
+    let player = client.player();
+    let (forward, _, _) = player.angles.vectors();
+    let eye = player.eye();
+    // World and brush models only, and deliberately: a portal on a door would
+    // need `SetMobileState` and the parent tracking under it, which
+    // `sv_allow_mobile_portals` turns off outside one map anyway.
+    let ray = Ray::line(eye, eye + forward * MAX_TRACE_LENGTH);
+    let hit = world
+        .collision
+        .tracer()
+        .trace(&ray, Contents::MASK_SHOT_PORTAL);
+    if !hit.did_hit() {
+        cx.print("portal: nothing in front of you");
+        return;
+    }
+
+    // `Vector vUp( 0.0f, 0.0f, 1.0f )`, replaced by the shot direction on a
+    // floor or a ceiling — see the doc comment.
+    let vertical = hit.normal.x.abs() < 0.001 && hit.normal.y.abs() < 0.001;
+    let up = match vertical {
+        true => forward,
+        false => glam::Vec3::Z,
+    };
+    let angles = crate::math::vector_angles(hit.normal, up);
+
+    if !server.place_portal(is_portal2, hit.end, angles) {
+        cx.print("portal: no game is running");
+        return;
+    }
+    let colour = if is_portal2 { "orange" } else { "blue" };
+    let linked = server
+        .portals()
+        .iter()
+        .filter(|portal| portal.linked)
+        .count();
+    cx.print(&format!(
+        "portal: {colour} at ({:.1} {:.1} {:.1}) angles ({:.1} {:.1} {:.1}); \
+         {} active, {linked} linked",
+        hit.end.x,
+        hit.end.y,
+        hit.end.z,
+        angles.x,
+        angles.y,
+        angles.z,
+        server.portals().len(),
+    ));
+}
+
 /// The `trace` command: fire a ray from the player's eye, or sweep the player
 /// hull from their feet, and report what the collision model says.
 ///
@@ -1660,6 +1831,7 @@ impl CommandTarget for EngineCommands<'_> {
                 None => cx.print("impulse <number>"),
             },
             "trace" => trace_command(self.world, self.client, cmd, cx),
+            "portal" => portal_command(self.world, self.client, self.server, cmd, cx),
             "report_entities" => self.server.report_entities(cx),
             "ent_dump" => self.server.ent_dump(cmd, cx),
             "ent_fire" => self.server.ent_fire(cmd, cx),
