@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 974 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 992 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -148,7 +148,7 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 7 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract`. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals), `trace/` (4 of 5), `input/` (4 of 5), `console/` (complete). No visibility, skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals), `trace/` (4 of 5, plus the portal carve), `input/` (4 of 5), `console/` (complete). No visibility, skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5** — input→command→movement→view, `CPortalGameMovement`'s walk, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning** | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener` and `prop_portal` — **46 classnames, 34,823 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
@@ -165,8 +165,9 @@ you. Two portals draw as coloured ovals.
 
 **It is not a runnable game**: no sound, no netcode, no weapon, no visibility
 or skybox, and a door moves *through* the player rather than shoving one.
-**There is no hole in the wall** — that is `portdocs/PORTAL.md` stage 3 — so you
-walk into a portal and stop.
+**The hole in the wall is real** — `portdocs/PORTAL.md` stage 3 has landed — so
+you can walk into a portal and stand inside the wall, and then fall out of the
+back of it, because the remote trace that would catch you is stage 4.
 
 **Frame cost is measurable and has been measured**, by `engine::world::bench`
 and `engine::exposure` (both depot-gated, `--ignored`). `sp_a1_intro1` records a
@@ -183,25 +184,26 @@ thermal state and read 2-3x high. Numbers and history:
 steps are individual classes and subsystems rather than a staged plan. `client/`
 stage 5 and everything below it needs `net/`, which is a long way from here.
 
-**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stages 1 and 2 of its
-five are done**: the blended pass, then **the class, drawn**. Stage 3 is the hole in the
-wall's collision and stage 4 the remote trace and the teleport — and stage 3 is the one
-everything else is inert without, because with no hole the player walks into the wall,
-never reaches the portal plane, and the teleport can never fire however correct it is.
-The other candidates, in the order they are worth doing:
+**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stages 1, 2 and 3 of
+its five are done**: the blended pass, the class drawn, and **the hole**. The carve needed
+no polyhedron library, exactly as predicted — `mathlib/polyhedron.cpp` (3,895 lines) and
+`staticcollisionpolyhedroncache.cpp` (586) are deleted outright — and it needed one
+correction the portdoc did not foresee, which is that an *empty* carved piece has to be
+detected rather than left to the clip loop, because a swept box expands every plane and
+turns one into a solid slab across the hole.
 
-- **`portdocs/PORTAL.md` stage 3 — the hole.** §4: an AABB brush enumerator over
-  `CollisionBsp`, the four-slab carve, the carved store, and a substitutive path
-  in `Tracer`. The finding that makes it tractable is already written down and is
-  worth repeating: **the carve does not need a polyhedron library.** Valve's
-  `CPolyhedron`s exist only to become `CPhysCollide`s, and this port traces BSP
-  brushes — so **a carved piece is the original brush's planes plus four side
-  planes at four distances**, no vertices generated and no hull built, and an
-  infeasible plane set reports a clean miss through the existing loop. That
-  deletes `mathlib/polyhedron.cpp` (3,895 lines) and
-  `staticcollisionpolyhedroncache.cpp` (586) outright. The seam it needs already
-  exists: `PortalState` carries the placement and the size, and stage 3 adds
-  nothing to it.
+Stage 4 is next, and it is the one that makes the module work:
+
+- **`portdocs/PORTAL.md` stage 4 — the remote trace and the teleport.** §5 and §6
+  together, because neither is testable without the other. §5 is
+  `TracePortalPlayerAABB`'s fourth step — the ray transformed into the exit
+  portal's space, traced against the linked portal's **tube**, which is what holds
+  the player up on the far room's floor while their box straddles the plane — plus
+  the tube itself (`CreateTubePolyhedrons`, `portalsimulation.cpp:3812`), which is
+  the same plane treatment `carve.rs` already does. §6 is `HandlePortalling`: the
+  portal selection, the frame split, the velocity clamp, the forced duck, and a
+  real `m_hPortalEnvironment` to replace `PortalHole::touches`. **Outcome: the
+  module works.**
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
   `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker

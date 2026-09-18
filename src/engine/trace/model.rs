@@ -290,6 +290,74 @@ impl CollisionBsp {
         Tracer::new(self)
     }
 
+    /// A collision model made of a flat list of brushes, under a tree with
+    /// one leaf that lists all of them.
+    ///
+    /// What [`carve`](super::carve) builds a portal's carved pieces into. The
+    /// degenerate tree is the point: a node whose two children are the same
+    /// leaf makes every descent reach it, so
+    /// [`recursive_hull_check`](super::hull), [`unswept_box_trace`](super::hull)
+    /// and [`CollisionBsp::leaf`] all apply to the result without a special
+    /// case, and the pieces are clipped by exactly the code the world's
+    /// brushes are. It is the shape `Fixture::single_leaf` already builds for
+    /// the tests.
+    ///
+    /// The leaf's own contents are **empty**, not the OR of the pieces —
+    /// [`CLeaf::contents`] is a *volume's* material and
+    /// [`unswept_box_trace`](super::hull) reads it to decide whether a box is
+    /// in the void outside the map. A carved wall has no outside.
+    ///
+    /// There are no displacements: terrain near a portal is not carved, which
+    /// is a real gap and is recorded as one in `rustdocs/ENGINE.md`.
+    pub(super) fn from_pieces(
+        mut planes: Vec<CPlane>,
+        brush_sides: Vec<CBrushSide>,
+        brushes: Vec<CBrush>,
+        surfaces: Vec<Surface>,
+    ) -> CollisionBsp {
+        // The node's own plane, appended rather than borrowed from the pieces:
+        // a node plane is read as `p[axis] - dist` when it is axial, which is
+        // only true for a *positive* axial normal, and a brush side's may face
+        // either way. Nothing descends on it — both children are the one
+        // leaf — but a plane that cannot be read wrongly is cheaper than the
+        // paragraph explaining why it does not matter.
+        let node_plane = planes.len() as u32;
+        planes.push(CPlane {
+            normal: Vec3::X,
+            dist: 0.0,
+            axis: Some(0),
+        });
+
+        let all_contents = brushes
+            .iter()
+            .fold(Contents::EMPTY, |all, brush| all.or(brush.contents));
+
+        CollisionBsp {
+            planes,
+            nodes: vec![CNode {
+                plane: node_plane,
+                children: [-1, -1],
+            }],
+            leaves: vec![CLeaf {
+                contents: Contents::EMPTY,
+                cluster: 0,
+                first_leaf_brush: 0,
+                num_leaf_brushes: brushes.len() as u32,
+                first_disp: 0,
+                num_disps: 0,
+            }],
+            leaf_brushes: (0..brushes.len() as u16).collect(),
+            brushes,
+            brush_sides,
+            box_brushes: Vec::new(),
+            disps: Vec::new(),
+            leaf_disps: Vec::new(),
+            surfaces,
+            head_nodes: vec![0],
+            all_contents,
+        }
+    }
+
     /// Brush model `index`, placed at `origin` and turned by `angles`.
     ///
     /// `index` is into the `.bsp`'s model lump, which is how an entity names

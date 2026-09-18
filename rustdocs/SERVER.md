@@ -55,8 +55,12 @@ third seam of its kind, after `PlayerState` and `ModelEntityState`),
 `Context::find_all_of_class`, and the `portal` console command's server half
 (`Server::place_portal`, `Server::fizzle_portals`). It links, it computes the
 matrix, and `engine::world::portals` draws a coloured oval where it is. **It
-does not carve the wall (stage 3) and it does not teleport anybody (stage 4)**,
-so what you see is an oval on an unbroken wall that you walk into and stop.
+does not teleport anybody (stage 4)**, and the class itself does not carve the
+wall either — stage 3 landed in `engine::trace::carve`, driven off the same
+`PortalState` this class already produced, which is what
+`portdocs/PORTAL.md` §12 meant by "the one thing stage 3 adds to the seam is
+nothing at all". So what you see is an oval on a wall you can walk *into*, and
+then fall out of the back of.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and

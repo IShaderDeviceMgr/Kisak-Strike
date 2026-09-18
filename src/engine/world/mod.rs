@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
-use crate::engine::trace::{BrushModel, CollisionBsp, Contents, Ray};
+use crate::engine::trace::{BrushModel, CollisionBsp, Contents, PortalHole, PortalHoles, Ray};
 use crate::filesystem::mount::pak::PakMount;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
@@ -410,6 +410,16 @@ pub struct World {
     /// whatever [`sync_portals`](World::sync_portals) was last told. Empty
     /// on 96 of the game's 106 maps, which place no `prop_portal`.
     pub portals: Portals,
+    /// The same portals' **collision** — the hole each one cuts in the wall it
+    /// sits on, `portdocs/PORTAL.md` stage 3.
+    ///
+    /// Here rather than in `trace/` for the reason
+    /// [`collision`](World::collision) is here: it is derived from this map's
+    /// file and dies with it. Kept in step by
+    /// [`sync_portals`](World::sync_portals), which is also what makes it the
+    /// *same* placement the oval is drawn at — a hole and a portal in
+    /// different places would be the worst kind of bug to find.
+    pub portal_holes: PortalHoles,
     /// The map's lighting — baked ambient cubes and world lights — kept after
     /// the `.bsp` is dropped.
     ///
@@ -642,6 +652,7 @@ impl World {
             prop_models,
             entity_models: EntityModels::default(),
             portals: Portals::load(materials, vfs),
+            portal_holes: PortalHoles::default(),
             lighting,
             entities,
             stats,
@@ -895,6 +906,21 @@ impl World {
     /// than matched.
     pub fn sync_portals(&mut self, portals: &[Portal]) {
         self.portals.sync(portals);
+
+        // …and the carve, which is the same list asked a different question.
+        // `PortalHoles::sync` compares each placement against the one it
+        // carved, so a portal standing still costs one comparison and a map
+        // with no portal costs nothing.
+        let live: Vec<(u64, PortalHole)> = portals
+            .iter()
+            .map(|p| {
+                (
+                    p.id,
+                    PortalHole::new(p.origin, p.angles, p.half_width, p.half_height),
+                )
+            })
+            .collect();
+        self.portal_holes.sync(&self.collision, &live);
     }
 
     pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>) {

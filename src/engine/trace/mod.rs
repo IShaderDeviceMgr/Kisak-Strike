@@ -8,6 +8,13 @@
 //! ([`Tracer::trace_model`]) — and the **displacements**, the map's terrain.
 //! No entities, no static props.
 //!
+//! [`carve`] is the exception to all of that, and it is `portdocs/PORTAL.md`
+//! stage 3 rather than `ENGINE_TRACE.md`: the collision near a portal, with a
+//! rectangular hole cut out of the wall behind it, as a collision model of its
+//! own. [`Tracer::with_hole`] is how it reaches a trace, and it is the one
+//! thing in this module that *changes* what [`Tracer::trace`] answers rather
+//! than adding to it.
+//!
 //! Terrain needs no call of its own: it is part of the world, [`Tracer::trace`]
 //! finds it the way it finds a brush, and the only visible difference is that
 //! [`Trace::disp_flags`] comes back non-zero. [`disp`] is where it lives, and
@@ -54,6 +61,7 @@
 //!    two lines are in [`brush`] and are commented as such.
 
 mod brush;
+mod carve;
 mod disp;
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -62,6 +70,7 @@ mod model;
 mod ray;
 mod result;
 
+pub use carve::{CarvedWall, PortalHole, PortalHoles, CARVE};
 pub use disp::disp_surf;
 pub use model::{BrushModel, CollisionBsp};
 pub use ray::{Contents, Ray};
@@ -228,6 +237,16 @@ pub struct Tracer<'a> {
     /// what makes [`trace`](Tracer::trace) a world-only sweep for every caller
     /// that has not asked for more.
     entities: &'a [BrushModel],
+    /// The carved wall substituted for the world near a portal, and its own
+    /// visit stamps — see [`with_hole`](Tracer::with_hole). `None` by default,
+    /// which is every caller that has not asked for a hole.
+    ///
+    /// The stamps are the hole's rather than the world's because they are
+    /// indexed by *its* brush numbering and there are a few hundred of them
+    /// against the map's tens of thousands. Allocated once, when the hole is
+    /// attached, for the reason the world's are: a `Tracer` is made once and
+    /// kept.
+    hole: Option<(&'a CarvedWall, Visits)>,
 }
 
 impl<'a> Tracer<'a> {
@@ -236,6 +255,7 @@ impl<'a> Tracer<'a> {
             bsp,
             visits: Visits::new(bsp.brushes.len(), bsp.disps.len()),
             entities: &[],
+            hole: None,
         }
     }
 
@@ -270,6 +290,50 @@ impl<'a> Tracer<'a> {
         self
     }
 
+    /// Substitutes a portal's carved geometry for the world near it —
+    /// `portdocs/PORTAL.md` §4.5's third item, and what makes the hole a hole.
+    ///
+    /// **Which portal is the caller's decision**, the way
+    /// [`with_entities`](Tracer::with_entities) leaves the clip chain to the
+    /// caller: `PortalHoles::touching` is the answer for a player, and this
+    /// module does not ask why.
+    ///
+    /// # Substitutive, not additive
+    ///
+    /// The clip chain *adds* candidates and takes the nearest. A hole does the
+    /// opposite — it takes away the wall the portal is on — and no amount of
+    /// adding can produce a subtraction, so [`trace`](Tracer::trace) runs the
+    /// sweep twice and reconciles: once against the real world and, only if
+    /// that hit something, once against the carved pieces, keeping **whichever
+    /// went further**. That is `TracePortalPlayerAABB`
+    /// (`portal_gamemovement.cpp:1640`) steps 1 to 3, exactly; its fourth step,
+    /// the ray transformed into the exit portal's space, is stage 4's and is
+    /// not here.
+    ///
+    /// # The cost, and the hazard
+    ///
+    /// A trace that hits nothing pays one comparison, which is Valve's guard
+    /// and is why a player nowhere near a portal is unaffected. One that hits
+    /// pays a second descent over a few hundred brushes.
+    ///
+    /// **"Whichever went further" is only safe inside the carved region.** The
+    /// carve holds the world within `vCollisionCloneExtents` of the portal
+    /// (`halfWidth + 75` across, `halfHeight + 75` through and up — 107 by 131
+    /// units for a shipped portal) and nothing outside it, so a sweep that leaves
+    /// that region finds nothing in the carved set, comes back at fraction 1,
+    /// and wins — i.e. passes through whatever the real world had there. A
+    /// movement step cannot: the guard needs the real trace to have hit
+    /// something, the selection needs the player inside the portal's trigger
+    /// box, and a tick's motion is a fraction of the distance to the edge.
+    /// A long ray can, and must not be traced with a hole attached. This is
+    /// the shipped engine's shape and is recorded rather than fixed —
+    /// `rustdocs/ENGINE.md` gotcha 23.
+    pub fn with_hole(mut self, wall: &'a CarvedWall) -> Tracer<'a> {
+        let pieces = wall.collision();
+        self.hole = Some((wall, Visits::new(pieces.brushes.len(), pieces.disps.len())));
+        self
+    }
+
     /// Sweeps `ray` through the world and everything in the clip chain,
     /// stopping at the nearest thing matching `mask`.
     ///
@@ -279,10 +343,53 @@ impl<'a> Tracer<'a> {
     /// that, followed by [`trace_model`](Tracer::trace_model) against each in
     /// turn. See [`with_entities`](Tracer::with_entities) for who decides
     /// which.
+    ///
+    /// **With a hole attached this is no longer only that**: it is the world's
+    /// answer *or* the portal's carved one, whichever went further. See
+    /// [`with_hole`](Tracer::with_hole), which is the only way to get one.
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace {
-        match self.entities.is_empty() {
+        let real = match self.entities.is_empty() {
             true => self.trace_world(ray, mask),
             false => self.trace_chain(ray, mask),
+        };
+        match self.hole.is_some() {
+            false => real,
+            true => self.substitute(ray, mask, real),
+        }
+    }
+
+    /// [`trace`](Tracer::trace)'s portal half — `TracePortalPlayerAABB`
+    /// (`portal_gamemovement.cpp:1640`) steps 1 to 3, with step 1 already done
+    /// and handed over as `real`.
+    ///
+    /// Two conditions, both Valve's and both worth reading twice:
+    ///
+    /// - **The carved sweep only runs when the real one hit something.** A
+    ///   trace that reached its end in open air has nothing a hole could
+    ///   improve, and letting the carved set answer it is exactly the failure
+    ///   [`with_hole`](Tracer::with_hole) warns about.
+    /// - **The carved answer wins when it went at least as far**, or whenever
+    ///   the real one began inside a solid — which is the case that matters,
+    ///   because a player standing in the hole *is* inside the wall as far as
+    ///   the real world is concerned, and without this they would be shoved
+    ///   out of it. A carved sweep that itself began solid never wins.
+    fn substitute(&mut self, ray: &Ray, mask: Contents, real: Trace) -> Trace {
+        if !(real.start_solid || (ray.is_swept && real.fraction < 1.0)) {
+            return real;
+        }
+        let Some((wall, visits)) = self.hole.as_mut() else {
+            return real;
+        };
+
+        let mut hole = sweep(wall.collision(), visits, ray, 0, mask);
+        compute_trace_endpoints(ray, &mut hole);
+        fix_up_hull_start(ray, &mut hole);
+
+        let better = real.start_solid
+            || (!hole.start_solid && ray.is_swept && hole.fraction >= real.fraction);
+        match better {
+            true => hole,
+            false => real,
         }
     }
 
@@ -515,44 +622,61 @@ impl<'a> Tracer<'a> {
     /// brush model. It is trusted to be a valid node index; `Bsp::parse`'s
     /// `validate` is what makes that true.
     fn box_trace(&mut self, ray: &Ray, head_node: i32, mask: Contents) -> Trace {
-        // `if (!pBSPData->numnodes)` — a map with no collision tree traces as
-        // a clean miss. Valve returns here leaving `startpos`/`endpos` at
-        // zero; the positions below are placeholders either way, because both
-        // callers overwrite them with `compute_trace_endpoints`.
-        if self.bsp.nodes.is_empty() {
-            return Trace::miss(ray.start, ray.start + ray.delta);
-        }
-
-        self.visits.begin();
-
-        let start = ray.start;
-        let end = ray.start + ray.delta;
-        let mut work = Work {
-            bsp: self.bsp,
-            start,
-            end,
-            extents: ray.extents,
-            delta: ray.delta,
-            inv_delta: ray.inv_delta(),
-            is_point: ray.is_ray,
-            is_swept: ray.is_swept,
-            contents: mask,
-            trace: Trace::miss(start, end),
-            disp_hit: false,
-            visits: &mut self.visits,
-        };
-
-        if !ray.is_swept {
-            // A zero-length sweep is a position test and has no direction to
-            // split the tree on.
-            hull::unswept_box_trace(&mut work, head_node);
-        } else if ray.is_ray {
-            hull::recursive_hull_check::<true>(&mut work, head_node, 0.0, 1.0, start, end);
-        } else {
-            hull::recursive_hull_check::<false>(&mut work, head_node, 0.0, 1.0, start, end);
-        }
-        work.trace
+        sweep(self.bsp, &mut self.visits, ray, head_node, mask)
     }
+}
+
+/// [`Tracer::box_trace`] against a collision model that is not the tracer's
+/// own, with its own visit stamps.
+///
+/// Split out for exactly one caller — [`Tracer::substitute`], which sweeps the
+/// carved pieces and cannot borrow the tracer's world and stamps to do it. A
+/// `Tracer` over the pieces would allocate a stamp table per trace; this
+/// allocates none, because [`with_hole`](Tracer::with_hole) allocated it once.
+fn sweep(
+    bsp: &CollisionBsp,
+    visits: &mut Visits,
+    ray: &Ray,
+    head_node: i32,
+    mask: Contents,
+) -> Trace {
+    // `if (!pBSPData->numnodes)` — a map with no collision tree traces as
+    // a clean miss. Valve returns here leaving `startpos`/`endpos` at
+    // zero; the positions below are placeholders either way, because both
+    // callers overwrite them with `compute_trace_endpoints`.
+    if bsp.nodes.is_empty() {
+        return Trace::miss(ray.start, ray.start + ray.delta);
+    }
+
+    visits.begin();
+
+    let start = ray.start;
+    let end = ray.start + ray.delta;
+    let mut work = Work {
+        bsp,
+        start,
+        end,
+        extents: ray.extents,
+        delta: ray.delta,
+        inv_delta: ray.inv_delta(),
+        is_point: ray.is_ray,
+        is_swept: ray.is_swept,
+        contents: mask,
+        trace: Trace::miss(start, end),
+        disp_hit: false,
+        visits,
+    };
+
+    if !ray.is_swept {
+        // A zero-length sweep is a position test and has no direction to
+        // split the tree on.
+        hull::unswept_box_trace(&mut work, head_node);
+    } else if ray.is_ray {
+        hull::recursive_hull_check::<true>(&mut work, head_node, 0.0, 1.0, start, end);
+    } else {
+        hull::recursive_hull_check::<false>(&mut work, head_node, 0.0, 1.0, start, end);
+    }
+    work.trace
 }
 
 /// Sweeps every displacement in one leaf's list — `CM_TraceToDispList`

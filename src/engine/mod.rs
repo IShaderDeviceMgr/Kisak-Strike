@@ -64,7 +64,7 @@ use crate::materials::{
 use crate::server::think::ServerClock;
 use crate::server::{self, Server};
 
-use self::trace::{disp_surf, Contents, Ray};
+use self::trace::{disp_surf, Contents, Ray, CARVE};
 use console::{
     Command, CommandSpec, CommandTarget, ConfigFiles, Console, ConsoleUi, Cvar, CvarFlags,
     CvarRegistry, Dispatch, ExecContext, Source,
@@ -772,11 +772,25 @@ impl<'a> Engine<'a> {
         // `clip_models` the brush entities the game has said are solid — which
         // is what makes a shut door a wall and, because a trigger is
         // `FSOLID_NOT_SOLID`, leaves every trigger in the map walk-through.
-        let mut tracer = self
-            .scene
-            .world
-            .as_ref()
-            .map(|w| w.collision.tracer().with_entities(w.clip_models()));
+        // …and the portal's hole, when the player is standing in one's trigger
+        // box. **Substitutive rather than additive** — see
+        // [`Tracer::with_hole`] — so the selection matters: attaching a hole
+        // that is nowhere near lets the sweep pass through the world. The box
+        // is the player's hull where they are *now*, which is what Valve's
+        // `m_hPortalEnvironment` records from the previous move's touch.
+        let player = self.scene.client.player();
+        let feet = player.origin;
+        let hull = (
+            feet + crate::client::movement::player_mins(player.ducked),
+            feet + crate::client::movement::player_maxs(player.ducked),
+        );
+        let mut tracer = self.scene.world.as_ref().map(|w| {
+            let tracer = w.collision.tracer().with_entities(w.clip_models());
+            match w.portal_holes.touching(hull.0, hull.1) {
+                Some(wall) => tracer.with_hole(wall),
+                None => tracer,
+            }
+        });
         self.scene
             .client
             .run_move(&command, seconds, tracer.as_mut());
@@ -1731,7 +1745,65 @@ fn trace_command(world: Option<&World>, client: &Client, cmd: &Command, cx: &mut
         )),
     }
 
+    trace_portal_hole(world, client, &ray, cx);
     trace_brush_models(world, &ray, from, cx);
+}
+
+/// The same ray again, against the **carved** geometry of whichever portal the
+/// player is standing in — `portdocs/PORTAL.md` stage 3.
+///
+/// Silent on a map with no portal, which is 96 of 106. When there is one it is
+/// the only way to see the carve from inside the running game: a hole is
+/// invisible, so "did the wall get cut" is otherwise a question you can only
+/// answer by walking into it.
+///
+/// The second trace is the carved pieces **alone** — `UTIL_Portal_TraceRay`
+/// (`portal_util_shared.cpp:638`), which never touches the real world. What
+/// [`Tracer::with_hole`] does with the two answers is the line above it.
+fn trace_portal_hole(world: &World, client: &Client, ray: &Ray, cx: &mut ExecContext<'_>) {
+    if world.portal_holes.is_empty() {
+        return;
+    }
+    let v = |v: glam::Vec3| format!("({:.1} {:.1} {:.1})", v.x, v.y, v.z);
+
+    let player = client.player();
+    let Some(wall) = world
+        .portal_holes
+        .touching(player.origin + VEC_HULL_MIN, player.origin + VEC_HULL_MAX)
+    else {
+        let carved = world
+            .portal_holes
+            .iter()
+            .map(|wall| format!("{} at {}", wall.id(), v(wall.hole().center)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        cx.print(&format!(
+            "  portal holes: {carved} — the player's hull is in none of them"
+        ));
+        return;
+    };
+
+    cx.print(&format!(
+        "  portal hole {} at {} facing {} (carve mask {CARVE}): {}",
+        wall.id(),
+        v(wall.hole().center),
+        v(wall.hole().forward),
+        wall.summary(),
+    ));
+    let hit = wall
+        .collision()
+        .tracer()
+        .trace(ray, Contents::MASK_PLAYERSOLID);
+    match hit.did_hit() {
+        false => cx.print("    the carved geometry stops nothing along this ray"),
+        true => cx.print(&format!(
+            "    fraction {:.6}  end {}  normal {}  startsolid {}",
+            hit.fraction,
+            v(hit.end),
+            v(hit.normal),
+            hit.start_solid,
+        )),
+    }
 }
 
 /// The same ray, against the brush models the map places —

@@ -38,7 +38,12 @@ A portal is four separable problems, and three of them are small:
 
 §4 is problem 2 and contains the finding that makes this tractable at all — **the carve
 does not need a polyhedron library**, because this port's brush clip consumes planes
-and Valve's polyhedra exist only to be turned into `CPhysCollide`s.
+and Valve's polyhedra exist only to be turned into `CPhysCollide`s. **That finding held**:
+§4 has landed in about 700 lines with `mathlib/polyhedron.cpp` and
+`staticcollisionpolyhedroncache.cpp` untouched. It needed one correction, which §4.3
+carries: the *one* thing the polyhedron clip was doing that the plane list does not get
+for free is deciding that a piece came out empty, and a swept box cannot be left to work
+that out for itself.
 
 ---
 
@@ -248,6 +253,13 @@ The hole itself is six planes (`portalsimulation.cpp:466`), and it is just a box
 Half a unit in front, five hundred behind, and **0.98×** the portal's half-size — not
 1.0, and not symmetric about the plane.
 
+> **This is not the hole the carve cuts, and the two go opposite ways.** The box above is
+> `pHoleShapeCollideable`, the volume `EntityIsInPortalHole` tests an entity against, and
+> it is slightly *smaller* than the portal. The hole §4.3 cuts is `halfWidth + 0.1` by
+> `halfHeight + 0.1` — slightly *larger*. Reading §4.2's numbers into the carve gives a
+> hole the player catches on the rim of, which is exactly what §9's sixth invariant warns
+> about, for the wrong reason.
+
 ### 4.3 This port does not need the polyhedron library
 
 `CarveWallBrushes_Sub` (`portalsimulation.cpp:3716`) is the whole of the hole-cutting,
@@ -279,9 +291,27 @@ This port traces BSP brushes. `clip_box_to_brush` (`src/engine/trace/brush.rs:18
 else**. So:
 
 > **A carved piece is the original brush's planes plus the four side planes at those
-> distances.** No vertices are generated, no convex hull is built, and a piece that came
-> out empty needs no detection — an infeasible plane set produces `enterfrac > leavefrac`
-> in the existing loop and reports a clean miss.
+> distances.** No vertices are generated and no convex hull is built.
+
+**The last clause of that used to read "and a piece that came out empty needs no
+detection — an infeasible plane set produces `enterfrac > leavefrac` in the existing loop
+and reports a clean miss". It is wrong, and it was wrong in the way that ships.** That
+holds for a *point*. `clip_box_to_brush` pushes every plane out by `|normal · extents|`
+before the loop (§4.4), so for a swept box two opposed planes with nothing between them
+end up a whole hull's width apart and the empty piece becomes a **solid slab**.
+
+And the case is guaranteed rather than incidental: the wall's own front face and the World
+set's clip plane are anti-parallel *by construction*, because a portal's forward is the
+surface normal of the wall it sits on. Left undetected, every portal in the game gets an
+invisible pane of glass across it — and only a box sweep can see it, so a point-grid test
+of the carve passes either way.
+
+The detection does **not** need the polyhedron library either: a scan for opposed planes
+whose distances sum below `PORTAL_POLYHEDRON_CUT_EPSILON` is `O(k²)` over a piece's dozen
+planes, proves emptiness without ever guessing at it, and drops **980 of 1,824 pieces
+(53.7%)** on the shipped game. What it misses — a piece empty only because of planes that
+are not parallel — survives as a sliver at a corner, which is §4.4's rounding and is
+bounded by the same extents.
 
 That deletes `mathlib/polyhedron.cpp` (3,895 lines) and
 `staticcollisionpolyhedroncache.cpp` (586) outright, and reduces `CreatePolyhedrons`'
@@ -335,14 +365,47 @@ bevel planes per non-axial side that `vbsp` writes.
    corners. `vCollisionCloneExtents` — `MAX( hw, hh ) + portal_environment_radius` (75,
    `:125`) on x and the half-sizes plus 75 on y and z — is the **World** set's box
    (`:3370`), which extends *forward* of the plane only and is §5's, not §4's.
-2. **The carved store**, rebuilt on `NewLocation`/activation and thrown away on
-   deactivation. Cheap: it is a `Vec<CPlane>` and a `Vec<CBrush>`-shaped side table.
-3. **A `Tracer` path that uses it.** `Tracer::with_entities` is the precedent — the
-   caller decides what is in the chain and the module does not know why. The portal case
-   is *substitutive* rather than additive, which is new: when the player is in a portal
-   environment, the carved pieces replace the originals rather than joining them, and
-   `TracePortalPlayerAABB` (§5) is how the two answers are reconciled.
-4. **The tube** (`CreateTubePolyhedrons`, `:3812-3917`), same plane treatment.
+2. **The carved store. LANDED** — `trace::carve::PortalHoles`, driven by
+   `World::sync_portals` from the same list the oval is drawn from, so a hole and a portal
+   cannot end up in different places. Carved on arrival, rebuilt when the placement
+   changes, dropped on deactivation; a portal standing still costs one comparison a frame.
+   It is exactly as cheap as predicted — a `Vec<CPlane>` and a `Vec<CBrush>`-shaped side
+   table — and it turned out to be the natural shape for it to be a **`CollisionBsp` with
+   a one-leaf tree**, which means every line of the ordinary traversal applies to the
+   pieces unchanged and the module contains no second sweep.
+
+   **One thing this section got wrong: the store has to hold the World set too.** §4.2
+   describes World and Wall as the two halves of Valve's split and this list only asked
+   for the Wall. But the reconciliation in (3) takes whichever trace went *further*, so a
+   store holding only the holed wall finds nothing under a player standing in a portal's
+   trigger box, prefers that, and drops them through the floor. The World set is the same
+   machinery with no side planes — `brushes_in_box` over the forward-facing OBB at
+   `:3370`, clipped to `collisionClip` — and it is what makes (3) safe.
+3. **A `Tracer` path that uses it. LANDED** — `Tracer::with_hole`, and
+   `Tracer::with_entities` was the right precedent: the caller decides which portal is in
+   play and the module does not know why. The substitution is `TracePortalPlayerAABB`
+   (`portal_gamemovement.cpp:1640`) steps 1 to 3 exactly — real trace, guard on it having
+   hit something, carved trace, keep whichever went further or the carved one if the real
+   began solid. `Engine::update_client` selects with `PortalHole::touches`, a stand-in for
+   `m_hPortalEnvironment` until §6.1 lands.
+
+   **The hazard to know about**: "whichever went further" is only safe inside the carved
+   region, which is `halfWidth + 75` across and `halfHeight + 75` through and up — 107 by
+   131 units for a shipped portal. A movement step cannot leave
+   it — the guard needs a hit, the selection needs the player in the trigger box, and a
+   tick's motion is a fraction of the distance to the edge — but a **long ray can**, and
+   would pass through whatever the real world had out there. That is the shipped engine's
+   shape and is ported rather than corrected; `rustdocs/ENGINE.md` gotcha 24 is the record.
+4. **The tube** (`CreateTubePolyhedrons`, `:3812-3917`), same plane treatment. **Still
+   open, and it belongs to stage 4** — a tube is the minimal volume an object must fit
+   inside to be eligible to pass, and what it is *for* is holding the player up on the far
+   room's floor through §5's remote trace. Without that there is nothing for it to do, and
+   stage 3's stated outcome is that you fall out of the back of the hole.
+5. **Terrain and static props in the carve.** Neither is cut: a displacement near a portal
+   is not in the carved set at all, so a substituted trace does not see it. Valve carries
+   displacements in behind `sv_portal_trace_vs_displacements` with reject regions
+   (`:2915`) and clips props with `GetBrushesInCollideable`. Portal 2's chambers put very
+   little terrain within 131 units of a portal, which is why this has not bitten.
 
 ---
 
@@ -668,9 +731,12 @@ lands.
 5. **The teleport trigger is the centre crossing the plane**, tested against
    `m_plane_Origin` with `< -FLT_EPSILON`, not the hull's near face and not the
    simulator's plane.
-6. **The hole is 0.98× the portal's half-size, 0.5 in front and 500 behind** (§4.2). Not
-   1.0, not symmetric. Using 1.0 makes the hole exactly the size of the visible portal
-   and the player catches on the rim.
+6. **There are two holes and they go opposite ways** (§4.2's note). The volume
+   `EntityIsInPortalHole` tests against is `0.98 ×` the half-sizes, 0.5 in front and 500
+   behind — smaller than the portal and not symmetric. The hole the carve *cuts* is
+   `half + 0.1`, with the slabs another 0.1 back from that — larger than the portal.
+   Using either set of numbers for the other job gives a hole the player catches on the
+   rim of.
 7. **`EntityIsInPortalHole` is a `startsolid` test**, not "is the origin inside" — a
    player whose centre is outside the hole but whose hull overlaps it is in the hole.
 8. **The velocity gate is directional and relative.** `ShouldTeleportTouchingEntity`
@@ -685,6 +751,15 @@ lands.
     preserves, not the origin. Conflating them drops the player 18 units.
 12. **The player's portal environment is reassigned to the exit portal before the
     post-teleport `startsolid` fixup** (§6.5), not on the next frame's touch update.
+13. **An empty carved piece becomes a solid slab under a swept box** (§4.3's correction),
+    and the arrangement that produces one is guaranteed rather than incidental. It draws
+    nothing and errors nothing: the portal looks right and the player cannot walk into it.
+    Only a box sweep can see it — a grid of *points* through the hole passes either way,
+    which is why the unit tests do both.
+14. **Taking whichever trace went further is only safe inside the carved region**
+    (§4.5's third item). Attach a hole to a tracer and then fire a long ray with it and
+    the ray passes through the world beyond the carve. Movement steps cannot reach that
+    far; anything else can.
 
 ---
 
@@ -759,10 +834,35 @@ Six decisions worth carrying forward:
    re-orient a shipped portal and the teleport matrix this port computes is the one the
    shipped game computes.
 
-**Stage 3 — the hole.** §4: the AABB brush enumerator (**landed** — `brushes_in_box`,
-see §4.5), the carve, the carved store, and `Tracer`'s substitutive path. **Outcome:** you can walk *into* the wall and stand in the
-hole, and fall out the back of it, because nothing catches you yet. Testable headlessly:
-a trace into a carved wall must miss where the hole is and hit where it is not.
+**Stage 3 — the hole. LANDED.** §4, all of it: the AABB brush enumerator
+(`brushes_in_box`), the carve, the carved store (`PortalHoles`) and `Tracer`'s
+substitutive path (`with_hole`). `src/engine/trace/carve.rs` is the whole of it;
+`rustdocs/ENGINE.md`, "The hole", is the reference.
+
+**Outcome, as predicted: you can walk into the wall and stand in the hole, and then fall
+out of the back of it**, because nothing catches you until stage 4.
+
+Four things this stage found that §4 did not predict:
+
+1. **The claim that an empty piece needs no detection is false for a swept box**, and the
+   case is guaranteed rather than incidental — §4.3 now carries the correction. It would
+   have shipped as an invisible pane of glass across every portal in the game, visible to
+   a hull sweep and not to a point test.
+2. **The store has to hold the World set as well as the Wall set**, or the substitutive
+   rule drops the player through the floor in front of the portal. §4.5's second item now
+   says so.
+3. **The far planes are asymmetric in the shipped game.** Three of the four are
+   `halfHeight × 40` and one is `halfWidth × 40` — including the *left* one, the only
+   plane in the set measured across the portal (`fFarLeftPlaneDistance`, `:3599`). Both
+   are an order of magnitude past any wall, so it can only matter where there is nothing
+   to cut; ported as written rather than "fixed" on a guess.
+4. **§4.2's hole and §4.3's hole are different boxes going opposite ways** — `0.98 ×` the
+   half-sizes for the detection volume, `+0.1` for the carve. §4.2 now says so out loud.
+
+Measured over all 21 shipped portals: **657 brushes carved into 844 pieces over 4,488
+planes, 980 pieces (53.7%) dropped as provably empty**, 0.06 ms to carve one portal and
+0.27 ms at worst; 945 sampled points inside the holes all clear, 4,200 outside them all
+unchanged, and a player hull walked into all 18 of the 21 that had a wall in the way.
 
 **Stage 4 — the remote trace and the teleport.** §5 and §6 together; neither is testable
 without the other. **Outcome:** the module works.
@@ -797,9 +897,22 @@ written**; the two that are not are stage 3's.
 - **Unit, fixture map:** a carved wall. Build a box brush, carve a hole in it, sweep a
   hull through the middle (must pass) and through the rim (must stop). `trace::fixture`
   already builds brushes from planes, which is exactly the shape a carved piece has.
+  **`a_hull_passes_through_the_hole_and_not_through_the_wall`**, and the rim half is
+  stronger than asked for: the carved sweep must stop at the *same fraction* the uncarved
+  world stops at, so a carve that moved the wall fails as loudly as one that removed it.
 - **Unit, fixture map:** the four-slab decomposition is complete — for a grid of points
   over the wall's face, "inside exactly one slab" ⟺ "outside the hole rectangle". This
   is the test that catches a sign error in §4.3's distance table, and it needs no BSP.
+  **`the_four_slabs_leave_a_hole_the_size_of_the_portal`**, over 3,111 points, and it is
+  a *point* test on purpose — which is also how it was discovered that a point test alone
+  cannot see the empty-piece bug §4.3 now describes.
+- **Depot, `--ignored`, and this one was not on the list:**
+  **`every_shipped_portal_carves_a_hole_in_its_wall`** carves all 21 against the maps they
+  are on and asserts that inside the hole nothing is solid and outside it the carved
+  answer is the uncarved one, brush for brush. The reference is the same enumerated
+  brushes with no clip and no side planes — not the world's own position test, which
+  answers "solid" for a point in the void outside the map where the carve correctly
+  answers nothing.
 - **Depot, `--ignored`:** all 21 shipped `prop_portal`s spawn, and all 10 maps produce
   exactly one linked pair in group 0 once every `SetActivatedState 1` in the map has
   been fired. Cheap — it is `Server::level_init` plus dispatch, the shape
@@ -843,12 +956,19 @@ written**; the two that are not are stage 3's.
 
 ## 12. Open questions
 
-1. **Substitutive tracing is new.** `Tracer::with_entities` adds candidates; the portal
-   needs the carved pieces to *replace* the world near the portal. §5 reconciles it by
-   running both traces and taking the better, which is Valve's own answer and avoids
-   teaching `box_trace` to skip brushes — but it costs a second full descent whenever
-   the player is near a portal. Measure it before optimising; the environment box is
-   small and `engine::world::bench` is the harness.
+1. **Substitutive tracing is new. ANSWERED, and it cost less than feared.**
+   `Tracer::with_hole` runs both traces and takes the better, exactly as §5 describes, and
+   the second descent is over a **one-leaf** collision model of a few hundred pieces
+   rather than the map — 844 pieces for all 21 shipped portals together, the largest
+   single carve being a fraction of that. It is also *guarded*: the carved sweep only runs
+   when the real one hit something, so a player standing in front of a portal in open air
+   pays one comparison. Nothing has been measured as a frame cost because nothing has
+   shown up as one; the number worth keeping is that **carving** a portal — which happens
+   on placement, not per frame — takes 0.06 ms.
+
+   The part that was *not* anticipated is the safety condition: taking the further trace
+   is only right inside the carved region, and the carved region has to include the
+   geometry in *front* of the plane (§4.5's second item) or the rule deletes the floor.
 2. **Where does the carve live? SETTLED IN STAGE 2, and the seam already exists.**
    `crate::server::PortalState` is "a portal exists here, this size, this angle,
    this long open", `Engine::frame` copies it across once a rendered frame, and

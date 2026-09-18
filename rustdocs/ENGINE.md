@@ -241,7 +241,8 @@ pub fn load_entity_models(
 pub fn sync_entity_models(&mut self, entities: &[entities::ModelEntity]);
 /// The active portals, once a rendered frame. The third and simplest of the
 /// three server seams — a portal owns no uploaded geometry, so the list is
-/// replaced rather than matched.
+/// replaced rather than matched. It also drives `portal_holes`, so the hole a
+/// portal cuts and the oval it wears can never be in different places.
 pub fn sync_portals(&mut self, portals: &[portals::Portal]);
 pub fn center(&self) -> Vec3;
 pub fn summary(&self) -> String;
@@ -262,6 +263,14 @@ pub struct World {
     pub brush_models: Vec<PlacedBrushModel>,
     /// The drawable ones among them, with their geometry.
     pub brush_model_geometry: Vec<BrushModelGeometry>,
+    /// The map's collision geometry, arranged for tracing.
+    pub collision: CollisionBsp,
+    /// The ovals the active portals wear — `portdocs/PORTAL.md` stage 2.
+    pub portals: Portals,
+    /// The same portals' **collision** — the hole each cuts in the wall it sits
+    /// on, `portdocs/PORTAL.md` stage 3. Hand one to
+    /// [`Tracer::with_hole`](#the-hole--portalhole-carvedwall-portalholes-and-with_hole).
+    pub portal_holes: PortalHoles,
     pub stats: WorldStats,
 }
 ```
@@ -772,10 +781,15 @@ with no geometry of its own anywhere in the game's files —
 `CPortalRenderable_FlatBasic::DrawSimplePortalMesh` with
 `models/portals/portalstaticoverlay_1.vmt` bound.
 
-`portdocs/PORTAL.md` **stage 2 of five**, so **what you see is a coloured oval
-on an unbroken wall**: no hole, no view through, no reflection of the room on
-the other side. That is the deliberate output of that document's scope and is
-worth saying out loud before anyone reports it as a bug.
+`portdocs/PORTAL.md` **stage 3 of five**, so **what you see is a coloured oval
+on a wall you can now walk into**: the hole is real collision and no longer a
+drawing, but there is still no view through and no reflection of the room on the
+other side, and nothing catches you on the far side of the wall — you fall out
+of the back of the hole. That is the deliberate output of that document's scope
+and is worth saying out loud before anyone reports it as a bug. The hole itself
+is `trace/`'s and is
+[`PortalHoles`](#the-hole--portalhole-carvedwall-portalholes-and-with_hole);
+`World::sync_portals` keeps the two in step from this one list.
 
 There is no per-instance load step and nothing to keep alive across an absence,
 which is why `sync` *replaces* the list where
@@ -1354,6 +1368,40 @@ impl Tracer<'_> {
     /// `GetBrushesInAABB` — the world brushes an axis-aligned box overlaps,
     /// as indices into the collision model's own table. See below.
     pub fn brushes_in_box(&mut self, mins: Vec3, maxs: Vec3, mask: Contents) -> Vec<usize>;
+    /// Stage 3 of `portdocs/PORTAL.md`: substitute a portal's carved geometry
+    /// for the world near it. **Changes what `trace` means.** See below.
+    pub fn with_hole(self, wall: &CarvedWall) -> Tracer<'_>;
+}
+
+/// The carve — `trace::carve`. `CARVE` is the contents mask it collects with.
+impl PortalHole {
+    /// `angles` is a `QAngle`; the basis comes out the way a `prop_portal`'s does.
+    pub fn new(origin: Vec3, angles: Vec3, half_width: f32, half_height: f32) -> PortalHole;
+    /// Whether a box is inside the portal's trigger volume — the stand-in for
+    /// `m_hPortalEnvironment` until stage 4. See below.
+    pub fn touches(&self, mins: Vec3, maxs: Vec3) -> bool;
+}
+
+impl CarvedWall {
+    /// `tracer` is used only to enumerate, so one may be shared across a whole sync.
+    pub fn build(tracer: &mut Tracer<'_>, id: u64, hole: &PortalHole) -> CarvedWall;
+    /// The pieces, as a collision model of their own — trace it like any other.
+    pub fn collision(&self) -> &CollisionBsp;
+    pub fn id(&self) -> u64;
+    pub fn hole(&self) -> &PortalHole;
+    pub fn sources(&self) -> usize;
+    pub fn pieces(&self) -> usize;
+    pub fn summary(&self) -> String;
+}
+
+impl PortalHoles {
+    /// Carve what is new, rebuild what moved, drop what is gone.
+    pub fn sync(&mut self, collision: &CollisionBsp, live: &[(u64, PortalHole)]);
+    pub fn get(&self, id: u64) -> Option<&CarvedWall>;
+    /// The portal whose trigger volume this box is in. First match wins.
+    pub fn touching(&self, mins: Vec3, maxs: Vec3) -> Option<&CarvedWall>;
+    pub fn iter(&self) -> impl Iterator<Item = &CarvedWall>;
+    pub fn is_empty(&self) -> bool;
 }
 ```
 
@@ -1371,6 +1419,27 @@ in `src/server/`. `world/` carries the answer across as
 `solid`, and **a model nobody has answered for is left out** — this port has classes for
 6,302 of the game's 11,635 brush entities, and among the rest are 2,383
 `func_portal_bumper`s, none of which is solid to a player.
+
+Three details inside it are load-bearing:
+
+- **The world is traced first and the ray is then shortened to the hit**, so a door behind
+  a wall costs a rejected descent rather than a full sweep. The shortening recomputes the
+  end and *subtracts* to get the delta rather than scaling it — Valve's comment says
+  scaling "would miss intersections we would get by feeding these results back in to the
+  tracer".
+- **The fractions come back rescaled onto the original ray.** Inside the loop they are
+  fractions of the shortened one.
+- **A trace that starts inside the world never looks at an entity** — "inside world, no
+  need to check being inside anything else".
+
+`ClipTraceToTrace`'s merge is not "take the smaller fraction": a trace that started inside
+something has a fraction of 1 and matters anyway, and when *both* started solid the
+surviving `start`/`fraction_left_solid` is the pair from whichever left solid **later**.
+
+The chain is walked linearly — Valve's spatial partition replaced by nothing, deliberately.
+A Portal 2 map has a few hundred brush entities (78 on `sp_a1_intro1`), each rejected by a
+bounding-box test at the top of its own BSP descent, and §5 of the portdoc already records
+that `parry`'s `Qbvh` is where a broadphase comes from when one is needed.
 
 ### The box query — `brushes_in_box`
 
@@ -1398,26 +1467,82 @@ set becomes a separate `CPhysCollide` with its own collision filter. A BSP brush
 its own contents and `clip_box_to_brush` already filters on them, so this port asks once
 with the union — which is the commented-out line at `portalsimulation.cpp:1167`.
 
-Three details inside it are load-bearing:
 
-- **The world is traced first and the ray is then shortened to the hit**, so a door behind
-  a wall costs a rejected descent rather than a full sweep. The shortening recomputes the
-  end and *subtracts* to get the delta rather than scaling it — Valve's comment says
-  scaling "would miss intersections we would get by feeding these results back in to the
-  tracer".
-- **The fractions come back rescaled onto the original ray.** Inside the loop they are
-  fractions of the shortened one.
-- **A trace that starts inside the world never looks at an entity** — "inside world, no
-  need to check being inside anything else".
+### The hole — `PortalHole`, `CarvedWall`, `PortalHoles` and `with_hole`
 
-`ClipTraceToTrace`'s merge is not "take the smaller fraction": a trace that started inside
-something has a fraction of 1 and matters anyway, and when *both* started solid the
-surviving `start`/`fraction_left_solid` is the pair from whichever left solid **later**.
+`CPortalSimulator::CreatePolyhedrons` and `CarveWallBrushes_Sub`
+(`game/shared/portal/portalsimulation.cpp:3315`, `:3716`), which are `portdocs/PORTAL.md`
+§4 and the whole of its stage 3. A portal splits the collision near it into two sets and
+`CarvedWall` holds both:
 
-The chain is walked linearly — Valve's spatial partition replaced by nothing, deliberately.
-A Portal 2 map has a few hundred brush entities (78 on `sp_a1_intro1`), each rejected by a
-bounding-box test at the top of its own BSP descent, and §5 of the portdoc already records
-that `parry`'s `Qbvh` is where a broadphase comes from when one is needed.
+| Set | Box | What happens to it |
+|---|---|---|
+| **World** | in *front* of the plane, `vCollisionCloneExtents` (`max(hw,hh)+75` forward, `hw+75` across, `hh+75` up) | clipped, not holed |
+| **Wall** | *behind* it, `2 × max(hh,hw)` deep by `±4 × hw` by `±4 × hh` | clipped, and cut into four slabs around a rectangular hole |
+
+**Both are needed, and the World set is not optional.** The substitutive rule below takes
+whichever of the two traces went *further*, so a store holding only the holed wall would
+find nothing under a player standing in a portal's trigger box, prefer that, and drop them
+through the floor. `the_carved_store_keeps_the_floor_in_front_of_the_portal` is the test.
+
+**No polyhedron library, and that part of `portdocs/PORTAL.md` §4.3 holds.** A carved piece
+is the original brush's planes, plus the six clip planes, plus the four side planes for
+that slab — no vertices generated and no hull built. `mathlib/polyhedron.cpp` (3,895 lines)
+and `staticcollisionpolyhedroncache.cpp` (586) are deleted outright. Two consequences the
+portdoc did not have:
+
+- **A box brush becomes a plane brush**, because a carved box is not a box. The two paths
+  agree to within how each applies `DIST_EPSILON`, so this changes which of two equivalent
+  routines a wall near a portal takes and nothing else.
+- **An empty piece has to be dropped** — see gotcha 23, which is the one thing in this
+  module that would have shipped as a bug.
+
+The four slabs are four clips of the same four normals — up, down, left, right — at four
+sets of distances, and the hole they leave is `halfWidth + 0.1` by `halfHeight + 0.1`
+about the centre, with the slabs stopping another `PORTAL_WALL_MIN_THICKNESS` (0.1) back
+from that. **That is a hole slightly *larger* than the portal.** Do not confuse it with
+`pHoleShapeCollideable` (`portalsimulation.cpp:466`), which is `0.98 ×` the half-sizes and
+so slightly *smaller*: that one is the volume `EntityIsInPortalHole` tests against and has
+nothing to do with the carve.
+
+#### The store, and its lifecycle
+
+`PortalHoles` is `CPortalSimulator`'s lifecycle reduced to what it does to collision:
+carved on `MoveTo`, rebuilt when the placement changes, dropped when the portal
+deactivates. `World::sync_portals` drives it from the same list the oval is drawn from, so
+a hole and a portal cannot end up in different places. A portal standing still costs one
+`PortalHole` comparison per frame and nothing else.
+
+#### Substitutive, not additive — `with_hole`
+
+The clip chain *adds* candidates and keeps the nearest. A hole does the opposite, and no
+amount of adding produces a subtraction, so `trace` runs the sweep twice and reconciles —
+`TracePortalPlayerAABB` (`portal_gamemovement.cpp:1640`) steps 1 to 3, exactly:
+
+1. trace the real world (and the clip chain);
+2. **only if** that started solid or actually hit something, trace the carved pieces;
+3. keep the carved answer when it went at least as far, or whenever the real one started
+   solid — and never when the carved one itself started solid.
+
+Step 3's `startsolid` clause is the one that matters: a player standing in the hole *is*
+inside the wall as far as the real world is concerned, and without it they are shoved back
+out every tick. Step 4 — the ray transformed into the exit portal's space — is stage 4's
+and is not here.
+
+`Engine::update_client` is the one caller: it asks `PortalHoles::touching` with the
+player's hull and attaches whatever comes back. **Which portal is the caller's decision**,
+the way `with_entities` leaves the clip chain to the caller.
+
+#### `touches` is a stand-in for `m_hPortalEnvironment`
+
+The real answer is `portdocs/PORTAL.md` §6.1's: `CPortal_Base2D::TestCollision` against the
+portal's OBB plus three filters, producing a networked handle the teleport reassigns.
+`touches` is the first of those on its own — the box overlaps
+`(0, -halfWidth, -halfHeight)`..`(64, halfWidth, halfHeight)` in the portal's frame, the
+64 being `GetLocalMaxs().x` (`portal_base2d.h:174`). It tests the *portal's* three axes
+and not the box's, which is half of a separating-axis test: exact for an axis-aligned
+portal and conservative for any other, erring towards using the carved geometry near a
+portal, which is the safe direction.
 
 ### `BrushModel` — a door, a platform, a piston
 
@@ -1692,6 +1817,58 @@ Ordered by how likely each is to bite.
     geometry.** `every_shipped_map_enumerates_the_brushes_in_a_box` is written around
     that rather than against it.
 
+### Four more, from the carve
+
+23. **An empty carved piece has to be *detected*, not left to the plane loop — and
+    `portdocs/PORTAL.md` §4.3 said the opposite.** The claim was that an infeasible plane
+    set produces `enterfrac > leavefrac` and reports a clean miss, so a piece that came
+    out empty needs no handling. That is true of a *point* and false of a swept box:
+    `clip_box_to_brush` pushes every plane out by `|normal · extents|`, so two opposed
+    planes with nothing between them end up a whole hull's width apart and the empty piece
+    becomes a solid slab.
+
+    It is not a corner case. The **wall's own front face and the World set's clip plane**
+    are anti-parallel by construction — a portal's forward *is* the surface normal of the
+    wall it sits on — and a sixteenth of a unit apart the wrong way round. Left in, every
+    portal in the game has an invisible pane of glass across it, and *only a box sweep can
+    see it*: the point-grid test passes either way.
+    `an_empty_piece_does_not_become_a_pane_of_glass_across_the_hole` is confirmed to fail
+    without the check, along with three of the four box-sweep tests.
+
+    The test is a scan for opposed planes whose distances sum below
+    `PORTAL_POLYHEDRON_CUT_EPSILON` (1/1024, `portalsimulation.cpp:69`). It is **sound but
+    not complete**: it proves emptiness and never guesses, so nothing real is dropped, and
+    what it misses is a piece that is empty only because of planes that are *not*
+    parallel — which survives as a sliver at a corner, bounded by the sweeping box's
+    extents and hugging a brush that is solid anyway. On the shipped game it drops **980 of
+    1,824 pieces, 53.7%**.
+
+24. **`with_hole` changes what `trace` means, and "whichever went further" is only safe
+    inside the carved region.** The carve holds the world within `halfWidth + 75` of the portal across and `halfHeight + 75`
+    through and up — 107 by 131 units for a shipped 32 by 56 portal —
+    the portal and nothing outside it, so a sweep that leaves that region finds nothing in
+    the carved set, comes back at fraction 1, and *wins* — passing through whatever the
+    real world had there. A movement step cannot do this: the guard needs the real trace to
+    have hit something, the selection needs the player inside the portal's trigger box, and
+    a tick's motion is a fraction of the distance to the edge. **A long ray can**, so do
+    not attach a hole to a tracer that is about to fire one. This is the shipped engine's
+    shape, not this port's addition.
+
+25. **The carve has no terrain and no static props.** `CarvedWall`'s collision model holds
+    brushes only, so a displacement near a portal is *not* cut and, more to the point, is
+    not in the carved set at all — a substituted trace does not see it. Valve carries
+    displacements into the simulator behind `sv_portal_trace_vs_displacements` and rejects
+    them by region (`portalsimulation.cpp:2915`), and clips static props with
+    `GetBrushesInCollideable`. Neither is here. Portal 2's chambers put very little terrain
+    within 131 units of a portal, which is why this has not bitten yet.
+
+26. **A cut face reports the null surface.** The four slabs' generated planes name
+    `**empty**`, where the brush's own faces keep their material. Valve gives its whole
+    carved collideable one `csurface_t`, taken from the trace that *placed* the portal
+    (`PS_SD_Static_SurfaceProperties_t`); this port deleted that trace with the placement
+    snap, and naming the originating brush's material for a face that brush does not have
+    would be a worse answer than none.
+
 ### One place this is stricter than Valve
 
 `IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
@@ -1712,6 +1889,10 @@ path either way.
 | Displacement *rendering* | done — `world/disp/` |
 | `LUMP_PHYSDISP`, `CM_CreateDispPhysCollide` | `vphysics/` — the displacement's *physics* mesh, not its trace |
 | Displacement multiblend (`LUMP_DISP_MULTIBLEND`) | nothing — no Portal 2 displacement sets `DISP_INFO_FLAG_HAS_MULTIBLEND` |
+| The portal **tube** (`CreateTubePolyhedrons`, `portalsimulation.cpp:3812`) | stage 4 — it is what holds a player up on the far room's floor, and needs the remote trace to mean anything |
+| Terrain and static props in the carve | gotcha 25 — displacements need `sv_portal_trace_vs_displacements`' reject regions, props need `GetBrushesInCollideable` |
+| `RemoteTransformedToLocal` — the linked portal's world brought through the matrix | stage 4, `portdocs/PORTAL.md` §5 |
+| A real `m_hPortalEnvironment` | stage 4's §6.1 selection; `PortalHole::touches` is the stand-in |
 | PVS, areas, areaportals | `world/`'s visibility work, not this module's |
 | `surfaceProps`, hitboxes, occlusion queries | `vphysics/`, `.mdl`, and never |
 
@@ -1724,6 +1905,14 @@ compiled it as walkable, then the contents and leaf at the eye, a ground probe w
 `CategorizePosition`'s 0.7 standable test (and the same walkable contrast), and — stage
 2 — the same ray against every brush model the map places, reporting the nearest by
 classname and model index.
+
+On a map with a portal on it there is one more line, and it is the only way to see the
+carve from inside the running game: which hole the player is standing in, how many brushes
+it cut into how many pieces, and the same ray against those pieces **alone** —
+`UTIL_Portal_TraceRay` (`portal_util_shared.cpp:638`), which never touches the real world.
+A hole is invisible, so "did the wall get cut" is otherwise a question you can only answer
+by walking into it. When the player is in no portal's trigger box the line lists the holes
+that exist and says so.
 
 **This port's own, not Valve's** — the C++ equivalents (`debugrayenable`, the trace
 counter) exist to work around a DLL boundary this build does not have. It is stages 1
@@ -1751,9 +1940,9 @@ fallen), and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x80
 
 ### Test coverage (trace)
 
-47 tests, none of which need a map, a GPU or a window — the fixtures build a
+59 tests, none of which need a map, a GPU or a window — the fixtures build a
 `CollisionBsp` through `CollisionBsp::build` from a hand-written `Bsp`, so the box
-extraction, the displacement build and the surface table are under test too — plus three
+extraction, the displacement build and the surface table are under test too — plus four
 depot-gated tests that need a Portal 2 install.
 
 | Test | Guards |
@@ -1895,6 +2084,51 @@ one would — and checks four properties rather than one comparison, for the rea
 Measured: **141,686 brushes across 106 maps, 25,744 of them outside the world subtree**;
 2,862 probes, 760 on something, 3,387 brushes returned, at most 62 from one box; 8,373
 leaves reached and 357,750 points asked which leaf they are in.
+
+The carve is covered by twelve unit tests on a fixture that is a wall slab across
+`x = -8..0` with a floor in front of it and a portal on the wall's face:
+
+| Test | Guards |
+|---|---|
+| `the_four_slabs_leave_a_hole_the_size_of_the_portal` | **the whole distance table**, as a grid of 3,111 points: solid ⟺ outside the hole rectangle. Fails on any sign error in §4.3's table |
+| `a_wall_of_plane_brushes_carves_to_the_same_hole` | the plane-brush half of `source_sides`, where the rest of the fixture is a box brush |
+| `a_hull_passes_through_the_hole_and_not_through_the_wall` | `portdocs/PORTAL.md` §11's acceptance test: through the middle, and stopped above it at the same fraction the uncarved world stops at |
+| `the_substitutive_trace_takes_the_hole_and_keeps_the_rest` | `with_hole`'s reconciliation, both branches |
+| `the_carved_store_keeps_the_floor_in_front_of_the_portal` | the World set — without it the player falls through the floor |
+| `a_hull_standing_in_the_hole_is_not_solid` | the `startsolid` branch of the reconciliation |
+| `an_empty_piece_does_not_become_a_pane_of_glass_across_the_hole` | gotcha 23 — **confirmed to fail without the check**, along with three of the tests above |
+| `a_cut_face_has_no_material_and_the_walls_own_faces_keep_theirs` | gotcha 26, and the surface remapping |
+| `the_wall_box_is_behind_the_plane_and_the_world_box_in_front` | the two query boxes, which are the easiest thing here to get the wrong way round |
+| `the_trigger_box_reaches_forward_of_the_portal_and_not_behind_it` | `touches`, at six positions |
+| `the_store_carves_on_arrival_rebuilds_on_a_move_and_drops_on_removal` | the whole lifecycle, including the hole moving with the portal |
+| `a_portal_with_no_wall_behind_it_carves_nothing` | the four mid-air portals the game ships, and that tracing nothing is a miss rather than a panic |
+
+**`every_shipped_portal_carves_a_hole_in_its_wall`** is the depot-gated one:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release carves_a_hole -- --ignored --nocapture
+```
+
+It carves all 21 shipped `prop_portal`s against the maps they are on and asserts two
+properties with *point* tests, so no Minkowski expansion is involved and the pieces are
+read as the volumes they are:
+
+- **inside the hole rectangle and behind the plane, nothing is solid** — whatever the map
+  had there, the carve took it away;
+- **outside it, the carved answer is the uncarved one**, brush for brush. The reference is
+  the same enumerated brushes with no clip and no side planes, which is the only comparison
+  that means anything: the *world's* own position test answers "solid" for a point in the
+  void outside the map, where the carve holds no brushes and correctly answers nothing.
+
+It also walks a player hull straight at each portal and counts how many get in, which is
+the stage's own stated outcome.
+
+Measured: **21 portals across 10 maps, 657 brushes carved into 844 pieces over 4,488
+planes, 980 pieces (53.7%) dropped as empty**; 945 points inside the holes, all clear;
+4,200 outside, 2,018 of them solid and every one unchanged; **a hull walked at 18 of the
+21 and got into all 18** (the other three start solid). Carving one portal takes **0.06 ms
+on average and 0.27 ms at worst**, which is why the store rebuilds on placement rather than
+on a schedule.
 
 Stage 4's clip chain is covered by three unit tests here
 (`the_clip_chain_keeps_the_nearest_of_the_world_and_the_entities`,
@@ -3444,7 +3678,8 @@ world draw are verified by running the binary — see [Quick start](#quick-start
 > record of how they were arrived at.
 
 **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
-lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5), `input/` (stages 1-4
+lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5, plus the portal
+carve), `input/` (stages 1-4
 of 5), and `console/` (all five stages, complete)**
 (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
 Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
@@ -3837,8 +4072,13 @@ and draw the coloured oval the shipped game draws — through a real port of
 `PortalRefract`'s `$Stage 2`, noise, gradient strip, opening animation and all.
 A `portal` console command places and links a pair wherever you are looking,
 because 21 scripted portals is not enough to develop against.
-**There is no hole**: that is `portdocs/PORTAL.md` stage 3, and until it lands
-you walk into the wall and stop.
+**And now there is a hole.** `portdocs/PORTAL.md` stage 3 carves the wall a
+portal sits on into four slabs around a rectangular opening and substitutes that
+for the world while you are standing in front of one, so **you can walk into the
+wall and stand inside it** — and then fall out of the back, because nothing
+catches you until stage 4's remote trace. Measured across all 21 shipped
+portals: 657 brushes carved into 844 pieces in 0.06 ms each, and a player hull
+walked into every one of the 18 that had a wall in the way.
 It is **still not a runnable game** — no sound, no netcode, no weapon, and
 a door moves *through* the player rather than shoving it (a chamber door is
 walked through for the same reason) — but the boot path is
