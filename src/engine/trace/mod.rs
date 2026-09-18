@@ -336,6 +336,111 @@ impl<'a> Tracer<'a> {
         trace
     }
 
+    /// Every world brush the axis-aligned box `mins`..`maxs` overlaps and
+    /// `mask` admits — `CEngineTrace::GetBrushesInAABB`
+    /// (`engine/enginetrace.cpp:599`).
+    ///
+    /// The one query this module answers that is not a sweep, and it exists
+    /// for `portdocs/PORTAL.md` stage 3: cutting a hole in a wall means
+    /// re-emitting the planes of every brush near the portal with four more
+    /// added, so the carve has to be handed the brushes before it can say
+    /// anything about them. The indices are into this module's own brush
+    /// table.
+    ///
+    /// # Overlap, not leaf membership
+    ///
+    /// A brush belongs to every leaf it touches and a leaf lists every brush
+    /// that touches *it*, so concatenating the leaf lists answers a larger
+    /// question than the one asked — a brush can share a leaf with the box and
+    /// be the length of the room away from it. Each candidate is therefore put
+    /// through the position test, [`brush::test_box_in_brush`], and kept only
+    /// when the box is really inside it. That is Valve's own shape: it sets up
+    /// a `TraceInfo_t` whose start and end are both the box's centre and keeps
+    /// the brushes that come back `allsolid`.
+    ///
+    /// # The world only, and leaf-limited
+    ///
+    /// Head node 0, no brush models, and nothing from
+    /// [`with_entities`](Tracer::with_entities) — the same scope as
+    /// [`trace_world`](Tracer::trace_world). Valve's form for anything else is
+    /// a separate call, `GetBrushesInCollideable`, which is what the portal
+    /// simulator carves static props and moving geometry with; both are stage
+    /// 3's deferred half.
+    ///
+    /// **"Every world brush the box overlaps" is not quite what comes back**,
+    /// and the difference is the shipped engine's as much as this port's: a
+    /// brush that no leaf names is unreachable, and a brush can reach past the
+    /// leaves that do name it. `rustdocs/ENGINE.md`'s gotcha 22 has the
+    /// measured shape of both, and
+    /// `every_shipped_map_enumerates_the_brushes_in_a_box` is written around
+    /// them. **The carve cuts against what the leaves offer, not against the
+    /// geometry.**
+    ///
+    /// Order is leaf order, then leaf-list order within a leaf, and **each
+    /// brush appears once** however many of the box's leaves hold it.
+    // Written ahead of its caller, which is `PORTAL.md` stage 3's carve. The
+    // seeding also keeps `leaves_in_box` alive, since that has no other one.
+    #[allow(dead_code)]
+    pub fn brushes_in_box(&mut self, mins: Vec3, maxs: Vec3, mask: Contents) -> Vec<usize> {
+        let leaves = self.bsp.leaves_in_box(mins, maxs, 0);
+        if leaves.is_empty() {
+            return Vec::new();
+        }
+
+        self.visits.begin();
+
+        // The degenerate sweep the position test reads: a box at rest at the
+        // query's centre. `is_point` stays false even for a zero-size query,
+        // because the flag selects an algorithm rather than describing the
+        // extents — Valve sets it false here unconditionally.
+        let center = (mins + maxs) * 0.5;
+        let mut work = Work {
+            bsp: self.bsp,
+            start: center,
+            end: center,
+            extents: maxs - center,
+            delta: Vec3::ZERO,
+            inv_delta: Vec3::ZERO,
+            is_point: false,
+            is_swept: false,
+            contents: mask,
+            trace: Trace::miss(center, center),
+            disp_hit: false,
+            visits: &mut self.visits,
+        };
+
+        let mut found = Vec::new();
+        for leaf_index in leaves {
+            let leaf = work.bsp.leaves[leaf_index];
+            let first = leaf.first_leaf_brush as usize;
+            let count = leaf.num_leaf_brushes as usize;
+            for i in first..first + count {
+                let index = work.bsp.leaf_brushes[i] as usize;
+                // Marked before the contents test, as Valve marks it: a brush
+                // the mask rejects is rejected in every leaf, and re-deciding
+                // that per leaf would be work with no possible answer of its
+                // own.
+                if !work.visit(index) {
+                    continue;
+                }
+                if !work.bsp.brushes[index].contents.intersects(mask) {
+                    continue;
+                }
+
+                brush::test_box_in_brush(&mut work, index);
+                if work.trace.all_solid {
+                    found.push(index);
+                    // "Clear the flag for re-use." The rest of the trace is
+                    // left dirty deliberately: `test_box_in_brush` reads
+                    // nothing out of it, so `all_solid` is the only field that
+                    // could carry an answer from one brush to the next.
+                    work.trace.all_solid = false;
+                }
+            }
+        }
+        found
+    }
+
     /// [`trace`](Tracer::trace)'s entity half.
     ///
     /// # Three details, and each of them is load-bearing
@@ -874,6 +979,68 @@ impl CollisionBsp {
             };
         }
         (-1 - num) as usize
+    }
+
+    /// Every leaf the axis-aligned box `mins`..`maxs` reaches, under
+    /// `head_node` — `CM_BoxLeafnums` (`engine/cmodel.cpp:552`).
+    ///
+    /// The box form of [`leaf`](CollisionBsp::leaf), and the same descent with
+    /// one difference: a plane the box straddles is descended on **both**
+    /// sides rather than one. The straddle test is the box's radius along the
+    /// plane normal, `|normal| · extents`, which is the support function of an
+    /// axis-aligned box and so exact rather than conservative.
+    ///
+    /// No leaf can appear twice — the tree partitions space, so a second visit
+    /// would mean two nodes claiming the same volume. That is what lets
+    /// [`brushes_in_box`](Tracer::brushes_in_box) dedupe brushes and nothing
+    /// else.
+    ///
+    /// The pending list is read front-to-back rather than as a stack, which
+    /// is not a detail: it is what makes the leaves come out in Valve's order,
+    /// and so what makes [`brushes_in_box`](Tracer::brushes_in_box)'s
+    /// documented ordering the shipped engine's. Valve's is a ring buffer of
+    /// 1,024 with an assert on overflow, and it also carries a `topnode` out
+    /// for the PVS; a `Vec` read with a cursor has neither limit, and no
+    /// caller wants the top node yet.
+    fn leaves_in_box(&self, mins: Vec3, maxs: Vec3, head_node: i32) -> Vec<usize> {
+        // A map with no collision tree has no leaves worth naming. `leaf`
+        // answers 0 instead, because a point is always *somewhere*; a box that
+        // touches nothing is properly empty.
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let center = (mins + maxs) * 0.5;
+        let extents = maxs - center;
+
+        let mut leaves = Vec::new();
+        let mut pending = vec![head_node];
+        let mut next = 0;
+        while next < pending.len() {
+            let mut num = pending[next];
+            next += 1;
+            while num >= 0 {
+                let node = self.nodes[num as usize];
+                let plane = &self.planes[node.plane as usize];
+                let (distance, radius) = match plane.axis {
+                    Some(axis) => (center[axis] - plane.dist, extents[axis]),
+                    None => (
+                        plane.normal.dot(center) - plane.dist,
+                        plane.normal.abs().dot(extents),
+                    ),
+                };
+                num = if distance >= radius {
+                    node.children[0]
+                } else if distance < -radius {
+                    node.children[1]
+                } else {
+                    pending.push(node.children[0]);
+                    node.children[1]
+                };
+            }
+            leaves.push((-1 - num) as usize);
+        }
+        leaves
     }
 }
 
@@ -2406,6 +2573,419 @@ mod tests {
         assert!(
             head_on * 4 > eligible * 3,
             "only {head_on} of {eligible} displacements were hit along their own normal"
+        );
+    }
+    /// A real split at `x = 0` with four brushes hung off it: two clear of the
+    /// plane on the front side, one straddling it so that **both** leaves list
+    /// it, and one that is `PLAYERCLIP` rather than `SOLID`.
+    ///
+    /// The shape is chosen so that the front leaf lists brushes the query box
+    /// does not touch — which is the whole difference between enumerating
+    /// brushes and concatenating leaf lists.
+    fn split_with_four_brushes() -> (CollisionBsp, [usize; 4]) {
+        let mut fixture = Fixture::default();
+        let near = fixture.add_box(
+            Vec3::new(10.0, -10.0, -10.0),
+            Vec3::new(20.0, 10.0, 10.0),
+            Contents::SOLID,
+            true,
+        );
+        let far = fixture.add_box(
+            Vec3::new(100.0, -10.0, -10.0),
+            Vec3::new(110.0, 10.0, 10.0),
+            Contents::SOLID,
+            true,
+        );
+        // Not axial, so this one takes the plane path through the position
+        // test while the other three take the box-brush path.
+        let across = fixture.add_box(
+            Vec3::new(-5.0, -10.0, -10.0),
+            Vec3::new(5.0, 10.0, 10.0),
+            Contents::SOLID,
+            false,
+        );
+        let clip = fixture.add_box(
+            Vec3::new(10.0, 20.0, -10.0),
+            Vec3::new(20.0, 30.0, 10.0),
+            Contents::PLAYERCLIP,
+            true,
+        );
+        let world = fixture.split(&[near, far, across, clip], &[across]);
+        (
+            world,
+            [near as usize, far as usize, across as usize, clip as usize],
+        )
+    }
+
+    #[test]
+    fn a_box_finds_the_brushes_it_overlaps_and_not_the_ones_it_shares_a_leaf_with() {
+        let (world, [near, far, across, clip]) = split_with_four_brushes();
+        // Straddles the node plane, so both leaves are descended and the front
+        // leaf hands over all four brushes as candidates. Only one is really
+        // in the box.
+        let found = world.tracer().brushes_in_box(
+            Vec3::new(-8.0, -12.0, -12.0),
+            Vec3::new(8.0, 12.0, 12.0),
+            Contents::MASK_ALL,
+        );
+        assert_eq!(found, vec![across], "near {near}, far {far}, clip {clip}");
+    }
+
+    #[test]
+    fn a_brush_in_two_leaves_is_reported_once() {
+        let (world, [_, _, across, _]) = split_with_four_brushes();
+        // The same query. `across` is listed by the front leaf *and* the back
+        // one, so without the visit stamp it would come back twice — and the
+        // carve would cut the same wall twice and leave two copies of it.
+        let found = world.tracer().brushes_in_box(
+            Vec3::new(-8.0, -12.0, -12.0),
+            Vec3::new(8.0, 12.0, 12.0),
+            Contents::MASK_ALL,
+        );
+        assert_eq!(found.iter().filter(|&&b| b == across).count(), 1);
+    }
+
+    #[test]
+    fn brushes_come_back_in_the_order_their_leaves_list_them() {
+        let (world, [near, _, across, _]) = split_with_four_brushes();
+        // Wholly in front of the node plane, so one leaf, whose list is
+        // `near, far, across, clip`.
+        let found = world.tracer().brushes_in_box(
+            Vec3::new(4.0, -2.0, -2.0),
+            Vec3::new(12.0, 2.0, 2.0),
+            Contents::MASK_ALL,
+        );
+        assert_eq!(found, vec![near, across]);
+    }
+
+    #[test]
+    fn the_contents_mask_decides_what_comes_back() {
+        let (world, [_, _, _, clip]) = split_with_four_brushes();
+        let query = |mask| {
+            world.tracer().brushes_in_box(
+                Vec3::new(12.0, 22.0, -2.0),
+                Vec3::new(18.0, 28.0, 2.0),
+                mask,
+            )
+        };
+        assert_eq!(query(Contents::MASK_PLAYERSOLID), vec![clip]);
+        // The same box, and the brush is still there — a mask that does not
+        // name `PLAYERCLIP` simply cannot see it.
+        assert_eq!(query(Contents::MASK_SOLID_BRUSHONLY), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_box_in_open_air_finds_nothing() {
+        let (world, _) = split_with_four_brushes();
+        let found = world.tracer().brushes_in_box(
+            Vec3::new(500.0, 500.0, 500.0),
+            Vec3::new(510.0, 510.0, 510.0),
+            Contents::MASK_ALL,
+        );
+        assert_eq!(found, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_collision_model_with_no_tree_has_no_brushes_in_any_box() {
+        let world = Fixture::default().finish();
+        assert!(world.is_empty());
+        let found = world.tracer().brushes_in_box(
+            Vec3::splat(-1000.0),
+            Vec3::splat(1000.0),
+            Contents::MASK_ALL,
+        );
+        assert_eq!(found, Vec::<usize>::new());
+    }
+
+    /// Every leaf under `head_node`, found by walking the whole subtree and
+    /// culling nothing.
+    ///
+    /// The scope half of the checks below: the one thing they and
+    /// [`CollisionBsp::leaves_in_box`] have to agree about that is *not* under
+    /// test — which leaves belong to the tree at all — derived the only way
+    /// that cannot encode a box test by accident.
+    fn every_leaf_under(bsp: &CollisionBsp, head_node: i32) -> Vec<usize> {
+        let mut leaves = Vec::new();
+        let mut pending = vec![head_node];
+        while let Some(num) = pending.pop() {
+            match num < 0 {
+                true => leaves.push((-1 - num) as usize),
+                false => pending.extend(bsp.nodes[num as usize].children),
+            }
+        }
+        leaves
+    }
+
+    /// Whether one brush passes the position test against this box.
+    ///
+    /// [`Tracer::brushes_in_box`]'s own predicate, pulled out so the checks
+    /// below can apply it to a brush of their choosing rather than to the
+    /// answer they are checking.
+    fn box_overlaps_brush(
+        bsp: &CollisionBsp,
+        visits: &mut Visits,
+        index: usize,
+        mins: Vec3,
+        maxs: Vec3,
+        mask: Contents,
+    ) -> bool {
+        let center = (mins + maxs) * 0.5;
+        let mut work = Work {
+            bsp,
+            start: center,
+            end: center,
+            extents: maxs - center,
+            delta: Vec3::ZERO,
+            inv_delta: Vec3::ZERO,
+            is_point: false,
+            is_swept: false,
+            contents: mask,
+            trace: Trace::miss(center, center),
+            disp_hit: false,
+            visits,
+        };
+        super::brush::test_box_in_brush(&mut work, index);
+        work.trace.all_solid
+    }
+
+    /// [`Tracer::brushes_in_box`] on every shipped map, checked four ways.
+    ///
+    /// # Why this is not one comparison against brute force
+    ///
+    /// The obvious test — enumerate the box, enumerate every brush in the map
+    /// by hand, assert the two sets are equal — was written first and is
+    /// **wrong**, three times over, and each failure says something about the
+    /// map format worth keeping:
+    ///
+    /// 1. **A map's brush lump holds brushes no leaf names.** One of them sits
+    ///    squarely inside a probe box in `mp_coop_catapult_1`. Nothing in the
+    ///    engine can reach them; a leaf-limited query is not missing them.
+    /// 2. **A brush model's leaves share the array with the world's.** Eleven
+    ///    of `mp_coop_catapult_2`'s stack up at one probe, and a door is not
+    ///    what this call answers about — see [`Tracer::brushes_in_box`].
+    /// 3. **A brush can reach outside the leaves that list it.** In
+    ///    `mp_coop_catapult_wall_intro` a brush spans `z −112..128` and the one
+    ///    world leaf naming it stops at `z 96`, so a box in `z 112..544`
+    ///    genuinely overlaps a brush that no reachable leaf offers. **Valve's
+    ///    `GetBrushesInAABB` misses it too** — it is leaf-limited by
+    ///    construction — so the carve inherits it, and `PORTAL.md` §4 should
+    ///    expect a hole cut against the leaves rather than against the
+    ///    geometry.
+    ///
+    /// What is left after those three is not "the set of brushes in the box",
+    /// and pretending otherwise is how the first version of this test claimed
+    /// a bug that was not there. So the properties checked are the ones that
+    /// are actually true:
+    ///
+    /// - **Nothing comes back twice**, which is the visit stamp.
+    /// - **Everything that comes back really is in the box**, checked for box
+    ///   brushes by plain interval arithmetic that shares no code with the
+    ///   module, and for all of them against the contents mask.
+    /// - **The descent reaches every leaf the box is in**, checked by dropping
+    ///   125 points into the box and asking [`CollisionBsp::leaf`] — a
+    ///   different function, already under test — which leaf each is in.
+    /// - **Nothing those leaves offer is dropped.** This is the one with
+    ///   teeth: a leaf the descent reaches and a brush that passes the
+    ///   position test must be in the answer.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release brushes_in_a_box -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn every_shipped_map_enumerates_the_brushes_in_a_box() {
+        use crate::engine::world::bsp::Bsp;
+        use std::collections::HashSet;
+
+        /// `PORTAL_HALF_WIDTH` and `PORTAL_HALF_HEIGHT`
+        /// (`game/shared/portal/prop_portal_shared.h`).
+        const HALF_WIDTH: f32 = 32.0;
+        const HALF_HEIGHT: f32 = 54.0;
+        /// What the portal simulator carves with — its four brush sets' masks
+        /// unioned, which is the commented-out line at
+        /// `portalsimulation.cpp:1167`. The four exist to give vphysics four
+        /// collideables with four collision filters; a BSP brush carries its
+        /// own contents, so this port has no reason to split them.
+        const CARVE: Contents = Contents(
+            Contents::MASK_SOLID_BRUSHONLY.0 | Contents::PLAYERCLIP.0 | Contents::MONSTERCLIP.0,
+        );
+
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "only {} maps found", names.len());
+
+        // The (holy) wall query box's half-extents: `2 * max(halfHeight,
+        // halfWidth)` back from the portal and `4 * halfWidth` by `4 *
+        // halfHeight` across it (`portalsimulation.cpp:3530`). Axis-aligned
+        // here, which is the *worst* case for the descent rather than the
+        // best — an oriented box's world AABB is larger and reaches more
+        // leaves.
+        let extents = Vec3::new(
+            HALF_HEIGHT.max(HALF_WIDTH),
+            HALF_WIDTH * 4.0,
+            HALF_HEIGHT * 4.0,
+        );
+
+        let (mut maps, mut probes, mut hits) = (0usize, 0usize, 0usize);
+        let (mut returned, mut candidates, mut worst) = (0usize, 0usize, 0usize);
+        let (mut brushes, mut elsewhere) = (0usize, 0usize);
+        let (mut leaves_reached, mut points) = (0usize, 0usize);
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            let collision = CollisionBsp::build(&bsp);
+            let Some(model) = bsp.models.first() else {
+                continue;
+            };
+            maps += 1;
+            brushes += collision.brushes.len();
+
+            let world_leaves = every_leaf_under(&collision, 0);
+            // Brushes the world subtree cannot reach: a brush model's, and the
+            // ones no leaf names at all. Neither is this call's to find.
+            let mut listed = vec![false; collision.brushes.len()];
+            for &leaf in &world_leaves {
+                let leaf = collision.leaves[leaf];
+                let first = leaf.first_leaf_brush as usize;
+                for n in first..first + leaf.num_leaf_brushes as usize {
+                    listed[collision.leaf_brushes[n] as usize] = true;
+                }
+            }
+            elsewhere += listed.iter().filter(|l| !**l).count();
+
+            let mut visits = Visits::new(collision.brushes.len(), collision.disps.len());
+            visits.begin();
+
+            let mins = Vec3::from(model.mins);
+            let maxs = Vec3::from(model.maxs);
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        // The 27 interior points of a 4x4x4 division, so no
+                        // probe sits on the world's own bounding planes.
+                        let t = Vec3::new(i as f32 + 1.0, j as f32 + 1.0, k as f32 + 1.0) / 4.0;
+                        let center = mins + (maxs - mins) * t;
+                        let (lo, hi) = (center - extents, center + extents);
+
+                        let found = collision.tracer().brushes_in_box(lo, hi, CARVE);
+                        probes += 1;
+                        returned += found.len();
+                        worst = worst.max(found.len());
+                        if !found.is_empty() {
+                            hits += 1;
+                        }
+
+                        let unique: HashSet<usize> = found.iter().copied().collect();
+                        assert_eq!(
+                            unique.len(),
+                            found.len(),
+                            "{name}: the box at {center} reported a brush twice"
+                        );
+
+                        for &index in &found {
+                            let brush = collision.brushes[index];
+                            assert!(
+                                brush.contents.intersects(CARVE),
+                                "{name}: brush {index} has contents {} and the mask is {CARVE}",
+                                brush.contents
+                            );
+                            // The independent half: a box brush's overlap is
+                            // interval arithmetic and needs none of this
+                            // module to decide.
+                            if let model::BrushSides::Box(b) = brush.sides {
+                                let b = collision.box_brushes[b as usize];
+                                assert!(
+                                    (0..3).all(|a| b.mins[a].max(lo[a]) <= b.maxs[a].min(hi[a])),
+                                    "{name}: brush {index} is {} .. {} and the box is {lo} .. {hi}",
+                                    b.mins,
+                                    b.maxs
+                                );
+                            }
+                        }
+
+                        // Every leaf the descent claims, and every leaf 125
+                        // points inside the box say it should have claimed.
+                        let reached: HashSet<usize> =
+                            collision.leaves_in_box(lo, hi, 0).into_iter().collect();
+                        leaves_reached += reached.len();
+                        for a in 0..5 {
+                            for b in 0..5 {
+                                for c in 0..5 {
+                                    let t = Vec3::new(a as f32, b as f32, c as f32) / 4.0;
+                                    let point = lo + (hi - lo) * t;
+                                    let leaf = collision.leaf(point);
+                                    points += 1;
+                                    assert!(
+                                        reached.contains(&leaf),
+                                        "{name}: {point} is in leaf {leaf} and the box \
+                                         {lo} .. {hi} did not reach it"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Nothing the reached leaves offer may be dropped.
+                        let mut offered = HashSet::new();
+                        for &leaf in &reached {
+                            let leaf = collision.leaves[leaf];
+                            let first = leaf.first_leaf_brush as usize;
+                            for n in first..first + leaf.num_leaf_brushes as usize {
+                                let index = collision.leaf_brushes[n] as usize;
+                                offered.insert(index);
+                                if !collision.brushes[index].contents.intersects(CARVE) {
+                                    continue;
+                                }
+                                if box_overlaps_brush(&collision, &mut visits, index, lo, hi, CARVE)
+                                {
+                                    assert!(
+                                        unique.contains(&index),
+                                        "{name}: brush {index} is in a leaf the box \
+                                         {lo} .. {hi} reached, passes the position test, \
+                                         and was not reported"
+                                    );
+                                }
+                            }
+                        }
+                        candidates += offered.len();
+                    }
+                }
+            }
+        }
+
+        println!(
+            "{maps} maps, {brushes} brushes, {elsewhere} of them outside the world subtree;\n  \
+             {probes} probes, {hits} of them on something: {returned} brushes returned in all, \
+             at most {worst} from one box;\n  \
+             {leaves_reached} leaves reached and {points} points asked which leaf they are \
+             in;\n  \
+             those leaves offer {candidates} brushes — the overlap test rejects {:.1}% of \
+             what the leaf lists alone would have carved.",
+            match candidates {
+                0 => 0.0,
+                _ => 100.0 * (candidates - returned) as f32 / candidates as f32,
+            }
+        );
+        assert_eq!(maps, 106, "the 106 shipped maps");
+        // A grid over a map's bounding box lands mostly in solid rock or
+        // outside the level, so most probes finding nothing is the expected
+        // shape. Measured: 760 of 2,862. This is here to catch a descent that
+        // has stopped finding anything at all, not to pin the ratio.
+        assert!(
+            hits * 5 > probes,
+            "only {hits} of {probes} probes found a brush, so the probes are in the void"
         );
     }
 }

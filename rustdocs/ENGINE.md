@@ -1351,6 +1351,9 @@ impl Tracer<'_> {
     pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
     /// Stage 4: put brush entities in the clip chain. See below.
     pub fn with_entities(self, entities: &[BrushModel]) -> Tracer<'_>;
+    /// `GetBrushesInAABB` — the world brushes an axis-aligned box overlaps,
+    /// as indices into the collision model's own table. See below.
+    pub fn brushes_in_box(&mut self, mins: Vec3, maxs: Vec3, mask: Contents) -> Vec<usize>;
 }
 ```
 
@@ -1368,6 +1371,32 @@ in `src/server/`. `world/` carries the answer across as
 `solid`, and **a model nobody has answered for is left out** — this port has classes for
 6,302 of the game's 11,635 brush entities, and among the rest are 2,383
 `func_portal_bumper`s, none of which is solid to a player.
+
+### The box query — `brushes_in_box`
+
+`CEngineTrace::GetBrushesInAABB` (`engine/enginetrace.cpp:599`), and the only question
+this module answers that is not a sweep. `portdocs/PORTAL.md` stage 3 is the caller:
+cutting a hole in a wall means re-emitting the planes of every brush near the portal with
+four more added, so the carve has to be handed the brushes before it can say anything
+about them. The indices are into the collision model's own brush table and mean nothing
+outside `trace/`.
+
+It is `CM_BoxLeafnums`' descent — the ordinary one, except that a plane the box straddles
+is descended on **both** sides — followed by the ordinary position test on each candidate,
+deduplicated by the same visit stamp a sweep uses.
+
+**The position test is the point, not an optimisation.** A leaf lists every brush that
+touches it, so concatenating the leaf lists answers a much larger question than the one
+asked: a brush can share a leaf with the box and be the length of the room away. Measured
+over 2,862 probe boxes on the 106 shipped maps, the leaf lists offer **25,700** brushes
+and **the overlap test rejects 86.8% of them**, leaving 3,387.
+
+**The four brush sets collapse to one.** `CPortalSimulator` runs this query four times,
+splitting on `MASK_SOLID_BRUSHONLY & ~CONTENTS_GRATE` / `CONTENTS_GRATE` /
+`CONTENTS_PLAYERCLIP` / `CONTENTS_MONSTERCLIP` (`portalsimulation.h:158`), because each
+set becomes a separate `CPhysCollide` with its own collision filter. A BSP brush carries
+its own contents and `clip_box_to_brush` already filters on them, so this port asks once
+with the union — which is the commented-out line at `portalsimulation.cpp:1167`.
 
 Three details inside it are load-bearing:
 
@@ -1641,6 +1670,28 @@ Ordered by how likely each is to bite.
     overlapping" and the second "what stops the player". They share the `owned` filter and
     nothing else.
 
+### One more, from the box query
+
+22. **`brushes_in_box` is leaf-limited, which is not the same as "every brush in the
+    box."** Three ways a brush can be inside the box and absent from the answer, all of
+    them Valve's as much as this port's, and all three found by writing the test that
+    assumed otherwise:
+
+    - **A brush no leaf names.** 25,744 of the game's 141,686 brushes are outside the
+      world subtree, counting brush models' and orphans together. Nothing in the engine
+      can reach an orphan.
+    - **A brush model's brush.** The call is world-only, exactly as `trace_world` is; a
+      door is a separate question and in Valve a separate function
+      (`GetBrushesInCollideable`).
+    - **A brush that reaches outside the leaves that list it.**
+      `mp_coop_catapult_wall_intro` has one spanning `z −112..128` whose only world leaf
+      stops at `z 96`, so a box in `z 112..544` genuinely overlaps a brush that no
+      reachable leaf offers.
+
+    The carve inherits all three: **it cuts against what the leaves offer, not against the
+    geometry.** `every_shipped_map_enumerates_the_brushes_in_a_box` is written around
+    that rather than against it.
+
 ### One place this is stricter than Valve
 
 `IsBoxBrush` (`engine/cmodel_bsp.cpp:667`) checks only that a six-sided brush's planes
@@ -1700,9 +1751,9 @@ fallen), and a `TOOLS/TOOLSPLAYERCLIP` brush 127 units ahead with contents `0x80
 
 ### Test coverage (trace)
 
-41 tests, none of which need a map, a GPU or a window — the fixtures build a
+47 tests, none of which need a map, a GPU or a window — the fixtures build a
 `CollisionBsp` through `CollisionBsp::build` from a hand-written `Bsp`, so the box
-extraction, the displacement build and the surface table are under test too — plus two
+extraction, the displacement build and the surface table are under test too — plus three
 depot-gated tests that need a Portal 2 install.
 
 | Test | Guards |
@@ -1806,6 +1857,44 @@ references, 904 at power 2 / 202 at 3 / 75 at 4. Of the 1,106 that a ray may hit
 starts as far out as the vertex offsets can reach, which on a deep patch is far enough to
 cross another), and 182 meet a brush on the way. If the winding convention were inverted,
 that first number would be zero — which is what the test asserts on.
+
+The box query is covered by six unit tests on a fixture with a real split at `x = 0`,
+built so that the front leaf lists brushes the query box does not touch — which is the
+whole difference between enumerating brushes and concatenating leaf lists:
+
+| Test | Guards |
+|---|---|
+| `a_box_finds_the_brushes_it_overlaps_and_not_the_ones_it_shares_a_leaf_with` | the position test, which is what makes the answer an answer |
+| `a_brush_in_two_leaves_is_reported_once` | the visit stamp, on a brush both leaves list |
+| `brushes_come_back_in_the_order_their_leaves_list_them` | the documented order |
+| `the_contents_mask_decides_what_comes_back` | the mask, on one `PLAYERCLIP` brush, both ways |
+| `a_box_in_open_air_finds_nothing` | the empty answer |
+| `a_collision_model_with_no_tree_has_no_brushes_in_any_box` | the early-out, which differs from `leaf`'s |
+
+**`every_shipped_map_enumerates_the_brushes_in_a_box`** is the depot-gated one:
+
+```text
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release brushes_in_a_box -- --ignored --nocapture
+```
+
+It drops 27 probe boxes into each of the 106 maps — the real (holy) wall box,
+`2 × max(halfHeight, halfWidth)` deep by `4 × halfWidth` by `4 × halfHeight`
+(`portalsimulation.cpp:3530`), axis-aligned, which reaches *fewer* leaves than an oriented
+one would — and checks four properties rather than one comparison, for the reason gotcha
+22 gives:
+
+- nothing comes back twice;
+- everything that comes back is really in the box, checked for box brushes by plain
+  interval arithmetic sharing no code with the module, and for all of them against the
+  mask;
+- **the descent reaches every leaf the box is in**, checked by dropping 125 points into
+  each box and asking `CollisionBsp::leaf` — a different function, already under test —
+  which leaf each is in;
+- **nothing those leaves offer is dropped**, which is the one with teeth.
+
+Measured: **141,686 brushes across 106 maps, 25,744 of them outside the world subtree**;
+2,862 probes, 760 on something, 3,387 brushes returned, at most 62 from one box; 8,373
+leaves reached and 357,750 points asked which leaf they are in.
 
 Stage 4's clip chain is covered by three unit tests here
 (`the_clip_chain_keeps_the_nearest_of_the_world_and_the_entities`,

@@ -309,11 +309,32 @@ bevel planes per non-axial side that `vbsp` writes.
 
 ### 4.5 What still has to be written
 
-1. **A brush enumerator over an AABB.** `CollisionBsp` exposes `leaf`, `point_contents`
-   and `box_trace`; there is no "which brushes are in this box". The portal environment
-   is `MAX( halfWidth, halfHeight ) + portal_environment_radius` (75, `:125`) on x and
-   the half-sizes plus 75 on y and z, so it is a small box and a plain node descent
-   collecting leaf brush lists is enough.
+1. **A brush enumerator over an AABB. LANDED** — `Tracer::brushes_in_box`, which is
+   `CEngineTrace::GetBrushesInAABB` (`enginetrace.cpp:599`): `CM_BoxLeafnums`' descent,
+   then the ordinary position test on each candidate, deduplicated by the sweep's own
+   visit stamp. `rustdocs/ENGINE.md`, "The box query", is the reference.
+
+   **A plain node descent collecting leaf brush lists is *not* enough**, which is what
+   this section used to say. A leaf lists every brush that touches it, so the lists offer
+   a great deal more than the box contains — measured over 2,862 probe boxes on the 106
+   shipped maps, **the position test rejects 86.8% of what they offer** (25,700 down to
+   3,387). Carving all of them would cut holes in walls the portal is nowhere near.
+
+   **And the answer is leaf-limited, which the carve has to live with.** Three ways a
+   brush is in the box and not in the answer, all of them the shipped engine's too: a
+   brush **no leaf names** (25,744 of the game's 141,686 brushes are outside the world
+   subtree, orphans and brush models' together); a **brush model's**, which is a
+   different call in Valve as well; and a brush that **reaches past the leaves that list
+   it** — `mp_coop_catapult_wall_intro` has one spanning `z −112..128` whose only world
+   leaf stops at `z 96`. §4.3's claim survives all three, because the shipped game cuts
+   against the same set.
+
+   The box itself is the (holy) wall's, not the environment's: `-forward` by
+   `2 × MAX( fHalfHeight, fHalfWidth )`, `±4 × fHalfWidth` across and
+   `±4 × fHalfHeight` up (`:3524-3541`), taken to a world AABB through the OBB's eight
+   corners. `vCollisionCloneExtents` — `MAX( hw, hh ) + portal_environment_radius` (75,
+   `:125`) on x and the half-sizes plus 75 on y and z — is the **World** set's box
+   (`:3370`), which extends *forward* of the plane only and is §5's, not §4's.
 2. **The carved store**, rebuilt on `NewLocation`/activation and thrown away on
    deactivation. Cheap: it is a `Vec<CPlane>` and a `Vec<CBrush>`-shaped side table.
 3. **A `Tracer` path that uses it.** `Tracer::with_entities` is the precedent — the
@@ -738,8 +759,8 @@ Six decisions worth carrying forward:
    re-orient a shipped portal and the teleport matrix this port computes is the one the
    shipped game computes.
 
-**Stage 3 — the hole.** §4: the AABB brush enumerator, the carve, the carved store, and
-`Tracer`'s substitutive path. **Outcome:** you can walk *into* the wall and stand in the
+**Stage 3 — the hole.** §4: the AABB brush enumerator (**landed** — `brushes_in_box`,
+see §4.5), the carve, the carved store, and `Tracer`'s substitutive path. **Outcome:** you can walk *into* the wall and stand in the
 hole, and fall out the back of it, because nothing catches you yet. Testable headlessly:
 a trace into a carved wall must miss where the hole is and hit where it is not.
 
