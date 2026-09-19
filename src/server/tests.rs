@@ -3728,7 +3728,15 @@ fn every_shipped_map_spawns_its_entities() {
     // shipped maps fire at a cube inside two seconds. A cube is scenery that
     // is acted on late — its 63 `OnFizzled` connections are *outputs*, and
     // what fires its inputs is a dropper or a fizzler the player has to reach.
-    assert_eq!(io.accepted, 5_042);
+    //
+    // **+1 with `vphysics`.** `EnableMotion` is `CPhysicsProp`'s and was
+    // deliberately left on the unhandled list below while there was no motion
+    // to enable; there is now, so the one connection in the game that fires it
+    // inside two seconds lands: `sp_a2_pull_the_rug`'s `logic_auto` fires
+    // `OnMapSpawn → laser_cube_wall_mixup_start_cube.EnableMotion` at a delay
+    // of 0.5 s, and that cube is the game's only `SF_PHYSPROP_MOTIONDISABLED`
+    // one. The map freezes it at spawn and thaws it half a second later.
+    assert_eq!(io.accepted, 5_043);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3769,11 +3777,12 @@ fn every_shipped_map_spawns_its_entities() {
     // is `RunScriptCode` (`portdocs/SERVER.md` §9), and
     // `prop_dynamic.Disabled` is eight connections misspelling `Disable`.
     //
-    // **`prop_weighted_cube` added two names and six occurrences, and both
-    // belong here rather than in the class.** `EnableMotion` is
-    // `CPhysicsProp`'s and there is no motion to enable; `AddOutput` is
-    // `CBaseEntity`'s and no class in the port implements it. Declaring either
-    // would make it accepted and inert, which this list exists to avoid.
+    // **`prop_weighted_cube` added two names and six occurrences. One of them
+    // has since left.** `EnableMotion` is `CPhysicsProp`'s, and it belonged
+    // here for as long as there was no motion to enable — `vphysics` gave it
+    // something to do and it is accepted now. `AddOutput` is `CBaseEntity`'s
+    // and no class in the port implements it; declaring it would make it
+    // accepted and inert, which is what this list exists to avoid.
     let unhandled: Vec<(&str, usize)> =
         io.unhandled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_eq!(
@@ -3793,7 +3802,6 @@ fn every_shipped_map_spawns_its_entities() {
             ("player.SetFogController", 97),
             ("prop_dynamic.Disabled", 8),
             ("prop_weighted_cube.AddOutput", 5),
-            ("prop_weighted_cube.Enablemotion", 1),
         ],
         "the set of inputs nothing handles has changed"
     );

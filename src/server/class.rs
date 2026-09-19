@@ -442,6 +442,10 @@ pub struct Context<'a> {
     /// What [`punch_penetrating_players`](Context::punch_penetrating_players)
     /// queued — portals that want the player shoved out of them.
     punches: Vec<EntityId>,
+    /// What the `vphysics_*` calls queued — see
+    /// [`physics`](super::physics), which is also where the deferral is
+    /// justified.
+    physics: Vec<super::physics::Pending>,
     /// Whether [`reload_level`](Context::reload_level) was called.
     reload_level: bool,
     /// Whether this handler parented anything to an attachment point — the
@@ -477,6 +481,7 @@ impl<'a> Context<'a> {
             created: Vec::new(),
             damage: Vec::new(),
             punches: Vec::new(),
+            physics: Vec::new(),
             reload_level: false,
             attachments_used: false,
             sequences,
@@ -610,6 +615,68 @@ impl<'a> Context<'a> {
     /// the one that moved is the one being dispatched.
     pub fn punch_penetrating_players(&mut self, portal: EntityId) {
         self.punches.push(portal);
+    }
+
+    /// `CBaseEntity::VPhysicsInitNormal( SOLID_VPHYSICS, 0, asleep )` — ask
+    /// for a rigid body built from this entity's own model.
+    ///
+    /// > **The body does not exist when this returns.** `Server::dispatch`
+    /// > builds it on the way out, for the reason
+    /// > [`create_entity`](Context::create_entity) is deferred: the entity
+    /// > asking is outside the entity list for the whole of its own handler,
+    /// > and a body has to be recorded against an entity that is in it.
+    /// > Everything a `Spawn` does after asking — set the origin, the angles,
+    /// > the model — still happens before the body is built, which is the
+    /// > order that matters, and it is the order the C++ has too.
+    ///
+    /// Silently does nothing when the level has no physics environment, which
+    /// is every test that does not ask for one and every map loaded before
+    /// `Server::set_physics` has run.
+    pub fn vphysics_init_normal(&mut self, entity: EntityId, asleep: bool) {
+        self.queue_physics(entity, super::physics::Request::InitNormal { asleep });
+    }
+
+    /// `IPhysicsObject::EnableMotion` — freeze a body in place, or let it go.
+    ///
+    /// A frozen body is still solid, which is the whole reason it is not just
+    /// "destroy the body": `Server::cleanup_delete_list` does that for an
+    /// entity that is going away, and this is for one that is staying.
+    pub fn vphysics_enable_motion(&mut self, entity: EntityId, enable: bool) {
+        self.queue_physics(entity, super::physics::Request::EnableMotion(enable));
+    }
+
+    /// `IPhysicsObject::Wake`.
+    pub fn vphysics_wake(&mut self, entity: EntityId) {
+        self.queue_physics(entity, super::physics::Request::Wake);
+    }
+
+    /// `IPhysicsObject::Sleep`.
+    pub fn vphysics_sleep(&mut self, entity: EntityId) {
+        self.queue_physics(entity, super::physics::Request::Sleep);
+    }
+
+    /// `IPhysicsObject::ApplyForceCenter`, in kg·units/s².
+    ///
+    /// The caller is `CTriggerPush::Touch`'s `MOVETYPE_VPHYSICS` case, which
+    /// is the one place in this port where a level's geometry pushes a
+    /// simulated object.
+    ///
+    /// `scale_by_mass` is `SF_TRIGGER_PUSH_USE_MASS`, and it is applied where
+    /// the mass is rather than here — see
+    /// [`physics::Request::Force`](super::physics::Request::Force).
+    pub fn vphysics_force(&mut self, entity: EntityId, force: Vec3, scale_by_mass: bool) {
+        self.queue_physics(
+            entity,
+            super::physics::Request::Force {
+                force,
+                scale_by_mass,
+            },
+        );
+    }
+
+    fn queue_physics(&mut self, entity: EntityId, request: super::physics::Request) {
+        self.physics
+            .push(super::physics::Pending { entity, request });
     }
 
     /// Another entity, read-only. `EHANDLE::Get()`.
@@ -860,6 +927,12 @@ impl<'a> Context<'a> {
     /// queued, for `Server::run_tick` to act on.
     pub(super) fn take_punch_queue(&mut self) -> Vec<EntityId> {
         std::mem::take(&mut self.punches)
+    }
+
+    /// The physics requests the `vphysics_*` calls queued, for
+    /// `Server::dispatch` to apply on the way out.
+    pub(super) fn take_physics_queue(&mut self) -> Vec<super::physics::Pending> {
+        std::mem::take(&mut self.physics)
     }
 
     /// `engine->ServerCommand( "reload\n" )` — start this level again.

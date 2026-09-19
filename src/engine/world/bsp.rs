@@ -88,6 +88,14 @@ const LUMP_BRUSHSIDES: usize = 19;
 const LUMP_DISPINFO: usize = 26;
 const LUMP_DISP_VERTS: usize = 33;
 const LUMP_DISP_TRIS: usize = 48;
+/// `LUMP_PHYSCOLLIDE` (`public/bspfile.h`) — the map's own collision models,
+/// one per brush model, in exactly the format a `.phy` file's solids are in.
+///
+/// Kept as raw bytes for the same reason [`LUMP_VISIBILITY`] is: it is not an
+/// array but a chain of variable-length records, and
+/// [`vphysics::collide::VCollide::read_lump`](crate::vphysics::collide::VCollide::read_lump)
+/// is its whole interface. `portdocs/VPHYSICS.md` §2.1.
+const LUMP_PHYSCOLLIDE: usize = 29;
 const LUMP_GAME_LUMP: usize = 35;
 const LUMP_PAKFILE: usize = 40;
 const LUMP_LEAF_AMBIENT_INDEX_HDR: usize = 51;
@@ -744,6 +752,11 @@ pub struct Bsp {
     /// has one**, totalling 5.0 MB and at most 236 KB on
     /// `sp_a3_portal_intro`.
     pub visibility: Vec<u8>,
+    /// `LUMP_PHYSCOLLIDE`, still in its on-disk form — see the constant.
+    ///
+    /// Every one of the 106 shipped maps has one; the largest,
+    /// `mp_coop_start`, describes 408 brush models.
+    pub phys_collide: Vec<u8>,
     /// `LUMP_AREAS`, `LUMP_AREAPORTALS` and `LUMP_CLIPPORTALVERTS` — the
     /// areaportal graph and the windows' outlines.
     pub areas: Vec<Area>,
@@ -983,6 +996,7 @@ impl Bsp {
             leaf_brushes: reader.records(LUMP_LEAFBRUSHES)?,
             leaf_faces: reader.records(LUMP_LEAFFACES)?,
             visibility: reader.raw(LUMP_VISIBILITY).unwrap_or(&[]).to_vec(),
+            phys_collide: reader.raw(LUMP_PHYSCOLLIDE).unwrap_or(&[]).to_vec(),
             areas: reader.records(LUMP_AREAS)?,
             area_portals: reader.records(LUMP_AREAPORTALS)?,
             clip_portal_verts: reader.records(LUMP_CLIPPORTALVERTS)?,

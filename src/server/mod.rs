@@ -76,6 +76,7 @@ pub mod keyvalue;
 pub mod movement;
 pub mod name;
 pub mod obb;
+pub mod physics;
 pub mod push;
 pub mod random;
 pub mod sequences;
@@ -236,6 +237,18 @@ pub struct Server {
     /// clearing it would need a second scan to prove the last one had gone.
     /// 86 of the game's 106 maps set it.
     attachments_in_use: bool,
+    /// `physenv`, with the map's static geometry already in it — see
+    /// [`physics`] and [`Server::set_physics`].
+    ///
+    /// `None` until the engine has built one, and for ever in a test with no
+    /// engine, in which case every `VPhysicsInitNormal` quietly does nothing
+    /// and nothing ever reaches [`MoveType::VPhysics`].
+    ///
+    /// [`MoveType::VPhysics`]: movement::MoveType::VPhysics
+    physics: Option<physics::Physics>,
+    /// What the `Context::vphysics_*` calls queued — see [`physics`], which is
+    /// also where the deferral is justified.
+    pending_physics: Vec<physics::Pending>,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -757,6 +770,8 @@ impl Server {
             sequences: SequenceTable::new(),
             attachments: Box::new(attachment::NoAttachments),
             attachments_in_use: false,
+            physics: None,
+            pending_physics: Vec::new(),
         }
     }
 
@@ -1067,6 +1082,11 @@ impl Server {
         self.sequences = SequenceTable::new();
         self.attachments = Box::new(attachment::NoAttachments);
         self.attachments_in_use = false;
+        // `CPhysicsHook::LevelShutdownPostEntity` destroys the environment
+        // outright, and it is level-scoped for exactly the reason the entity
+        // list is: every body in it belongs to something in that list.
+        self.physics = None;
+        self.pending_physics.clear();
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -1086,6 +1106,54 @@ impl Server {
     /// the same moment and subject to the same ordering rule. It is a trait
     /// object rather than a table because an attachment's answer is a matrix
     /// that moves with the parent's animation — see [`attachment`].
+    /// The physics environment, with the map's static geometry already in it.
+    ///
+    /// `CPhysicsHook::LevelInitPreEntity` creates `physenv` and calls
+    /// `PhysCreateWorld`; the engine has done the equivalent by the time this
+    /// is called, because the world, its terrain and its static props are all
+    /// *its* data. What is left is the fourth thing `PhysCreateWorld` cannot
+    /// do — the map's other brush models, which are placed by entities rather
+    /// than by the lump.
+    ///
+    /// **After [`level_init`](Server::level_init), and that is forced**: a
+    /// `func_door` with `spawnpos 1` has already moved up to 294 units inside
+    /// its own `Spawn`, so taking its placement from the lump would put its
+    /// collision where the door no longer is.
+    ///
+    /// Called once per level by the engine, and never in a test that has no
+    /// map — see the field.
+    pub fn set_physics(
+        &mut self,
+        environment: crate::vphysics::env::Environment,
+        models: std::collections::HashMap<String, crate::vphysics::Model>,
+        brush_models: Vec<(usize, crate::vphysics::Model)>,
+    ) {
+        let mut built = physics::Physics::new(environment, models, brush_models);
+        let placements = self.brush_models.clone();
+        built.add_brush_entities(&mut self.entities, &placements);
+        self.physics = Some(built);
+        // Anything that asked for a body during `level_init` — every
+        // `prop_weighted_cube` on the map — asked before there was an
+        // environment to ask. The queue kept it, and this is the moment it can
+        // be served.
+        self.flush_physics();
+        // …and *then* the entities that place a studio model and have not
+        // already got one, which is `CDynamicProp::CreateVPhysics`. The order
+        // matters: a cube's dynamic body has to exist before this runs, or
+        // this would give the cube a **static** one and the cube would then
+        // throw it away and build the real one. Same answer, twice the work,
+        // and one more place for the two to disagree.
+        if let Some(physics) = &mut self.physics {
+            physics.add_studio_entities(&mut self.entities);
+        }
+    }
+
+    /// What the level's physics is made of, for the load-time line and for the
+    /// depot test. `None` when the level has no environment.
+    pub fn physics_stats(&self) -> Option<&physics::PhysicsStats> {
+        self.physics.as_ref().map(|p| p.stats())
+    }
+
     pub fn set_attachments(&mut self, attachments: Box<dyn attachment::Attachments>) {
         self.attachments = attachments;
     }
@@ -1146,6 +1214,10 @@ impl Server {
         self.player_pre_think();
         self.player_touch_triggers(query);
         self.run_think_functions(query);
+        // `CPhysicsHook::FrameUpdatePostEntityThink` — after every think and
+        // before the touch sweep, so that a cube which moved this tick is in
+        // its new place when `check_for_entity_untouch` looks.
+        self.step_physics();
         self.refresh_attachment_children();
         self.check_for_entity_untouch();
         self.service_events();
@@ -1791,6 +1863,7 @@ impl Server {
         let created = cx.take_created();
         let damage = cx.take_damage_queue();
         let punches = cx.take_punch_queue();
+        let queued_physics = cx.take_physics_queue();
         let reload = cx.take_reload_level();
         // Once a level has any attachment parenting, every tick re-derives
         // what rides one — see `Server::refresh_attachment_children`.
@@ -1855,11 +1928,101 @@ impl Server {
         // [`Server::flush_portal_punches`], which is the far end of this.
         self.pending_punches.extend(punches);
 
+        // `CreateVPhysics`, which in the C++ a `Spawn` calls on itself. It
+        // happens here for the reason the spawn flush above does — see
+        // [`physics`] — and it is *after* both of them, because a body is
+        // built from where the entity ended up and a `Spawn` is free to move
+        // it right up to the moment it returns.
+        self.pending_physics.extend(queued_physics);
+        self.flush_physics();
+
         if reload {
             self.level_restart = self.map.clone();
         }
 
         Some(result)
+    }
+
+    /// Applies whatever the `Context::vphysics_*` calls queued.
+    ///
+    /// Unlike [`flush_created`](Server::flush_created) and
+    /// [`flush_damage`](Server::flush_damage) this needs no re-entrancy guard,
+    /// because nothing it does dispatches: creating, destroying or waking a
+    /// body touches the environment and the entity's own handle, and neither
+    /// can run a handler.
+    ///
+    /// > **A request made before there is an environment is kept, not
+    /// > dropped**, and that is what makes the cube work: every
+    /// > `prop_weighted_cube` on a map asks for a body inside
+    /// > [`level_init`](Server::level_init), and the engine cannot build the
+    /// > environment until `level_init` has returned — the brush entities'
+    /// > placements come from the entities it just spawned. So the queue
+    /// > survives until [`set_physics`](Server::set_physics) drains it. A
+    /// > level that never gets an environment — every test that does not ask
+    /// > for one — keeps a handful of requests that nothing ever serves, and
+    /// > [`level_shutdown`](Server::level_shutdown) clears them.
+    fn flush_physics(&mut self) {
+        if self.pending_physics.is_empty() || self.physics.is_none() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.pending_physics);
+        let Some(physics) = &mut self.physics else {
+            return;
+        };
+        for pending in &queued {
+            physics.apply(&mut self.entities, pending);
+        }
+    }
+
+    /// `PhysFrame( TICK_INTERVAL )` (`physics.cpp:1731`), called from
+    /// `CPhysicsHook::FrameUpdatePostEntityThink`.
+    ///
+    /// Three steps, in Valve's order and for Valve's reasons:
+    ///
+    /// 1. **the movers' poses go in first**, because a kinematic body's
+    ///    velocity for this step is the gap between where it is and where the
+    ///    game says it will be — the half of `VPhysicsShadowUpdate` a door
+    ///    needs;
+    /// 2. the environment steps once;
+    /// 3. every body that moved writes its placement back onto its entity,
+    ///    which is `VPhysicsUpdate`'s `SetAbsOrigin`/`SetAbsAngles`.
+    ///
+    /// The writeback goes through [`hierarchy::propagate_id`] rather than
+    /// through a bare assignment, because anything parented to a physics prop
+    /// has to ride it — the same rule the pusher and the attachment refresh
+    /// both obey.
+    ///
+    /// > **`VPhysicsUpdate` returns early for a parented entity**
+    /// > (`baseentity_shared.cpp:1317`), and so does this: a body whose entity
+    /// > has a parent is being carried by something else, and letting the
+    /// > solver write its world position would tear it off.
+    fn step_physics(&mut self) {
+        let Some(physics) = &mut self.physics else {
+            return;
+        };
+        physics.follow_movers(&self.entities);
+        let moved = physics.step();
+        if moved.is_empty() {
+            return;
+        }
+        let now = self.clock.time().curtime;
+        for (id, origin, angles) in moved {
+            let Some(entity) = self.entities.get_mut(id) else {
+                continue;
+            };
+            if entity.core.parent().is_some() {
+                continue;
+            }
+            entity.core.set_abs_placement(origin, angles);
+            hierarchy::propagate_id(
+                id,
+                &mut self.entities,
+                attachment::Poser {
+                    attachments: self.attachments.as_ref(),
+                    now,
+                },
+            );
+        }
     }
 
     /// Applies whatever [`Context::take_damage`] queued, and whatever the
@@ -1996,6 +2159,22 @@ impl Server {
             .collect();
         for id in going {
             self.remove_touched_list(id);
+        }
+
+        // `CBaseEntity::UpdateOnRemove`'s `VPhysicsDestroyObject()`
+        // (`baseentity.cpp:2607`), which likewise has to run before the slot
+        // is freed — the environment holds the pairing both ways and a body
+        // whose entity has gone would keep being stepped.
+        if let Some(physics) = &mut self.physics {
+            let doomed: Vec<EntityId> = self
+                .entities
+                .iter()
+                .filter(|(_, e)| e.core.removed && e.core.physics.is_some())
+                .map(|(id, _)| id)
+                .collect();
+            for id in doomed {
+                physics.destroy(&mut self.entities, id);
+            }
         }
 
         let freed = self.entities.cleanup_delete_list();

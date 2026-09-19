@@ -30,6 +30,7 @@ mod materials;
 mod math;
 mod server;
 mod studio;
+mod vphysics;
 
 fn main() -> std::process::ExitCode {
     let code = launcher::run();

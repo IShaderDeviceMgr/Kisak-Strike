@@ -92,6 +92,20 @@ const SF_TRIGGER_ONLY_CLIENTS_IN_VEHICLES: u32 = 0x20;
 const SF_TRIGGER_ALLOW_ALL: u32 = 0x40;
 /// `trigger_push`: transfer the velocity once and delete the trigger.
 const SF_TRIG_PUSH_ONCE: u32 = 0x80;
+
+/// `SF_TRIGGER_PUSH_USE_MASS` (`triggers_shared.h:30`) — "correctly account
+/// for an entity's mass (`CTriggerPush::Touch` used to assume 100Kg)".
+///
+/// The two branches differ only for a physics prop whose mass is not 100 kg,
+/// which every weighted cube is: a cube is 40 kg, so the **old** branch shoves
+/// it 2.5× as hard as the new one. **13 of Portal 2's 192 `trigger_push`es set
+/// the flag**, so both branches are live content and the difference is not
+/// hypothetical.
+const SF_TRIGGER_PUSH_USE_MASS: u32 = 0x1000;
+
+/// `DEFAULT_MASS` (`triggers.cpp:2581`) — the mass `CTriggerPush::Touch`
+/// assumes when [`SF_TRIGGER_PUSH_USE_MASS`] is clear.
+const PUSH_DEFAULT_MASS: f32 = 100.0;
 /// `trigger_push`: push a player who is on a ladder. `GameHasLadders()` is
 /// false for Portal (`portdocs/CLIENT.md` stage 4), so nothing reaches it.
 const _SF_TRIG_PUSH_AFFECT_PLAYER_ON_LADDER: u32 = 0x100;
@@ -1240,6 +1254,16 @@ impl Behaviour for TriggerPush {
             // difference between `noclip` being a debug tool and `noclip`
             // being subject to the level's fans.
             MoveType::None | MoveType::Push | MoveType::Noclip => {}
+            // A physics prop is pushed with a *force* rather than a velocity,
+            // because the solver owns its velocity. `frametime` is in it
+            // because the force is meant to last one frame — and `frametime`
+            // here is the tick, because a trigger's touch pass runs on the
+            // tick.
+            MoveType::VPhysics => {
+                let force = self.push_speed * dir * PUSH_DEFAULT_MASS * cx.time.interval;
+                let by_mass = entity.has_spawn_flags(SF_TRIGGER_PUSH_USE_MASS);
+                cx.vphysics_force(other, force, by_mass);
+            }
             // `default:` in the C++ switch, which is why a *dead* player is
             // blown around by a fan: `MOVETYPE_FLYGRAVITY` names no case, so
             // it lands here with `MOVETYPE_WALK`.

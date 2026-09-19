@@ -178,6 +178,14 @@ pub struct Prop {
     pub modulation: [f32; 4],
     /// The prop's slice of [`Props::leaves`]. Unused until visibility lands.
     pub leaves: std::ops::Range<usize>,
+    /// `StaticPropLump_t::m_Solid` — `SOLID_NONE` (0), `SOLID_BBOX` (2) or
+    /// `SOLID_VPHYSICS` (6).
+    ///
+    /// Read by [`vphysics`](crate::vphysics): `CStaticProp::CreateVPhysics`
+    /// (`staticpropmgr.cpp:1283`) returns immediately for `SOLID_NONE` and
+    /// takes the model's `.phy` only for `SOLID_VPHYSICS`, which is what
+    /// decides whether a cube can land on this prop.
+    pub solid: u8,
 }
 
 /// Every static prop in one map.
@@ -236,6 +244,7 @@ impl Props {
                 modulation: prop.diffuse_modulation.map(|c| f32::from(c) / 255.0),
                 leaves: prop.first_leaf as usize
                     ..prop.first_leaf as usize + prop.leaf_count as usize,
+                solid: prop.solid,
             })
             .collect();
 

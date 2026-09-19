@@ -110,6 +110,45 @@ glam = "0.33.7"
 # `egui-wgpu`'s defaults add `wgpu/webgl`, which is dead weight in a native
 # binary. `clipboard`, `wayland` and `x11` are kept because Linux is the
 # primary target and all three are load-bearing there.
+# Rigid-body physics. Replaces `legacy/vphysics/` (22,607 lines) and the whole
+# of the `legacy/ivp` submodule -- Ipion/Havok's IVP engine -- outright.
+# `portdocs/ENGINE_TRACE.md` §5.3 calls this "the single largest
+# crate-substitution win left in the port" and `portdocs/VPHYSICS.md` is the
+# plan that decision implies. Arrives with `src/vphysics/`, which is the first
+# thing in the port that integrates a velocity it did not compute itself.
+#
+# This is the largest dependency here by some distance and that is worth
+# stating plainly: **the build graph goes from 131 crates to 156**, measured
+# rather than counted off the lockfile -- `Cargo.lock` gains 30 packages but
+# five of them (three extra `glam` versions behind `nalgebra`'s
+# `convert-glam0xx` features, and two proc-macro-only siblings) are resolved
+# and never built. The 25 that are: `parry3d` (the collision half, which is
+# also what `ENGINE_TRACE.md` §5.5 reserves for displacement collision),
+# `glamx`, `nalgebra` + `nalgebra-macros` + `simba` + `matrixmultiply` +
+# `rawpointer` + `approx` + `typenum` + the `num-*` family (the solver's dense
+# linear algebra), `rstar` + `ena` + `robust`-adjacent `ordered-float` (parry's
+# mesh utilities), `wide` (SIMD), `heapless` + `hash32` + `slab` +
+# `stable_deref_trait` + `byteorder` + `downcast-rs`, and
+# `profiling-procmacros`. Twelve more that rapier names -- `bitflags`, `log`,
+# `arrayvec`, `smallvec`, `hashbrown`, `spade`, `num-traits`,
+# `static_assertions`, `thiserror`, `profiling`, `safe_arch`, `libm` -- are
+# already in the tree behind `wgpu` and `egui` and cost nothing.
+#
+# What it does *not* bring is a second math stack, and that is the finding
+# that made this affordable: as of 0.35 both rapier and parry are built on
+# **glam**, through dimforge's own `glamx`, and they resolve to **glam 0.33** --
+# the exact version pinned above. `parry::math::Vector` *is* `glam::Vec3`, so a
+# position crosses the boundary with no conversion at all. `nalgebra` is still
+# in the graph for the solver's internals and is compiled with exactly one of
+# its four `convert-glam0xx` features (`convert-glam033`), so the other three
+# glam versions in `Cargo.lock` are resolved but never built.
+#
+# `default-features` are the right ones already -- `dim3`, `f32`, `std`,
+# `alloc`. Deliberately NOT enabled: `parallel` (rayon for one map's worth of
+# cubes is the tail wagging the dog), `simd8` (needs nightly `portable_simd`),
+# `enhanced-determinism` (this port has no netcode to be deterministic for),
+# `serde-serialize` (no saved games) and `debug-render`.
+rapier3d = "0.35.3"
 egui = "0.36.2"
 egui-winit = { version = "0.36.2", default-features = false, features = [
     "clipboard",

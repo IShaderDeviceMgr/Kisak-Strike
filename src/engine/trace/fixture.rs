@@ -424,6 +424,7 @@ impl Fixture {
             };
 
         Bsp {
+            phys_collide: Vec::new(),
             game_lumps: Vec::new(),
             leaf_ambient: Vec::new(),
             leaf_ambient_index: Vec::new(),

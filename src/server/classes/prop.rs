@@ -2035,7 +2035,25 @@ pub struct WeightedCube {
     pub pickup_disabled: bool,
 }
 
-/// The nine inputs (`prop_weightedcube.cpp:308`).
+/// `SF_PHYSPROP_START_ASLEEP` (`legacy/game/shared/props_shared.h:17`).
+///
+/// **0 of the game's 98 cubes set it**, so every shipped cube starts awake —
+/// which is what makes the drop on `sp_a1_intro1` visible without touching
+/// anything.
+const SF_PHYSPROP_START_ASLEEP: u32 = 0x000001;
+
+/// `SF_PHYSPROP_MOTIONDISABLED` (`:20`) — "motion disabled at startup (flag
+/// only valid in spawn — motion can be enabled via input)".
+///
+/// **1 of the game's 98 cubes sets it** —
+/// `sp_a2_pull_the_rug`'s `laser_cube_wall_mixup_start_cube`, which that map's
+/// `logic_auto` thaws half a second later with `OnMapSpawn → EnableMotion`.
+/// That one connection is the whole of what `vphysics` added to
+/// `every_shipped_map_spawns_its_entities`'s accepted-input count.
+const SF_PHYSPROP_MOTIONDISABLED: u32 = 0x000008;
+
+/// The ten inputs (`prop_weightedcube.cpp:308`) plus `CPhysicsProp`'s four
+/// and `CBaseAnimating`'s `skin`.
 ///
 /// `skin` is **not** among them: `CBaseAnimating`'s `DEFINE_INPUT( m_nSkin, …,
 /// "skin" )` is on the class, but a cube that took it would have the value
@@ -2055,6 +2073,12 @@ pub static WEIGHTED_CUBE_INPUTS: InputDefs = &[
     InputDef::new("DisablePickup", FieldType::Void),
     InputDef::new("EnablePickup", FieldType::Void),
     InputDef::new("skin", FieldType::Int),
+    // `CPhysicsProp`'s (`props.cpp:2690`), which had nothing to act on until
+    // `vphysics` landed. `DisableFloating` is the fifth and is buoyancy.
+    InputDef::new("EnableMotion", FieldType::Void),
+    InputDef::new("DisableMotion", FieldType::Void),
+    InputDef::new("Wake", FieldType::Void),
+    InputDef::new("Sleep", FieldType::Void),
 ];
 
 /// The four outputs (`:318`) plus the two the FGD declares and the datadesc
@@ -2334,24 +2358,42 @@ impl Behaviour for WeightedCube {
     /// cube in the game the standard model.
     ///
     /// Absent, each because the subsystem is: `Precache` (nothing to
-    /// pre-load), `m_nBouncyMaterialIndex` and `SetCollisionGroup` (vphysics),
-    /// `SetInteraction( PROPINTER_PHYSGUN_ALLOW_OVERHEAD )` (the physics gun),
-    /// the Schrodinger think, `g_PortalGameStats`, `VisibilityMonitor_…` (the
-    /// pickup hint) and the two fade calls.
-    fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
+    /// pre-load), `m_nBouncyMaterialIndex` and `SetCollisionGroup`
+    /// (`COLLISION_GROUP_WEIGHTED_CUBE`, which is a filtering rule this port
+    /// has no consumer for), `SetInteraction( PROPINTER_PHYSGUN_ALLOW_OVERHEAD )`
+    /// (the physics gun), the Schrodinger think, `g_PortalGameStats`,
+    /// `VisibilityMonitor_…` (the pickup hint) and the two fade calls.
+    fn spawn(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) -> SpawnResult {
         self.convert_old_skins();
         self.current_painted_type = PaintPower::None;
         self.pickup_disabled = false;
         self.set_cube_type(entity);
 
-        // `CPhysicsProp::Spawn`'s `SOLID_VPHYSICS` and `MOVETYPE_VPHYSICS`.
-        // There is no `MoveType::VPhysics` here and nothing would step it if
-        // there were, so the cube is `None` and hangs where the map put it —
-        // the same thing `prop_floor_button` does with the same solidity, and
-        // for the same reason: `World::clip_models` only ever sees brush
-        // models, so nothing collides with either.
+        // `BaseClass::Spawn()` — `CPhysicsProp::Spawn` (`props.cpp:2793`),
+        // whose one line that reaches a map is `CreateVPhysics()`.
+        //
+        // The solidity is set here and the *movetype* is not, because
+        // `VPhysicsInitNormal` is what writes it and it does so only if a body
+        // was actually made: a model with no `.phy` leaves the cube hanging in
+        // the air exactly as it did before this module, which is also what
+        // `CPhysicsProp::CreateVPhysics` does when `PhysModelCreate` returns
+        // `NULL`.
         entity.solid = Solid::VPhysics;
         entity.move_type = MoveType::None;
+        // `SF_PHYSPROP_START_ASLEEP` (`props_shared.h:17`). **0 of the game's
+        // 98 cubes set it**, so every one of them starts awake and settles
+        // within the first second — which is what makes the drop visible on
+        // `sp_a1_intro1` rather than something you have to nudge.
+        let asleep = entity.has_spawn_flags(SF_PHYSPROP_START_ASLEEP);
+        cx.vphysics_init_normal(entity.id(), asleep);
+        // `SF_PHYSPROP_MOTIONDISABLED` (`:20`) — "motion disabled at startup
+        // (flag only valid in spawn — motion can be enabled via input)".
+        // **Exactly one shipped cube sets it**:
+        // `sp_a2_pull_the_rug`'s `laser_cube_wall_mixup_start_cube`, which is
+        // frozen until the map fires `EnableMotion` at it.
+        if entity.has_spawn_flags(SF_PHYSPROP_MOTIONDISABLED) {
+            cx.vphysics_enable_motion(entity.id(), false);
+        }
         SpawnResult::Ok
     }
 
@@ -2416,6 +2458,35 @@ impl Behaviour for WeightedCube {
         if is("SetPaint") {
             let paint = PaintPower::from_int(input.value.int());
             self.paint(entity, paint, cx);
+            return true;
+        }
+        // `CPhysicsProp`'s physics inputs (`props.cpp:2690`). They were
+        // deliberately left undeclared until `vphysics` landed, because there
+        // was no object for them to act on and an accepted-and-inert input is
+        // worse than a reported one — `every_shipped_map_spawns_its_entities`
+        // listed `prop_weighted_cube.Enablemotion` in its unhandled table, and
+        // this is what took it off.
+        //
+        // Two of the five are still absent. `EnableMotion`'s
+        // `GetEnableMotionPosition` teleport is not ported: it restores a
+        // position saved by `phys_enable_motion`, which is a `CPhysBox`
+        // feature reachable only from a `func_physbox` this port has not got.
+        // `DisableFloating` is buoyancy, which nothing here has.
+        if is("EnableMotion") {
+            cx.vphysics_enable_motion(entity.id(), true);
+            cx.vphysics_wake(entity.id());
+            return true;
+        }
+        if is("DisableMotion") {
+            cx.vphysics_enable_motion(entity.id(), false);
+            return true;
+        }
+        if is("Wake") {
+            cx.vphysics_wake(entity.id());
+            return true;
+        }
+        if is("Sleep") {
+            cx.vphysics_sleep(entity.id());
             return true;
         }
         if is("DisablePickup") {

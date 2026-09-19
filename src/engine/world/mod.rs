@@ -36,6 +36,9 @@ pub mod disp;
 pub mod entities;
 /// The light cache — what lights a model standing at a point.
 pub mod light;
+/// Filling the physics environment from a loaded map — `world/`'s side of
+/// `portdocs/VPHYSICS.md` §5.
+pub mod physics;
 pub mod portals;
 pub mod portalview;
 pub mod props;
@@ -443,6 +446,14 @@ pub struct World {
     ///
     /// [`Props::models`]: props::Props::models
     pub props: Props,
+    /// The map's physics environment, waiting for the server to take it.
+    ///
+    /// `Option` because it is **moved out** at the end of the level load:
+    /// `physenv` belongs to the game (`portdocs/VPHYSICS.md` §5), and leaving
+    /// a copy here would leave two owners of the same bodies. `None` after
+    /// `Scene::load` has handed it over, and in a `World` built by a test
+    /// fixture.
+    pub physics: Option<physics::WorldPhysics>,
     /// The models those placements name, uploaded once each.
     pub prop_models: PropModels,
     /// The models the map's **entities** place, posed by their animation.
@@ -674,6 +685,14 @@ impl World {
         stats.prop_models = props.models.len();
         let prop_models = PropModels::load(vfs, materials, device, &props, bsp.lighting_is_hdr);
 
+        // The map's static collision: the world's own hulls, its terrain and
+        // the static props that are `SOLID_VPHYSICS`. Everything it needs is
+        // the engine's own data, which is why it happens here — the two things
+        // it cannot do yet are the entities' models (`add_models`, once
+        // `level_init` has named them) and the brush entities' placements
+        // (`Server::set_physics`, for the same reason).
+        let physics = physics::build(name, &bsp, &props, vfs, physics::surface_properties(vfs));
+
         Ok(World {
             name: name.to_owned(),
             bsp_version: bsp.version,
@@ -702,6 +721,7 @@ impl World {
             collision,
             props,
             prop_models,
+            physics: Some(physics),
             entity_models: EntityModels::default(),
             portals: Portals::load(materials, vfs),
             portal_holes: PortalHoles::default(),

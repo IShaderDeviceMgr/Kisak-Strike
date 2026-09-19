@@ -22,6 +22,7 @@ is not compiled, not linked, and not edited.
   src/client/      the game client — the player, CUserCmd, movement, the view, exposure
   src/server/      the game server — the entity list, the class table, spawn
   src/studio/      studio models — .mdl/.vvd/.vtx into geometry, and animation
+  src/vphysics/    rigid-body physics — .phy/vcollide, surface properties, rapier
   src/cmdline.rs   CommandLine(), at the root because everything reads it
   src/math.rs      the parts of mathlib that are a convention, not arithmetic
   legacy/          the original C++ tree, verbatim; read-only reference
@@ -45,9 +46,14 @@ cargo build
 cargo test
 ```
 
-That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and nine
-direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam`, and
-`egui`/`egui-winit`/`egui-wgpu` (each justified in a comment in `Cargo.toml`). Release
+That is the entire build. **No CMake, no C++ toolchain, no `build.rs`, no FFI**, and ten
+direct dependencies: `thiserror`, `wgpu`, `winit`, `pollster`, `bytemuck`, `glam`,
+`rapier3d`, and `egui`/`egui-winit`/`egui-wgpu` (each justified in a comment in
+`Cargo.toml`). `rapier3d` is by far the largest — it takes the build graph from 131
+crates to 156 — and it replaces `legacy/vphysics/` and the whole `legacy/ivp` submodule
+outright; `portdocs/VPHYSICS.md` §0 is the case for it, and the finding that made it
+affordable is that rapier and parry are now built on **glam 0.33**, the version this port
+already pins, so a position crosses the boundary with no conversion at all. Release
 builds use full LTO and one codegen unit; **debug builds optimise the dependencies**
 (`[profile.dev.package."*"] opt-level = 3`) while leaving this crate untouched, because
 almost all of a frame's CPU time is inside `wgpu` and a debug build has to be playable —
@@ -58,7 +64,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,092 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,129 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -153,7 +159,8 @@ before calling into a module.** This table is the index.
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points** and **skinning**. No LOD selection, no `.phy`, no skin families, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher** and **attachment parenting** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting** and the **vphysics seam** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, and an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in. No shadow controller, so the player walks through a cube; no constraints, collision events, ragdolls or vehicles | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -166,9 +173,10 @@ door opens as you approach and shuts behind you, a `trigger_hurt` can kill you,
 **a mover shoves you out of its way or is stopped by you**, and **what is
 bolted to a moving arm rides the point on it the map named**. **Every model is
 skinned**, so the seven pieces of falling debris on the default map bend with
-their skeletons instead of standing in their bind pose, and the weighted cube
-in the corner is drawn — in the right model, though not yet in the rusted skin
-the map asked for. Two portals draw as coloured ovals — **and they work, and you can see
+their skeletons instead of standing in their bind pose, and **the weighted cube
+falls**: it drops 255 units out of its dropper onto the chamber floor, settles
+in two seconds and goes to sleep lying on the slope it landed on — in the right
+model, though not yet in the rusted skin the map asked for. Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
@@ -328,10 +336,18 @@ three-bone door as well. **It cost nothing** — an A/B of `frame_cost` reads
 `entity models` 0.14 ms before and **0.12 after**, because a batch that was one
 draw per bone run is now one draw.
 
+What `sp_a1_intro1` ends up with, printed by
+`sp_a1_intro1_drops_its_cube_through_the_whole_server_path`: **667 static
+bodies** (2 world solids, 11 displacements, 654 static props), **26 brush
+entity bodies**, **49 studio entity bodies** and **one dynamic** one. The map's
+build costs **18 ms** and a tick costs **0.011 ms while the cube is falling and
+0.000 once it sleeps**.
+
 **`prop_weighted_cube` has landed** — 98 cubes across 59 maps, one on
 `sp_a1_intro1` — and it is the first class here whose *base* is missing rather
-than whose siblings are: `CPhysicsProp` is vphysics, so a cube is drawn, in the
-right model for its type, and hangs in the air. Three findings, in
+than whose siblings are: `CPhysicsProp` is vphysics, so a cube was drawn, in
+the right model for its type, and hung in the air — **`src/vphysics/` is the
+base arriving, and now it falls**. Three findings, in
 `rustdocs/SERVER.md`: **the `skin` key is a cube *type*, not a skin**, and 77 of
 the 98 take that path rather than `CubeType`; the Schrodinger cube is dead code
 in the shipped game under an unacted `FIXME`; and a cube that ships pre-painted
@@ -340,6 +356,57 @@ not be ported faithfully** — it calls `CTriggerPortalCleanser`, which is
 declared in no header this tree ships — so it is implemented as
 `SilentDissolve`, which is the half a map can observe through its 63 shipped
 `OnFizzled` connections.
+
+**`src/vphysics/` has landed** — `legacy/vphysics/` (22,607 lines) and the whole
+of the `legacy/ivp` submodule replaced by **rapier**, with one part *ported*
+rather than replaced: Valve's collision format. `portdocs/VPHYSICS.md` is the
+plan and `rustdocs/VPHYSICS.md` the API. Five findings worth knowing before
+reading either:
+
+- **The simulation runs in Source units, not metres.** Valve scales every
+  length by `METERS_PER_INCH` at every boundary because IVP had no alternative
+  — `convert.h`'s own first line is `// UNDONE: Remove all conversion/scaling`
+  — and Rapier does: `IntegrationParameters::length_unit` is 39.3701 and
+  nothing converts.
+- **`IVP_Compact_Surface::rotation_inertia` is not a moment of inertia**, and
+  the port reproduces the error deliberately. `IVP_Rot_Inertia_Solver` writes
+  `sqrt(⟨y²⟩² + ⟨z²⟩²)` where the moment is `⟨y²⟩ + ⟨z²⟩`, so **every Portal 2
+  cube rotates 1.41× more easily than a real one** and every throw in the game
+  is tuned against it. `Mass::true_inertia` is the other answer and nothing
+  calls it.
+- **The format was proved before it was written.** A Python prototype parsed
+  all 1,056 shipped `.phy` files and all 106 maps' `LUMP_PHYSCOLLIDE`, and the
+  decisive check is that the world hull's bounds on `sp_a1_intro1` equal
+  `dmodel[0]`'s mins and maxs *to the float*. Three traps cost a wrong answer
+  on the way: `phyheader_t::id` is zero rather than `'VPHY'`, a ledgetree node
+  is 28 bytes and not 48, and `IVP_Compact_Ledge::get_n_points()` is a guess
+  that must not be used.
+- **Displacement collision needed none of `physics_virtualmesh.cpp`.** All 106
+  maps say `virtualterrain {}` and ship an empty `LUMP_PHYSDISP`; `Bsp::disp_grid`
+  already exists and is shared with `trace/` and `world/`, so 643 lines became
+  one `TriMesh` constructor.
+- **The world gets one surface property and cannot have more.** IVP resolves it
+  per *triangle*; a collider has one, and **73,856 of the game's 115,225 world
+  ledges mix more than one material**, so there is no per-ledge answer either.
+  The cost is bounded: every material a shipped `materialtable` names has
+  friction 0.8 except `glass`.
+
+**The pass that was nearly missed** is the one that gives a body to every
+entity placing a *studio* model — `CDynamicProp::CreateVPhysics` ends in
+`VPhysicsInitStatic()`, and `prop_dynamic` is 8,072 entities across 105 maps.
+Without it a cube falls through every panel and hatch in the game and lands on
+the level shell. The static-or-kinematic rule for those is **not** the brush
+entities' and must not read the movetype: `CBaseProp::Spawn` sets
+`MOVETYPE_PUSH` on every prop in the game, the way `CFuncBrush::Spawn` does on
+every brush entity, so a movetype rule would make all 8,072 kinematic bodies
+rewritten every tick.
+
+**What it does not do is the shadow controller** (`physics_shadow.cpp`, 1,455
+lines), so **the player walks through a cube** rather than pushing it, and a
+cube cannot hold a floor button down. A *door* is a kinematic body, which is
+the half of the shadow controller a moving brush actually uses —
+`CFuncBrush::CreateVPhysics`'s own comment is why nearly every brush entity is
+one.
 - **External `.ani` animation blocks** (`animblock != 0`), which skinning just promoted
   to the largest gap in the model path. Until skinning landed, every `$includemodel` host
   but the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
@@ -359,6 +426,13 @@ declared in no header this tree ships — so it is implemented as
   the cube on `sp_a1_intro1`**, so it is visible on the default map. It needs `PropBatch`
   to carry a material per skin family rather than one, and the draw to pick by
   instance.
+- **The shadow controller** — `legacy/vphysics/physics_shadow.cpp` (1,455 lines) and
+  `vphysics/player_controller.h`. It is what `src/vphysics/` deliberately left out and
+  it is the single most visible gap the cube opened: **the player walks through a cube**,
+  a cube cannot hold a `prop_floor_button` down, and nothing a physics prop does is
+  visible to `trace/`. It is a design question rather than an implementation — `client/`'s
+  movement, `trace/` and the environment all have to agree about where the player is, and
+  today only the first two do. `rustdocs/VPHYSICS.md` §7 is the list it heads.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view
@@ -507,7 +581,10 @@ How the C++ tree is organized, which is what you need to navigate it (not to bui
 - **`legacy/common/`** — shared non-engine utilities (GameUI, config management) used by
   launcher/engine/tools.
 - **`legacy/ivp/`** is a git submodule (`kisak-physics`) providing the Havok/IVP physics
-  backend consumed by `vphysics/`.
+  backend `vphysics/` was built on. **Both are now replaced** by `src/vphysics/` on
+  rapier and can be deleted; what was read out of them first is written down in
+  `portdocs/VPHYSICS.md` §2, which is the only part of IVP the port keeps —
+  the binary layout of a compact surface.
 - **`legacy/external/`, `legacy/thirdparty/`** — vendored third-party libs (crypto++,
   zlib, libpng, protobuf, RmlUi, SDL2, quickhull, …). Most are slated for replacement by
   crates; `common/netmessages.proto` and friends are the exception worth keeping.

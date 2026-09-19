@@ -186,6 +186,13 @@ pub struct EntityCore {
     /// The staleness window is the same one Valve has; it is just closed from
     /// the other end.
     parent_to_world: glam::Affine3A,
+    /// `m_pPhysicsObject` — this entity's rigid body, if it has one.
+    ///
+    /// Written only by [`physics::Physics`](super::physics::Physics), which is
+    /// the one place that can keep the environment's side of the pairing in
+    /// step. A handle to a removed body resolves to nothing rather than to
+    /// somebody else's, so a stale one here is inert rather than dangerous.
+    pub physics: Option<crate::vphysics::env::BodyId>,
     /// `m_spawnflags`.
     pub spawn_flags: u32,
     /// `m_ModelName` — `"*12"` for a brush model, `"models/…/x.mdl"` for a
@@ -960,10 +967,17 @@ impl EntityCore {
     ///
     /// A `MOVETYPE_PUSH` entity qualifies only while its alarm is in the
     /// future, which is what keeps 11,000 motionless brush entities out of the
-    /// per-tick loop. `MOVETYPE_NONE` never qualifies.
+    /// per-tick loop. `MOVETYPE_NONE` never qualifies, and **neither does
+    /// `MOVETYPE_VPHYSICS`** — a physics prop is moved by `PhysFrame`, after
+    /// the simulation list has been walked, so putting one in that list would
+    /// buy a `PhysicsNone` call and nothing else.
     pub fn will_simulate_game_physics(&self) -> bool {
         match self.move_type {
-            MoveType::None | MoveType::Walk | MoveType::Noclip | MoveType::FlyGravity => false,
+            MoveType::None
+            | MoveType::Walk
+            | MoveType::Noclip
+            | MoveType::FlyGravity
+            | MoveType::VPhysics => false,
             MoveType::Push => self.move_done_time() > 0.0,
         }
     }
@@ -1064,6 +1078,7 @@ impl Entity {
                 local_origin: Vec3::ZERO,
                 local_angles: Vec3::ZERO,
                 parent_to_world: glam::Affine3A::IDENTITY,
+                physics: None,
                 spawn_flags: 0,
                 model: None,
                 hammer_id: None,

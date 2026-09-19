@@ -1638,6 +1638,41 @@ impl Level for Scene<'_> {
         self.server
             .set_attachments(Box::new(WorldAttachments(attachments)));
 
+        // …and the physics environment, which is the third thing handed over
+        // at this seam and the only one that is *moved* rather than copied:
+        // `physenv` is the game's (`portdocs/VPHYSICS.md` §5), and the models
+        // an entity may ask for a body from are the ones just loaded above.
+        if let Some(mut physics) = world.physics.take() {
+            let names: Vec<String> = placements
+                .iter()
+                .map(|placement| placement.model.clone())
+                .collect();
+            physics.add_models(&names, vfs);
+            eprintln!("source-engine: world: {}", physics.stats.summary());
+            if let Some(failure) = &physics.stats.first_failure {
+                eprintln!(
+                    "source-engine: world: {} collision model(s) failed to read; first: {failure}",
+                    physics.stats.failed
+                );
+            }
+            self.server.set_physics(
+                physics.environment,
+                physics.models,
+                physics.brush_models,
+            );
+            if let Some(stats) = self.server.physics_stats() {
+                eprintln!(
+                    "source-engine: server: physics {} static, {} brush, {} model \
+                     ({} moving), {} dynamic body(ies)",
+                    stats.static_bodies,
+                    stats.brush_bodies,
+                    stats.studio_bodies,
+                    stats.brush_movers + stats.studio_movers,
+                    stats.dynamic_bodies,
+                );
+            }
+        }
+
         self.world = Some(world);
         Ok(())
     }

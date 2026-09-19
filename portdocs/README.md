@@ -130,6 +130,18 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   (inheritance became composition), §7.3's FGD cross-check (the FGD is not a superset of
   the datadesc, so the check with teeth is against map data), and §4.4's wildcard rule.
 
+- [`VPHYSICS.md`](VPHYSICS.md) — **rigid-body physics.** Written before the port;
+  **all five stages have landed** — see `src/vphysics/` and `rustdocs/VPHYSICS.md`.
+  `legacy/vphysics/` is 22,607 lines sitting on the whole of the `legacy/ivp`
+  submodule, and **Rapier replaces all of it but one part**: the collision *format*,
+  which every physics engine needs and none can read. Records the case for simulating
+  in Source units rather than converting to metres the way Valve must, the derivation
+  showing that **Valve's stored rotational inertia is a factor of √2/2 below the true
+  one** — and the decision to reproduce that, because Portal 2 is tuned against it —
+  and a census taken with a Python prototype before a line of Rust: **1,056 of 2,041
+  models ship a `.phy` and all of them parse**, all 106 maps carry a
+  `LUMP_PHYSCOLLIDE`, and the world hull's bounds equal `dmodel[0]`'s to the float.
+
 - [`PORTAL.md`](PORTAL.md) — **`prop_portal`: teleportation and a drawn frame.** Written
   before the port; nothing has landed. ~26,600 lines of `game/{server,shared}/portal/` and `mathlib/`
   plus a 7,400-line client renderer that is entirely out of scope, of which roughly

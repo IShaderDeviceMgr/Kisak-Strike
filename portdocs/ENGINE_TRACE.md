@@ -485,7 +485,12 @@ not**. That distinction is what §5.3's ordering is built on.
 
 ### 5.3 Where they are the right answer — three places
 
-1. **`vphysics/` → `rapier3d`.** 20,618 lines of Valve code sitting on the entire
+1. **`vphysics/` → `rapier3d`. This has landed** — `src/vphysics/`,
+   `portdocs/VPHYSICS.md`, `rustdocs/VPHYSICS.md`. The dependency price §5.2 quoted was
+   right in shape and can now be stated exactly: **the build graph goes from 131 crates
+   to 156**, and `nalgebra` is in it for the solver's internals only — rapier and parry
+   are both built on **glam 0.33**, the version this port already pins, so
+   `parry::math::Vector` *is* `glam::Vec3` and nothing converts. 20,618 lines of Valve code sitting on the entire
    `legacy/ivp` submodule (Havok/IVP: `ivp_physics`, `ivp_controller`,
    `ivp_compact_builder`, `havana`). Portal 2 is a physics game — weighted cubes, the
    excursion funnel, turret knockdown, ragdolls, paint blobs. Porting IVP is not a

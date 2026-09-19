@@ -65,6 +65,18 @@ draws"** — the standing census of the default map.
   comment in `baseentity.cpp` says. Names no GPU type, so all 28 of its unit tests run
   without a window.
 
+- [`VPHYSICS.md`](VPHYSICS.md) — `src/vphysics/`. **Rigid-body physics on
+  [rapier](https://rapier.rs)**, replacing `legacy/vphysics/` and the whole `legacy/ivp`
+  submodule. `collide` reads Valve's format — `.phy` files and a `.bsp`'s
+  `LUMP_PHYSCOLLIDE`, which are the same IVP compact surface under two headers — into
+  convex hulls; `surfaceprops` is the friction and elasticity database with its two
+  inheritance rules; `env` is the environment. Records that **the simulation runs in
+  Source units rather than Valve's metres** (rapier's `length_unit` is what makes that
+  possible), that **`IVP_Compact_Surface::rotation_inertia` is not a moment of inertia**
+  and the port reproduces the error deliberately, and the three byte-layout traps that
+  each cost a wrong answer. Its porting doc is
+  [`portdocs/VPHYSICS.md`](../portdocs/VPHYSICS.md).
+
 ## Root modules
 
 Two modules live at the crate root rather than under a subsystem, because their consumers

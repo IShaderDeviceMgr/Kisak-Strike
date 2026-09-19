@@ -85,6 +85,20 @@ pub enum MoveType {
     Walk,
     /// `MOVETYPE_NOCLIP`. The player, flying. Simulated by `client/`.
     Noclip,
+    /// `MOVETYPE_VPHYSICS`. Moved by the **solver**, not by this module:
+    /// `SetAbsOrigin` on one of these is overwritten by the next
+    /// `VPhysicsUpdate`, which is what `CBaseEntity::VPhysicsInitNormal`'s own
+    /// comment warns about ("physics alone determines where it goes… and the
+    /// entity receives updates from vphysics. `SetAbsOrigin()`, etc do not
+    /// affect the object!").
+    ///
+    /// Arrives with [`vphysics`](crate::vphysics) and the weighted cube. It
+    /// takes the same branch of [`simulate`] that
+    /// [`None`](MoveType::None) does — an entity in this state still *thinks*,
+    /// and `PhysicsNone` is exactly what `PhysicsSimulate` dispatches
+    /// `MOVETYPE_VPHYSICS` to (`physics_main.cpp:1755`): the movement happens
+    /// in `PhysFrame`, after every think has run.
+    VPhysics,
     /// `MOVETYPE_FLYGRAVITY`. The player, **dead** — `CBasePlayer::Event_Killed`
     /// sets it and nothing sets it back except a respawn. Gravity and a single
     /// swept move with no clip-and-retry; `CGameMovement::FullTossMove`, and
@@ -591,7 +605,11 @@ pub fn simulate(
         // copy; see [`MoveType`]. That includes `MOVETYPE_FLYGRAVITY`, which
         // is the dead player — and it is what makes `PlayerDeathThink` run at
         // all, since a think is the only thing this branch does.
-        MoveType::None | MoveType::Walk | MoveType::Noclip | MoveType::FlyGravity => {
+        MoveType::None
+        | MoveType::Walk
+        | MoveType::Noclip
+        | MoveType::FlyGravity
+        | MoveType::VPhysics => {
             physics_run_think(entity, behaviour, cx);
         }
         MoveType::Push => physics_pusher(entity, behaviour, cx, query),

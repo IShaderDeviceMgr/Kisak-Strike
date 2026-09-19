@@ -1785,8 +1785,9 @@ impl TestChamberDoor {
     pub fn is_animating(&self) -> bool;  // m_bIsAnimating: a `fully` is owed
     pub fn is_locked(&self) -> bool;     // m_bIsLocked
 }
-/// `prop_weighted_cube` — the first `CPhysicsProp` here, and this port has no
-/// physics, so what it is is a model, a skin ladder and nine inputs.
+/// `prop_weighted_cube` — the first `CPhysicsProp` here. **It falls**: its
+/// `Spawn` asks for a rigid body through `Context::vphysics_init_normal`, and
+/// `physics` is where that goes.
 /// **The `skin` key is a cube *type*, not a skin** — see the section below.
 /// The two enums are reached as `classes::prop::CubeType` /
 /// `classes::prop::PaintPower` — only the tests name them, so they are not
@@ -2842,7 +2843,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
 | ~~`$includemodel`~~ | **Landed** in `src/studio/include.rs`, and it was measured here first: 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**. Of the 2,738 props playing a sequence two seconds into their map, the labels that resolve went from 1,666 to **2,556** and the ones that do not from 897 to **182** — and that remainder is Valve's own map errors, 183 `DefaultAnim` keys naming a sequence in no model at all. `animating` rose with it, because an animation that can now *end* fires `OnAnimationDone` into the game's 5,311 `SetAnimation` connections. |
 | `prop_dynamic_ornament` (`COrnamentProp`) | A prop that `FollowEntity`s another, which needs the same local/abs transform pair the `SetParent` family does. **Zero placed by any shipped map.** |
-| `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls. `prop_weighted_cube` is ported now, but a cube here has no vphysics — it never falls, never moves and never enters a trigger — so those two would still be furniture nothing can press. **The blocker moved from the class to `MOVETYPE_VPHYSICS`.** The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
+| `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls. A cube falls now, but **what it falls through is not what a trigger tests**: the cube is in the physics world and the trigger sweep is in `trace/`'s, so a cube resting on a button does not press it. **The blocker moved again, from `MOVETYPE_VPHYSICS` to the shadow controller** — `rustdocs/VPHYSICS.md` §7. The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
 | **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
@@ -3127,6 +3128,13 @@ case values.
 | `tests::a_cube_with_a_prepainted_power_fires_onpainted_when_the_map_starts` | `Activate`'s double call — the 23 shipped cubes that fire an output on tick one |
 | `tests::dissolving_a_cube_fires_onfizzled_and_removes_it` | both dissolve inputs, and the 63 shipped `OnFizzled` connections that listen |
 | `tests::the_funnel_and_pickup_flags_are_kept_and_toggled` | the four flags nothing reads yet, so the plumbing is known good when something does |
+| `physics::a_weighted_cube_falls_once_the_engine_has_handed_over_an_environment` | **the whole seam, end to end** — a cube asks during `level_init`, the request outlives the absence of an environment, and the cube then falls onto a floor and stops |
+| `physics::a_cube_whose_model_ships_no_phy_is_left_hanging` | `PhysModelCreate` returning `NULL`, which leaves the entity exactly as it was before this module |
+| `physics::disable_motion_and_enable_motion_reach_the_solver` | the two inputs that left the unhandled list, plus `SF_PHYSPROP_MOTIONDISABLED` |
+| `physics::a_solid_brush_entity_gets_a_body_and_a_mover_gets_a_kinematic_one` | `CFuncBrush::CreateVPhysics`'s shadow rule — **both** brush entities are kinematic, which is the assertion that was wrong first |
+| `physics::a_solid_prop_dynamic_gets_a_static_body_and_a_parented_one_is_kinematic` | `CDynamicProp::CreateVPhysics`, and that `solid 0` gets nothing |
+| `physics::a_jointed_model_is_refused_rather_than_frozen_in_its_bind_pose` | bone followers, which are absent |
+| `physics::a_cube_is_not_given_a_static_body_by_the_studio_pass` | the order of `set_physics`'s three passes |
 | `tests::a_schrodinger_cube_is_remapped_to_a_reflective_one` | `SetCubeType`'s unacted `FIXME`, and the dead code below it |
 | `tests::every_shipped_map_spawns_its_entities` (the cube tally) | **what all 98 shipped cubes end up wearing**, model by model and skin by skin — which is both the proof that `ConvertOldSkins` works on real map data and the size of the skin-family gap (15 of 98) |
 
@@ -3148,8 +3156,8 @@ The first loads all 106 maps, spawns a player in each, runs **two seconds of
 server time**, and asserts exact totals: 60,925 blocks, 35,330 matched, 65
 created, 28,458 spawned, 6,937 lights deleted, 213 kept, 54,631 connections,
 156 unimplemented classnames, the full 49-name unhandled-key table, 5,787
-events dispatched, 5,042 inputs accepted, 7,318 thinks, 1,025 events that found
-no target, zero bad conversions, the **seven**-name unhandled-input table, a peak
+events dispatched, 5,043 inputs accepted, 7,318 thinks, 1,025 events that found
+no target, zero bad conversions, the **six**-name unhandled-input table, a peak
 of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
@@ -4345,12 +4353,19 @@ mean the carrying half is thinly exercised by shipped content in that window,
 and `an_attachment_child_follows_the_bone_as_the_parent_animates` is what
 actually holds it.
 
-### `prop_weighted_cube` — a class with its simulation removed
+### `prop_weighted_cube` — a class with its simulation removed, and then given back
 
-The first `CPhysicsProp` here, and the port has no vphysics — so this is the
-first class whose *base* is missing rather than whose siblings are. The
-interesting thing is how much of it survives that: a cube's identity is map
-data, and map data is exactly what this port has.
+The first `CPhysicsProp` here, and when it landed the port had no vphysics — so
+it was the first class whose *base* was missing rather than whose siblings
+were. The interesting thing was how much of it survived that: a cube's identity
+is map data, and map data is exactly what this port has.
+
+> **`src/vphysics/` has since landed and the base is no longer missing.** The
+> paragraph below about hanging in the air is kept as written because the
+> findings under it were made in that state and do not depend on it; what
+> changed is one line of `Spawn` — `cx.vphysics_init_normal(entity.id(),
+> asleep)` — and three inputs that had nothing to act on. See
+> **"The vphysics seam"** below and `rustdocs/VPHYSICS.md`.
 
 **98 cubes across 59 of the game's 106 maps**, one of them on `sp_a1_intro1`,
 carrying 63 `OnFizzled` connections — nearly all of them a dropper being told
@@ -4433,3 +4448,88 @@ therefore correct; 15 are not** — 5 companion (skin 1), 8 rusted standard (ski
 3) and 2 rusted reflective (skin 1). **One of the 15 is `sp_a1_intro1`'s**, a
 rusted standard cube, so the gap is visible on the map this port loads by
 default. The four types that differ by *model* are all correct.
+
+### The vphysics seam — where a body comes from
+
+`src/vphysics/` is the simulation and knows nothing about entities; this module
+owns the environment and knows nothing about `.phy` files. They meet at exactly
+the line Valve's DLL boundary is — `physenv` is a game-DLL global and the
+collision models come across from `modelinfo->GetVCollide` — and the Rust shape
+is the one this module has used twice before, for `sequences` and for
+`attachments`: **the engine builds something and hands it over at level init.**
+
+```rust,ignore
+Server::set_physics(environment, models, brush_models)
+```
+
+`physics.rs` is the whole of it: `Physics` holds the environment, the model
+table, the body↔entity pairing both ways, and the list of brush entities whose
+pose the game writes each tick.
+
+**Three things about it are not obvious.**
+
+**A class asks for a body, it does not make one.** `CPhysicsProp::Spawn` calls
+`CreateVPhysics()` inline; that cannot happen here, because `Server::dispatch`
+lifts the spawning entity *out of the entity list* for the whole of its own
+handler and a body has to be recorded against an entity that is in it. So
+`Context::vphysics_init_normal` queues, and `Server::flush_physics` drains on
+the way out — the same deferral `create_entity` and `take_damage` already use,
+and everything a `Spawn` does between asking and returning still happens before
+the body is built, which is the order that matters.
+
+**A request made before there is an environment is kept.** Every
+`prop_weighted_cube` on a map asks during `level_init`, and the engine cannot
+build the environment until `level_init` has *returned* — the brush entities'
+placements come from the entities it just spawned, and `CBaseDoor::Spawn` moves
+a door up to 294 units inside its own `Spawn`. So the queue survives until
+`set_physics` drains it. A level that never gets an environment — every test
+that does not ask for one — keeps a handful of requests nothing serves, and
+`level_shutdown` clears them.
+
+**Entities that place a *studio* model get bodies too, and that is the pass it
+would have been easy to miss.** `CDynamicProp::CreateVPhysics`
+(`props.cpp:2119`) ends in `VPhysicsInitStatic()`, and `prop_dynamic` is 8,072
+entities across 105 of the game's 106 maps — the panels, hatches and machinery a
+chamber is built out of. Without them a cube falls through the furniture and
+lands on the level shell.
+
+The static-or-kinematic rule for those is **not the same one brush entities
+use**, and reading the movetype would get it wrong: `CBaseProp::Spawn`
+(`props.cpp:253`) sets `MOVETYPE_PUSH` on every prop in the game, exactly as
+`CFuncBrush::Spawn` does on every brush entity. `VPhysicsInitStatic`'s own rule
+ignores the movetype — parented → shadow, otherwise static — and an *animating*
+prop is still static, because `prop_dynamic` animates its bones and not its
+origin.
+
+**Nearly every brush entity is a kinematic body, including the ones that never
+move.** That is Valve's, not an accident: `CFuncBrush::Spawn` sets
+`MOVETYPE_PUSH` "so it doesn't get pushed by anything", and
+`CFuncBrush::CreateVPhysics` (`modelentities.cpp:84`) then says *"Don't init
+this static. It's pretty common for these to be constrained and dynamically
+parented."* `CFuncMoveLinear`, `CFuncRotating` and `CBaseDoor` all agree. A
+kinematic body that is never moved behaves exactly as a fixed one does, and
+`Physics::follow_movers` skips the ones whose pose has not changed.
+
+**Where it runs in the tick.** `PhysFrame` is called from
+`CPhysicsHook::FrameUpdatePostEntityThink`, so `Server::run_tick` steps the
+environment **after `run_think_functions` and before `check_for_entity_untouch`**
+— a cube that moved this tick is in its new place when the touch pass looks,
+and an `OnEndTouch` still arrives in the tick it happened. The writeback goes
+through `hierarchy::propagate_id`, not a bare assignment, so anything parented
+to a physics prop rides it; and a body whose entity *has* a parent is skipped
+entirely, which is `VPhysicsUpdate`'s own early return
+(`baseentity_shared.cpp:1317`).
+
+**What it changed elsewhere.** `MoveType::VPhysics` exists, which
+`trigger_push` branches on — a physics prop is pushed with a *force* rather
+than a velocity, and `SF_TRIGGER_PUSH_USE_MASS` (13 of the game's 192
+`trigger_push`es set it) decides whether that force scales with the object's
+own mass. `EnableMotion`, `DisableMotion` and `Wake` left the unhandled list
+and took `io.accepted` from 5,042 to 5,043: **one connection in the game fires
+`EnableMotion` inside two seconds**, and it is the one that unfreezes
+`sp_a2_pull_the_rug`'s single `SF_PHYSPROP_MOTIONDISABLED` cube.
+
+**What it did not change.** The cube is in the physics world and not in
+`trace/`'s, so the player walks through it and it cannot press a floor button.
+That is the shadow controller, and `rustdocs/VPHYSICS.md` §7 is the list it
+heads.

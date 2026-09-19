@@ -4866,6 +4866,25 @@ frames including the world so that the *difference* is the number: `everything` 
 draw**, which is what it is; the row to read it against is `everything, novis` at 1.81 ms,
 which is what one level would have cost before visibility landed. That is the whole reason
 `portdocs/ENGINE_WORLD_VIS.md` went first.
+**Physics does not show up in this benchmark at all, because it is not in the draw
+path** — and that is the measurement rather than an excuse. Two runs of `frame_cost`
+with it read `everything` **0.36 and 0.38 ms**, `entity models` **0.12** both times and
+`props only` **0.23** both times, against the **0.36 / 0.12 / 0.22** recorded for the
+commit before it. **The one run taken on that commit for the comparison is not usable
+and is recorded here as a warning rather than as data**: it read 0.59 / 0.15 / 0.41
+with `novis` at 4.49 against its own recorded 1.87 — 2.4x across every row, because it
+ran immediately after the full LTO rebuild that switching dependency sets forces. That
+is exactly the thermal inflation the note below is about, and it is the reason the A/B
+here is "the draw path is untouched and reads the same twice" rather than a difference.
+What it
+*does* cost is measured by `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest`, which
+builds the same map's environment and times it: **16 ms once, at load**, for the
+world's 1,528 convex hulls, 11 displacement meshes, 78 brush models, 654 static props
+and 77 models' `.phy` files; and then **0.010 ms a tick while a cube is falling and
+0.000 ms once it sleeps**. A 64 Hz tick has 15.6 ms in it, so a map in motion spends
+0.06% of one on physics and a map at rest spends none — islands are why, and it is
+the reason `Environment::active()` is the writeback's only input.
+
 Run the sub-benchmarks on their own — back to back they share thermal
 state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
@@ -4879,7 +4898,7 @@ second is A/B/A, not A/B.
 > map — the numbers to re-measure after a change to the draw path or the entity
 > list, and the three materials that still do not resolve.
 
-There is a unit test suite (`cargo test`, 1,092 tests, plus 38 depot-gated), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 1,129 tests, plus 44 depot-gated), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and
@@ -4954,6 +4973,16 @@ what each filter left. The finding that would have cost the game its terrain:
 **`LUMP_LEAFFACES` names none of the 1,181 displacement faces in the game**, so
 the leaf list a displacement belongs to has to be rebuilt from its bounds, the
 way the shipped loader builds `mleaf_t::dispListStart`.
+**And the cube falls.** `src/vphysics/` put the world, its terrain, its 654 solid
+static props, its 78 brush models and the weighted cube into a rapier environment, and
+`sp_a1_intro1`'s cube drops **254.8 units** out of its dropper, settles in **136 ticks**
+(2.1 s) and goes to sleep. It does not rest level, and that is the map: the floor there
+is **6.85° off vertical**, and the cube's own up ends up **1.30° from the floor's
+normal** — a cross-check worth stating, because the floor's normal comes from `trace/`,
+which builds its own structures out of the brush lumps and has never seen
+`LUMP_PHYSCOLLIDE`. Two independent collision representations of the same map agree to
+a degree. What still does not work is the other direction: **the player walks through
+the cube**, because there is no shadow controller.
 **And now you can see through a portal.** `portdocs/PORTAL_RENDER.md` took the
 stencil, the opening and the recursion: an oval is no longer a picture of the
 wall it is on but a hole with the room behind its partner in it, drawn two levels
