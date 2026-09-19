@@ -305,12 +305,17 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
         return true;
     }
 
+    // `SetAbsAngles`/`SetAbsOrigin` — Valve's `KeyValue` really does set the
+    // *absolute* pair here, and asserts that nothing is parented yet.
+    // `SetupParentsForSpawnList` runs after every key is read, which is what
+    // makes that hold and what makes the local pair these two write correct:
+    // it is the world placement, and parenting rebases it afterwards.
     if is("angles") {
-        entity.angles = string_to_vector(value);
+        entity.set_abs_angles(string_to_vector(value));
         return true;
     }
     if is("origin") {
-        entity.origin = string_to_vector(value);
+        entity.set_abs_origin(string_to_vector(value));
         return true;
     }
     if is("targetname") {

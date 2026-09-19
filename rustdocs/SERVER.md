@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener` and `prop_portal`.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, and **a portal links to its partner and draws an oval**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the local/abs transform pair.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, and **what is parented to a mover rides it**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 191 unit tests + ten depot tests over all 106 shipped maps |
+| Tests | 201 unit tests + ten depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -19,6 +19,11 @@ and the think schedule. Porting doc:
 `player_loadsaved`, and the `god`/`kill`/`hurtme` commands. **`trigger_hurt`
 kills**: 138 of the game's 215 kill a player standing in them, and the other 77
 are switched off, admit no clients or have nowhere to stand.
+
+**What the transform pair added** (the most recent thing to land, and not a
+stage): `hierarchy.rs`, `local_origin`/`local_angles` on `EntityCore`, and the
+`SetParent`/`ClearParent` inputs. 4,582 of the game's entities name a parent
+and 201 of them are movers; before this they all moved in world space.
 
 **What `prop_dynamic` added** (after stage 5, not part of it): `CDynamicProp`
 across its four classnames — **8,462 entities, the commonest thing in a Portal 2
@@ -472,9 +477,12 @@ pub struct EntityCore {
     pub name: Option<String>,          // targetname
     pub target: Option<String>,        // the `target` key — m_target
     pub parent_name: Option<String>,
-    pub parent: Option<EntityId>,
-    pub origin: Vec3,
-    pub angles: Vec3,                  // pitch, yaw, roll
+    pub origin: Vec3,                  // m_vecAbsOrigin — the WORLD placement
+    pub angles: Vec3,                  // m_angAbsRotation, pitch/yaw/roll
+    pub local_origin: Vec3,            // m_vecOrigin — in the PARENT's frame
+    pub local_angles: Vec3,            // m_angRotation
+    // parent, children and the cached parent frame are private; see the
+    // transform-pair section below.
     pub spawn_flags: u32,
     pub model: Option<String>,         // "*12" or "models/…/x.mdl" — a NAME
     pub hammer_id: Option<u32>,
@@ -1154,6 +1162,116 @@ the plane are computed and thrown away in the original; they are not computed
 here. Something that wants to *stop* against an OBB rather than notice one is
 what makes this grow a `Trace`.
 
+### `hierarchy` (`hierarchy.rs`) — the transform pair and parenting
+
+```rust
+/// On EntityCore: the pair, and everything that may write it.
+pub fn parent(&self) -> Option<EntityId>;
+pub fn children(&self) -> &[EntityId];
+/// `EntityToWorldTransform()` — m_rgflCoordinateFrame, built not cached.
+pub fn to_world(&self) -> Affine3A;
+/// `SetLocalOrigin`/`SetLocalAngles` — what a mover writes.
+pub fn set_local_origin(&mut self, origin: Vec3);
+pub fn set_local_angles(&mut self, angles: Vec3);
+/// `SetAbsOrigin` + `SetAbsAngles` — what a teleport or a placement writes.
+pub fn set_abs_placement(&mut self, origin: Vec3, angles: Vec3);
+pub fn set_abs_origin(&mut self, origin: Vec3);
+pub fn set_abs_angles(&mut self, angles: Vec3);
+
+/// In `hierarchy`:
+pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Option<EntityId>);
+pub fn propagate(core: &EntityCore, entities: &mut EntityList);
+pub fn propagate_id(id: EntityId, entities: &mut EntityList);
+pub fn descendants(core: &EntityCore, entities: &EntityList) -> Vec<EntityId>;
+
+/// On Context, for a class that wants either:
+pub fn set_parent(&mut self, core: &mut EntityCore, parent: Option<EntityId>);
+pub fn moved(&mut self, core: &EntityCore);
+```
+
+`game/server/hierarchy.cpp`, `CBaseEntity::SetParent`/`CalcAbsolutePosition`,
+and the position half of `InvalidatePhysicsRecursive`. **4,582 of the shipped
+maps' 60,925 entities name a `parentname`** — 2,129 `prop_dynamic`, 1,118
+`func_brush`, 226 `prop_dynamic_override` — and **201 of them are movers**, for
+which the frame is not a detail: `CBaseToggle`'s destinations, the velocity it
+computes and both halves of `PerformPush` are all in the parent's frame.
+
+#### Which pair to read, and which to write
+
+| you are | read | write |
+|---|---|---|
+| colliding, drawing, measuring a distance | `origin`, `angles` | — |
+| a mover integrating or arriving | `local_origin`, `local_angles` | `set_local_*` |
+| teleporting, spawning, placing | `origin`, `angles` | `set_abs_placement` |
+| re-parenting | — | `Context::set_parent` |
+
+The world pair is **derived**: every setter above re-derives it, and
+`propagate` re-derives it for everything underneath. A bare `entity.origin = …`
+compiles and is the one way to break the module, which is why
+`every_shipped_map_spawns_its_entities` asserts the invariant — `origin ==
+parent.to_world() * local_origin`, and the parent names the child back — for
+every entity of all 106 maps, at load and after two seconds.
+
+#### Eager, where Valve is lazy
+
+Valve marks `EFL_DIRTY_ABSTRANSFORM` down the subtree and pays at the next
+`GetAbsOrigin`. That needs a parent *pointer*, and this port has an `EntityId`
+that only the `EntityList` resolves — while the entity being dispatched is
+*outside* that list for the whole of its handler. So the one instant a mover
+integrates its velocity is the one instant it could not look its parent up.
+
+The port turns it around. `EntityCore` caches the **parent's** frame, so
+writing the local pair re-derives the world pair from `&mut self` alone; and
+`Server::dispatch` calls `propagate` once on the way out of every handler,
+which is the only place that can see both the entity that moved and the list it
+moved within. Two early-outs make that affordable, and neither is optional:
+
+- `propagate` returns at once on an empty child list. **59,017 of the game's
+  60,925 entities have no children**; only 1,908 are anybody's parent, and the
+  widest child list in the game is 170.
+- `EntityCore::follow` compares the frame it is handed against the one the
+  child holds, so an unmoved subtree is not walked. Without it the walk is not
+  merely wasted: `MatrixAngles(AngleMatrix(a))` is not `a` in `f32`, so a still
+  parent shuffles its children sideways every tick — **measured at 532 extra
+  brush entities drifting off their spawn placement** in the first two seconds
+  of the shipped maps.
+
+`CBaseDoor::Spawn` is why the seam is `dispatch` rather than the pusher: a door
+that spawns open moves up to 294 units inside its own `Spawn`, and covering
+only `PerformPush` left its clip brush behind for good. The invariant test
+found that, on `mp_coop_laser_crusher`, before anyone could play it.
+
+#### `SetParent` and `ClearParent` both hold the world placement still
+
+…and the C++ does not look like it. `SetParent` computes the new local origin
+from `GetLocalOrigin()` — the **local** one — which only makes sense once you
+have read `UnlinkFromParent` (`hierarchy.cpp:98`) and seen that it writes the
+absolute pair into the local pair first. So an entity re-parented in mid-air
+does not jump, and `ClearParent` leaves it exactly where it was.
+
+`InputSetParent` resolves its parameter with the **activator** and no caller,
+so `!activator` works in a `SetParent` and `!caller` does not. Removing an
+entity takes its whole subtree with it — `UpdateOnRemove`'s "Any children still
+connected are orphans, mark all for delete" — rather than handing the children
+back to the world.
+
+#### What is not here: attachments
+
+`SetParentAttachment` and `SetParentAttachmentMaintainOffset` stay unhandled,
+and they are **1,362 shipped connections** against `SetParent`'s 143. The
+condition is `CBaseAnimating::LookupAttachment`, and it is a real one rather
+than a formality: of the 1,454 connections in the game that fire one, **1,376
+aim at an entity whose parent carries a `.mdl`**, so Valve's two guards let them
+through to the lookup; 2 are parented to a brush model, 75 have no parent at
+all, 1 has an unresolvable one. Accepting the 1,376 without the lookup would
+put each entity at its parent's *origin* instead of its attachment point, which
+is worse than refusing. The map-key form `parentname "arm,attachment"` is
+unaffected — **zero of the 4,582 parented entities in the game use it.**
+
+`CalcAbsoluteVelocity`'s pair is absent for the same kind of reason: nothing
+reads a parented entity's absolute velocity yet. It is needed the moment
+something rides a moving parent and is then let go.
+
 ### `touch` (`touch.rs`)
 
 ```rust
@@ -1715,15 +1833,16 @@ entity built is not there start at 47, and if something will not die start at
     with a tolerance; asserting an exact zero asserts something the shipped
     game does not do either.
 
-34. **Parented movers move in world space.** This port resolves `parentname` to
-    a handle and keeps no local/abs transform pair, so `EntityCore::origin` is
-    always the world-space origin the map gave and a move is applied there.
-    Valve integrates `GetLocalVelocity()` into `GetLocalOrigin()` — the
-    *parent's* frame. Measured: **174 of the game's 1,164 movers name a
-    parent**, and for those the motion is right in shape and wrong in frame
-    whenever the parent is itself turned or moved. It is the same missing pair
-    that keeps the `SetParent` family unimplemented, and 1,078 of the depot's
-    1,081 unhandled inputs are that family.
+34. **`origin` is the world placement and `local_origin` is the truth.** A
+    mover reads and writes the *local* pair — every coordinate in `subs.cpp`
+    and both halves of `PerformPush` are `GetLocal*`/`SetLocal*` — and the
+    world pair is re-derived from it. Read `origin` (collision, drawing,
+    distance); write `set_local_origin` (a mover), `set_abs_placement` (a
+    teleport, a spawn placement). **Writing the `origin` field directly is the
+    one way to break this module**, and
+    `every_shipped_map_spawns_its_entities` checks the invariant on every
+    entity of every map so that it fails as a test rather than as a door that
+    teleports.
 
 35. **A trigger is `SOLID_BSP` *and* `FSOLID_NOT_SOLID` *and*
     `FSOLID_TRIGGER`, and all three are load-bearing.** The type is what lets
@@ -2135,6 +2254,16 @@ entity built is not there start at 47, and if something will not die start at
     rather than the `0.9` the exit-speed rules use. Valve's comment for the
     second: *"allowing those to punch creates a floor to floor exploit"*.
 
+85. **`CRotDoor::Spawn` spawns open through `Teleport`, and its linear sibling
+    through `UTIL_SetOrigin` — one sets the absolute pair and the other the
+    local one.** `m_vecAngle2` is a *local* angle either way, so a
+    `func_door_rotating` that both has a parent and spawns open is placed at
+    its intended angle read in the wrong frame. It is a bug and it is
+    reproduced rather than fixed: **3 of the game's 63 parented
+    `func_door_rotating`s spawn open**, and correcting it would move three
+    doors the shipped game does not move. `doors.cpp` `CRotDoor::Spawn` against
+    `CBaseDoor::Spawn`, four lines apart.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2153,7 +2282,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | The zero-delay event chain | Unbounded; a self-triggering relay hangs the server | Bounded at 100,000 events a tick, then the queue is dropped with a warning | Four times the largest map's entire connection count. |
 | A `filter_multi` chain | Unbounded; a filter naming itself recurses until the stack runs out | Bounded at 8 deep, reported, treated as a pass | No shipped map has a chain deeper than one. |
 | Pressing a floor button | `m_pOwnerButton->TriggerStartTouch( pOther )`, a direct call | The trigger posts `PressIn` at the button | A handler cannot dispatch into another class — the dispatched entity is lifted out of the list. Same tick, one more event; gotcha 51. |
-| `CPropFloorButton::CreateTriggers`' `SetParent` | Parents the trigger to the button, so a button on a platform carries it | Places the trigger at the button's absolute origin and angles | The same missing local/abs pair as gotcha 34. **Not one of the game's 65 `prop_floor_button`s has a `parentname`**, and none is a mover, so there is nothing for the transform to do. |
+| `CPropFloorButton::CreateTriggers`' `SetParent` | Parents the trigger to the button, so a button on a platform carries it | Places the trigger at the button's absolute origin and angles | The transform pair exists now, so this is a two-line change rather than a blocked one — but it still buys nothing: **not one of the game's 65 `prop_floor_button`s has a `parentname`**, and none is a mover. Do it when a map places one on something that moves. |
 | `CPropFloorButton::UpdateOnRemove` | `UTIL_Remove( m_hButtonTrigger )` | The trigger outlives a killed button | There is no removal hook on `Behaviour`, and **no connection in any shipped map fires `Kill` at a floor button**. An orphan does nothing: its owner handle stops resolving, so its filter refuses everything. |
 | A creator's `DispatchSpawn` | Called by the creator, part-way through its own `Spawn` | Queued, run the moment the creator's handler returns | Gotcha 47. |
 | `pOther->TakeDamage( info )` | A direct call, part-way through the hurter's think | Queued, applied the moment the hurter's handler returns | Same reason and same shape as the row above: applying damage runs the *victim's* virtuals, and the hurter has been lifted out of the list. Gotcha 52. |
@@ -2225,7 +2354,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Named think *contexts* (`m_aThinkFunctions`) | Still no class here needs two independent timers, and stage 3 is the evidence rather than the counter-example: a mover uses the think schedule **and** the arrival alarm, which are two different mechanisms with two different fields, not two contexts. The one class that genuinely wanted a context is `CBaseDoor`'s `"MovingSound"`, and there is no sound system. |
 | `IGameSystem` as a registry | One system exists (`CTonemapSystem`), so it is a method. The condition is the second system that needs a level hook. |
 | `FIELD_EHANDLE` and `FIELD_POSITION_VECTOR` | No class declares either. `FIELD_EHANDLE`'s two conversions both need the entity list, which `Variant::convert` has not got. |
-| `AddOutput`, `SetParent`, `ClearParent` and `SetParentAttachment*` | **The condition is a real local/abs transform pair on `EntityCore`**, which this port does not have — a child's origin is the world-space one the map gave and nothing rebases it — plus `LookupAttachment` on a studio model for the attachment forms, which would be this module's first dependency on `studio/`. It is the largest single absence left: **1,078 of the depot's 1,081 unhandled inputs** are this family, 883 of them `func_brush.SetParentAttachmentMaintainOffset`. See gotcha 34. |
+| `AddOutput` | Rewrites a keyfield or adds a connection at run time from a string. No shipped Portal 2 connection fires it at a class this port implements. |
+| `SetParentAttachment` and `SetParentAttachmentMaintainOffset` | `SetParent` and `ClearParent` landed with the transform pair; these two did not, and they are **1,362 shipped connections against `SetParent`'s 143**. They need `CBaseAnimating::LookupAttachment`, which would be this module's first dependency on `studio/` — and the need is measured rather than assumed: of the 1,454 connections that fire one, **1,376 aim at an entity whose parent carries a `.mdl`** and so reach the lookup. 883 of them are `func_brush.SetParentAttachmentMaintainOffset`. See the `hierarchy` section. |
 | `CLogicBranch::UpdateOnRemove`'s notification | Valve posts `_OnLogicBranchRemoved` at the *branch* instead of at the listener (`logicentities.cpp:2622`), so no listener in the shipped game has ever received one; a stale branch is counted as false for the rest of the level. This port reaches the same state by a different route — there is no `UpdateOnRemove` hook on `Behaviour`, and a dead id reads as false in `DoTest`. **No shipped map fires `Kill` at a `logic_branch`.** |
 | `SendTable`/`DT_`/`edict_t` | One process. Deleted, not deferred. |
 | Save/restore, `FTYPEDESC_SAVE` | Deferred; `serde` over entity state when it comes back, not `ISave`. |
@@ -2311,6 +2441,16 @@ case values.
 | `think::a_removed_entity_leaves_the_think_list` | `EntityChanged`'s first line |
 | `think::the_tickrate_switch_quantises_to_512ths_and_clamps` | `-tickrate` |
 | `random::the_same_seed_gives_the_same_stream` | gotcha 17 |
+| `hierarchy::parenting_holds_the_world_placement_still_and_solves_the_local_one` | `SetParent`'s rebase |
+| `hierarchy::a_parent_that_turns_carries_its_child_around_it` | `CalcAbsolutePosition` through a rotated frame |
+| `hierarchy::clearing_a_parent_leaves_the_entity_exactly_where_it_was` | `UnlinkFromParent`'s two lines |
+| `hierarchy::a_grandchild_moves_with_the_root` | the recursive descent, and `descendants` |
+| `hierarchy::an_entity_cannot_be_its_own_parent` | `SetParent`'s `Assert(0)` case |
+| `hierarchy::an_unparented_entity_keeps_its_angles_bit_for_bit` | `CalcAbsolutePosition`'s no-move-parent copy |
+| `tests::a_maps_parentname_rebases_the_child_into_its_parents_frame` | `SetupParentsForSpawnList` running before the spawn pass |
+| `tests::a_mover_carries_what_is_parented_to_it` | the whole point: a rider ends up where its platform put it |
+| `tests::set_parent_and_clear_parent_leave_the_entity_where_it_is` | both inputs |
+| `tests::removing_a_parent_removes_everything_under_it` | `UpdateOnRemove`'s orphan sweep |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
 | `entity::a_handle_to_a_removed_entity_stops_resolving` | gotcha 10 |
@@ -2444,7 +2584,7 @@ case values.
 | `tests::the_area_portal_keys_are_consumed_including_the_two_broken_ones` | the four keys, and the two Hammer instance-fixup leftovers |
 | `studio::the_testchamber_door_model_animates` | the facts the class is written against: `open` 23 frames against `close`'s 36, non-looping, `fadeouttime` 0.2, every vertex on one bone |
 | `engine::world::entities::the_chamber_door_draws_and_opens` | **the model drawn**: the doorway covered when shut and clear when open, the rings turning inside the door, the leaves travelling 53 units each |
-| `tests::every_shipped_map_spawns_its_entities` | **everything, against all 106 maps** |
+| `tests::every_shipped_map_spawns_its_entities` | **everything, against all 106 maps** — including the transform pair's invariant on every entity, and the 52 brush entities a parent carries in the first two seconds (the furthest by 539 units) |
 | `tests::every_shipped_maps_triggers_notice_the_player` | **every brush trigger in the game, touched** |
 | `tests::every_shipped_floor_button_presses_when_stood_on` | **every floor button in the game, stood on** |
 | `tests::every_shipped_testchamber_door_opens_and_shuts` | **every chamber door in the game, opened and shut** |
@@ -2801,10 +2941,10 @@ lip. **`AngleVectors` of a right angle is not exact**, so a door travelling 64 u
 straight up also travels 2.8 millionths of a unit sideways — Valve's residue too.
 **The `Use` input's *type* is the connection's serial number, cast**
 (`InputUse` passes `(USE_TYPE)inputdata.nOutputID`), which is why an I/O `Use` does
-nothing on a `func_movelinear` and works on a `func_button`. And **a parented mover
-moves in world space**, where Valve moves it in the parent's frame — 174 of the game's
-1,164 movers name a parent, and the missing local/abs pair is the same thing that keeps
-the `SetParent` family unimplemented (**1,078 of the depot's 1,081 unhandled inputs**).
+nothing on a `func_movelinear` and works on a `func_button`. And **a parented mover moved in
+world space**, where Valve moves it in the parent's frame — which was true until the
+transform pair landed and is the one thing on this list that has since been fixed
+outright (see the `hierarchy` section).
 
 One find worth keeping for its own sake: **`inputfilter` is declared by `base.fgd` for
 `func_brush`, written onto 2,497 of them by Hammer, and consumed by nothing anywhere in
@@ -3476,3 +3616,58 @@ and it needs **no map** — what a portal draws does not depend on where it is. 
 (0.19 14.34 31.66) and (31.17 17.33 0.00) — which is what says the 256x1 gradient
 strip is sampled on its one row — and ~24,700 pixels differ between a settled oval and
 a half-open one, which is what says group 3 reaches the shader at all.
+
+### The transform pair — parenting, after the five stages
+
+`portdocs/SERVER.md`'s five stages were done, so this is not a stage: it is one
+piece of `CBaseEntity` that everything else had been working around.
+`src/server/hierarchy.rs` (`hierarchy.cpp`'s 180 lines, `SetParent`,
+`CalcAbsolutePosition` and the position half of `InvalidatePhysicsRecursive`)
+plus four fields and eight methods on `EntityCore`. What it bought, measured:
+
+- **`SetParent` and `ClearParent` are accepted**, +31 inputs on the depot run
+  (3,932 → 3,963) and the unhandled list down from 20 names / 1,371
+  occurrences to 16 / 1,340.
+- **52 brush entities are now carried by a parent** in the first two seconds of
+  the shipped maps, the furthest by **539 units**. Before the pair, all 52 sat
+  where the lump put them while the thing they are bolted to drove off. The
+  brush entities that end up somewhere other than their spawn placement went
+  from 67 to 106.
+- **201 movers are parented** (87 `func_movelinear`, 63 `func_door_rotating`,
+  24 `func_door`, 16 `func_button`, 9 `func_rotating`, 1 each of
+  `momentary_rot_button` and `func_tracktrain`) and every one of them now
+  integrates in its parent's frame, which is where `subs.cpp` and
+  `physics_main.cpp` do it.
+
+**Three findings, and the first is the one that would have been shipped
+broken.** Propagation cannot live in the pusher: `CBaseDoor::Spawn` moves a
+door up to 294 units inside its own `Spawn`, so a door that spawns open left
+its clip brush behind for good. The seam is `Server::dispatch`, on the way out
+of every handler, which is also the only place that can see both the entity
+that moved and the list it moved within. The invariant test found it on
+`mp_coop_laser_crusher`.
+
+Second: **the equality guards are not an optimisation.**
+`MatrixAngles(AngleMatrix(a))` is not `a` in `f32`, so a subtree recomputed
+against an unchanged frame does not come back unchanged — 532 extra brush
+entities drift off their spawn placement in two seconds without them. Valve has
+the same guards (`if (m_vecOrigin != origin)`, `if (m_vecAbsOrigin ==
+absOrigin) return;`) and they read as micro-optimisations until you remove
+them.
+
+Third: **`SetParentAttachment*` is not the same problem as `SetParent`, and the
+measurement says so.** It was easy to hope that Valve's fallback — "if the
+parent has no animating model, use its own transform" — covered the shipped
+content, in which case the attachment forms would have come free. It does not:
+`SetParentAttachment` *returns* when the guard fails rather than falling
+through, and of the game's 1,454 such connections **1,376 aim at an entity
+whose parent carries a `.mdl`**, so the lookup is genuinely load-bearing for
+95% of them. That is 1,362 connections still refused, and they are the whole of
+what is left of the family. The next step for them is `LookupAttachment`, which
+would be `server/`'s first dependency on `studio/`.
+
+One quirk kept rather than fixed: `CRotDoor::Spawn` spawns open through
+`Teleport` (absolute) where `CBaseDoor::Spawn` uses `UTIL_SetOrigin` (local),
+four lines apart, with a *local* destination in both. **3 of the game's 63
+parented `func_door_rotating`s spawn open** and land where the shipped game
+lands them, which is not where the mapper drew them.

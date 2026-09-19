@@ -418,7 +418,12 @@ impl Portals {
         let Some(portal) = self.live.get(index) else {
             return;
         };
-        self.bind_overlay(pass, curtime, portal, static_amount(portal, remaining_depth));
+        self.bind_overlay(
+            pass,
+            curtime,
+            portal,
+            static_amount(portal, remaining_depth),
+        );
 
         let vertices = quad(portal);
         let vertices = pass.vertices(&vertices);

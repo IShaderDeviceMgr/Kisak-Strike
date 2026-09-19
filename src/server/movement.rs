@@ -397,11 +397,19 @@ impl Toggle {
         // exact. 53 of the game's 64 `func_button`s are `SF_BUTTON_DONTMOVE`
         // and spawn with position2 == position1, so this is the path most
         // buttons in Portal 2 take on every press.
-        if dest == entity.origin {
+        //
+        // **Local, not absolute.** Every coordinate `CBaseToggle` touches is
+        // in the parent's frame: `m_vecPosition1`/`m_vecPosition2` are read
+        // off `GetLocalOrigin()` at spawn, the velocity it computes is a
+        // *local* velocity, and `LinearlyMoveRootEntity` integrates it into
+        // the local origin. 201 of the game's movers are parented and for
+        // those the two frames differ; for the rest they are equal and this
+        // reads the same as it always did.
+        if dest == entity.local_origin {
             return false;
         }
 
-        let delta = dest - entity.origin;
+        let delta = dest - entity.local_origin;
         let travel_time = delta.length() / speed;
         entity.set_move_done_time(travel_time);
         entity.velocity = delta / travel_time;
@@ -421,11 +429,11 @@ impl Toggle {
         self.final_angle = dest_angle;
         self.movement = Movement::Angular;
 
-        if dest_angle == entity.angles {
+        if dest_angle == entity.local_angles {
             return false;
         }
 
-        let delta = dest_angle - entity.angles;
+        let delta = dest_angle - entity.local_angles;
         let mut travel_time = delta.length() / speed;
 
         // `MinTravelTime` (`subs.cpp:293`): "If we only travel for a short
@@ -452,15 +460,16 @@ impl Toggle {
     /// of `CBaseToggle::MoveDone` produces.
     pub fn move_done(&mut self, entity: &mut EntityCore) {
         match self.movement {
-            // `LinearMoveDone` (`subs.cpp:258`).
+            // `LinearMoveDone` (`subs.cpp:258`) — `UTIL_SetOrigin`, which is
+            // `SetLocalOrigin` and nothing else (`util.cpp:1394`).
             Movement::Linear => {
-                entity.origin = self.final_dest;
+                entity.set_local_origin(self.final_dest);
                 entity.velocity = Vec3::ZERO;
                 entity.set_move_done_time(-1.0);
             }
             // `AngularMoveDone` (`subs.cpp:310`).
             Movement::Angular => {
-                entity.angles = self.final_angle;
+                entity.set_local_angles(self.final_angle);
                 entity.angular_velocity = Vec3::ZERO;
                 entity.set_move_done_time(-1.0);
             }
@@ -615,18 +624,23 @@ fn physics_pusher(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &m
 /// into "rotate if rotating, translate if translating" and local time never
 /// goes backwards.
 ///
-/// # Parented movers move in world space
+/// # A parented mover moves in its parent's frame
 ///
-/// Valve integrates `GetLocalVelocity()` into `GetLocalOrigin()` — the frame
-/// of the *parent*, for an entity that has one. This port resolves
-/// `parentname` to a handle and keeps no transform hierarchy, so
-/// [`EntityCore::origin`] is always the world-space origin the map gave and a
-/// move is applied there. Measured: **174 of the game's 1,164 movers name a
-/// parent** (24 `func_door`, 63 `func_door_rotating`, 87 `func_movelinear`),
-/// and for those the motion is right in shape and wrong in frame whenever the
-/// parent is itself turned or moved. The condition for fixing it is a real
-/// local/abs transform pair on [`EntityCore`], which is also what the
-/// `SetParent` input family needs.
+/// Valve integrates `GetLocalVelocity()` into `GetLocalOrigin()`, which for an
+/// entity with a parent is that parent's frame — and so does this, since
+/// [`EntityCore`] grew the transform pair. **201 of the game's movers name a
+/// parent** (87 `func_movelinear`, 63 `func_door_rotating`, 24 `func_door`,
+/// 16 `func_button`, 9 `func_rotating`, 1 each of `momentary_rot_button` and
+/// `func_tracktrain`), and before the pair existed every one of them drove
+/// itself back towards a fixed world position whenever the thing it is bolted
+/// to moved.
+///
+/// **Nothing here pushes the change down to the children.**
+/// `SetupAllInHierarchy` (`physics_main.cpp:889`) is what does that in the
+/// C++; here it is one call in `Server::dispatch`, after the handler returns,
+/// so that a mover that moves *and then snaps* in `MoveDone` drags its subtree
+/// exactly once and onto the final placement — see
+/// [`hierarchy`](super::hierarchy).
 fn perform_push(
     entity: &mut EntityCore,
     behaviour: &mut dyn Behaviour,
@@ -645,11 +659,17 @@ fn perform_push(
         // Valve runs rotation first and says so; with no blocker the order is
         // not observable, and it is kept because the ordering *is* observable
         // the moment a blocker exists.
+        //
+        // Both are `SetLocal*( GetLocal*() + GetLocal*Velocity() * movetime )`
+        // (`physics_main.cpp:993` and `:1057`) — **the pusher integrates in
+        // the parent's frame**, which is what makes a door on a moving
+        // platform open relative to the platform instead of driving itself
+        // back to a fixed world position every tick.
         if entity.angular_velocity != Vec3::ZERO {
-            entity.angles += entity.angular_velocity * movetime;
+            entity.set_local_angles(entity.local_angles + entity.angular_velocity * movetime);
         }
         if entity.velocity != Vec3::ZERO {
-            entity.origin += entity.velocity * movetime;
+            entity.set_local_origin(entity.local_origin + entity.velocity * movetime);
         }
     }
 

@@ -164,6 +164,24 @@ impl ClassDef {
 pub const BASE_INPUTS: &[InputDef] = &[
     InputDef::new("Kill", FieldType::Void),
     InputDef::new("Use", FieldType::Void),
+    // `DEFINE_INPUTFUNC( FIELD_STRING, "SetParent", InputSetParent )` and
+    // `DEFINE_INPUTFUNC( FIELD_VOID, "ClearParent", InputClearParent )`
+    // (`baseentity.cpp:2382`, `:2385`). 143 and 240 shipped connections.
+    //
+    // **`SetParentAttachment` and `SetParentAttachmentMaintainOffset` are
+    // deliberately still absent**, and they are 1,362 more connections — the
+    // larger half of the family by a long way. They need
+    // `CBaseAnimating::LookupAttachment`, and the reason that is not a
+    // formality is measured: of the 1,454 connections that fire one,
+    // **1,376 aim at an entity whose parent is a studio-model entity**, 2 at
+    // one parented to a brush model and 75 at one with no parent at all. So
+    // Valve's two guards — "must have a parent", "parent must be a
+    // `CBaseAnimating`" — reject 77 of them and the other 1,376 really do go
+    // on to look an attachment up by name. Accepting those without the lookup
+    // would put 1,376 entities at their parent's origin rather than at its
+    // attachment point, which is worse than refusing.
+    InputDef::new("SetParent", FieldType::String),
+    InputDef::new("ClearParent", FieldType::Void),
     // `DEFINE_INPUTFUNC( FIELD_STRING, "SetDamageFilter", InputSetDamageFilter )`
     // (`baseentity.cpp:2388`) — see the note above.
     InputDef::new("SetDamageFilter", FieldType::String),
@@ -214,6 +232,37 @@ pub fn base_accept_input(
             true => None,
             false => cx.find_by_name(&name),
         };
+        return true;
+    }
+    if is("SetParent") {
+        // `InputSetParent` (`baseentity.cpp:4751`) → `SetParent( string_t,
+        // pActivator )` (`:1478`), which is `FindEntityByName` against the
+        // **activator**, so a `!activator` in the parameter resolves. The
+        // ambiguity warning Valve prints when a second entity shares the name
+        // is dropped: `find_by_name` takes the first match either way, which
+        // is what `SetParent` does after printing it.
+        //
+        // The attachment is cleared first — "it's no longer valid" — which
+        // costs nothing here because there is no attachment to clear.
+        let name = input.value.to_string();
+        let parent = match name.is_empty() {
+            // `newParent == NULL_STRING` is the no-parent case rather than a
+            // lookup of the empty string.
+            true => None,
+            // `FindEntityByName( NULL, newParent, NULL, pActivator )` —
+            // the activator is passed and the caller is not, so `!activator`
+            // resolves in a `SetParent` parameter and `!caller` does not.
+            false => cx.find_target(&name, None, input.activator, None),
+        };
+        cx.set_parent(entity, parent);
+        return true;
+    }
+    if is("ClearParent") {
+        // `InputClearParent` (`baseentity.cpp:4822`) — `SetParent( NULL )`,
+        // which keeps the entity exactly where it is in the world. See
+        // [`hierarchy::set_parent`](super::hierarchy::set_parent) for why that
+        // is not obvious from the C++.
+        cx.set_parent(entity, None);
         return true;
     }
     if is("Use") {
@@ -533,6 +582,30 @@ impl<'a> Context<'a> {
         let entity = self.entities.get_mut(id)?;
         self.changed.push(id);
         Some(&mut entity.core)
+    }
+
+    /// `InvalidatePhysicsRecursive( POSITION_CHANGED | ANGLES_CHANGED )` —
+    /// this entity has moved, so drag whatever is parented to it along.
+    ///
+    /// Free for the 92% of entities with no children, and **the caller's job
+    /// rather than the setter's**: a handler that moves an entity three times
+    /// pays for one walk, and the walk has to happen after the last write
+    /// rather than after each. See [`hierarchy`](super::hierarchy).
+    pub fn moved(&mut self, core: &EntityCore) {
+        super::hierarchy::propagate(core, self.entities);
+    }
+
+    /// `CBaseEntity::SetParent` — re-point this entity's move parent, holding
+    /// its world placement still.
+    ///
+    /// Takes `core` rather than an [`EntityId`] because the entity doing the
+    /// parenting is the one being dispatched, and that one is not in the list
+    /// (see [`EntityList::detach`](super::entity::EntityList::detach)).
+    pub fn set_parent(&mut self, core: &mut EntityCore, parent: Option<EntityId>) {
+        super::hierarchy::set_parent(core, self.entities, parent);
+        if let Some(parent) = parent {
+            self.changed.push(parent);
+        }
     }
 
     /// `gEntList.FindEntityByName( NULL, name )` — the first match, or `None`.

@@ -71,7 +71,7 @@ impl PointTeleport {
         // `EntityMayTeleport`: a parented entity refuses, unless it is a
         // passenger in a vehicle — and Portal 2 has no vehicles, so the second
         // half is a warning and a refusal.
-        let parented = cx.entity(target).is_some_and(|e| e.core.parent.is_some());
+        let parented = cx.entity(target).is_some_and(|e| e.core.parent().is_some());
         if parented {
             eprintln!(
                 "source-engine: server: ERROR: ({}) can't teleport object ({name}) as it has a parent",
@@ -123,7 +123,7 @@ impl Behaviour for PointTeleport {
         let Some(target_entity) = cx.entity(target) else {
             return;
         };
-        if target_entity.core.parent.is_some() {
+        if target_entity.core.parent().is_some() {
             eprintln!(
                 "source-engine: server: ERROR: ({}) can't teleport object ({name}) as it has a parent",
                 entity.debug_name()

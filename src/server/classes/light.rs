@@ -65,7 +65,9 @@ impl Light {
             // exactly as it is in the original: a `light_spot` carries both,
             // and whichever comes last in the lump wins. All 2,470 of them
             // spell `angles` before `pitch`, so the pitch survives.
-            entity.angles.x = atof(value);
+            let mut angles = entity.angles;
+            angles.x = atof(value);
+            entity.set_abs_angles(angles);
         } else if is("style") {
             self.style = atoi(value);
         } else if is("pattern") {

@@ -69,6 +69,7 @@ pub mod class;
 pub mod classes;
 pub mod damage;
 pub mod entity;
+pub mod hierarchy;
 pub mod io;
 pub mod keyvalue;
 pub mod movement;
@@ -748,10 +749,18 @@ impl Server {
         let ordered = self.spawn_order(&spawn_list);
 
         // `SetupParentsForSpawnList` (`:206`). Before the spawn pass, so that
-        // a `Spawn` can already see where its parent is.
+        // a `Spawn` can already see where its parent is — which is also what
+        // makes `CBaseToggle`'s local coordinates come out right, because a
+        // door's `m_vecPosition1` is `GetLocalOrigin()` read inside `Spawn`.
         //
         // The attachment half of the name is dropped — see
         // [`extract_parent_name`].
+        //
+        // **Every key has been read by now and nothing has moved**, so each
+        // entity's world placement is the one the map gave and
+        // [`hierarchy::set_parent`] rebases it into the parent's frame. The
+        // order within `ordered` does not matter for that — parenting changes
+        // a local pair and never a world one — but it is parents-first anyway.
         for &id in &ordered {
             let Some(parent_name) = self.entities.get(id).and_then(|e| e.parent_name.clone())
             else {
@@ -763,8 +772,9 @@ impl Server {
             if parent.is_none() {
                 stats.parents_missing += 1;
             }
-            if let Some(entity) = self.entities.get_mut(id) {
-                entity.core.parent = parent;
+            if let Some(mut entity) = self.entities.detach(id) {
+                hierarchy::set_parent(&mut entity.core, &mut self.entities, parent);
+                self.entities.attach(id, entity);
             }
         }
 
@@ -1560,6 +1570,18 @@ impl Server {
         let mut entity = entities.detach(id)?;
         let mut cx = Context::new(time, queue, random, entities, player, sequences);
         let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
+
+        // `InvalidatePhysicsRecursive( POSITION_CHANGED )`, at the one seam
+        // every handler passes through. A `Spawn`, a think, an input and the
+        // pusher can all move an entity, and `CBaseDoor::Spawn` alone proves
+        // that covering only the pusher is not enough: a door that spawns open
+        // moves 294 units inside its own `Spawn`, and before this call was
+        // here its clip brush stayed behind and never caught up.
+        //
+        // Unconditional, and free when nothing moved:
+        // [`EntityCore::follow`] compares the frame it is handed against the
+        // one the child already has and the walk stops wherever they agree.
+        cx.moved(&entity.core);
         let changed = cx.take_changed();
         let created = cx.take_created();
         let damage = cx.take_damage_queue();
@@ -1590,6 +1612,10 @@ impl Server {
             );
             self.thinks
                 .entity_changed(other, next_think, simulates, removed);
+            // …and the same for whatever the handler moved through
+            // `entity_mut` rather than moving itself: a `trigger_push` lifting
+            // a toucher, a teleport writing a destination.
+            hierarchy::propagate_id(other, &mut self.entities);
         }
 
         // `DispatchSpawn( pEnt )`, which in the C++ the creator calls itself
@@ -1710,6 +1736,38 @@ impl Server {
 
     /// `gEntList.CleanupDeleteList` plus the two lists that name entities.
     fn cleanup_delete_list(&mut self) -> usize {
+        // `UpdateOnRemove`'s parenting half (`baseentity.cpp:2629`), which is
+        // two things and the second is easy to miss:
+        //
+        // - `UnlinkFromParent( this )`, so that the parent's child list does
+        //   not keep naming a freed slot;
+        // - **"Any children still connected are orphans, mark all for
+        //   delete"** — a removed entity takes its whole subtree with it. It
+        //   does not hand the children back to the world and it does not leave
+        //   them where they are. `descendants` is recursive, so one pass over
+        //   what is already marked reaches the whole tree.
+        let doomed: Vec<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e.core.removed)
+            .map(|(id, _)| id)
+            .collect();
+        for id in doomed {
+            let Some(entity) = self.entities.get(id) else {
+                continue;
+            };
+            let (parent, orphans) = (
+                entity.core.parent(),
+                hierarchy::descendants(&entity.core, &self.entities),
+            );
+            if let Some(parent) = parent.and_then(|p| self.entities.get_mut(p)) {
+                parent.core.unlink_child(id);
+            }
+            for orphan in orphans {
+                self.entities.mark_for_deletion(orphan);
+            }
+        }
+
         // `CBaseEntity::UpdateOnRemove`'s `PhysicsRemoveTouchedList( this )`,
         // which has to run **before** the entity is freed so that whatever it
         // was touching gets its `EndTouch` against a handle that still
@@ -1921,8 +1979,11 @@ impl Server {
             return;
         };
         let core = &mut entity.core;
-        core.origin = state.origin;
-        core.angles = state.angles;
+        // The player is never parented — `SetParent` is not something a map
+        // can fire at `!player` and nothing here does it — so the absolute
+        // form is both correct and, through
+        // `CalcAbsolutePosition`'s no-move-parent branch, exact.
+        core.set_abs_placement(state.origin, state.angles);
         core.velocity = state.velocity;
         core.base_velocity = state.base_velocity;
         core.model_bounds = ModelBounds {
@@ -2471,10 +2532,28 @@ impl Server {
             if let Some(parent) = &entity.parent_name {
                 cx.print(&format!(
                     "  parentname: {parent} ({})",
-                    match entity.parent {
+                    match entity.parent() {
                         Some(_) => "resolved",
                         None => "NOT FOUND",
                     }
+                ));
+            }
+            // The local half of the transform pair, and only when it says
+            // something the two lines above do not: for an unparented entity
+            // it is the world pair exactly.
+            if entity.parent().is_some() {
+                cx.print(&format!("  local origin: {}", v(entity.local_origin)));
+                cx.print(&format!("  local angles: {}", v(entity.local_angles)));
+            }
+            if !entity.children().is_empty() {
+                cx.print(&format!(
+                    "  children: {}",
+                    entity
+                        .children()
+                        .iter()
+                        .map(|c| c.slot().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 ));
             }
             if entity.effects != 0 {

@@ -241,8 +241,7 @@ impl FloorButton {
         // `DispatchSpawn`.
         let (origin, angles) = (entity.origin, entity.angles);
         if let Some(core) = cx.entity_mut(id) {
-            core.origin = origin;
-            core.angles = angles;
+            core.set_abs_placement(origin, angles);
             core.model_bounds = ModelBounds {
                 mins: TRIGGER_MINS,
                 maxs: TRIGGER_MAXS,

@@ -189,7 +189,7 @@ fn worldspawn_is_never_parented() {
     );
     let world = find(&server, "worldspawn");
     assert!(world.parent_name.is_none());
-    assert!(world.parent.is_none());
+    assert!(world.parent().is_none());
 }
 
 /// `ComputeSpawnHierarchyDepth` plus the sort: a parent spawns before its
@@ -230,8 +230,11 @@ fn a_child_spawns_after_its_parent_whatever_the_lump_order() {
     assert_eq!(order, vec![root, child, grandchild]);
 
     // And the handles are resolved, not just the names.
-    assert_eq!(server.entities.get(child).unwrap().parent, Some(root));
-    assert_eq!(server.entities.get(grandchild).unwrap().parent, Some(child));
+    assert_eq!(server.entities.get(child).unwrap().parent(), Some(root));
+    assert_eq!(
+        server.entities.get(grandchild).unwrap().parent(),
+        Some(child)
+    );
 }
 
 /// A `parentname` naming nothing is not an error — the entity is simply at
@@ -249,7 +252,7 @@ fn a_missing_parent_is_counted_and_not_fatal() {
         &[],
     );
     assert_eq!((stats.parented, stats.parents_missing), (1, 1));
-    assert!(find(&server, "info_target").parent.is_none());
+    assert!(find(&server, "info_target").parent().is_none());
 }
 
 /// Valve checks only for an entity parented to itself; a longer cycle recurses
@@ -279,6 +282,205 @@ fn a_parent_cycle_terminates() {
         &[],
     );
     assert_eq!(server.entities.len(), 3);
+}
+
+/// The map places a child at its **world** position and `parentname` rebases
+/// it — `SetupParentsForSpawnList` running before the spawn pass is what makes
+/// this the state a `Spawn` sees.
+#[test]
+fn a_maps_parentname_rebases_the_child_into_its_parents_frame() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "arm"),
+                ("origin", "100 0 0"),
+                ("angles", "0 90 0"),
+            ]),
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "rider"),
+                ("origin", "100 40 0"),
+                ("parentname", "arm"),
+            ]),
+        ],
+        &[],
+    );
+
+    let rider = find_named(&server, "rider");
+    assert_eq!(
+        rider.origin,
+        Vec3::new(100.0, 40.0, 0.0),
+        "where Hammer put it"
+    );
+    // The arm is yawed a quarter turn, so "40 units along +Y of the world" is
+    // "40 units along the arm's own +X".
+    assert!(
+        (rider.local_origin - Vec3::new(40.0, 0.0, 0.0)).length() < 1e-3,
+        "{:?}",
+        rider.local_origin
+    );
+    assert_eq!(
+        find_named(&server, "arm").children().len(),
+        1,
+        "and the parent names it back"
+    );
+}
+
+/// The whole point of the pair: a mover that carries something.
+///
+/// A `func_movelinear` with an `info_target` bolted to it, opened by an input
+/// — the rider ends up exactly as far along as the platform without ever being
+/// touched.
+#[test]
+fn a_mover_carries_what_is_parented_to_it() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[
+                ("classname", "func_movelinear"),
+                ("targetname", "lift"),
+                ("model", "*1"),
+                ("origin", "0 0 0"),
+                ("movedir", "-90 0 0"),
+                ("movedistance", "128"),
+                ("speed", "100"),
+                ("startposition", "0"),
+            ]),
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "rider"),
+                ("origin", "0 0 64"),
+                ("parentname", "lift"),
+            ]),
+        ],
+        &[],
+    );
+
+    let lift = name::find_by_name(&server.entities, "lift").next().unwrap();
+    assert!(server.accept_input(lift, "Open", Variant::Void, None, None, 0));
+    // 128 units at 100 a second, plus a tick for the alarm to be armed.
+    ticks_touching(&mut server, &mut NoTouchQuery, 90);
+
+    let lift = find_named(&server, "lift");
+    let rider = find_named(&server, "rider");
+    assert!(
+        (lift.origin.z - 128.0).abs() < 1e-3,
+        "the platform arrived: {:?}",
+        lift.origin
+    );
+    assert!(
+        (rider.origin.z - 192.0).abs() < 1e-3,
+        "…and took the rider with it: {:?}",
+        rider.origin
+    );
+    // The rider never moved in the frame it lives in, which is the invariant
+    // that makes this work rather than a coincidence of two entities getting
+    // the same answer.
+    assert_eq!(rider.local_origin, Vec3::new(0.0, 0.0, 64.0));
+    assert_eq!(rider.velocity, Vec3::ZERO);
+}
+
+/// `InputSetParent`/`InputClearParent`: both hold the world placement still,
+/// and the second is the one whose C++ does not look like it does.
+#[test]
+fn set_parent_and_clear_parent_leave_the_entity_where_it_is() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "arm"),
+                ("origin", "0 0 100"),
+                ("angles", "0 45 0"),
+            ]),
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "rider"),
+                ("origin", "50 0 100"),
+            ]),
+        ],
+        &[],
+    );
+    let rider_id = name::find_by_name(&server.entities, "rider")
+        .next()
+        .unwrap();
+    let placed = find_named(&server, "rider").origin;
+
+    assert!(server.accept_input(
+        rider_id,
+        "SetParent",
+        Variant::String("arm".to_owned()),
+        None,
+        None,
+        0
+    ));
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.origin, placed, "SetParent moves nothing in the world");
+    assert_eq!(
+        rider.parent(),
+        Some(name::find_by_name(&server.entities, "arm").next().unwrap())
+    );
+    assert!(
+        (rider.local_origin.length() - 50.0).abs() < 1e-3,
+        "…but it is 50 units out in a frame yawed 45°: {:?}",
+        rider.local_origin
+    );
+
+    assert!(server.accept_input(rider_id, "ClearParent", Variant::Void, None, None, 0));
+    let rider = find_named(&server, "rider");
+    assert!(rider.parent().is_none());
+    assert_eq!(rider.origin, placed, "and ClearParent moves nothing either");
+    assert_eq!(
+        rider.local_origin, placed,
+        "the local pair becomes the world one"
+    );
+    assert!(find_named(&server, "arm").children().is_empty());
+}
+
+/// `UpdateOnRemove`: "Any children still connected are orphans, mark all for
+/// delete". A removed parent takes its whole subtree, not just its children.
+#[test]
+fn removing_a_parent_removes_everything_under_it() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[("classname", "info_target"), ("targetname", "root")]),
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "child"),
+                ("parentname", "root"),
+            ]),
+            block(&[
+                ("classname", "info_target"),
+                ("targetname", "grandchild"),
+                ("parentname", "child"),
+            ]),
+            // Not under the root, so it must survive.
+            block(&[("classname", "info_target"), ("targetname", "bystander")]),
+        ],
+        &[],
+    );
+    let before = server.entities.len();
+    let root = name::find_by_name(&server.entities, "root").next().unwrap();
+    assert!(server.accept_input(root, "Kill", Variant::Void, None, None, 0));
+    ticks_touching(&mut server, &mut NoTouchQuery, 2);
+
+    assert_eq!(server.entities.len(), before - 3);
+    for gone in ["root", "child", "grandchild"] {
+        assert!(
+            name::find_by_name(&server.entities, gone).next().is_none(),
+            "{gone} should have gone with the root"
+        );
+    }
+    assert!(name::find_by_name(&server.entities, "bystander")
+        .next()
+        .is_some());
 }
 
 /// The priority table is data with no reachable entry yet; this is what stops
@@ -976,8 +1178,14 @@ fn an_input_no_class_implements_is_counted() {
     let id = name::find_by_name(&server.entities, "count")
         .next()
         .unwrap();
-    assert!(!server.accept_input(id, "SetParent", Variant::Void, None, None, 0));
-    assert_eq!(server.io.unhandled.get("math_counter.SetParent"), Some(&1));
+    // `SetParentAttachment` rather than `SetParent`: the latter is a base
+    // input now that the transform pair exists, and this test wants a name
+    // nothing anywhere declares.
+    assert!(!server.accept_input(id, "SetParentAttachment", Variant::Void, None, None, 0));
+    assert_eq!(
+        server.io.unhandled.get("math_counter.SetParentAttachment"),
+        Some(&1)
+    );
 }
 
 /// The string a map writes reaches a float handler, because `AcceptInput`
@@ -2481,6 +2689,10 @@ fn every_shipped_map_spawns_its_entities() {
     let mut brush_entities = 0;
     let mut moved = 0;
     let mut still_moving = 0;
+    // Of the brush entities that moved, the ones that have a parent and no
+    // motion of their own — carried rather than driven.
+    let mut carried = 0;
+    let mut carried_furthest = 0.0f32;
     // Stage 4's parse-side metric: how many of the game's brush entities are
     // triggers this port has a class for, and therefore how much of a map is
     // now able to notice the player.
@@ -2585,12 +2797,59 @@ fn every_shipped_map_spawns_its_entities() {
             peak_thinks = peak_thinks.max(server.thinks.len());
         }
 
+        // **The transform pair's invariant, on every entity of every map.**
+        // The world pair is derived state — `hierarchy` recomputes it from the
+        // local pair whenever anything moves — so a direct write to `origin`
+        // that skipped `set_abs_placement` would leave the two disagreeing and
+        // the next time the parent moved, the entity would snap. Checking it
+        // here is what makes that a test failure rather than a bug report
+        // about a door that teleports.
+        for (id, entity) in server.entities.iter() {
+            let Some(parent) = entity.parent() else {
+                assert_eq!(
+                    (entity.local_origin, entity.local_angles),
+                    (entity.origin, entity.angles),
+                    "{name}: unparented {} [{}] has two different placements",
+                    entity.classname(),
+                    id.slot()
+                );
+                continue;
+            };
+            let Some(parent) = server.entities.get(parent) else {
+                continue;
+            };
+            assert!(
+                parent.children().contains(&id),
+                "{name}: {} [{}] names a parent that does not name it back",
+                entity.classname(),
+                id.slot()
+            );
+            let expected = parent.to_world()
+                * glam::Affine3A::from_mat3_translation(
+                    crate::math::angle_matrix(entity.local_angles),
+                    entity.local_origin,
+                );
+            let expected = glam::Vec3::from(expected.translation);
+            assert!(
+                (entity.origin - expected).length() < 0.01,
+                "{name}: {} [{}] is at {:?} but its parent ({}) puts it at {expected:?}",
+                entity.classname(),
+                id.slot(),
+                entity.origin,
+                parent.classname(),
+            );
+        }
+
         for (index, origin, angles) in placed {
             let Some(entity) = server.brush_entity(index) else {
                 continue;
             };
             if entity.origin != origin || entity.angles != angles {
                 moved += 1;
+                if entity.parent().is_some() && entity.velocity == glam::Vec3::ZERO {
+                    carried += 1;
+                    carried_furthest = carried_furthest.max((entity.origin - origin).length());
+                }
             }
             if entity.will_simulate_game_physics() {
                 still_moving += 1;
@@ -2652,6 +2911,10 @@ fn every_shipped_map_spawns_its_entities() {
          {moved} of them are not where the lump put them, \
          {still_moving} are still moving; \
          {triggers} are live triggers"
+    );
+    println!(
+        "    {carried} of the movers' children were carried rather than driven, \
+         the furthest by {carried_furthest:.1} units"
     );
     println!("  inputs nothing handled:");
     let mut unhandled_inputs: Vec<_> = io.unhandled.iter().collect();
@@ -2816,7 +3079,12 @@ fn every_shipped_map_spawns_its_entities() {
     // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
     // `SetActivatedState` a map used to aim at a classname nothing answered
     // for now lands. Only two of the game's 31 are fired inside two seconds.
-    assert_eq!(io.accepted, 3_932);
+    // **+31 with the parenting pair.** `SetParent` and `ClearParent` are base
+    // inputs now that `EntityCore` carries a local/abs transform pair, and 31
+    // of the game's 143 `SetParent` connections fire inside the first two
+    // seconds — 16 `prop_dynamic_override`, 12 `func_brush`, 2 `prop_dynamic`
+    // and 1 `info_target`. No `ClearParent` does.
+    assert_eq!(io.accepted, 3_963);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -2839,18 +3107,31 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The whole set of inputs that reach an implemented class and are refused.
     //
-    // **Twenty names, and 1,103 of the 1,371 occurrences are the parenting
-    // family.** `func_brush` alone takes 883 `SetParentAttachmentMaintainOffset`
-    // in the first two seconds of the game, because a Hammer instance parents
-    // its clip brushes to a moving platform and the `logic_auto` bootstrap is
-    // what does the parenting; `prop_dynamic` brought 177 more of the same
-    // family, which is the largest single thing that would be fixed by giving
-    // `EntityCore` a local/abs transform pair. That family stays unimplemented
-    // on purpose and the condition is a real one: `SetParent` needs that pair
-    // (a child's origin is the world-space one the map gave and nothing
-    // rebases it), and `SetParentAttachment*` needs `LookupAttachment` on a
-    // studio model. Three of the remaining names are the player procedurals
-    // (stage 5's), one is `RunScriptCode` (`portdocs/SERVER.md` §9), and
+    // **Sixteen names, and 1,072 of the 1,340 occurrences are what is left of
+    // the parenting family** — the attachment half of it, and only that half.
+    // The transform pair took `SetParent` and `ClearParent` off this list; the
+    // two `SetParentAttachment*` forms stay, and the condition for them is
+    // sharper than "needs a transform pair" ever was.
+    //
+    // **`SetParentAttachment*` needs `CBaseAnimating::LookupAttachment`, and
+    // that is not a formality.** `CBaseEntity::SetParentAttachment`
+    // (`baseentity.cpp:4765`) has two guards before the lookup — the entity
+    // must already have a parent, and that parent must be a `CBaseAnimating`
+    // — and it *returns* rather than falling back to plain parenting when
+    // either fails. Measured over the 1,454 connections in the game that fire
+    // one: **1,376 aim at an entity whose parent carries a `.mdl`**, 2 at one
+    // parented to a brush model, 75 at one with no `parentname` at all, 1 at
+    // one whose parent does not resolve. So 78 of them are no-ops in the
+    // shipped game and the other 1,376 genuinely place an entity on a named
+    // attachment point of an animating model — which this port cannot find
+    // without `studio/`'s attachment table, and which it would place at the
+    // parent's *origin* if it pretended otherwise. `func_brush` alone takes
+    // 883 of them in the first two seconds, because a Hammer instance parents
+    // its clip brushes to a moving arm and the `logic_auto` bootstrap is what
+    // does the parenting.
+    //
+    // Three of the remaining names are the player procedurals (stage 5's), one
+    // is `RunScriptCode` (`portdocs/SERVER.md` §9), and
     // `prop_dynamic.Disabled` is eight connections misspelling `Disable`.
     let unhandled: Vec<(&str, usize)> =
         io.unhandled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -2867,18 +3148,14 @@ fn every_shipped_map_spawns_its_entities() {
             // than too little. See `classes::AreaPortal`.
             ("func_areaportalwindow.SetFadeEndDistance", 43),
             ("func_areaportalwindow.SetFadeStartDistance", 43),
-            ("func_brush.SetParent", 12),
             ("func_brush.SetParentAttachmentMaintainOffset", 883),
-            ("info_target.SetParent", 1),
             ("info_target.SetParentAttachment", 12),
             ("info_target.SetParentAttachmentMaintainOffset", 1),
             ("logic_relay.RunScriptCode", 1),
             ("player.SetFogController", 97),
             ("prop_dynamic.Disabled", 8),
-            ("prop_dynamic.SetParent", 2),
             ("prop_dynamic.SetParentAttachment", 3),
             ("prop_dynamic.SetParentAttachmentMaintainOffset", 148),
-            ("prop_dynamic_override.SetParent", 16),
             ("prop_dynamic_override.SetParentAttachment", 3),
             ("prop_dynamic_override.SetParentAttachmentMaintainOffset", 3),
             ("trigger_hurt.SetParentAttachmentMaintainOffset", 19),
@@ -2900,8 +3177,21 @@ fn every_shipped_map_spawns_its_entities() {
     // **Stage 4 doubled the brush-entity count and moved nothing extra**, and
     // both halves are the point: the five trigger classes are 2,892 more brush
     // entities the game now answers for, and not one of them is a mover.
+    //
+    // **Parenting took it from 67 to 106, and the 39 are the whole reason the
+    // transform pair exists**: they are brush entities with no velocity of
+    // their own that a parent dragged somewhere. `carried` counts them
+    // directly — 52, including the ones that also moved by themselves — and
+    // the furthest ride in the game's first two seconds is **539 units**, a
+    // clip brush on the lift that opens a chamber. Before the pair, all 52 sat
+    // where the lump put them while the thing they are bolted to drove off.
     assert_eq!(brush_entities, 6_302);
-    assert_eq!(moved, 67, "brush entities that left their spawn placement");
+    assert_eq!(moved, 106, "brush entities that left their spawn placement");
+    assert_eq!(carried, 52, "…of which this many were carried by a parent");
+    assert!(
+        carried_furthest > 539.0 && carried_furthest < 540.0,
+        "the longest carried ride moved: {carried_furthest}"
+    );
     assert_eq!(still_moving, 34, "…and were still travelling at 2s");
 
     // Stage 4's own parse-side number, and it is no longer only about brush
@@ -7440,10 +7730,11 @@ fn portal_named<'a>(server: &'a Server, name: &str) -> &'a classes::PropPortal {
 #[test]
 fn moving_a_portal_shoves_a_player_out_of_its_partner() {
     let mut server = Server::new();
-    server.level_init("test", &portal_pair_map(), &[model(
-        [-2048.0, -2048.0, -2048.0],
-        [2048.0, 2048.0, 2048.0],
-    )]);
+    server.level_init(
+        "test",
+        &portal_pair_map(),
+        &[model([-2048.0, -2048.0, -2048.0], [2048.0, 2048.0, 2048.0])],
+    );
     assert!(
         portal_named(&server, "blue").is_active_and_linked(),
         "the two portals in the map did not link"
@@ -7485,10 +7776,11 @@ fn the_punch_is_refused_by_each_of_its_three_guards() {
                 .expect("Activated")
                 .1 = String::from("0");
         }
-        server.level_init("test", &map, &[model(
-            [-2048.0, -2048.0, -2048.0],
-            [2048.0, 2048.0, 2048.0],
-        )]);
+        server.level_init(
+            "test",
+            &map,
+            &[model([-2048.0, -2048.0, -2048.0], [2048.0, 2048.0, 2048.0])],
+        );
         server.spawn_player(player_at(Vec3::new(1000.0, 0.0, -56.0)));
         assert!(server.place_portal(false, Vec3::new(0.0, 500.0, 0.0), angles));
         ticks_touching(&mut server, &mut Embedded(embedded), 1);
@@ -7519,10 +7811,11 @@ fn the_punch_is_refused_by_each_of_its_three_guards() {
 #[test]
 fn moving_a_portal_reopens_it_and_fills_its_partner_with_static() {
     let mut server = Server::new();
-    server.level_init("test", &portal_pair_map(), &[model(
-        [-2048.0, -2048.0, -2048.0],
-        [2048.0, 2048.0, 2048.0],
-    )]);
+    server.level_init(
+        "test",
+        &portal_pair_map(),
+        &[model([-2048.0, -2048.0, -2048.0], [2048.0, 2048.0, 2048.0])],
+    );
 
     // Let both settle: a second of server time is past the end of both curves.
     ticks_touching(&mut server, &mut NoTouchQuery, 64);
@@ -7567,10 +7860,11 @@ fn switching_a_portal_on_resets_both_of_its_clocks() {
             .1 = String::from("0");
     }
     let mut server = Server::new();
-    server.level_init("test", &map, &[model(
-        [-2048.0, -2048.0, -2048.0],
-        [2048.0, 2048.0, 2048.0],
-    )]);
+    server.level_init(
+        "test",
+        &map,
+        &[model([-2048.0, -2048.0, -2048.0], [2048.0, 2048.0, 2048.0])],
+    );
     ticks_touching(&mut server, &mut NoTouchQuery, 64);
 
     server.queue.add(Event {

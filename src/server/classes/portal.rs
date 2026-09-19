@@ -686,8 +686,7 @@ impl PropPortal {
         // effect and one at a live portal only re-opens it.
         let was_active = self.activated;
 
-        entity.origin = origin;
-        entity.angles = angles;
+        entity.set_abs_placement(origin, angles);
         self.set_active(true);
         self.update_linkage(entity, cx);
         self.restart_effect(was_active, cx);

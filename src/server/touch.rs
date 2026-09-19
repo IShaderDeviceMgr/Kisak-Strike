@@ -129,7 +129,7 @@ impl Server {
             return false;
         };
         // "Entities in hierarchy should not interact."
-        if this_core.parent == Some(other) || other_core.parent == Some(this) {
+        if this_core.parent() == Some(other) || other_core.parent() == Some(this) {
             return false;
         }
         // `FL_DONTTOUCH` — set by nothing here, kept because the line is one
@@ -382,11 +382,15 @@ pub struct Teleport {
 impl Teleport {
     /// Writes this teleport onto an ordinary entity.
     pub fn apply(&self, entity: &mut EntityCore) {
-        if let Some(origin) = self.origin {
-            entity.origin = origin;
-        }
-        if let Some(angles) = self.angles {
-            entity.angles = angles;
+        // `CBaseEntity::Teleport` sets the **absolute** pair, which is the
+        // right half for a teleport by definition: a destination is a place in
+        // the world, and a parented entity that arrives there has to have its
+        // offset from its parent re-solved rather than kept.
+        if self.origin.is_some() || self.angles.is_some() {
+            entity.set_abs_placement(
+                self.origin.unwrap_or(entity.origin),
+                self.angles.unwrap_or(entity.angles),
+            );
         }
         if let Some(velocity) = self.velocity {
             entity.velocity = velocity;

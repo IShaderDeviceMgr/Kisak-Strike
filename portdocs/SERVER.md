@@ -1725,9 +1725,12 @@ subsystems rather than a staged plan.** In the order they are worth doing:
   the first puzzle that cannot be solved without standing on something that
   moves, and it is also what would make a `func_door` able to *crush*, which is
   the damage type 71 of the game's `trigger_hurt`s are labelled with.
-- **The local/abs transform pair on `EntityCore`**, which unblocks
-  `SetParent`/`ClearParent`/`SetParentAttachment*` — **1,078 of the depot
-  test's 1,102 unhandled inputs** — and parented movers.
+- ~~**The local/abs transform pair on `EntityCore`**~~ — **done**, in
+  `src/server/hierarchy.rs`. It took `SetParent`/`ClearParent` and the 201
+  parented movers with it; what is left of the family is
+  `SetParentAttachment*`, which needs `LookupAttachment` on a studio model and
+  is **1,362 shipped connections**. See `rustdocs/SERVER.md`, "The transform
+  pair".
 - **`player_speedmod`** (4 placed): `SetLaggedMovementValue` and
   `DisableButtons`, two more `PlayerState` fields. Small.
 - ~~**`$includemodel` in `studio/`**~~ — **done**, in `src/studio/include.rs`.
@@ -1827,13 +1830,18 @@ question into a number.
    is a wall to the player now — so this is the next thing in the module worth
    doing, alongside the local/abs pair below.
 
-   **A second, smaller question opened underneath it**: a mover that is *parented*
-   moves in the parent's frame in Valve's engine and in world space here, because
-   this port keeps no local/abs transform pair. 174 of the game's 1,164 movers name
-   a parent. The same missing pair is what keeps the `SetParent` input family
-   unimplemented, and that family is **1,078 of the 1,081 inputs the depot test
-   reports as unhandled** — so whichever of the two forces it, both are fixed at
-   once.
+   **A second, smaller question opened underneath it, and it has since been
+   answered.** A mover that is *parented* moves in the parent's frame in Valve's
+   engine and moved in world space here, because this port kept no local/abs
+   transform pair. That pair has landed (`src/server/hierarchy.rs`), so the 201
+   parented movers now integrate where `subs.cpp` and `physics_main.cpp`
+   integrate, and `SetParent`/`ClearParent` are accepted. The prediction that
+   "whichever of the two forces it, both are fixed at once" held: the
+   `SetParent` family was what forced it and the movers came free.
+   `CPhysicsPushedEntities` is now the only one of the two still open, and the
+   pair gave it something it will want — `SetupAllInHierarchy` builds the
+   pusher's children into the push list, and the child list it walks is
+   `EntityCore::children()`.
 5. **The 41 reconstructed classes.** §1.3. The risk is silent divergence: reconstructed
    behaviour that looks right and is not. Mark them, and lean on the FGD check (§7.3)
    for at least the interface.

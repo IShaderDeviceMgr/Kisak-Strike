@@ -3442,10 +3442,7 @@ mod tests {
         // Past `MIN_FLING_SPEED` horizontally the branch is the fling
         // cancellation instead, and the funnel never runs.
         let flung = Vec3::new(0.0, 400.0, -300.0);
-        assert!(
-            drift(flung, 60.0, 0.0).abs() < 1.0,
-            "a fling was funnelled"
-        );
+        assert!(drift(flung, 60.0, 0.0).abs() < 1.0, "a fling was funnelled");
         // Looking ahead rather than down.
         assert!(
             drift(falling, 0.0, 0.0).abs() < 1.0,

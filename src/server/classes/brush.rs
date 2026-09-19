@@ -416,7 +416,7 @@ impl Behaviour for Door {
         // a handle and nothing rebases through it — so a parented door takes
         // the `SOLID_VPHYSICS` branch, which for a brush entity is the same
         // brushes either way. 87 of the game's 621 doors name a parent.
-        entity.solid = match entity.parent.is_some() {
+        entity.solid = match entity.parent().is_some() {
             true => Solid::VPhysics,
             false => Solid::Bsp,
         };
@@ -430,7 +430,7 @@ impl Behaviour for Door {
             self.locked = true;
         }
 
-        self.toggle.position1 = entity.origin;
+        self.toggle.position1 = entity.local_origin;
 
         // > **The travel is the model's own size along `movedir`, less the
         // > lip.** `vecOBB -= Vector(2,2,2)` because "the engine expands
@@ -438,11 +438,11 @@ impl Behaviour for Door {
         // > its doorway exactly still clears it.
         let (mins, maxs) = (entity.model_bounds.mins, entity.model_bounds.maxs);
         let mut obb = maxs - mins;
-        if entity.angles != Vec3::ZERO {
+        if entity.local_angles != Vec3::ZERO {
             // `RotateAABB`: a door placed by a Hammer instance arrives
             // pre-rotated, and its travel has to be measured in the turned
             // frame. 88 `func_door`s and 56 `func_door_rotating`s are.
-            obb = rotate_aabb(entity.angles, mins, maxs);
+            obb = rotate_aabb(entity.local_angles, mins, maxs);
         }
         obb -= Vec3::splat(2.0);
         self.toggle.position2 = self.toggle.position1
@@ -450,7 +450,7 @@ impl Behaviour for Door {
 
         if !self.rotating {
             if self.spawn_position == FUNC_DOOR_SPAWN_OPEN {
-                entity.origin = self.toggle.position2;
+                entity.set_local_origin(self.toggle.position2);
                 self.toggle.state = ToggleState::AtTop;
             } else {
                 self.toggle.state = ToggleState::AtBottom;
@@ -463,11 +463,21 @@ impl Behaviour for Door {
         if entity.has_spawn_flags(SF_DOOR_ROTATE_BACKWARDS) {
             self.toggle.move_ang = -self.toggle.move_ang;
         }
-        self.toggle.angle1 = entity.angles;
-        self.toggle.angle2 = entity.angles + self.toggle.move_ang * self.toggle.move_distance;
+        self.toggle.angle1 = entity.local_angles;
+        self.toggle.angle2 = entity.local_angles + self.toggle.move_ang * self.toggle.move_distance;
 
+        // > **`CRotDoor::Spawn` spawns open through `Teleport`, which sets the
+        // > *absolute* angles — and `m_vecAngle2` is a *local* one.** Its
+        // > linear sibling four lines up uses `UTIL_SetOrigin`, which is
+        // > `SetLocalOrigin`, so the two halves of the same `Spawn` disagree
+        // > about which frame their destination is in. It is a bug and it is
+        // > reproduced: **3 of the game's 63 parented `func_door_rotating`s
+        // > spawn open**, and for those three the shipped game leaves the door
+        // > at an angle that is its intended one read in the wrong frame, with
+        // > a local angle that no longer matches `m_vecAngle2`. Fixing it here
+        // > would move three doors the shipped game does not move.
         if self.spawn_position == FUNC_DOOR_SPAWN_OPEN {
-            entity.angles = self.toggle.angle2;
+            entity.set_abs_angles(self.toggle.angle2);
             self.toggle.state = ToggleState::AtTop;
         } else {
             self.toggle.state = ToggleState::AtBottom;
@@ -696,9 +706,9 @@ impl Behaviour for MoveLinear {
         // The origin is where the mapper *drew* it, which is `start_position`
         // of the way along — so the closed end is behind it.
         self.toggle.position1 =
-            entity.origin - self.move_dir * self.move_distance * self.start_position;
+            entity.local_origin - self.move_dir * self.move_distance * self.start_position;
         self.toggle.position2 = self.toggle.position1 + self.move_dir * self.move_distance;
-        self.toggle.set_final_dest(entity.origin);
+        self.toggle.set_final_dest(entity.local_origin);
 
         SpawnResult::Ok
     }
@@ -712,12 +722,12 @@ impl Behaviour for MoveLinear {
         let is = |name: &str| input.name.eq_ignore_ascii_case(name);
 
         if is("Open") {
-            if entity.origin != self.toggle.position2 {
+            if entity.local_origin != self.toggle.position2 {
                 let (dest, speed) = (self.toggle.position2, entity.speed);
                 self.move_to(entity, dest, speed, cx);
             }
         } else if is("Close") {
-            if entity.origin != self.toggle.position1 {
+            if entity.local_origin != self.toggle.position1 {
                 let (dest, speed) = (self.toggle.position1, entity.speed);
                 self.move_to(entity, dest, speed, cx);
             }
@@ -726,7 +736,7 @@ impl Behaviour for MoveLinear {
             // refuses a move shorter than a thousandth of a unit.
             let target = self.toggle.position1
                 + input.value.float() * (self.toggle.position2 - self.toggle.position1);
-            if (target - entity.origin).length() > 0.001 {
+            if (target - entity.local_origin).length() > 0.001 {
                 let speed = entity.speed;
                 self.move_to(entity, target, speed, cx);
             }
@@ -736,13 +746,13 @@ impl Behaviour for MoveLinear {
             // turned into a stop by aiming at where the entity already is.
             entity.speed = input.value.float();
             let dest = self.toggle.final_dest();
-            if (dest - entity.origin).length_squared() > f32::EPSILON * f32::EPSILON {
+            if (dest - entity.local_origin).length_squared() > f32::EPSILON * f32::EPSILON {
                 if entity.speed.abs() > f32::EPSILON {
                     let speed = entity.speed;
                     let _ = self.toggle.linear_move(entity, dest, speed);
                 } else {
                     entity.speed = 1.0;
-                    let here = entity.origin;
+                    let here = entity.local_origin;
                     let _ = self.toggle.linear_move(entity, here, 1.0);
                 }
             }
@@ -762,9 +772,9 @@ impl Behaviour for MoveLinear {
         self.toggle.move_done(entity);
 
         let me = Some(entity.id());
-        if entity.origin == self.toggle.position2 {
+        if entity.local_origin == self.toggle.position2 {
             entity.fire_output("OnFullyOpen", Variant::Void, me, me, 0.0, cx);
-        } else if entity.origin == self.toggle.position1 {
+        } else if entity.local_origin == self.toggle.position1 {
             entity.fire_output("OnFullyClosed", Variant::Void, me, me, 0.0, cx);
         }
     }
@@ -786,7 +796,7 @@ impl Behaviour for MoveLinear {
         let value = input.value.float().min(1.0);
         let target =
             self.toggle.position1 + value * (self.toggle.position2 - self.toggle.position1);
-        let speed = (target - entity.origin).length() * 10.0;
+        let speed = (target - entity.local_origin).length() * 10.0;
         self.move_to(entity, target, speed, cx);
     }
 
@@ -1061,7 +1071,7 @@ impl Behaviour for Button {
         }
 
         self.toggle.state = ToggleState::AtBottom;
-        self.toggle.position1 = entity.origin;
+        self.toggle.position1 = entity.local_origin;
 
         let (mins, maxs) = (entity.model_bounds.mins, entity.model_bounds.maxs);
         let obb = (maxs - mins) - Vec3::splat(2.0);
@@ -1317,7 +1327,7 @@ impl Rotating {
 
         if self.stop_at_start_pos {
             let axis = self.check_axis();
-            let mut delta = anglemod(entity.angles[axis] - self.ang_start[axis]);
+            let mut delta = anglemod(entity.local_angles[axis] - self.ang_start[axis]);
             if delta > 180.0 {
                 delta -= 360.0;
             }
@@ -1327,7 +1337,7 @@ impl Rotating {
                     self.target_speed = 0.0;
                     self.stop_at_start_pos = false;
                     entity.speed = 0.0;
-                    entity.angles = self.ang_start;
+                    entity.set_local_angles(self.ang_start);
                 } else if delta.abs() > 90.0 {
                     // "Keep rotating at same speed for now."
                     entity.speed = old_speed;
@@ -1398,14 +1408,14 @@ impl Rotating {
         entity.set_move_done_time(interval);
 
         let axis = self.check_axis();
-        let mut delta = anglemod(entity.angles[axis] - self.ang_start[axis]);
+        let mut delta = anglemod(entity.local_angles[axis] - self.ang_start[axis]);
         if delta > 180.0 {
             delta -= 360.0;
         }
         let per_tick = entity.angular_velocity * cx.time.interval;
         if delta.abs() < per_tick[axis].abs() {
             self.set_target_speed(entity, 0.0, cx);
-            entity.angles = self.ang_start;
+            entity.set_local_angles(self.ang_start);
             self.stop_at_start_pos = false;
         }
     }
@@ -1462,7 +1472,7 @@ impl Rotating {
         const MAX_ANGLE: f32 = 200.0 * 360.0;
         const TIME_TO_RENORMALIZE: f32 = 15.0;
 
-        let mut angle = entity.angles;
+        let mut angle = entity.local_angles;
         for i in 0..3 {
             if angle[i] > MAX_ANGLE {
                 angle[i] -= MAX_ANGLE;
@@ -1471,8 +1481,8 @@ impl Rotating {
                 angle[i] += MAX_ANGLE;
             }
         }
-        if angle != entity.angles {
-            entity.angles = angle;
+        if angle != entity.local_angles {
+            entity.set_local_angles(angle);
         }
 
         // "Think at semi-random intervals so func rotatings don't all stack up
@@ -1553,7 +1563,7 @@ impl Behaviour for Rotating {
 
         // "Set speed to 0 in case there's an old 'speed' key lying around."
         entity.speed = 0.0;
-        self.ang_start = entity.angles;
+        self.ang_start = entity.local_angles;
 
         SpawnResult::Ok
     }

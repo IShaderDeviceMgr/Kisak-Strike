@@ -116,16 +116,67 @@ pub struct EntityCore {
     /// the name outlives a parent that has not spawned yet, and
     /// `SetupParentsForSpawnList` resolves it once everything exists.
     pub parent_name: Option<String>,
-    /// The resolved parent, or `None`. Set by the spawn pass.
-    pub parent: Option<EntityId>,
-    /// `m_vecAbsOrigin`. Valve's `KeyValue` calls `SetAbsOrigin` here rather
-    /// than `SetLocalOrigin`, and asserts that nothing is parented yet —
-    /// parenting happens after every key is read, which is why that holds.
+    /// The resolved parent, or `None`. Set by
+    /// [`hierarchy::set_parent`](super::hierarchy::set_parent), which is the
+    /// only thing that may write it — a bare assignment would leave the
+    /// parent's [`children`](EntityCore::children) list and this entity's
+    /// [`local_origin`](EntityCore::local_origin) disagreeing with it.
+    parent: Option<EntityId>,
+    /// Every entity whose [`parent`](EntityCore::parent) is this one.
+    ///
+    /// `m_hMoveChild`/`m_hMovePeer` (`hierarchy.cpp:21`) flattened: Valve
+    /// threads an intrusive list through the children because a `CBaseEntity`
+    /// has nowhere to put a `Vec`, and the list is only ever walked front to
+    /// back. The order differs — `LinkChild` pushes onto the *front* — and
+    /// nothing reads it, because every walk of this list recomputes a
+    /// transform and transforms do not care what order siblings come in.
+    children: Vec<EntityId>,
+    /// `m_vecAbsOrigin` — where this entity is **in the world**.
+    ///
+    /// Read everywhere; written only by
+    /// [`set_abs_placement`](EntityCore::set_abs_placement) and by
+    /// [`calc_absolute_position`](EntityCore::calc_absolute_position), because
+    /// it is now half of a pair. See
+    /// [`local_origin`](EntityCore::local_origin).
     pub origin: Vec3,
     /// `m_angAbsRotation`, as pitch/yaw/roll. [`crate::math::angle_matrix`] is
     /// what turns it into a basis; see `rustdocs/STUDIO.md` on why the
     /// component order is the trap it is.
     pub angles: Vec3,
+    /// `m_vecOrigin` — where this entity is **in its parent's frame**.
+    ///
+    /// Equal to [`origin`](EntityCore::origin) while nothing is parented,
+    /// which is why the port got this far without it. The two differ for the
+    /// 4,582 entities the shipped maps parent, and **the difference is not
+    /// cosmetic for the 201 of those that are movers**: every one of
+    /// `CBaseToggle`'s moves is computed in this frame, so a door parented to
+    /// a moving platform that read the world pair would drive itself back to a
+    /// world position each tick and tear itself off its parent.
+    pub local_origin: Vec3,
+    /// `m_angRotation` — this entity's orientation in its parent's frame.
+    pub local_angles: Vec3,
+    /// The parent's `EntityToWorldTransform()`, cached here rather than
+    /// fetched — the identity while unparented.
+    ///
+    /// # Why a cache, when Valve has a dirty flag
+    ///
+    /// `CBaseEntity` goes the other way: `GetAbsOrigin` checks
+    /// `EFL_DIRTY_ABSTRANSFORM` and calls `CalcAbsolutePosition` on the spot,
+    /// walking up to the parent through a pointer it has. Neither half of that
+    /// survives the port. There is no pointer — a parent is an
+    /// [`EntityId`] that only the [`EntityList`] can resolve — and the
+    /// dispatched entity is *outside* that list for the whole of its own
+    /// handler ([`EntityList::detach`]), so the one moment a mover integrates
+    /// its velocity is the one moment it could not look its parent up.
+    ///
+    /// Caching the parent's frame turns that inside out: **a write to the
+    /// local pair recomputes the world pair immediately, from `&mut self`
+    /// alone**, and the only operation that needs the list is pushing a change
+    /// *down* to the children — [`hierarchy::propagate`](super::hierarchy::propagate),
+    /// which is `InvalidatePhysicsRecursive` done eagerly instead of lazily.
+    /// The staleness window is the same one Valve has; it is just closed from
+    /// the other end.
+    parent_to_world: glam::Affine3A,
     /// `m_spawnflags`.
     pub spawn_flags: u32,
     /// `m_ModelName` — `"*12"` for a brush model, `"models/…/x.mdl"` for a
@@ -316,6 +367,208 @@ impl EntityCore {
     /// [`EntityList::mark_for_deletion`].
     pub fn remove(&mut self) {
         self.removed = true;
+    }
+
+    // -----------------------------------------------------------------------
+    // the transform pair — `m_vecOrigin`/`m_vecAbsOrigin` and their angles
+    // -----------------------------------------------------------------------
+    //
+    // Read [`local_origin`](EntityCore::local_origin) and
+    // [`parent_to_world`] first. In one line: **the local pair is the truth
+    // and the world pair is derived**, every write below re-derives it, and
+    // the only thing missing from that sentence is the children — which
+    // [`hierarchy::propagate`](super::hierarchy::propagate) does, because it
+    // is the only operation here that needs the entity list.
+
+    /// `GetMoveParent()` — the entity this one moves with, if any.
+    pub fn parent(&self) -> Option<EntityId> {
+        self.parent
+    }
+
+    /// Every entity parented to this one. `FirstMoveChild`/`NextMovePeer`.
+    pub fn children(&self) -> &[EntityId] {
+        &self.children
+    }
+
+    /// `EntityToWorldTransform()` (`m_rgflCoordinateFrame`) — this entity's
+    /// own frame, in the world.
+    ///
+    /// Built rather than cached, unlike Valve's: `angle_matrix` is nine
+    /// multiplies and this is asked for once per parenting operation and once
+    /// per child per move, not once per bone per frame.
+    pub fn to_world(&self) -> glam::Affine3A {
+        glam::Affine3A::from_mat3_translation(crate::math::angle_matrix(self.angles), self.origin)
+    }
+
+    /// `CalcAbsolutePosition` (`baseentity.cpp:6521`) — rebuild the world pair
+    /// from the local pair and the cached parent frame.
+    ///
+    /// Valve's early-out on `EFL_DIRTY_ABSTRANSFORM` has no counterpart: this
+    /// runs *because* something changed rather than in the hope that nothing
+    /// did.
+    ///
+    /// **Both of Valve's exact-copy branches are load-bearing and both are
+    /// here.** `MatrixAngles( AngleMatrix( a ) )` is not `a` in `f32`, so
+    /// anything that round-trips through the matrix drifts in the last bits
+    /// every time it is asked. `CalcAbsolutePosition` avoids it twice:
+    ///
+    /// - with no move parent it copies the local pair straight across, which
+    ///   is the path **every unparented entity in the game takes** — and this
+    ///   port has been taking it implicitly since stage 1, because until now
+    ///   there was only one pair;
+    /// - with a move parent but no rotation of its own it copies the
+    ///   *parent's* absolute angles, so a child at rest under a still parent
+    ///   does not creep.
+    fn calc_absolute_position(&mut self) {
+        let Some(_) = self.parent else {
+            self.origin = self.local_origin;
+            self.angles = self.local_angles;
+            return;
+        };
+        let local = glam::Affine3A::from_mat3_translation(
+            crate::math::angle_matrix(self.local_angles),
+            self.local_origin,
+        );
+        let world = self.parent_to_world * local;
+        self.origin = Vec3::from(world.translation);
+        self.angles = match self.local_angles == Vec3::ZERO {
+            true => crate::math::matrix_angles(glam::Mat3::from(self.parent_to_world.matrix3)),
+            false => crate::math::matrix_angles(glam::Mat3::from(world.matrix3)),
+        };
+    }
+
+    /// `SetLocalOrigin` (`baseentity.cpp:6847`) — move this entity within its
+    /// parent's frame.
+    ///
+    /// **This is what a mover writes.** `LinearlyMoveRootEntity`
+    /// (`physics_main.cpp:1057`) is `SetLocalOrigin( GetLocalOrigin() +
+    /// GetLocalVelocity() * movetime )` and `CBaseToggle::LinearMove` aims at
+    /// a local destination, so the whole of `subs.cpp` is in this frame.
+    ///
+    /// The children are *not* updated here — see
+    /// [`hierarchy::propagate`](super::hierarchy::propagate) for why that one
+    /// step is separate, and note that a leaf entity (which is almost all of
+    /// them) therefore costs nothing extra at all.
+    /// > **The equality early-out is Valve's and it is load-bearing.**
+    /// > `if (m_vecOrigin != origin)` guards the whole body, so a write of the
+    /// > value already there invalidates nothing. Drop it and every pusher in
+    /// > the simulation list rebuilds its subtree every tick whether or not it
+    /// > moved — and because `MatrixAngles(AngleMatrix(a))` is not `a`, that
+    /// > is not merely wasted work: a still parent would walk its children
+    /// > sideways by a ten-thousandth of a unit a tick. Measured, on the
+    /// > shipped maps: **532 extra brush entities drifting off their spawn
+    /// > placement in two seconds** with the guard missing, against 0 with it.
+    pub fn set_local_origin(&mut self, origin: Vec3) {
+        if self.local_origin == origin {
+            return;
+        }
+        self.local_origin = origin;
+        self.calc_absolute_position();
+    }
+
+    /// `SetLocalAngles` (`baseentity.cpp:6874`). Same guard, same reason.
+    pub fn set_local_angles(&mut self, angles: Vec3) {
+        if self.local_angles == angles {
+            return;
+        }
+        self.local_angles = angles;
+        self.calc_absolute_position();
+    }
+
+    /// `SetAbsOrigin` + `SetAbsAngles` (`baseentity.cpp:6678`, `:6722`) — put
+    /// this entity somewhere in the **world**, and back-solve what that means
+    /// in its parent's frame.
+    ///
+    /// The two are one call because every caller here sets both: a teleport,
+    /// a spawn placement, the player's position coming back from the client.
+    /// Valve splits them because each is a separate network variable and each
+    /// one alone is a common operation in code this port does not have.
+    pub fn set_abs_placement(&mut self, origin: Vec3, angles: Vec3) {
+        if self.origin == origin && self.angles == angles {
+            return;
+        }
+        self.origin = origin;
+        self.angles = angles;
+        match self.parent {
+            None => {
+                self.local_origin = origin;
+                self.local_angles = angles;
+            }
+            Some(parent) => {
+                let frame = self.parent_to_world;
+                self.set_parent_frame(Some(parent), frame);
+            }
+        }
+    }
+
+    /// `SetAbsOrigin` alone, for the callers that move an entity without
+    /// turning it. [`set_abs_placement`](EntityCore::set_abs_placement) is the
+    /// real one; this is the spelling that reads right at a call site.
+    pub fn set_abs_origin(&mut self, origin: Vec3) {
+        let angles = self.angles;
+        self.set_abs_placement(origin, angles);
+    }
+
+    /// `SetAbsAngles` alone.
+    pub fn set_abs_angles(&mut self, angles: Vec3) {
+        let origin = self.origin;
+        self.set_abs_placement(origin, angles);
+    }
+
+    /// Re-point this entity at a parent frame, keeping its *local* placement
+    /// and moving it in the world.
+    ///
+    /// The direction [`hierarchy::propagate`](super::hierarchy::propagate)
+    /// pushes: the parent moved, so the child moves with it.
+    ///
+    /// Answers whether anything actually changed, which is what lets
+    /// `propagate` stop rather than walk a subtree that did not move. It is
+    /// the same guard `SetLocalOrigin` has and it is needed for the same
+    /// reason: `MatrixAngles(AngleMatrix(a))` is not `a`, so a subtree
+    /// recomputed against an unchanged frame does not come back unchanged.
+    pub(super) fn follow(&mut self, parent_to_world: glam::Affine3A) -> bool {
+        if self.parent_to_world == parent_to_world {
+            return false;
+        }
+        self.parent_to_world = parent_to_world;
+        self.calc_absolute_position();
+        true
+    }
+
+    /// `LinkChild`/`UnlinkChild` (`hierarchy.cpp:21`), for
+    /// [`hierarchy`](super::hierarchy) alone — the two halves of the list that
+    /// has to stay in step with [`parent`](EntityCore::parent).
+    pub(super) fn link_child(&mut self, child: EntityId) {
+        self.children.push(child);
+    }
+
+    pub(super) fn unlink_child(&mut self, child: EntityId) {
+        self.children.retain(|&c| c != child);
+    }
+
+    /// The other half of [`follow`](EntityCore::follow): a new parent, and the
+    /// **world** placement held still while the local one is re-solved.
+    pub(super) fn set_parent_frame(&mut self, parent: Option<EntityId>, frame: glam::Affine3A) {
+        self.parent = parent;
+        self.parent_to_world = frame;
+        // Not [`set_abs_placement`](EntityCore::set_abs_placement): its
+        // early-out is on the *world* pair, which is exactly the half this
+        // holds still. What has to be re-solved is the local pair.
+        match parent {
+            None => {
+                self.local_origin = self.origin;
+                self.local_angles = self.angles;
+            }
+            Some(_) => {
+                let world = glam::Affine3A::from_mat3_translation(
+                    crate::math::angle_matrix(self.angles),
+                    self.origin,
+                );
+                let local = frame.inverse() * world;
+                self.local_origin = Vec3::from(local.translation);
+                self.local_angles = crate::math::matrix_angles(glam::Mat3::from(local.matrix3));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -700,8 +953,12 @@ impl Entity {
                 target: None,
                 parent_name: None,
                 parent: None,
+                children: Vec::new(),
                 origin: Vec3::ZERO,
                 angles: Vec3::ZERO,
+                local_origin: Vec3::ZERO,
+                local_angles: Vec3::ZERO,
+                parent_to_world: glam::Affine3A::IDENTITY,
                 spawn_flags: 0,
                 model: None,
                 hammer_id: None,

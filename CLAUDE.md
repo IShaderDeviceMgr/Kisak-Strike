@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,044 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,054 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -153,7 +153,7 @@ before calling into a module.** This table is the index.
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace and the transition ramp), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the two areaportals — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals and the **local/abs transform pair** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -250,21 +250,37 @@ pass — and `c_portalghostrenderable.cpp` (980) for the half of an entity that 
 of the other portal, which nothing but the player passes through and the player is not
 drawn.
 
+**The local/abs transform pair has landed** — `src/server/hierarchy.rs` plus four
+fields on `EntityCore` — so **what is parented to a mover now rides it**. 4,582 of the
+game's entities name a `parentname` and **201 of them are movers**, which is the half
+that has teeth: every coordinate in `subs.cpp` and both halves of `PerformPush` are in
+the parent's frame, so before this a door bolted to a moving platform drove itself back
+towards a fixed world position every tick. Measured on the shipped maps: **52 brush
+entities are now carried by a parent in the first two seconds, the furthest by 539
+units**, and `SetParent`/`ClearParent` took 31 inputs off the unhandled list. Three
+findings, in `rustdocs/SERVER.md`: the propagation seam has to be `Server::dispatch`
+rather than the pusher, because `CBaseDoor::Spawn` moves a door up to 294 units inside
+its own `Spawn`; Valve's `if (m_vecOrigin != origin)` guards are not optimisations,
+because `MatrixAngles(AngleMatrix(a))` is not `a` and a still parent would otherwise
+walk its children sideways every tick; and `SetParentAttachment*` is genuinely a
+different problem from `SetParent`, not the same one twice.
+
 - **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
   is no longer in the way, so this is unblocked for the first time:
   `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker
   enumeration and rollback, and `EntityCore::local_time` is already the field
   its answer goes in. The condition is the first puzzle that cannot be solved
   without standing on something that moves.
-- **The local/abs transform pair on `EntityCore`**, which is smaller than a stage and
-  unblocks two things at once: `SetParent`/`ClearParent`/`SetParentAttachment*` —
-  **1,103 of the 1,371 inputs the depot test reports as unhandled** — and parented
-  movers, which currently move in world space where Valve moves them in the parent's
-  frame (174 of the game's 1,164 movers name a parent). `prop_dynamic` raised the
-  stakes: **2,355 of the game's 8,462 props name a `parentname`**, and 177 of the
-  unhandled inputs are now theirs. The attachment forms also want
-  `LookupAttachment` on a studio model, which would be `server/`'s first dependency on
-  `studio/`.
+- **`LookupAttachment` on a studio model**, which is what is left of the parenting
+  family and would be `server/`'s first dependency on `studio/`. The transform pair
+  landed and took `SetParent`/`ClearParent` with it; the two
+  `SetParentAttachment*` forms did not, and they are **1,362 shipped connections
+  against `SetParent`'s 143**. The need is measured rather than assumed:
+  `CBaseEntity::SetParentAttachment` *returns* when its parent-is-a-`CBaseAnimating`
+  guard fails rather than falling through to plain parenting, and **1,376 of the
+  game's 1,454 such connections aim at an entity whose parent carries a `.mdl`** — so
+  95% of them really do reach the lookup, and accepting them without it would put each
+  entity at its parent's origin instead of its attachment point.
 - **Skinning in `src/studio/`**, which `$includemodel` promoted to the largest gap in
   the model path and which now gates the second largest. The per-bone draw split is
   exact only when every vertex answers to one bone, and **74 of the 591 readable models

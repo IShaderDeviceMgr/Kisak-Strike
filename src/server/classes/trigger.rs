@@ -235,7 +235,7 @@ impl BaseTrigger {
         // "solid" for `IsSolid()`; the distinction is which collision
         // representation Valve would have used, and for a brush entity they
         // are the same brushes.
-        entity.solid = match entity.parent.is_some() {
+        entity.solid = match entity.parent().is_some() {
             true => Solid::VPhysics,
             false => Solid::Bsp,
         };
@@ -1202,7 +1202,7 @@ impl Behaviour for TriggerPush {
         let (solid, move_type, parented, flags, base_velocity) = (
             other_core.is_solid(),
             other_core.move_type,
-            other_core.parent.is_some(),
+            other_core.parent().is_some(),
             other_core.flags,
             other_core.base_velocity,
         );
@@ -1252,7 +1252,7 @@ impl Behaviour for TriggerPush {
                 if let Some(core) = cx.entity_mut(other) {
                     if lift {
                         core.flags &= !FL_ONGROUND;
-                        core.origin.z += 1.0;
+                        core.set_abs_origin(core.origin + glam::Vec3::Z);
                     }
                     core.base_velocity = push;
                     core.flags |= FL_BASEVELOCITY;
