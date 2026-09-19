@@ -158,7 +158,7 @@ before calling into a module.** This table is the index.
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
-| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points** and **skinning**. No LOD selection, no `.phy`, no skin families, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
+| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning** and **skin families**. No LOD selection, no body groups, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting** and the **vphysics seam** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, and an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in. No shadow controller, so the player walks through a cube; no constraints, collision events, ragdolls or vehicles | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
@@ -175,8 +175,8 @@ bolted to a moving arm rides the point on it the map named**. **Every model is
 skinned**, so the seven pieces of falling debris on the default map bend with
 their skeletons instead of standing in their bind pose, and **the weighted cube
 falls**: it drops 255 units out of its dropper onto the chamber floor, settles
-in two seconds and goes to sleep lying on the slope it landed on — in the right
-model, though not yet in the rusted skin the map asked for. Two portals draw as coloured ovals — **and they work, and you can see
+in two seconds and goes to sleep lying on the slope it landed on, in the right
+model **and in the rusted skin its map asked for**. Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
@@ -336,6 +336,35 @@ three-bone door as well. **It cost nothing** — an A/B of `frame_cost` reads
 `entity models` 0.14 ms before and **0.12 after**, because a batch that was one
 draw per bone run is now one draw.
 
+**Skin families have landed** — `studiohdr_t`'s replaceable texture table, read
+at last — and the measurement is what moved them off `portdocs/STUDIO.md` stage
+6's "optional, and small". `mstudiomesh_t::material` is not an index into a
+model's texture list: it is a *column* of a `numskinfamilies × numskinref` table,
+and the material is `pSkinRef[skin * numskinref][mesh->material]`. **10,030 of
+the game's 56,955 static prop placements ask for a family other than 0 and
+10,002 of them draw a different material for it** — 17.6% of the game's props,
+across 101 of 106 maps, **269 of them on `sp_a1_intro1`**. The worst single model
+is not the cube but `anim_wp/framework/squarebeam_off` at **5,666 placements**,
+the white beam Aperture's walls are built out of. On the entity side it is **663
+placements, 659 of which remap**, and that includes **15 of the game's 98 cubes**
+— one of them the cube on the default map, which drew `metal_box` and now draws
+`metal_box_skin003`. Three findings, in `rustdocs/STUDIO.md` and
+`portdocs/STUDIO.md` §14. **Family 0 is the identity permutation in all 2,041
+shipped models**, and `numskinref == numtextures` in all of them, which is why
+the port's old direct index was exactly right at skin 0 and why this could not
+regress a picture that was already correct — the depot census asserts both.
+**The batch key had to stay the replaceable *slot* rather than become the
+resolved material**: `models/props/metal_box.mdl` is 12 families over 12 slots
+with a single mesh on slot 0, so grouping by material would have collapsed all
+twelve into one. And **`uses_bumpmapping` had to widen with it**, because it is
+`bStaticLighting`'s deciding half and a model that is per-pixel only at skin 2
+must answer yes for every placement — which is why Valve ORs it over the whole
+`ppMaterials` array. It is the one change here that had a **measurable frame
+cost and needed a second change to pay it back**: with 269 differently-skinned
+props interleaved among 1,080, the material bind group changed on nearly every
+draw, so `PropModels::load` now sorts each model's instance list by family and
+the opaque pass binds once per (batch, family) again.
+
 What `sp_a1_intro1` ends up with, printed by
 `sp_a1_intro1_drops_its_cube_through_the_whole_server_path`: **667 static
 bodies** (2 world solids, 11 displacements, 654 static props), **26 brush
@@ -416,16 +445,11 @@ one.
   sequences declare, the worst by 23,029 units, and since `studiomdl` computes that box
   from the animated geometry the pose is what is wrong.
   `every_shipped_studio_model_parses` prints the list.
-- **Skin families in `src/studio/`** — `studiohdr_t`'s `skinindex` table, which remaps a
-  mesh's material by `m_nSkin`. `portdocs/STUDIO.md` stage 6's other half, and
-  `prop_weighted_cube` is what put a price on it: the class computes its skin correctly
-  and the renderer ignores it, so a **companion cube draws with the standard cube's
-  materials and a rusted cube draws clean**. Measured by
-  `every_shipped_map_spawns_its_entities`: **15 of the game's 98 cubes end on a non-zero
-  skin** — 5 companion, 8 rusted standard, 2 rusted reflective — and **one of the 15 is
-  the cube on `sp_a1_intro1`**, so it is visible on the default map. It needs `PropBatch`
-  to carry a material per skin family rather than one, and the draw to pick by
-  instance.
+- **Body groups** (`m_nBody`) in `src/studio/` — the half of the selector family skin
+  families left behind. It chooses which *model* inside a body part draws, which is
+  geometry rather than materials, and `build.rs` already keeps body parts in separate
+  batches so that it can be added without a rewrite. 959 of 968 models have exactly one
+  body part, so it is near-vestigial on props and matters for characters.
 - **The shadow controller** — `legacy/vphysics/physics_shadow.cpp` (1,455 lines) and
   `vphysics/player_controller.h`. It is what `src/vphysics/` deliberately left out and
   it is the single most visible gap the cube opened: **the player walks through a cube**,
@@ -471,6 +495,17 @@ client to the server, where the move type lives; and `CommandLine` moving to
   0.25 s for `sp_a1_intro1`'s collision model alone. **Fix it when a map's load time is
   actually a problem**, by moving `Props::light` after `PropModels::load` and passing it
   the per-instance answer; the seam already exists as `PropModels::light_ranges`.
+
+- **Every skin family's materials are loaded, including the families a map never
+  places.** `PropBatch::materials` is indexed by family, so it has to have an entry for
+  each one, and resolving them all is what makes a runtime skin change — a
+  `prop_weighted_cube` being painted — land on a material that is already in the cache.
+  Static prop skins cannot change, so the static half *could* resolve only the families
+  its placements name and leave the rest unloaded. Measured: `sp_a1_intro1`'s props go
+  from **67 materials to 81**, about 21% more, paid once at level load. **Fix it when a
+  map's load time is actually a problem**, and only on the static side — `EntityModels`
+  must keep loading all of them, because a cube changes skin while the level runs. The
+  seam is the `resolved` cache in `PropModels::load`.
 
 - **`gameinfo.txt` is parsed twice at startup.** `src/launcher/mod.rs` reads it for the
   window title (`gameinfo.txt`'s `game` key, `engine/sys_mainwind.cpp:1261`), and

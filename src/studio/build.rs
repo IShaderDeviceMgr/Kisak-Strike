@@ -24,7 +24,11 @@
 //!
 //! # Batching
 //!
-//! One batch per `(body part, model, material)`, concatenated in that order.
+//! One batch per `(body part, model, replaceable texture slot)`, concatenated
+//! in that order. The *slot*, not the material it resolves to: a slot means the
+//! same thing in every skin family and a material does not, so a batch keyed on
+//! one carries a material per family and stays a single draw. See
+//! `portdocs/STUDIO.md` §14.
 //!
 //! Grouping by material is the same decision `world` made for faces — Valve's
 //! *sort ID*, computed at load so nothing sorts per frame. Not grouping *across*
@@ -130,8 +134,15 @@ pub(super) fn build(
                 continue;
             };
 
-            // Gather this model's meshes by material, preserving first-seen
-            // order so the output is deterministic and reads in file order.
+            // Gather this model's meshes by **replaceable texture slot**,
+            // preserving first-seen order so the output is deterministic and
+            // reads in file order.
+            //
+            // The slot and not the resolved material, which is what makes a
+            // batch skin-independent: two slots that share a material in
+            // family 0 can differ in family 3, so merging them here would make
+            // a skin unrepresentable. It costs nothing — every shipped model
+            // that does this has one mesh per slot anyway.
             let mut by_material: Vec<(usize, Vec<u32>)> = Vec::new();
             for (mesh_index, (mdl_mesh, vtx_mesh)) in
                 mdl_model.meshes.iter().zip(&lod.meshes).enumerate()
@@ -181,7 +192,7 @@ pub(super) fn build(
                 }
             }
 
-            for (material, group) in by_material {
+            for (slot, group) in by_material {
                 if group.is_empty() {
                     continue;
                 }
@@ -189,7 +200,21 @@ pub(super) fn build(
                 let index_count = group.len() as u32;
                 indices.extend(group);
                 batches.push(Batch {
-                    material: materials.get(material).cloned().unwrap_or_default(),
+                    // One material per skin family, resolved through that
+                    // family's row. `slot` is the *column* — a replaceable
+                    // texture slot, which is what `mstudiomesh_t::material`
+                    // holds — so this is `pSkinRef[pMesh->material]` once per
+                    // family rather than once per draw.
+                    materials: mdl
+                        .skin_families
+                        .iter()
+                        .map(|row| {
+                            row.get(slot)
+                                .and_then(|&texture| materials.get(usize::from(texture)))
+                                .cloned()
+                                .unwrap_or_default()
+                        })
+                        .collect(),
                     first_index,
                     index_count,
                     body_part: bp_index as u16,
@@ -209,6 +234,7 @@ pub(super) fn build(
         vertices,
         indices,
         batches,
+        skin_families: mdl.skin_families.len(),
         meshes,
         bones: mdl.bones.clone(),
         sequences: mdl.sequences.clone(),

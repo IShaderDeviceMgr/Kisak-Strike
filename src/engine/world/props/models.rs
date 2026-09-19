@@ -40,11 +40,35 @@ use super::super::vis::VisibleSet;
 use super::super::GeometryPass;
 use super::Props;
 
-/// One material's slice of a model's indices.
+/// One replaceable texture slot's slice of a model's indices.
+///
+/// Not "one material's": the slot is the same in every skin family and the
+/// material is not, so a batch carries one material per family and the
+/// instance's `m_nSkin` picks between them at record time. See
+/// `portdocs/STUDIO.md` §14 and [`studio::Batch`](crate::studio::Batch).
 pub struct PropBatch {
-    pub material: Arc<Material>,
+    /// One per skin family, in family order. **Never empty.**
+    pub materials: Vec<Arc<Material>>,
     pub first_index: u32,
     pub index_count: u32,
+}
+
+impl PropBatch {
+    /// The material this batch wears at `skin` — the raw `m_nSkin` or
+    /// `StaticPropLump_t::m_Skin`, clamped to family 0 the way
+    /// [`studio::Batch::material`](crate::studio::Batch::material) is.
+    ///
+    /// Taken raw and clamped here rather than resolved onto the instance
+    /// because a skin **changes while the level runs**: `prop_weighted_cube`
+    /// picks a different one when it is painted, and a precomputed family
+    /// would have to be re-derived in [`EntityModels::sync`]. Two comparisons
+    /// per draw against a class of bug that only appears in motion.
+    ///
+    /// [`EntityModels::sync`]: super::super::entities::EntityModels::sync
+    pub fn material(&self, skin: i32) -> &Arc<Material> {
+        let family = crate::studio::family(skin, self.materials.len());
+        &self.materials[family]
+    }
 }
 
 /// One distinct model, uploaded once and drawn by every instance of it.
@@ -209,7 +233,17 @@ impl PropModel {
 
         PropModel {
             vertex_count: model.vertices.len(),
-            uses_bumpmapping: batches.iter().any(|batch| batch.material.uses_bumpmapping),
+            // **Every family's materials, not family 0's.** This flag is
+            // `bStaticLighting`'s deciding half — a model lit per pixel reads
+            // no `.vhv` at all — so a model that is per-pixel only at skin 2
+            // has to answer yes for every placement of it, or two placements
+            // of one model would want different vertex streams. Valve ORs it
+            // over the whole `ppMaterials` array for the same reason
+            // (`studiorendercontext.cpp:274`).
+            uses_bumpmapping: batches
+                .iter()
+                .flat_map(|batch| &batch.materials)
+                .any(|material| material.uses_bumpmapping),
             checksum: model.checksum,
             meshes: model.meshes.clone(),
             vertices: VertexBuffer::new(device, &model.path, &model.vertices),
@@ -293,40 +327,47 @@ impl PropModels {
                 let batches = model
                     .batches
                     .iter()
-                    .map(|batch| {
-                        let material = resolved
-                            .entry(batch.material.clone())
-                            .or_insert_with(|| {
-                                stats.materials += 1;
-                                let material = materials.load(vfs, &batch.material);
-                                if Arc::ptr_eq(&material, &materials.error_material()) {
-                                    stats.materials_missing += 1;
-                                    return Arc::clone(&error);
-                                }
-                                // A prop's geometry is `ModelVertex` and
-                                // nothing else, so a material whose shader
-                                // wants brush vertices cannot draw it. Same
-                                // decision `World::load` makes in the other
-                                // direction, and for the same reason: visibly
-                                // wrong beats plausibly wrong.
-                                if material.shader.vertex_layout() != VertexLayout::Model {
-                                    eprintln!(
-                                        "source-engine: props: {}: {} does not take model \
-                                         geometry",
-                                        batch.material,
-                                        material.shader.name()
-                                    );
-                                    stats.materials_missing += 1;
-                                    return Arc::clone(&error);
-                                }
-                                material
+                    .map(|batch| PropBatch {
+                        // Every family's, not just family 0's: 10,002 of the
+                        // game's 56,955 static prop placements ask for another
+                        // one, and a material the cache has not got is a
+                        // material the draw cannot reach.
+                        materials: batch
+                            .materials
+                            .iter()
+                            .map(|name| {
+                                resolved
+                                    .entry(name.clone())
+                                    .or_insert_with(|| {
+                                        stats.materials += 1;
+                                        let material = materials.load(vfs, name);
+                                        if Arc::ptr_eq(&material, &materials.error_material()) {
+                                            stats.materials_missing += 1;
+                                            return Arc::clone(&error);
+                                        }
+                                        // A prop's geometry is `ModelVertex`
+                                        // and nothing else, so a material
+                                        // whose shader wants brush vertices
+                                        // cannot draw it. Same decision
+                                        // `World::load` makes in the other
+                                        // direction, and for the same reason:
+                                        // visibly wrong beats plausibly wrong.
+                                        if material.shader.vertex_layout() != VertexLayout::Model {
+                                            eprintln!(
+                                                "source-engine: props: {name}: {} does not take \
+                                                 model geometry",
+                                                material.shader.name()
+                                            );
+                                            stats.materials_missing += 1;
+                                            return Arc::clone(&error);
+                                        }
+                                        material
+                                    })
+                                    .clone()
                             })
-                            .clone();
-                        PropBatch {
-                            material,
-                            first_index: batch.first_index,
-                            index_count: batch.index_count,
-                        }
+                            .collect(),
+                        first_index: batch.first_index,
+                        index_count: batch.index_count,
                     })
                     .collect();
 
@@ -337,11 +378,33 @@ impl PropModels {
             })
             .collect::<Vec<_>>();
 
-        let mut instances = vec![Vec::new(); models.len()];
+        let mut instances: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
         for (i, prop) in props.instances.iter().enumerate() {
             match models.get(prop.model_index) {
                 Some(Some(_)) => instances[prop.model_index].push(i),
                 _ => stats.instances_without_a_model += 1,
+            }
+        }
+
+        // **Grouped by skin family**, because `record`'s inner loop is over the
+        // instances of one batch and the material is now per instance: with
+        // 269 of `sp_a1_intro1`'s 1,080 props on a family other than 0 and
+        // interleaved with the rest, group 1 was re-bound on nearly every draw
+        // instead of once per run. Sorting here makes it once per (batch,
+        // family) again.
+        //
+        // Safe because this list feeds only the opaque and refracting passes,
+        // where the order of two props that do not overlap in depth is not
+        // observable — the translucent pass takes its order from a sort of its
+        // own. Stable, so props within a family keep lump order.
+        for (model, list) in models.iter().zip(&mut instances) {
+            let Some(model) = model else { continue };
+            let families = model
+                .batches
+                .first()
+                .map_or(1, |batch| batch.materials.len());
+            if families > 1 {
+                list.sort_by_key(|&i| crate::studio::family(props.instances[i].skin, families));
             }
         }
 
@@ -416,11 +479,20 @@ impl PropModels {
             .max()
             .unwrap_or(0);
 
-        let refracts = models.iter().flatten().any(|model| {
+        // **Per placement, not per model.** A model can carry a refracting
+        // material in a family no map ever asks for, and a false positive here
+        // costs the map a full-screen `copy_texture_to_texture` and a second
+        // pass every frame. `uses_bumpmapping` above is deliberately the other
+        // way round — it decides which *vertex stream* every placement of a
+        // model reads, so it has to be one answer for the model.
+        let refracts = props.instances.iter().any(|prop| {
+            let Some(Some(model)) = models.get(prop.model_index) else {
+                return false;
+            };
             model
                 .batches
                 .iter()
-                .any(|batch| batch.material.needs_frame_buffer_copy)
+                .any(|batch| batch.material(prop.skin).needs_frame_buffer_copy)
         });
 
         PropModels {
@@ -539,8 +611,12 @@ impl PropModels {
             for (batch_index, batch) in model.batches.iter().enumerate() {
                 for &i in &self.instances[index] {
                     let prop = &props.instances[i];
-                    let pass =
-                        GeometryPass::of_instance(&batch.material, prop.modulation[3] != 1.0);
+                    // Per instance in *two* ways now: the modulation alpha,
+                    // and which skin family's material is being classified.
+                    let pass = GeometryPass::of_instance(
+                        batch.material(prop.skin),
+                        prop.modulation[3] != 1.0,
+                    );
                     if pass == GeometryPass::Translucent {
                         out(
                             prop.transform.transform_point3(center),
@@ -600,7 +676,7 @@ impl PropModels {
             .indices
             .range(batch.first_index, batch.index_count);
         pass.draw_modulated(
-            &batch.material,
+            batch.material(prop.skin),
             &model_data.vertices.slice(),
             &indices,
             prop.transform,
@@ -695,8 +771,10 @@ impl PropModels {
                     // Per instance rather than per batch: a prop whose
                     // `m_DiffuseModulation` alpha is below 1 is translucent
                     // even where the material is not.
-                    if GeometryPass::of_instance(&batch.material, prop.modulation[3] != 1.0)
-                        != wanted
+                    if GeometryPass::of_instance(
+                        batch.material(prop.skin),
+                        prop.modulation[3] != 1.0,
+                    ) != wanted
                     {
                         continue;
                     }
@@ -710,7 +788,7 @@ impl PropModels {
                     let Some(light) = light else { continue };
                     pass.bind_static_light(&light);
                     pass.draw_modulated(
-                        &batch.material,
+                        batch.material(prop.skin),
                         &vertices,
                         &indices,
                         prop.transform,

@@ -1119,3 +1119,123 @@ reference.
 - **Eight units of slack decide shadowing**, under a comment reading `// hack`:
   `if ( (1.f - pm.fraction) * dist > 8 )`. It is what lets a light embedded in
   the surface of its own fixture still light the room.
+
+---
+
+## 14. Skin families, which §8 called half a stage
+
+> Written **before** this piece of work, unlike §12 and §13 — the measurements
+> below are what scoped it. `rustdocs/STUDIO.md` listed skin families as a
+> one-line gap ("`Prop::skin` is parsed and ignored"), and §8 stage 6 filed
+> them under LOD selection as "optional, and small". **The measurement says
+> otherwise**: this is the largest single correctness gap left in the model
+> path, and it is visible on the default map.
+
+### 14.1 What it is
+
+A `.mdl` carries a **replaceable texture table**: `numskinfamilies` rows of
+`numskinref` `short`s at `skinindex`, and `mstudiomesh_t::material` is an index
+into a *row*, not into `mstudiotexture_t[]` directly. The draw-time lookup is
+one line, and it is the same line everywhere in `studiorender/`
+(`studiorendercontext.cpp:2010`, `:1938`, `r_studiogettriangles.cpp:36`):
+
+```c
+short *pSkinRef = pStudioHdr->pSkinref( nSkin * pStudioHdr->numskinref );
+IMaterial *pMaterial = ppMaterials[ pSkinRef[ pMesh->material ] ];
+```
+
+`nSkin` is `m_nSkin` on an animating entity and `StaticPropLump_t::m_Skin` on a
+static prop. So one model draws in as many material sets as it has families,
+and **the geometry is identical in all of them** — the table remaps materials
+and nothing else.
+
+### 14.2 The four measurements that scoped it
+
+Taken against the depot, over all 2,041 models and all 106 maps.
+
+| | |
+|---|---:|
+| models with more than one skin family | **208** of 2,041 |
+| the widest (`models/props/metal_box.mdl`, the weighted cube) | **12** families |
+| **static prop placements that ask for a non-zero skin** | **10,030** of 56,955 |
+| …of those, ones whose row actually differs from row 0 | **10,002** |
+| maps with at least one | **101** of 106 |
+| on `sp_a1_intro1` alone | **269** |
+| entity-lump `skin` keys that are non-zero | **771** across 91 maps |
+| …the largest class among them | `prop_dynamic`, **609** |
+
+The family histogram is `{1: 1833, 2: 125, 3: 46, 4: 13, 5: 4, 6: 8, 7: 11, 12: 1}`.
+
+**17.6% of the game's static props draw with the wrong materials today**, and
+the worst offender by a distance is `models/anim_wp/framework/squarebeam_off.mdl`
+— 5,666 placements, which is the white framework beam that Aperture's walls are
+built out of. `models/props_lab/glass_lightcover.mdl` is second at 1,652.
+
+That is the case for doing this now rather than filing it behind LOD selection:
+the cube is 15 placements and the framework is five thousand.
+
+### 14.3 The finding that makes it safe
+
+**Family 0 is the identity permutation in every one of the game's 2,041
+models**, and `numskinref == numtextures` in every one of them too. So the
+port's current `textures[mesh.material]` is *exactly* right for skin 0 and
+wrong only for the other families — there is no latent bug being fixed here,
+only a missing feature being added, and nothing that draws correctly today can
+regress.
+
+It also means the table cannot be skipped as "usually identity": a
+`squarebeam_off` at skin 1 is a genuinely different row.
+
+### 14.4 The clamp, and the one divergence
+
+Valve clamps out-of-range skins to family 0, in two spellings that disagree
+about negatives:
+
+```c
+if ( nSkin >= pStudioHdr->numskinfamilies ) nSkin = 0;          // :1938, :2006
+if ( skin > 0 && skin < m_pStudioHdr->numskinfamilies ) ...     // r_studiodraw.cpp:2911
+```
+
+The first indexes negatively for a negative `m_nSkin`; the second does not.
+**This port takes the second**, so `skin <= 0 || skin >= families` is family 0.
+No shipped content reaches it — 28 placements name a family their model has not
+got, all of them positive — and the difference is a read out of bounds against
+a defined answer. Recorded here because it is the kind of thing a later reader
+would otherwise "fix" back.
+
+### 14.5 The design
+
+The batch key does not change. `build.rs` already groups a model's meshes by
+`mstudiomesh_t::material`, which *is* the skinref slot — skin-independent by
+construction — so the index ranges, the batch count and the draw order are all
+untouched. Only the material a batch names becomes plural:
+
+- `Mdl` gains `skin_families: Vec<Vec<u16>>`, rows of texture indices, every
+  entry range-checked against `numtextures`. `mstudiomesh_t::material` is
+  range-checked against `numskinref` instead of `numtextures`.
+- `studio::Batch::material: String` becomes `materials: Vec<String>` — one per
+  family, resolved through the row — with `Batch::material(skin: i32) -> &str`
+  doing the clamp.
+- `PropBatch::material: Arc<Material>` becomes `materials: Vec<Arc<Material>>`,
+  the same shape, with the same accessor.
+- Every draw site passes the instance's raw skin. The clamp stays on the
+  accessor rather than being precomputed onto the instance, because
+  `prop_weighted_cube` changes its skin at run time when it is painted and a
+  precomputed family would have to be re-derived in `sync`.
+
+**`uses_bumpmapping` has to widen with it.** It is ORed over the model's
+materials and it decides `bStaticLighting` — whether a prop reads a `.vhv` at
+all — so it must consider *every* family's materials, not family 0's. Valve
+computes it over the whole `ppMaterials` array for exactly this reason
+(`studiorendercontext.cpp:274`). So does `needs_frame_buffer_copy`, which
+decides whether the map needs a refracting pass.
+
+### 14.6 What it does not do
+
+**Body groups** (`m_nBody`) are the other half of the same family of
+selectors and stay unported — they choose which *model* inside a body part
+draws, which is geometry rather than materials, and §8's batching already keeps
+body parts separate so that they can be added without a rewrite.
+
+**`$includemodel` does not merge skin tables.** An included model contributes
+sequences and nothing else here, and its host's table is the one that draws.

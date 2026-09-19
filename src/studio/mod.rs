@@ -158,11 +158,17 @@ pub enum StudioError {
 /// never sorts per frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
-    /// The material name as [`MaterialCache::load`] wants it: relative to
-    /// `materials/`, lowercased, no extension.
+    /// The material name as [`MaterialCache::load`] wants it — relative to
+    /// `materials/`, lowercased, no extension — **one per skin family**, in
+    /// family order.
+    ///
+    /// Never empty: a model with no replaceable texture table gets one entry,
+    /// which is the whole of what the port drew before families were read.
+    /// Index it with [`material`](Batch::material) rather than directly, so
+    /// that an out-of-range skin lands on family 0 the way the reference does.
     ///
     /// [`MaterialCache::load`]: crate::materials::MaterialCache::load
-    pub material: String,
+    pub materials: Vec<String>,
     /// Offset into [`StudioModel::indices`].
     pub first_index: u32,
     pub index_count: u32,
@@ -175,6 +181,40 @@ pub struct Batch {
     /// merging across them would make body-group selection impossible to add.
     pub body_part: u16,
     pub model: u16,
+}
+
+impl Batch {
+    /// The material this batch wears at `skin`, which is `m_nSkin` on an
+    /// entity and `StaticPropLump_t::m_Skin` on a static prop.
+    ///
+    /// **Out of range is family 0**, which is what `studiorender` does — with
+    /// one deliberate difference. Valve spells the clamp two ways that
+    /// disagree about negatives: `if ( nSkin >= numskinfamilies ) nSkin = 0`
+    /// (`studiorendercontext.cpp:1938`, `:2006`) indexes *behind* the table for
+    /// a negative skin, while `if ( skin > 0 && skin < numskinfamilies )`
+    /// (`r_studiodraw.cpp:2911`) does not. This takes the second. No shipped
+    /// content reaches the difference — all 28 out-of-range static prop
+    /// placements in the game name a positive family — so the choice is
+    /// between a read out of bounds and a defined answer.
+    pub fn material(&self, skin: i32) -> &str {
+        self.materials
+            .get(family(skin, self.materials.len()))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+}
+
+/// Which skin family a raw `m_nSkin` selects out of `families` of them.
+///
+/// Shared with [`engine::world::props`] so that the two spellings of the clamp
+/// cannot drift — see [`Batch::material`] for why it is this spelling.
+///
+/// [`engine::world::props`]: crate::engine::world::props
+pub fn family(skin: i32, families: usize) -> usize {
+    match skin > 0 && (skin as usize) < families {
+        true => skin as usize,
+        false => 0,
+    }
 }
 
 /// A studio model, resolved and ready to upload.
@@ -209,6 +249,13 @@ pub struct StudioModel {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
+    /// `numskinfamilies` — how many material sets this model's geometry draws
+    /// in. **At least 1**, and 1 for 1,833 of the game's 2,041 models.
+    ///
+    /// Every [`Batch::materials`] is this long, so it is redundant with them;
+    /// it is kept because a model with no batches still has an answer and
+    /// because the census wants it without walking the batches.
+    pub skin_families: usize,
     /// The studio meshes of LOD 0, in file order — what a [`Vhv`]'s meshes are
     /// matched against.
     pub meshes: Vec<HardwareMesh>,
@@ -434,7 +481,7 @@ mod tests {
         assert_eq!(model.vertices.len(), 3);
         assert_eq!(model.indices, vec![0, 1, 2]);
         assert_eq!(model.batches.len(), 1);
-        assert_eq!(model.batches[0].material, "models/test/wall");
+        assert_eq!(model.batches[0].material(0), "models/test/wall");
         assert_eq!(model.triangle_count(), 1);
     }
 
@@ -597,7 +644,7 @@ mod tests {
         let model = assemble_spec(&spec).expect("a well-formed trio");
         // Only the second directory exists to the resolver, so it wins even
         // though the first is tried first.
-        assert_eq!(model.batches[0].material, "models/test/wall");
+        assert_eq!(model.batches[0].material(0), "models/test/wall");
     }
 
     /// 8 texture references across the whole shipped game resolve to nothing.
@@ -610,13 +657,17 @@ mod tests {
             ..Spec::default()
         };
         let model = assemble_spec(&spec).expect("an unresolvable material is not a load failure");
-        assert_eq!(model.batches[0].material, "models/nowhere/wall");
+        assert_eq!(model.batches[0].material(0), "models/nowhere/wall");
     }
 
-    /// Meshes sharing a material become one batch; meshes that do not stay
-    /// separate.
+    /// Meshes sharing a replaceable texture slot become one batch; meshes that
+    /// do not stay separate.
+    ///
+    /// The companion to [`two_slots_sharing_a_material_stay_two_batches`],
+    /// which is the same rule seen from the other side: the *slot* merges two
+    /// meshes, and a shared material does not.
     #[test]
-    fn batches_group_by_material_within_a_model() {
+    fn batches_group_by_slot_within_a_model() {
         let spec = Spec {
             textures: vec!["wall".to_owned(), "floor".to_owned()],
             pool_vertices: 9,
@@ -647,12 +698,158 @@ mod tests {
             ..Spec::default()
         };
         let model = assemble_spec(&spec).expect("a well-formed trio");
-        assert_eq!(model.batches.len(), 2, "two materials, three meshes");
+        assert_eq!(model.batches.len(), 2, "two slots, three meshes");
         let wall = &model.batches[0];
-        assert_eq!(wall.material, "models/test/wall");
+        assert_eq!(wall.material(0), "models/test/wall");
         assert_eq!(wall.index_count, 6, "both wall meshes in one batch");
         let indices = &model.indices[wall.first_index as usize..][..6];
         assert_eq!(indices, [0, 1, 2, 6, 7, 8]);
+    }
+
+    /// **`mstudiomesh_t::material` is a column of the skin table, not an index
+    /// into the texture list.** The two coincide at family 0 — which is the
+    /// identity permutation in every one of the game's 2,041 models — and
+    /// diverge everywhere else, so this is the assertion that says the
+    /// indirection is actually being walked.
+    #[test]
+    fn a_mesh_material_is_a_column_of_the_skin_table() {
+        let spec = Spec {
+            textures: vec!["clean".to_owned(), "rusted".to_owned()],
+            // Two families over one reference: family 1 swaps in the second
+            // texture for the same slot, which is what a rusted cube is.
+            skin_families: vec![vec![0], vec![1]],
+            ..Spec::default()
+        };
+        let model = assemble_spec(&spec).expect("a well-formed trio");
+        assert_eq!(model.skin_families, 2);
+        assert_eq!(model.batches.len(), 1, "one slot is one batch in both");
+        let batch = &model.batches[0];
+        assert_eq!(batch.material(0), "models/test/clean");
+        assert_eq!(batch.material(1), "models/test/rusted");
+    }
+
+    /// The clamp, in the spelling `r_studiodraw.cpp:2911` uses rather than the
+    /// one `studiorendercontext.cpp:1938` does — see [`Batch::material`].
+    ///
+    /// Valve's other spelling (`if ( nSkin >= numskinfamilies ) nSkin = 0`)
+    /// indexes *behind* the table for a negative skin. No shipped content
+    /// reaches it: all 28 out-of-range static prop placements in the game name
+    /// a positive family.
+    #[test]
+    fn a_skin_outside_the_table_draws_family_zero() {
+        let spec = Spec {
+            textures: vec!["clean".to_owned(), "rusted".to_owned()],
+            skin_families: vec![vec![0], vec![1]],
+            ..Spec::default()
+        };
+        let model = assemble_spec(&spec).expect("a well-formed trio");
+        let batch = &model.batches[0];
+        for skin in [-7, -1, 2, 11, i32::MAX, i32::MIN] {
+            assert_eq!(
+                batch.material(skin),
+                "models/test/clean",
+                "skin {skin} should fall back to family 0"
+            );
+        }
+    }
+
+    /// A file with no replaceable texture table at all still answers for skin
+    /// 0, by the identity row the reader synthesizes — which is exactly what
+    /// the port drew before families were read, so nothing that drew correctly
+    /// can regress.
+    #[test]
+    fn a_model_with_no_skin_table_gets_an_identity_row() {
+        let model = assemble_spec(&Spec::default()).expect("a well-formed trio");
+        assert_eq!(model.skin_families, 1);
+        assert_eq!(model.batches[0].materials, ["models/test/wall"]);
+        assert_eq!(model.batches[0].material(3), "models/test/wall");
+    }
+
+    /// **Batches are keyed on the slot, not on the material it resolves to.**
+    ///
+    /// Two slots pointing at one texture in family 0 are one material and two
+    /// batches, because family 1 tells them apart. Merging them at build time
+    /// — which grouping by the resolved name would do — would make the second
+    /// family unrepresentable, and the model would draw entirely in the first
+    /// slot's material at every skin.
+    #[test]
+    fn two_slots_sharing_a_material_stay_two_batches() {
+        let spec = Spec {
+            textures: vec!["clean".to_owned(), "rusted".to_owned()],
+            skin_families: vec![vec![0, 0], vec![0, 1]],
+            pool_vertices: 6,
+            body_parts: vec![ModelSpec {
+                vertex_index: 0,
+                vertex_count: 6,
+                meshes: vec![
+                    MeshSpec {
+                        material: 0,
+                        vertex_offset: 0,
+                        vertex_count: 3,
+                        triangles: vec![[0, 1, 2]],
+                    },
+                    MeshSpec {
+                        material: 1,
+                        vertex_offset: 3,
+                        vertex_count: 3,
+                        triangles: vec![[0, 1, 2]],
+                    },
+                ],
+            }],
+            ..Spec::default()
+        };
+        let model = assemble_spec(&spec).expect("a well-formed trio");
+        assert_eq!(model.batches.len(), 2, "two slots, one material at skin 0");
+        assert_eq!(model.batches[0].material(0), "models/test/clean");
+        assert_eq!(model.batches[1].material(0), "models/test/clean");
+        assert_eq!(model.batches[1].material(1), "models/test/rusted");
+    }
+
+    /// A skin family naming a texture the model has not got is refused rather
+    /// than silently drawn as the error material: it is a misread `skinindex`
+    /// far more often than it is a bad file, and reading one table at the wrong
+    /// offset gives plausible small integers.
+    #[test]
+    fn a_skin_family_naming_a_missing_texture_is_refused() {
+        let spec = Spec {
+            textures: vec!["clean".to_owned()],
+            skin_families: vec![vec![0], vec![4]],
+            ..Spec::default()
+        };
+        let err = assemble_spec(&spec).unwrap_err();
+        let StudioError::Corrupt { what, .. } = &err else {
+            panic!("expected a corrupt-file error, got {err}");
+        };
+        assert!(what.contains("skin family 1"), "{what}");
+    }
+
+    /// A mesh naming a slot wider than the table is refused for the same
+    /// reason, and with the range check that used to be against the *texture*
+    /// count. They are equal in every shipped model; the format does not say
+    /// they must be.
+    #[test]
+    fn a_mesh_naming_a_slot_the_table_has_not_got_is_refused() {
+        let spec = Spec {
+            textures: vec!["clean".to_owned(), "rusted".to_owned()],
+            // One reference wide, and the mesh below asks for the second.
+            skin_families: vec![vec![0]],
+            body_parts: vec![ModelSpec {
+                vertex_index: 0,
+                vertex_count: 3,
+                meshes: vec![MeshSpec {
+                    material: 1,
+                    vertex_offset: 0,
+                    vertex_count: 3,
+                    triangles: vec![[0, 1, 2]],
+                }],
+            }],
+            ..Spec::default()
+        };
+        let err = assemble_spec(&spec).unwrap_err();
+        let StudioError::Corrupt { what, .. } = &err else {
+            panic!("expected a corrupt-file error, got {err}");
+        };
+        assert!(what.contains("skin reference 1 of 1"), "{what}");
     }
 
     /// A `.vtx` from a different build of the model parses fine and indexes the
@@ -828,6 +1025,45 @@ mod tests {
         assert_eq!(model.vertices.len(), 3);
     }
 
+    /// **The weighted cube's own table**, which is the widest in the game and
+    /// the one the default map's cube draws out of.
+    ///
+    /// `models/props/metal_box.mdl` is 12 families over 12 slots and **one
+    /// mesh**, on slot 0. So every family but 0 differs from 0 in exactly one
+    /// entry — the one the mesh names — and the other eleven columns are
+    /// carried along unused. That shape is why a batch has to be keyed on the
+    /// slot and carry a material per family: keying on the resolved material
+    /// would collapse all twelve into one.
+    ///
+    /// `sp_a1_intro1`'s cube is a rusted standard cube, skin 3. Before the
+    /// table was read it drew `metal_box`; it now draws `metal_box_skin003`.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_weighted_cube_draws_in_twelve_material_sets() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let model = StudioModel::load(&vfs, "models/props/metal_box.mdl").expect("the cube model");
+        assert_eq!(model.skin_families, 12, "the widest table in the game");
+        assert_eq!(model.batches.len(), 1, "one mesh, one replaceable slot");
+        let batch = &model.batches[0];
+        assert_eq!(batch.materials.len(), 12);
+        assert_eq!(batch.material(0), "models/props/metal_box");
+        // The three the shipped maps actually place: companion (1), rusted
+        // standard (3) and — through `reflection_cube.mdl` rather than this
+        // model — rusted reflective. See `server::tests`' cube census.
+        assert_eq!(batch.material(1), "models/props/metal_box_skin001");
+        assert_eq!(batch.material(3), "models/props/metal_box_skin003");
+        // Every family names a distinct material, so no two of the twelve
+        // draw alike and none of them is family 0.
+        let distinct: std::collections::HashSet<&String> = batch.materials.iter().collect();
+        assert_eq!(distinct.len(), 12, "twelve families, twelve materials");
+    }
+
     /// Every studio model the shipped game holds, parsed for real.
     ///
     /// Ignored by default and gated on `KISAK_GAME_DIR`, because the depot is
@@ -896,6 +1132,13 @@ mod tests {
         // `$includemodel`: how many models declare one, how many of those the
         // game actually ships, and what merging them is worth.
         let (mut declares, mut merged, mut from_includes) = (0usize, 0usize, 0usize);
+        // **Skin families.** How many models draw in more than one material
+        // set, how wide the widest table is, and — the finding that makes the
+        // whole change safe — whether family 0 is ever anything but the
+        // identity permutation. See `portdocs/STUDIO.md` §14.
+        let (mut multi_family, mut family_zero_remaps) = (0usize, 0usize);
+        let (mut widest_family, mut widest_family_at) = (0usize, String::new());
+        let mut narrow_table = 0usize;
         // `Mdl::render_bounds`' reason to exist.
         let (mut no_view_bb, mut rescued) = (0usize, 0usize);
         let (mut widest_hull, mut widest_hull_at) = (0.0f32, String::new());
@@ -939,6 +1182,33 @@ mod tests {
                 .unwrap_or((0, 0));
             let local_attachments = header.as_ref().map_or(0, |mdl| mdl.attachments.len());
             declares += usize::from(declared > 0);
+            if let Some(mdl) = &header {
+                let families = mdl.skin_families.len();
+                multi_family += usize::from(families > 1);
+                if families > widest_family {
+                    widest_family = families;
+                    widest_family_at = path.clone();
+                }
+                // **Family 0 is the identity in every shipped model.** That is
+                // why the port's old `textures[mesh.material]` was right for
+                // skin 0 and wrong only for the rest: this change adds a
+                // feature and cannot regress a picture. If this ever fires,
+                // some model draws differently at skin 0 than it used to.
+                let row = &mdl.skin_families[0];
+                if row
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, &texture)| usize::from(texture) != slot)
+                {
+                    family_zero_remaps += 1;
+                }
+                // And `numskinref == numtextures` in every one of them, which
+                // is why widening the mesh range check from the texture count
+                // to the table width refuses nothing new.
+                if row.len() != mdl.textures.len() {
+                    narrow_table += 1;
+                }
+            }
             // **The assumption `world::props::models` makes about a prop's two
             // lighting sources.** They replace each other — the colour mesh or
             // the light cache, never both — and this flag is the one thing that
@@ -1315,6 +1585,28 @@ mod tests {
         // Was 5,434 before the merge, and the difference is what every
         // `prop_dynamic` naming an `anim_wp/room_transform` sequence was
         // missing.
+        // `portdocs/STUDIO.md` §14's first three rows, asserted rather than
+        // recorded: 208 of the game's models draw in more than one material
+        // set and the weighted cube's is the widest at 12.
+        println!(
+            "  skin families: {multi_family} models with more than one, \
+             widest {widest_family} ({widest_family_at})"
+        );
+        assert_eq!(multi_family, 208, "models with more than one skin family");
+        assert_eq!(widest_family, 12, "the widest replaceable texture table");
+        assert_eq!(
+            widest_family_at, "models/props/metal_box.mdl",
+            "the widest is the weighted cube's"
+        );
+        assert_eq!(
+            family_zero_remaps, 0,
+            "skin 0 is the identity permutation in every shipped model, which \
+             is why reading the table cannot change a picture that was right"
+        );
+        assert_eq!(
+            narrow_table, 0,
+            "numskinref == numtextures in every shipped model"
+        );
         assert_eq!(sequences, 10_666, "sequences, including included ones");
         assert_eq!(from_includes, 5_232, "sequences that came from a companion");
         assert_eq!(widest_animation, 4_050, "the longest animation in the game");

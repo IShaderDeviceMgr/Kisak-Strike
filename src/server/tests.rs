@@ -3264,6 +3264,12 @@ fn every_shipped_map_spawns_its_entities() {
     // triggers this port has a class for, and therefore how much of a map is
     // now able to notice the player.
     let mut triggers = 0;
+    // The entity half of `portdocs/STUDIO.md` §14's measurement — the static
+    // prop half is `every_shipped_map_places_its_props`. How many entities
+    // that place a studio model end up on a skin family other than 0, and how
+    // many of those actually draw a different material for it.
+    let (mut entity_skins, mut entity_skins_remapped) = (0usize, 0usize);
+    let mut skin_tables: BTreeMap<String, Option<Vec<Vec<String>>>> = BTreeMap::new();
 
     for name in &names {
         let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
@@ -3294,6 +3300,28 @@ fn every_shipped_map_spawns_its_entities() {
             1,
             "{name}: not exactly one worldspawn"
         );
+
+        for state in server.model_entities() {
+            if state.skin == 0 {
+                continue;
+            }
+            entity_skins += 1;
+            let families = skin_tables
+                .entry(state.model.clone())
+                .or_insert_with(|| {
+                    crate::studio::StudioModel::load(&vfs, &state.model)
+                        .ok()
+                        .map(|model| model.batches.into_iter().map(|b| b.materials).collect())
+                })
+                .as_ref();
+            let Some(families) = families else { continue };
+            if families.iter().any(|materials| {
+                let family = crate::studio::family(state.skin, materials.len());
+                family != 0 && materials[family] != materials[0]
+            }) {
+                entity_skins_remapped += 1;
+            }
+        }
 
         for (_, entity) in server.entities.iter() {
             *per_class.entry(entity.classname()).or_default() += 1;
@@ -3646,6 +3674,20 @@ fn every_shipped_map_spawns_its_entities() {
     // 98 across 59 maps, one of them on `sp_a1_intro1`. Every one of them is
     // drawn, and none of them falls.
     assert_eq!(per_class.get("prop_weighted_cube"), Some(&98));
+    println!(
+        "  entity skins: {entity_skins} placements name a non-zero family, \
+         {entity_skins_remapped} of them draw a different material"
+    );
+    // The entity half of the skin-family measurement. Fewer than the 771
+    // non-zero `skin` keys the entity lump carries, because a key on a class
+    // this port has no model path for never reaches the draw — 663 is the
+    // number that does, and the 4 that do not remap name a family their model
+    // has not got.
+    assert_eq!(entity_skins, 663, "model entities on a non-zero skin family");
+    assert_eq!(
+        entity_skins_remapped, 659,
+        "…of which draw a different material for it"
+    );
     println!("  what each shipped cube ends up wearing:");
     for ((model, skin), count) in &cube_skins {
         println!("    {count:>4}  {model} skin {skin}");
@@ -3654,10 +3696,11 @@ fn every_shipped_map_spawns_its_entities() {
     // behind two claims. First, that `ConvertOldSkins` is doing its job: the
     // four distinct models are the four cube types the maps actually place,
     // and 77 of the 98 got there from a `skin` key rather than a `CubeType`.
-    // Second, the size of the skin-family gap — **15 of the 98 end on a
-    // non-zero skin** (5 companion, 8 rusted standard, 2 rusted reflective)
-    // and the renderer draws skin 0 for all of them, because `.mdl`'s skin
-    // table is not read yet. One of the 15 is on `sp_a1_intro1`.
+    // Second, what skin families bought here — **15 of the 98 end on a
+    // non-zero skin** (5 companion, 8 rusted standard, 2 rusted reflective),
+    // and every one of them now draws in it. One of the 15 is on
+    // `sp_a1_intro1`, which is why the default map's cube went from clean to
+    // rusted the day `Batch::materials` landed.
     assert_eq!(
         cube_skins
             .iter()
@@ -3681,7 +3724,7 @@ fn every_shipped_map_spawns_its_entities() {
             .map(|(_, n)| n)
             .sum::<usize>(),
         15,
-        "cubes whose skin the renderer cannot yet draw"
+        "cubes drawn in a family other than 0"
     );
     // `portdocs/PORTAL.md` stage 2. 21 across 10 maps, two of them on
     // `sp_a1_intro1` — the map this port loads by default, which makes this

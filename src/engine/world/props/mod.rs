@@ -549,6 +549,21 @@ mod tests {
 
         let (mut maps, mut total, mut with_props) = (0, 0usize, 0);
         let (mut vhv_total, mut vhv_matched, mut vhv_stale) = (0usize, 0usize, 0usize);
+        // **What reading the skin table is worth**, in placements rather than
+        // in models: how many static props ask for a family other than 0, and
+        // how many of those actually draw a different material for it. See
+        // `portdocs/STUDIO.md` §14 — the answer is why this went in ahead of
+        // LOD selection.
+        let (mut skinned, mut skinned_remapped, mut skinned_clamped) = (0usize, 0usize, 0usize);
+        let mut skinned_maps = 0usize;
+        let (mut worst_model, mut worst_model_count) = (String::new(), 0usize);
+        let mut by_model: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Keyed by path and shared across maps: the same model is placed on
+        // dozens of them and only its *materials per family* are wanted, so
+        // the geometry is dropped as soon as it is read.
+        let mut skins: std::collections::HashMap<String, Option<Vec<Vec<String>>>> =
+            std::collections::HashMap::new();
         for name in &names {
             let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
             let props = Props::load(name, &bsp).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -565,6 +580,48 @@ mod tests {
                 assert!(prop.leaves.end <= props.leaves.len());
                 assert!(prop.model.ends_with(".mdl"), "{}", prop.model);
             }
+            let mut map_remapped = 0usize;
+            for prop in &props.instances {
+                if prop.skin == 0 {
+                    continue;
+                }
+                skinned += 1;
+                let families = skins
+                    .entry(prop.model.clone())
+                    .or_insert_with(|| {
+                        crate::studio::StudioModel::load(&vfs, &prop.model)
+                            .ok()
+                            .map(|model| {
+                                model.batches.into_iter().map(|b| b.materials).collect()
+                            })
+                    })
+                    .as_ref();
+                let Some(families) = families else { continue };
+                // The draw's own question, asked the draw's own way: does any
+                // batch resolve to a different material at this skin than at
+                // family 0? An out-of-range skin answers no, because
+                // `Batch::material` clamps to family 0 — which is what the 28
+                // placements counted here as clamped are.
+                let remaps = families.iter().any(|materials| {
+                    let family = crate::studio::family(prop.skin, materials.len());
+                    family != 0 && materials[family] != materials[0]
+                });
+                match remaps {
+                    true => {
+                        skinned_remapped += 1;
+                        map_remapped += 1;
+                        let count = by_model.entry(prop.model.clone()).or_default();
+                        *count += 1;
+                        if *count > worst_model_count {
+                            worst_model_count = *count;
+                            worst_model = prop.model.clone();
+                        }
+                    }
+                    false => skinned_clamped += 1,
+                }
+            }
+            skinned_maps += usize::from(map_remapped > 0);
+
             // Stage 4: every prop's `.vhv` must match the model it names, in
             // the hardware vertex order `HardwareMesh` documents. A count that
             // disagrees is the reader being wrong about that order rather than
@@ -622,6 +679,11 @@ mod tests {
                 // `portdocs/STUDIO.md` §8 stage 2's acceptance measurement.
                 assert_eq!(props.instances.len(), 1080, "sp_a1_intro1 prop count");
                 assert_eq!(props.models.len(), 136, "sp_a1_intro1 distinct models");
+                // §14's: the default map is not a corner case for this.
+                assert_eq!(
+                    map_remapped, 269,
+                    "sp_a1_intro1 props drawn in a family other than 0"
+                );
             }
         }
         println!(
@@ -629,6 +691,27 @@ mod tests {
              {vhv_matched}/{vhv_total} .vhv files match their model \
              ({vhv_stale} with a stale checksum, used anyway)"
         );
+        println!(
+            "  skins: {skinned} placements ask for a non-zero family, \
+             {skinned_remapped} of them draw a different material, over \
+             {skinned_maps} maps; worst model {worst_model} ({worst_model_count})"
+        );
+        // **17.6% of the game's static props drew the wrong materials before
+        // this.** That is the case for reading the table, and these are the
+        // numbers `portdocs/STUDIO.md` §14.2 was scoped from.
+        assert_eq!(skinned, 10_030, "placements naming a non-zero skin");
+        assert_eq!(skinned_remapped, 10_002, "placements that actually remap");
+        assert_eq!(
+            skinned_clamped, 28,
+            "placements naming a family their model has not got, which clamp \
+             to 0 rather than reading past the table"
+        );
+        assert_eq!(skinned_maps, 101, "maps with at least one");
+        assert_eq!(
+            worst_model, "models/anim_wp/framework/squarebeam_off.mdl",
+            "the framework beam Aperture's walls are built out of"
+        );
+        assert_eq!(worst_model_count, 5_666);
 
         // The decode question `light::decode` documents, measured rather than
         // argued: a lightmap luxel and an ambient cube sample are both

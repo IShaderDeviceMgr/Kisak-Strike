@@ -73,9 +73,12 @@ pub struct ModelEntity {
     pub origin: Vec3,
     /// Pitch, yaw, roll.
     pub angles: Vec3,
-    /// `m_nSkin`. Not read yet — a model's skin families are
-    /// `portdocs/STUDIO.md` stage 6's — and carried so that the seam does not
-    /// have to change when they are.
+    /// `m_nSkin` — which skin family of the model draws this entity.
+    ///
+    /// Out of range is family 0; see
+    /// [`studio::family`](crate::studio::family) for which of Valve's two
+    /// disagreeing clamps this is. 771 of the game's entities ship a non-zero
+    /// one, 609 of them `prop_dynamic`.
     pub skin: i32,
     /// `ShouldDraw` — whether this entity is drawn *this frame*.
     ///
@@ -182,6 +185,13 @@ struct Instance {
     /// them from the bind pose turns `sp_a1_intro1`'s furniture a quarter turn
     /// and stands it in the bed.
     sequence: usize,
+    /// `m_nSkin` — which of the model's skin families draws it, raw and
+    /// unclamped; [`PropBatch::material`] does the clamping.
+    ///
+    /// **Re-read every sync**, because it changes while the level runs:
+    /// `prop_weighted_cube` picks a different one when it is painted, which is
+    /// the only one of the game's 771 non-zero skins that is not set at spawn.
+    skin: i32,
     cycle: f32,
     anim_time: f32,
     playback_rate: f32,
@@ -473,13 +483,13 @@ impl EntityModels {
                     .batches
                     .iter()
                     .map(|batch| PropBatch {
-                        material: resolve_material(
-                            vfs,
-                            materials,
-                            &mut resolved,
-                            &error,
-                            &batch.material,
-                        ),
+                        materials: batch
+                            .materials
+                            .iter()
+                            .map(|name| {
+                                resolve_material(vfs, materials, &mut resolved, &error, name)
+                            })
+                            .collect(),
                         first_index: batch.first_index,
                         index_count: batch.index_count,
                     })
@@ -515,6 +525,7 @@ impl EntityModels {
                     * Mat4::from_mat3(crate::math::angle_matrix(entity.angles)),
                 visible: entity.visible,
                 sequence: model.sequence(&entity.sequence).unwrap_or(0),
+                skin: entity.skin,
                 cycle: entity.cycle,
                 anim_time: entity.anim_time,
                 playback_rate: entity.playback_rate,
@@ -524,11 +535,15 @@ impl EntityModels {
         }
 
         let widest = models.iter().map(|m| m.vertex_count).max().unwrap_or(0);
+        // The skin the instance actually wears, not every family the model
+        // carries: a false positive costs the map a full-screen copy and a
+        // second pass every frame. See `PropModels::load` for the same rule
+        // and for why `uses_bumpmapping` is deliberately the other way round.
         let refracts = instances.iter().any(|instance| {
             models[instance.model]
                 .batches
                 .iter()
-                .any(|batch| batch.material.needs_frame_buffer_copy)
+                .any(|batch| batch.material(instance.skin).needs_frame_buffer_copy)
         });
 
         let by_id = instances
@@ -596,6 +611,7 @@ impl EntityModels {
             instance.sequence = self.models[instance.model]
                 .sequence(&entity.sequence)
                 .unwrap_or(0);
+            instance.skin = entity.skin;
             instance.cycle = entity.cycle;
             instance.anim_time = entity.anim_time;
             instance.playback_rate = entity.playback_rate;
@@ -717,8 +733,10 @@ impl EntityModels {
                 .transform
                 .transform_point3((model.bounds.0 + model.bounds.1) * 0.5);
             for (batch_index, batch) in model.batches.iter().enumerate() {
-                let pass =
-                    GeometryPass::of_instance(&batch.material, instance.modulation[3] != 1.0);
+                let pass = GeometryPass::of_instance(
+                    batch.material(instance.skin),
+                    instance.modulation[3] != 1.0,
+                );
                 if pass == GeometryPass::Translucent {
                     out(center, index, batch_index);
                 }
@@ -764,7 +782,7 @@ impl EntityModels {
         let vertices = model.vertices.slice();
         let indices = model.indices.range(batch.first_index, batch.index_count);
         pass.draw_modulated(
-            &batch.material,
+            batch.material(instance.skin),
             &vertices,
             &indices,
             instance.transform,
@@ -803,7 +821,8 @@ impl EntityModels {
 
             for batch in &model.batches {
                 let translucent = instance.modulation[3] != 1.0;
-                if GeometryPass::of_instance(&batch.material, translucent) != wanted {
+                if GeometryPass::of_instance(batch.material(instance.skin), translucent) != wanted
+                {
                     continue;
                 }
                 self.record_batch(pass, model, instance, batch);

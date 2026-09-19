@@ -43,6 +43,12 @@ pub(crate) struct Spec {
     pub textures: Vec<String>,
     /// `cdtextures` search directories, without trailing slashes.
     pub texture_dirs: Vec<String>,
+    /// The replaceable texture table: one row per skin family, each of
+    /// `numskinref` indices into [`textures`](Spec::textures). **Empty writes
+    /// no table at all**, which is the shape the reader synthesizes an
+    /// identity row for — and the shape every test that predates skin families
+    /// uses.
+    pub skin_families: Vec<Vec<u16>>,
     /// One entry per body part; every body part holds exactly one model.
     pub body_parts: Vec<ModelSpec>,
     /// How many vertices the `.vvd` pool holds, before any fixup culling.
@@ -75,6 +81,7 @@ impl Default for Spec {
             checksum: 0x1234_5678,
             textures: vec!["wall".to_owned()],
             texture_dirs: vec!["models/test".to_owned()],
+            skin_families: Vec::new(),
             body_parts: vec![ModelSpec {
                 vertex_index: 0,
                 vertex_count: 3,
@@ -156,6 +163,25 @@ impl Spec {
         }
         put_i32(&mut out, 212, self.texture_dirs.len() as i32);
         put_i32(&mut out, 216, cd_base as i32);
+
+        // The replaceable texture table — `numskinfamilies` rows of
+        // `numskinref` shorts, laid out flat and row-major, which is how
+        // `pSkinref( skin * numskinref )` strides it.
+        if let Some(width) = self.skin_families.first().map(Vec::len) {
+            let skin_base = out.len();
+            for row in &self.skin_families {
+                assert_eq!(row.len(), width, "every skin family is numskinref wide");
+                for &entry in row {
+                    let at = out.len();
+                    out.resize(at + 2, 0);
+                    out[at..at + 2].copy_from_slice(&entry.to_le_bytes());
+                }
+            }
+            align4(&mut out);
+            put_i32(&mut out, 220, width as i32);
+            put_i32(&mut out, 224, self.skin_families.len() as i32);
+            put_i32(&mut out, 228, skin_base as i32);
+        }
 
         // Body parts, then each one's model, then each model's meshes. Written
         // in three passes because a body part's `modelindex` is relative to

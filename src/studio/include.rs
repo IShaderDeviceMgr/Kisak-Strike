@@ -330,6 +330,7 @@ mod tests {
             include_models: Vec::new(),
             textures: Vec::new(),
             texture_dirs: Vec::new(),
+            skin_families: vec![Vec::new()],
             body_parts: Vec::new(),
         }
     }

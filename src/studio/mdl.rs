@@ -130,7 +130,15 @@ impl StudioFlags {
 /// One mesh: a contiguous run of the model's vertices, all wearing one material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mesh {
-    /// Index into [`Mdl::textures`].
+    /// **A column of [`Mdl::skin_families`], not an index into
+    /// [`Mdl::textures`].**
+    ///
+    /// `mstudiomesh_t::material` names a *replaceable texture slot*: the
+    /// material is `skin_families[skin][material]`, which is how one model
+    /// draws in several material sets off one set of vertices. Family 0 is the
+    /// identity permutation in every one of Portal 2's 2,041 models, so the two
+    /// readings coincide at skin 0 and diverge everywhere else — see
+    /// `portdocs/STUDIO.md` §14.
     pub material: usize,
     /// `vertexoffset` — this mesh's first vertex **within its model**, which is
     /// the base the `.vtx`'s `origMeshVertID` is measured from.
@@ -213,6 +221,20 @@ pub struct Mdl {
     /// `cdtextureindex` — the directories to try, in order, each already
     /// slash-normalized, lowercased and terminated with `/`.
     pub texture_dirs: Vec<String>,
+    /// The **replaceable texture table**: `numskinfamilies` rows of
+    /// `numskinref` indices into [`textures`](Mdl::textures), which is what
+    /// [`Mesh::material`] selects a column of.
+    ///
+    /// `studiorender` reads it as one flat array and strides by `numskinref`
+    /// (`studiorendercontext.cpp:2010`); rows are nicer to bounds-check and
+    /// nicer to index, and every row is the same length by construction.
+    ///
+    /// **Never empty.** A file declaring no families or no references at all
+    /// gets the identity row over [`textures`](Mdl::textures) synthesized for
+    /// it, which is what the port drew before this table was read and is what
+    /// `studiorendercontext.cpp:1302`'s `!numskinfamilies` guard falls back to.
+    /// No shipped model needs it.
+    pub skin_families: Vec<Vec<u16>>,
     pub body_parts: Vec<BodyPart>,
 }
 
@@ -382,6 +404,48 @@ impl Mdl {
             dirs
         };
 
+        // The replaceable texture table. Read before the body parts because
+        // its *width* is what a mesh's `material` field is checked against.
+        let skin_families = {
+            let width = r.count(220, "skin references")?;
+            let rows = r.count(224, "skin families")?;
+            let base = r.offset(228, "skinindex")?;
+            // Checked before anything is allocated: `count` bounds each field
+            // by the file's length on its own, so a misread pair can ask for a
+            // table far larger than the file and this reader would reserve for
+            // it a row at a time before the first read failed.
+            if base + rows * width * 2 > r.bytes.len() {
+                return Err(r.corrupt(format!(
+                    "{rows} skin families of {width} references at {base} run past                      the end of {} ({} bytes)",
+                    r.what,
+                    r.bytes.len()
+                )));
+            }
+            let mut families = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut entries = Vec::with_capacity(width);
+                for column in 0..width {
+                    // Signed in the file and used unsigned; a negative entry
+                    // would index behind the material array.
+                    let entry = r.i16(base + (row * width + column) * 2)?;
+                    if entry < 0 || entry as usize >= textures.len() {
+                        return Err(r.corrupt(format!(
+                            "skin family {row} names texture {entry} of {}",
+                            textures.len()
+                        )));
+                    }
+                    entries.push(entry as u16);
+                }
+                families.push(entries);
+            }
+            // See `Mdl::skin_families`: a table that selects nothing still has
+            // to answer for skin 0.
+            if families.iter().all(|row| row.is_empty()) {
+                families = vec![(0..textures.len() as u16).collect()];
+            }
+            families
+        };
+
         let body_parts = {
             let count = r.count(232, "body parts")?;
             let base = r.offset(236, "bodypartindex")?;
@@ -390,7 +454,7 @@ impl Mdl {
                 parts.push(Self::body_part(
                     &r,
                     base + i * BODY_PART_STRIDE,
-                    textures.len(),
+                    skin_families[0].len(),
                 )?);
             }
             parts
@@ -412,11 +476,12 @@ impl Mdl {
             include_models,
             textures,
             texture_dirs,
+            skin_families,
             body_parts,
         })
     }
 
-    fn body_part(r: &Reader, at: usize, texture_count: usize) -> Result<BodyPart, StudioError> {
+    fn body_part(r: &Reader, at: usize, skin_refs: usize) -> Result<BodyPart, StudioError> {
         let name_at = r.relative_offset(at, at, "mstudiobodyparts_t::sznameindex")?;
         let name = normalize(&r.c_string(name_at)?);
         let count = r.count(at + 4, "models")?;
@@ -424,12 +489,12 @@ impl Mdl {
 
         let mut models = Vec::with_capacity(count);
         for i in 0..count {
-            models.push(Self::model(r, base + i * MODEL_STRIDE, texture_count)?);
+            models.push(Self::model(r, base + i * MODEL_STRIDE, skin_refs)?);
         }
         Ok(BodyPart { name, models })
     }
 
-    fn model(r: &Reader, at: usize, texture_count: usize) -> Result<Model, StudioError> {
+    fn model(r: &Reader, at: usize, skin_refs: usize) -> Result<Model, StudioError> {
         let name = normalize(&r.fixed_string(at, 64));
         let mesh_count = r.count(at + 72, "meshes")?;
         let mesh_base = r.relative_offset(at + 76, at, "mstudiomodel_t::meshindex")?;
@@ -454,10 +519,13 @@ impl Mdl {
         let mut meshes = Vec::with_capacity(mesh_count);
         for i in 0..mesh_count {
             let mesh_at = mesh_base + i * MESH_STRIDE;
+            // Against the *width of a skin family*, not the texture count:
+            // this is a column of the replaceable table. They are equal in
+            // every shipped model and the format does not require it.
             let material = r.i32(mesh_at)?;
-            if material < 0 || material as usize >= texture_count {
+            if material < 0 || material as usize >= skin_refs {
                 return Err(r.corrupt(format!(
-                    "mesh {i} of model {name:?} names material {material} of {texture_count}"
+                    "mesh {i} of model {name:?} names skin reference {material} of {skin_refs}"
                 )));
             }
             let mesh_vertex_count = r.i32(mesh_at + 8)?.max(0) as u32;

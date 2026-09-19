@@ -62,6 +62,7 @@ pub struct StudioModel {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
+    pub skin_families: usize,    // numskinfamilies — how many material sets, >= 1
     pub bones: Vec<anim::Bone>,
     pub sequences: Vec<anim::Sequence>,
     /// **Shared, not owned** — the draw path poses a model to look at it and
@@ -90,13 +91,31 @@ impl StudioModel {
 }
 
 pub struct Batch {
-    pub material: String,        // as MaterialCache::load wants it
+    /// **One per skin family**, in family order, as MaterialCache::load wants
+    /// them. Never empty. Index it with `material()`, not directly.
+    pub materials: Vec<String>,
     pub first_index: u32,
     pub index_count: u32,
     pub body_part: u16,
     pub model: u16,
 }
+
+impl Batch {
+    /// The material at `skin` — the raw m_nSkin, clamped to family 0.
+    pub fn material(&self, skin: i32) -> &str;
+}
+
+/// Which family a raw m_nSkin selects. `skin <= 0 || skin >= families` is 0.
+pub fn family(skin: i32, families: usize) -> usize;
 ```
+
+**A batch is one replaceable texture *slot*, not one material.** A slot means
+the same thing in every skin family and a material does not, so the batch is
+keyed on the slot and carries a material per family; the instance's skin picks
+between them at record time. Two slots that resolve to the same material at
+skin 0 stay two batches, because a later family can tell them apart —
+`models/props/metal_box.mdl` is 12 families over 12 slots with **one mesh**, and
+every family differs from family 0 in exactly the one column that mesh names.
 
 <a id="render-bounds"></a>
 
@@ -383,7 +402,7 @@ pub struct Prop {
     pub transform: Mat4,
     pub lighting_origin: Vec3,
     pub flags: PropFlags,
-    pub skin: i32,
+    pub skin: i32,                 // m_nSkin — which skin family draws it
     pub fade: (f32, f32, f32),
     pub diffuse_modulation: [u8; 4],
     pub leaves: Range<usize>,
@@ -407,6 +426,25 @@ impl PropModels {
 `PropModels::load` **cannot fail**: a prop whose model is missing is a prop that
 does not draw, which is what `CStaticPropMgr` does too. The reason is on stderr,
 once per model, and the count is in `stats`.
+
+```rust
+pub struct PropBatch {
+    pub materials: Vec<Arc<Material>>,   // one per skin family; never empty
+    pub first_index: u32,
+    pub index_count: u32,
+}
+
+impl PropBatch {
+    pub fn material(&self, skin: i32) -> &Arc<Material>;   // clamps like studio::family
+}
+```
+
+**`PropBatch` mirrors `studio::Batch`**, and every draw site passes the
+instance's *raw* skin rather than a precomputed family index. That is
+deliberate: a skin changes while the level runs — `prop_weighted_cube` picks a
+different one when it is painted — so a precomputed family would have to be
+re-derived in `EntityModels::sync`. Two comparisons per draw against a class of
+bug that only appears in motion.
 
 ### Lighting
 
@@ -750,8 +788,12 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   Valve gets the sharing free from `CMDLCache`; the equivalent here is a cache
   above `StudioModel::load`, and the condition for writing one is a level load
   that is actually too slow.
-- **Skin families** — `Prop::skin` is parsed and ignored; `mdl` reads
-  `numskinref`/`skinindex` but does not resolve them.
+- **Body groups** (`m_nBody`) — the other half of the selector family skin
+  families belong to, and the one still missing. It chooses which *model*
+  inside a body part draws, which is geometry rather than materials;
+  `build.rs` already keeps body parts in separate batches precisely so that it
+  can be added without a rewrite. 959 of 968 models have exactly one body part,
+  so it is near-vestigial on props and matters for characters.
 - **Culling** — `PropModel::bounds` is already in hand for it.
 
 ---
@@ -767,10 +809,18 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 | `studio::tests::materials_resolve_through_the_cdtexture_cross_product` | material resolution order |
 | `studio::tests::quad_lists_and_flex_deltas_are_refused` | the refusals §3 justifies |
 | `studio::tests::a_stale_companion_file_is_refused` | the checksum guard |
+| `studio::tests::a_mesh_material_is_a_column_of_the_skin_table` | that the indirection is walked at all — `mesh->material` is a slot, not a texture |
+| `studio::tests::a_skin_outside_the_table_draws_family_zero` | the clamp, in `r_studiodraw.cpp:2911`'s spelling rather than the one that indexes negatively |
+| `studio::tests::a_model_with_no_skin_table_gets_an_identity_row` | that a file with no table still answers for skin 0 — the shape every pre-families test uses |
+| `studio::tests::two_slots_sharing_a_material_stay_two_batches` | **the batching key**: grouping by resolved material instead of by slot would make the other families unrepresentable |
+| `studio::tests::a_skin_family_naming_a_missing_texture_is_refused`, `a_mesh_naming_a_slot_the_table_has_not_got_is_refused` | the two range checks a misread `skinindex` trips |
+| `studio::tests::the_weighted_cube_draws_in_twelve_material_sets` | the widest table in the game, resolved for real — 12 families over one mesh |
+| `engine::world::props::tests::every_shipped_map_places_its_props` | **the size of the skin gap**: 10,030 of 56,955 placements name a non-zero family and 10,002 draw a different material for it, over 101 maps, 269 on `sp_a1_intro1` |
+| `server::tests::every_shipped_map_spawns_its_entities` | the entity half — 663 model entities on a non-zero family, 659 of which remap — and that 15 of the game's 98 cubes now draw in the skin their map asked for |
 | `engine::world::entities::tests::the_cull_box_covers_a_model_that_declared_no_clipping_box` | gotcha 24 — the fallback's *shape*, including the eight-corner transform a rotated prop needs |
 | `engine::world::entities::tests::the_cull_box_follows_the_sequence_the_entity_plays` | the sequence box being merged in |
 | `engine::world::entities::tests::the_old_cull_box_would_have_dropped_most_of_the_games_props` | **the size of gotcha 24**, against the depot: 7,515 of 8,072 `prop_dynamic` placements wear a model that escapes the box the port used to build |
-| `studio::tests::every_shipped_studio_model_parses` | also the census behind gotchas 24 and 25, and the assertion that **no** static prop reaches outside its render bounds |
+| `studio::tests::every_shipped_studio_model_parses` | also the census behind gotchas 24 and 25, the assertion that **no** static prop reaches outside its render bounds, and that **family 0 is the identity permutation in all 2,041 models** — the finding that makes reading the skin table incapable of changing a picture that was already right |
 | `studio::anim::tests::skinning_on_the_cpu_matches_what_the_shader_does` | **`anim::skin` against the vertex shader's own arithmetic**, built the shader's way through `bone_rows` — the two spellings the whole skinning path rests on |
 | `studio::anim::tests::an_unweighted_slot_contributes_nothing` | that the *weight* and not the index decides, including for a bone the palette has not got |
 | `materials::preview::tests::a_skinned_vertex_rides_the_bone_its_weights_name` | the palette being read at all, on a real GPU — the quad's own coordinates put it on the left and the bone moves it right |
@@ -940,3 +990,32 @@ they are for**. The first of those found two wrong `.vtx` field offsets that **e
 synthetic test had passed**, because the fixture had been written from the reader
 instead of from `optimize.h`; the second found the hardware-order rule.
 `portdocs/STUDIO.md` §11 has both.
+
+**Skin families landed after `src/vphysics/`**, and the measurement is what moved
+them off `portdocs/STUDIO.md` §8's optional stage 6 and in front of LOD selection.
+`mstudiomesh_t::material` is not an index into the texture list — it is a *column*
+of a `numskinfamilies × numskinref` table of `short`s at `skinindex`, and the material
+is `pSkinRef[skin * numskinref][mesh->material]`. **10,030 of the game's 56,955 static
+prop placements ask for a family other than 0 and 10,002 of them draw a different
+material for it**, across 101 of 106 maps and **269 of them on `sp_a1_intro1`** —
+17.6% of the game's props, drawing the wrong materials until this. The worst single
+model is not the cube: it is `models/anim_wp/framework/squarebeam_off.mdl` at
+**5,666 placements**, the white beam Aperture's walls are built out of, with
+`props_lab/glass_lightcover` second at 1,652. The entity half is **663 model entities
+on a non-zero family, 659 of which remap** — 609 of the raw keys are `prop_dynamic` —
+and it includes **15 of the game's 98 weighted cubes**, one of which is the cube on
+`sp_a1_intro1`: it drew `metal_box` and now draws `metal_box_skin003`, the rusted one
+its map asked for. Three things the implementation found. **Family 0 is the identity
+permutation in every one of the 2,041 shipped models**, and `numskinref == numtextures`
+in every one too, which is why the port's old direct index was exactly right for skin 0
+and why reading the table cannot regress a picture that was already correct — the
+depot census asserts it. **The batch key had to stay the slot rather than become the
+resolved material**: `models/props/metal_box.mdl` is 12 families over 12 slots with a
+single mesh on slot 0, so grouping by material would have collapsed all twelve into
+one; a batch now carries `Vec<String>` — one material per family — and the instance's
+raw `m_nSkin` picks at record time, unclamped on the instance because a cube changes
+skin when it is painted. And **`uses_bumpmapping` had to widen with it**: it is
+`bStaticLighting`'s deciding half, so a model that is per-pixel only at skin 2 must
+answer yes for every placement, which is why Valve ORs it over the whole `ppMaterials`
+array. `sp_a1_intro1`'s static props went from **67 materials to 81** at load; the
+frame cost is in `rustdocs/ENGINE.md`, "Frame cost, measured".
