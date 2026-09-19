@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair and the pusher.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it**, and **a door closing on you shoves you out of the way, or is stopped by you**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair, the pusher and attachment parenting.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it** — down to a named point on one of its bones — and **a door closing on you shoves you out of the way, or is stopped by you**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 209 unit tests + eleven depot tests over all 106 shipped maps |
+| Tests | 222 unit tests + twelve depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -20,7 +20,18 @@ and the think schedule. Porting doc:
 kills**: 138 of the game's 215 kill a player standing in them, and the other 77
 are switched off, admit no clients or have nowhere to stand.
 
-**What the pusher added** (the most recent thing to land, and not a stage):
+**What attachment parenting added** (the most recent thing to land, and not a
+stage): `attachment.rs` — `CBaseAnimating::LookupAttachment` and
+`GetAttachment` behind a trait — plus `EntityCore::parent_attachment`, the two
+`SetParentAttachment*` inputs and one new step in the tick.
+**What is parented to a moving arm now rides the point on it that the map
+named**, rather than sitting at the arm's origin: the shipped maps declare
+**1,362** such connections against `SetParent`'s 143, and 1,040 entities end
+up riding a bone. See [attachment parenting](#attachment-parenting--riding-a-bone) for
+what it cost and for the two findings, one of which is a step Valve needs no
+equivalent of because Valve is lazy where this port is eager.
+
+**What the pusher added** (before that, and also not a stage):
 `push.rs` — `CPhysicsPushedEntities` — plus `TouchQuery::push_trace`,
 `EntityCore::blocker`, a two-valued `CollisionGroup`, and
 `Behaviour::blocked`/`start_blocked`/`end_blocked`. **A mover no longer moves
@@ -30,7 +41,7 @@ furthest single shove is 234.4 units. See
 [the pusher](#the-pusher--a-door-that-shoves-the-player) for the four findings,
 one of which is a solidity bug that had been sitting here since stage 3.
 
-**What the transform pair added** (before the pusher, and also not a stage):
+**What the transform pair added** (before both, and also not a stage):
 `hierarchy.rs`, `local_origin`/`local_angles` on `EntityCore`, and the
 `SetParent`/`ClearParent` inputs. 4,582 of the game's entities name a parent
 and 201 of them are movers; before this they all moved in world space. It is
@@ -93,9 +104,7 @@ it and `Context` grew `punch_penetrating_players`, which queues the work the way
 read as bugs.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
-it needs the portal system), the armour, drowning, and `SetParentAttachment*`,
-which is 1,362 shipped connections waiting on `studio/`'s
-`LookupAttachment`. **43 of the 200
+it needs the portal system), the armour and drowning. **43 of the 200
 classnames the shipped maps place are implemented**, out of 48 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
@@ -1247,15 +1256,35 @@ pub fn set_abs_placement(&mut self, origin: Vec3, angles: Vec3);
 pub fn set_abs_origin(&mut self, origin: Vec3);
 pub fn set_abs_angles(&mut self, angles: Vec3);
 
-/// In `hierarchy`:
-pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Option<EntityId>);
-pub fn propagate(core: &EntityCore, entities: &mut EntityList);
-pub fn propagate_id(id: EntityId, entities: &mut EntityList);
-pub fn descendants(core: &EntityCore, entities: &EntityList) -> Vec<EntityId>;
+/// `m_iParentAttachment`, zero-based — see `attachment`.
+pub fn parent_attachment(&self) -> Option<usize>;
 
-/// On Context, for a class that wants either:
+/// In `hierarchy`. `Poser` is the attachment table and the clock.
+pub fn set_parent(
+    core: &mut EntityCore, entities: &mut EntityList,
+    parent: Option<EntityId>, attachment: Option<usize>, poser: Poser<'_>,
+);
+pub fn propagate(
+    core: &EntityCore, posed: Option<Posed<'_>>,
+    entities: &mut EntityList, poser: Poser<'_>,
+);
+pub fn propagate_id(id: EntityId, entities: &mut EntityList, poser: Poser<'_>);
+pub fn descendants(core: &EntityCore, entities: &EntityList) -> Vec<EntityId>;
+pub fn root_move_parent(id: EntityId, entities: &EntityList) -> EntityId;
+/// `GetParentToWorldTransform` — the attachment's frame, or the parent's own.
+pub fn parent_to_world(
+    parent: &Entity, attachment: Option<usize>, poser: Poser<'_>,
+) -> Affine3A;
+
+/// On Context, for a class that wants any of them:
 pub fn set_parent(&mut self, core: &mut EntityCore, parent: Option<EntityId>);
-pub fn moved(&mut self, core: &EntityCore);
+pub fn set_parent_attachment(
+    &mut self, core: &mut EntityCore,
+    parent: Option<EntityId>, attachment: Option<usize>,
+);
+/// Takes the whole `Entity`, because a child may ride an attachment point and
+/// where those are is a question about the model the OTHER half is playing.
+pub fn moved(&mut self, entity: &Entity);
 ```
 
 `game/server/hierarchy.cpp`, `CBaseEntity::SetParent`/`CalcAbsolutePosition`,
@@ -1273,6 +1302,7 @@ computes and both halves of `PerformPush` are all in the parent's frame.
 | a mover integrating or arriving | `local_origin`, `local_angles` | `set_local_*` |
 | teleporting, spawning, placing | `origin`, `angles` | `set_abs_placement` |
 | re-parenting | — | `Context::set_parent` |
+| re-parenting onto a bone | — | `Context::set_parent_attachment` |
 
 The world pair is **derived**: every setter above re-derives it, and
 `propagate` re-derives it for everything underneath. A bare `entity.origin = …`
@@ -1324,22 +1354,130 @@ entity takes its whole subtree with it — `UpdateOnRemove`'s "Any children stil
 connected are orphans, mark all for delete" — rather than handing the children
 back to the world.
 
-#### What is not here: attachments
+#### Parenting to an attachment point
 
-`SetParentAttachment` and `SetParentAttachmentMaintainOffset` stay unhandled,
-and they are **1,362 shipped connections** against `SetParent`'s 143. The
-condition is `CBaseAnimating::LookupAttachment`, and it is a real one rather
-than a formality: of the 1,454 connections in the game that fire one, **1,376
-aim at an entity whose parent carries a `.mdl`**, so Valve's two guards let them
-through to the lookup; 2 are parented to a brush model, 75 have no parent at
-all, 1 has an unresolvable one. Accepting the 1,376 without the lookup would
-put each entity at its parent's *origin* instead of its attachment point, which
-is worse than refusing. The map-key form `parentname "arm,attachment"` is
-unaffected — **zero of the 4,582 parented entities in the game use it.**
+A child that names `m_iParentAttachment` hangs off a **named frame on one of
+its parent's bones** rather than off the parent's origin, which is what 1,376
+of the game's 1,362 `SetParentAttachment*` connections do — against
+`SetParent`'s 143. The composition is unchanged: the child's local pair is
+still applied to a parent frame, and only the *frame* differs.
+`parent_to_world` is the one function that knows it, and
+[`attachment`](#attachment-attachmentrs) is where the frame comes from.
+
+**That frame moves on the clock, which plain parenting's does not.** A panel
+arm's origin, angles and even its `m_flCycle` can all be untouched for a second
+while the point it carries sweeps a quarter circle. `EntityCore::follow`'s
+early-out still works — it compares *frames*, and the frame it is handed is the
+attachment's — but the walk has to be started, and no handler is going to start
+it. That is what
+[`Server::refresh_attachment_children`](#the-tick) is for: one pass a tick, on
+a map that uses attachment parenting at all. See gotcha 91.
+
+The map-key form `parentname "arm,attachment"` is a different thing and is
+still not read — **zero of the 4,582 parented entities in the game use it**,
+which is why `extract_parent_name` can drop the half after the comma.
 
 `CalcAbsoluteVelocity`'s pair is absent for the same kind of reason: nothing
 reads a parented entity's absolute velocity yet. It is needed the moment
 something rides a moving parent and is then let go.
+
+### `attachment` (`attachment.rs`)
+
+```rust
+/// What `server/` asks a studio model about its attachment points, and the
+/// whole of it. Implemented by whoever loaded the models.
+pub trait Attachments {
+    /// `LookupAttachment` — ZERO-based, `None` for "no such attachment".
+    fn lookup(&self, model: &str, name: &str) -> Option<usize>;
+    /// `GetAttachment( iAttachment, attachmentToWorld )`, in the MODEL's
+    /// frame — the caller multiplies by the entity's.
+    fn attachment_to_model(&self, posed: &Posed<'_>, attachment: usize) -> Option<Affine3A>;
+}
+
+/// Knows no models, so every lookup fails and every parenting is plain.
+pub struct NoAttachments;
+
+/// The table and the clock, carried together.
+pub struct Poser<'a> { pub attachments: &'a dyn Attachments, pub now: f32 }
+impl Poser<'_> { pub const NONE: Poser<'static>; }
+
+/// Where a parent is in its animation — everything `attachment_to_model`
+/// needs beside the index.
+pub struct Posed<'a> {
+    pub model: &'a str, pub sequence: &'a str,
+    pub cycle: f32, pub anim_time: f32, pub playback_rate: f32,
+    pub now: f32,
+}
+
+/// `GetBaseAnimating()` — `None` for a brush model or no model at all.
+pub fn posed<'a>(entity: &'a Entity, poser: Poser<'_>) -> Option<Posed<'a>>;
+
+/// A `Posed` with its strings owned, for `push`, which holds one across a
+/// `&mut` borrow. Refuses to allocate for an entity with no children.
+pub struct PosedSnapshot { /* private */ }
+```
+
+```rust
+/// On Server, called by the engine at the same moment as `set_sequences`.
+pub fn set_attachments(&mut self, attachments: Box<dyn Attachments>);
+
+/// On Context.
+pub fn attachment(&self, entity: EntityId, name: &str) -> Option<usize>;
+pub fn set_parent_attachment(
+    &mut self, core: &mut EntityCore,
+    parent: Option<EntityId>, attachment: Option<usize>,
+);
+
+/// On EntityCore. `m_iParentAttachment`, zero-based.
+pub fn parent_attachment(&self) -> Option<usize>;
+```
+
+#### Why this one is a trait where sequences are a table
+
+[`SequenceTable`](#sequences-sequencesrs) holds *answers*, copied in once per
+level, because a sequence's duration and loop flag are two numbers and a bit
+that cannot change. An attachment's answer is a **matrix that moves every
+tick**: it rides a bone, the bone is posed by whichever animation the parent is
+playing, and the cycle advances on the clock. There is nothing to tabulate.
+
+So the shape is [`TouchQuery`](#touchquery-modrs)'s — a question the game asks
+and something outside answers. What differs is *when*: a collision query is
+threaded through one tick, and this is held by the `Server` for the level's
+lifetime, because [`hierarchy`](#hierarchy-hierarchyrs--the-transform-pair-and-parenting)
+runs at the end of **every** dispatch and a console `ent_fire` reaches one
+without going through a frame.
+
+#### The cycle is not the server's to compute
+
+`Posed` carries five numbers where three would look like enough, and the reason
+is the third gotcha in this module that produces a *place* rather than an error:
+
+> **`m_flCycle` is a checkpoint, not the live value.** It is written when
+> something *decides* something — a new sequence, a `SetPlaybackRate`, a think
+> that has to know whether the animation is over — and between those writes the
+> pose is `cycle + elapsed * rate / duration`. `CDynamicProp::AnimThink` stops
+> re-arming once an animation ends or when its sequence is not in the table at
+> all, so the checkpoint can be a second stale while the bone sweeps a quarter
+> circle.
+
+The server does not own a `.mdl`, so it does not know `duration`. Whoever
+implements `Attachments` does — and it is the same code that derives the cycle
+the model is **drawn** at, which is the property that matters: an attachment
+that used a different derivation would put a clip brush somewhere the picture
+is not.
+
+#### Three failure cases, one `None`
+
+`GetParentToWorldTransform` (`baseentity.cpp:6650`) asks for the attachment
+and, if anything at all goes wrong — no model, no such index, the bone missing
+— **falls through to the parent's own transform**. So there is one `None` here
+and not three, and [`hierarchy::parent_to_world`] treats it as plain parenting.
+That is a real path rather than a defensive one: every `Spawn` in the game runs
+before any model is loaded.
+
+`SetParentAttachment` is the exception and is the other way round: both of its
+guards **return** rather than falling back, so a refused input leaves the entity
+on its plain parent rather than moving it. See the divergence table.
 
 ### `push` (`push.rs`) — the pusher
 
@@ -1394,12 +1532,13 @@ PerformPush( movetime )
 
 `IsPushableMoveType` (`baseentity_shared.h:316`) lists the four movetypes that
 *cannot* be pushed — `PUSH`, `NONE`, `VPHYSICS`, `NOCLIP` — and three of this
-port's four [`MoveType`](#movement-movementrs)s are on it (`VPHYSICS` has no
-variant here at all). What is left is `Walk`: **the player**, and nothing else
-in the entity list. A noclipping player is not pushed, which is Valve's rule and
-the same one `trigger_push` follows. The rule is written as Valve spells it — the
-four that are *not*, negated — rather than as "is it the player", so a fifth
-movetype needs no change here, and neither does `prop_physics` when it lands.
+port's five [`MoveType`](#movement-movementrs)s are on it (`VPHYSICS` has no
+variant here at all). What is left is `Walk` and `FlyGravity`: **the player,
+alive and dead**, and nothing else in the entity list. A noclipping player is
+not pushed, which is Valve's rule and the same one `trigger_push` follows. The
+rule is written as Valve spells it — the four that are *not*, negated — rather
+than as "is it the player", so a sixth movetype needs no change here, and
+neither does `prop_physics` when it lands.
 
 #### The three sweeps, and why there are three
 
@@ -1778,6 +1917,7 @@ Engine::frame -> Server::frame( frame_time, query )
                      PhysicsTouchTriggers      the player's sweep -> StartTouch/Touch
                                                (brush models AND SOLID_OBB boxes)
                      Physics_RunThinkFunctions think, then push, in entity order
+                     refresh_attachment_children  what rides a bone, re-derived
                      FrameUpdatePostEntityThink the stale-link sweep -> EndTouch
                      ServiceEventQueue         everything due, restart-from-head
                      CleanupDeleteList         anything a think removed
@@ -1805,6 +1945,17 @@ fire the arrival alarm if it has come round.
 door arrives on the tick it was scheduled for rather than the tick after — or it
 does not arrive at all, because something was standing in it and the clock was
 rolled back with the move.
+
+**The fourth step has no counterpart in the original, and that is the point.**
+`refresh_attachment_children` re-derives everything riding an attachment point,
+once a tick. Everywhere else a child moves because its parent moved and
+`dispatch` walks the subtree of whatever it just dispatched; an attachment
+child moves because the parent's *animation* advanced, which happens on the
+clock and not in a handler. Valve needs nothing here because Valve is lazy —
+`InvalidatePhysicsRecursive` marks the subtree dirty and the next
+`GetAbsOrigin` pays — so "whenever it is read" becomes "every tick" the moment
+propagation is eager. It costs one pass over the entity list on a map that uses
+attachment parenting and nothing at all on one that does not.
 
 **That is why `query` reaches this far in.** `Server::frame`'s collision half is
 handed down through `run_think_functions` into the closure `dispatch` runs, as a
@@ -1848,11 +1999,13 @@ entities that make other entities; 52-59 are stage 5's and are about damage,
 death and the move type; 60-70 came with `prop_dynamic` and
 `prop_testchamber_door` and are about animation; 71-73 are
 `logic_branch_listener`'s; 74-84 are `prop_portal`'s; 85 is the transform
-pair's; 86-90 are the pusher's** — if a door is in the wrong place or at the
-wrong time start at 26, if a trigger does not fire start at 35, if something an
-entity built is not there start at 47, if something will not die start at 52,
-if a model is posed wrong start at 60, if an oval is in the wrong place start at
-74, and if a mover walks through the player or jams against them start at 86.
+pair's; 86-90 are the pusher's; 91-94 are attachment parenting's** — if a door
+is in the wrong place or at the wrong time start at 26, if a trigger does not
+fire start at 35, if something an entity built is not there start at 47, if
+something will not die start at 52, if a model is posed wrong start at 60, if an
+oval is in the wrong place start at 74, if a mover walks through the player or
+jams against them start at 86, and if something bolted to an arm is sitting at
+the arm's origin start at 91.
 
 1. **The server's `curtime` is not `Scene::curtime`.** The server's is
    `tick * interval` and moves in steps of 1/64 s; the scene's is the
@@ -2543,6 +2696,44 @@ if a model is posed wrong start at 60, if an oval is in the wrong place start at
     `DAMAGE_EVENTS_ONLY`, which removes a `"gib"` — has no port: there are no
     gibs and no class here sets that `m_takedamage`.
 
+91. **A child riding an attachment point is the one thing a handler never
+    moves, so the tick moves it.** Everything else in this module propagates
+    because something was dispatched; an attachment's frame changes because the
+    parent's *animation* advanced, and the parent's origin, angles and
+    `m_flCycle` can all be untouched while the bone sweeps. `Server::run_tick`
+    therefore ends the think phase with `refresh_attachment_children`, gated on
+    whether the level has ever used one. Valve needs no equivalent:
+    `InvalidatePhysicsRecursive` marks the subtree dirty and the next
+    `GetAbsOrigin` re-derives, so a lazy port is never stale and an eager one
+    has to be told.
+
+    > **It runs after the thinks and therefore after the touch pass**, so a
+    > *trigger* riding an attachment is tested against where it was one tick
+    > ago. That is the same one-tick relationship the rest of the tick order
+    > already has — the player's touch test runs before the thinks on purpose
+    > — and 21 of the game's attachment connections aim at a trigger.
+
+92. **`m_flCycle` is a checkpoint, and reading it as the pose puts an
+    attachment where the picture is not.** `CDynamicProp::AnimThink` writes it
+    when it has to decide something and stops re-arming otherwise, so between
+    writes the pose is `cycle + elapsed * rate / duration`. `Posed` therefore
+    carries the cycle, the stamp *and* the rate, and the side that owns the
+    `.mdl` derives the live value — the same derivation the drawn model goes
+    through. See [`attachment`](#attachment-attachmentrs).
+
+93. **`SetParentAttachment`'s parameter is the attachment, not the parent.**
+    It re-parents the entity to the parent it **already has**
+    (`SetParent( m_pParent, m_iParentAttachment )`), so a map fires `SetParent`
+    first and this second — which is exactly what a Hammer instance's
+    `logic_auto` bootstrap does. Fire it at an entity with no parent and both
+    of Valve's guards `return`: no warning this port can print, and no
+    parenting.
+
+94. **A plain `SetParent` clears the attachment.** `InputSetParent`'s first
+    three lines are "if we had a parent attachment, clear it, because it's no
+    longer valid", so the two inputs are not additive and order matters.
+    `Context::set_parent` passes `None` for the attachment, which is that line.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2586,6 +2777,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `LinearlyMoveRootEntity`'s push vector | `GetAbsVelocity() * movetime` | The displacement the root actually underwent | This port has no velocity pair (`hierarchy`), and the displacement is the same number for an unparented root and the *right* number for a parented one, where Valve's is a tick stale whenever the parent is itself moving. |
 | `IsStandingOnPusher` | Reads the ground entity | Redoes `CategorizePosition`'s two-unit drop against the pushers | There is no ground entity: the player's ground is found by `client/`'s move and only `FL_ONGROUND` crosses the seam. The nudge that wants `ground->GetAbsOrigin()` gets the root pusher's, since a `PushHit` names nothing. |
 | `SF_DOOR_NONSOLID_TO_PLAYER` in the **clip chain** | `CTraceFilterSimple` asks `ShouldCollide( COLLISION_GROUP_PLAYER, COLLISION_GROUP_PASSABLE_DOOR )` per trace | The door is left out of `world/`'s clip chain entirely, through `Placement::solid` | The clip chain has exactly one consumer — the player's own move — so "solid" there means "solid to the player". 141 of the game's 621 doors are ones the shipped game lets you walk straight through; leaving them in would give a door the player can neither pass nor block. |
+| `LookupAttachment`'s return | `Studio_FindAttachment( … ) + 1`, so that 0 can mean "none"; every caller then tests `!iAttachment` or subtracts the one again | Zero-based, `Option<usize>` | The `+1` is the encoding of an absent value in a language with no `Option`. `m_iParentAttachment` follows it, so `EntityCore::parent_attachment()` is one less than the number `ent_dump` would print in the original. |
+| `SetParentAttachment`'s three `Warning` calls | Prints which of the three guards refused — no parent, parent has no model, no such attachment | Refuses silently, and **reports the input as handled** | The port has no warning channel for a *declared* input that ran and declined; reporting it unhandled instead would file it beside the inputs no class implements, which is a different thing. The census is in `every_shipped_attachment_connection_puts_its_entity_on_a_bone` rather than in a log line. |
+| A child of an attachment being re-derived | Lazily, at the next `GetAbsOrigin`, through `EFL_DIRTY_ABSTRANSFORM` | Eagerly, once a tick, by `Server::refresh_attachment_children` | The dirty-flag scheme needs a parent *pointer* and this port has a handle the list resolves — `hierarchy` says why. Lazy is never stale; eager has to be told, and an attachment's frame changes with the clock rather than in a handler. Gotcha 91. |
+| The clock an attachment is resolved at | `gpGlobals->curtime` inside the tick, which on the server *is* the tick's clock | The same — `Time::curtime`, not `Scene::curtime` | Listed because the drawn pose uses the scene's, so an attachment child's collision is up to one tick behind the picture. That is the relationship a ticked door's origin already has to the one on screen (gotcha 1). |
 | `!player_blue` / `!player_orange` | `GetGlobalTeam( … )->GetPlayer( 0 )` | Reported as "no such player" | Single player has no teams, so Valve answers null here too — this is a report line rather than a divergence, and it is 74 of the depot's unhandled procedurals. |
 
 ---
@@ -2641,7 +2836,6 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `IGameSystem` as a registry | One system exists (`CTonemapSystem`), so it is a method. The condition is the second system that needs a level hook. |
 | `FIELD_EHANDLE` and `FIELD_POSITION_VECTOR` | No class declares either. `FIELD_EHANDLE`'s two conversions both need the entity list, which `Variant::convert` has not got. |
 | `AddOutput` | Rewrites a keyfield or adds a connection at run time from a string. No shipped Portal 2 connection fires it at a class this port implements. |
-| `SetParentAttachment` and `SetParentAttachmentMaintainOffset` | `SetParent` and `ClearParent` landed with the transform pair; these two did not, and they are **1,362 shipped connections against `SetParent`'s 143**. They need `CBaseAnimating::LookupAttachment`, which would be this module's first dependency on `studio/` — and the need is measured rather than assumed: of the 1,454 connections that fire one, **1,376 aim at an entity whose parent carries a `.mdl`** and so reach the lookup. 883 of them are `func_brush.SetParentAttachmentMaintainOffset`. See the `hierarchy` section. |
 | `CLogicBranch::UpdateOnRemove`'s notification | Valve posts `_OnLogicBranchRemoved` at the *branch* instead of at the listener (`logicentities.cpp:2622`), so no listener in the shipped game has ever received one; a stale branch is counted as false for the rest of the level. This port reaches the same state by a different route — there is no `UpdateOnRemove` hook on `Behaviour`, and a dead id reads as false in `DoTest`. **No shipped map fires `Kill` at a `logic_branch`.** |
 | `SendTable`/`DT_`/`edict_t` | One process. Deleted, not deferred. |
 | Save/restore, `FTYPEDESC_SAVE` | Deferred; `serde` over entity state when it comes back, not `ISave`. |
@@ -2901,6 +3095,15 @@ case values.
 | `tests::a_rotating_door_under_pushes_on_the_other_side_and_jams` | gotcha 87, the other quadrant, and that a rolled-back push leaves nothing behind |
 | `tests::a_child_of_a_moving_door_pushes_as_the_door_does` | `SetupAllInHierarchy` — the pusher list is the hierarchy, not the entity |
 | `tests::every_shipped_mover_pushes_the_player_standing_in_front_of_it` | **every linear mover in the game, closed on a real player hull**: 54 pushed, 13 blocked, the furthest shove 234.4 units |
+| `tests::set_parent_attachment_puts_the_entity_on_the_attachment_point` | the snap onto the point, and the `MOVETYPE_NONE` that comes with it |
+| `tests::set_parent_attachment_maintain_offset_leaves_the_entity_where_it_was` | the one bool the two inputs differ in |
+| `tests::an_attachment_child_follows_the_bone_as_the_parent_animates` | **gotchas 91 and 92 in one test** — the parent never moves, never turns and is not even thinking, and the rider swings with the bone anyway |
+| `tests::set_parent_attachment_is_refused_rather_than_downgraded` | both of Valve's guards *returning* rather than falling back to plain parenting |
+| `tests::set_parent_after_set_parent_attachment_clears_the_attachment` | gotcha 94 — `InputSetParent`'s first three lines |
+| `tests::an_attachment_is_refused_while_the_models_are_still_unloaded` | the state every `Spawn` in the game runs in |
+| `attachment::tests::only_an_entity_wearing_a_studio_model_can_be_posed` | `GetBaseAnimating()` — a brush model is not one |
+| `attachment::tests::a_snapshot_is_not_taken_for_an_entity_nothing_hangs_off` | the pusher's snapshot not allocating for the 59,017 entities with no children |
+| `tests::every_shipped_attachment_connection_puts_its_entity_on_a_bone` | **every `SetParentAttachment*` in the game, followed through** — against the engine's real attachment table, with no GPU |
 
 Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
 
@@ -2913,16 +3116,17 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_intro_maps_door -- --ig
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release branch_listener -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_portal -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_mover -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ignored --nocapture
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
 server time**, and asserts exact totals: 60,925 blocks, 35,232 matched, 65
 created, 28,360 spawned, 6,937 lights deleted, 213 kept, 54,535 connections,
 157 unimplemented classnames, the full 49-name unhandled-key table, 5,787
-events dispatched, 3,932 inputs accepted, 7,318 thinks, 1,036 events that found
-no target, zero bad conversions, the 20-name unhandled-input table, a peak of
-215 entities in the simulation list at once, 2,341 live triggers, 105 maps with
-a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
+events dispatched, 5,037 inputs accepted, 7,318 thinks, 1,036 events that found
+no target, zero bad conversions, the **five**-name unhandled-input table, a peak
+of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
+with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
 
 > **`prop_portal` moved six of those and every one of them is the same 21
@@ -3953,15 +4157,14 @@ absOrigin) return;`) and they read as micro-optimisations until you remove
 them.
 
 Third: **`SetParentAttachment*` is not the same problem as `SetParent`, and the
-measurement says so.** It was easy to hope that Valve's fallback — "if the
+measurement said so.** It was easy to hope that Valve's fallback — "if the
 parent has no animating model, use its own transform" — covered the shipped
 content, in which case the attachment forms would have come free. It does not:
 `SetParentAttachment` *returns* when the guard fails rather than falling
-through, and of the game's 1,454 such connections **1,376 aim at an entity
-whose parent carries a `.mdl`**, so the lookup is genuinely load-bearing for
-95% of them. That is 1,362 connections still refused, and they are the whole of
-what is left of the family. The next step for them is `LookupAttachment`, which
-would be `server/`'s first dependency on `studio/`.
+through, and almost every one of the game's 1,362 such connections aims at an
+entity whose parent carries a `.mdl`. That prediction is what
+[attachment parenting](#attachment-parenting--riding-a-bone) then went and
+did, and the census at the bottom of it is the number it was predicting.
 
 One quirk kept rather than fixed: `CRotDoor::Spawn` spawns open through
 `Teleport` (absolute) where `CBaseDoor::Spawn` uses `UTIL_SetOrigin` (local),
@@ -4048,3 +4251,75 @@ another entity's `DoorGoUp` and write that entity's origin, which is the
 cross-entity dispatch `Context` defers everywhere else, and unlike most of the
 things in the absent table it is reachable content: 121 of the game's doors
 share a name with another door and 48 of those have `wait >= 0`.
+
+### Attachment parenting — riding a bone
+
+`portdocs/SERVER.md`'s next step after the pusher, and the half of the
+parenting family the transform pair could not take: `src/server/attachment.rs`
+is `CBaseAnimating::LookupAttachment` and `GetAttachment` behind a trait,
+`src/studio/anim.rs` grew the `mstudioattachment_t` reader under it, and
+`CBaseEntity::SetParentAttachment`'s two inputs are what a map uses.
+**What is bolted to a moving arm now rides the point on it that the map
+named**, rather than sitting at the arm's origin.
+
+It is `server/`'s first question about a studio model that is not a *table*.
+`sequences` could copy its answers in once per level because a duration and a
+loop flag cannot change; an attachment's answer is a matrix that moves every
+tick, so this is `TouchQuery`'s shape instead — a trait the engine implements
+over the models it has already loaded, sharing their animation data through an
+`Arc` rather than copying 1,350 animations to be asked about one bone.
+
+What it bought, measured over the 106 shipped maps by
+`every_shipped_attachment_connection_puts_its_entity_on_a_bone`:
+
+- **1,362 `SetParentAttachment*` connections** are declared by the shipped
+  maps, against `SetParent`'s 143 — the larger half of the family by nearly
+  ten to one, and the reason this was worth doing before skinning.
+- **1,040 entities end the first two seconds riding a bone** rather than
+  sitting at their parent's origin, across **83 of the 106 maps**. 883 of the
+  connections are `func_brush.SetParentAttachmentMaintainOffset`, which is a
+  Hammer instance parenting its clip brushes to an arm through a `logic_auto`
+  bootstrap. The furthest point from its parent's origin is **7,050 units** —
+  `sp_a2_bts6`'s `tube_ride_chell_proxy`, on `props_vac_anim/chell_bts6.mdl`,
+  which is an animation that carries Chell across the map.
+- **174 connections name a point the parent's model has not got**, 6 aim at an
+  entity with no parent, and **0 at one whose parent is a brush model.** All
+  three are Valve's guards refusing, and the port refuses with them.
+
+**Two findings.**
+
+First, **the port needed a step in the tick that Valve has no equivalent of,
+and the reason is the one `hierarchy` has been carrying since the transform
+pair landed.** Valve propagates lazily: `InvalidatePhysicsRecursive` marks a
+subtree dirty and the next `GetAbsOrigin` re-derives it, so a child is never
+stale however its parent's frame came to move. This port propagates eagerly,
+because the entity being dispatched is outside the list for the whole of its
+handler — and every other frame change happens *in* a handler, so `dispatch`
+can walk the subtree on the way out. An attachment's frame is the exception:
+it changes because the parent's animation advanced, which happens on the clock.
+A panel arm's origin, angles and `m_flCycle` can all be untouched for a second
+while the point it carries sweeps a quarter circle. So `run_tick` grew
+`refresh_attachment_children`, gated on whether the level has used one at all.
+Before it existed, a clip brush updated only as often as its arm happened to be
+dispatched — and stopped entirely once that think cancelled itself, which
+`CDynamicProp::AnimThink` does as soon as there is nothing left to decide.
+
+Second, **`m_flCycle` is a checkpoint and not a pose, and reading it as one
+would have put every attachment somewhere the picture is not.** It is written
+when something decides something and left alone in between, so the live cycle
+is `cycle + elapsed * rate / duration` — and `duration` belongs to the `.mdl`,
+which this module does not own. That is why `Posed` carries five numbers rather
+than two: the derivation happens on the side that owns the model, through the
+same `advance_cycle` the *drawn* pose goes through. Two different derivations
+of the same number is exactly how a collision brush ends up a few units from
+the arm it is supposed to be bolted to.
+
+One number worth keeping in view: **only 6 of the 1,040 moved under their own
+parent's animation during the two seconds measured**, the furthest by 116.6
+units — `sp_a2_dual_lasers`' `platform_tiles-robotarm_powerupA_01panel`, a clip
+brush on a `room_transform` arm, which is exactly the shape the feature is for.
+That 6 is not the feature failing: the *placement* is what 1,040 of them
+needed, and a Portal 2 chamber spends its opening seconds still. But it does
+mean the carrying half is thinly exercised by shipped content in that window,
+and `an_attachment_child_follows_the_bone_as_the_parent_animates` is what
+actually holds it.

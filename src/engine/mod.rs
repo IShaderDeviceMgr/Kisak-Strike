@@ -1318,6 +1318,41 @@ fn apply_player_state(client: &mut Client, state: server::PlayerState) {
     player.frozen = state.flags & server::movement::FL_FROZEN != 0;
 }
 
+/// The engine's half of the server's attachment lookup —
+/// `modelinfo->GetModelPtr` and `CBaseAnimating::GetAttachment`.
+///
+/// A newtype rather than an `impl` on
+/// [`AttachmentModels`](world::entities::AttachmentModels) itself, and here
+/// rather than in `world/`, for the reason [`push_trace`] is here: **`world/`
+/// names no `server/` type**, and this is the function that has to name both.
+/// The `Arc` is shared with the level's uploaded models, so a table with 1,350
+/// animations in it is not copied to hand it over.
+struct WorldAttachments(std::sync::Arc<world::entities::AttachmentModels>);
+
+impl server::attachment::Attachments for WorldAttachments {
+    fn lookup(&self, model: &str, name: &str) -> Option<usize> {
+        self.0.lookup(model, name)
+    }
+
+    fn attachment_to_model(
+        &self,
+        posed: &server::attachment::Posed<'_>,
+        attachment: usize,
+    ) -> Option<glam::Affine3A> {
+        self.0
+            .attachment_to_model(
+                posed.model,
+                attachment,
+                posed.sequence,
+                posed.cycle,
+                posed.anim_time,
+                posed.playback_rate,
+                posed.now,
+            )
+            .map(glam::Affine3A::from_mat4)
+    }
+}
+
 /// The engine's half of the server's touch test — `engine->SolidMoved`.
 ///
 /// A struct rather than a closure because it holds the world across a whole
@@ -1588,6 +1623,20 @@ impl Level for Scene<'_> {
             );
         }
         self.server.set_sequences(sequences);
+
+        // …and the attachment points of those same models, which cannot be a
+        // table because the answer moves with the parent's animation. See
+        // `crate::server::attachment`, and `WorldAttachments` below for why
+        // the `impl` is here rather than in `world/`.
+        let attachments = world.entity_models.attachments();
+        if !attachments.is_empty() {
+            eprintln!(
+                "source-engine: server: {} model(s) with attachment points a map can parent to",
+                attachments.len()
+            );
+        }
+        self.server
+            .set_attachments(Box::new(WorldAttachments(attachments)));
 
         self.world = Some(world);
         Ok(())

@@ -108,6 +108,7 @@
 
 use glam::Vec3;
 
+use super::attachment;
 use super::class::{Behaviour, Context};
 use super::entity::{EntityCore, EntityId};
 use super::hierarchy;
@@ -228,6 +229,19 @@ pub fn perform_push(
     // them is the same test.
     let previously = entity.blocker;
 
+    // Where this pusher's own **attachment points** are, for the subtree walk
+    // that every move below ends in. Taken once, because the walk needs it
+    // while `entity` is borrowed mutably and the cycle cannot change inside a
+    // push anyway.
+    //
+    // **`None` for every mover in the shipped game**, which is a brush entity
+    // and has no attachment points — but not for `prop_dynamic`, which is
+    // `MOVETYPE_PUSH` as well (`props.cpp:206`) and is exactly the class the
+    // game's 1,376 attachment children hang off. Pass `None` here and a panel
+    // arm would yank its clip brushes back onto its own origin every tick.
+    let posed = attachment::PosedSnapshot::of(entity, behaviour, cx.poser());
+    let posed = posed.as_ref();
+
     if movetime > 0.0 {
         let blocker = match (
             entity.angular_velocity != Vec3::ZERO,
@@ -238,12 +252,12 @@ pub fn perform_push(
             // greater one wins — see the module docs.
             (true, true) => {
                 let initial = entity.local_time;
-                match physics_push_rotate(entity, cx, query, movetime) {
+                match physics_push_rotate(entity, posed, cx, query, movetime) {
                     Some(blocker) => Some(blocker),
                     None => {
                         let rotated = entity.local_time;
                         entity.local_time = initial;
-                        let blocker = physics_push_move(entity, cx, query, movetime);
+                        let blocker = physics_push_move(entity, posed, cx, query, movetime);
                         if entity.local_time < rotated {
                             entity.local_time = rotated;
                         }
@@ -251,13 +265,13 @@ pub fn perform_push(
                     }
                 }
             }
-            (true, false) => physics_push_rotate(entity, cx, query, movetime),
+            (true, false) => physics_push_rotate(entity, posed, cx, query, movetime),
             // Also the branch a pusher with no velocity at all takes, which is
             // what makes the alarm double as a plain wait timer:
             // `PhysicsPushMove` increments local time before it looks at the
             // velocity, so a door standing still at the top of its travel
             // still spends `m_flWait`.
-            (false, _) => physics_push_move(entity, cx, query, movetime),
+            (false, _) => physics_push_move(entity, posed, cx, query, movetime),
         };
 
         entity.blocker = blocker;
@@ -288,6 +302,7 @@ pub fn perform_push(
 /// `CBaseEntity::PhysicsPushMove` (`physics_main.cpp:1537`).
 fn physics_push_move(
     entity: &mut EntityCore,
+    posed: Option<&attachment::PosedSnapshot>,
     cx: &mut Context<'_>,
     query: &mut dyn TouchQuery,
     movetime: f32,
@@ -299,7 +314,7 @@ fn physics_push_move(
         return None;
     }
 
-    let blocker = perform_linear_push(entity, cx, query, movetime);
+    let blocker = perform_linear_push(entity, posed, cx, query, movetime);
     if blocker.is_some() {
         entity.local_time -= movetime;
     }
@@ -309,6 +324,7 @@ fn physics_push_move(
 /// `CBaseEntity::PhysicsPushRotate` (`physics_main.cpp:1558`).
 fn physics_push_rotate(
     entity: &mut EntityCore,
+    posed: Option<&attachment::PosedSnapshot>,
     cx: &mut Context<'_>,
     query: &mut dyn TouchQuery,
     movetime: f32,
@@ -318,7 +334,7 @@ fn physics_push_rotate(
         return None;
     }
 
-    let blocker = perform_rotate_push(entity, cx, query, movetime);
+    let blocker = perform_rotate_push(entity, posed, cx, query, movetime);
     if blocker.is_some() {
         entity.local_time -= movetime;
     }
@@ -328,6 +344,7 @@ fn physics_push_rotate(
 /// `CPhysicsPushedEntities::PerformLinearPush` (`physics_main.cpp:1075`).
 fn perform_linear_push(
     root: &mut EntityCore,
+    posed: Option<&attachment::PosedSnapshot>,
     cx: &mut Context<'_>,
     query: &mut dyn TouchQuery,
     movetime: f32,
@@ -342,7 +359,7 @@ fn perform_linear_push(
     // GetLocalOrigin() + GetLocalVelocity() * movetime )`, in the *parent's*
     // frame, followed by the walk that drags the subtree with it.
     root.set_local_origin(root.local_origin + root.velocity * movetime);
-    hierarchy::propagate(root, cx.entities_mut());
+    cx.propagate(root, posed.map(attachment::PosedSnapshot::as_posed));
 
     // `*pAbsPushVector = pRoot->GetAbsVelocity() * movetime`. This port has no
     // absolute velocity — [`hierarchy`](super::hierarchy) records why the
@@ -362,7 +379,7 @@ fn perform_linear_push(
         }
         Err((moved, blocker)) => {
             root.set_local_origin(previous_local_origin);
-            hierarchy::propagate(root, cx.entities_mut());
+            cx.propagate(root, posed.map(attachment::PosedSnapshot::as_posed));
             restore_entities(&moved, cx);
             Some(blocker)
         }
@@ -372,6 +389,7 @@ fn perform_linear_push(
 /// `CPhysicsPushedEntities::PerformRotatePush` (`physics_main.cpp:1017`).
 fn perform_rotate_push(
     root: &mut EntityCore,
+    posed: Option<&attachment::PosedSnapshot>,
     cx: &mut Context<'_>,
     query: &mut dyn TouchQuery,
     movetime: f32,
@@ -390,7 +408,7 @@ fn perform_rotate_push(
         start_local_to_world: root.to_world(),
         end_local_to_world: {
             root.set_local_angles(root.local_angles + root.angular_velocity * movetime);
-            hierarchy::propagate(root, cx.entities_mut());
+            cx.propagate(root, posed.map(attachment::PosedSnapshot::as_posed));
             root.to_world()
         },
     };
@@ -408,7 +426,7 @@ fn perform_rotate_push(
         }
         Err((moved, blocker)) => {
             root.set_local_angles(previous_local_angles);
-            hierarchy::propagate(root, cx.entities_mut());
+            cx.propagate(root, posed.map(attachment::PosedSnapshot::as_posed));
             restore_entities(&moved, cx);
             Some(blocker)
         }

@@ -7,6 +7,7 @@
 //! `classes`, which has to offer every class every input without a map, and
 //! the class unit tests, which want to watch one entity in isolation.
 
+use super::attachment::{self, Attachments};
 use super::class::{Behaviour, ClassDef, Context, SpawnResult};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{EventQueue, FieldType, Input, Variant};
@@ -34,6 +35,12 @@ pub(super) struct Harness {
     /// runs in too — see [`sequences`](super::sequences). A test that wants a
     /// prop's animation to *finish* fills it in first.
     pub sequences: SequenceTable,
+    /// What `studio/` would have said about their **attachment points**.
+    ///
+    /// [`NoAttachments`](super::attachment::NoAttachments) by default, so a
+    /// `SetParentAttachment` is refused exactly as it is against a level whose
+    /// models have not loaded. A test that wants one to land swaps this.
+    pub attachments: Box<dyn Attachments>,
 }
 
 impl Harness {
@@ -45,6 +52,7 @@ impl Harness {
             entities: EntityList::new(),
             player: None,
             sequences: SequenceTable::new(),
+            attachments: Box::new(attachment::NoAttachments),
         }
     }
 
@@ -58,6 +66,7 @@ impl Harness {
             &mut self.entities,
             self.player,
             &self.sequences,
+            self.attachments.as_ref(),
         )
     }
 
@@ -71,6 +80,7 @@ impl Harness {
             &mut self.entities,
             self.player,
             &self.sequences,
+            self.attachments.as_ref(),
         );
         behaviour.spawn(core, &mut cx)
     }
@@ -91,6 +101,7 @@ impl Harness {
             &mut self.entities,
             self.player,
             &self.sequences,
+            self.attachments.as_ref(),
         );
         // No collision either, so nothing a mover pushes against can block it
         // — see [`TouchQuery::push_trace`](super::TouchQuery::push_trace)'s
@@ -122,6 +133,7 @@ impl Harness {
             &mut self.entities,
             self.player,
             &self.sequences,
+            self.attachments.as_ref(),
         );
         let input = Input {
             name,

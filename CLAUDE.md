@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,062 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,077 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -152,8 +152,8 @@ before calling into a module.** This table is the index.
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
-| `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals, the **local/abs transform pair** and the **pusher** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel` and **attachment points**. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals, the **local/abs transform pair**, the **pusher** and **attachment parenting** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -163,7 +163,8 @@ models all draw, lit the way the shipped game lights them and auto-exposed to
 the map's own limits. The entity logic runs on a 64 Hz tick: doors and panels
 move, triggers fire, a floor button presses when you stand on it, a chamber
 door opens as you approach and shuts behind you, a `trigger_hurt` can kill you,
-and **a mover shoves you out of its way or is stopped by you**. Two portals draw as coloured ovals — **and they work, and you can see
+**a mover shoves you out of its way or is stopped by you**, and **what is
+bolted to a moving arm rides the point on it the map named**. Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
@@ -288,16 +289,27 @@ rebuilt from a two-unit drop against the pushers; and `CBaseDoor::Spawn`'s
 solidity had been inverted since stage 3, invisibly, until
 `ComputeRotationalPushDirection` started reading it.
 
-- **`LookupAttachment` on a studio model**, which is what is left of the parenting
-  family and would be `server/`'s first dependency on `studio/`. The transform pair
-  landed and took `SetParent`/`ClearParent` with it; the two
-  `SetParentAttachment*` forms did not, and they are **1,362 shipped connections
-  against `SetParent`'s 143**. The need is measured rather than assumed:
-  `CBaseEntity::SetParentAttachment` *returns* when its parent-is-a-`CBaseAnimating`
-  guard fails rather than falling through to plain parenting, and **1,376 of the
-  game's 1,454 such connections aim at an entity whose parent carries a `.mdl`** — so
-  95% of them really do reach the lookup, and accepting them without it would put each
-  entity at its parent's origin instead of its attachment point.
+**Attachment parenting has landed** — `src/server/attachment.rs` plus the
+`mstudioattachment_t` reader under it — so **the parenting family is complete**
+and what is bolted to a moving arm rides the point on it the map named rather
+than sitting at the arm's origin. It was the larger half of that family by
+nearly ten to one: **1,362 shipped `SetParentAttachment*` connections against
+`SetParent`'s 143**, and measured over the shipped maps **1,040 entities now
+end up riding a bone** (174 connections name a point their parent's model has
+not got, 6 have no parent — both of which are Valve's guards refusing).
+`server/` still names no studio type: this is its first question about a model
+that is not a *table*, because an attachment's answer is a matrix that moves
+with the parent's animation, so it goes out through a trait the engine
+implements over models it has already loaded — sharing their animation data
+through an `Arc` rather than copying 1,350 animations to be asked about one
+bone. Two findings, in `rustdocs/SERVER.md`: **eager propagation needed a step
+in the tick that Valve has no equivalent of**, because an attachment's frame
+changes on the clock rather than in a handler and Valve's lazy
+`EFL_DIRTY_ABSTRANSFORM` re-derives on read instead; and **`m_flCycle` is a
+checkpoint rather than a pose** — `AnimThink` stops re-arming once there is
+nothing left to decide — so the live cycle has to be derived on the side that
+owns the `.mdl`, through the same arithmetic the *drawn* pose goes through, or
+a clip brush ends up a few units from the arm it is bolted to.
 - **Skinning in `src/studio/`**, which `$includemodel` promoted to the largest gap in
   the model path and which now gates the second largest. The per-bone draw split is
   exact only when every vertex answers to one bone, and **74 of the 591 readable models
@@ -310,8 +322,9 @@ solidity had been inverted since stage 3, invisibly, until
   before skinning buys nothing. **There is now a number on what the missing `.ani`
   costs**: 135 models pose outside the box their own sequences declare, the worst by
   23,029 units, and since `studiomdl` computes that box from the animated geometry the
-  pose is what is wrong. `every_shipped_studio_model_parses` prints the list. `vvd::Vertex` grows a `bones` field, `vtx` stops
-  discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
+  pose is what is wrong. `every_shipped_studio_model_parses` prints the list. `vtx` stops
+  discarding `StripHeader_t`'s bone plumbing and the bone matrices move to the GPU;
+  `vvd::BoneWeights` already carries the indices and weights.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view

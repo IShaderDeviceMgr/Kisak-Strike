@@ -57,16 +57,30 @@
 //! extra brush entities drifting off their spawn placement in the first two
 //! seconds of the shipped maps.
 //!
-//! # What is deliberately not here
+//! # Parenting to an attachment point
 //!
-//! **Attachment parenting.** `m_iParentAttachment` and the
-//! `SetParentAttachment`/`SetParentAttachmentMaintainOffset` inputs need
-//! `CBaseAnimating::LookupAttachment`, and 1,376 of the 1,454 shipped
-//! connections that fire one really do reach the lookup — see the
-//! expected-unhandled table in `tests` for the whole breakdown. The map-key
-//! form `parentname "arm,attachment"` is not affected: **zero of the shipped
-//! maps' 4,582 parented entities use it**, which is why
-//! `extract_parent_name` can drop the half after the comma.
+//! A child names `m_iParentAttachment` and then hangs off a **named frame on
+//! one of its parent's bones** rather than off the parent's origin. The
+//! shipped maps declare **1,362** `SetParentAttachment*` connections against
+//! `SetParent`'s 143, and 1,040 entities end up riding a bone. The composition is unchanged — the child's local pair is still applied
+//! to a parent frame — so only the *frame* differs, and
+//! [`parent_to_world`] is the one function that knows it:
+//! `GetParentToWorldTransform` (`baseentity.cpp:6650`), which asks
+//! [`Attachments`] and falls back to the parent's own transform if anything
+//! at all goes wrong.
+//!
+//! **That frame moves every tick, which plain parenting's does not.** A
+//! `prop_dynamic` arm advances its cycle in `AnimThink`, and the attachment
+//! rides a bone that the new cycle has moved — so a child of an attachment
+//! has to be recomputed on a tick where the parent's *origin* did not change
+//! at all. [`EntityCore::follow`]'s early-out still works, because it compares
+//! frames rather than origins and the frame it is handed is the attachment's.
+//!
+//! The map-key form `parentname "arm,attachment"` is a different thing and is
+//! still not read: **zero of the shipped maps' 4,582 parented entities use
+//! it**, which is why `extract_parent_name` can drop the half after the comma.
+//!
+//! # What is deliberately not here
 //!
 //! **The velocity pair.** `CalcAbsoluteVelocity` (`baseentity.cpp:6588`)
 //! rotates a local velocity into the world and adds the parent's. Nothing here
@@ -77,7 +91,8 @@
 
 use glam::Affine3A;
 
-use super::entity::{EntityCore, EntityId, EntityList};
+use super::attachment::{self, Posed, Poser};
+use super::entity::{Entity, EntityCore, EntityId, EntityList};
 
 /// `CBaseEntity::SetParent` (`baseentity.cpp:1558`) — move `core` into
 /// `parent`'s frame, or, for `None`, back out into the world's.
@@ -101,7 +116,13 @@ use super::entity::{EntityCore, EntityId, EntityList};
 /// the only two things looked up. Parenting to an entity that is not in the
 /// list — which includes parenting to *oneself* — is refused, the way Valve's
 /// `Assert(0); m_pParent = NULL;` refuses the self case.
-pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Option<EntityId>) {
+pub fn set_parent(
+    core: &mut EntityCore,
+    entities: &mut EntityList,
+    parent: Option<EntityId>,
+    attachment: Option<usize>,
+    poser: Poser<'_>,
+) {
     // `UnlinkFromParent( this )`: leave the old parent's child list. The local
     // pair becoming the world pair is what `set_parent_frame` does below, so
     // it is not spelled twice.
@@ -117,7 +138,7 @@ pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Opti
         Some(parent) if parent != core.id() => match entities.get_mut(parent) {
             Some(entity) => {
                 entity.core.link_child(core.id());
-                Some(entity.core.to_world())
+                Some(parent_to_world(entity, attachment, poser))
             }
             None => None,
         },
@@ -125,8 +146,39 @@ pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Opti
     };
 
     match frame {
-        Some(frame) => core.set_parent_frame(parent, frame),
-        None => core.set_parent_frame(None, Affine3A::IDENTITY),
+        Some(frame) => core.set_parent_frame(parent, attachment, frame),
+        // An attachment without a parent is not an attachment: Valve's
+        // `SetParent( NULL )` leaves `m_iParentAttachment` set but nothing
+        // ever reads it again, because every read is behind a move parent.
+        None => core.set_parent_frame(None, None, Affine3A::IDENTITY),
+    }
+}
+
+/// `CBaseEntity::GetParentToWorldTransform` (`baseentity.cpp:6650`) — the
+/// frame a child of `parent` hangs from.
+///
+/// The parent's own transform, unless the child names an attachment point and
+/// that point can be found, in which case it is the attachment's. **Every
+/// failure falls back to the parent's own transform**, which is Valve's
+/// comment at the bottom of the function — "if we fall through to here, then
+/// just use the move parent's abs origin and angles" — and is not a defensive
+/// branch: a level's first tick asks this before any model has been loaded.
+pub fn parent_to_world(
+    parent: &Entity,
+    attachment: Option<usize>,
+    poser: Poser<'_>,
+) -> Affine3A {
+    let entity_to_world = parent.core.to_world();
+    let Some(index) = attachment else {
+        return entity_to_world;
+    };
+    match attachment::posed(parent, poser)
+        .and_then(|posed| posed.attachment_to_model(index, poser.attachments))
+    {
+        // `ConcatTransforms` — the attachment is in the model's frame and the
+        // model is in the world's.
+        Some(attachment_to_model) => entity_to_world * attachment_to_model,
+        None => entity_to_world,
     }
 }
 
@@ -140,8 +192,25 @@ pub fn set_parent(core: &mut EntityCore, entities: &mut EntityList, parent: Opti
 ///
 /// `core` itself is not touched — its own world pair was re-derived by
 /// whichever setter moved it.
-pub fn propagate(core: &EntityCore, entities: &mut EntityList) {
-    push_down(core.to_world(), core.children(), entities);
+pub fn propagate(
+    core: &EntityCore,
+    posed: Option<Posed<'_>>,
+    entities: &mut EntityList,
+    poser: Poser<'_>,
+) {
+    if core.children().is_empty() {
+        return;
+    }
+    let mut work = Vec::new();
+    frames_for(
+        core.to_world(),
+        posed,
+        core.children(),
+        entities,
+        poser,
+        &mut work,
+    );
+    push_down(work, entities, poser);
 }
 
 /// [`propagate`] for an entity that is *in* the list rather than detached.
@@ -149,7 +218,7 @@ pub fn propagate(core: &EntityCore, entities: &mut EntityList) {
 /// The form `Server::dispatch` uses for everything a handler reached through
 /// [`Context::entity_mut`](super::class::Context::entity_mut), which it knows
 /// only by handle.
-pub fn propagate_id(id: EntityId, entities: &mut EntityList) {
+pub fn propagate_id(id: EntityId, entities: &mut EntityList, poser: Poser<'_>) {
     let Some(entity) = entities.get(id) else {
         return;
     };
@@ -157,7 +226,54 @@ pub fn propagate_id(id: EntityId, entities: &mut EntityList) {
         return;
     }
     let (frame, children) = (entity.core.to_world(), entity.core.children().to_vec());
-    push_down(frame, &children, entities);
+    let mut work = Vec::new();
+    frames_for(
+        frame,
+        attachment::posed(entity, poser),
+        &children,
+        entities,
+        poser,
+        &mut work,
+    );
+    push_down(work, entities, poser);
+}
+
+/// Which frame each of `children` hangs from, given a parent that is at
+/// `entity_to_world` and posed as `posed`.
+///
+/// Almost every child takes the parent's own transform and the whole function
+/// is one copy. The attachment path is the exception, and it **caches by
+/// attachment index** because posing a skeleton is the expensive half and a
+/// Hammer instance parents its whole clip set to the same point — 883 of the
+/// game's `func_brush`es arrive through one input name on a handful of arms.
+fn frames_for(
+    entity_to_world: Affine3A,
+    posed: Option<Posed<'_>>,
+    children: &[EntityId],
+    entities: &EntityList,
+    poser: Poser<'_>,
+    out: &mut Vec<(EntityId, Affine3A)>,
+) {
+    let mut cache: Vec<(usize, Affine3A)> = Vec::new();
+    for &child in children {
+        let index = entities
+            .get(child)
+            .and_then(|child| child.core.parent_attachment());
+        let frame = match index {
+            None => entity_to_world,
+            Some(index) => match cache.iter().find(|(held, _)| *held == index) {
+                Some(&(_, frame)) => frame,
+                None => {
+                    let frame = posed
+                        .and_then(|posed| posed.attachment_to_model(index, poser.attachments))
+                        .map_or(entity_to_world, |local| entity_to_world * local);
+                    cache.push((index, frame));
+                    frame
+                }
+            },
+        };
+        out.push((child, frame));
+    }
 }
 
 /// The walk itself: a frame, the entities it applies to, and their subtrees.
@@ -167,12 +283,11 @@ pub fn propagate_id(id: EntityId, entities: &mut EntityList) {
 /// it. **The descent stops wherever nothing changed** — see
 /// [`EntityCore::follow`] — which is what makes calling this after every
 /// dispatch cost nothing for the entities that did not move.
-fn push_down(frame: Affine3A, children: &[EntityId], entities: &mut EntityList) {
-    if children.is_empty() {
-        return;
-    }
-    let mut work: Vec<(EntityId, Affine3A)> =
-        children.iter().map(|&child| (child, frame)).collect();
+fn push_down(
+    mut work: Vec<(EntityId, Affine3A)>,
+    entities: &mut EntityList,
+    poser: Poser<'_>,
+) {
     while let Some((id, frame)) = work.pop() {
         let Some(entity) = entities.get_mut(id) else {
             continue;
@@ -180,8 +295,15 @@ fn push_down(frame: Affine3A, children: &[EntityId], entities: &mut EntityList) 
         if !entity.core.follow(frame) {
             continue;
         }
-        let next = entity.core.to_world();
-        work.extend(entity.core.children().iter().map(|&child| (child, next)));
+        if entity.core.children().is_empty() {
+            continue;
+        }
+        let (next, children) = (entity.core.to_world(), entity.core.children().to_vec());
+        // Re-fetched immutably rather than kept from above: the child lookups
+        // in `frames_for` borrow the same list, and a posed parent's
+        // `model_state` borrows the parent.
+        let posed = entities.get(id).and_then(|parent| attachment::posed(parent, poser));
+        frames_for(next, posed, &children, entities, poser, &mut work);
     }
 }
 
@@ -236,6 +358,7 @@ pub fn root_move_parent(id: EntityId, entities: &EntityList) -> EntityId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::attachment::Poser;
     use crate::server::classes;
     use crate::server::entity::Entity;
     use glam::Vec3;
@@ -255,9 +378,20 @@ mod tests {
         id: EntityId,
         f: impl FnOnce(&mut EntityCore, &mut EntityList),
     ) {
+        with_poser(entities, id, Poser::NONE, f)
+    }
+
+    /// [`with`], for a list whose models have attachment points.
+    fn with_poser(
+        entities: &mut EntityList,
+        id: EntityId,
+        poser: Poser<'_>,
+        f: impl FnOnce(&mut EntityCore, &mut EntityList),
+    ) {
         let mut entity = entities.detach(id).expect("live");
         f(&mut entity.core, entities);
-        propagate(&entity.core, entities);
+        let posed = attachment::posed(&entity, poser);
+        propagate(&entity.core, posed, entities, poser);
         entities.attach(id, entity);
     }
 
@@ -271,7 +405,7 @@ mod tests {
             .set_abs_placement(Vec3::new(100.0, 0.0, 0.0), Vec3::new(0.0, 90.0, 0.0));
         with(&mut entities, child, |core, entities| {
             core.set_abs_placement(Vec3::new(110.0, 0.0, 0.0), Vec3::ZERO);
-            set_parent(core, entities, Some(parent));
+            set_parent(core, entities, Some(parent), None, Poser::NONE);
         });
 
         let child = &entities.get(child).unwrap().core;
@@ -291,7 +425,7 @@ mod tests {
         let (mut entities, parent, child) = list();
         with(&mut entities, child, |core, entities| {
             core.set_abs_placement(Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO);
-            set_parent(core, entities, Some(parent));
+            set_parent(core, entities, Some(parent), None, Poser::NONE);
         });
         // The parent yaws a quarter turn about the origin it sits on.
         with(&mut entities, parent, |core, _| {
@@ -317,7 +451,7 @@ mod tests {
         });
         with(&mut entities, child, |core, entities| {
             core.set_abs_placement(Vec3::new(32.0, 0.0, 64.0), Vec3::ZERO);
-            set_parent(core, entities, Some(parent));
+            set_parent(core, entities, Some(parent), None, Poser::NONE);
         });
         // The parent moves, taking the child with it, and only then is the
         // child let go.
@@ -326,7 +460,7 @@ mod tests {
         });
         let carried = entities.get(child).unwrap().core.origin;
         with(&mut entities, child, |core, entities| {
-            set_parent(core, entities, None);
+            set_parent(core, entities, None, None, Poser::NONE);
         });
 
         let child = &entities.get(child).unwrap().core;
@@ -345,7 +479,7 @@ mod tests {
         let grandchild = entities.insert(Entity::new(class));
         for (id, parent) in [(child, root), (grandchild, child)] {
             with(&mut entities, id, |core, entities| {
-                set_parent(core, entities, Some(parent));
+                set_parent(core, entities, Some(parent), None, Poser::NONE);
             });
         }
         with(&mut entities, root, |core, _| {
@@ -367,7 +501,7 @@ mod tests {
         let (mut entities, parent, _) = list();
         with(&mut entities, parent, |core, entities| {
             let me = core.id();
-            set_parent(core, entities, Some(me));
+            set_parent(core, entities, Some(me), None, Poser::NONE);
         });
         assert!(entities.get(parent).unwrap().core.parent().is_none());
     }

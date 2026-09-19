@@ -56,6 +56,22 @@ pub(super) const BONE_STRIDE: usize = 216;
 pub(super) const SEQUENCE_STRIDE: usize = 212;
 /// `sizeof(mstudioanimdesc_t)` (`studio.h:1040`).
 pub(super) const ANIM_DESC_STRIDE: usize = 100;
+/// `sizeof(mstudioattachment_t)` (`studio.h:706`) — three ints, a
+/// `matrix3x4_t` and `unused[8]`.
+pub(super) const ATTACHMENT_STRIDE: usize = 92;
+
+/// `ATTACHMENT_FLAG_WORLD_ALIGN` (`studio.h:703`).
+///
+/// The attachment keeps the bone's **position** and throws its rotation away,
+/// so whatever hangs off it stays square with the world however the bone
+/// turns. `CBaseAnimating::GetAttachment` spells that as a separate branch
+/// rather than as a mask, and so does [`attachment_to_model`].
+///
+/// **Not one of the game's 1,952 attachment points sets it**
+/// (`every_shipped_studio_model_parses`), so the branch is here for fidelity
+/// rather than for content — it is two lines and it is the kind of thing that
+/// is invisible until a model that needs it is loaded.
+pub const ATTACHMENT_FLAG_WORLD_ALIGN: u32 = 0x10000;
 
 /// `STUDIO_ANIM_*` (`studio.h:866`) — how one bone's channel is stored.
 mod anim_flag {
@@ -108,6 +124,26 @@ pub struct Bone {
     /// multiplied by. Skip it and every bone applies its own bind transform
     /// twice.
     pub pose_to_bone: Mat4,
+}
+
+/// One attachment point — a named frame riding a bone.
+/// `mstudioattachment_t` (`studio.h:706`).
+///
+/// What a map parents things to: `SetParentAttachment "muzzle"` puts an entity
+/// at this frame and keeps it there as the bone moves. The name is what
+/// `LookupAttachment` searches, case insensitively.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub name: String,
+    /// The only flag that exists is
+    /// [`ATTACHMENT_FLAG_WORLD_ALIGN`].
+    pub flags: u32,
+    /// `localbone` — an index into the model's own bone list, already
+    /// remapped if this attachment arrived through `$includemodel`.
+    pub bone: usize,
+    /// `local` — where the point sits **in that bone's frame**, so the world
+    /// answer is `boneToWorld * local`. See [`attachment_to_model`].
+    pub local: Mat4,
 }
 
 /// One sequence. `mstudioseqdesc_t` (`studio.h:1331`).
@@ -269,6 +305,43 @@ pub(super) fn parse_bones(r: &Reader, base: usize, count: usize) -> Result<Vec<B
         });
     }
     Ok(bones)
+}
+
+/// Reads the attachment table. `numlocalattachments` / `localattachmentindex`
+/// at header offsets 240 / 244.
+///
+/// `bone_count` is checked rather than trusted: `GetAttachmentBone` indexes
+/// the bone array with whatever the file says, and an attachment naming a bone
+/// that is not there would pose against uninitialised memory in the original
+/// and panic here. Refusing the file is the same call
+/// [`parse_bones`] makes about an out-of-order parent.
+pub(super) fn parse_attachments(
+    r: &Reader,
+    base: usize,
+    count: usize,
+    bone_count: usize,
+) -> Result<Vec<Attachment>, StudioError> {
+    let mut attachments = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = base + i * ATTACHMENT_STRIDE;
+        let name_at = r.relative_offset(at, at, "mstudioattachment_t::sznameindex")?;
+        let bone = r.i32(at + 8)?;
+        let bone = match bone {
+            b if b >= 0 && (b as usize) < bone_count => b as usize,
+            b => {
+                return Err(r.corrupt(format!(
+                    "attachment {i} names bone {b}, and the model has {bone_count}"
+                )))
+            }
+        };
+        attachments.push(Attachment {
+            name: r.c_string(name_at)?,
+            flags: r.u32(at + 4)?,
+            bone,
+            local: matrix3x4(r, at + 12)?,
+        });
+    }
+    Ok(attachments)
 }
 
 /// Reads the sequence table. `numlocalseq` / `localseqindex` at 188 / 192.
@@ -653,7 +726,7 @@ fn quaternion_blend(p: Quat, q: Quat, t: f32) -> Quat {
 
 /// A `matrix3x4_t`: row-major, three rows of four, translation in the last
 /// column.
-fn matrix3x4(r: &Reader, at: usize) -> Result<Mat4, StudioError> {
+pub(super) fn matrix3x4(r: &Reader, at: usize) -> Result<Mat4, StudioError> {
     let mut m = [0.0f32; 12];
     for (i, slot) in m.iter_mut().enumerate() {
         *slot = r.f32(at + i * 4)?;
@@ -689,6 +762,27 @@ fn matrix3x4(r: &Reader, at: usize) -> Result<Mat4, StudioError> {
 /// `cycle` is clamped to `[0, 1]`; looping is the caller's, because whether a
 /// sequence loops is a property of the *sequence* and this takes an animation.
 pub fn pose(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4> {
+    let mut matrices = bone_to_model(bones, anim, cycle);
+    for (matrix, bone) in matrices.iter_mut().zip(bones) {
+        *matrix *= bone.pose_to_bone;
+    }
+    matrices
+}
+
+/// Steps 1 and 2 of [`pose`] alone: where each bone's **own frame** is, in
+/// model space, at `cycle` through `anim`.
+///
+/// `boneToWorld` in the original — `R_StudioSetupBones`' array before the
+/// `poseToBone` concat, and what `CBaseEntity::GetBoneTransform` hands out.
+///
+/// > **This, and not [`pose`], is what an attachment rides.**
+/// > `CBaseAnimating::GetAttachment` is `ConcatTransforms( bonetoworld,
+/// > pattachment.local, … )` and `bonetoworld` comes from `GetBoneTransform`.
+/// > [`pose`]'s extra factor exists to cancel a *vertex's* bind transform, and
+/// > an attachment's `local` is already expressed in the bone's posed frame —
+/// > so multiplying by `pose_to_bone` first would apply the bind pose twice
+/// > and put the point somewhere that is wrong without ever looking wrong.
+pub fn bone_to_model(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4> {
     // `Studio_CalcFrame`: a cycle spans `numframes - 1` intervals, so the last
     // frame is reached at cycle 1 exactly.
     let (frame, s) = match anim {
@@ -717,11 +811,30 @@ pub fn pose(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4> {
         };
         bone_to_model.push(world);
     }
-
-    for (matrix, bone) in bone_to_model.iter_mut().zip(bones) {
-        *matrix *= bone.pose_to_bone;
-    }
     bone_to_model
+}
+
+/// `CBaseAnimating::GetAttachment( iAttachment, attachmentToWorld )`
+/// (`baseanimating.cpp:2120`), in **model space** — the caller multiplies by
+/// the entity's own frame.
+///
+/// `bones` is [`bone_to_model`]'s output, not [`pose`]'s.
+///
+/// Returns `None` where Valve returns `false` and the caller falls back to the
+/// parent entity's own transform: an attachment whose bone is not in the list.
+/// Valve's other two false cases — no model, index out of range — are the
+/// caller's here, because an [`Attachment`] only exists when both held.
+pub fn attachment_to_model(attachment: &Attachment, bones: &[Mat4]) -> Option<Mat4> {
+    let bone_to_world = *bones.get(attachment.bone)?;
+    match attachment.flags & ATTACHMENT_FLAG_WORLD_ALIGN == 0 {
+        true => Some(bone_to_world * attachment.local),
+        // "world align": take the point the bone puts it at and drop every
+        // rotation, the bone's and the attachment's both.
+        false => {
+            let origin = bone_to_world.transform_point3(attachment.local.w_axis.truncate());
+            Some(Mat4::from_translation(origin))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -873,5 +986,102 @@ mod tests {
                 .sum();
             assert!(difference < 1e-4, "{matrix:?} is not the identity");
         }
+    }
+
+    /// A bone with a bind pose, so that `pose` and `bone_to_model` differ.
+    fn bent_bone(pos: Vec3, quat: Quat) -> Bone {
+        Bone {
+            name: String::from("arm"),
+            parent: None,
+            pos,
+            quat,
+            rot: Vec3::ZERO,
+            pos_scale: Vec3::ONE,
+            rot_scale: Vec3::ONE,
+            flags: 0,
+            pose_to_bone: Mat4::from_rotation_translation(quat, pos).inverse(),
+        }
+    }
+
+    /// **The one that draws something rather than nothing if it is wrong.**
+    ///
+    /// An attachment rides `boneToWorld`, which is [`bone_to_model`]; [`pose`]
+    /// is that times `poseToBone`, which exists to cancel a *vertex's* bind
+    /// transform. Feed `pose`'s output to an attachment and the bind pose is
+    /// applied twice — here, an attachment sitting on the bone's own origin
+    /// would come back at the model origin instead of 30 units up.
+    #[test]
+    fn an_attachment_rides_the_bone_and_not_the_posed_vertex_matrix() {
+        let bones = [bent_bone(Vec3::new(0.0, 0.0, 30.0), Quat::IDENTITY)];
+        let attachment = Attachment {
+            name: String::from("muzzle"),
+            flags: 0,
+            bone: 0,
+            local: Mat4::IDENTITY,
+        };
+
+        let riding = attachment_to_model(&attachment, &bone_to_model(&bones, None, 0.0))
+            .expect("bone 0 is in the list");
+        assert_eq!(riding.w_axis.truncate(), Vec3::new(0.0, 0.0, 30.0));
+
+        // What the wrong array would have said: `poseToBone` is the inverse of
+        // the bind pose, so every matrix is the identity and the attachment
+        // lands on the model's origin.
+        let wrong = attachment_to_model(&attachment, &pose(&bones, None, 0.0)).expect("in the list");
+        assert_eq!(wrong.w_axis.truncate(), Vec3::ZERO);
+    }
+
+    /// `local` is in the bone's frame, so a bone that is turned turns the
+    /// offset with it. A quarter turn about `+Z` sends `+X` to `+Y`.
+    #[test]
+    fn an_attachments_local_offset_is_in_the_bones_frame() {
+        let bones = [bent_bone(Vec3::ZERO, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))];
+        let attachment = Attachment {
+            name: String::from("tip"),
+            flags: 0,
+            bone: 0,
+            local: Mat4::from_translation(Vec3::new(8.0, 0.0, 0.0)),
+        };
+        let at = attachment_to_model(&attachment, &bone_to_model(&bones, None, 0.0)).unwrap();
+        let origin = at.w_axis.truncate();
+        assert!((origin - Vec3::new(0.0, 8.0, 0.0)).length() < 1e-5, "{origin:?}");
+    }
+
+    /// `ATTACHMENT_FLAG_WORLD_ALIGN` takes the point the bone puts the
+    /// attachment at and throws **both** rotations away — the bone's and the
+    /// attachment's — which is what keeps a world-aligned child square with the
+    /// world however its parent turns.
+    #[test]
+    fn a_world_aligned_attachment_keeps_the_place_and_drops_the_turn() {
+        let bones = [bent_bone(Vec3::ZERO, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))];
+        let attachment = Attachment {
+            name: String::from("flat"),
+            flags: ATTACHMENT_FLAG_WORLD_ALIGN,
+            bone: 0,
+            local: Mat4::from_rotation_translation(
+                Quat::from_rotation_x(0.7),
+                Vec3::new(8.0, 0.0, 0.0),
+            ),
+        };
+        let at = attachment_to_model(&attachment, &bone_to_model(&bones, None, 0.0)).unwrap();
+        // The position is the bone's answer…
+        let origin = at.w_axis.truncate();
+        assert!((origin - Vec3::new(0.0, 8.0, 0.0)).length() < 1e-5, "{origin:?}");
+        // …and the rotation is gone.
+        assert_eq!(Mat4::from_cols(at.x_axis, at.y_axis, at.z_axis, Mat4::IDENTITY.w_axis), Mat4::IDENTITY);
+    }
+
+    /// An attachment naming a bone the list does not have is Valve's
+    /// `GetAttachment` returning false, which the caller reads as "no
+    /// attachment" and answers with plain parenting.
+    #[test]
+    fn an_attachment_whose_bone_is_missing_has_no_answer() {
+        let attachment = Attachment {
+            name: String::from("gone"),
+            flags: 0,
+            bone: 7,
+            local: Mat4::IDENTITY,
+        };
+        assert!(attachment_to_model(&attachment, &[]).is_none());
     }
 }

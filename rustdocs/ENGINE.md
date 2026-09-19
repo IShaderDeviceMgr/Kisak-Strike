@@ -687,6 +687,29 @@ pub struct SequenceRow<'a> {
 
 pub struct EntityModels { pub stats: EntityModelStats, /* private */ }
 
+/// Every entity model that has attachment points at all, by path — 266 of the
+/// game's 2,017 models do.
+pub struct AttachmentModels { /* private */ }
+
+impl AttachmentModels {
+    /// Records one model's points. **Needs no GPU**, which is why it is a
+    /// method rather than part of `EntityModels::load`: the depot test that
+    /// measures this over the whole game has no device, and a measurement
+    /// made against a copy of this code would not be one.
+    pub fn insert_model(&mut self, path: &str, model: &StudioModel);
+    /// `Studio_FindAttachment` — zero-based.
+    pub fn lookup(&self, model: &str, name: &str) -> Option<usize>;
+    /// `CBaseAnimating::GetAttachment`, in the model's own frame. **Derives
+    /// the cycle itself**, through the same `advance_cycle` the drawn pose
+    /// goes through — see below.
+    pub fn attachment_to_model(
+        &self, model: &str, attachment: usize, sequence: &str,
+        cycle: f32, anim_time: f32, playback_rate: f32, now: f32,
+    ) -> Option<Mat4>;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
 impl EntityModels {
     pub fn load(
         vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
@@ -696,6 +719,10 @@ impl EntityModels {
     /// What each loaded model says about each of its sequences — the answer
     /// back, for `crate::server::sequences::SequenceTable`.
     pub fn sequences(&self) -> impl Iterator<Item = SequenceRow<'_>> + '_;
+    /// …and their **attachment points**, which cannot be an answer because
+    /// the answer moves. Shared, not copied: the same `Arc<[Animation]>` the
+    /// draw path poses from. See below.
+    pub fn attachments(&self) -> Arc<AttachmentModels>;
     pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn refracts(&self) -> bool;
@@ -780,6 +807,29 @@ Seven things about it are worth knowing.
   sequence has *finished* before it has *ended*. `world/` still names no server
   type — the row-to-`SequenceInfo` translation is `engine::group_sequences`,
   the one function in the port that names both.
+
+- **`attachments()` is that seam again, and it is the one that could not be a
+  table.** `SetParentAttachment "attach_arm"` parents an entity to a named
+  point on one of a model's bones, and where that point *is* depends on the
+  cycle — so there is nothing to copy across once per level. What crosses
+  instead is an `Arc<AttachmentModels>` that the server holds for the level,
+  behind a trait it defines (`server::attachment::Attachments`); the `impl` is
+  `engine/mod.rs`'s `WorldAttachments`, beside `push_trace` and for the same
+  reason, since `world/` names no server type.
+
+  Two things about it:
+
+  - **It shares the animations rather than copying them.**
+    `StudioModel::animations` is an `Arc<[Animation]>` for this: the draw path
+    poses a model to look at it and this poses the same model to place a child
+    of it, and `models/anim_wp/room_transform` carries 1,350 animations after
+    its `$includemodel` merge.
+  - **It derives the cycle itself**, through the same `advance_cycle` the drawn
+    pose goes through, from `m_flCycle` + `m_flAnimTime` + the playback rate.
+    The server's `m_flCycle` is a *checkpoint* — `CDynamicProp::AnimThink`
+    stops re-arming once there is nothing left to decide — so taking it as the
+    pose would put a clip brush somewhere the picture is not. That is why the
+    method takes seven arguments where three would look like enough.
 
 - **The list is keyed on `id`, and it used to be positional.** The note here
   said the condition for a real key would be "the first class that creates or

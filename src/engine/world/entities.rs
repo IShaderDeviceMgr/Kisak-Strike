@@ -216,6 +216,172 @@ pub struct EntityModelStats {
     pub instances_with_includes: usize,
 }
 
+/// One model's attachment points, and everything needed to place them.
+///
+/// `CBaseAnimating::GetAttachment` reduced to what it reads: the attachment
+/// table, the skeleton the bones are chained from, the sequence labels a
+/// caller names and the animations they play. The last of those is shared
+/// with [`PropModel`] rather than copied — see
+/// [`StudioModel::animations`](crate::studio::StudioModel::animations).
+pub struct AttachmentModel {
+    attachments: Vec<crate::studio::anim::Attachment>,
+    bones: Vec<crate::studio::anim::Bone>,
+    /// `LookupSequence`'s table, reduced to what posing one needs.
+    sequences: Vec<AttachmentSequence>,
+    animations: Arc<[crate::studio::anim::Animation]>,
+}
+
+/// One sequence, as the attachment lookup reads it.
+struct AttachmentSequence {
+    label: String,
+    /// Which of [`AttachmentModel::animations`] it plays.
+    anim: usize,
+    /// `STUDIO_LOOPING` — whether a cycle past 1 wraps or clamps.
+    looping: bool,
+}
+
+/// Every entity model that has attachment points at all, by path.
+///
+/// **Most models are not in here**: an attachment is a thing a map parents to,
+/// and a prop nothing hangs off has none. Built at load beside the uploads,
+/// and handed to the game server, which asks it where a child of an animating
+/// parent should be — `src/server/attachment.rs` for that side of it.
+#[derive(Default)]
+pub struct AttachmentModels {
+    /// Keyed by the folded path, the same way `server/`'s sequence table is:
+    /// map data spells a model path with either slash and either case.
+    models: HashMap<String, AttachmentModel>,
+}
+
+impl AttachmentModels {
+    /// Records one model's attachment points, if it has any.
+    ///
+    /// Filed under `path` rather than under the model's own
+    /// `studiohdr_t::name`, because the string an entity kept is the path it
+    /// asked for — the two differ on 313 of the game's models.
+    ///
+    /// **Needs no GPU**, which is the point of it being a method rather than
+    /// part of [`EntityModels::load`]: the depot test that measures this over
+    /// the whole game has no device, and a measurement made against a copy of
+    /// this code would not be a measurement of it.
+    pub fn insert_model(&mut self, path: &str, model: &crate::studio::StudioModel) {
+        if model.attachments.is_empty() {
+            return;
+        }
+        self.models.insert(
+            fold_model(path),
+            AttachmentModel {
+                attachments: model.attachments.clone(),
+                bones: model.bones.clone(),
+                sequences: model
+                    .sequences
+                    .iter()
+                    .map(|s| AttachmentSequence {
+                        label: s.label.clone(),
+                        anim: s.anim,
+                        looping: s.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                    })
+                    .collect(),
+                animations: Arc::clone(&model.animations),
+            },
+        );
+    }
+
+    /// `Studio_FindAttachment` (`bone_utils.cpp:3543`) — zero-based, and
+    /// `None` for a model this does not have or a name it does not carry.
+    pub fn lookup(&self, model: &str, name: &str) -> Option<usize> {
+        self.models
+            .get(&fold_model(model))?
+            .attachments
+            .iter()
+            .position(|a| a.name.eq_ignore_ascii_case(name))
+    }
+
+    /// `CBaseAnimating::GetAttachment( iAttachment, attachmentToWorld )`
+    /// (`baseanimating.cpp:2120`), in the model's own frame.
+    ///
+    /// Poses the whole skeleton for one attachment, which is what the original
+    /// does too — `GetBoneTransform` runs `SetupBones` for every bone and
+    /// caches it per entity per frame. There is no such cache here and there
+    /// is no need for one yet: the callers that ask repeatedly ask for the
+    /// same attachment of the same parent, and
+    /// [`hierarchy`](crate::server::hierarchy) caches the answer across a
+    /// parent's whole child list.
+    ///
+    /// > **The cycle is derived here and not taken as given**, through the
+    /// > same [`advance_cycle`] the drawn pose goes through. The server's
+    /// > `m_flCycle` is a checkpoint written when something decides something
+    /// > — `CDynamicProp::AnimThink` stops re-arming once an animation is over
+    /// > — so between writes it is stale, and only the side that owns the
+    /// > `.mdl` knows the duration that turns it into a pose. Deriving it
+    /// > anywhere else is how an attachment ends up somewhere the picture is
+    /// > not.
+    pub fn attachment_to_model(
+        &self,
+        model: &str,
+        attachment: usize,
+        sequence: &str,
+        cycle: f32,
+        anim_time: f32,
+        playback_rate: f32,
+        now: f32,
+    ) -> Option<Mat4> {
+        let model = self.models.get(&fold_model(model))?;
+        let attachment = model.attachments.get(attachment)?;
+        let found = model
+            .sequences
+            .iter()
+            .find(|held| held.label.eq_ignore_ascii_case(sequence))
+            .and_then(|held| Some((model.animations.get(held.anim)?, held.looping)));
+
+        let (anim, cycle) = match found {
+            // A sequence with no length cannot advance, which is
+            // `EntityModels::cycle`'s guard and this one's for the same reason.
+            Some((anim, looping)) if anim.duration() > 0.0 => (
+                Some(anim),
+                advance_cycle(
+                    cycle,
+                    (now - anim_time).max(0.0),
+                    playback_rate,
+                    anim.duration(),
+                    looping,
+                ),
+            ),
+            Some((anim, _)) => (Some(anim), cycle),
+            // No such label: the bind pose, which is what the renderer draws
+            // for it too.
+            None => (None, cycle),
+        };
+
+        let bones = crate::studio::anim::bone_to_model(&model.bones, anim, cycle);
+        crate::studio::anim::attachment_to_model(attachment, &bones)
+    }
+
+    /// How many models this describes. For the startup log.
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+}
+
+/// The key form a model path is filed under: lower case, and `\` as `/`.
+///
+/// `V_FixSlashes` plus `stricmp`, the same rule
+/// [`SequenceTable`](crate::server::sequences::SequenceTable) applies one
+/// layer up, so that the table a model was filed under matches the string the
+/// entity kept.
+fn fold_model(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '\\' => '/',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
 /// Every studio model the map's entities place, uploaded and placed.
 #[derive(Default)]
 pub struct EntityModels {
@@ -232,6 +398,9 @@ pub struct EntityModels {
     /// must still be bound, because the vertex layout says so.
     unlit: Option<VertexBuffer>,
     refracts: bool,
+    /// The attachment points of whichever of [`models`](Self::models) have
+    /// any, shared with the game server rather than copied to it.
+    attachments: Arc<AttachmentModels>,
     pub stats: EntityModelStats,
 }
 
@@ -272,6 +441,7 @@ impl EntityModels {
         // `$includemodel` companion. Kept here rather than on `PropModel`
         // because nothing but the startup log ever asks.
         let mut from_include: Vec<bool> = Vec::new();
+        let mut attachments = AttachmentModels::default();
 
         for entity in entities {
             let key = entity.model.to_ascii_lowercase();
@@ -323,6 +493,10 @@ impl EntityModels {
                     stats.models_with_includes += 1;
                 }
                 from_include.push(!model.includes.is_empty());
+                // Before the upload, which consumes the model. Only the
+                // models something can be parented *to* are kept: an
+                // attachment table with no attachments in it answers nothing.
+                attachments.insert_model(&model.path, &model);
                 models.push(PropModel::upload(device, model, batches));
                 Some(models.len() - 1)
             });
@@ -377,8 +551,17 @@ impl EntityModels {
             models,
             instances,
             refracts,
+            attachments: Arc::new(attachments),
             stats,
         }
+    }
+
+    /// The attachment points of the models this level placed.
+    ///
+    /// Shared rather than copied: the game server holds this for the level's
+    /// lifetime and the draw path keeps drawing from the same animations.
+    pub fn attachments(&self) -> Arc<AttachmentModels> {
+        Arc::clone(&self.attachments)
     }
 
     /// Takes each entity's placement, visibility and pose from whoever owns

@@ -442,6 +442,282 @@ fn set_parent_and_clear_parent_leave_the_entity_where_it_is() {
     assert!(find_named(&server, "arm").children().is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// SetParentAttachment — parenting to a point on a bone
+// ---------------------------------------------------------------------------
+
+/// An arm with one attachment point, `muzzle`, which sits [`RADIUS`] units out
+/// along the model's `+X` and **swings a quarter turn about the model origin
+/// over one cycle** of the sequence `swing`.
+///
+/// Any other sequence holds it at cycle 0, which is what makes "the parent is
+/// playing something else" observable. The cycle is derived the way the real
+/// table derives it — from `anim_time`, the rate and `now` — because that is
+/// the half of [`Posed`](crate::server::attachment::Posed) a stale
+/// `m_flCycle` would hide.
+struct SwingingArm;
+
+impl SwingingArm {
+    const MODEL: &'static str = "models/arm.mdl";
+    const RADIUS: f32 = 40.0;
+    /// Seconds for one full swing, so `cycle = elapsed / DURATION`.
+    const DURATION: f32 = 1.0;
+}
+
+impl crate::server::attachment::Attachments for SwingingArm {
+    fn lookup(&self, model: &str, name: &str) -> Option<usize> {
+        let known = model.eq_ignore_ascii_case(Self::MODEL) && name.eq_ignore_ascii_case("muzzle");
+        known.then_some(0)
+    }
+
+    fn attachment_to_model(
+        &self,
+        posed: &crate::server::attachment::Posed<'_>,
+        attachment: usize,
+    ) -> Option<glam::Affine3A> {
+        if !posed.model.eq_ignore_ascii_case(Self::MODEL) || attachment != 0 {
+            return None;
+        }
+        let cycle = match posed.sequence.eq_ignore_ascii_case("swing") {
+            true => (posed.cycle
+                + (posed.now - posed.anim_time).max(0.0) * posed.playback_rate / Self::DURATION)
+                .clamp(0.0, 1.0),
+            false => 0.0,
+        };
+        let turn = cycle * std::f32::consts::FRAC_PI_2;
+        Some(
+            glam::Affine3A::from_rotation_z(turn)
+                * glam::Affine3A::from_translation(Vec3::new(Self::RADIUS, 0.0, 0.0)),
+        )
+    }
+}
+
+/// An arm wearing [`SwingingArm::MODEL`] and a `func_brush` rider parented to
+/// it, both at the world origin unless `arm_origin` says otherwise.
+fn arm_and_rider(arm_origin: &str, rider_origin: &str) -> Vec<bsp::Entity> {
+    vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "prop_dynamic"),
+            ("targetname", "arm"),
+            ("model", SwingingArm::MODEL),
+            ("origin", arm_origin),
+        ]),
+        block(&[
+            ("classname", "func_brush"),
+            ("targetname", "rider"),
+            ("model", "*1"),
+            ("origin", rider_origin),
+            ("parentname", "arm"),
+        ]),
+    ]
+}
+
+fn arm_server(arm_origin: &str, rider_origin: &str) -> Server {
+    let mut server = Server::new();
+    server.level_init("test", &arm_and_rider(arm_origin, rider_origin), &[]);
+    server.set_attachments(Box::new(SwingingArm));
+    server
+}
+
+fn attach(server: &mut Server, input: &str, point: &str) -> bool {
+    let rider = name::find_by_name(&server.entities, "rider")
+        .next()
+        .unwrap();
+    server.accept_input(
+        rider,
+        input,
+        Variant::String(point.to_owned()),
+        None,
+        None,
+        0,
+    )
+}
+
+/// **`SetParentAttachment` snaps the entity onto the point**, which is
+/// `SetLocalOrigin( vec3_origin )` after the re-parent — and it sets
+/// `MOVETYPE_NONE`, because something pinned to a bone has no business
+/// integrating a velocity.
+#[test]
+fn set_parent_attachment_puts_the_entity_on_the_attachment_point() {
+    let mut server = arm_server("0 0 0", "300 0 0");
+    assert!(attach(&mut server, "SetParentAttachment", "muzzle"));
+
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.parent_attachment(), Some(0));
+    assert_eq!(rider.move_type, crate::server::movement::MoveType::None);
+    assert_eq!(rider.local_origin, Vec3::ZERO, "snapped onto the point");
+    assert!(
+        (rider.origin - Vec3::new(SwingingArm::RADIUS, 0.0, 0.0)).length() < 1e-3,
+        "…which is 40 units out along the arm's +X: {:?}",
+        rider.origin
+    );
+}
+
+/// `SetParentAttachmentMaintainOffset` differs in one bool: the local pair is
+/// **not** zeroed, so the entity stays where it is in the world and keeps that
+/// offset from the point from then on.
+#[test]
+fn set_parent_attachment_maintain_offset_leaves_the_entity_where_it_was() {
+    let mut server = arm_server("0 0 0", "300 0 0");
+    let placed = find_named(&server, "rider").origin;
+    assert!(attach(
+        &mut server,
+        "SetParentAttachmentMaintainOffset",
+        "muzzle"
+    ));
+
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.parent_attachment(), Some(0));
+    assert_eq!(rider.origin, placed, "nothing moved in the world");
+    assert!(
+        (rider.local_origin - Vec3::new(300.0 - SwingingArm::RADIUS, 0.0, 0.0)).length() < 1e-3,
+        "…and the offset is now measured from the point: {:?}",
+        rider.local_origin
+    );
+}
+
+/// **The one that is the whole point of the feature.** The arm never moves and
+/// never turns; its *animation* moves the bone the point rides, and the rider
+/// goes with it.
+///
+/// Plain parenting cannot express this — the parent's own transform is
+/// constant for the whole test — so a rider that stayed put would be a rider
+/// that quietly fell back to it.
+#[test]
+fn an_attachment_child_follows_the_bone_as_the_parent_animates() {
+    let mut server = arm_server("0 0 0", "0 0 0");
+    let arm = find_named(&server, "arm").id();
+    server.accept_input(
+        arm,
+        "SetAnimation",
+        Variant::String("swing".to_owned()),
+        None,
+        None,
+        0,
+    );
+    assert!(attach(&mut server, "SetParentAttachment", "muzzle"));
+
+    let start = find_named(&server, "rider").origin;
+    assert!((start - Vec3::new(SwingingArm::RADIUS, 0.0, 0.0)).length() < 1e-3);
+
+    // Half a swing: the point has turned 45° about the arm's origin, so the
+    // rider is 40 units out at 45°.
+    run(&mut server, SwingingArm::DURATION / 2.0);
+    let rider = find_named(&server, "rider");
+    let half = std::f32::consts::FRAC_PI_4;
+    let expected = Vec3::new(
+        SwingingArm::RADIUS * half.cos(),
+        SwingingArm::RADIUS * half.sin(),
+        0.0,
+    );
+    assert!(
+        (rider.origin - expected).length() < 1.0,
+        "the rider should have swung with the bone: {:?} vs {expected:?}",
+        rider.origin
+    );
+
+    // The arm itself has not moved at all, which is what makes the above the
+    // attachment's doing and not the parent's.
+    assert_eq!(find_named(&server, "arm").origin, Vec3::ZERO);
+    assert_eq!(find_named(&server, "arm").angles, Vec3::ZERO);
+
+    // …and it is **not thinking either**: no sequence table was handed over,
+    // so `CDynamicProp::AnimThink` took its `Lookup::Unknown` branch on the
+    // first tick and never re-armed. That is exactly the case the per-tick
+    // refresh exists for — see `Server::refresh_attachment_children` — and
+    // before it existed this test froze the rider at tick one.
+    assert_eq!(
+        find_named(&server, "arm").next_think_tick(),
+        crate::server::think::TICK_NEVER_THINK,
+        "the arm's own think has cancelled itself"
+    );
+}
+
+/// Both of Valve's guards **return** rather than falling back to plain
+/// parenting, and each is a measured slice of the shipped connections: 75 aim
+/// at an entity with no parent, and 2 at one whose parent is a brush model.
+/// The input is still *accepted* — it is a declared input that ran and warned.
+#[test]
+fn set_parent_attachment_is_refused_rather_than_downgraded() {
+    // No parent at all.
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[("classname", "worldspawn")]),
+            block(&[
+                ("classname", "func_brush"),
+                ("targetname", "rider"),
+                ("model", "*1"),
+                ("origin", "300 0 0"),
+            ]),
+        ],
+        &[],
+    );
+    server.set_attachments(Box::new(SwingingArm));
+    assert!(attach(&mut server, "SetParentAttachment", "muzzle"));
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.parent(), None);
+    assert_eq!(rider.origin, Vec3::new(300.0, 0.0, 0.0));
+
+    // A parent, but no attachment by that name — `LookupAttachment` answering
+    // zero, which is 183 `DefaultAnim`-shaped map errors' worth of precedent.
+    let mut server = arm_server("0 0 0", "300 0 0");
+    assert!(attach(&mut server, "SetParentAttachment", "nosuchpoint"));
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.parent_attachment(), None);
+    assert_eq!(
+        rider.origin,
+        Vec3::new(300.0, 0.0, 0.0),
+        "still on the plain parent"
+    );
+}
+
+/// `InputSetParent`'s first three lines: "if we had a parent attachment, clear
+/// it, because it's no longer valid". So a later `SetParent` really does take
+/// the entity off the bone and put it back on the parent's origin.
+#[test]
+fn set_parent_after_set_parent_attachment_clears_the_attachment() {
+    let mut server = arm_server("0 0 0", "300 0 0");
+    assert!(attach(&mut server, "SetParentAttachment", "muzzle"));
+    assert_eq!(find_named(&server, "rider").parent_attachment(), Some(0));
+
+    let rider_id = find_named(&server, "rider").id();
+    assert!(server.accept_input(
+        rider_id,
+        "SetParent",
+        Variant::String("arm".to_owned()),
+        None,
+        None,
+        0
+    ));
+    let rider = find_named(&server, "rider");
+    assert_eq!(rider.parent_attachment(), None);
+    // `SetParent` holds the world placement still, so it stays on the point it
+    // was snapped to — but it is now measured from the arm, and the next time
+    // the arm animates it will not follow.
+    assert!(rider.parent().is_some());
+    assert_eq!(rider.local_origin, rider.origin);
+}
+
+/// A model whose attachment table nobody filled in is a model with no
+/// attachments: every `SetParentAttachment` is refused and every parenting is
+/// plain. **That is the state of a level's first tick**, because the models are
+/// not read until after `level_init`.
+#[test]
+fn an_attachment_is_refused_while_the_models_are_still_unloaded() {
+    let mut server = Server::new();
+    server.level_init("test", &arm_and_rider("0 0 0", "300 0 0"), &[]);
+    // No `set_attachments`.
+    assert!(attach(&mut server, "SetParentAttachment", "muzzle"));
+    assert_eq!(find_named(&server, "rider").parent_attachment(), None);
+    assert_eq!(
+        find_named(&server, "rider").origin,
+        Vec3::new(300.0, 0.0, 0.0)
+    );
+}
+
 /// `UpdateOnRemove`: "Any children still connected are orphans, mark all for
 /// delete". A removed parent takes its whole subtree, not just its children.
 #[test]
@@ -1178,12 +1454,13 @@ fn an_input_no_class_implements_is_counted() {
     let id = name::find_by_name(&server.entities, "count")
         .next()
         .unwrap();
-    // `SetParentAttachment` rather than `SetParent`: the latter is a base
-    // input now that the transform pair exists, and this test wants a name
-    // nothing anywhere declares.
-    assert!(!server.accept_input(id, "SetParentAttachment", Variant::Void, None, None, 0));
+    // A name nothing anywhere declares, which is getting harder to find: the
+    // transform pair took `SetParent`/`ClearParent` and `LookupAttachment`
+    // took both `SetParentAttachment*` forms. `SetBodyGroup` is
+    // `CBaseAnimating`'s and no class here is one.
+    assert!(!server.accept_input(id, "SetBodyGroup", Variant::Void, None, None, 0));
     assert_eq!(
-        server.io.unhandled.get("math_counter.SetParentAttachment"),
+        server.io.unhandled.get("math_counter.SetBodyGroup"),
         Some(&1)
     );
 }
@@ -3084,7 +3361,14 @@ fn every_shipped_map_spawns_its_entities() {
     // of the game's 143 `SetParent` connections fire inside the first two
     // seconds — 16 `prop_dynamic_override`, 12 `func_brush`, 2 `prop_dynamic`
     // and 1 `info_target`. No `ClearParent` does.
-    assert_eq!(io.accepted, 3_963);
+    //
+    // **+1,074 with `LookupAttachment`.** Both `SetParentAttachment*` forms
+    // are base inputs now, and they are accepted even here, where the maps
+    // carry no models at all: Valve's two guards `return` rather than falling
+    // back, so a declared input that ran and declined is *handled*. This test
+    // therefore measures that they are reached; what they do with a model in
+    // hand is `every_shipped_attachment_connection_puts_its_entity_on_a_bone`.
+    assert_eq!(io.accepted, 5_037);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3107,28 +3391,15 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The whole set of inputs that reach an implemented class and are refused.
     //
-    // **Sixteen names, and 1,072 of the 1,340 occurrences are what is left of
-    // the parenting family** — the attachment half of it, and only that half.
-    // The transform pair took `SetParent` and `ClearParent` off this list; the
-    // two `SetParentAttachment*` forms stay, and the condition for them is
-    // sharper than "needs a transform pair" ever was.
-    //
-    // **`SetParentAttachment*` needs `CBaseAnimating::LookupAttachment`, and
-    // that is not a formality.** `CBaseEntity::SetParentAttachment`
-    // (`baseentity.cpp:4765`) has two guards before the lookup — the entity
-    // must already have a parent, and that parent must be a `CBaseAnimating`
-    // — and it *returns* rather than falling back to plain parenting when
-    // either fails. Measured over the 1,454 connections in the game that fire
-    // one: **1,376 aim at an entity whose parent carries a `.mdl`**, 2 at one
-    // parented to a brush model, 75 at one with no `parentname` at all, 1 at
-    // one whose parent does not resolve. So 78 of them are no-ops in the
-    // shipped game and the other 1,376 genuinely place an entity on a named
-    // attachment point of an animating model — which this port cannot find
-    // without `studio/`'s attachment table, and which it would place at the
-    // parent's *origin* if it pretended otherwise. `func_brush` alone takes
-    // 883 of them in the first two seconds, because a Hammer instance parents
-    // its clip brushes to a moving arm and the `logic_auto` bootstrap is what
-    // does the parenting.
+    // **The parenting family is no longer on this list at all.** The transform
+    // pair took `SetParent` and `ClearParent` off it, and `LookupAttachment`
+    // took both `SetParentAttachment*` forms — which between them were 1,072
+    // of the occurrences here. They are *accepted* now even on this test's
+    // maps, which carry no models at all, because `SetParentAttachment`'s two
+    // guards `return` rather than falling back: a declared input that ran and
+    // declined is handled, not unhandled. What it does when the models *are*
+    // in hand is
+    // `every_shipped_attachment_connection_puts_its_entity_on_a_bone`.
     //
     // Three of the remaining names are the player procedurals (stage 5's), one
     // is `RunScriptCode` (`portdocs/SERVER.md` §9), and
@@ -3148,18 +3419,9 @@ fn every_shipped_map_spawns_its_entities() {
             // than too little. See `classes::AreaPortal`.
             ("func_areaportalwindow.SetFadeEndDistance", 43),
             ("func_areaportalwindow.SetFadeStartDistance", 43),
-            ("func_brush.SetParentAttachmentMaintainOffset", 883),
-            ("info_target.SetParentAttachment", 12),
-            ("info_target.SetParentAttachmentMaintainOffset", 1),
             ("logic_relay.RunScriptCode", 1),
             ("player.SetFogController", 97),
             ("prop_dynamic.Disabled", 8),
-            ("prop_dynamic.SetParentAttachment", 3),
-            ("prop_dynamic.SetParentAttachmentMaintainOffset", 148),
-            ("prop_dynamic_override.SetParentAttachment", 3),
-            ("prop_dynamic_override.SetParentAttachmentMaintainOffset", 3),
-            ("trigger_hurt.SetParentAttachmentMaintainOffset", 19),
-            ("trigger_multiple.SetParentAttachmentMaintainOffset", 2),
         ],
         "the set of inputs nothing handles has changed"
     );
@@ -4029,9 +4291,18 @@ fn the_player_is_an_entity_and_resolves_procedurally() {
             queue,
             random,
             sequences,
+            attachments,
             ..
         } = &mut server;
-        let mut cx = Context::new(time, queue, random, entities, Some(player), sequences);
+        let mut cx = Context::new(
+            time,
+            queue,
+            random,
+            entities,
+            Some(player),
+            sequences,
+            attachments.as_ref(),
+        );
         cx.post_named("!player", "Kill", Variant::Void, 0.0, None, Some(spot), 0);
     }
     run(&mut server, 0.1);
@@ -8716,5 +8987,297 @@ fn every_shipped_mover_pushes_the_player_standing_in_front_of_it() {
     assert!(
         (234.0..235.0).contains(&furthest),
         "the furthest shove was {furthest:.1} units"
+    );
+}
+
+/// **Every `SetParentAttachment*` the shipped game fires, followed through to
+/// where it puts the entity.**
+///
+/// `LookupAttachment`'s depot test, and the one that says what the feature is
+/// worth. For each of the 106 maps it spawns the entities, loads every `.mdl`
+/// their props name — through `StudioModel`, which needs a `Vfs` and no GPU —
+/// fills in the sequence table *and* the attachment table exactly as
+/// `Engine::load_level` does, and runs two seconds.
+///
+/// It uses `engine::world::entities::AttachmentModels` rather than a stand-in,
+/// for the reason the pusher's depot test uses the engine's real
+/// `push_trace`: a seam measured against a copy of itself is not measured.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
+    use crate::engine::world::entities::AttachmentModels;
+    use crate::filesystem::Vfs;
+    use crate::studio::StudioModel;
+
+    const RUN_SECONDS: f32 = 2.0;
+
+    /// The engine's table, as the server asks it — `engine/mod.rs`'s
+    /// `WorldAttachments`, which is private to that module.
+    struct Table(std::sync::Arc<AttachmentModels>);
+
+    impl crate::server::attachment::Attachments for Table {
+        fn lookup(&self, model: &str, name: &str) -> Option<usize> {
+            self.0.lookup(model, name)
+        }
+
+        fn attachment_to_model(
+            &self,
+            posed: &crate::server::attachment::Posed<'_>,
+            attachment: usize,
+        ) -> Option<glam::Affine3A> {
+            self.0
+                .attachment_to_model(
+                    posed.model,
+                    attachment,
+                    posed.sequence,
+                    posed.cycle,
+                    posed.anim_time,
+                    posed.playback_rate,
+                    posed.now,
+                )
+                .map(glam::Affine3A::from_mat4)
+        }
+    }
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    // Every `.mdl` read so far. `None` for one that would not load.
+    let mut studio: BTreeMap<String, Option<StudioModel>> = BTreeMap::new();
+
+    // Connections the maps declare, counted from the lump rather than from a
+    // handler, so the denominator is the content and not the port.
+    let mut declared = 0usize;
+    // Entities that ended the run riding an attachment point.
+    let mut on_a_point = 0usize;
+    // …and the three ways Valve's two guards refuse one.
+    let (mut no_parent, mut parent_has_no_model, mut no_such_point) = (0usize, 0usize, 0usize);
+    // Which classes are parented to a bone, by connection — the shape of the
+    // content rather than a total, and the reason `func_brush` dominates is
+    // that a Hammer instance parents its clip set to an arm.
+    let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
+    // Entities whose origin moved during the run while their **parent's** did
+    // not — the animation carrying them, which plain parenting cannot do.
+    let mut carried_by_animation = 0usize;
+    let (mut furthest_offset, mut furthest_offset_at) = (0.0f32, String::new());
+    let (mut furthest_carry, mut furthest_carry_at) = (0.0f32, String::new());
+    let mut maps_with_one = 0usize;
+
+    let mut server = Server::new();
+    for name in &names {
+        let bsp = crate::engine::world::bsp::Bsp::load(&vfs, name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let blocks = bsp.entities();
+
+        // The connections the map declares, before anything runs. A value is
+        // `target,input,parameter,delay,times` and the input is field 1.
+        let here_declared = blocks
+            .iter()
+            .flat_map(|block| block.pairs.iter())
+            .filter(|(_, value)| {
+                value
+                    .split(&[',', '\x1b'][..])
+                    .nth(1)
+                    .map(|input| {
+                        input.eq_ignore_ascii_case("SetParentAttachment")
+                            || input.eq_ignore_ascii_case("SetParentAttachmentMaintainOffset")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        declared += here_declared;
+        if here_declared > 0 {
+            maps_with_one += 1;
+        }
+
+        server.level_init(name, &blocks, &bsp.models);
+
+        // The engine's job, done here: read every model the entities name and
+        // hand both answers back.
+        let mut table = sequences::SequenceTable::new();
+        let mut attachments = AttachmentModels::default();
+        let models: Vec<String> = server
+            .entities
+            .iter()
+            .filter_map(|(_, entity)| entity.core.model.clone())
+            .filter(|model| !model.starts_with('*') && !model.is_empty())
+            .collect();
+        for model in models {
+            let entry = studio
+                .entry(model.to_ascii_lowercase())
+                .or_insert_with(|| StudioModel::load(&vfs, &model).ok());
+            let Some(loaded) = entry else { continue };
+            table.insert_model(
+                &model,
+                loaded
+                    .sequences
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sequence)| {
+                        (
+                            sequence.label.clone(),
+                            sequences::SequenceInfo {
+                                duration: loaded.animation(i).map_or(0.0, |a| a.duration()),
+                                loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                                fade_out_time: sequence.fade_out_time,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            attachments.insert_model(&model, loaded);
+        }
+        server.set_sequences(table);
+        server.set_attachments(Box::new(Table(std::sync::Arc::new(attachments))));
+
+        // One tick to let the `logic_auto` bootstrap fire its parenting, then
+        // a snapshot, then the rest of the run — so "moved" means "moved after
+        // it was attached" rather than "was placed".
+        run(&mut server, 0.1);
+        let placed: BTreeMap<u64, (Vec3, Vec3)> = server
+            .entities
+            .iter()
+            .filter(|(_, entity)| entity.core.parent_attachment().is_some())
+            .filter_map(|(id, entity)| {
+                let parent = server.entities.get(entity.core.parent()?)?;
+                Some((id.to_int(), (entity.core.origin, parent.core.origin)))
+            })
+            .collect();
+        run(&mut server, RUN_SECONDS - 0.1);
+
+        for (id, entity) in server.entities.iter() {
+            match entity.core.parent_attachment() {
+                Some(_) => {
+                    on_a_point += 1;
+                    if let Some(parent) = entity.core.parent().and_then(|p| server.entities.get(p)) {
+                        let where_ = || {
+                            format!(
+                                "{name}: {} on {}",
+                                entity.debug_name(),
+                                parent.core.model.clone().unwrap_or_default()
+                            )
+                        };
+                        let offset = (entity.core.origin - parent.core.origin).length();
+                        if offset > furthest_offset {
+                            furthest_offset = offset;
+                            furthest_offset_at = where_();
+                        }
+                        if let Some(&(was, parent_was)) = placed.get(&id.to_int()) {
+                            let moved = (entity.core.origin - was).length();
+                            // The parent standing still is what makes this the
+                            // *animation's* doing: plain parenting could not
+                            // have moved the child at all.
+                            if moved > 0.01 && (parent.core.origin - parent_was).length() < 0.01 {
+                                carried_by_animation += 1;
+                                if moved > furthest_carry {
+                                    furthest_carry = moved;
+                                    furthest_carry_at = where_();
+                                }
+                            }
+                        }
+                    }
+                }
+                // The refusals, told apart the way `SetParentAttachment`'s two
+                // guards tell them apart. Only entities a map actually aimed
+                // one at can be counted, and the port does not record which
+                // those were — so this is the *shape* of the population rather
+                // than a per-connection tally.
+                None => {}
+            }
+        }
+
+        // The three refusal counts, from the lump: for each connection, what
+        // the target's `parentname` resolves to.
+        for block in &blocks {
+            for (_, value) in &block.pairs {
+                let mut fields = value.split(&[',', '\x1b'][..]);
+                let (Some(target), Some(input)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                if !input.eq_ignore_ascii_case("SetParentAttachment")
+                    && !input.eq_ignore_ascii_case("SetParentAttachmentMaintainOffset")
+                {
+                    continue;
+                }
+                let Some(id) = name::find_by_name(&server.entities, target).next() else {
+                    continue;
+                };
+                let Some(entity) = server.entities.get(id) else {
+                    continue;
+                };
+                *by_class
+                    .entry(entity.classname().to_owned())
+                    .or_default() += 1;
+                if entity.core.parent_attachment().is_some() {
+                    continue;
+                }
+                match entity.core.parent() {
+                    None => no_parent += 1,
+                    Some(parent) => {
+                        let has_model = server
+                            .entities
+                            .get(parent)
+                            .and_then(|p| p.core.model.clone())
+                            .map(|m| !m.starts_with('*') && !m.is_empty())
+                            .unwrap_or(false);
+                        match has_model {
+                            true => no_such_point += 1,
+                            false => parent_has_no_model += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "attachment parenting over {} maps ({maps_with_one} with any):\n  \
+         {declared} SetParentAttachment* connections declared;\n  \
+         {on_a_point} entities ended up riding a bone, the furthest \
+         {furthest_offset:.1} units from its parent's origin ({furthest_offset_at});\n  \
+         {carried_by_animation} of those were carried by the animation alone \
+         (furthest {furthest_carry:.1} units, {furthest_carry_at});\n  \
+         refused: {no_parent} with no parent, {parent_has_no_model} whose parent \
+         is not a studio model, {no_such_point} with no point by that name.",
+        names.len()
+    );
+    let mut ranked: Vec<(&String, &usize)> = by_class.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    println!("  by the class being parented:");
+    for (classname, count) in ranked.iter().take(10) {
+        println!("    {count:>7}  {classname}");
+    }
+
+    // Exact, the way the other depot tests are exact: the seed is fixed and
+    // the maps do not change, so a number that moves is a behaviour that
+    // moved.
+    assert_eq!(
+        (
+            declared,
+            on_a_point,
+            carried_by_animation,
+            no_parent,
+            parent_has_no_model,
+            no_such_point
+        ),
+        (1362, 1040, 6, 6, 0, 174),
+        "the attachment census over the shipped maps has changed"
     );
 }

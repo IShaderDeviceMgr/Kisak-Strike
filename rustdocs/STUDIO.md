@@ -17,6 +17,7 @@ behind the scoping: `portdocs/STUDIO.md`.
 | 6 | LOD selection and fade | **not started** (optional) |
 | — | bones, sequences and animation | **done** for rigid models — `studio/anim.rs`, below |
 | — | `$includemodel` | **done** — `studio/include.rs`, below; 25 shipped models declare one, 9 of them worn by 926 `prop_dynamic`s |
+| — | attachment points | **done** — `Attachment`, `bone_to_model`, `attachment_to_model`; 266 shipped models carry 1,952 points. `src/server/attachment.rs` is what asks |
 
 Not implemented and not planned here: `.phy` collision (that is
 `ENGINE_TRACE.md` stage 5), the prop leaf lists as a *visibility* structure
@@ -63,14 +64,21 @@ pub struct StudioModel {
     pub batches: Vec<Batch>,
     pub bones: Vec<anim::Bone>,
     pub sequences: Vec<anim::Sequence>,
-    pub animations: Vec<anim::Animation>,
-    /// The `$includemodel` companions merged into the two lists above.
+    /// **Shared, not owned** — the draw path poses a model to look at it and
+    /// `server/`'s attachment lookup poses the same model to place a child of
+    /// it, and `models/anim_wp/room_transform` carries 1,350 animations.
+    pub animations: Arc<[anim::Animation]>,
+    /// The attachment points — 266 of the game's 2,017 models have any.
+    pub attachments: Vec<anim::Attachment>,
+    /// The `$includemodel` companions merged into the lists above.
     pub includes: Vec<String>,
 }
 
 impl StudioModel {
     pub fn sequence(&self, label: &str) -> Option<usize>;   // LookupSequence
     pub fn animation(&self, sequence: usize) -> Option<&anim::Animation>;
+    /// LookupAttachment — ZERO-based, `None` for "no such attachment".
+    pub fn attachment(&self, name: &str) -> Option<usize>;
     /// Which bone moves each vertex — `Some` only if EVERY vertex answers to
     /// exactly one. See gotcha 9.
     pub fn rigid_bones(&self) -> Option<&[u8]>;
@@ -163,10 +171,26 @@ pub struct Animation {
 }
 impl Animation { pub fn duration(&self) -> f32; }
 
-pub const STUDIO_LOOPING: u32 = 0x0001;
+/// mstudioattachment_t — a named frame riding a bone. 92 bytes.
+pub struct Attachment {
+    pub name: String,
+    pub flags: u32,       // only ATTACHMENT_FLAG_WORLD_ALIGN exists
+    pub bone: usize,      // into the model's OWN bone list, already remapped
+    pub local: Mat4,      // where the point sits in that bone's frame
+}
 
-/// R_StudioSetupBones + ComputePoseToWorld, in model space.
+pub const STUDIO_LOOPING: u32 = 0x0001;
+pub const ATTACHMENT_FLAG_WORLD_ALIGN: u32 = 0x10000;
+
+/// R_StudioSetupBones + ComputePoseToWorld, in model space —
+/// what a BIND-POSE VERTEX is multiplied by.
 pub fn pose(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4>;
+/// The same walk WITHOUT the poseToBone factor — `boneToWorld`, which is
+/// what `GetBoneTransform` hands out and what an ATTACHMENT rides.
+pub fn bone_to_model(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4>;
+/// CBaseAnimating::GetAttachment, in model space. `bones` is
+/// `bone_to_model`'s output, NOT `pose`'s.
+pub fn attachment_to_model(attachment: &Attachment, bones: &[Mat4]) -> Option<Mat4>;
 ```
 
 `bonesetup/bone_decode.cpp` plus the slice of `studiorender/r_studio.cpp`'s
@@ -213,6 +237,37 @@ cull cheap: no pose is computed for an entity that is then culled.
 which is what a *bind-pose* vertex is multiplied by. With no animation every
 one of them is the identity, which is what lets a static prop and an animated
 model share one draw path.
+
+#### Attachment points, and the one array they must not use
+
+An **attachment** is a named frame riding a bone: `muzzle` on a gun,
+`attach_arm` on a panel arm. It is what a map parents an entity *to* —
+`SetParentAttachment "attach_arm"` — and `src/server/attachment.rs` is the
+other end of that. [`StudioModel::attachment`] is `LookupAttachment` and is
+**zero-based**, where Valve's returns `index + 1` so that 0 can mean "none".
+
+> **It rides [`bone_to_model`] and not [`pose`], and the difference is a wrong
+> answer rather than an error.** `CBaseAnimating::GetAttachment` is
+> `ConcatTransforms( bonetoworld, pattachment.local, … )`, and `bonetoworld`
+> comes from `GetBoneTransform` — the array *before* the `poseToBone` concat.
+> `pose`'s extra factor exists to cancel a **vertex's** bind transform, and an
+> attachment's `local` is already expressed in the bone's posed frame, so
+> multiplying by it first applies the bind pose twice. In the bind pose that
+> makes every attachment collapse onto the model's origin, which is a place
+> rather than a crash; `an_attachment_rides_the_bone_and_not_the_posed_vertex_matrix`
+> pins both answers side by side.
+
+Measured over the shipped game (`every_shipped_studio_model_parses`): **266 of
+the 2,017 models have attachment points, 1,952 points between them under 854
+distinct names.** Two of the branches ported with them are content-free in
+Portal 2 and are recorded as such rather than deleted:
+
+- **`ATTACHMENT_FLAG_WORLD_ALIGN`** — keep the bone's position, drop every
+  rotation — is set by **none** of the 1,952.
+- **`AppendAttachments`' merge** carries **none** of them: all 25
+  `$includemodel` hosts own their attachment points and their companions carry
+  animation and nothing else. The bone remap in it is kept anyway, because it
+  is the same silent-wrong-joint trap the animation tracks have.
 
 ### `include` — `$includemodel`
 
@@ -661,9 +716,10 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   LOD's indices, so selection is a parameter and a `switchPoint` comparison, not
   a rewrite. 819 of 968 models have one LOD, so this is performance, not
   correctness.
-- **Skinned models** — `vvd::Vertex` grows a `bones` field, `vtx` stops
-  discarding `StripHeader_t`'s bone plumbing, and `mdl` reads the bone array it
-  currently counts and skips.
+- **Skinned models** — `vtx` stops discarding `StripHeader_t`'s bone plumbing
+  and the bone matrices move to the GPU. (`vvd::BoneWeights` already carries
+  `bones`, `weights` and `count`; the gap is the strip plumbing and the
+  shaders, not the reader.)
 - **Sharing an included model between hosts** — both panel arms include the
   same 1.3 MB companion, and a map placing both reads and expands it twice
   (about 50 ms and 7 MB each, at level load; the frame path is untouched).
@@ -703,6 +759,11 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 | `studio::include::tests::the_dedup_window_is_fixed_before_the_include_rather_than_growing` | `numCheck` being captured before the loop — invisible in Portal 2, and wrong the obvious way |
 | `studio::include::tests::a_missing_include_is_skipped_and_not_an_error`, `a_cycle_terminates` | `FindModel` returning null, and the cycle guard Valve has not got |
 | `studio::anim_depot_tests::an_included_model_supplies_the_sequences_a_map_asks_for` | **the merge, against the real panel arm** — 1,351 sequences, a pose 112 units off the bind pose, and all sixteen bones agreeing with the companion's own frame at three cycles |
+| `studio::anim::tests::an_attachment_rides_the_bone_and_not_the_posed_vertex_matrix` | **the one attachment mistake that gives a place rather than an error** — `bone_to_model` against `pose`, with the wrong answer asserted alongside the right one |
+| `studio::anim::tests::an_attachments_local_offset_is_in_the_bones_frame` | `ConcatTransforms( bonetoworld, local )`, the way round it is |
+| `studio::anim::tests::a_world_aligned_attachment_keeps_the_place_and_drops_the_turn` | `ATTACHMENT_FLAG_WORLD_ALIGN` — unreachable in Portal 2, so this is the only thing holding it |
+| `studio::anim::tests::an_attachment_whose_bone_is_missing_has_no_answer` | `GetAttachment` returning false, which the caller reads as plain parenting |
+| `studio::include::tests::an_included_attachments_bone_is_remapped_by_name_and_not_by_index`, `the_host_keeps_its_own_attachment_and_drops_one_with_no_bone` | `AppendAttachments` — also unreachable in Portal 2, and the same remap trap as the tracks |
 | `studio::anim_depot_tests::the_floor_button_model_animates` | **the decoder, against the real `portal_button.mdl`** — bones, sequences, 7.29 units of plate travel, and `up` retracing `down` |
 | `engine::world::entities::tests::the_button_draws_and_moves_as_it_presses` | **the whole path, on real pixels** — the model on screen, and the image changing as it presses |
 | `props::tests::the_second_prop_lands_on_the_seventy_two_byte_boundary` | gotcha 1 |

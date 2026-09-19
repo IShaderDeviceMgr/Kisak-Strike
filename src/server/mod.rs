@@ -65,6 +65,7 @@
 //! dispatched later in the *same* tick, but an input handler cannot see a
 //! think that has not run yet.
 
+pub mod attachment;
 pub mod class;
 pub mod classes;
 pub mod damage;
@@ -219,6 +220,22 @@ pub struct Server {
     /// Empty until the engine has loaded the level's models, which is *after*
     /// `level_init`, and empty for ever in a test with no engine.
     sequences: SequenceTable,
+    /// The same models' **attachment points**, which unlike their sequences
+    /// cannot be tabulated — see [`attachment`] and
+    /// [`Server::set_attachments`].
+    ///
+    /// [`NoAttachments`](attachment::NoAttachments) until the engine has
+    /// loaded the level's models, and for ever in a test with no engine, in
+    /// which case every attachment parenting quietly becomes a plain one.
+    attachments: Box<dyn attachment::Attachments>,
+    /// Whether anything in this level has ever been parented to an attachment
+    /// point — the gate on
+    /// [`refresh_attachment_children`](Server::refresh_attachment_children).
+    ///
+    /// Set and never cleared, because the pass it gates is idempotent and
+    /// clearing it would need a second scan to prove the last one had gone.
+    /// 86 of the game's 106 maps set it.
+    attachments_in_use: bool,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -738,6 +755,8 @@ impl Server {
             pending_punches: Vec::new(),
             level_restart: None,
             sequences: SequenceTable::new(),
+            attachments: Box::new(attachment::NoAttachments),
+            attachments_in_use: false,
         }
     }
 
@@ -866,7 +885,18 @@ impl Server {
                 stats.parents_missing += 1;
             }
             if let Some(mut entity) = self.entities.detach(id) {
-                hierarchy::set_parent(&mut entity.core, &mut self.entities, parent);
+                // No attachment: the map-key form `parentname "arm,point"` is
+                // the only way one could arrive here and **zero of the game's
+                // 4,582 parented entities use it** — see
+                // [`hierarchy`]. The two inputs are the live path, and they
+                // run long after this.
+                hierarchy::set_parent(
+                    &mut entity.core,
+                    &mut self.entities,
+                    parent,
+                    None,
+                    attachment::Poser::NONE,
+                );
                 self.entities.attach(id, entity);
             }
         }
@@ -1035,6 +1065,8 @@ impl Server {
         self.created_while_loading.clear();
         self.level_loading = false;
         self.sequences = SequenceTable::new();
+        self.attachments = Box::new(attachment::NoAttachments);
+        self.attachments_in_use = false;
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -1046,6 +1078,16 @@ impl Server {
     /// has to know it.
     pub fn set_sequences(&mut self, sequences: SequenceTable) {
         self.sequences = sequences;
+    }
+
+    /// What `studio/` says about those models' **attachment points**.
+    ///
+    /// The other half of [`set_sequences`](Server::set_sequences), called at
+    /// the same moment and subject to the same ordering rule. It is a trait
+    /// object rather than a table because an attachment's answer is a matrix
+    /// that moves with the parent's animation — see [`attachment`].
+    pub fn set_attachments(&mut self, attachments: Box<dyn attachment::Attachments>) {
+        self.attachments = attachments;
     }
 
     // -----------------------------------------------------------------------
@@ -1104,6 +1146,7 @@ impl Server {
         self.player_pre_think();
         self.player_touch_triggers(query);
         self.run_think_functions(query);
+        self.refresh_attachment_children();
         self.check_for_entity_untouch();
         self.service_events();
         // `m_hLinkedPortal->PunchAllPenetratingPlayers()`, which the C++ does
@@ -1115,6 +1158,57 @@ impl Server {
         self.flush_portal_punches(query);
         // Anything a think or an input removed.
         self.cleanup_delete_list();
+    }
+
+    /// Re-derive everything riding an **attachment point**, once a tick.
+    ///
+    /// This is the one place eager propagation is not enough on its own.
+    /// Everywhere else a child moves because its parent moved, and
+    /// `Server::dispatch` walks the subtree of whatever it just dispatched. An
+    /// attachment child moves because the parent's *animation* advanced, which
+    /// happens on the clock rather than in a handler: the parent's origin,
+    /// angles and even its `m_flCycle` can all be untouched for a second at a
+    /// time while the point it rides sweeps a quarter circle, because the
+    /// cycle is derived from `anim_time` and `curtime` rather than stepped.
+    ///
+    /// > **Valve needs no equivalent because Valve is lazy.**
+    /// > `InvalidatePhysicsRecursive` marks `EFL_DIRTY_ABSTRANSFORM` and the
+    /// > next `GetAbsOrigin` pays for it, so a child of an attachment is
+    /// > re-derived whenever it is *read* and is never stale. This port
+    /// > propagates eagerly — [`hierarchy`] says why it must — so "whenever it
+    /// > is read" has to become "every tick". Without it a clip brush on a
+    /// > panel arm updates only as often as the arm happens to be dispatched,
+    /// > which is `CDynamicProp::AnimThink`'s tenth of a second, and stops
+    /// > entirely once that think cancels itself.
+    ///
+    /// Costs one pass over the entity list on a map that uses attachment
+    /// parenting at all, and nothing at all on one that does not — see
+    /// [`attachments_in_use`](Server::attachments_in_use). `EntityCore::follow`
+    /// stops the walk wherever the frame has not actually changed, so a parent
+    /// whose animation has finished costs one matrix compare per child.
+    fn refresh_attachment_children(&mut self) {
+        if !self.attachments_in_use {
+            return;
+        }
+        let mut parents: Vec<EntityId> = Vec::new();
+        for (_, entity) in self.entities.iter() {
+            if entity.core.parent_attachment().is_none() {
+                continue;
+            }
+            let Some(parent) = entity.core.parent() else {
+                continue;
+            };
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+        let poser = attachment::Poser {
+            attachments: self.attachments.as_ref(),
+            now: self.clock.time().curtime,
+        };
+        for parent in parents {
+            hierarchy::propagate_id(parent, &mut self.entities, poser);
+        }
     }
 
     /// `CPortal_Player::PreThink` (`portal_player.cpp:1855`), reduced to the
@@ -1667,10 +1761,19 @@ impl Server {
             queue,
             random,
             sequences,
+            attachments,
             ..
         } = self;
         let mut entity = entities.detach(id)?;
-        let mut cx = Context::new(time, queue, random, entities, player, sequences);
+        let mut cx = Context::new(
+            time,
+            queue,
+            random,
+            entities,
+            player,
+            sequences,
+            attachments.as_ref(),
+        );
         let result = f(&mut entity.core, &mut *entity.behaviour, &mut cx);
 
         // `InvalidatePhysicsRecursive( POSITION_CHANGED )`, at the one seam
@@ -1683,12 +1786,15 @@ impl Server {
         // Unconditional, and free when nothing moved:
         // [`EntityCore::follow`] compares the frame it is handed against the
         // one the child already has and the walk stops wherever they agree.
-        cx.moved(&entity.core);
+        cx.moved(&entity);
         let changed = cx.take_changed();
         let created = cx.take_created();
         let damage = cx.take_damage_queue();
         let punches = cx.take_punch_queue();
         let reload = cx.take_reload_level();
+        // Once a level has any attachment parenting, every tick re-derives
+        // what rides one — see `Server::refresh_attachment_children`.
+        self.attachments_in_use |= cx.took_attachment();
         let next_think = entity.core.next_think_tick();
         // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
         // `SetMoveType` both call — reconciled here for the same reason the
@@ -1717,7 +1823,14 @@ impl Server {
             // …and the same for whatever the handler moved through
             // `entity_mut` rather than moving itself: a `trigger_push` lifting
             // a toucher, a teleport writing a destination.
-            hierarchy::propagate_id(other, &mut self.entities);
+            hierarchy::propagate_id(
+                other,
+                &mut self.entities,
+                attachment::Poser {
+                    attachments: self.attachments.as_ref(),
+                    now: time.curtime,
+                },
+            );
         }
 
         // `DispatchSpawn( pEnt )`, which in the C++ the creator calls itself

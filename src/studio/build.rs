@@ -189,7 +189,8 @@ pub(super) fn build(
         meshes,
         bones: mdl.bones.clone(),
         sequences: mdl.sequences.clone(),
-        animations: mdl.animations.clone(),
+        animations: mdl.animations.clone().into(),
+        attachments: mdl.attachments.clone(),
         // `StudioModel::load` fills this in; `assemble` joins three files and
         // has no filesystem to resolve a fourth against.
         includes: Vec::new(),

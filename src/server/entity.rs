@@ -122,6 +122,15 @@ pub struct EntityCore {
     /// parent's [`children`](EntityCore::children) list and this entity's
     /// [`local_origin`](EntityCore::local_origin) disagreeing with it.
     parent: Option<EntityId>,
+    /// `m_iParentAttachment` — which of the parent's attachment points this
+    /// entity rides, rather than the parent's own origin.
+    ///
+    /// **Zero-based**, where Valve's is one-based so that 0 can mean "none".
+    /// `None` is that case, and it is what all but 1,376 of the game's
+    /// parented entities are. Written only by
+    /// [`hierarchy::set_parent`](super::hierarchy::set_parent), for the same
+    /// reason [`parent`](EntityCore::parent) is: the two are one decision.
+    parent_attachment: Option<usize>,
     /// Every entity whose [`parent`](EntityCore::parent) is this one.
     ///
     /// `m_hMoveChild`/`m_hMovePeer` (`hierarchy.cpp:21`) flattened: Valve
@@ -395,6 +404,13 @@ impl EntityCore {
         self.parent
     }
 
+    /// `m_iParentAttachment`, zero-based — which of the parent's attachment
+    /// points this entity rides, if it rides one rather than the parent
+    /// itself.
+    pub fn parent_attachment(&self) -> Option<usize> {
+        self.parent_attachment
+    }
+
     /// Every entity parented to this one. `FirstMoveChild`/`NextMovePeer`.
     pub fn children(&self) -> &[EntityId] {
         &self.children
@@ -505,8 +521,8 @@ impl EntityCore {
                 self.local_angles = angles;
             }
             Some(parent) => {
-                let frame = self.parent_to_world;
-                self.set_parent_frame(Some(parent), frame);
+                let (frame, attachment) = (self.parent_to_world, self.parent_attachment);
+                self.set_parent_frame(Some(parent), attachment, frame);
             }
         }
     }
@@ -558,8 +574,14 @@ impl EntityCore {
 
     /// The other half of [`follow`](EntityCore::follow): a new parent, and the
     /// **world** placement held still while the local one is re-solved.
-    pub(super) fn set_parent_frame(&mut self, parent: Option<EntityId>, frame: glam::Affine3A) {
+    pub(super) fn set_parent_frame(
+        &mut self,
+        parent: Option<EntityId>,
+        attachment: Option<usize>,
+        frame: glam::Affine3A,
+    ) {
         self.parent = parent;
+        self.parent_attachment = attachment;
         self.parent_to_world = frame;
         // Not [`set_abs_placement`](EntityCore::set_abs_placement): its
         // early-out is on the *world* pair, which is exactly the half this
@@ -1035,6 +1057,7 @@ impl Entity {
                 target: None,
                 parent_name: None,
                 parent: None,
+                parent_attachment: None,
                 children: Vec::new(),
                 origin: Vec3::ZERO,
                 angles: Vec3::ZERO,

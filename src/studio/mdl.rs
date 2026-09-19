@@ -16,7 +16,7 @@
 //! owned `Vec`s. That is the same trade `world::bsp` made, for the same reason:
 //! it is what most of the C++'s lifetime management exists to support.
 
-use super::anim::{self, Animation, Bone, Sequence};
+use super::anim::{self, Animation, Attachment, Bone, Sequence};
 use super::StudioError;
 use glam::Vec3;
 
@@ -193,6 +193,10 @@ pub struct Mdl {
     /// The animations a sequence names, already expanded out of their RLE
     /// blocks. See [`anim`](super::anim) for why that happens at load.
     pub animations: Vec<Animation>,
+    /// The attachment points, in file order — what `LookupAttachment`
+    /// searches. Empty for most models; see
+    /// [`StudioModel::attachment`](super::StudioModel::attachment).
+    pub attachments: Vec<Attachment>,
     /// `mstudiotexture_t` names, in order — what a mesh's `material` indexes.
     /// These are *bare* names with no directory: `pillar_64` and not
     /// `models/props_bts/pillar_64`.
@@ -300,6 +304,23 @@ impl Mdl {
             animations.len(),
         )?;
 
+        // `numlocalattachments` / `localattachmentindex` (`studio.h:2691`),
+        // which sit immediately after `bodypartindex` — the four bytes that
+        // used to be the end of this reader's interest in the header. Read
+        // after the bones because an attachment is checked against them.
+        let attachments = {
+            let count = r.count(240, "attachments")?;
+            match count {
+                0 => Vec::new(),
+                _ => anim::parse_attachments(
+                    &r,
+                    r.offset(244, "localattachmentindex")?,
+                    count,
+                    bones.len(),
+                )?,
+            }
+        };
+
         // `$includemodel` (`studio.h:2767`). Read before the geometry for the
         // same reason the bone list is: it is the sequences' half of the file,
         // and `include::resolve` merges into the lists `parse_sequences` has
@@ -387,6 +408,7 @@ impl Mdl {
             bones,
             sequences,
             animations,
+            attachments,
             include_models,
             textures,
             texture_dirs,

@@ -240,7 +240,24 @@ pub struct StudioModel {
     pub sequences: Vec<anim::Sequence>,
     /// The animations, parallel to nothing — a [`Sequence`](anim::Sequence)
     /// indexes them.
-    pub animations: Vec<anim::Animation>,
+    ///
+    /// **Shared rather than owned**, because two things need the same
+    /// animation data for the whole of a level: the draw path poses a model to
+    /// look at it, and `server/`'s attachment lookup poses the same model to
+    /// find out where a child of it should be. `models/anim_wp/room_transform`
+    /// carries 1,350 animations after its `$includemodel` merge, and a second
+    /// copy of those is megabytes.
+    pub animations: std::sync::Arc<[anim::Animation]>,
+    /// The attachment points — named frames riding bones, which is what a map
+    /// parents an entity to. [`attachment`](StudioModel::attachment) is
+    /// `LookupAttachment`.
+    ///
+    /// **Empty for most models**: 266 of the 2,017 the game ships have any at
+    /// all, 1,952 points between them under 854 distinct names. Includes are
+    /// merged in, host first, exactly as sequences are — though **not one of
+    /// the 1,952 arrives that way** (see [`include`](self::include)), and not
+    /// one is world aligned.
+    pub attachments: Vec<anim::Attachment>,
     /// The `$includemodel` companions whose sequences and animations are in
     /// the two lists above, in the order they were merged.
     ///
@@ -354,6 +371,19 @@ impl StudioModel {
         self.animations.get(sequence.anim)
     }
 
+    /// `CBaseAnimating::LookupAttachment` (`baseanimating.cpp:2041`) — an
+    /// attachment's index by name, case insensitively.
+    ///
+    /// **Zero-based, and `None` for "no such attachment".** Valve returns
+    /// `Studio_FindAttachment( … ) + 1` so that 0 can mean "none", and every
+    /// caller then either tests `!iAttachment` or subtracts the one again.
+    /// That is the encoding, not the knowledge.
+    pub fn attachment(&self, name: &str) -> Option<usize> {
+        self.attachments
+            .iter()
+            .position(|a| a.name.eq_ignore_ascii_case(name))
+    }
+
     /// Which bone moves each vertex — `Some` only if **every** vertex is moved
     /// by exactly one.
     ///
@@ -429,6 +459,10 @@ mod tests {
     fn struct_strides_match_the_shipped_files() {
         assert_eq!(super::mdl::MODEL_STRIDE, 148, "mstudiomodel_t");
         assert_eq!(super::mdl::MESH_STRIDE, 116, "mstudiomesh_t");
+        // Three ints, a `matrix3x4_t` and `unused[8]` (`studio.h:706`). Get it
+        // wrong and every attachment after the first reads the middle of its
+        // neighbour, which is a name that matches nothing rather than an error.
+        assert_eq!(super::anim::ATTACHMENT_STRIDE, 4 + 4 + 4 + 48 + 32);
     }
 
     #[test]
@@ -883,6 +917,13 @@ mod tests {
         // could not be posed by splitting their triangles between bones.
         let (mut multi_bone, mut not_rigid) = (0usize, Vec::new());
         let (mut sequences, mut widest_animation) = (0usize, 0usize);
+        // Attachment points: how many models have any, how many there are, how
+        // many arrived through a `$includemodel`, and how many are world
+        // aligned — the flag that throws the bone's rotation away.
+        let (mut with_attachments, mut attachments) = (0usize, 0usize);
+        let (mut attachments_from_includes, mut world_aligned) = (0usize, 0usize);
+        let mut attachment_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // `$includemodel`: how many models declare one, how many of those the
         // game actually ships, and what merging them is worth.
         let (mut declares, mut merged, mut from_includes) = (0usize, 0usize, 0usize);
@@ -927,6 +968,7 @@ mod tests {
                 .as_ref()
                 .map(|mdl| (mdl.include_models.len(), mdl.sequences.len()))
                 .unwrap_or((0, 0));
+            let local_attachments = header.as_ref().map_or(0, |mdl| mdl.attachments.len());
             declares += usize::from(declared > 0);
             // **The assumption `world::props::models` makes about a prop's two
             // lighting sources.** They replace each other — the colour mesh or
@@ -1086,6 +1128,30 @@ mod tests {
                     }
                     merged += model.includes.len();
                     from_includes += model.sequences.len() - local_sequences;
+                    if !model.attachments.is_empty() {
+                        with_attachments += 1;
+                        attachments += model.attachments.len();
+                        attachments_from_includes +=
+                            model.attachments.len().saturating_sub(local_attachments);
+                        for a in &model.attachments {
+                            attachment_names.insert(a.name.to_ascii_lowercase());
+                            world_aligned += usize::from(
+                                a.flags & anim::ATTACHMENT_FLAG_WORLD_ALIGN != 0,
+                            );
+                            // Every attachment rides a bone the model has —
+                            // `parse_attachments` refuses a file where it does
+                            // not, and `include::merge` drops one whose bone the
+                            // host is missing. This is that invariant, over the
+                            // whole game.
+                            assert!(
+                                a.bone < model.bones.len().max(1),
+                                "{path}: attachment {:?} rides bone {} of {}",
+                                a.name,
+                                a.bone,
+                                model.bones.len()
+                            );
+                        }
+                    }
                     widest_animation = widest_animation.max(
                         model
                             .animations
@@ -1144,6 +1210,13 @@ mod tests {
         println!(
             "{declares} models declare a $includemodel; {merged} include(s) merged, \
              carrying {from_includes} of the {sequences} sequences"
+        );
+        println!(
+            "{with_attachments} of {loaded} models have attachment points: \
+             {attachments} points under {} distinct names, \
+             {attachments_from_includes} merged from a $includemodel, \
+             {world_aligned} world aligned",
+            attachment_names.len()
         );
         println!(
             "{no_view_bb} models have no view bbox; {rescued} of those have a hull \

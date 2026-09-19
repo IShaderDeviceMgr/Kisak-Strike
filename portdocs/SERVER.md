@@ -1736,10 +1736,18 @@ subsystems rather than a staged plan.** In the order they are worth doing:
   solidity bug that had been sitting in this port since stage 3.
 - ~~**The local/abs transform pair on `EntityCore`**~~ — **done**, in
   `src/server/hierarchy.rs`. It took `SetParent`/`ClearParent` and the 201
-  parented movers with it; what is left of the family is
-  `SetParentAttachment*`, which needs `LookupAttachment` on a studio model and
-  is **1,362 shipped connections**. See `rustdocs/SERVER.md`, "The transform
-  pair".
+  parented movers with it. See `rustdocs/SERVER.md`, "The transform pair".
+- ~~**`SetParentAttachment*` and `LookupAttachment`**~~ — **done**, in
+  `src/server/attachment.rs`, and **the parenting family is now complete**.
+  The prediction this list made held: the lookup really was load-bearing
+  rather than a formality, and **1,040 entities now ride a named point on a
+  bone** where they used to sit at their parent's origin — out of 1,362
+  declared connections, against `SetParent`'s 143. It is `server/`'s first
+  question about a studio model that is not a *table*, because the answer moves
+  with the parent's animation. Two findings, in `rustdocs/SERVER.md`,
+  "Attachment parenting": eager propagation needed a step in the tick that
+  Valve's lazy scheme does not, and `m_flCycle` is a checkpoint rather than a
+  pose, so the cycle has to be derived on the side that owns the `.mdl`.
 - **`player_speedmod`** (4 placed): `SetLaggedMovementValue` and
   `DisableButtons`, two more `PlayerState` fields. Small.
 - ~~**`$includemodel` in `studio/`**~~ — **done**, in `src/studio/include.rs`.

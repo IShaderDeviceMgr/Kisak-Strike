@@ -31,10 +31,13 @@
 
 use std::any::Any;
 
+use glam::Vec3;
+
+use super::attachment::{Attachments, Posed, Poser};
 use super::damage::{self, DamageInfo, DamageMode, Damaged, LifeState};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
-use super::movement::EF_NODRAW;
+use super::movement::{MoveType, EF_NODRAW};
 use super::name;
 use super::random::RandomStream;
 use super::sequences::{Lookup, SequenceTable};
@@ -168,20 +171,21 @@ pub const BASE_INPUTS: &[InputDef] = &[
     // `DEFINE_INPUTFUNC( FIELD_VOID, "ClearParent", InputClearParent )`
     // (`baseentity.cpp:2382`, `:2385`). 143 and 240 shipped connections.
     //
-    // **`SetParentAttachment` and `SetParentAttachmentMaintainOffset` are
-    // deliberately still absent**, and they are 1,362 more connections — the
-    // larger half of the family by a long way. They need
-    // `CBaseAnimating::LookupAttachment`, and the reason that is not a
-    // formality is measured: of the 1,454 connections that fire one,
-    // **1,376 aim at an entity whose parent is a studio-model entity**, 2 at
-    // one parented to a brush model and 75 at one with no parent at all. So
-    // Valve's two guards — "must have a parent", "parent must be a
-    // `CBaseAnimating`" — reject 77 of them and the other 1,376 really do go
-    // on to look an attachment up by name. Accepting those without the lookup
-    // would put 1,376 entities at their parent's origin rather than at its
-    // attachment point, which is worse than refusing.
     InputDef::new("SetParent", FieldType::String),
     InputDef::new("ClearParent", FieldType::Void),
+    // `DEFINE_INPUTFUNC( FIELD_STRING, "SetParentAttachment", … )` and
+    // `"SetParentAttachmentMaintainOffset"` (`baseentity.cpp:2383`) — **the
+    // larger half of the parenting family by a long way**, at 1,362 shipped
+    // connections against `SetParent`'s 143.
+    //
+    // Both are one call to `SetParentAttachment` differing in a single bool,
+    // and both go through `CBaseAnimating::LookupAttachment`. Measured by
+    // `every_shipped_attachment_connection_puts_its_entity_on_a_bone`: those
+    // connections put **1,040 entities on a bone** across 83 of the 106 maps;
+    // 174 name a point the parent's model has not got and 6 aim at an entity
+    // with no parent, which are Valve's two guards refusing.
+    InputDef::new("SetParentAttachment", FieldType::String),
+    InputDef::new("SetParentAttachmentMaintainOffset", FieldType::String),
     // `DEFINE_INPUTFUNC( FIELD_STRING, "SetDamageFilter", InputSetDamageFilter )`
     // (`baseentity.cpp:2388`) — see the note above.
     InputDef::new("SetDamageFilter", FieldType::String),
@@ -242,8 +246,11 @@ pub fn base_accept_input(
         // is dropped: `find_by_name` takes the first match either way, which
         // is what `SetParent` does after printing it.
         //
-        // The attachment is cleared first — "it's no longer valid" — which
-        // costs nothing here because there is no attachment to clear.
+        // **The attachment is cleared**, which is `InputSetParent`'s first
+        // three lines — "if we had a parent attachment, clear it, because
+        // it's no longer valid". `Context::set_parent` passes `None` for it,
+        // so a `SetParent` after a `SetParentAttachment` really does take the
+        // entity off the bone and put it back on the parent's origin.
         let name = input.value.to_string();
         let parent = match name.is_empty() {
             // `newParent == NULL_STRING` is the no-parent case rather than a
@@ -255,6 +262,38 @@ pub fn base_accept_input(
             false => cx.find_target(&name, None, input.activator, None),
         };
         cx.set_parent(entity, parent);
+        return true;
+    }
+    if is("SetParentAttachment") || is("SetParentAttachmentMaintainOffset") {
+        // `CBaseEntity::SetParentAttachment` (`baseentity.cpp:4765`), whose
+        // two input handlers differ only in the `bMaintainOffset` they pass.
+        let maintain_offset = is("SetParentAttachmentMaintainOffset");
+        // **The parent is the one it already has**, not one named by the
+        // parameter — the parameter is the *attachment*. So a map fires
+        // `SetParent` first and this second, which is exactly what the
+        // `logic_auto` bootstrap in a Hammer instance does.
+        //
+        // Both of Valve's guards return rather than falling back to plain
+        // parenting, and `Context::attachment` folds them into one `None`:
+        // "must have a parent", and "valid only on `CBaseAnimating`".
+        let Some(parent) = entity.parent() else {
+            return true;
+        };
+        let name = input.value.to_string();
+        let Some(attachment) = cx.attachment(parent, &name) else {
+            return true;
+        };
+
+        cx.set_parent_attachment(entity, Some(parent), Some(attachment));
+
+        // "Now move myself directly onto the attachment point." The move type
+        // goes first because Valve's does, and because an entity pinned to a
+        // bone has no business integrating a velocity.
+        entity.move_type = MoveType::None;
+        if !maintain_offset {
+            entity.set_local_origin(Vec3::ZERO);
+            entity.set_local_angles(Vec3::ZERO);
+        }
         return true;
     }
     if is("ClearParent") {
@@ -405,10 +444,17 @@ pub struct Context<'a> {
     punches: Vec<EntityId>,
     /// Whether [`reload_level`](Context::reload_level) was called.
     reload_level: bool,
+    /// Whether this handler parented anything to an attachment point — the
+    /// one bit `Server::refresh_attachment_children` needs to know.
+    attachments_used: bool,
     /// What `studio/` said about the models this level's entities place —
     /// `modelinfo->GetModelPtr`, answered in advance. See
     /// [`sequences`](super::sequences).
     sequences: &'a SequenceTable,
+    /// What `studio/` says about those models' **attachment points**, which
+    /// unlike their sequences has to be asked rather than tabulated. See
+    /// [`attachment`](super::attachment).
+    attachments: &'a dyn Attachments,
 }
 
 impl<'a> Context<'a> {
@@ -419,6 +465,7 @@ impl<'a> Context<'a> {
         entities: &'a mut EntityList,
         player: Option<EntityId>,
         sequences: &'a SequenceTable,
+        attachments: &'a dyn Attachments,
     ) -> Context<'a> {
         Context {
             time,
@@ -431,7 +478,9 @@ impl<'a> Context<'a> {
             damage: Vec::new(),
             punches: Vec::new(),
             reload_level: false,
+            attachments_used: false,
             sequences,
+            attachments,
         }
     }
 
@@ -591,8 +640,40 @@ impl<'a> Context<'a> {
     /// rather than the setter's**: a handler that moves an entity three times
     /// pays for one walk, and the walk has to happen after the last write
     /// rather than after each. See [`hierarchy`](super::hierarchy).
-    pub fn moved(&mut self, core: &EntityCore) {
-        super::hierarchy::propagate(core, self.entities);
+    ///
+    /// Takes the whole [`Entity`] and not just its core because a child may be
+    /// riding one of its **attachment points**, and where those are is a
+    /// question about the model it is playing — which is
+    /// [`Behaviour::model_state`], on the other half.
+    pub fn moved(&mut self, entity: &Entity) {
+        let posed = super::attachment::posed(entity, self.poser());
+        self.propagate(&entity.core, posed);
+    }
+
+    /// The attachment source and the clock, as one value —
+    /// [`hierarchy`](super::hierarchy) takes them together.
+    pub(super) fn poser(&self) -> Poser<'_> {
+        Poser {
+            attachments: self.attachments,
+            now: self.time.curtime,
+        }
+    }
+
+    /// [`moved`](Context::moved) for a caller that holds the core and the pose
+    /// separately — [`push`](super::push), whose root is a detached
+    /// `EntityCore` and whose pose is a
+    /// [`PosedSnapshot`](super::attachment::PosedSnapshot).
+    ///
+    /// It is a method rather than a direct
+    /// [`hierarchy::propagate`](super::hierarchy::propagate) call because the
+    /// entity list and the attachment source are two private fields, and only
+    /// something inside this type can borrow one mutably and the other not.
+    pub(super) fn propagate(&mut self, core: &EntityCore, posed: Option<Posed<'_>>) {
+        let poser = Poser {
+            attachments: self.attachments,
+            now: self.time.curtime,
+        };
+        super::hierarchy::propagate(core, posed, self.entities, poser);
     }
 
     /// The whole entity list, to read. [`push`](super::push)'s, and nothing
@@ -629,10 +710,42 @@ impl<'a> Context<'a> {
     /// parenting is the one being dispatched, and that one is not in the list
     /// (see [`EntityList::detach`](super::entity::EntityList::detach)).
     pub fn set_parent(&mut self, core: &mut EntityCore, parent: Option<EntityId>) {
-        super::hierarchy::set_parent(core, self.entities, parent);
+        self.set_parent_attachment(core, parent, None);
+    }
+
+    /// `SetParent( pParent, iAttachment )` — the same, onto one of the
+    /// parent's attachment points rather than onto the parent itself.
+    ///
+    /// `attachment` is zero-based and is [`Context::attachment`]'s answer.
+    pub fn set_parent_attachment(
+        &mut self,
+        core: &mut EntityCore,
+        parent: Option<EntityId>,
+        attachment: Option<usize>,
+    ) {
+        let poser = Poser {
+            attachments: self.attachments,
+            now: self.time.curtime,
+        };
+        super::hierarchy::set_parent(core, self.entities, parent, attachment, poser);
+        self.attachments_used |= attachment.is_some();
         if let Some(parent) = parent {
             self.changed.push(parent);
         }
+    }
+
+    /// `CBaseAnimating::LookupAttachment` on another entity's model
+    /// (`baseanimating.cpp:2041`) — which attachment `name` is, zero-based.
+    ///
+    /// `None` covers all three of Valve's refusals at once: the entity is not
+    /// in the list, it is not a `CBaseAnimating` (no model, or a brush model),
+    /// or its model has no attachment by that name. `SetParentAttachment`
+    /// **returns** on each rather than falling back to plain parenting, so one
+    /// answer is enough — see [`attachment`](super::attachment).
+    pub fn attachment(&self, entity: EntityId, name: &str) -> Option<usize> {
+        let entity = self.entities.get(entity)?;
+        let posed = super::attachment::posed(entity, self.poser())?;
+        self.attachments.lookup(posed.model, name)
     }
 
     /// `gEntList.FindEntityByName( NULL, name )` — the first match, or `None`.
@@ -769,6 +882,11 @@ impl<'a> Context<'a> {
     /// Whether [`reload_level`](Context::reload_level) was called.
     pub(super) fn take_reload_level(&mut self) -> bool {
         std::mem::take(&mut self.reload_level)
+    }
+
+    /// Whether this handler parented anything to an attachment point.
+    pub(super) fn took_attachment(&self) -> bool {
+        self.attachments_used
     }
 
     /// `UTIL_GetLocalPlayer()`/`AI_GetSinglePlayer()` — the one player, if the

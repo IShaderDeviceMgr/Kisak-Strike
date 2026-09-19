@@ -93,7 +93,11 @@ pub struct PropModel {
     /// The sequences, in file order. `LookupSequence` searches it by label.
     pub sequences: Vec<crate::studio::anim::Sequence>,
     /// The animations a sequence names.
-    pub animations: Vec<crate::studio::anim::Animation>,
+    ///
+    /// Shared with `server/`'s attachment lookup, which poses the same
+    /// skeleton to answer a different question — see
+    /// [`StudioModel::animations`](crate::studio::StudioModel::animations).
+    pub animations: std::sync::Arc<[crate::studio::anim::Animation]>,
     /// `STUDIOHDR_FLAGS_USES_BUMPMAPPING` — whether **any** of this model's
     /// materials lights it per pixel, which is how Valve computes the flag
     /// (`studiorendercontext.cpp:274`, once per material, ORed onto the

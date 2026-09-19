@@ -25,8 +25,8 @@
 //! owned value — so the groups collapse: the remap is applied **once**, at
 //! load, and what comes out is one bone list, one sequence list and one
 //! animation list indistinguishable from a model that had them all along.
-//! `masterSeq`, `boneMap`, the attachment/pose/node/IK-lock tables and the
-//! whole `CModelLookupContext` string-table optimisation go with it.
+//! `masterSeq`, `boneMap`, `masterAttachment`, the pose/node/IK-lock tables
+//! and the whole `CModelLookupContext` string-table optimisation go with it.
 //!
 //! What does not collapse is [`masterBone`](merge): an included animation's
 //! `mstudio_rle_anim_t::bone` indexes the **included** model's bone list, and
@@ -208,6 +208,41 @@ fn merge(host: &mut Mdl, included: Mdl) {
         };
         host.sequences.push(sequence);
     }
+
+    // `AppendAttachments` (`studio_virtualmodel.cpp:374`), with the same
+    // fixed dedup window and the same host-wins rule as the two above — and
+    // one rule of its own: **an attachment whose bone the host does not have
+    // is dropped**, which is Valve's `if (n == -1) continue`.
+    //
+    // > **No shipped content reaches this.** Of the game's 1,952 attachment
+    // > points, *none* arrives through a `$includemodel` — the 25 hosts carry
+    // > their own and their companions carry animation and nothing else. So
+    // > this is the reference's shape rather than live content, kept because
+    // > the bone remap below is the same silent-wrong-answer trap the
+    // > animation tracks have and because a companion that did carry one
+    // > would otherwise ride the wrong bone.
+    //
+    // The bone index is remapped here rather than at lookup. Valve leaves it
+    // pointing into the included file and remaps in
+    // `CStudioHdr::GetAttachmentBone`, which is the same indirection the
+    // groups exist for and the same one that collapses here — see the module
+    // docs. Skip it and an attachment rides whichever of the host's bones
+    // happens to share an index with the include's, which on eight of the
+    // nine shipped hosts is a *different bone*.
+    let known_attachments = host.attachments.len();
+    for mut attachment in included.attachments {
+        let Some(bone) = master_bone.get(attachment.bone).copied().flatten() else {
+            continue;
+        };
+        if host.attachments[..known_attachments]
+            .iter()
+            .any(|held| held.name.eq_ignore_ascii_case(&attachment.name))
+        {
+            continue;
+        }
+        attachment.bone = bone;
+        host.attachments.push(attachment);
+    }
 }
 
 /// One animation, with every track moved onto the host's bone indices.
@@ -231,7 +266,7 @@ fn remap(mut animation: Animation, master_bone: &[Option<usize>]) -> Animation {
 
 #[cfg(test)]
 mod tests {
-    use super::super::anim::{Animation, Bone, BoneTrack, Sequence};
+    use super::super::anim::{Animation, Attachment, Bone, BoneTrack, Sequence};
     use super::*;
     use glam::{Mat4, Quat, Vec3};
 
@@ -291,6 +326,7 @@ mod tests {
             bones: bones.iter().map(|name| bone(name)).collect(),
             sequences: Vec::new(),
             animations: Vec::new(),
+            attachments: Vec::new(),
             include_models: Vec::new(),
             textures: Vec::new(),
             texture_dirs: Vec::new(),
@@ -321,6 +357,60 @@ mod tests {
         assert_eq!(host.sequences.len(), 1);
         assert_eq!(host.sequences[0].label, "wave");
         assert_eq!(host.sequences[0].anim, 0);
+    }
+
+    fn attachment(name: &str, bone: usize) -> Attachment {
+        Attachment {
+            name: name.to_owned(),
+            flags: 0,
+            bone,
+            local: Mat4::IDENTITY,
+        }
+    }
+
+    /// `AppendAttachments` (`studio_virtualmodel.cpp:374`), and the same trap
+    /// the animation tracks have: an included attachment's `localbone` indexes
+    /// the **include's** bone list.
+    ///
+    /// Without the remap the attachment rides whichever host bone happens to
+    /// share its index — a wrong place that still looks like a place, which is
+    /// the failure mode a child parented to it would inherit.
+    #[test]
+    fn an_included_attachments_bone_is_remapped_by_name_and_not_by_index() {
+        let mut host = model("host.mdl", &["root", "arm", "tip"]);
+        let mut included = model("anim.mdl", &["tip", "root", "arm"]);
+        // On include bone 0, which is `tip` — host bone 2.
+        included.attachments = vec![attachment("muzzle", 0)];
+
+        merge(&mut host, included);
+
+        assert_eq!(host.attachments.len(), 1);
+        assert_eq!(host.attachments[0].name, "muzzle");
+        assert_eq!(host.attachments[0].bone, 2, "read as an index it stays 0");
+    }
+
+    /// The host is group 0 and wins every name collision, exactly as it does
+    /// for sequences and animations — and an attachment whose bone the host
+    /// does not have is dropped, which is Valve's `if (n == -1) continue`.
+    #[test]
+    fn the_host_keeps_its_own_attachment_and_drops_one_with_no_bone() {
+        let mut host = model("host.mdl", &["root"]);
+        host.attachments = vec![attachment("muzzle", 0)];
+        let mut included = model("anim.mdl", &["root", "tail"]);
+        included.attachments = vec![
+            // Same name as the host's: dropped, host wins.
+            attachment("MUZZLE", 1),
+            // On `tail`, which the host does not have: dropped.
+            attachment("tip", 1),
+            // Kept.
+            attachment("base", 0),
+        ];
+
+        merge(&mut host, included);
+
+        let names: Vec<&str> = host.attachments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["muzzle", "base"]);
+        assert_eq!(host.attachments[0].bone, 0);
     }
 
     /// `masterBone` of -1: the host has no such bone, so the track goes.
