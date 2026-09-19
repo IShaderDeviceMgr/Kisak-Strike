@@ -65,8 +65,15 @@ pub struct PropModel {
     /// `models/stars/allstars.mdl` has 187,676 vertices.
     pub indices: IndexBuffer,
     pub batches: Vec<PropBatch>,
-    /// `view_bbmin`/`view_bbmax`, in model space. For the culling that is not
-    /// written yet.
+    /// The model's **render** bounds in model space —
+    /// [`StudioModel::bounds`](crate::studio::StudioModel::bounds), which is
+    /// `hull_min`/`hull_max` for all but eight of the game's models rather
+    /// than the `view_bbmin`/`view_bbmax` the name suggests.
+    ///
+    /// A static prop is not culled by this — `vbsp` wrote it a leaf list and
+    /// that is exact — so the reader here is the translucent sort's centre,
+    /// and [`EntityModels`](super::super::entities::EntityModels), whose
+    /// instances have no leaf list and are culled by a box.
     pub bounds: (Vec3, Vec3),
     /// `illumposition` — where this model wants its lighting sampled, in model
     /// space. Read by stage 5.

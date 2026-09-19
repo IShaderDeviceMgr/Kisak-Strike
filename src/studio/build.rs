@@ -179,7 +179,7 @@ pub(super) fn build(
     Ok(StudioModel {
         path: mdl.path.clone(),
         name: mdl.name.clone(),
-        bounds: mdl.bounds,
+        bounds: mdl.render_bounds(),
         illum_position: mdl.illum_position,
         flags: mdl.flags,
         checksum: mdl.checksum,

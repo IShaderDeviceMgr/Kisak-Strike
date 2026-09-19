@@ -690,7 +690,7 @@ changed nothing here at all — which is the point of the list below.
 > geometrically for that reason, and checks the pixels only where they can say
 > anything.
 
-Six things about it are worth knowing.
+Seven things about it are worth knowing.
 
 - **The join with the game is a sequence *name*, and the cycle is the engine's.**
   The server says which sequence, where in it the entity was, when that was, and
@@ -751,6 +751,42 @@ Six things about it are worth knowing.
   whose id is missing from a frame's list is made **invisible and kept**, so
   that the model it uploaded — very likely shared with its neighbours — stays
   valid.
+
+<a id="the-cull-box"></a>
+
+- **The cull box is `C_BaseAnimating::GetRenderBounds`, and both of its halves
+  are load-bearing.** An entity model is in no leaf list — `vbsp` wrote one for
+  every *static* prop and none for these — so it is culled by a world-space box
+  through [`World::box_visible`](#worldvis--what-a-frame-actually-draws). The
+  box is the model's **render bounds** merged with the box the compiler
+  measured over the **sequence being played**, transformed by all eight
+  corners, plus eight units of slack.
+
+  Both halves were found by a regression rather than by reading, and neither
+  shows up as an error — the prop is simply not drawn, from some viewpoints and
+  not others:
+
+  - `view_bbmin`/`view_bbmax` is **zero on 2,033 of the game's 2,041 models**,
+    so taking it straight gives a degenerate box at the entity's origin.
+    `studio::Mdl::render_bounds` falls back to `hull_min`/`hull_max` the way
+    `CModelInfo::GetModelRenderBounds` does. Measured over the depot, **7,515
+    of the game's 8,072 `prop_dynamic` placements** wear a model whose drawn
+    extent escaped the box this port used to build.
+  - A model's own bounds do not contain its *animated* geometry: a posed vertex
+    reaches up to 23,029 units outside them. `anim::Sequence::bounds` is the
+    term Valve merges, and all 10,666 sequences in the game declare one.
+
+  **It is also half of why areaportals looked broken.** A prop is culled
+  against the *narrowed* frustum of the area it is in, and a box that is too
+  small fails there far more often than in the open — so a room seen through a
+  doorway came out as an empty shell. Measured over every open areaportal in
+  the game, a view through one keeps **11,653 props with the real bounds
+  against 7,588 with the old box**;
+  `vis::tests::you_can_see_through_an_open_areaportal` pins both numbers.
+
+  The sequence box covers the whole sequence rather than this instance's cycle,
+  which is Valve's and is what keeps the cull cheap: no pose is computed for an
+  entity that is then culled.
 
 - **`visible` is carried, not filtered.** 1,000 props in the game are
   `StartDisabled` and 206 connections toggle one, so an invisible instance is
@@ -1462,6 +1498,24 @@ It also sweeps 379 leaves across twelve maps asserting that **standing in a leaf
 draws**. That is the invariant that catches an over-aggressive cull, which is the failure
 mode with no symptom other than a hole in the world: every filter here can only remove, so
 nothing downstream would notice. It is also the test that found gotcha 2, by failing.
+
+**`you_can_see_through_an_open_areaportal`** is the other one, and it exists because the
+test above cannot fail on a broken flow: it measures how much a view *culls*, and a flow
+that never stepped through a window culls **more**. This one puts the eye in front of every
+areaportal in the game — with the entity list's open/closed states applied, not the
+loader's defaults — and asks whether the far side is there. Measured: **711 of 714 windows
+see through from a metre away, 644 of 654 from five, and the leaf directly behind the
+window draws in 622 of 634 views**; the entity list closes 39 of the game's 515 keys.
+
+It also carries the measurement that says the areaportal complaints were really a *prop*
+bug: a view through one of these windows keeps **11,653 `prop_dynamic`s with the model's
+real bounds against 7,588 with the degenerate box** the port used to build — see
+[the cull box](#the-cull-box).
+
+> Its own first version reported 141 failures, all of them the test's fault:
+> `look_at` with an up vector parallel to the view direction is a degenerate matrix, and
+> **141 of the game's areaportals lie in a horizontal plane** — a hatch, a fan shaft. That
+> is now a comment in the test, because it reads exactly like an engine bug.
 
 #### The `vis` command
 
@@ -4603,6 +4657,14 @@ below it.
 entity lump it has just parsed — so `bench` now spawns a `Server` and calls
 `load_entity_models`, the same two calls `Level::load` makes. Before that it was silently
 measuring a frame with the largest thing in it missing.
+**The cull-box fix made the entity-model pass cost more, and that is the fix working.**
+Until it landed, the box an entity model was culled by was a 128-unit cube at its origin,
+so **7,515 of the game's 8,072 `prop_dynamic` placements** could be dropped while on
+screen. On `sp_a1_intro1` the pass went from about 0.09 ms to about 0.12 — read as a ratio
+against `everything, novis` in the same run (5.0% to 5.6%), because the two runs were
+19% apart on thermal state alone: `novis` draws everything and cannot have changed, and it
+read 1.81 ms before and 2.16 after.
+
 **The recursive view is the eighth and ninth sub-benchmarks**, and they measure whole
 frames including the world so that the *difference* is the number: `everything` 0.27 ms,
 `+ portal depth 1` 0.53, `+ portal depth 2` 0.81. **Each recursion level is one more world

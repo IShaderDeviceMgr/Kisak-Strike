@@ -133,6 +133,17 @@ pub struct Sequence {
     /// **10,664 of the 10,666 sequences in the shipped game are 0.2 and two
     /// are 0.5**. None is zero, so the term never folds away.
     pub fade_out_time: f32,
+    /// `bbmin` / `bbmax` — the box the compiler measured over **this
+    /// sequence's** frames, in model space.
+    ///
+    /// `C_BaseAnimating::GetRenderBounds` (`c_baseanimating.cpp:6353`) merges
+    /// it into the model's own render bounds for the sequence being played,
+    /// and it is not a refinement: a model's `hull_min`/`hull_max` does not
+    /// contain its animated geometry at all. Measured over the depot, a posed
+    /// vertex reaches **24,188 units** outside the hull
+    /// (`models/a4_destruction/fin3_orangepipeexpl.mdl`, an explosion that
+    /// throws debris across the map).
+    pub bounds: (Vec3, Vec3),
     /// Which [`Animation`] plays. Valve resolves this through a blend table of
     /// `groupsize[0] * groupsize[1]` entries; **every sequence in every model
     /// this port loads has a 1x1 table**, so only entry zero is read and the
@@ -274,6 +285,8 @@ pub(super) fn parse_sequences(
         // `pBlend( 0, 0 )` — the first entry of the `groupsize[0] *
         // groupsize[1]` blend table, which is the only one without pose
         // parameters to index the rest.
+        // `bbmin`/`bbmax`, which sit between `eventindex` and `numblends`.
+        let bounds = (r.vec3(at + 32)?, r.vec3(at + 44)?);
         let blend_at = r.relative_offset(at + 60, at, "mstudioseqdesc_t::animindexindex")?;
         let anim = r.i16(blend_at)?;
         let anim = match anim >= 0 && (anim as usize) < anim_count {
@@ -288,6 +301,7 @@ pub(super) fn parse_sequences(
             // `fadeouttime`, which sits after `fadeintime` at the end of the
             // pose-parameter block: `paramparent` at 100, `fadeintime` at 104.
             fade_out_time: r.f32(at + 108)?,
+            bounds,
             anim,
         });
     }

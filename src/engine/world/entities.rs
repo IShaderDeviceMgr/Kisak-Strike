@@ -140,16 +140,14 @@ pub struct SequenceRow<'a> {
 /// leaf is.
 pub(crate) type BoxVisible<'a> = &'a dyn Fn(Vec3, Vec3) -> bool;
 
-/// How far outside its bind-pose bounds an animated instance is allowed to
-/// reach before culling would be wrong.
+/// A last pad on the cull box, after the model's render bounds and the
+/// playing sequence's box have both been taken.
 ///
-/// The largest travel any of this port's posed models has is a
-/// `prop_testchamber_door`'s 53-unit slide, measured by
-/// `the_chamber_door_slides_out_of_the_way`. Padding by it makes the cull
-/// conservative for every model in the game without posing anything: a pose
-/// costs three `Mat4`s per instance and would have to run for entities that
-/// are then thrown away.
-const POSE_SLACK: f32 = 64.0;
+/// Not doing any real work — those two boxes are the whole of
+/// `C_BaseAnimating::GetRenderBounds` — and kept because a cull box is only
+/// ever wrong in one direction: too small drops a prop that is on screen, too
+/// large costs one draw the depth test then throws away.
+const BOUNDS_SLACK: f32 = 8.0;
 
 /// One placed instance, resolved against a loaded model.
 struct Instance {
@@ -491,29 +489,31 @@ impl EntityModels {
 
     /// One instance's bounding box in world space.
     ///
-    /// The model's own `view_bbmin`/`view_bbmax` under the entity's transform,
-    /// **not under its pose** — the same approximation
-    /// [`collect_translucent`](EntityModels::collect_translucent) makes and for
-    /// the same reason, except that here it has to be *conservative* rather
-    /// than merely close, so the box is padded by the largest travel any of
-    /// this port's animated models has: a chamber door's 53-unit slide.
+    /// `C_BaseAnimating::GetRenderBounds` (`c_baseanimating.cpp:6320`) under
+    /// the entity's transform: the model's render bounds — which are
+    /// `hull_min`/`hull_max` for **2,033 of the game's 2,041 models**, because
+    /// `view_bbmin`/`view_bbmax` is zero unless the model was compiled with an
+    /// explicit `$bbox` — merged with the box the compiler measured over the
+    /// sequence being played.
+    ///
+    /// **Both halves are load-bearing and each was found the hard way.**
+    /// Without the first the box is degenerate at the entity's origin and the
+    /// prop disappears from some viewpoints and not others; without the second
+    /// it is the model's *rest* extent, and a posed vertex reaches up to
+    /// 24,188 units outside that
+    /// (`models/a4_destruction/fin3_orangepipeexpl.mdl`, an explosion that
+    /// throws debris across the map). Neither shows up as an error — the prop
+    /// simply is not drawn.
+    ///
+    /// The sequence box covers the *whole* sequence rather than this
+    /// instance's cycle, which is Valve's and is what keeps this cheap: no
+    /// pose is computed for an entity that is then culled.
     fn world_bounds(&self, instance: &Instance) -> (Vec3, Vec3) {
         let model = &self.models[instance.model];
-        let (mins, maxs) = model.bounds;
-        let mut bounds = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-        for corner in 0..8u32 {
-            let pick = |axis: usize| match corner >> axis & 1 {
-                0 => mins[axis],
-                _ => maxs[axis],
-            };
-            let point = instance
-                .transform
-                .transform_point3(Vec3::new(pick(0), pick(1), pick(2)));
-            bounds = (bounds.0.min(point), bounds.1.max(point));
-        }
-        (
-            bounds.0 - Vec3::splat(POSE_SLACK),
-            bounds.1 + Vec3::splat(POSE_SLACK),
+        cull_box(
+            model.bounds,
+            model.sequences.get(instance.sequence).map(|s| s.bounds),
+            instance.transform,
         )
     }
 
@@ -722,6 +722,38 @@ fn resolve_material(
         .clone()
 }
 
+/// The world-space cull box of one instance — [`EntityModels::world_bounds`]'
+/// arithmetic, as a free function so it can be tested without a GPU.
+///
+/// `model` is the model's render bounds and `sequence` the box of the sequence
+/// being played, both in model space; `transform` is the entity's placement.
+/// The eight corners are transformed and re-bounded rather than the two
+/// extremes, because a rotated box's extent is not its rotated extremes.
+fn cull_box(
+    model: (Vec3, Vec3),
+    sequence: Option<(Vec3, Vec3)>,
+    transform: Mat4,
+) -> (Vec3, Vec3) {
+    let (mut mins, mut maxs) = model;
+    if let Some((lo, hi)) = sequence {
+        mins = mins.min(lo);
+        maxs = maxs.max(hi);
+    }
+    let mut bounds = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for corner in 0..8u32 {
+        let pick = |axis: usize| match corner >> axis & 1 {
+            0 => mins[axis],
+            _ => maxs[axis],
+        };
+        let point = transform.transform_point3(Vec3::new(pick(0), pick(1), pick(2)));
+        bounds = (bounds.0.min(point), bounds.1.max(point));
+    }
+    (
+        bounds.0 - Vec3::splat(BOUNDS_SLACK),
+        bounds.1 + Vec3::splat(BOUNDS_SLACK),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +762,156 @@ mod tests {
     use crate::server::Server;
 
     const SIZE: u32 = 256;
+
+    /// **A model with no clipping box still gets a cull box around its
+    /// geometry.**
+    ///
+    /// The regression this guards is the one that made `prop_dynamic`s wink
+    /// out at particular angles: `view_bbmin`/`view_bbmax` is zero on **2,033
+    /// of the game's 2,041 models**, so taking it straight gave a degenerate
+    /// box at the entity's origin, padded by a constant, and a prop longer
+    /// than that pad vanished as soon as its *origin* left the frustum.
+    /// `Mdl::render_bounds` falls back to `hull_min`/`hull_max` the way
+    /// `CModelInfo::GetModelRenderBounds` does, and this is the shape of the
+    /// answer that has to come out the other end.
+    #[test]
+    fn the_cull_box_covers_a_model_that_declared_no_clipping_box() {
+        // A 256-unit girder lying along +X, as `hull_min`/`hull_max` would
+        // describe it once `render_bounds` has fallen back to them.
+        let hull = (Vec3::new(-8.0, -8.0, -8.0), Vec3::new(256.0, 8.0, 8.0));
+        let at = Vec3::new(1000.0, 2000.0, 64.0);
+        let (mins, maxs) = cull_box(hull, None, Mat4::from_translation(at));
+        assert!(
+            mins.x <= at.x - 8.0 && maxs.x >= at.x + 256.0,
+            "the box {mins} .. {maxs} does not reach the far end of the girder"
+        );
+
+        // Rotated a quarter turn about Z, the girder runs along +Y and the
+        // box has to follow it. This is what the eight-corner transform buys
+        // over transforming the two extremes.
+        let turned = Mat4::from_translation(at) * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let (mins, maxs) = cull_box(hull, None, turned);
+        assert!(
+            maxs.y >= at.y + 256.0 && maxs.x <= at.x + 16.0,
+            "the box {mins} .. {maxs} did not turn with the model"
+        );
+    }
+
+    /// **How many of the game's `prop_dynamic`s the old cull box would have
+    /// dropped.**
+    ///
+    /// The regression report was "many `prop_dynamic`s disappear when looking
+    /// at them from a particular angle and position, it varies from prop to
+    /// prop". This is that sentence as a number: a placement wears a model
+    /// whose drawn extent reaches outside the box the old code built — a
+    /// degenerate box at the entity's origin, padded by 64 — and every one of
+    /// those could wink out as soon as its origin left the frustum or the
+    /// narrowed frustum of an areaportal it was seen through.
+    ///
+    /// CPU only: the entity lump and the `.mdl` headers, no device.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_old_cull_box -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_old_cull_box_would_have_dropped_most_of_the_games_props() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+
+        // The old pad, kept as a literal so that changing `BOUNDS_SLACK` does
+        // not quietly change what this measures.
+        const OLD_SLACK: f32 = 64.0;
+        let mut headers: std::collections::HashMap<String, Option<(Vec3, Vec3)>> =
+            std::collections::HashMap::new();
+        let (mut placements, mut would_drop) = (0usize, 0usize);
+        let mut worst = (0.0f32, String::new());
+        for name in &names {
+            let Ok(bsp) = crate::engine::world::bsp::Bsp::load(&vfs, name) else {
+                continue;
+            };
+            for entity in bsp.entities() {
+                if entity.classname() != Some("prop_dynamic") {
+                    continue;
+                }
+                let Some(model) = entity.get("model") else {
+                    continue;
+                };
+                let model = model.to_ascii_lowercase().replace('\\', "/");
+                let bounds = headers
+                    .entry(model.clone())
+                    .or_insert_with(|| {
+                        let bytes = vfs.read(&model).ok()?;
+                        let mdl = crate::studio::Mdl::parse(model.clone(), &bytes).ok()?;
+                        let (mut lo, mut hi) = mdl.render_bounds();
+                        for sequence in &mdl.sequences {
+                            lo = lo.min(sequence.bounds.0);
+                            hi = hi.max(sequence.bounds.1);
+                        }
+                        Some((lo, hi))
+                    })
+                    .to_owned();
+                let Some((lo, hi)) = bounds else { continue };
+                placements += 1;
+                // The old box was `(0,0,0)..(0,0,0)` padded by 64 — this
+                // model's geometry escapes it by this much.
+                let out = (-lo - Vec3::splat(OLD_SLACK))
+                    .max(hi - Vec3::splat(OLD_SLACK))
+                    .max_element();
+                if out > 0.0 {
+                    would_drop += 1;
+                    if out > worst.0 {
+                        worst = (out, model);
+                    }
+                }
+            }
+        }
+
+        println!(
+            "{would_drop} of {placements} prop_dynamic placements wear a model that \
+             escapes the old cull box (worst by {:.0} units, {})",
+            worst.0, worst.1
+        );
+        assert!(placements > 5_000, "only {placements} placements");
+        assert!(
+            would_drop * 2 > placements,
+            "only {would_drop} of {placements} placements were affected — \
+             if this ever drops, the fallback in Mdl::render_bounds stopped mattering"
+        );
+    }
+
+    /// **The playing sequence's own box is merged in.**
+    ///
+    /// `C_BaseAnimating::GetRenderBounds` does this and it is not a
+    /// refinement: a model's rest extent does not contain its animated
+    /// geometry. Measured over the depot, a posed vertex reaches up to 23,029
+    /// units outside the model's own bounds.
+    #[test]
+    fn the_cull_box_follows_the_sequence_the_entity_plays() {
+        let model = (Vec3::splat(-16.0), Vec3::splat(16.0));
+        let travel = (Vec3::new(-16.0, -16.0, -16.0), Vec3::new(16.0, 16.0, 512.0));
+        let (_, rest) = cull_box(model, None, Mat4::IDENTITY);
+        let (_, moving) = cull_box(model, Some(travel), Mat4::IDENTITY);
+        assert!(rest.z < 64.0, "the rest box should be the model's own");
+        assert!(
+            moving.z >= 512.0,
+            "the sequence's 512-unit climb is not in the cull box: {moving}"
+        );
+    }
 
     /// A button's `down` is 0.4167 s and a chamber door's `open` 0.9167 s.
     /// Both are non-looping, so both ramp — and both are pinned at the far end

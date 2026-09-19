@@ -271,6 +271,7 @@ mod tests {
             label: label.to_owned(),
             flags: 0,
             fade_out_time: 0.2,
+            bounds: (Vec3::ZERO, Vec3::ZERO),
             anim,
         }
     }
@@ -284,6 +285,7 @@ mod tests {
             checksum: 0,
             flags: Default::default(),
             bounds: (Vec3::ZERO, Vec3::ZERO),
+            hull: (Vec3::ZERO, Vec3::ZERO),
             illum_position: Vec3::ZERO,
             bone_count: bones.len() as u32,
             bones: bones.iter().map(|name| bone(name)).collect(),

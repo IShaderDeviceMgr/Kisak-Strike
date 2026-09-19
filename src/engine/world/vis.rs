@@ -1899,4 +1899,248 @@ mod tests {
         bits.clear(69);
         assert_eq!(bits.count(), 1);
     }
+    /// **Standing in front of an open areaportal, you can see the room on the
+    /// other side.**
+    ///
+    /// The one property the whole areaportal half of this module exists for,
+    /// and the one the map-wide census above cannot check: that test measures
+    /// how much a view *culls*, and a flow that never steps through a window
+    /// culls more, not less. So it passes on a broken flow.
+    ///
+    /// For every areaportal in every shipped map this puts the eye a metre in
+    /// front of the window's own plane, centred on the window and looking
+    /// straight through it, and asks whether the area on the far side is in
+    /// the visible set. Every areaportal starts open in
+    /// [`Visibility::build`], so no entity list is needed.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release you_can_see_through -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn you_can_see_through_an_open_areaportal() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+            .expect("mount the game");
+
+        let mut names: Vec<String> = vfs
+            .list("maps")
+            .expect("maps/")
+            .into_iter()
+            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+            .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+            .collect();
+        names.sort();
+
+        let (mut probes, mut through, mut skipped) = (0usize, 0usize, 0usize);
+        let (mut far_probes, mut far_through) = (0usize, 0usize);
+        let (mut behind_probes, mut behind_seen) = (0usize, 0usize);
+        // What a view through a window keeps of the far room's furniture,
+        // under the cull box this port used to build and the one it builds
+        // now. See the note under the assertions.
+        let (mut props_old, mut props_new) = (0usize, 0usize);
+        let mut model_bounds: std::collections::HashMap<String, Option<(Vec3, Vec3)>> =
+            std::collections::HashMap::new();
+        /// The cull box `EntityModels::world_bounds` builds, in model space:
+        /// the render bounds merged with every sequence's own box.
+        fn read_bounds(
+            vfs: &crate::filesystem::Vfs,
+            model: &str,
+        ) -> Option<(Vec3, Vec3)> {
+            let bytes = vfs.read(model).ok()?;
+            let mdl = crate::studio::Mdl::parse(model.to_owned(), &bytes).ok()?;
+            let (mut lo, mut hi) = mdl.render_bounds();
+            for sequence in &mdl.sequences {
+                lo = lo.min(sequence.bounds.0);
+                hi = hi.max(sequence.bounds.1);
+            }
+            Some((lo, hi))
+        }
+        let mut behind_failures: Vec<String> = Vec::new();
+        let (mut closed_keys, mut total_keys) = (0usize, 0usize);
+        let mut failures: Vec<String> = Vec::new();
+        for name in &names {
+            let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+            let mut vis = Visibility::build(&bsp);
+            // **The entity list's answer, not the loader's default.** Every
+            // window starts open in `build`; `func_areaportal` then closes the
+            // ones the map wants shut, and that is the state a running frame
+            // sees.
+            let mut server = crate::server::Server::new();
+            server.level_init(name, &bsp.entities(), &bsp.models);
+            // Every `prop_dynamic` on the map, as an origin and the two cull
+            // boxes it would be tested with: the old one (a degenerate box at
+            // the origin, padded by 64) and the one
+            // `EntityModels::world_bounds` builds now.
+            let props: Vec<(Vec3, (Vec3, Vec3))> = bsp
+                .entities()
+                .iter()
+                .filter(|e| e.classname() == Some("prop_dynamic"))
+                .filter_map(|e| {
+                    let origin = e.vector("origin")?;
+                    let model = e.get("model")?.to_ascii_lowercase().replace('\\', "/");
+                    let bounds = (*model_bounds
+                        .entry(model.clone())
+                        .or_insert_with(|| read_bounds(&vfs, &model)))?;
+                    Some((origin, bounds))
+                })
+                .collect();
+            let states = server.area_portals();
+            vis.set_area_portals(&states);
+            total_keys += vis.open.len();
+            closed_keys += vis.open.iter().filter(|&&open| !open).count();
+            let vis = vis;
+            for (index, portal) in vis.portals.iter().enumerate() {
+                if !vis.open[usize::from(portal.key)] {
+                    continue;
+                }
+                let verts =
+                    &vis.portal_verts[portal.verts.start as usize..portal.verts.end as usize];
+                if verts.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                let center = verts.iter().copied().sum::<Vec3>() / verts.len() as f32;
+                let eye = center + portal.plane.normal * 64.0;
+                let leaf = &vis.leaves[vis.leaf_at(eye)];
+                // A window flush against geometry on its near side: there is
+                // nowhere to stand and look through it, so it says nothing.
+                if leaf.solid || leaf.cluster < 0 {
+                    skipped += 1;
+                    continue;
+                }
+                probes += 1;
+
+                let projection = glam::camera::rh::proj::directx::perspective(
+                    90f32.to_radians(),
+                    16.0 / 9.0,
+                    7.0,
+                    28_000.0,
+                );
+                // **Not `Vec3::Z` unconditionally.** 141 of the game's
+                // areaportals lie in a horizontal plane — a hatch, a fan
+                // shaft — and `look_at` with an up vector parallel to the
+                // view direction is a degenerate matrix whose frustum clips
+                // everything away. The first version of this test read that
+                // as an engine bug.
+                let up = match portal.plane.normal.z.abs() > 0.9 {
+                    true => Vec3::X,
+                    false => Vec3::Z,
+                };
+                let view = glam::camera::rh::view::look_at_mat4(eye, center, up);
+                let set = vis.mark(eye, projection * view, false);
+
+                // The same probe from where a player would actually stand:
+                // five metres back rather than one, which is where the
+                // window is a doorway across the room instead of a wall in
+                // your face.
+                let far_eye = center + portal.plane.normal * 320.0;
+                let far_leaf = &vis.leaves[vis.leaf_at(far_eye)];
+                if !far_leaf.solid && far_leaf.cluster >= 0 {
+                    far_probes += 1;
+                    let far_view = glam::camera::rh::view::look_at_mat4(far_eye, center, up);
+                    let far_set = vis.mark(far_eye, projection * far_view, false);
+                    if far_set.areas.get(usize::from(portal.other_area)) {
+                        far_through += 1;
+                        // **And the leaf immediately behind the window is
+                        // drawn.** Reaching the area is not the same as
+                        // drawing anything in it: the narrowed frustum still
+                        // has to accept the one leaf that is dead centre of
+                        // the opening.
+                        // **And the far room's props.** A `prop_dynamic` is
+                        // culled by its box against the *narrowed* frustum of
+                        // the area it is in, so a box that is too small fails
+                        // here far more often than it does in the open — which
+                        // is why "you cannot see through an areaportal" and
+                        // "props disappear" were one bug.
+                        for &(origin, (lo, hi)) in &props {
+                            let old = (
+                                origin - Vec3::splat(64.0),
+                                origin + Vec3::splat(64.0),
+                            );
+                            let new = (origin + lo - Vec3::splat(8.0), origin + hi + Vec3::splat(8.0));
+                            props_old += usize::from(vis.box_visible(&far_set, old.0, old.1));
+                            props_new += usize::from(vis.box_visible(&far_set, new.0, new.1));
+                        }
+
+                        let behind = vis.leaf_at(center - portal.plane.normal * 16.0);
+                        if !vis.leaves[behind].solid {
+                            behind_probes += 1;
+                            if far_set.leaves.get(behind) {
+                                behind_seen += 1;
+                            } else if behind_failures.len() < 12 {
+                                behind_failures.push(format!(
+                                    "{name}: portal {index} key {} -> area {} leaf {behind} \
+                                     (area {}, cluster {}) is not drawn",
+                                    portal.key,
+                                    portal.other_area,
+                                    vis.leaves[behind].area,
+                                    vis.leaves[behind].cluster,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if set.areas.get(usize::from(portal.other_area)) {
+                    through += 1;
+                } else if failures.len() < 12 {
+                    let rect = vis.window_rect(portal, projection * view, &set.frustum);
+                    failures.push(format!(
+                        "{name}: portal {index} key {} from area {} -> {} \
+                         (eye area {}, window {rect:?})",
+                        portal.key,
+                        leaf.area,
+                        portal.other_area,
+                        vis.area_at(eye),
+                    ));
+                }
+            }
+        }
+
+        println!("{through} of {probes} areaportals see through ({skipped} unreachable)");
+        println!("  from 320 units back: {far_through} of {far_probes}");
+        println!("  the entity list closes {closed_keys} of {total_keys} keys");
+        println!("  the leaf behind the window draws: {behind_seen} of {behind_probes}");
+        println!(
+            "  prop_dynamics kept by those views: {props_new} with the render bounds, \
+             {props_old} with a 64-unit box at the origin"
+        );
+        for line in &behind_failures {
+            println!("  {line}");
+        }
+        for line in &failures {
+            println!("  {line}");
+        }
+        assert!(probes > 500, "only {probes} probes");
+        assert!(
+            through * 100 >= probes * 98,
+            "only {through} of {probes} open areaportals let the far area be seen"
+        );
+        assert!(
+            far_through * 100 >= far_probes * 97,
+            "from 320 units back, only {far_through} of {far_probes} let the far area be seen"
+        );
+        assert!(
+            behind_seen * 100 >= behind_probes * 96,
+            "the leaf behind the window draws in only {behind_seen} of {behind_probes} views"
+        );
+        // **The second half of the same regression.** A prop is culled by its
+        // box against the *narrowed* frustum of the area it is in, so a box
+        // that is too small fails far more often through a window than in the
+        // open — which is why "props disappear from some angles" and "you
+        // cannot see the other side of an areaportal" were one bug and not
+        // two. Measured: **11,653 props survive these views with the model's
+        // real bounds against 7,588 with the degenerate box the port used to
+        // build**, a room's worth of furniture per doorway.
+        assert!(
+            props_new > props_old,
+            "the render bounds keep {props_new} props through these windows and the \
+             old 64-unit box kept {props_old} — the cull box regression is back"
+        );
+    }
 }

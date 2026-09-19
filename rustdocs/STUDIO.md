@@ -54,7 +54,7 @@ models.draw(&mut pass, &props);
 pub struct StudioModel {
     pub path: String,            // models/props_bts/gantry_rails_a.mdl
     pub name: String,            // studiohdr_t::name — the compiler's, not always the path
-    pub bounds: (Vec3, Vec3),    // view_bbmin / view_bbmax, model space
+    pub bounds: (Vec3, Vec3),    // the RENDER bounds, model space — see below
     pub illum_position: Vec3,    // where lighting is sampled by default
     pub flags: StudioFlags,
     pub checksum: u32,           // shared by all three files; also what a .vhv must match
@@ -92,6 +92,43 @@ pub struct Batch {
 }
 ```
 
+<a id="render-bounds"></a>
+
+#### `bounds` is the *render* bounds, and that is not `view_bbmin`
+
+`Mdl` carries both boxes the header holds and `StudioModel::bounds` is
+`Mdl::render_bounds()`, which is `CModelInfo::GetModelRenderBounds`
+(`engine/ModelInfo.cpp:263`):
+
+```rust
+pub struct Mdl {
+    pub bounds: (Vec3, Vec3),   // view_bbmin / view_bbmax — the clipping box
+    pub hull: (Vec3, Vec3),     // hull_min / hull_max — the movement box
+    …
+}
+impl Mdl {
+    /// view_bb when either vector is non-zero; hull otherwise.
+    pub fn render_bounds(&self) -> (Vec3, Vec3);
+}
+```
+
+**Take `render_bounds()`, never `bounds`.** `studiomdl` writes
+`view_bbmin`/`view_bbmax` only for a model compiled with an explicit `$bbox`,
+and measured over the depot **2,033 of the game's 2,041 models leave both
+zero**. Reading them straight gives a *degenerate box at the model's origin* —
+which is not an error anywhere, it is a cull box that rejects the prop from most
+viewpoints. Valve spells the same fallback in three places
+(`ModelInfo.cpp:263`, `c_baseanimating.cpp:6341`, `tier3/mdlutils.cpp:40`) and
+all three test "is either vector non-zero", not "is the box non-empty".
+
+The measurement that says it works: with the fallback, **0 of the game's 1,444
+static props** reach outside their render bounds; reading `view_bbmin` raw,
+**all 2,017 loadable models** did, the worst by 8,972 units.
+`every_shipped_studio_model_parses` asserts the zero.
+
+For an *animated* model the render bounds are not enough on their own — see
+[`Sequence::bounds`](#anim--bones-sequences-and-the-pose).
+
 `load` accepts the name with or without the `.mdl` extension and normalises
 backslashes and case, because the `sprp` dictionary stores the extension and
 most other callers do not.
@@ -116,7 +153,8 @@ pub struct Bone {
 
 pub struct Sequence {
     pub label: String, pub flags: u32, pub anim: usize,
-    pub fade_out_time: f32,   // mstudioseqdesc_t::fadeouttime, in SECONDS
+    pub fade_out_time: f32,     // mstudioseqdesc_t::fadeouttime, in SECONDS
+    pub bounds: (Vec3, Vec3),   // mstudioseqdesc_t::bbmin/bbmax, model space
 }
 pub struct BoneTrack { pub bone: usize, pub pos: Vec<Vec3>, pub rot: Vec<Quat> }
 pub struct Animation {
@@ -156,6 +194,20 @@ finished `fadeouttime` seconds before it ends, and that is what
 made of. Measured over the shipped game: **10,664 of its 10,666 sequences write
 0.2 and the other two write 0.5**; none writes zero, so the term never folds
 away. See `rustdocs/SERVER.md`'s `sequences` and gotcha 67.
+
+**`Sequence::bounds` is not optional decoration — a model's own bounds do not
+contain its animated geometry.** `C_BaseAnimating::GetRenderBounds`
+(`c_baseanimating.cpp:6353`) merges the *playing* sequence's box into the
+model's render bounds, and the reason is the size of the gap: measured over the
+depot, a posed vertex reaches up to **23,029 units** outside the model's own
+box (`models/a4_destruction/fin3_orangepipeexpl.mdl`, an explosion that throws
+debris across the map). All 10,666 sequences in the game declare one and the
+widest reaches 16,384 units — half the coordinate range, which is what a
+"whole map" box looks like.
+
+`engine::world::entities`' `cull_box` is the consumer, and it takes the whole
+sequence's box rather than this instance's cycle — Valve's, and what keeps the
+cull cheap: no pose is computed for an entity that is then culled.
 
 `pose` returns **pose-to-model** matrices: `boneToWorld[i] * poseToBone[i]`,
 which is what a *bind-pose* vertex is multiplied by. With no animation every
@@ -490,6 +542,23 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
     resolve a fourth against; only `StudioModel::load` merges. A test that
     builds a model from fixtures therefore never sees an include.
 
+24. **`view_bbmin`/`view_bbmax` is zero on 2,033 of the game's 2,041 models**,
+    so anything that reads `Mdl::bounds` directly is reading a degenerate box
+    at the origin. Take [`render_bounds`](#render-bounds). This produced a real
+    regression — `prop_dynamic`s winking out at particular angles, and rooms
+    behind an areaportal looking empty — and nothing about it reads as an
+    error: the prop is simply not drawn.
+
+25. **This port poses 135 models outside the box their own sequences declare**,
+    the worst by 23,029 units. `studiomdl` computes `mstudioseqdesc_t::bbmin`/
+    `bbmax` from the animated geometry, so a gap that large means the pose is
+    *wrong*, not the box — almost certainly the sequences whose animation lives
+    in an external `.ani` block, which is unported (see "What is deliberately
+    absent"). They are the `a4_destruction` set, the cloth sims and the
+    `props_vac_anim` models. The cull box follows Valve exactly either way;
+    what is wrong is upstream of it.
+    `every_shipped_studio_model_parses` prints the list, worst first.
+
 ---
 
 ## What is deliberately absent
@@ -618,6 +687,10 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 | `studio::tests::materials_resolve_through_the_cdtexture_cross_product` | material resolution order |
 | `studio::tests::quad_lists_and_flex_deltas_are_refused` | the refusals §3 justifies |
 | `studio::tests::a_stale_companion_file_is_refused` | the checksum guard |
+| `engine::world::entities::tests::the_cull_box_covers_a_model_that_declared_no_clipping_box` | gotcha 24 — the fallback's *shape*, including the eight-corner transform a rotated prop needs |
+| `engine::world::entities::tests::the_cull_box_follows_the_sequence_the_entity_plays` | the sequence box being merged in |
+| `engine::world::entities::tests::the_old_cull_box_would_have_dropped_most_of_the_games_props` | **the size of gotcha 24**, against the depot: 7,515 of 8,072 `prop_dynamic` placements wear a model that escapes the box the port used to build |
+| `studio::tests::every_shipped_studio_model_parses` | also the census behind gotchas 24 and 25, and the assertion that **no** static prop reaches outside its render bounds |
 | `studio::anim::tests::a_radian_euler_is_roll_pitch_yaw_and_not_a_qangle` | gotcha 14 |
 | `studio::anim::tests::the_rle_walk_repeats_the_last_valid_value` | `ExtractAnimValue`'s run encoding |
 | `studio::anim::tests::a_compressed_quaternion_rebuilds_its_w` | `Quaternion48`/`Quaternion64` |
@@ -659,6 +732,13 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release -- --ignored --nocapture
   found gotcha 8.** It also carries the `$includemodel` census: **25 models
   declare one, 24 companions can be read, and they carry 5,232 of the 10,666
   sequences the game's models hold** — that total was 5,434 before the merge.
+
+  **And the bounds census**, added when the cull box turned out to be
+  degenerate: 2,033 of 2,041 models declare no `view_bbmin`/`view_bbmax`, 2,030
+  of those have a hull to fall back to, **0 of the 1,444 static props reach
+  outside their render bounds** where all 2,017 loadable models did before, and
+  135 models pose outside the box their own sequences declare (gotcha 25),
+  printed worst-first.
 - `props::tests::every_shipped_map_places_its_props` — 106 maps, 104 with props,
   56,955 props placed; asserts `sp_a1_intro1`'s measured 1,080 props from 136
   models, prints the luminance comparison behind gotcha 2, and checks that

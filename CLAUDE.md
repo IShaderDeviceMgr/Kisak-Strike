@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,032 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,034 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -152,7 +152,7 @@ before calling into a module.** This table is the index.
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport — input→command→movement→view, `CPortalGameMovement`'s walk, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
-| `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning** | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
+| `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the two areaportals — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
@@ -262,7 +262,10 @@ drawn.
   gates **external `.ani` animation blocks**, because every `$includemodel` host but
   the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
   and the personality sphere — is a model this cannot pose anyway, so reading `.ani`
-  before skinning buys nothing. `vvd::Vertex` grows a `bones` field, `vtx` stops
+  before skinning buys nothing. **There is now a number on what the missing `.ani`
+  costs**: 135 models pose outside the box their own sequences declare, the worst by
+  23,029 units, and since `studiomdl` computes that box from the animated geometry the
+  pose is what is wrong. `every_shipped_studio_model_parses` prints the list. `vvd::Vertex` grows a `bones` field, `vtx` stops
   discarding `StripHeader_t`'s bone plumbing, and the bone matrices move to the GPU.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of

@@ -178,7 +178,12 @@ pub struct Mdl {
     pub name: String,
     pub checksum: u32,
     pub flags: StudioFlags,
+    /// `view_bbmin` / `view_bbmax` — the *clipping* box, which is **zero on
+    /// most models**. Use [`render_bounds`](Mdl::render_bounds), not this.
     pub bounds: (Vec3, Vec3),
+    /// `hull_min` / `hull_max` — the movement box, and what
+    /// [`render_bounds`](Mdl::render_bounds) falls back to.
+    pub hull: (Vec3, Vec3),
     pub illum_position: Vec3,
     pub bone_count: u32,
     /// The bone list, in file order. A bone's parent is always earlier in it.
@@ -205,6 +210,32 @@ pub struct Mdl {
     /// slash-normalized, lowercased and terminated with `/`.
     pub texture_dirs: Vec<String>,
     pub body_parts: Vec<BodyPart>,
+}
+
+impl Mdl {
+    /// `CModelInfo::GetModelRenderBounds` (`engine/ModelInfo.cpp:263`): the
+    /// clipping box when the compiler wrote one, and the movement box when it
+    /// did not.
+    ///
+    /// **The fallback is not a corner case.** `studiomdl` writes
+    /// `view_bbmin`/`view_bbmax` only for a model given an explicit `$bbox`,
+    /// so most props ship with both zero — and reading them straight gives a
+    /// *degenerate box at the model's origin*, which is a cull box that
+    /// rejects the prop from most angles. `C_BaseAnimating::GetRenderBounds`
+    /// (`c_baseanimating.cpp:6341`) makes the same test, as does
+    /// `tier3/mdlutils.cpp:40`; all three spell it as "is either vector
+    /// non-zero", not "is the box non-empty".
+    ///
+    /// What this does **not** add is `mstudioseqdesc_t::bbmin`/`bbmax`, which
+    /// `C_BaseAnimating` merges in for the sequence being played — that is
+    /// [`anim::Sequence::bounds`](super::anim::Sequence::bounds), and the
+    /// consumer merges the two: see `engine::world::entities`' `cull_box`.
+    pub fn render_bounds(&self) -> (Vec3, Vec3) {
+        match self.bounds.0 == Vec3::ZERO && self.bounds.1 == Vec3::ZERO {
+            true => self.hull,
+            false => self.bounds,
+        }
+    }
 }
 
 impl Mdl {
@@ -247,6 +278,7 @@ impl Mdl {
         let checksum = r.u32(8)?;
         let name = r.fixed_string(12, 64);
         let illum_position = r.vec3(92)?;
+        let hull = (r.vec3(104)?, r.vec3(116)?);
         let bounds = (r.vec3(128)?, r.vec3(140)?);
         let flags = StudioFlags(r.u32(152)?);
         let bone_count = r.i32(156)?.max(0) as u32;
@@ -349,6 +381,7 @@ impl Mdl {
             checksum,
             flags,
             bounds,
+            hull,
             illum_position,
             bone_count,
             bones,

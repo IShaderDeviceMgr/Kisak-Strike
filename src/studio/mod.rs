@@ -211,7 +211,15 @@ pub struct StudioModel {
     /// `studiohdr_t::name` — the name the *compiler* recorded, which is not
     /// always the path it ships at.
     pub name: String,
-    /// `view_bbmin` / `view_bbmax` — the render bounds, in model space.
+    /// The **render** bounds, in model space — `Mdl::render_bounds`, which is
+    /// `view_bbmin`/`view_bbmax` when the compiler wrote them and
+    /// `hull_min`/`hull_max` when it did not.
+    ///
+    /// **Not `view_bbmin`/`view_bbmax` straight.** Most props ship with both
+    /// zero, so reading them raw gives a degenerate box at the model's origin
+    /// — a cull box that drops the prop from most viewpoints. See
+    /// [`Mdl::render_bounds`](mdl::Mdl::render_bounds) for Valve's three
+    /// spellings of the same fallback.
     pub bounds: (Vec3, Vec3),
     /// `illumposition` — where lighting is sampled when the placing entity
     /// names no lighting origin of its own.
@@ -878,6 +886,16 @@ mod tests {
         // `$includemodel`: how many models declare one, how many of those the
         // game actually ships, and what merging them is worth.
         let (mut declares, mut merged, mut from_includes) = (0usize, 0usize, 0usize);
+        // `Mdl::render_bounds`' reason to exist.
+        let (mut no_view_bb, mut rescued) = (0usize, 0usize);
+        let (mut widest_hull, mut widest_hull_at) = (0.0f32, String::new());
+        let (mut outside, mut raw_outside, mut outside_static) = (0usize, 0usize, 0usize);
+        let (mut worst_outside, mut worst_raw) = (0.0f32, 0.0f32);
+        let mut worst_outside_at = String::new();
+        let (mut posed_worst, mut posed_worst_at) = (0.0f32, String::new());
+        let (mut seq_reach, mut seq_nonzero) = (0.0f32, 0usize);
+        let mut posed_over: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
         let (mut widest, mut widest_at) = (0usize, String::new());
         let (mut failed, mut animated_failed) = (Vec::new(), Vec::new());
         for path in &paths {
@@ -922,12 +940,150 @@ mod tests {
                         .contains(StudioFlags::BAKED_VERTEX_LIGHTING_IS_INDIRECT_ONLY),
                     "{path} asks for indirect-only baked lighting"
                 );
+
+                // **How often `view_bbmin`/`view_bbmax` is zero**, which is
+                // the measurement behind `Mdl::render_bounds`. A model with
+                // both zero has no clipping box, and reading it raw gives a
+                // degenerate cull box at the origin — the bug that made
+                // `prop_dynamic`s vanish at some angles and not others.
+                if mdl.bounds.0 == Vec3::ZERO && mdl.bounds.1 == Vec3::ZERO {
+                    no_view_bb += 1;
+                    let (mins, maxs) = mdl.hull;
+                    let reach = mins.abs().max(maxs.abs()).max_element();
+                    if reach > 0.0 {
+                        rescued += 1;
+                    }
+                    if reach > widest_hull {
+                        widest_hull = reach;
+                        widest_hull_at = path.clone();
+                    }
+                }
+                assert_eq!(
+                    mdl.render_bounds(),
+                    match mdl.bounds == (Vec3::ZERO, Vec3::ZERO) {
+                        true => mdl.hull,
+                        false => mdl.bounds,
+                    },
+                    "{path}: render_bounds is not the fallback"
+                );
             }
 
             match StudioModel::load(&vfs, path) {
                 Ok(model) => {
                     loaded += 1;
+                    // **Does the cull box contain what is drawn?** The whole
+                    // point of `render_bounds`, measured against the geometry
+                    // rather than against another header field.
+                    let mut lo = Vec3::splat(f32::MAX);
+                    let mut hi = Vec3::splat(f32::MIN);
+                    for v in &model.vertices {
+                        let p = Vec3::from_array(v.position);
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                    if !model.vertices.is_empty() {
+                        let out = (model.bounds.0 - lo).max(hi - model.bounds.1).max_element();
+                        if out > 0.01 {
+                            outside += 1;
+                            if is_static && out > worst_outside {
+                                worst_outside = out;
+                                worst_outside_at = path.clone();
+                            }
+                            if is_static {
+                                outside_static += 1;
+                            }
+                        }
+                        // **And the same question for every pose the model
+                        // can be drawn in**, which is the one that matters for
+                        // `prop_dynamic`: a bind-pose vertex outside the hull
+                        // is not necessarily drawn there, and a posed one is.
+                        // Drawn exactly the way `EntityModels` draws it —
+                        // per-vertex bone when the model is rigid, bind pose
+                        // when it is not.
+                        if let Some(vertex_bones) = model.rigid_bones() {
+                            for sequence in 0..model.sequences.len() {
+                                // `STUDIO_DELTA`: the sequence *adds* to a
+                                // base pose rather than replacing it, so both
+                                // its animation and its declared box are
+                                // deltas. Posing one standalone is
+                                // meaningless, and nothing in this port plays
+                                // one — `prop_dynamic` names a sequence by
+                                // label and layers nothing on top.
+                                if model.sequences[sequence].flags & 0x0004 != 0 {
+                                    continue;
+                                }
+                                for step in 0..3 {
+                                    let bones = anim::pose(
+                                        &model.bones,
+                                        model.animation(sequence),
+                                        step as f32 * 0.5,
+                                    );
+                                    let mut plo = Vec3::splat(f32::MAX);
+                                    let mut phi = Vec3::splat(f32::MIN);
+                                    for (i, v) in model.vertices.iter().enumerate() {
+                                        let bone = bones
+                                            .get(usize::from(vertex_bones[i]))
+                                            .copied()
+                                            .unwrap_or(glam::Mat4::IDENTITY);
+                                        let p = bone
+                                            .transform_point3(Vec3::from_array(v.position));
+                                        plo = plo.min(p);
+                                        phi = phi.max(p);
+                                    }
+                                    // The cull box `EntityModels` actually
+                                    // uses: the render bounds merged with
+                                    // this sequence's own box.
+                                    let seq = model.sequences[sequence].bounds;
+                                    let lo = model.bounds.0.min(seq.0);
+                                    let hi = model.bounds.1.max(seq.1);
+                                    let out = (lo - plo).max(phi - hi).max_element();
+                                    if out > 1.0 {
+                                        posed_over
+                                            .entry(path.clone())
+                                            .and_modify(|w| *w = out.max(*w))
+                                            .or_insert(out);
+                                    }
+                                    if out > posed_worst {
+                                        posed_worst = out;
+                                        posed_worst_at =
+                                            format!("{path} sequence {sequence}");
+                                    }
+                                }
+                            }
+                        }
+
+                        // What it would have been without the fallback: the
+                        // number that says how bad the bug was.
+                        let raw = header
+                            .as_ref()
+                            .map(|mdl| mdl.bounds)
+                            .unwrap_or(model.bounds);
+                        let raw_out = (raw.0 - lo).max(hi - raw.1).max_element();
+                        worst_raw = worst_raw.max(raw_out);
+                        if raw_out > 0.01 {
+                            raw_outside += 1;
+                        }
+                    }
                     sequences += model.sequences.len();
+                    // A sanity check on the two new header reads: a sequence
+                    // box outside the biggest map the engine allows is a
+                    // misread offset, not content.
+                    for seq in &model.sequences {
+                        let reach = seq
+                            .bounds
+                            .0
+                            .abs()
+                            .max(seq.bounds.1.abs())
+                            .max_element();
+                        assert!(
+                            reach.is_finite() && reach < 65_536.0,
+                            "{path}: sequence {} has bounds {:?}",
+                            seq.label,
+                            seq.bounds
+                        );
+                        seq_reach = seq_reach.max(reach);
+                        seq_nonzero += usize::from(seq.bounds != (Vec3::ZERO, Vec3::ZERO));
+                    }
                     merged += model.includes.len();
                     from_includes += model.sequences.len() - local_sequences;
                     widest_animation = widest_animation.max(
@@ -988,6 +1144,54 @@ mod tests {
         println!(
             "{declares} models declare a $includemodel; {merged} include(s) merged, \
              carrying {from_includes} of the {sequences} sequences"
+        );
+        println!(
+            "{no_view_bb} models have no view bbox; {rescued} of those have a hull \
+             (widest reach {widest_hull:.0} units, {widest_hull_at})"
+        );
+        println!(
+            "cull box vs. geometry: {outside} of {loaded} models reach outside their \
+             render bounds, {outside_static} of them static props \
+             (worst static {worst_outside:.0} units, {worst_outside_at}); \
+             reading view_bbmin raw it would be {raw_outside}, worst {worst_raw:.0}"
+        );
+        println!(
+            "{seq_nonzero} of {sequences} sequences declare a box; widest reach \
+             {seq_reach:.0} units"
+        );
+        {
+            let mut over: Vec<(&String, &f32)> = posed_over.iter().collect();
+            over.sort_by(|a, b| b.1.partial_cmp(a.1).expect("finite"));
+            println!(
+                "{} models pose outside their cull box (worst {posed_worst:.0} units, \
+                 {posed_worst_at})",
+                over.len()
+            );
+            for (path, out) in over.iter().take(10) {
+                println!("  {out:>8.0}  {path}");
+            }
+        }
+        // **The fallback is the common case, not the corner case.** If this
+        // ever stopped holding, `Mdl::render_bounds` would look like dead
+        // defensive code and somebody would delete it.
+        assert!(
+            no_view_bb * 2 > loaded,
+            "only {no_view_bb} of {loaded} models lack a view bbox — \
+             Mdl::render_bounds' fallback no longer carries the weight it was written for"
+        );
+        // **What the fallback buys, as an invariant rather than a count**: a
+        // static prop is drawn in its bind pose and nothing else, so its
+        // render bounds must contain its geometry exactly. Before the
+        // fallback every one of the 1,444 failed this.
+        assert_eq!(
+            outside_static, 0,
+            "{outside_static} static props reach outside their render bounds"
+        );
+        assert!(
+            widest_hull > 64.0,
+            "the widest hull of a model with no view bbox is {widest_hull} units; \
+             a degenerate cull box would have been hidden by the pad \
+             `engine::world::entities::cull_box` adds"
         );
         for line in not_rigid.iter().take(10) {
             println!("  shares vertices between bones: {line}");
