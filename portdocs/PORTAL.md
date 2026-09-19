@@ -11,9 +11,10 @@ other side rather than the wall. Everything this document says about *why* the r
 view was left out was true when it was written and is the reason that second document
 exists; the places it matters are marked below.
 
-**Status: stages 1 to 4 of §10's five have landed**, plus the recursive view. The
-blended pass, the class and its oval, the hole in the wall, and the teleport. Sizes and
-line numbers are from `legacy/`; every count of entities, models or materials is measured
+**Status: all five of §10's stages have landed**, plus the recursive view. The blended
+pass, the class and its oval, the hole in the wall, the teleport, and the polish — the
+transition ramp, the two animation clocks, the funnel and the punch. Sizes and line
+numbers are from `legacy/`; every count of entities, models or materials is measured
 against the 106 shipped maps or the mounted game, not estimated.
 
 > **What stage 2 corrected in this document is recorded where it belongs** — §7.2's
@@ -55,9 +56,17 @@ that out for itself.
 
 **Problems 1, 2, 3 and 4 have all landed** — stages 1 to 4 of §10 — and so has §7's
 picture, the recursive view through the opening, on the separate plan
-`portdocs/PORTAL_RENDER.md`. What is left of the module is stage 5, which is polish: the
-transition ramp, `$PortalOpenAmount`'s open animation, `IsFloorPortal`'s special cases and
-`PunchAllPenetratingPlayers`.
+`portdocs/PORTAL_RENDER.md`. **Stage 5, the polish, has landed too**, so the plan is
+finished: the transition ramp is a fifth carved set in `engine/trace/carve.rs` that a
+trace reports through `Trace::portal_ramp` and the mover reads through
+`hit_portal_ramp`; `$PortalOpenAmount`'s open animation grew its sibling
+`$PortalStatic`, on its own clock, in `engine/world/portals.rs`; `IsFloorPortal`'s
+reachable special cases are the funnel in `client/movement.rs` and the guard on the
+punch; and `PunchAllPenetratingPlayers` is a deferred queue on `Context` that
+`Server::flush_portal_punches` drains against a `TouchQuery`. §10's stage-5 entry
+records what each of the four found, including the one that matters most — **none of
+the nine shipped portal pairs is steep enough to reach the transition ramp**, so it is
+unit-tested but unreachable from shipped content until the portal gun exists.
 
 ---
 
@@ -1006,8 +1015,90 @@ them. The nine pairs hold **590 carved pieces, 72 tube slabs and 292 remote piec
 between them, and carving a linked pair takes **0.09 ms on average, 0.16 ms at worst** — on
 placement, not per frame.
 
-**Stage 5 — polish, if wanted.** The transition ramp, `$PortalOpenAmount`'s open
-animation, `IsFloorPortal`'s special cases, `PunchAllPenetratingPlayers`.
+**Stage 5 — polish. LANDED, and it is the last of the five.** All four items, and each
+one turned out to be somewhere different from where this line implies:
+
+| Item | Where it landed |
+|---|---|
+| The transition ramp | `engine/trace/carve.rs`'s `ramp_piece` and `CarvedWall::ramp`, `Trace::portal_ramp`, and four consumer sites in `client/movement.rs` |
+| `$PortalOpenAmount`'s open animation | a **second clock** on `PropPortal` and `PortalState`, plus `ComputeStaticAmountForRendering` in `engine/world/portals.rs` |
+| `IsFloorPortal`'s special cases | the **funnel** in `client/movement.rs`, and the punch's guard |
+| `PunchAllPenetratingPlayers` | `server/`, deferred across a tick boundary, with `TouchQuery::start_solid` as the new half of the seam |
+
+**Outcome: a portal you fall into rather than at.** The funnel is the visible one — a
+long drop now goes *in* instead of clipping the rim — and the other three are each a
+thing that had been quietly wrong: a portal with nothing behind it settled into a clear
+oval showing the wall, a re-placed portal cleared its own interference rather than its
+partner's, and a player standing where a portal landed stayed in the wall.
+
+Seven things this stage found that the one-line plan did not say:
+
+1. **`CPortalGameMovement::AirMove` is not the base class's, and the port had the base
+   class's.** Portal's override accelerates at **`sv_paintairacceleration` (5.0)**, not
+   `sv_airaccelerate` (12.0), unconditionally and with no paint anywhere in the branch —
+   `portal_gamemovement.cpp:800` against `gamemovement.cpp:2043`. The constant's *name* is
+   the only thing about it that is about paint. Taking the name at face value gives a
+   Portal 2 player 2.4x the air control the shipped game gives them, and the funnel could
+   not be added without porting the function it lives in, which is how this was found.
+   The same function also cancels a wish direction that opposes a fling — nothing to do
+   with portals either — and deliberately leaves the view forward *unnormalised* when it
+   is steeper than 30 degrees, which is a damping and not an oversight.
+
+2. **The transition ramp is one convex, and three quarters of the code that builds it is
+   commented out.** `MovedOrResized` fills a four-element `pAABBTransformConvexes` array
+   beside the inverse hole's, and `:583`, `:637` and `:665` are all `/* … */`; what
+   reaches `ConvertConvexToCollideParams` is `&pAABBTransformConvexes[1]` with a count of
+   **1**. That is the *bottom* section — the wall below the opening — and it is the only
+   edge a player can walk up onto, so it is the only one that needs the rescue.
+
+3. **Nothing stops against the ramp, and the shipped tree contains the version that
+   does**, under a `#if 0` and the comment *"on second thought, maybe you shouldn't
+   actually walk on this magic ramp"*. What is ported is the flag.
+
+4. **No shipped map can reach the ramp, and now there is a number.** Over the nine pairs
+   the shipped maps form, `|m[2][2]|` — `ShouldPortalTransitionCrouch`'s own quantity — is
+   1 for **seven** and below `cos 30°` for **two**; **none** lands in between, which is
+   the "slightly angled" case the ramp exists for.
+   `a_player_walks_through_every_shipped_portal_pair` prints the split. §5's prediction
+   ("it needs an angled portal to matter and §2 says the content barely has one") was
+   right and is now measured: the thing that will exercise it is the gun.
+
+5. **`$PortalStatic` needs its own clock**, which §12's answer about the instance
+   parameter did not foresee. `OnActiveStateChanged` resets the open amount *and* the
+   static; `OnPortalMoved` resets the open amount **only**; and both of them set the
+   *partner's* static without touching the partner's opening. Three different effects from
+   one timestamp is not possible, so `PortalState` carries two.
+
+6. **`ComputeStaticAmountForRendering` is where the open animation actually mattered**,
+   and it is two overrides rather than a curve: an **unlinked** portal is full static, and
+   so is the **deepest one drawn** — *"end of the line, no more views"*. The second is
+   what makes `r_portal_stencil_depth 0` look like the shipped game rather than like a
+   decal. Its third branch, `m_fSecondaryStaticAmount`, is **dead in this tree**: the
+   field is declared, decayed by `ClientThink` and assigned `0.0f` in two places, and
+   nothing anywhere gives it a non-zero value, so its guard can only pass when the static
+   amount is already negative. Deleted with that evidence rather than ported.
+
+7. **`IsFloorPortal`'s other three call sites are unreachable by the player**, which is
+   why this stage's answer to that item is the funnel. Two of them are
+   `TeleportTouchingEntity`'s floor-to-floor special cases — the doubled `z` compensation
+   (`portal_base2d_shared.cpp:452`) and the pitch reorientation and Bowie manoeuvre
+   (`:556`) — and `CPortal_Base2D::Touch`, `StartTouch` and `EndTouch` **all return
+   immediately for a player** (`portal_base2d.cpp:709`, `:885`, `:944`), so the player's
+   teleport never goes near them. The third is `portal_placement.cpp`, which is deleted
+   with the gun. What is left is `PlayerShouldFunnel` and the punch's guard, and both are
+   here. A fourth thing worth recording from that reading: **`IsCeilingPortal` is not the
+   mirror of `IsFloorPortal`** — both compare `vForward.z` against the same `0.8`, `>` for
+   one and `<` for the other, so every portal that is not in the floor is a "ceiling
+   portal", a wall portal included. Ported as written.
+
+And one thing about the *punch* that changed a seam: its second condition is
+`enginetrace->TraceRay(…).startsolid`, which is a question about **world geometry**, and
+`server/` has none. `TouchQuery` gained `start_solid` and `Context` gained
+`punch_penetrating_players`, which queues the portal the way `take_damage` queues damage;
+`Server::run_tick` drains it where a `TouchQuery` is in hand, in the same tick as the
+input that asked. Both guards on it read state from *before* the move —
+`bOtherShouldBeStatic` is computed before the relink, and `IsFloorPortal()` is asked at the
+new placement with the default `0.8` rather than the `0.9` the exit-speed rules use.
 
 **Out of order, and out of this document: the recursive view. LANDED.**
 `portdocs/PORTAL_RENDER.md`, which §7 was only ever written to justify leaving out. Four

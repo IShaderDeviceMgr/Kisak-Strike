@@ -242,7 +242,11 @@ pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32, visible: &vis::
 pub fn translucent_list(&self, eye: Vec3, forward: Vec3, visible: &vis::VisibleSet)
     -> TranslucentList;
 pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &TranslucentList,
-                        visible: &vis::VisibleSet);
+                        visible: &vis::VisibleSet, remaining_depth: u8);
+/// `enginetrace->TraceRay(…).startsolid` for an unswept player-sized box —
+/// the world's own subtree, with no portal hole attached. `server/`'s, through
+/// `TouchQuery::start_solid`.
+pub fn start_solid(&self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
@@ -437,6 +441,8 @@ impl World {
     pub fn brush_models_touching(
         &self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, out: &mut Vec<usize>,
     );
+    /// Would a box at `origin` start a trace inside the **world's** solid?
+    pub fn start_solid(&self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 }
 
 pub const RENDER_NONE: i32 = 10;   // kRenderNone
@@ -547,6 +553,16 @@ the trigger's actual brushes) and not filtered to triggers (which of them is
 one is `FSOLID_TRIGGER`, the server's live state; a copy here would be a frame
 stale every time something was enabled). It *is* filtered to `owned`, for the
 same reason `clip_models` is.
+
+`start_solid` is the second half of the same seam and answers the one question
+`server/` has about *world* geometry rather than about brush models: is the
+player embedded in something here. Its only caller is
+`Server::punch_penetrating_players`, which fires when a portal is re-placed onto
+a wall a player is standing inside; Valve's comment is what the question is for
+— *"player would be stuck unless moving using portal traces. Really good
+indicator that they're actually in the portal plane."* It sweeps the world's own
+subtree with **no portal hole attached**, deliberately: a carved tracer would
+answer `false` for exactly the case being asked about.
 
 ### `Batch`
 
@@ -813,6 +829,7 @@ pub struct Portal {
     pub half_height: f32,     // 56 — not 14; `rustdocs/SERVER.md` gotcha 79
     pub is_portal2: bool,     // which of the two overlay materials
     pub open_for: f32,        // how long it has been open, in seconds
+    pub static_for: f32,      // …and how long since it last filled with static
     pub linked: Option<u64>,  // the partner's `id`
     pub matrix: Mat4,         // m_matrixThisToLinked; the identity while unlinked
 }
@@ -835,7 +852,8 @@ impl Portals {
     pub fn sync(&mut self, portals: &[Portal]);
     pub fn pairs(&self) -> Vec<PortalPair>;
     pub fn centers(&self) -> impl Iterator<Item = (usize, Vec3)> + '_;
-    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize);
+    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize,
+                    remaining_depth: u8);
 
     // The recursive view's three draws — see `world::portalview`.
     pub fn draw_hole(&self, pass: &mut Pass<'_>, curtime: f32, index: usize);
@@ -855,16 +873,16 @@ with no geometry of its own anywhere in the game's files —
 `CPortalRenderable_FlatBasic::DrawSimplePortalMesh` with
 `models/portals/portalstaticoverlay_1.vmt` bound.
 
-`portdocs/PORTAL.md` **stage 4 of five**, plus `portdocs/PORTAL_RENDER.md` whole,
-so **what you see is the room behind the other portal, framed by a coloured
-oval, and you can walk into it**: the hole is real collision, the far side is
-traced, the teleport runs, and the picture in the opening is the world drawn
-again from somewhere else. The picture is
+`portdocs/PORTAL.md` **all five stages**, plus `portdocs/PORTAL_RENDER.md`
+whole, so **what you see is the room behind the other portal, framed by a
+coloured oval, and you can walk into it**: the hole is real collision, the far
+side is traced, the teleport runs, and the picture in the opening is the world
+drawn again from somewhere else. The picture is
 [`world::portalview`](#worldportalview--the-view-through-one); this module owns
 the oval, and owns the two draws that view reaches back for. What is still
 missing is the *warp* — a portal's surface does not refract what is behind it,
-and it has no opening animation, both of which are `PortalRefract`'s `$Stage 0`
-(`portdocs/PORTAL_RENDER.md` §7). The collision is `trace/`'s and is
+which is `PortalRefract`'s `$Stage 0` (`portdocs/PORTAL_RENDER.md` §7). The
+collision is `trace/`'s and is
 [`PortalHoles`](#the-hole--portalhole-carvedwall-portalholes-and-with_hole); the
 teleport is `client/`'s `handle_portalling`; `World::sync_portals` keeps all
 three in step from this one list, and it is also where the **pairing** is
@@ -908,12 +926,56 @@ Three things here produce a plausible wrong picture rather than an error.
   ring out of its own opening. `PORTAL_OFFSET` exists in `portalview` and applies
   to the near-plane cap alone.
 
-`open_for` is where the two curves come from: `$PortalOpenAmount` climbs to 1
-over half a second and `$PortalStatic` decays to 0 over one, which is
-`C_Prop_Portal::ClientThink` integrating both. The seam carries the *elapsed*
-time rather than the instant because the instant is on the server's tick clock
-and the elapsed time is measured against the scene's; `Engine::frame` does the
-subtraction, clamped at zero.
+#### The two curves, and the two clocks they run on
+
+`$PortalOpenAmount` climbs to 1 over half a second and `$PortalStatic` decays to
+0 over one — `C_Prop_Portal::ClientThink` integrating both, in closed form here.
+The seam carries the *elapsed* time rather than the instant because the instant
+is on the server's tick clock and the elapsed time is measured against the
+scene's; `Engine::frame` does the subtraction, clamped at zero.
+
+**They are two clocks, not one.** The events that reset them are different sets,
+and one timestamp cannot say both:
+
+| | `$PortalOpenAmount` → 0 | `$PortalStatic` → 1 |
+|---|---|---|
+| this portal switched on (`OnActiveStateChanged`) | yes | yes |
+| this portal **moved** (`OnPortalMoved`) | yes | **no** |
+| either of those, on the **partner** | no | yes |
+
+So a portal that is re-placed opens again with whatever interference it already
+had, and the other end of the pair fills with static without re-opening — which
+is the shipped game's *"add static to the remote"*, because the far end is now
+looking at a different room.
+
+#### `remaining_depth` — what a portal at the end of the line draws
+
+`C_Prop_Portal::ComputeStaticAmountForRendering` (`c_prop_portal.cpp:1148`) is
+what `$PortalStatic`'s material proxy actually writes, and it is `m_fStaticAmount`
+only some of the time. `draw_one` takes
+`CPortalRender::GetRemainingPortalViewDepth()` — `r_portal_stencil_depth` minus
+the recursion level being drawn, which `World::draw_translucent` threads down —
+and overrides the curve twice:
+
+- **an unlinked portal is full static.** It has nothing to show, and without
+  this it settles into a clear oval with the wall visible through it;
+- **so is the deepest one drawn.** At `r_portal_stencil_depth 0` that is *every*
+  portal, which is what makes the flat-oval debug setting look like the shipped
+  game's rather than like a decal.
+
+The third branch — `m_fSecondaryStaticAmount` at `remaining_depth == 1`, *"fading
+in from no views to another view (player just walked through it)"* — is **dead in
+the reference tree** and is not ported: the field is declared, decayed by
+`ClientThink` and set to `0.0f` in two places (`:933`, `:1019`), and **nothing
+anywhere assigns it a non-zero value**, so its own guard
+(`m_fSecondaryStaticAmount > flStaticAmount`) can only pass when the static
+amount is already negative. The depth-doubler branch above it goes with
+`WillUseDepthDoublerThisDraw`, which `portdocs/PORTAL_RENDER.md` §7 deletes.
+
+`$Stage 1` — the stencil hole — reads `$PortalOpenAmount` and nothing else, so
+`draw_hole` and `draw_hole_cap` bind the settled static and it is never sampled.
+The *open* amount they bind matters and is shared with the oval on purpose: a
+ring and a hole computed from two blocks would stop being concentric.
 
 ### `world::portalview` — the view through one
 
@@ -1745,9 +1807,11 @@ pub struct Trace {
     pub surface_flags: i32,
     pub all_solid: bool,
     pub start_solid: bool,
+    pub portal_ramp: bool,         // see "The transition ramp" below
 }
 
 pub fn did_hit(&self) -> bool;     // fraction < 1 || all_solid || start_solid
+pub fn hit_portal_ramp(&self, up: Vec3) -> bool;
 ```
 
 Absent, and what each waits on: `m_pEnt`, `hitgroup`, `physicsbone`, `hitbox` (entities
@@ -1961,7 +2025,7 @@ with the union — which is the commented-out line at `portalsimulation.cpp:1167
 `CPortalSimulator::CreatePolyhedrons`, `CarveWallBrushes_Sub` and
 `CreateTubePolyhedrons` (`game/shared/portal/portalsimulation.cpp:3315`, `:3716`,
 `:3812`), which are `portdocs/PORTAL.md` §4 and §5 — stages 3 and 4. A portal splits the
-collision near it into sets, and `CarvedWall` holds four of them:
+collision near it into sets, and `CarvedWall` holds five of them:
 
 | Set | Box | What happens to it |
 |---|---|---|
@@ -1969,10 +2033,11 @@ collision near it into sets, and `CarvedWall` holds four of them:
 | **Wall** | *behind* it, `2 × max(hh,hw)` deep by `±4 × hw` by `±4 × hh` | clipped, and cut into four slabs around a rectangular hole |
 | **Tube** | the hole's own rim, `PORTAL_WALL_TUBE_OFFSET` (0.01) to `+ PORTAL_WALL_TUBE_DEPTH` (1.0) behind the plane | generated, not cut — four slabs `PORTAL_WALL_MIN_THICKNESS` thick lining the opening |
 | **Remote** | the **exit** portal's World box, in the exit's own space | the exit's World set, plus *this* portal's tube through the pair's matrix |
+| **Ramp** | the wall *below* the opening, 64 units deep, in the exit's own space | generated — one convex, and nothing ever stops against it. See below |
 
-The first two are one `CollisionBsp` (`collision()`); the tube and the remote set are
-their own (`tube()`, `remote()`), which is how the shipped engine holds them and what lets
-the remote trace ask for the far side without the near one.
+The first two are one `CollisionBsp` (`collision()`); the others are their own (`tube()`,
+`remote()`, `ramp()`), which is how the shipped engine holds them and what lets the remote
+trace ask for the far side without the near one.
 
 **Both are needed, and the World set is not optional.** The substitutive rule below takes
 whichever of the two traces went *further*, so a store holding only the holed wall would
@@ -2102,6 +2167,55 @@ caller supplies both the decision and the numbers; `Engine::update_client` asks
 `client::movement::transition_crouches` once per move and passes the duck hull when it
 says yes. Left unset the remote box is the local one, which is what the shipped engine
 uses for every transition that does not force a crouch.
+
+#### The transition ramp — `ramp()` and `Trace::portal_ramp`
+
+`pAABBAngleTransformCollideable` (`portalsimulation.cpp:681`), stage 5, and it is the one
+thing in this module that is a **label rather than collision**.
+
+*"Slightly angled portal transitions can present their remote-space collision as an
+extremely steep slope. Step code fails on that kind of step because it's both
+non-standable and just barely too far forward to step onto"*
+(`portal_gamemovement.cpp:1766`). The rescue is to notice that the box is touching the
+wall immediately below the opening and, when it is, to treat whatever it *did* hit as
+standable however steep — which `client::movement` does at four sites through
+`Trace::hit_portal_ramp`.
+
+Four things about it that are not obvious from the name:
+
+- **It is one convex, not four.** `CPortalSimulator::MovedOrResized` builds a
+  four-element `pAABBTransformConvexes` array beside the inverse hole's and **three of the
+  four constructions are commented out** (`:583`, `:637`, `:665`); what reaches
+  `ConvertConvexToCollideParams` is `&pAABBTransformConvexes[1]` with a count of `1`. The
+  bottom section is the only edge a player can walk up onto, so it is the only one that
+  needs rescuing.
+- **It lives in the exit's space and is swept by `ray_remote`.** The shipped engine places
+  the collideable at `Placement.ptaap_ThisToLinked`, which is the same arrangement the
+  remote tube already has here. Sweeping the local ray against a local ramp is a
+  *different* question, because `CalculateExtentShift` moves the remote box along the exit
+  normal and the local one is not moved at all.
+- **It starts below the lip, not at it.** `kAABBInnerCarve` is
+  `(PORTAL_HOLE_HALF_WIDTH_MOD + 1/16) × 4` = **0.65**, against the carve's own 0.2, so
+  the ramp is a strict subset of solid wall and can never stand in front of the hole.
+- **Nothing stops against it.** The shipped tree contains the version that takes the
+  ramp's own impact under a `#if 0` and the comment *"on second thought, maybe you
+  shouldn't actually walk on this magic ramp"*. Not ported; the flag is what the eight
+  `HitPortalRamp` call sites read, and this port has four of them.
+
+`Trace::portal_ramp` carries it. It is on `Trace` rather than on a subclass — Valve's
+`CTrace_PlayerAABB_vs_Portals` — because it has to survive every place a `Trace` is copied
+around: the four-quadrant ground retry and the step-up/step-down comparison both do, and a
+parallel `bool` threaded beside them is a field that can be dropped silently. Only a
+tracer with a hole attached ever sets it, and only on an answer the carved geometry won.
+
+**Measured: no shipped map can reach it.** Over the nine pairs the shipped maps form,
+`|m[2][2]|` — `ShouldPortalTransitionCrouch`'s own quantity — is 1 for **seven** and below
+`cos 30°` for **two**; **none** lands in between, which is the "slightly angled" case the
+ramp exists for. `a_player_walks_through_every_shipped_portal_pair` prints the split. So
+this is implemented against the reference and pinned by unit tests
+(`the_transition_ramp_is_the_wall_under_the_hole`,
+`a_box_under_the_opening_is_flagged_as_a_transition_ramp`), and the thing that will
+exercise it is the gun.
 
 #### Who chooses the hole
 
@@ -2501,7 +2615,7 @@ path either way.
 | `LUMP_PHYSDISP`, `CM_CreateDispPhysCollide` | `vphysics/` — the displacement's *physics* mesh, not its trace |
 | Displacement multiblend (`LUMP_DISP_MULTIBLEND`) | nothing — no Portal 2 displacement sets `DISP_INFO_FLAG_HAS_MULTIBLEND` |
 | Terrain and static props in the carve | gotcha 25 — displacements need `sv_portal_trace_vs_displacements`' reject regions, props need `GetBrushesInCollideable` |
-| `pAABBAngleTransformCollideable`, the transition ramp | an angled portal to matter — `portdocs/PORTAL.md` §5 declines it until a gun exists |
+| ~~`pAABBAngleTransformCollideable`, the transition ramp~~ | **done** — stage 5, above. Measured unreachable on shipped content, which needs the gun |
 | `bSkipRemoteTubeCheck` for a fling | `ShouldMaintainFlingAssistCrouch` reaching a shipped map, which needs paint |
 | PVS, areas, areaportals | `world/`'s visibility work, not this module's |
 | `surfaceProps`, hitboxes, occlusion queries | `vphysics/`, `.mdl`, and never |

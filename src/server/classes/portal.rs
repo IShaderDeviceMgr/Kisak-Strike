@@ -2,11 +2,17 @@
 //!
 //! `game/server/portal/prop_portal.cpp`'s `CProp_Portal` and the half of
 //! `game/server/portal/portal_base2d.cpp`'s `CPortal_Base2D` that is about
-//! *placement and linkage* rather than about simulation. This is
-//! `portdocs/PORTAL.md` **stage 2 of five**: the class exists, it links to its
-//! partner, it computes the teleport matrix, and `world/` draws a coloured
-//! oval where it is. It does not carve the wall (stage 3) and it does not
-//! teleport anybody (stage 4).
+//! *placement and linkage* rather than about simulation. The class exists, it
+//! links to its partner, it computes the teleport matrix, `world/` draws a
+//! coloured oval where it is, `trace/` carves the wall behind it and
+//! `client/movement` walks the player through it — `portdocs/PORTAL.md`, all
+//! five stages.
+//!
+//! What this file owns of stage 5 is the two animation clocks
+//! ([`opened_at`](PropPortal::opened_at) and
+//! [`static_at`](PropPortal::static_at), which are not reset by the same
+//! events) and the request half of `PunchAllPenetratingPlayers` — see
+//! [`new_location`](PropPortal::new_location).
 //!
 //! ```text
 //!     21  prop_portal   CProp_Portal : CPortal_Base2D : CBaseAnimating
@@ -68,7 +74,7 @@
 //! - **The microphone and speaker pair**, the ambient loop, the placement
 //!   particles, the portal detectors (`func_portal_detector`, 31 entities, not
 //!   ported), `CPhysicsCloneArea`, `CFunc_Portalled`, `SetMobileState` (one
-//!   map, `sv_allow_mobile_portals` defaults to 0) and `PunchAllPenetratingPlayers`.
+//!   map, `sv_allow_mobile_portals` defaults to 0).
 //! - **The five outputs are declared and none can fire yet**, because all five
 //!   are teleport notifications and nothing teleports until stage 4. They are
 //!   declared so that the one shipped connection parses as an output rather
@@ -117,6 +123,22 @@ pub const DEFAULT_HALF_HEIGHT: f32 = 56.0;
 /// in the portal's own frame, so it is one-sided: it covers the room in front
 /// of the portal and nothing behind it.
 pub const OBB_DEPTH: f32 = 64.0;
+
+/// How hard a portal shoves a player who is standing in its plane when it
+/// moves — `vForward *= 100.0f` (`portal_base2d.cpp:612`).
+///
+/// A velocity, not an impulse: `VelocityPunch` adds it to the player's
+/// velocity and clears their ground, so it is 100 units a second of shove.
+pub const PUNCH_SPEED: f32 = 100.0;
+
+/// The threshold `PunchAllPenetratingPlayers` is guarded by —
+/// `IsFloorPortal()`'s default (`portal_base2d.h:98`).
+///
+/// *"Make sure it's not a floor portal... allowing those to punch creates a
+/// floor to floor exploit"* (`portal_base2d.cpp:1549`): a portal in the floor
+/// would shove the player straight up, which with a second floor portal is
+/// free height every time one of the pair is re-placed.
+pub const FLOOR_PORTAL_THRESHOLD: f32 = 0.8;
 
 /// The two models `ResetModel` (`prop_portal.cpp:265`) picks between.
 ///
@@ -254,16 +276,34 @@ pub struct PropPortal {
     /// `UTIL_Portal_AngleTransform`, arrives with the teleport in stage 4.
     pub matrix: Mat4,
     /// The server clock at the last activation or move — what the *renderer*
-    /// measures `$PortalOpenAmount` and `$PortalStatic` from.
+    /// measures `$PortalOpenAmount` from.
     ///
     /// `C_Prop_Portal::OnActiveStateChanged` (`c_prop_portal.cpp:425`) sets
-    /// `m_fOpenAmount = 0` and `m_fStaticAmount = 1` and lets `ClientThink`
-    /// run them back up; `OnPortalMoved` resets the first alone. Both are
-    /// pure functions of "how long ago was that", so the seam carries the
-    /// timestamp and `world/` derives the two curves — the same split
-    /// `ModelState::anim_time` already has, and for the same reason: a 64 Hz
-    /// tick would step an effect that should be smooth.
+    /// `m_fOpenAmount = 0` and lets `ClientThink` run it back up, and so does
+    /// `OnPortalMoved` (`:393`). Both are pure functions of "how long ago was
+    /// that", so the seam carries the timestamp and `world/` derives the
+    /// curve — the same split `ModelState::anim_time` already has, and for the
+    /// same reason: a 64 Hz tick would step an effect that should be smooth.
     pub opened_at: f32,
+    /// The server clock at the last event that filled this portal with
+    /// interference — what the renderer measures `$PortalStatic` from.
+    ///
+    /// **A second clock rather than a second reading of
+    /// [`opened_at`](PropPortal::opened_at), because the two events are not
+    /// the same set.** `m_fStaticAmount` is set to 1 by three things and
+    /// `m_fOpenAmount` is reset by two of them:
+    ///
+    /// | | `m_fOpenAmount = 0` | `m_fStaticAmount = 1` |
+    /// |---|---|---|
+    /// | `OnActiveStateChanged` (this portal switched on) | yes | yes |
+    /// | `OnPortalMoved` (this portal moved) | yes | **no** |
+    /// | either of those, on the **partner** | no | yes |
+    ///
+    /// So a portal that *moves* keeps whatever static it had and re-opens,
+    /// and its partner fills with static without re-opening — which is the
+    /// shipped game's "the other end of the pair flickers when this one is
+    /// re-placed". One timestamp cannot say both.
+    pub static_at: f32,
 }
 
 /// The inputs (`prop_portal.cpp:66`).
@@ -316,6 +356,7 @@ impl PropPortal {
             linked: None,
             matrix: Mat4::IDENTITY,
             opened_at: 0.0,
+            static_at: 0.0,
         })
     }
 
@@ -394,10 +435,14 @@ impl PropPortal {
     /// `IsFloorPortal( threshold )` (`portal_base2d_shared.cpp:879`) — is this
     /// portal in the floor, facing up?
     ///
-    /// The threshold is a parameter because Valve calls it with two: the
-    /// default `0.8` guards `PunchAllPenetratingPlayers`, and `0.9` is what
-    /// the exit-speed rules use (stage 4).
-    #[allow(dead_code)]
+    /// The threshold is a parameter because Valve calls it with two:
+    /// [`FLOOR_PORTAL_THRESHOLD`] guards `PunchAllPenetratingPlayers`, and
+    /// `0.9` is what `TeleportTouchingEntity`'s floor-to-floor special cases
+    /// use — a path the player never takes, because `CPortal_Base2D::Touch`,
+    /// `StartTouch` and `EndTouch` all return immediately for one
+    /// (`portal_base2d.cpp:709`, `:885`, `:944`). The player's own teleport
+    /// asks `m_plane_Origin.normal.z > COS_PI_OVER_SIX` directly, in
+    /// `client::movement::exit_speed_range`.
     pub fn is_floor_portal(entity: &EntityCore, threshold: f32) -> bool {
         Self::forward(entity).z > threshold
     }
@@ -564,6 +609,39 @@ impl PropPortal {
         }
     }
 
+    /// `C_Prop_Portal::OnActiveStateChanged` (`c_prop_portal.cpp:422`) and
+    /// `OnPortalMoved` (`:393`) — restart the opening animation, and fill the
+    /// partner with interference.
+    ///
+    /// The two client-side handlers differ by exactly one line, which is
+    /// `only_moved`: a portal that *moved* keeps the static it had, and one
+    /// that just switched *on* starts at full static. Everything else about
+    /// them is the same, including the remote fill, whose comment is the whole
+    /// explanation — *"add static to the remote"*, because the other end of
+    /// the pair is now looking at a different room.
+    ///
+    /// **Call it after [`update_linkage`](PropPortal::update_linkage)**: the
+    /// partner filled here is the one the portal has *now*, which is what the
+    /// client sees, since both handlers run off a networked state change and
+    /// the linkage is part of the same update.
+    ///
+    /// Not here, and neither has anywhere to run: `SetNextClientThink` (the
+    /// curves are derived from a timestamp rather than integrated — see
+    /// [`static_at`](PropPortal::static_at)) and `UpdateTransformedLighting`
+    /// (a portal lights the room it opens onto; there are no dynamic lights).
+    fn restart_effect(&mut self, only_moved: bool, cx: &mut Context<'_>) {
+        let now = cx.curtime();
+        self.opened_at = now;
+        if !only_moved {
+            self.static_at = now;
+        }
+        if let Some(partner) = self.linked {
+            if let Some(other) = cx.behaviour_mut::<PropPortal>(partner) {
+                other.static_at = now;
+            }
+        }
+    }
+
     /// `CProp_Portal::NewLocation` (`prop_portal.cpp:635`) and the base's
     /// (`portal_base2d.cpp:1482`), reduced to what moves.
     ///
@@ -572,10 +650,26 @@ impl PropPortal {
     /// switched-off portal switches it on. All four shipped connections fire
     /// it at a tractor-beam portal in `sp_a4_finale1`/`2` that is already on.
     ///
-    /// Not here: `WakeNearbyEntities`, the microphone and speaker moves, the
-    /// "did I land on something that moves" trace and the parenting it drives
-    /// (`sv_allow_mobile_portals` is `0` outside one map), and
-    /// `PunchAllPenetratingPlayers`.
+    /// # `PunchAllPenetratingPlayers`, and the two conditions on it
+    ///
+    /// A portal that lands on a wall a player is standing inside shoves them
+    /// out of it — [`Context::punch_penetrating_players`], which defers the
+    /// work to `Server::run_tick` because the test needs the engine's world.
+    /// The shove comes out of the **partner**, not out of this portal, and
+    /// both guards around it are easy to read past:
+    ///
+    /// - **`bOtherShouldBeStatic`** (`portal_base2d.cpp:1528`) is computed
+    ///   *before* the relink, from whether there was a partner then:
+    ///   *"if the other portal should be static, let's not punch stuff resting
+    ///   on it"*. A portal that acquires its partner by this very move does
+    ///   not punch.
+    /// - **`!IsFloorPortal()`** is about *this* portal, at its new placement,
+    ///   with the default [`FLOOR_PORTAL_THRESHOLD`] rather than the `0.9` the
+    ///   exit-speed rules use.
+    ///
+    /// Not here: `WakeNearbyEntities`, the microphone and speaker moves, and
+    /// the "did I land on something that moves" trace and the parenting it
+    /// drives (`sv_allow_mobile_portals` is `0` outside one map).
     pub fn new_location(
         &mut self,
         entity: &mut EntityCore,
@@ -583,11 +677,26 @@ impl PropPortal {
         angles: Vec3,
         cx: &mut Context<'_>,
     ) {
+        // `bOtherShouldBeStatic`, read before anything moves or relinks.
+        let had_partner = self.linked.is_some();
+
+        // `OnActiveStateChanged` fires as well as `OnPortalMoved` when the
+        // move switches a dark portal on, and it is the one that resets the
+        // static — so a `NewLocation` at an *inactive* portal starts the whole
+        // effect and one at a live portal only re-opens it.
+        let was_active = self.activated;
+
         entity.origin = origin;
         entity.angles = angles;
         self.set_active(true);
-        self.opened_at = cx.curtime();
         self.update_linkage(entity, cx);
+        self.restart_effect(was_active, cx);
+
+        if had_partner && !Self::is_floor_portal(entity, FLOOR_PORTAL_THRESHOLD) {
+            if let Some(partner) = self.linked {
+                cx.punch_penetrating_players(partner);
+            }
+        }
     }
 
     /// `CPortal_Base2D::Resize` (`portal_base2d.cpp:1700`).
@@ -791,10 +900,13 @@ impl Behaviour for PropPortal {
         if input.name.eq_ignore_ascii_case("SetActivatedState") {
             let active = input.value.bool();
             self.set_active(active);
-            if active && !self.old_activated {
-                self.opened_at = cx.curtime();
-            }
             self.update_linkage(entity, cx);
+            // `OnActiveStateChanged`, and only on the edge that turns one
+            // *on*: the handler's `else` branch is the fizzle particles and
+            // the light going out, neither of which has a subsystem here.
+            if active && !self.old_activated {
+                self.restart_effect(false, cx);
+            }
             return true;
         }
 

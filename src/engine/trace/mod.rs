@@ -268,6 +268,9 @@ struct Hole<'a> {
     /// `None` when the portal is unlinked, which is when there is no remote
     /// model to sweep.
     remote: Option<Visits>,
+    /// The transition ramp's, which is one brush — `None` for the same reason
+    /// [`remote`](Hole::remote) is.
+    ramp: Option<Visits>,
 }
 
 impl<'a> Hole<'a> {
@@ -277,6 +280,7 @@ impl<'a> Hole<'a> {
             pieces: stamps(wall.collision()),
             tube: stamps(wall.tube()),
             remote: wall.remote().map(stamps),
+            ramp: wall.ramp().map(stamps),
             wall,
         }
     }
@@ -489,6 +493,26 @@ impl<'a> Tracer<'a> {
             return real;
         }
 
+        // The transition ramp, which is asked before the far side and read
+        // after it. `PortalTrace.fraction` in Valve's comparison is the
+        // carved answer *before* any remote merge, which is what `portal`
+        // still holds here.
+        let mut contacted_ramp = false;
+        if let (Some(ramp), Some(visits)) = (hole.wall.ramp(), hole.ramp.as_mut()) {
+            if let Some((far_ray, _)) = hole.wall.remote_ray(ray, exit_extents) {
+                let mut angle = sweep(ramp, visits, &far_ray, 0, mask);
+                compute_trace_endpoints(&far_ray, &mut angle);
+                fix_up_hull_start(&far_ray, &mut angle);
+                // *"note, only has to go as far as local trace to work"* — so
+                // `<=` rather than `<`, and the `< 1.0` is what stops a sweep
+                // that reached its end from claiming a contact.
+                contacted_ramp = angle.start_solid
+                    || (far_ray.is_swept
+                        && angle.fraction <= portal.fraction
+                        && angle.fraction < 1.0);
+            }
+        }
+
         // Steps 4 and 5.
         if let (Some(remote), Some(visits), Some(link)) =
             (hole.wall.remote(), hole.remote.as_mut(), hole.wall.link())
@@ -515,8 +539,16 @@ impl<'a> Tracer<'a> {
             }
         }
 
+        // `pm.m_bContactedPortalTransitionRamp = bContactedTransitionRamp` on
+        // the branch that keeps the portal's answer, and `= false` on both
+        // branches that give the real one back — *"if we switch over to portal
+        // traces, we have to commit 100%"*, and the ramp is part of that
+        // commitment.
         match better(&real, &portal, ray) {
-            true => portal,
+            true => Trace {
+                portal_ramp: contacted_ramp,
+                ..portal
+            },
             false => real,
         }
     }

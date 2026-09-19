@@ -351,6 +351,9 @@ pub struct Context<'a> {
     /// What [`take_damage`](Context::take_damage) queued, in the order it was
     /// dealt, waiting to be applied.
     damage: Vec<(EntityId, DamageInfo)>,
+    /// What [`punch_penetrating_players`](Context::punch_penetrating_players)
+    /// queued — portals that want the player shoved out of them.
+    punches: Vec<EntityId>,
     /// Whether [`reload_level`](Context::reload_level) was called.
     reload_level: bool,
     /// What `studio/` said about the models this level's entities place —
@@ -377,6 +380,7 @@ impl<'a> Context<'a> {
             changed: Vec::new(),
             created: Vec::new(),
             damage: Vec::new(),
+            punches: Vec::new(),
             reload_level: false,
             sequences,
         }
@@ -489,6 +493,25 @@ impl<'a> Context<'a> {
         }
         self.damage.push((target, info));
         true
+    }
+
+    /// `CPortal_Base2D::PunchAllPenetratingPlayers` (`portal_base2d.cpp:620`)
+    /// — shove any player standing in `portal`'s plane out along its forward.
+    ///
+    /// **Deferred, exactly like [`take_damage`](Context::take_damage)**, and
+    /// for a second reason on top of that one: the test is
+    /// `enginetrace->TraceRay(…).startsolid`, and the world is the engine's.
+    /// `Server::run_tick` is where a [`TouchQuery`](super::TouchQuery) is in
+    /// hand, so that is where the queue drains — inside the same tick, after
+    /// the event that asked.
+    ///
+    /// `portal` is the portal the shove comes *out of*, which is the
+    /// **partner** of the one that moved: `NewLocation` ends in
+    /// `m_hLinkedPortal->PunchAllPenetratingPlayers()`
+    /// (`portal_base2d.cpp:1557`), so the entity named here is in the list and
+    /// the one that moved is the one being dispatched.
+    pub fn punch_penetrating_players(&mut self, portal: EntityId) {
+        self.punches.push(portal);
     }
 
     /// Another entity, read-only. `EHANDLE::Get()`.
@@ -617,6 +640,13 @@ impl<'a> Context<'a> {
     /// `Server::dispatch` to apply.
     pub(super) fn take_damage_queue(&mut self) -> Vec<(EntityId, DamageInfo)> {
         std::mem::take(&mut self.damage)
+    }
+
+    /// The portals
+    /// [`punch_penetrating_players`](Context::punch_penetrating_players)
+    /// queued, for `Server::run_tick` to act on.
+    pub(super) fn take_punch_queue(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.punches)
     }
 
     /// `engine->ServerCommand( "reload\n" )` — start this level again.

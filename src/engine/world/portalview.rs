@@ -772,7 +772,15 @@ impl World {
             let translucent =
                 self.translucent_list(cameras.cull.eye, cameras.cull.forward(), &sub_visible);
             if !translucent.is_empty() {
-                self.draw_translucent(pass, setup.curtime, &translucent, &sub_visible);
+                // The sub-scene is one level deeper than this one, so a
+                // portal drawn *in* it has one fewer level left to open onto.
+                self.draw_translucent(
+                    pass,
+                    setup.curtime,
+                    &translucent,
+                    &sub_visible,
+                    setup.max_depth - (level + 1),
+                );
             }
 
             // --- step 4: put the wall's depth and the stencil back --------
@@ -1243,6 +1251,7 @@ mod rendered {
             // Wide open: the hole's cutout is a function of this, and a portal
             // still opening punches a smaller hole than its own oval.
             open_for: 10.0,
+            static_for: 10.0,
             linked: Some(1 - id),
             matrix: to,
         };
@@ -1500,7 +1509,7 @@ mod rendered {
                 );
                 world.portals.draw_hole(pass, 10.0, 0);
                 pass.set_stencil(Some(stencil(StencilFunc::Equal, StencilOp::Keep)), 1);
-                world.portals.draw_one(pass, 10.0, 0);
+                world.portals.draw_one(pass, 10.0, 0, 1);
                 pass.set_stencil(None, 0);
             },
         );

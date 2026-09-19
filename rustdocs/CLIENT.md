@@ -345,11 +345,81 @@ player who moves plausibly and wrongly. What survives into this port:
 | `ClipVelocity`'s re-push | at least `DIST_EPSILON` | cancels the residual only |
 | `StayOnGround`'s up-probe | 2 units | **1 unit** |
 | Walking into a standable slope | `StepMove` | **slides up the ramp** |
+| `AirMove`'s acceleration | `sv_airaccelerate`, 12 | **`sv_paintairacceleration`, 5** |
+| Steering against a fast fling | free | **cancelled per axis past `MIN_FLING_SPEED`** |
+| Falling towards a floor portal | nothing | **funnelled onto its axis** |
 
 Where Portal's override differs only by generalising world `+Z` to an arbitrary "stick
 normal" — its paint-gel gravity reorientation — the two are the same function with no
 paint, because `m_vGravityDirection = -stickNormal` and the stick normal is world up.
 Those are ported in the world-`+Z` form.
+
+**The last three rows arrived with `portdocs/PORTAL.md` stage 5 and the first of them is
+the one to read twice.** `CGameMovement::AirMove` passes `sv_airaccelerate`
+(`gamemovement.cpp:2043`); `CPortalGameMovement::AirMove` passes
+`sv_paintairacceleration` (`:800`), **unconditionally, with no paint anywhere in the
+branch**. The constant's name is the only thing about it that is about paint, and taking
+the name at face value gives a Portal 2 player 2.4x the air control the shipped game gives
+them. `SV_AIRACCELERATE` is still carried by `MoveVars` because `FullTossMove` and the
+rest use it; `AirMove` alone uses the other one.
+
+The fourth difference in that function is one the port does not need a special case for
+and would break by "tidying": Valve leaves the view forward **unnormalised** when it is
+steeper than 30 degrees from horizontal, *"to prevent the player from screwing up their
+momentum after exiting floor portals or jumping off sticky ceilings while looking straight
+up/down"*. Projecting onto the horizontal plane and not renormalising shortens the
+movement basis as the player looks further up or down, which is the intended damping, so
+the two branches are written out rather than collapsed.
+
+### The funnel — `portal_funnel`
+
+`CPortalGameMovement::PortalFunnel` (`portal_gamemovement.cpp:909`) and the three
+functions under it, stage 5. A player falling towards a floor portal is pulled onto its
+axis so the fall goes *in* rather than clipping the rim; it is what makes Portal 2's
+long drops land, and without it every fling that starts as a fall is a coin toss.
+
+It is also **`IsFloorPortal`'s one remaining consumer on the player's path**, which is
+what put it in stage 5. The other three call sites are `TeleportTouchingEntity`'s
+floor-to-floor special cases — the doubled `z` compensation, the pitch reorientation and
+the Bowie manoeuvre — and the player never reaches them: `CPortal_Base2D::Touch`,
+`StartTouch` and `EndTouch` all `return` immediately for one (`portal_base2d.cpp:709`,
+`:885`, `:944`). The fourth is the punch guard, which is `server/`'s.
+
+Five conditions, and each is a way the funnel would otherwise fight the player:
+
+- it runs **only below `MIN_FLING_SPEED`** (300) horizontally — past that, `AirMove` is
+  cancelling the steer instead and the funnel never runs at all;
+- the player must not be steering hard: `|wishdir| > 64` on either horizontal axis kills
+  it;
+- they must be falling fast (`velocity.z < -165`) **and looking down** (`look.z < -0.7`),
+  or rising fast at a ceiling portal — *"we are more liberal about funneling into a
+  ceiling portal … we aren't going to be hitting these by accident"*;
+- the portal must be within 1,024 units, on the side they are heading, and for a rising
+  player within the height their rise can still reach;
+- and they must be inside a cone that widens from 1.5x the portal's own size at 256 units
+  to 3x at 1,024.
+
+Three things about it that read as bugs until checked against the reference:
+
+1. **`IsCeilingPortal` is not the mirror of `IsFloorPortal`.** Both compare
+   `vForward.z` against the same default `0.8` — `>` for a floor portal and `<` for a
+   ceiling one (`portal_base2d_shared.cpp:879`, `:884`) — so *every* portal that is not
+   in the floor is a "ceiling portal", a wall portal included, where the comment above
+   the test says *"make sure it's a floor or ceiling portal"*. Ported as written.
+2. **It aims 32 units in front of the portal.** Every measurement is against
+   `pPortal->WorldSpaceCenter()`, and a portal's collision box runs from its plane to 64
+   units in front of it, so the target for a floor portal is a spot a yard *above* the
+   hole. `PortalHole::world_center` is that point.
+3. **A zero sideways velocity means "will not make it"**, not "is already there":
+   `AirPortalFunnel`'s guard is `if( mv->m_vecVelocity[i] )`, so a player with no drift
+   at all gets the pull rather than the decay.
+
+**The ground half is deleted with a reason.** `speed_funnelling_enabled` gates it on
+`player->MaxSpeed() > sv_speed_normal`, which in Portal 2 means speed gel; with no paint
+`MaxSpeed()` is `SV_SPEED_NORMAL` exactly and the branch's first line returns `false`
+every time.
+
+### The teleport — `handle_portalling`
 
 ### The teleport — `handle_portalling`
 
@@ -479,8 +549,11 @@ which is Valve's order.
 - **`GetImplicitVerticalStepSpeed`** — the vertical speed a player carries implicitly
   while walking up a slope, since ground velocity is xy-only. Added before the rotation in
   the original; nothing here tracks it and it is zero except on a slope.
-- **`bSkipRemoteTubeCheck`**, which a fling sets, and the **transition ramp**
-  (`m_bContactedPortalTransitionRamp`). Both need content this port cannot reach yet.
+- **`bSkipRemoteTubeCheck`**, which a fling sets. It needs content this port cannot reach
+  yet. **The transition ramp is no longer here** — stage 5 landed it: the geometry is
+  `trace/`'s `CarvedWall::ramp` and the flag is `Trace::portal_ramp`, which this module
+  reads at four sites through `standable` and `Trace::hit_portal_ramp`. Measured, no
+  shipped pair can reach it (`rustdocs/ENGINE.md`, "The transition ramp").
 - **`UnrollPredictedTeleportations`, `ApplyPredictedPortalTeleportation` and the
   `EntityPortalled` user message** — all of them reconcile a predicting client with an
   authoritative server, and this port is one process.
@@ -947,8 +1020,8 @@ Same ordering: most likely to bite first.
 | `CheckFalling`, `PlayerRoughLandingEffects`, `m_flFallVelocity` | The landing sound and the landing animation need sound and animation. **Fall damage is neither deferred nor missing: Portal has none.** `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules agree in words. |
 | ~~Base velocity~~ | **Done** — `src/server/` stage 4's `trigger_push` writes it and the walk adds and subtracts it; see [`Player`](#player-and-movedata). What is still missing is the *conveyor* half: `FL_CONVEYOR` and `SetGroundEntity`'s velocity exchange, which need a ground **entity** rather than a ground plane. No Portal 2 entity sets `FL_CONVEYOR` — `CFuncMoveLinear::Spawn` has the one call commented out, with a name and a reason. |
 | `m_outWishVel`, `m_outJumpVel`, `m_outStepHeight` | Outputs for the view's step smoothing and the animation layer. Carrying fields nothing reads would be carrying fields nothing checks; `view.cpp`'s step smoothing is where `m_outStepHeight` attaches. |
-| Speed paint, bounce gel, tractor beams, portal funnelling, projected walls, `PortalFunnel`, `TBeamMove` | Paint. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. **The teleport itself has landed** — see [the teleport](#the-teleport--handle_portalling) — and what is still missing from it is listed there. |
-| `GetImplicitVerticalStepSpeed`, the transition ramp, `bSkipRemoteTubeCheck` | [The teleport](#the-teleport--handle_portalling)'s own deferrals; each is zero except on a slope, on an angled portal, or during a fling. |
+| Speed paint, bounce gel, tractor beams, projected walls, `TBeamMove`, `GroundPortalFunnel` | Paint. They are why Portal's overrides generalise world `+Z` to a stick normal; that generalisation is the seam. **The air half of `PortalFunnel` has landed** — see [the funnel](#the-funnel--portal_funnel); the ground half is gated on `MaxSpeed() > sv_speed_normal`, which without speed gel is never true. **The teleport has landed too** — see [the teleport](#the-teleport--handle_portalling). |
+| `GetImplicitVerticalStepSpeed`, `bSkipRemoteTubeCheck` | [The teleport](#the-teleport--handle_portalling)'s own deferrals; each is zero except on a slope or during a fling. **The transition ramp is no longer one of them** — stage 5 landed it, in `trace/`. |
 | `player->m_surfaceFriction` from a real surface, `jumpFactor`, `maxSpeedFactor` | The physics surface-property database — `vphysics/`. Every surface reads as the default until then, and `surface_friction` still carries `CategorizePosition`'s 0.25. |
 | `env_fog_controller`'s `farz`, which overrides `GetZFar` when positive | Entities. |
 | `r_aspectratio`, and `AspectRatioInfo_t`'s non-square-pixel scalar | `r_aspectratio` is a *renderer* cvar (`gl_rmain.cpp:46`); registering it from the game client to read it in `screen_aspect` would put it in the wrong module. The pixel-shape scalar is the material system's. Both coincide with `width / height` on every square-pixel display, which is the only case this port supports. |
@@ -986,7 +1059,7 @@ Same ordering: most likely to bite first.
 
 ## Which tests guard what
 
-`cargo test client::` — 85 tests, no window, no GPU, no game content, plus one
+`cargo test client::` — 115 tests, no window, no GPU, no game content, plus one
 depot-gated. Stage 4's build a collision model with `engine::trace::fixture::Fixture`
 rather than loading a `.bsp`: a room with a floor, a 16-unit step, a wall nothing can climb
 and a ceiling only a crouched player fits under. The teleport's use
@@ -1039,6 +1112,8 @@ between them — see `rustdocs/ENGINE.md`.
 | `a_transition_that_turns_the_up_axis_ducks_the_player_as_they_cross` | the forced duck, the duck timer, the environment handover, and that the transform preserves the box's **centre** |
 | `a_player_leaves_a_floor_portal_at_three_hundred_units_a_second` | `GetExitSpeedRange`'s four answers, including the perch quadratic and the `forward.z > 0.5` gate |
 | `the_quadratic_keeps_valves_degenerate_answers` | `SolveQuadratic`'s linear, all-zero and imaginary cases, which `perch_speed` relies on rather than guards against |
+| `falling_towards_a_floor_portal_pulls_the_player_onto_its_axis` | **the funnel**, with the control that makes it mean something: the same fall with no portal in the level does not drift at all |
+| `the_funnel_refuses_a_fling_a_steer_and_a_player_looking_up` | its three live refusals, each on its own |
 | `a_tap_does_not_overcome_noclip_friction_but_does_with_no_acceleration` | gotcha 7, and that `sv_noclipaccelerate 0` restores the old feel |
 | `holding_strafe_moves_with_the_mouse_instead_of_turning`, `lookstrafe_redirects_only_the_horizontal_axis` | `ApplyMouse`'s three cases and the asymmetry between the axes |
 | `cl_mouseenable_zero_drops_the_motion_rather_than_banking_it` | nothing arrives in one lump when it is turned back on |

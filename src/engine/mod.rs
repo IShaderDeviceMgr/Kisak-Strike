@@ -1051,7 +1051,9 @@ impl<'a> Engine<'a> {
             let scene = post.scene(frame.size());
             let mut pass =
                 context.target_pass(frame, materials.pipelines(), scene, &camera, Load::Keep);
-            world.draw_translucent(&mut pass, curtime, &translucent, &visible);
+            // The top-level scene is recursion level 0, so every level
+            // `r_portal_stencil_depth` allows is still ahead of it.
+            world.draw_translucent(&mut pass, curtime, &translucent, &visible, portal_depth);
         }
 
         post.resolve(frame, measure);
@@ -1189,6 +1191,7 @@ fn portals(server: &Server, curtime: f32) -> Vec<world::portals::Portal> {
             half_height: portal.half_height,
             is_portal2: portal.is_portal2,
             open_for: (curtime - portal.opened_at).max(0.0),
+            static_for: (curtime - portal.static_at).max(0.0),
             linked: portal.linked,
             matrix: portal.matrix,
         })
@@ -1320,6 +1323,10 @@ impl server::TouchQuery for WorldTouchQuery<'_> {
     ) {
         self.world
             .brush_models_touching(start, end, mins, maxs, out);
+    }
+
+    fn start_solid(&mut self, origin: glam::Vec3, mins: glam::Vec3, maxs: glam::Vec3) -> bool {
+        self.world.start_solid(origin, mins, maxs)
     }
 }
 

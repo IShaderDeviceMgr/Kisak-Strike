@@ -74,6 +74,24 @@ pub struct Trace {
     pub all_solid: bool,
     /// The sweep began inside a solid.
     pub start_solid: bool,
+    /// The box touched the wall immediately below a portal's opening, as the
+    /// **exit** portal sees it — `m_bContactedPortalTransitionRamp`
+    /// (`portal_gamemovement.h:167`).
+    ///
+    /// # This is the one field here that is not about the surface hit
+    ///
+    /// Valve puts it on a subclass, `CTrace_PlayerAABB_vs_Portals`, which only
+    /// the player's movement ever declares. It is here instead of on a second
+    /// type because it has to survive every place a `Trace` is copied around —
+    /// the four-quadrant ground retry, the step-up/step-down comparison — and
+    /// a parallel `bool` threaded beside those is a field that can be dropped
+    /// silently.
+    ///
+    /// **Only [`Tracer::with_hole`](super::Tracer::with_hole) ever sets it**,
+    /// and only on an answer the portal's carved geometry won. Every other
+    /// trace in the port leaves it `false`, which is what
+    /// [`hit_portal_ramp`](Trace::hit_portal_ramp) then answers.
+    pub portal_ramp: bool,
 }
 
 impl Trace {
@@ -94,6 +112,7 @@ impl Trace {
             surface_flags: 0,
             all_solid: false,
             start_solid: false,
+            portal_ramp: false,
         }
     }
 
@@ -102,6 +121,27 @@ impl Trace {
     /// even though the fraction is 1.
     pub fn did_hit(&self) -> bool {
         self.fraction < 1.0 || self.all_solid || self.start_solid
+    }
+
+    /// `CTrace_PlayerAABB_vs_Portals::HitPortalRamp`
+    /// (`portal_gamemovement.cpp:214`) — should whatever this hit be treated
+    /// as standable however steep it is?
+    ///
+    /// Three conditions, and Valve's fourth — `sv_portal_new_player_trace`,
+    /// which is `1` — is the switch this whole path lives under and is not a
+    /// `ConVar` here:
+    ///
+    /// - the sweep touched the ramp ([`portal_ramp`](Trace::portal_ramp));
+    /// - it hit *something* — the ramp is a label on another surface, not a
+    ///   surface;
+    /// - what it hit faces **up at all**. Not `>= CRITICAL_SLOPE`, which is
+    ///   the test this exists to bypass: `> 0.0`, so a wall is still a wall
+    ///   and anything that leans even slightly back is ground.
+    ///
+    /// `up` is the movement's stick normal, which without paint is world up
+    /// at every one of this port's four call sites.
+    pub fn hit_portal_ramp(&self, up: Vec3) -> bool {
+        self.portal_ramp && self.did_hit() && self.normal.dot(up) > 0.0
     }
 }
 

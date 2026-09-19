@@ -2990,6 +2990,12 @@ impl BoxTriggers {
 }
 
 impl TouchQuery for BoxTriggers {
+    /// A fixture of hand-placed boxes has no world, so nothing can be inside
+    /// one.
+    fn start_solid(&mut self, _: Vec3, _: Vec3, _: Vec3) -> bool {
+        false
+    }
+
     fn brush_models_touching(
         &mut self,
         start: Vec3,
@@ -3803,6 +3809,14 @@ struct Placed<'a> {
 }
 
 impl TouchQuery for Placed<'_> {
+    fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool {
+        let ray = crate::engine::trace::Ray::hull(origin, origin, mins, maxs);
+        self.collision
+            .tracer()
+            .trace(&ray, crate::engine::trace::Contents::MASK_PLAYERSOLID)
+            .start_solid
+    }
+
     fn brush_models_touching(
         &mut self,
         start: Vec3,
@@ -7365,4 +7379,215 @@ fn every_shipped_portal_is_on_a_wall() {
         worst_angle <= DEGREES,
         "a portal the snap would have re-oriented"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `portdocs/PORTAL.md` stage 5 — the punch, and the two animation clocks
+// ---------------------------------------------------------------------------
+
+/// A [`TouchQuery`] that answers one fixed thing to
+/// [`start_solid`](TouchQuery::start_solid) and nothing to the other half.
+///
+/// The punch's second condition is *"the world says the player is embedded"*,
+/// and the world is the engine's; a `server/` test that had to build a `.bsp`
+/// to say "yes" would be testing the collision model rather than the guard.
+struct Embedded(bool);
+
+impl TouchQuery for Embedded {
+    fn brush_models_touching(&mut self, _: Vec3, _: Vec3, _: Vec3, _: Vec3, _: &mut Vec<usize>) {}
+
+    fn start_solid(&mut self, _: Vec3, _: Vec3, _: Vec3) -> bool {
+        self.0
+    }
+}
+
+/// A map with a linked pair: blue at the origin facing `+X`, orange far away
+/// facing `-X`, both switched on from the start so `Activate` links them.
+fn portal_pair_map() -> Vec<bsp::Entity> {
+    vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "prop_portal"),
+            ("targetname", "blue"),
+            ("origin", "0 0 0"),
+            ("angles", "0 0 0"),
+            ("Activated", "1"),
+        ]),
+        block(&[
+            ("classname", "prop_portal"),
+            ("targetname", "orange"),
+            ("origin", "1000 0 0"),
+            ("angles", "0 180 0"),
+            ("PortalTwo", "1"),
+            ("Activated", "1"),
+        ]),
+    ]
+}
+
+/// One portal's class state, by name. A free function rather than a closure,
+/// for the reason [`branch_list_at`] is one.
+fn portal_named<'a>(server: &'a Server, name: &str) -> &'a classes::PropPortal {
+    find_named(server, name)
+        .behaviour
+        .downcast_ref::<classes::PropPortal>()
+        .expect("a prop_portal")
+}
+
+/// **`PunchAllPenetratingPlayers`.** A portal moved while a player is standing
+/// in its partner's plane shoves them out of it, along the **partner's**
+/// forward and at 100 units a second — and takes their ground away, or the
+/// next `CategorizePosition` would put them straight back.
+#[test]
+fn moving_a_portal_shoves_a_player_out_of_its_partner() {
+    let mut server = Server::new();
+    server.level_init("test", &portal_pair_map(), &[model(
+        [-2048.0, -2048.0, -2048.0],
+        [2048.0, 2048.0, 2048.0],
+    )]);
+    assert!(
+        portal_named(&server, "blue").is_active_and_linked(),
+        "the two portals in the map did not link"
+    );
+
+    // Standing in orange's plane: orange is at `(1000, 0, 0)` facing `-X`, so
+    // its quad is the plane `x = 1000` and a player hull at that x overlaps it.
+    server.spawn_player(player_at(Vec3::new(1000.0, 0.0, -56.0)));
+
+    // Move blue. The shove comes out of orange, which faces `-X`.
+    assert!(server.place_portal(false, Vec3::new(0.0, 500.0, 0.0), Vec3::ZERO));
+    ticks_touching(&mut server, &mut Embedded(true), 1);
+
+    let state = server.player_state().expect("a player");
+    // Orange's yaw of 180 puts a millionth of a unit on the cross axis, which
+    // is `sin(180°)` in `f32` and not a sign of anything.
+    assert!(
+        (state.velocity - Vec3::new(-100.0, 0.0, 0.0)).length() < 1e-3,
+        "shoved along orange's forward at PUNCH_SPEED: {}",
+        state.velocity
+    );
+    assert!(!state.on_ground, "VelocityPunch clears the ground first");
+}
+
+/// The three guards on the punch, each on its own: the world has to say the
+/// player is stuck, the moved portal must not be in the floor, and the pair
+/// must already have been a pair.
+#[test]
+fn the_punch_is_refused_by_each_of_its_three_guards() {
+    let punched = |embedded: bool, angles: Vec3, link: bool| {
+        let mut server = Server::new();
+        let mut map = portal_pair_map();
+        if !link {
+            // Orange never switches on, so blue has no partner to punch from.
+            map[2]
+                .pairs
+                .iter_mut()
+                .find(|(k, _)| k == "Activated")
+                .expect("Activated")
+                .1 = String::from("0");
+        }
+        server.level_init("test", &map, &[model(
+            [-2048.0, -2048.0, -2048.0],
+            [2048.0, 2048.0, 2048.0],
+        )]);
+        server.spawn_player(player_at(Vec3::new(1000.0, 0.0, -56.0)));
+        assert!(server.place_portal(false, Vec3::new(0.0, 500.0, 0.0), angles));
+        ticks_touching(&mut server, &mut Embedded(embedded), 1);
+        server.player_state().expect("a player").velocity != Vec3::ZERO
+    };
+
+    // `angles` of `-90 0 0` points forward straight up: a floor portal.
+    let floor = Vec3::new(-90.0, 0.0, 0.0);
+    assert!(punched(true, Vec3::ZERO, true), "the control does punch");
+    assert!(
+        !punched(false, Vec3::ZERO, true),
+        "the world said the player was not stuck and it punched anyway"
+    );
+    assert!(
+        !punched(true, floor, true),
+        "a floor portal punched — that is the floor-to-floor exploit"
+    );
+    assert!(
+        !punched(true, Vec3::ZERO, false),
+        "a portal with no partner before the move punched"
+    );
+}
+
+/// **The two animation clocks are not the same clock.** A portal that *moves*
+/// re-opens without clearing its own static; one that switches *on* resets
+/// both; and either event fills the **partner** with static without re-opening
+/// it.
+#[test]
+fn moving_a_portal_reopens_it_and_fills_its_partner_with_static() {
+    let mut server = Server::new();
+    server.level_init("test", &portal_pair_map(), &[model(
+        [-2048.0, -2048.0, -2048.0],
+        [2048.0, 2048.0, 2048.0],
+    )]);
+
+    // Let both settle: a second of server time is past the end of both curves.
+    ticks_touching(&mut server, &mut NoTouchQuery, 64);
+    let settled = server.time().curtime;
+
+    let (before_opened, before_static) = {
+        let orange = portal_named(&server, "orange");
+        (orange.opened_at, orange.static_at)
+    };
+    assert!(server.place_portal(false, Vec3::new(0.0, 500.0, 0.0), Vec3::ZERO));
+
+    {
+        let blue = portal_named(&server, "blue");
+        assert_eq!(blue.opened_at, settled, "the moved portal re-opened");
+        assert_eq!(
+            blue.static_at, before_static,
+            "OnPortalMoved resets the open amount and not the static"
+        );
+    }
+    let orange = portal_named(&server, "orange");
+    assert_eq!(
+        orange.opened_at, before_opened,
+        "the partner did not move, so it did not re-open"
+    );
+    assert_eq!(
+        orange.static_at, settled,
+        "…but it did fill with static: 'add static to the remote'"
+    );
+}
+
+/// Switching a portal on resets **both** of its clocks, which is the one case
+/// `OnActiveStateChanged` differs from `OnPortalMoved` in.
+#[test]
+fn switching_a_portal_on_resets_both_of_its_clocks() {
+    let mut map = portal_pair_map();
+    for portal in &mut map[1..] {
+        portal
+            .pairs
+            .iter_mut()
+            .find(|(k, _)| k == "Activated")
+            .expect("Activated")
+            .1 = String::from("0");
+    }
+    let mut server = Server::new();
+    server.level_init("test", &map, &[model(
+        [-2048.0, -2048.0, -2048.0],
+        [2048.0, 2048.0, 2048.0],
+    )]);
+    ticks_touching(&mut server, &mut NoTouchQuery, 64);
+
+    server.queue.add(Event {
+        fire_time: server.time().curtime,
+        target: Target::Name(String::from("blue")),
+        input: String::from("SetActivatedState"),
+        value: Variant::Bool(true),
+        activator: None,
+        caller: None,
+        output_id: 0,
+    });
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+
+    // The event is serviced on the tick *after* the one that queued it, so
+    // "now" is the clock as it stands after that tick and not before it.
+    let now = server.time().curtime;
+    let blue = portal_named(&server, "blue");
+    assert_eq!((blue.opened_at, blue.static_at), (now, now));
+    assert!(blue.linked.is_none(), "orange is still off");
 }

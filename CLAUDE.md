@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,034 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,044 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -150,8 +150,8 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve and the far-side trace), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
-| `src/client/` | **stages 1-4 of 5**, plus the teleport — input→command→movement→view, `CPortalGameMovement`'s walk, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace and the transition ramp), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the two areaportals — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
@@ -176,9 +176,11 @@ rotated, with your velocity rotated and clamped and your view turned with you;
 measured over the nine pairs the shipped maps form, a player hull walked through
 six. `portdocs/PORTAL_RENDER.md` then landed the **picture**: an oval is a hole
 with the room behind its partner in it, two levels deep by default and up to ten
-under `r_portal_stencil_depth`. What is still missing is the *warp* — a portal's
-surface does not refract what is behind it and it has no opening animation, both
-of which are `PortalRefract`'s `$Stage 0`.
+under `r_portal_stencil_depth`. Stage 5 then landed the *animation*: an oval opens
+on `$PortalOpenAmount` and fades its noise out on `$PortalStatic`, each on its own
+clock, restarted when a portal is switched on or moved. What is still missing is the
+*warp* — a portal's surface does not refract what is behind it — which is
+`PortalRefract`'s `$Stage 0`.
 
 **Visibility has landed** — `portdocs/ENGINE_WORLD_VIS.md`. `mod_vis.cpp`,
 `r_areaportal.cpp`, the areaportal half of `cmodel.cpp` and
@@ -205,11 +207,12 @@ thermal state and read 2-3x high. Numbers and history:
 **`portdocs/SERVER.md` is finished** — all five stages — so the game layer's next
 steps are individual classes and subsystems rather than a staged plan. `client/`
 stage 5 and everything below it needs `net/`, which is a long way from here.
+**With `portdocs/PORTAL.md` finished too, no staged plan is live**: everything below is
+a discrete piece of work, not a stage of one.
 
-**`portdocs/PORTAL.md` is the one staged plan that is live**, and **stages 1 to 4 of its
-five are done**: the blended pass, the class drawn, **the hole**, and **the teleport**. The
-carve needed no polyhedron library, exactly as predicted — `mathlib/polyhedron.cpp` (3,895
-lines) and `staticcollisionpolyhedroncache.cpp` (586) are deleted outright — and it needed
+**`portdocs/PORTAL.md` is finished** — **all five of its stages**: the blended pass, the
+class drawn, **the hole**, **the teleport**, and the polish. The carve needed no
+polyhedron library, exactly as predicted — `mathlib/polyhedron.cpp` (3,895 lines) and `staticcollisionpolyhedroncache.cpp` (586) are deleted outright — and it needed
 one correction the portdoc did not foresee, which is that an *empty* carved piece has to be
 detected rather than left to the clip loop, because a swept box expands every plane and
 turns one into a solid slab across the hole. Stage 4 needed three more, all in
@@ -218,9 +221,18 @@ the hole is a ledge and a swept AABB is held by any ledge it overlaps), the remo
 window is one or two ticks rather than the whole approach, and
 `CalculateExtentShift`'s comment contradicts its own arithmetic.
 
-**Only stage 5 of `portdocs/PORTAL.md` is left, and it is polish** — the transition ramp,
-`$PortalOpenAmount`'s open animation, `IsFloorPortal`'s special cases,
-`PunchAllPenetratingPlayers`.
+**Stage 5, the polish, landed last** — the transition ramp, `$PortalOpenAmount`'s open
+animation, `IsFloorPortal`'s special cases and `PunchAllPenetratingPlayers` — in four
+places: a fifth carved set (`Ramp`) that `Trace::portal_ramp` reports and
+`hit_portal_ramp` turns into standable ground, `$PortalStatic` on its own clock beside
+`$PortalOpenAmount` in `engine/world/portals.rs`, `CPortalGameMovement::AirMove`'s
+funnel in `client/movement.rs` (which is where `IsFloorPortal`'s reachable cases are —
+`CPortal_Base2D::Touch` early-returns for players, so the floor-to-floor teleport cases
+are unreachable), and a deferred punch queue on `Context` that
+`Server::flush_portal_punches` drains. The stage's honest measurement, recorded in
+§10: **0 of the 9 shipped portal pairs is steep enough to reach the transition ramp**
+(7 are flat, 2 force a crouch), so the ramp is implemented against the reference and
+unit-tested but cannot be exercised by shipped content until the portal gun exists.
 
 **The recursive view is done** — `portdocs/PORTAL_RENDER.md`, all four of its stages. The
 stencil landed in `materials/` (`RenderState::stencil`, `write_color`,

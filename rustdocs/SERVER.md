@@ -47,8 +47,9 @@ the borrow shape, and it did not: stage 4's answer — `Server::dispatch` lifts
 the dispatched entity out of the list, so `Context` can carry the rest of it —
 was already enough.
 
-**What `prop_portal` added** (after `logic_branch_listener`, and it is
-`portdocs/PORTAL.md` **stage 2 of five**): `CProp_Portal` and the placement half
+**What `prop_portal` added** (after `logic_branch_listener`; it was
+`portdocs/PORTAL.md` **stage 2**, and that plan is now finished — see the note
+below on what stage 5 brought back here): `CProp_Portal` and the placement half
 of `CPortal_Base2D` — **21 entities across 10 of the 106 maps, two of them on
 `sp_a1_intro1`** — the linkage group, the teleport matrix, `PortalState` (the
 third seam of its kind, after `PlayerState` and `ModelEntityState`),
@@ -63,6 +64,16 @@ class already produced — which is what `portdocs/PORTAL.md` §12 meant by "the
 thing stage 3 adds to the seam is nothing at all". Stage 4 asked for two more
 fields, `linked` as the partner's key and `matrix`, and nothing else. **So the
 ovals work now**: you walk into one and come out of the other.
+
+**Stage 5 came back here for two things, and one of them widened a seam.**
+`PortalState` gained `static_at` — a *second* animation clock, because the
+events that reset `$PortalStatic` are not the events that reset
+`$PortalOpenAmount` (gotcha 82) — and `PunchAllPenetratingPlayers` arrived,
+which is the first thing in this module that has to ask the engine about **world
+geometry** rather than about brush models. `TouchQuery` grew `start_solid` for
+it and `Context` grew `punch_penetrating_players`, which queues the work the way
+`take_damage` queues damage; gotchas 83 and 84 are the two things about it that
+read as bugs.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
 it needs the portal system), the armour, drowning, and
@@ -236,9 +247,12 @@ pub trait TouchQuery {
     fn brush_models_touching(
         &mut self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, out: &mut Vec<usize>,
     );
+    /// `enginetrace->TraceRay(…).startsolid` for an unswept box — the
+    /// **world's** solid, not the brush models'.
+    fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 }
 
-pub struct NoTouchQuery;   // reports nothing
+pub struct NoTouchQuery;   // reports nothing, and nothing is solid
 ```
 
 `engine->SolidMoved` (`vengineserver_impl.cpp:2467`, `engine/world.cpp`'s
@@ -384,6 +398,7 @@ pub struct PortalState {
     pub half_height: f32,     // 56 — NOT 14; see gotcha 79
     pub is_portal2: bool,     // which of the two overlay materials
     pub opened_at: f32,       // the SERVER's clock, like ModelEntityState::anim_time
+    pub static_at: f32,       // …and a SECOND clock; see gotcha 82
     /// The partner's key when `IsActivedAndLinked()`, `None` otherwise.
     pub linked: Option<u64>,
     /// `m_matrixThisToLinked` — the identity while unlinked.
@@ -700,6 +715,11 @@ impl Context<'_> {
 
     // prop_dynamic — LookupSequence/SequenceDuration/SequenceLoops in one call
     pub fn sequence(&self, model: &str, label: &str) -> Lookup;
+
+    // prop_portal, stage 5 — queued like `take_damage`, and for a second
+    // reason on top of that one: the test needs the engine's world. See
+    // gotcha 83.
+    pub fn punch_penetrating_players(&mut self, portal: EntityId);
 }
 
 /// The read-only view a `filter_*` class evaluates against.
@@ -2087,6 +2107,34 @@ entity built is not there start at 47, and if something will not die start at
     mirrors the quad, the corners and the matrix together, which is a picture
     that looks plausible until you walk through.
 
+82. **A portal has two animation clocks and they are reset by different
+    events.** `PropPortal::opened_at` drives `$PortalOpenAmount` and
+    `static_at` drives `$PortalStatic`; switching a portal *on* resets both,
+    **moving** one resets only the first, and either event on a portal fills
+    its **partner**'s static without touching the partner's opening. One
+    timestamp cannot say all three, which is why there are two —
+    `c_prop_portal.cpp:393` and `:422` are the two client handlers that differ
+    by exactly the one line.
+
+83. **The punch comes out of the partner, not out of the portal that moved,
+    and it is deferred by a tick boundary rather than run in place.**
+    `NewLocation` ends in `m_hLinkedPortal->PunchAllPenetratingPlayers()`
+    (`portal_base2d.cpp:1557`), and the test it needs —
+    *"would the player be startsolid here"* — is about **world** geometry,
+    which this module does not have. So `Context::punch_penetrating_players`
+    queues the portal and `Server::run_tick` drains the queue where a
+    `TouchQuery` is in hand, in the same tick as the input that asked. A
+    `place_portal` from the console lands one tick later, which is 15.6 ms of a
+    velocity change.
+
+84. **Both guards on the punch read state from *before* the move.**
+    `bOtherShouldBeStatic` is computed before `UpdatePortalLinkage` runs, so a
+    portal that acquires its partner *by* this move does not punch — *"if the
+    other portal should be static, let's not punch stuff resting on it"* — and
+    `IsFloorPortal()` is asked at the **new** placement with the default `0.8`
+    rather than the `0.9` the exit-speed rules use. Valve's comment for the
+    second: *"allowing those to punch creates a floor to floor exploit"*.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2413,6 +2461,10 @@ case values.
 | `tests::resizing_one_portal_of_a_pair_unlinks_it` | that the partner search compares both half-extents exactly |
 | `tests::placing_a_pair_by_hand_creates_and_links_two_portals` | the `portal` command's server half: `FindPortal` preferring an active match, and `fizzle_portals` |
 | `tests::every_shipped_portal_spawns_and_its_map_can_link_a_pair` | **all 21 portals in the game, switched on by their own maps' logic** |
+| `tests::moving_a_portal_shoves_a_player_out_of_its_partner` | `PunchAllPenetratingPlayers` — the direction (the **partner's** forward), the speed, and that the ground is cleared first |
+| `tests::the_punch_is_refused_by_each_of_its_three_guards` | gotcha 84, each guard on its own, against a control that does punch |
+| `tests::moving_a_portal_reopens_it_and_fills_its_partner_with_static` | gotcha 82 — the three rows of the table, in one test |
+| `tests::switching_a_portal_on_resets_both_of_its_clocks` | the one row `OnActiveStateChanged` differs from `OnPortalMoved` in |
 | `tests::every_shipped_portal_is_on_a_wall` | **the deleted placement snap, measured**: 15 flush, 2 proud, 4 floating — and not one more than 0.00 degrees off its surface |
 
 Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:

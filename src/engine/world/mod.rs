@@ -915,12 +915,19 @@ impl World {
     /// materials can come out in the wrong order. Visibility does not fix
     /// this: it decides *whether* a batch draws, not where in the order it
     /// goes. The fix is the leaf walk, and that needs the leaf index.
+    ///
+    /// `remaining_depth` is `CPortalRender::GetRemainingPortalViewDepth()` for
+    /// the scene being drawn — `r_portal_stencil_depth` at the top level, one
+    /// less at each recursion. Only [`Portals::draw_one`](portals::Portals)
+    /// reads it, and only to decide whether a portal is at the end of the line
+    /// and should fill with static instead of showing a wall.
     pub fn draw_translucent(
         &self,
         pass: &mut Pass<'_>,
         curtime: f32,
         list: &TranslucentList,
         visible: &vis::VisibleSet,
+        remaining_depth: u8,
     ) {
         let mut gathered = Vec::new();
         for (_, item) in list.0.iter().rev() {
@@ -941,7 +948,9 @@ impl World {
                 Translucent::Entity { instance, batch } => {
                     self.entity_models.draw_one(pass, curtime, instance, batch)
                 }
-                Translucent::Portal(index) => self.portals.draw_one(pass, curtime, index),
+                Translucent::Portal(index) => {
+                    self.portals.draw_one(pass, curtime, index, remaining_depth)
+                }
             }
         }
     }
@@ -1098,6 +1107,29 @@ impl World {
             maxs,
             out,
         );
+    }
+
+    /// Would a box `mins`-`maxs` at `origin` begin a trace inside the world's
+    /// solid? — the other half of
+    /// [`TouchQuery`](crate::server::TouchQuery), and the one question
+    /// `server/` asks about world geometry rather than about brush models.
+    ///
+    /// `MASK_PLAYERSOLID` and an **unswept** ray, which is
+    /// `CPortal_Base2D::PunchPenetratingPlayer`'s
+    /// `playerRay.Init( origin, origin, mins, maxs )` exactly — a degenerate
+    /// sweep, so only `start_solid` means anything in the answer and only
+    /// `start_solid` is returned.
+    ///
+    /// **No portal hole is attached**, deliberately: the whole point of the
+    /// one caller is to notice that the player is inside a wall the *real*
+    /// world still has, so a carved tracer would answer `false` for exactly
+    /// the case it is asked about.
+    pub fn start_solid(&self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool {
+        let ray = Ray::hull(origin, origin, mins, maxs);
+        self.collision
+            .tracer()
+            .trace(&ray, Contents::MASK_PLAYERSOLID)
+            .start_solid
     }
 
     /// Records every brush entity's batches, each under its own transform.

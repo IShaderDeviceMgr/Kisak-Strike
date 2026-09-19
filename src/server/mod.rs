@@ -202,6 +202,10 @@ pub struct Server {
     /// Re-entrancy guard for [`Server::flush_damage`], the twin of
     /// [`spawning`](Server::spawning).
     damaging: bool,
+    /// Portals [`Context::punch_penetrating_players`] named and that have not
+    /// shoved anybody yet — see [`Server::flush_portal_punches`], which is
+    /// where the engine's world is in hand to ask.
+    pending_punches: Vec<EntityId>,
     /// The map [`Context::reload_level`] asked for, until the engine takes it.
     ///
     /// `engine->ServerCommand( "reload\n" )` in one process and with no
@@ -248,6 +252,25 @@ pub trait TouchQuery {
         maxs: Vec3,
         out: &mut Vec<usize>,
     );
+
+    /// Would a box `mins`-`maxs` at `origin` begin a trace inside the
+    /// **world's** solid?
+    ///
+    /// `enginetrace->TraceRay( playerRay, MASK_PLAYERSOLID, … ).startsolid`
+    /// for an unswept ray, which is the whole of what
+    /// `CPortal_Base2D::PunchPenetratingPlayer` (`portal_base2d.cpp:588`)
+    /// reads out of a `trace_t`. Its comment is the reason the question is
+    /// shaped this way rather than as "is the player near the portal":
+    /// *"player would be stuck unless moving using portal traces. Really good
+    /// indicator that they're actually in the portal plane."*
+    ///
+    /// **The world's own subtree and not the clip chain**, where Valve's
+    /// filter also sweeps entities. The wall a portal is cut into is world
+    /// geometry in every case that can ask this — a portal placed on a door
+    /// needs `sv_allow_mobile_portals`, which is `0` outside one map
+    /// (`portdocs/PORTAL.md` §8) — so the extra sweeps could only ever answer
+    /// "yes" for a reason that is not the hole.
+    fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 }
 
 /// The player, as the two halves of the port that own pieces of it agree to
@@ -427,13 +450,18 @@ pub struct PortalState {
     pub is_portal2: bool,
     /// The server clock when this portal was switched on or moved.
     ///
-    /// The renderer turns it into `$PortalOpenAmount` and `$PortalStatic`,
-    /// which `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`) runs up
-    /// from 0 and down from 1 at fixed rates. Carried as the instant rather
-    /// than as the two curves for the reason
-    /// [`ModelEntityState::anim_time`] is: a 64 Hz tick would step an effect
-    /// that has to be smooth.
+    /// The renderer turns it into `$PortalOpenAmount`, which
+    /// `C_Prop_Portal::ClientThink` (`c_prop_portal.cpp:222`) runs up from 0
+    /// at a fixed rate. Carried as the instant rather than as the curve for
+    /// the reason [`ModelEntityState::anim_time`] is: a 64 Hz tick would step
+    /// an effect that has to be smooth.
     pub opened_at: f32,
+    /// The server clock when this portal last filled with interference —
+    /// `$PortalStatic`'s clock, and **not the same set of events** as
+    /// [`opened_at`](PortalState::opened_at)'s. See
+    /// [`PropPortal::static_at`](classes::PropPortal::static_at) for the
+    /// three-row table that says which event resets which.
+    pub static_at: f32,
     /// The partner this portal found, if it found one — the same key
     /// [`id`](PortalState::id) is.
     ///
@@ -465,6 +493,12 @@ pub struct NoTouchQuery;
 
 impl TouchQuery for NoTouchQuery {
     fn brush_models_touching(&mut self, _: Vec3, _: Vec3, _: Vec3, _: Vec3, _: &mut Vec<usize>) {}
+
+    /// Nothing is solid in a world that has no geometry, which is also the
+    /// answer that makes [`Server::punch_penetrating_players`] do nothing.
+    fn start_solid(&mut self, _: Vec3, _: Vec3, _: Vec3) -> bool {
+        false
+    }
 }
 
 /// What one `level_init` produced.
@@ -607,6 +641,7 @@ impl Server {
             level_loading: false,
             pending_damage: Vec::new(),
             damaging: false,
+            pending_punches: Vec::new(),
             level_restart: None,
             sequences: SequenceTable::new(),
         }
@@ -888,6 +923,7 @@ impl Server {
         self.player_was_ducked = false;
         self.player_prev_origin = Vec3::ZERO;
         self.pending_damage.clear();
+        self.pending_punches.clear();
         // **Not `level_restart`**: the whole point of it is to survive
         // `level_shutdown`, because the shutdown is what it asked for.
         self.overlaps.clear();
@@ -967,6 +1003,13 @@ impl Server {
         self.run_think_functions();
         self.check_for_entity_untouch();
         self.service_events();
+        // `m_hLinkedPortal->PunchAllPenetratingPlayers()`, which the C++ does
+        // inside `NewLocation` and which cannot happen there — see
+        // [`Context::punch_penetrating_players`]. It lands in the same tick as
+        // the input that asked for it; a `place_portal` from the console
+        // between ticks lands in the next one, which is 15.6 ms of a velocity
+        // change nobody can see.
+        self.flush_portal_punches(query);
         // Anything a think or an input removed.
         self.cleanup_delete_list();
     }
@@ -1520,6 +1563,7 @@ impl Server {
         let changed = cx.take_changed();
         let created = cx.take_created();
         let damage = cx.take_damage_queue();
+        let punches = cx.take_punch_queue();
         let reload = cx.take_reload_level();
         let next_think = entity.core.next_think_tick();
         // `CheckHasGamePhysicsSimulation`, which `SetMoveDoneTime` and
@@ -1563,6 +1607,12 @@ impl Server {
         // legitimately be aimed at.
         self.pending_damage.extend(damage);
         self.flush_damage();
+
+        // `m_hLinkedPortal->PunchAllPenetratingPlayers()`, which needs the
+        // engine's world and so cannot happen here — see
+        // [`Context::punch_penetrating_players`] and
+        // [`Server::flush_portal_punches`], which is the far end of this.
+        self.pending_punches.extend(punches);
 
         if reload {
             self.level_restart = self.map.clone();
@@ -2048,6 +2098,7 @@ impl Server {
                     half_height: portal.half_height,
                     is_portal2: portal.is_portal2,
                     opened_at: portal.opened_at,
+                    static_at: portal.static_at,
                     linked: portal
                         .is_active_and_linked()
                         .then(|| portal.linked.map(|id| id.to_int()))
@@ -2160,6 +2211,91 @@ impl Server {
             }
         });
         true
+    }
+
+    /// Runs whatever [`Context::punch_penetrating_players`] queued.
+    ///
+    /// Called once a tick from [`run_tick`](Server::run_tick), where a
+    /// [`TouchQuery`] is in hand. **Not a loop**: a punch changes a velocity
+    /// and cannot queue another one, so unlike
+    /// [`flush_damage`](Server::flush_damage) there is nothing to drain.
+    fn flush_portal_punches(&mut self, query: &mut dyn TouchQuery) {
+        for portal in std::mem::take(&mut self.pending_punches) {
+            self.punch_penetrating_players(portal, query);
+        }
+    }
+
+    /// `CPortal_Base2D::PunchAllPenetratingPlayers` (`portal_base2d.cpp:620`)
+    /// and the `PunchPenetratingPlayer` (`:588`) under it, for the one player
+    /// this port has.
+    ///
+    /// A portal that has just been moved onto a wall a player is standing
+    /// inside shoves them out along its forward at 100 units a second. The
+    /// player is *inside* the wall because the hole was cut around them, so
+    /// without this they stand in a wall that has stopped having a hole in it
+    /// where they are.
+    ///
+    /// Three conditions, and the third is the interesting one:
+    ///
+    /// 1. the player's world-space box meets the portal's quad —
+    ///    `UTIL_IsBoxIntersectingPortal` (`portal_util_shared.cpp:2056`),
+    ///    which is the box against the two triangles the quad splits into.
+    ///    [`obb::swept_box_touches_obb`] answers the same question about the
+    ///    rectangle those two triangles tile, with the sweep degenerate;
+    /// 2. the world says the player is `startsolid` there —
+    ///    [`TouchQuery::start_solid`], and Valve's comment for it;
+    /// 3. `m_PortalSimulator.IsReadyToSimulate()`, which is *not* checked
+    ///    here because there is nothing it could exclude: a portal in this
+    ///    port has carved geometry from the frame it became active, and the
+    ///    engine's side of the seam rebuilds it from
+    ///    [`Server::portals`] whether or not this ran.
+    ///
+    /// `VelocityPunch` (`player.cpp:5639`) is the two lines it looks like —
+    /// clear the ground and add the impulse — and the ground bit matters:
+    /// without it the next `CategorizePosition` snaps the player straight back
+    /// down onto whatever they were standing on.
+    fn punch_penetrating_players(&mut self, portal: EntityId, query: &mut dyn TouchQuery) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let Some(entity) = self.entities.get(portal) else {
+            return;
+        };
+        let Some(class) = entity.behaviour.downcast_ref::<classes::PropPortal>() else {
+            return;
+        };
+        let (origin, angles) = (entity.core.origin, entity.core.angles);
+        let (half_width, half_height) = (class.half_width, class.half_height);
+        let forward = classes::PropPortal::forward(&entity.core);
+
+        let Some(player_entity) = self.entities.get(player) else {
+            return;
+        };
+        let bounds = player_entity.core.model_bounds;
+        let player_origin = player_entity.core.origin;
+
+        // The quad, as a zero-thickness OBB in the portal's own frame — the
+        // rectangle `UTIL_Portal_Triangles` (`portal_util_shared.cpp:1962`)
+        // cuts its two triangles out of.
+        let touching = obb::swept_box_touches_obb(
+            player_origin,
+            player_origin,
+            bounds.mins,
+            bounds.maxs,
+            origin,
+            angles,
+            Vec3::new(0.0, -half_width, -half_height),
+            Vec3::new(0.0, half_width, half_height),
+        );
+        if !touching || !query.start_solid(player_origin, bounds.mins, bounds.maxs) {
+            return;
+        }
+
+        let Some(player_entity) = self.entities.get_mut(player) else {
+            return;
+        };
+        player_entity.core.velocity += forward * classes::portal::PUNCH_SPEED;
+        player_entity.core.flags &= !movement::FL_ONGROUND;
     }
 
     /// Switch every portal in the map off — `Fizzle` at each, which is what

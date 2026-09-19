@@ -120,6 +120,7 @@ mod tests {
                 half_height: 54.0,
                 is_portal2,
                 open_for: 10.0,
+                static_for: 10.0,
                 linked: Some(1 - id),
                 matrix,
             }
@@ -293,7 +294,7 @@ mod tests {
                         &camera,
                         Load::Clear(wgpu::Color::BLACK),
                     );
-                    world.draw_translucent(&mut pass, 0.0, &list, &visible);
+                    world.draw_translucent(&mut pass, 0.0, &list, &visible, 2);
                 }
                 queue.submit([encoder.finish()]);
             };

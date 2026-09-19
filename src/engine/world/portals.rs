@@ -23,9 +23,15 @@
 //! [`World::draw_portal_views`](super::World::draw_portal_views), which reaches
 //! back here for [`draw_hole`](Portals::draw_hole),
 //! [`draw_hole_cap`](Portals::draw_hole_cap) and
-//! [`clear_depth`](Portals::clear_depth). What is still missing is the *warp* —
-//! a portal's surface does not refract what is behind it, and it has no opening
-//! animation.
+//! [`clear_depth`](Portals::clear_depth).
+//!
+//! **Both animate open** — the ring from [`Portal::open_for`] and the hole from
+//! the same number, which is why [`bind_overlay`](Portals::bind_overlay) is
+//! shared: a ring and a hole computed from two blocks would stop being
+//! concentric. What is still missing is the *warp*, `PortalRefract`'s
+//! `$Stage 0`: a portal's surface does not refract what is behind it.
+//! `portdocs/PORTAL_RENDER.md` §7 says why that one is deferred for a reason
+//! rather than for scope.
 //!
 //! # Three things here that produce a plausible wrong picture rather than an
 //! error
@@ -173,6 +179,13 @@ pub struct Portal {
     /// different modules: the instant is the *server's* tick clock and the
     /// elapsed time is measured against the *scene's*.
     pub open_for: f32,
+    /// How long ago this portal last filled with interference, in seconds.
+    ///
+    /// A second clock because the events that reset it are a different set —
+    /// `crate::server::classes::PropPortal::static_at` has the table. The one
+    /// that is easy to miss: a portal fills with static when its **partner**
+    /// moves or lights up, without re-opening.
+    pub static_for: f32,
     /// The [`id`](Portal::id) of this portal's partner, if it has one.
     ///
     /// Two readers, and they arrived a stage apart:
@@ -306,9 +319,8 @@ impl Portals {
     /// radius and the ring's radius are the same expression of the same open
     /// amount, so a ring drawn from one block and a hole from another would
     /// stop being concentric.
-    fn bind_overlay(&self, pass: &mut Pass<'_>, curtime: f32, portal: &Portal) {
+    fn bind_overlay(&self, pass: &mut Pass<'_>, curtime: f32, portal: &Portal, static_amount: f32) {
         let open_amount = (portal.open_for * OPEN_RATE).clamp(0.0, 1.0);
-        let static_amount = (1.0 - portal.open_for * STATIC_RATE).clamp(0.0, 1.0);
         pass.set_portal_overlay(&PortalOverlay {
             open_amount,
             // **`g_flPortalActive` is `1 - $PortalStatic`**
@@ -333,7 +345,10 @@ impl Portals {
         let Some(portal) = self.live.get(index) else {
             return;
         };
-        self.bind_overlay(pass, curtime, portal);
+        // `$Stage 1` reads `$PortalOpenAmount` and nothing else — see
+        // `shaders/portalhole.wgsl` — so the static amount bound with it is
+        // never sampled and the settled value is as good as any.
+        self.bind_overlay(pass, curtime, portal, 0.0);
         let vertices = quad(portal);
         let vertices = pass.vertices(&vertices);
         let indices = pass.indices(&QUAD_INDICES);
@@ -356,7 +371,7 @@ impl Portals {
         if cap.len() < 3 {
             return;
         }
-        self.bind_overlay(pass, curtime, portal);
+        self.bind_overlay(pass, curtime, portal, 0.0);
 
         let vertices: Vec<SimpleVertex> = cap
             .iter()
@@ -393,12 +408,17 @@ impl Portals {
     ///
     /// `curtime` is the scene clock, and it reaches the shader twice: once as
     /// the noise scroll and once, through
-    /// [`Portal::open_for`], as the two curves.
-    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize) {
+    /// [`Portal::open_for`], as the opening curve.
+    ///
+    /// `remaining_depth` is how many more recursion levels a portal drawn in
+    /// *this* scene could open onto — see
+    /// [`static_amount`], which is the only thing that
+    /// reads it and is where the shipped game's end-of-the-line kludge lives.
+    pub fn draw_one(&self, pass: &mut Pass<'_>, curtime: f32, index: usize, remaining_depth: u8) {
         let Some(portal) = self.live.get(index) else {
             return;
         };
-        self.bind_overlay(pass, curtime, portal);
+        self.bind_overlay(pass, curtime, portal, static_amount(portal, remaining_depth));
 
         let vertices = quad(portal);
         let vertices = pass.vertices(&vertices);
@@ -414,6 +434,44 @@ impl Portals {
             Mat4::IDENTITY,
         );
     }
+}
+
+/// `C_Prop_Portal::ComputeStaticAmountForRendering`
+/// (`c_prop_portal.cpp:1148`) — what `$PortalStatic`'s proxy actually
+/// writes, which is `m_fStaticAmount` only some of the time.
+///
+/// `remaining_depth` is `CPortalRender::GetRemainingPortalViewDepth()`:
+/// how many *more* recursion levels a portal drawn in this scene could
+/// still open onto. It is `r_portal_stencil_depth` minus the level being
+/// drawn, and the whole reason the field exists is its own comment —
+/// *"let's portals know that they should do 'end of the line' kludges to
+/// cover up that portals don't go infinitely recursive"*.
+///
+/// Two overrides, and both are the difference between a portal that looks
+/// like a hole and one that looks like a mistake:
+///
+/// - **an unlinked portal is full static.** It has nothing to show, and
+///   without this it settles into a clear oval with the wall visible
+///   through it.
+/// - **so is the deepest one drawn.** At `r_portal_stencil_depth 0` that
+///   is *every* portal, which is what makes the flat-oval debug setting
+///   look like the shipped game's rather than like a decal.
+///
+/// The third branch — `m_fSecondaryStaticAmount` at
+/// `remaining_depth == 1`, *"fading in from no views to another view
+/// (player just walked through it)"* — is **dead in this tree** and is not
+/// ported. The field is declared, decayed by `ClientThink` and set to
+/// `0.0f` in two places (`c_prop_portal.cpp:933`, `:1019`); nothing
+/// anywhere assigns it a non-zero value, so the branch's own guard
+/// (`m_fSecondaryStaticAmount > flStaticAmount`) can only pass when the
+/// static amount is already negative. The depth doubler's branch above it
+/// goes with `WillUseDepthDoublerThisDraw`, which
+/// `portdocs/PORTAL_RENDER.md` §7 deletes.
+fn static_amount(portal: &Portal, remaining_depth: u8) -> f32 {
+    if portal.linked.is_none() || remaining_depth == 0 {
+        return 1.0;
+    }
+    (1.0 - portal.static_for * STATIC_RATE).clamp(0.0, 1.0)
 }
 
 /// One linked portal and everything the recursive view needs to know about
@@ -584,6 +642,44 @@ fn quad(portal: &Portal) -> [SimpleVertex; 4] {
 mod tests {
     use super::*;
 
+    /// `ComputeStaticAmountForRendering`'s two live branches, and the curve
+    /// they override.
+    #[test]
+    fn a_portal_with_nothing_behind_it_is_full_static() {
+        let settled = Portal {
+            static_for: 10.0,
+            linked: Some(2),
+            ..portal(Vec3::ZERO)
+        };
+        assert_eq!(static_amount(&settled, 2), 0.0, "settled and linked");
+        // Half a second in, half the interference is left.
+        assert!(
+            (static_amount(
+                &Portal {
+                    static_for: 0.5,
+                    ..settled
+                },
+                2
+            ) - 0.5)
+                .abs()
+                < 1e-6
+        );
+
+        // *"end of the line, no more views"* — whatever the clock says.
+        assert_eq!(static_amount(&settled, 0), 1.0);
+        // …and an unlinked portal, at any depth.
+        assert_eq!(
+            static_amount(
+                &Portal {
+                    linked: None,
+                    ..settled
+                },
+                2
+            ),
+            1.0
+        );
+    }
+
     fn portal(angles: Vec3) -> Portal {
         Portal {
             id: 1,
@@ -593,6 +689,7 @@ mod tests {
             half_height: 56.0,
             is_portal2: false,
             open_for: 1.0,
+            static_for: 1.0,
             linked: None,
             matrix: glam::Mat4::IDENTITY,
         }
@@ -795,7 +892,9 @@ mod rendered {
                     Load::Clear(wgpu::Color::BLACK),
                 );
                 for index in 0..portals.live.len() {
-                    portals.draw_one(&mut pass, curtime, index);
+                    // One level still to go, so `static_amount` uses the
+                    // portal's own curve rather than the end-of-the-line 1.
+                    portals.draw_one(&mut pass, curtime, index, 1);
                 }
             }
             encoder.copy_texture_to_buffer(
@@ -865,7 +964,14 @@ mod rendered {
                 half_height: 56.0,
                 is_portal2,
                 open_for: 10.0,
-                linked: None,
+                static_for: 10.0,
+                // **Linked, to a partner that is not in the list.** Nothing
+                // about the oval reads where the partner is, but
+                // [`static_amount`] reads *whether there is one*: an
+                // unlinked portal is full static whatever its clock says, and
+                // a fixture that left this `None` would compare two noise
+                // fields and call it an opening animation.
+                linked: Some(!u64::from(is_portal2)),
                 matrix: glam::Mat4::IDENTITY,
             };
 
@@ -898,6 +1004,7 @@ mod rendered {
             // all — with a zeroed block both shots would be identical.
             portals.sync(&[Portal {
                 open_for: 0.25,
+                static_for: 0.25,
                 ..portal
             }]);
             let opening = shot(&portals, 10.0);

@@ -86,6 +86,31 @@ const WORLD_WALL_SEPARATION: f32 = 1.0 / 16.0;
 /// and `fHalfHeight * 40` (`portalsimulation.cpp:3598`).
 const FAR: f32 = 40.0;
 
+/// `kAABBInnerCarve` (`portalsimulation.cpp:645`) — how far *below* the
+/// portal's own bottom edge the transition ramp starts.
+///
+/// `(PORTAL_HOLE_HALF_WIDTH_MOD + (1.0f/16.0f)) * 4.0f`, which is 0.65 — six
+/// and a half times [`HOLE_MOD`], and written with a dead
+/// `//(-1.0f/1024.0f)` beside it. The sign is what matters: the ramp begins
+/// **lower** than the wall's own lower slab (`half + 0.2`), so it is a strict
+/// subset of solid wall and can never present a surface where the carve left a
+/// hole.
+const AABB_INNER_CARVE: f32 = (HOLE_MOD + 1.0 / 16.0) * 4.0;
+
+/// How far the transition ramp reaches back into the wall —
+/// `fAABBTransformPlanes[(1*4) + 3] = -PortalPlane.m_Dist + 64.0f`
+/// (`portalsimulation.cpp:535`).
+///
+/// Deeper than [`TUBE_DEPTH`] by two orders of magnitude, because a ramp is
+/// something the player *slides along* rather than something they bump into:
+/// it has to still be there when the box is
+/// [`extent_shift`](extent_shift)ed a hull's depth past the plane.
+const RAMP_DEPTH: f32 = 64.0;
+
+/// How far the outer planes of the ramp are pushed out to stand in for
+/// infinity — `kReallyFar` (`portalsimulation.cpp:537`).
+const REALLY_FAR: f32 = 1024.0;
+
 /// `PORTAL_WALL_TUBE_DEPTH` (`portalsimulation.cpp:66`) — how far back into
 /// the wall the sleeve reaches. One unit, and Valve's commented-out
 /// alternative was 1/128.
@@ -154,6 +179,18 @@ impl PortalHole {
             half_width,
             half_height,
         }
+    }
+
+    /// `CBaseEntity::WorldSpaceCenter()` for a portal — the middle of its
+    /// **trigger box**, which is [`TOUCH_DEPTH`]`/2` in front of the plane and
+    /// so is *not* [`center`](PortalHole::center).
+    ///
+    /// The distinction is invisible for anything that tests the quad and
+    /// decisive for anything that measures a distance: the funnel aims at this
+    /// point, so it pulls a falling player towards a spot 32 units above a
+    /// floor portal rather than at the hole itself.
+    pub fn world_center(&self) -> Vec3 {
+        self.center + self.forward * (TOUCH_DEPTH * 0.5)
     }
 
     /// `vCollisionCloneExtents` (`portalsimulation.cpp:447`) — how far in each
@@ -326,6 +363,10 @@ pub struct CarvedWall {
     /// exit's space — what `ray_remote` is swept against. `None` while
     /// unlinked.
     remote: Option<CollisionBsp>,
+    /// The transition ramp, also in the exit's space — see
+    /// [`ramp_piece`] and [`CarvedWall::ramp`]. `None` while unlinked, because
+    /// it is placed by a matrix an unlinked portal has not got.
+    ramp: Option<CollisionBsp>,
     /// How many brushes went in, before the split into pieces — the two sets
     /// added together, so a brush that lands in both is counted twice.
     /// Reported by [`summary`](CarvedWall::summary) and by nothing else.
@@ -417,6 +458,13 @@ impl CarvedWall {
             CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces)
         });
 
+        // The transition ramp, one convex in the exit's space.
+        let ramp = link.map(|link| {
+            let mut out = Pieces::default();
+            ramp_piece(&mut out, hole, &link);
+            CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces)
+        });
+
         CarvedWall {
             id,
             hole: *hole,
@@ -425,6 +473,7 @@ impl CarvedWall {
             pieces: CollisionBsp::from_pieces(out.planes, out.sides, out.brushes, out.surfaces),
             tube,
             remote,
+            ramp,
         }
     }
 
@@ -456,6 +505,25 @@ impl CarvedWall {
     /// builds and nothing else.
     pub fn remote(&self) -> Option<&CollisionBsp> {
         self.remote.as_ref()
+    }
+
+    /// The transition ramp — `None` while unlinked.
+    ///
+    /// *"Slightly angled portal transitions can present their remote-space
+    /// collision as an extremely steep slope. Step code fails on that kind of
+    /// step because it's both non-standable and just barely too far forward to
+    /// step onto"* (`portal_gamemovement.cpp:1766`).
+    ///
+    /// **Nothing stops against it.** Sweeping it answers one question — did
+    /// the box touch the wall immediately below the opening — and the answer
+    /// becomes [`Trace::portal_ramp`](super::Trace::portal_ramp), which makes
+    /// whatever *was* hit standable however steep it is. The shipped tree also
+    /// contains the version that takes the ramp's own impact, under a `#if 0`
+    /// and the comment *"on second thought, maybe you shouldn't actually walk
+    /// on this magic ramp"*; it is not ported, because the flag is what the
+    /// eight `HitPortalRamp` call sites read.
+    pub fn ramp(&self) -> Option<&CollisionBsp> {
+        self.ramp.as_ref()
     }
 
     /// This portal's partner and the transforms between them — `None` while
@@ -808,6 +876,61 @@ fn tube_pieces(
     }
 }
 
+/// The transition ramp — `pAABBAngleTransformCollideable`
+/// (`portalsimulation.cpp:681`), built in the **exit** portal's space.
+///
+/// # What it is
+///
+/// One convex: the wall **below the hole**, from a thirty-second of a unit
+/// behind the portal plane to [`RAMP_DEPTH`] into the wall, unbounded sideways
+/// and downwards. It is not collision anybody stops against — it is a *label*.
+/// See [`CarvedWall::ramp`] for what reads it.
+///
+/// # Why one convex and not four
+///
+/// `MovedOrResized` builds a four-element `pAABBTransformConvexes` array
+/// beside the inverse hole's, and **three of the four constructions are
+/// commented out in the shipped tree** (`portalsimulation.cpp:583`, `:637`,
+/// `:665`). What reaches `ConvertConvexToCollideParams` is
+/// `&pAABBTransformConvexes[1]` with a count of `1` — the *bottom* section
+/// alone, and the line above it that would have passed all four is commented
+/// out too. That is deliberate rather than rotten: a slightly-angled floor
+/// transition presents its remote-space collision as an unclimbable step, and
+/// the only edge that can happen at is the one the player walks *up onto*.
+///
+/// # Why it is built in the exit's space
+///
+/// The shipped engine places the collideable at
+/// `Placement.ptaap_ThisToLinked` and sweeps it with `ray_remote`
+/// (`portal_gamemovement.cpp:1773`), which is the same arrangement the remote
+/// tube already has here: the basis goes through the matrix and the planes
+/// follow it. Doing it the other way — sweeping the local ray against a local
+/// ramp — is a different question, because [`extent_shift`] moves the remote
+/// box along the exit normal and the local one is not moved at all.
+fn ramp_piece(out: &mut Pieces, hole: &PortalHole, link: &PortalLink) {
+    let moved = |v: Vec3| link.to_exit.transform_vector3(v);
+    let center = link.to_exit.transform_point3(hole.center);
+    let (forward, right, up) = (moved(hole.forward), moved(hole.right), moved(hole.up));
+
+    let at = |normal: Vec3, distance: f32| cplane(normal, normal.dot(center) + distance);
+    let planes = [
+        // Behind the plane by a *half* of the world/wall separation, where the
+        // Wall set's own first plane sits on the plane exactly.
+        at(forward, -WORLD_WALL_SEPARATION / 2.0),
+        at(-forward, RAMP_DEPTH),
+        // Below the hole's bottom edge, by more than the carve's own slack.
+        at(up, -(hole.half_height + AABB_INNER_CARVE)),
+        at(-up, REALLY_FAR),
+        at(-right, REALLY_FAR),
+        at(right, REALLY_FAR),
+    ];
+    let mut indices = [0u32; 6];
+    for (slot, plane) in indices.iter_mut().zip(planes) {
+        *slot = out.plane(plane);
+    }
+    out.piece(TUBE_CONTENTS, &[], &indices);
+}
+
 /// A plane, with [`CPlane::axis`] filled in the way
 /// [`CollisionBsp::build`] fills it.
 fn cplane(normal: Vec3, dist: f32) -> CPlane {
@@ -1009,7 +1132,7 @@ impl Pieces {
 mod tests {
     use super::*;
     use crate::engine::trace::fixture::{self, Fixture};
-    use crate::engine::trace::Ray;
+    use crate::engine::trace::{Ray, Trace};
 
     /// `PORTAL_HALF_WIDTH`, and the half-height this port settled on —
     /// `server::classes::portal::DEFAULT_HALF_HEIGHT`, which is 56 and not the
@@ -1563,6 +1686,176 @@ mod tests {
             "the unlinked carve stopped at {} rather than on this room's floor",
             fell.end.z
         );
+    }
+
+    /// The transition ramp is the wall **below** the hole and nothing else,
+    /// and it is in the exit portal's space.
+    ///
+    /// The analogue of [`the_four_slabs_leave_a_hole_the_size_of_the_portal`]
+    /// for a convex whose whole meaning is which side of one plane it is on:
+    /// six probes, each of which a sign error in one of the ramp's six planes
+    /// moves across the boundary. They are given in **blue's** frame and then
+    /// pushed through the pair's matrix, which is what says the ramp went
+    /// through it — a ramp built in the local frame passes every one of these
+    /// against the untransformed model and none of them here.
+    #[test]
+    fn the_transition_ramp_is_the_wall_under_the_hole() {
+        let rooms = fixture::portal_rooms();
+        let mut holes = PortalHoles::default();
+
+        holes.sync(&rooms.collision, &rooms.unlinked());
+        assert!(
+            holes
+                .get(fixture::PortalRooms::BLUE_ID)
+                .expect("carved")
+                .ramp()
+                .is_none(),
+            "an unlinked portal has nowhere to put a ramp"
+        );
+
+        holes.sync(&rooms.collision, &rooms.live());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        let ramp = blue.ramp().expect("a linked portal has a ramp");
+        let to_exit = blue.link().expect("linked").to_exit;
+
+        // Blue is at the origin facing `+X`, so "into the wall" is `-x`, "up"
+        // is `+z` and the hole's bottom lip is at `z = -HALF_HEIGHT`.
+        let lip = -HALF_HEIGHT;
+        let probes = [
+            // Just inside the wall, a unit under the lip's carve-out: solid.
+            (Vec3::new(-1.0, 0.0, lip - 2.0), true),
+            // Deep in the wall, still under it: solid.
+            (Vec3::new(-32.0, 0.0, lip - 40.0), true),
+            // Far to the side and far below, where the 1024-unit planes are:
+            // still solid, because the ramp is only bounded downwards and
+            // sideways at infinity.
+            (Vec3::new(-1.0, 300.0, lip - 300.0), true),
+            // *In* the opening rather than under it: empty.
+            (Vec3::new(-1.0, 0.0, 0.0), false),
+            // Above the portal, where the wall is solid but the ramp is not.
+            (Vec3::new(-1.0, 0.0, HALF_HEIGHT + 20.0), false),
+            // In front of the plane, in the room: empty. This is the probe
+            // that fails if the first plane's sign or its half-separation is
+            // wrong, and it is a *tenth* of a unit out rather than a whole one
+            // because the ramp's face is only 1/32 behind the plane.
+            (Vec3::new(0.5, 0.0, lip - 2.0), false),
+            // …and a hair *behind* it is inside, which is the other side of
+            // the same knife edge.
+            (Vec3::new(-0.5, 0.0, lip - 2.0), true),
+        ];
+        for (local, expected) in probes {
+            let point = to_exit.transform_point3(local);
+            assert_eq!(
+                solid_at(ramp, point),
+                expected,
+                "{local} (at {point} through the matrix) should be {}",
+                match expected {
+                    true => "on the ramp",
+                    false => "off it",
+                }
+            );
+        }
+
+        // And the ramp starts *below* the lip by `kAABBInnerCarve`, not at it
+        // — a strict subset of the wall, so it can never stand in front of the
+        // hole the carve cut.
+        let inside_the_carve = to_exit.transform_point3(Vec3::new(-1.0, 0.0, lip - 0.3));
+        assert!(
+            !solid_at(ramp, inside_the_carve),
+            "the ramp reaches into the hole's own slack"
+        );
+    }
+
+    /// The ramp reaches a trace: a box that overlaps the wall under the
+    /// opening comes back flagged, and one that does not, does not.
+    ///
+    /// This is the half [`the_transition_ramp_is_the_wall_under_the_hole`]
+    /// cannot see — that `Tracer::substitute` sweeps the thing, with the
+    /// *remote* ray, and hands the answer back on the trace rather than
+    /// dropping it.
+    #[test]
+    fn a_box_under_the_opening_is_flagged_as_a_transition_ramp() {
+        let rooms = fixture::portal_rooms();
+        let mut holes = PortalHoles::default();
+        holes.sync(&rooms.collision, &rooms.live());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+
+        // Blue's opening runs from the floor up; a hull whose feet are *at*
+        // the floor is entirely above the ramp, and one four units lower
+        // overlaps it.
+        let nudge = |height: f32, x: f32| {
+            let from = Vec3::new(x, 0.0, fixture::PORTAL_ROOM_FLOOR + height);
+            rooms
+                .collision
+                .tracer()
+                .with_hole(blue)
+                .trace(&walk(from, from + Vec3::new(-8.0, 0.0, -1.0)), CARVE)
+                .portal_ramp
+        };
+
+        assert!(nudge(-4.0, 0.0), "in the opening and below its lip");
+        assert!(nudge(-4.0, -20.0), "inside the wall and below its lip");
+        assert!(!nudge(0.0, 0.0), "standing on the lip is not touching it");
+        assert!(!nudge(4.0, 0.0), "above the lip");
+        // Far enough out in the room that the local trace hits nothing, so the
+        // carved path never runs at all.
+        assert!(!nudge(-4.0, 80.0), "nowhere near the portal");
+
+        // And an unlinked portal has no ramp, so nothing is ever flagged.
+        holes.sync(&rooms.collision, &rooms.unlinked());
+        let blue = holes.get(fixture::PortalRooms::BLUE_ID).expect("carved");
+        let from = Vec3::new(0.0, 0.0, fixture::PORTAL_ROOM_FLOOR - 4.0);
+        assert!(
+            !rooms
+                .collision
+                .tracer()
+                .with_hole(blue)
+                .trace(&walk(from, from + Vec3::new(-8.0, 0.0, -1.0)), CARVE)
+                .portal_ramp,
+            "an unlinked portal flagged a ramp it has not got"
+        );
+    }
+
+    /// `HitPortalRamp` needs all three of its conditions, and the third is
+    /// the one that is not the obvious one: the surface has to face **up at
+    /// all**, not up enough to stand on — the whole point being to accept
+    /// slopes that `CRITICAL_SLOPE` rejects.
+    #[test]
+    fn the_ramp_flag_only_makes_an_upward_surface_standable() {
+        let steep = Vec3::new(0.99, 0.0, 0.141).normalize();
+        let base = Trace {
+            fraction: 0.5,
+            normal: steep,
+            ..Trace::miss(Vec3::ZERO, Vec3::X)
+        };
+        assert!(!base.hit_portal_ramp(Vec3::Z), "no flag, no ramp");
+        assert!(Trace {
+            portal_ramp: true,
+            ..base
+        }
+        .hit_portal_ramp(Vec3::Z));
+
+        // A sheer wall is still a wall.
+        assert!(!Trace {
+            portal_ramp: true,
+            normal: Vec3::X,
+            ..base
+        }
+        .hit_portal_ramp(Vec3::Z));
+        // An overhang leans the wrong way.
+        assert!(!Trace {
+            portal_ramp: true,
+            normal: Vec3::new(0.99, 0.0, -0.141).normalize(),
+            ..base
+        }
+        .hit_portal_ramp(Vec3::Z));
+        // A flagged trace that hit nothing has no surface to make standable.
+        assert!(!Trace {
+            portal_ramp: true,
+            fraction: 1.0,
+            ..base
+        }
+        .hit_portal_ramp(Vec3::Z));
     }
 
     /// A portal that finds or loses a partner is recarved, because the far side

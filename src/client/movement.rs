@@ -208,6 +208,50 @@ const EXIT_SPEED_MIN_FLOOR: f32 = 300.0;
 /// is a flat 1000 and asks none of its four arguments.
 const EXIT_SPEED_MAX: f32 = 1000.0;
 
+/// `sv_paintairacceleration` (`portal_gamemovement.cpp:58`) — **the air
+/// acceleration a Portal 2 player actually gets, paint or no paint.**
+///
+/// `CGameMovement::AirMove` passes `sv_airaccelerate`
+/// (`gamemovement.cpp:2043`); `CPortalGameMovement::AirMove` passes *this*
+/// (`:800`), unconditionally and with no paint anywhere in the branch. The
+/// name is the only thing about it that is about paint, and taking the name at
+/// face value gives a player 2.4x the air control the shipped game gives them.
+///
+/// [`SV_AIRACCELERATE`] is still the right number and is still what
+/// [`MoveVars`] carries, because `FullTossMove` and anything else that
+/// accelerates in air uses it; this one is `AirMove`'s alone.
+pub const SV_PAINTAIRACCELERATION: f32 = 5.0;
+
+/// `MIN_FLING_SPEED` (`portal_shareddefs.h:38`) — the horizontal speed above
+/// which `AirMove` stops the player steering *against* their own momentum.
+///
+/// *"Don't let the player screw their fling because of adjusting into a floor
+/// portal"*: past this, a wish direction that opposes the velocity on either
+/// horizontal axis is zeroed on that axis. It is also the gate on the funnel,
+/// which only runs *below* it.
+const MIN_FLING_SPEED: f32 = 300.0;
+
+/// `PORTAL_FUNNEL_AMOUNT` (`portal_gamemovement.cpp:81`) — how hard the funnel
+/// pulls, as a multiplier on the distance still to cover.
+const PORTAL_FUNNEL_AMOUNT: f32 = 6.0;
+
+/// `sv_player_funnel_height_adjust` (`portal_gamemovement.cpp:50`) — how far
+/// *above* a floor portal the funnel aims.
+///
+/// Subtracted from the drop before the time-to-impact is solved, so the funnel
+/// finishes centring the player 128 units up rather than at the lip, which is
+/// what stops it still correcting as they go through.
+const FUNNEL_HEIGHT_ADJUST: f32 = 128.0;
+
+/// `sv_player_funnel_speed_bonus` (`portal_gamemovement.cpp:48`) — the funnel
+/// pulls up to this much harder the faster the player is falling.
+const FUNNEL_SPEED_BONUS: f32 = 2.0;
+
+/// `sv_player_funnel_snap_threshold` (`portal_gamemovement.cpp:47`) — below
+/// this much horizontal speed, a player who is already going to arrive
+/// centred is simply stopped on that axis instead of decayed.
+const FUNNEL_SNAP_THRESHOLD: f32 = 10.0;
+
 /// *"Apply slightly more gravity on exit so that floor/floor portals trend
 /// towards decaying velocity. 1.008 is a magic number found through
 /// experimentation."* (`portal_gamemovement.cpp:2441`)
@@ -716,7 +760,10 @@ fn stay_on_ground(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars) {
     if trace.fraction > 0.0
         && trace.fraction < 1.0
         && !trace.start_solid
-        && trace.normal.z >= CRITICAL_SLOPE
+        // *"can't hit a steep slope that we can't stand on anyway"* — unless
+        // it is a portal transition ramp, which is exactly a slope too steep
+        // to stand on that the player has to be able to walk out of.
+        && (trace.normal.z >= CRITICAL_SLOPE || trace.hit_portal_ramp(Vec3::Z))
     {
         let delta = (mv.origin.z - trace.end.z).abs();
         // "This is incredibly hacky. The real problem is that trace returning
@@ -764,7 +811,7 @@ fn step_move(
     let trace = trace_player_bbox(mv, tracer, mv.origin, down);
 
     // If we are not on the ground any more then use the original attempt.
-    if trace.normal.z < CRITICAL_SLOPE {
+    if trace.normal.z < CRITICAL_SLOPE && !trace.hit_portal_ramp(Vec3::Z) {
         mv.origin = down_pos;
         mv.velocity = down_vel;
         return;
@@ -882,31 +929,319 @@ fn walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f3
     stay_on_ground(mv, tracer, vars);
 }
 
-/// `CGameMovement::AirMove` (`gamemovement.cpp:2006`).
+/// `CPortalGameMovement::AirMove` (`portal_gamemovement.cpp:706`) — **not the
+/// base class's**, which this used to be.
 ///
-/// Portal's override (`:706`) adds portal funnelling and the gravity-direction
-/// generalisation; without portals or paint the two are the same function.
-fn air_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32) {
+/// Three things Portal's override does that `CGameMovement::AirMove`
+/// (`gamemovement.cpp:2006`) does not, and none of them needs paint:
+///
+/// 1. **It accelerates at [`SV_PAINTAIRACCELERATION`]**, 5.0 against
+///    `sv_airaccelerate`'s 12.0. The constant's name is about paint; its use
+///    is not conditional on anything.
+/// 2. **A fling is not steerable against itself.** Above
+///    [`MIN_FLING_SPEED`] horizontally, a wish direction opposing the velocity
+///    on the x or y axis is zeroed on that axis — *"don't let the player screw
+///    their fling because of adjusting into a floor portal"*.
+/// 3. **Below that speed it funnels** ([`portal_funnel`]), which is what makes
+///    a fall into a floor portal go in rather than clip the rim.
+///
+/// The fourth difference is one the port cannot reproduce and does not need
+/// to: Valve leaves the view forward *unnormalised* when it is steeper than
+/// 30 degrees from horizontal, *"to prevent the player from screwing up their
+/// momentum after exiting floor portals or jumping off sticky ceilings while
+/// looking straight up/down"*. That is exactly what this does — projecting
+/// onto the horizontal plane and **not** renormalising shortens the movement
+/// basis as the player looks further up or down, which is the intended
+/// damping — so the two branches are written out rather than collapsed.
+fn air_move(
+    mv: &mut MoveData,
+    tracer: &mut Tracer<'_>,
+    holes: &PortalHoles,
+    vars: &MoveVars,
+    dt: f32,
+) {
     let (forward, right, _) = mv.angles.vectors();
-    let forward = Vec3::new(forward.x, forward.y, 0.0).normalize_or_zero();
+    // Looking mostly straight forward? Flatten and renormalise. Looking
+    // steeply up or down? Flatten and **leave it short**.
+    let forward = match forward.z < 0.5 && forward.z > -0.5 {
+        true => Vec3::new(forward.x, forward.y, 0.0).normalize_or_zero(),
+        false => Vec3::new(forward.x, forward.y, 0.0),
+    };
     let right = Vec3::new(right.x, right.y, 0.0).normalize_or_zero();
 
-    let mut wishvel = forward * mv.forwardmove + right * mv.sidemove;
-    wishvel.z = 0.0;
+    let mut wishdir = forward * mv.forwardmove + right * mv.sidemove;
+    wishdir.z = 0.0;
 
-    let mut wishspeed = wishvel.length();
-    let wishdir = wishvel.normalize_or_zero();
+    let mut funnel = Vec3::ZERO;
+    let horizontal = mv.velocity.x * mv.velocity.x + mv.velocity.y * mv.velocity.y;
+    if horizontal > MIN_FLING_SPEED * MIN_FLING_SPEED {
+        // Cancel only the component that fights the fling, and only past half
+        // the threshold — so a player drifting sideways at 100 can still
+        // correct, and one committed at 200 cannot undo it.
+        for axis in 0..2 {
+            if mv.velocity[axis] > MIN_FLING_SPEED * 0.5 && wishdir[axis] < 0.0 {
+                wishdir[axis] = 0.0;
+            } else if mv.velocity[axis] < -MIN_FLING_SPEED * 0.5 && wishdir[axis] > 0.0 {
+                wishdir[axis] = 0.0;
+            }
+        }
+    } else {
+        // `sv_player_funnel_into_portals` is 1.
+        funnel = portal_funnel(mv, holes, wishdir, vars, dt);
+    }
 
+    // `IsSuppressingAirControl` — bounce and speed gel, and the tractor beam.
+    // No paint, so the wish direction is never nuked; the funnel is added
+    // *after* the point where it would have been, which is the whole reason
+    // the two are separate vectors. Valve's comment: *"we still want to
+    // funnel, even if the player isnt allowed to move themself"*.
+    wishdir += funnel;
+
+    let mut wishspeed = wishdir.length();
+    let wishdir = wishdir.normalize_or_zero();
+    // **`VectorScale( targetVel, … )` on the line above this in the original
+    // writes to a vector nothing reads again** — `targetVel` is dead from the
+    // moment `wishdir` is copied out of it. What the clamp actually does is
+    // cap the speed, and that is all this does.
     if wishspeed != 0.0 && wishspeed > mv.max_speed {
-        wishvel *= mv.max_speed / wishspeed;
         wishspeed = mv.max_speed;
     }
 
-    air_accelerate(mv, wishdir, wishspeed, vars.airaccelerate, dt);
+    air_accelerate(mv, wishdir, wishspeed, SV_PAINTAIRACCELERATION, dt);
 
     mv.velocity += mv.base_velocity;
     try_player_move(mv, tracer, dt, None);
     mv.velocity -= mv.base_velocity;
+}
+
+/// `RemapValClamped` (`public/mathlib/mathlib.h:1035`).
+fn remap_clamped(value: f32, from: (f32, f32), to: (f32, f32)) -> f32 {
+    if from.0 == from.1 {
+        // `fsel( val - B, D, C )` — **zero takes `D`**, because `fsel` selects
+        // on `>= 0`.
+        return match value >= from.1 {
+            true => to.1,
+            false => to.0,
+        };
+    }
+    let fraction = ((value - from.0) / (from.1 - from.0)).clamp(0.0, 1.0);
+    to.0 + (to.1 - to.0) * fraction
+}
+
+/// `ExponentialDecay( halflife, dt )` (`public/mathlib/mathlib.h:1603`) — the
+/// factor a value is multiplied by to lose half of itself every `halflife`
+/// seconds.
+fn exponential_decay(halflife: f32, dt: f32) -> f32 {
+    (-0.693_147_2 / halflife * dt).exp()
+}
+
+/// `CPortalGameMovement::IsInPortalFunnelVolume`
+/// (`portal_gamemovement.cpp:811`) — is the player inside the cone that opens
+/// out of this portal?
+///
+/// The portal's own right and up, **re-orthogonalised against its plane
+/// normal** and renormalised, and the player's offset measured against each.
+/// For a rigid basis the re-orthogonalisation is a no-op; it is here because
+/// it is there, and because a hand-built placement need not be rigid.
+///
+/// Valve compares `(offset · axis * axis).LengthSqr()` against `extent²`,
+/// which is the square of the *scalar* projection by a longer route.
+fn is_in_portal_funnel_volume(
+    to_portal: Vec3,
+    hole: &PortalHole,
+    extent_x: f32,
+    extent_y: f32,
+) -> bool {
+    let flatten = |axis: Vec3| (axis - axis.dot(hole.forward) * hole.forward).normalize_or_zero();
+    let across = to_portal.dot(flatten(hole.right));
+    if across * across > extent_x * extent_x {
+        return false;
+    }
+    let along = to_portal.dot(flatten(hole.up));
+    along * along <= extent_y * extent_y
+}
+
+/// `CPortalGameMovement::PlayerShouldFunnel` (`portal_gamemovement.cpp:839`) —
+/// should the player be pulled towards the middle of this portal?
+///
+/// **This is `IsFloorPortal`'s one remaining consumer on the player's path.**
+/// The other three are `TeleportTouchingEntity`'s floor-to-floor special
+/// cases, and `CPortal_Base2D::Touch`, `StartTouch` and `EndTouch` all return
+/// immediately for a player, so the player never reaches them; the fourth is
+/// the punch guard, which is `server/`'s.
+///
+/// Five conditions in the air, in Valve's order:
+///
+/// - the player is not steering hard sideways (`|wishdir| > 64` on either
+///   horizontal axis kills it), **and** is either rising fast at a ceiling
+///   portal or falling fast while looking down at a floor one — *"we are more
+///   liberal about funneling into a ceiling portal … we aren't going to be
+///   hitting these by accident"*;
+/// - the portal faces the right way for that direction;
+/// - it is within 1,024 units and on the side the player is heading, and for
+///   a ceiling portal within the height the player's rise can still reach;
+/// - the player is inside a cone that widens from 1.5x the portal's own size
+///   at 256 units to 3x at 1,024;
+///
+/// and the **ground** branch is deleted with a reason:
+/// `speed_funnelling_enabled` gates it on `player->MaxSpeed() >
+/// sv_speed_normal`, which in Portal 2 means speed gel. There is no paint, so
+/// `MaxSpeed()` is [`SV_SPEED_NORMAL`] exactly and the branch's first line
+/// returns `false` every time.
+fn player_should_funnel(
+    mv: &MoveData,
+    hole: &PortalHole,
+    look: Vec3,
+    wishdir: Vec3,
+    vars: &MoveVars,
+) -> bool {
+    if mv.ground.is_some() {
+        return false;
+    }
+    let funnel_up = mv.velocity.z > 165.0;
+    if (wishdir.x.abs() > 64.0 || wishdir.y.abs() > 64.0)
+        || !(funnel_up || (look.z < -0.7 && mv.velocity.z < -165.0))
+    {
+        return false;
+    }
+
+    // **`IsCeilingPortal` is not the mirror of `IsFloorPortal`, and the
+    // comment above this test in the original claims it is.** Both take the
+    // same default threshold and both compare against it directly —
+    // `vForward.z > 0.8` for a floor portal and `vForward.z < 0.8` for a
+    // ceiling one (`portal_base2d_shared.cpp:879`, `:884`) — so *every*
+    // portal that is not in the floor is a "ceiling portal", a wall portal
+    // included. What that means here is that the rising case funnels into a
+    // wall portal overhead as well as into one in the ceiling, where
+    // Valve's comment says *"make sure it's a floor or ceiling portal"*.
+    // Ported as written: the other four conditions still have to pass, and
+    // "fix" it and a fling at a high wall portal stops being helped.
+    let to_portal = hole.world_center() - player_center(mv);
+    let is_floor = hole.forward.z > 0.8;
+    let is_ceiling = hole.forward.z < 0.8;
+    if (funnel_up && !is_ceiling) || (!funnel_up && !is_floor) {
+        return false;
+    }
+
+    // How high the player can still rise, from where they are.
+    let peak = (mv.velocity.z * mv.velocity.z) / (2.0 * vars.gravity);
+    let out_of_reach = match funnel_up {
+        true => to_portal.z > 1024.0 || to_portal.z <= 0.0 || to_portal.z > peak,
+        false => to_portal.z < -1024.0 || to_portal.z >= 0.0,
+    };
+    if out_of_reach {
+        return false;
+    }
+
+    let cone = remap_clamped(to_portal.z.abs(), (256.0, 1024.0), (1.5, 3.0));
+    is_in_portal_funnel_volume(
+        to_portal,
+        hole,
+        hole.half_width * cone,
+        hole.half_height * cone,
+    )
+}
+
+/// `CPortalGameMovement::PortalFunnel` (`portal_gamemovement.cpp:909`) — pick
+/// the nearest portal worth funnelling into and ask
+/// [`air_portal_funnel`] for the push.
+///
+/// Returns the force to add to the wish direction; [`air_portal_funnel`] also
+/// damps the velocity directly, which is the half of the effect that makes the
+/// player *stop* drifting once they are going to arrive centred.
+fn portal_funnel(
+    mv: &mut MoveData,
+    holes: &PortalHoles,
+    wishdir: Vec3,
+    vars: &MoveVars,
+    dt: f32,
+) -> Vec3 {
+    let look = mv.angles.vectors().0;
+    let center = player_center(mv);
+
+    let mut best: Option<(PortalHole, Vec3, f32)> = None;
+    for wall in holes.iter() {
+        // `IsActivedAndLinked`.
+        if wall.link().is_none() {
+            continue;
+        }
+        let hole = wall.hole();
+        let to_portal = hole.world_center() - center;
+        let distance = to_portal.length_squared();
+        if !player_should_funnel(mv, hole, look, wishdir, vars) {
+            continue;
+        }
+        if best.is_none_or(|(_, _, nearest)| distance < nearest) {
+            best = Some((*hole, to_portal, distance));
+        }
+    }
+    let Some((_, to_portal, _)) = best else {
+        return Vec3::ZERO;
+    };
+
+    // Only the air branch — see [`player_should_funnel`] for why the ground
+    // one is unreachable without paint.
+    let height = -to_portal.z - FUNNEL_HEIGHT_ADJUST;
+    let extra = remap_clamped(mv.velocity.z, (0.0, 1065.0), (1.0, FUNNEL_SPEED_BONUS));
+
+    // When do we hit the portal? `-g t²/2 + v t + h = 0`, written as
+    // `SolveQuadratic( -g, 2v, 2h )`.
+    let roots = solve_quadratic(-vars.gravity, 2.0 * mv.velocity.z, 2.0 * height);
+    let Some((first, second)) = roots else {
+        return Vec3::ZERO;
+    };
+    // *"flRoot1 > 0 ? flRoot1 : flRoot2"*, then the earlier of the two when
+    // both are ahead — which is not the same as `min`, because a negative
+    // first root must not be replaced by a negative second one.
+    let mut time = match first > 0.0 {
+        true => first,
+        false => second,
+    };
+    if second < first && second >= 0.0 && first >= 0.0 {
+        time = second;
+    }
+
+    air_portal_funnel(mv, to_portal, extra, time, dt)
+}
+
+/// `CPortalGameMovement::AirPortalFunnel` (`portal_gamemovement.cpp:981`) —
+/// per horizontal axis, either pull towards the portal or damp what is already
+/// there.
+///
+/// The question asked per axis is *"will I make it to the centre in time"*,
+/// and the two answers are opposites: if not, add a force proportional to the
+/// distance left; if so, **bleed the speed off**, because arriving centred and
+/// still moving sideways means leaving centred and still moving sideways.
+///
+/// The decay's half-life comes from how far away the portal is — 0.01 seconds
+/// at 128 units, 0.15 at 1,024 — so a distant portal corrects gently and a
+/// close one snaps.
+fn air_portal_funnel(mv: &mut MoveData, to_portal: Vec3, extra: f32, time: f32, dt: f32) -> Vec3 {
+    let halflife = remap_clamped(to_portal.z.abs(), (128.0, 1024.0), (0.01, 0.15));
+    let decay = exponential_decay(halflife, dt);
+
+    let mut force = Vec3::ZERO;
+    for axis in 0..2 {
+        let velocity = mv.velocity[axis];
+        // **A zero velocity is "will not make it"**, not "is already there":
+        // Valve's guard is `if( mv->m_vecVelocity[i] )`, so a player with no
+        // sideways speed at all gets the pull rather than the decay.
+        let in_time = velocity != 0.0 && (to_portal[axis] / velocity) < time;
+        if !in_time {
+            force[axis] = to_portal[axis] * extra * PORTAL_FUNNEL_AMOUNT - velocity;
+        } else if velocity.abs() > FUNNEL_SNAP_THRESHOLD {
+            mv.velocity[axis] = velocity * decay;
+        } else {
+            mv.velocity[axis] = 0.0;
+        }
+    }
+    force
+}
+
+/// `player->WorldSpaceCenter()` — the middle of the player's hull, where
+/// [`MoveData::origin`] is their feet.
+fn player_center(mv: &MoveData) -> Vec3 {
+    mv.origin + (player_mins(mv.ducked) + player_maxs(mv.ducked)) * 0.5
 }
 
 /// `CPortalGameMovement::Friction` (`portal_gamemovement.cpp:3356`).
@@ -997,6 +1332,24 @@ fn set_ground(mv: &mut MoveData, ground: Option<Vec3>) {
     }
 }
 
+/// Is this what a player stands on? — the test
+/// `CPortalGameMovement::CategorizePosition`, its four-quadrant retry,
+/// `StepMove`'s step-down and `StayOnGround` all spell out in place.
+///
+/// `DidHit() && normal.z >= CRITICAL_SLOPE`, **or the portal transition
+/// ramp** — see [`Trace::hit_portal_ramp`](crate::engine::trace::Trace::hit_portal_ramp),
+/// which is how a slightly-angled portal transition stops presenting as an
+/// unclimbable step.
+///
+/// Valve writes the two halves the other way up — *"was on ground, but now
+/// suddenly am not"* is `!pm.m_pEnt || ((traceNormalAngle < flStandableAngle)
+/// && !pm.HitPortalRamp(stickNormal))` (`portal_gamemovement.cpp:1320`) — and
+/// `!pm.m_pEnt` is this port's `!did_hit()`, because a trace that hit nothing
+/// has no entity and a trace that hit the world has one.
+fn standable(trace: &crate::engine::trace::Trace) -> bool {
+    trace.did_hit() && (trace.normal.z >= CRITICAL_SLOPE || trace.hit_portal_ramp(Vec3::Z))
+}
+
 /// `TracePlayerBBoxForGround` (`gamemovement.cpp:4049`) — retry the ground
 /// trace with each quadrant of the hull, looking for a shallower slope one
 /// corner of the player is standing on.
@@ -1004,6 +1357,13 @@ fn set_ground(mv: &mut MoveData, ground: Option<Vec3>) {
 /// The fraction and endpoint of the *original* trace are restored on the way
 /// out, "so we don't try to move the player down to the new floor and get stuck
 /// on a leaning wall that the original trace hit first".
+///
+/// **Portal's version is the same four quadrants with
+/// [`standable`] in place of the slope test** — all four of
+/// `PortalTracePlayerBBoxForGround`'s comparisons are
+/// `(flNormalCos >= 0.7f) || pm.HitPortalRamp( Vector( 0, 0, 1 ) )`
+/// (`portal_gamemovement.cpp:2065`, `:2099`, `:2133`, `:2167`), and the world
+/// up they pass is a literal rather than the stick normal.
 fn trace_player_bbox_for_ground(
     mv: &MoveData,
     tracer: &mut Tracer<'_>,
@@ -1043,7 +1403,7 @@ fn trace_player_bbox_for_ground(
     for (mins, maxs) in quadrants {
         let ray = Ray::hull(start, end, mins, maxs);
         *pm = tracer.trace(&ray, Contents::MASK_PLAYERSOLID);
-        if pm.did_hit() && pm.normal.z >= CRITICAL_SLOPE {
+        if standable(pm) {
             break;
         }
     }
@@ -1092,9 +1452,6 @@ fn categorize_position(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVa
         move_to_end_pos = false;
     } else {
         let mut pm = trace_player_bbox(mv, tracer, bump_origin, point);
-
-        let standable =
-            |t: &crate::engine::trace::Trace| t.did_hit() && t.normal.z >= CRITICAL_SLOPE;
 
         if !standable(&pm) {
             // Test four sub-boxes for a shallower slope we could stand on.
@@ -1501,7 +1858,13 @@ pub fn full_noclip_move(mv: &mut MoveData, vars: &MoveVars, dt: f32) {
 /// *before* the move so that a player standing still on a conveyor does not
 /// slow relative to it; and `CategorizePosition` runs after the move so the
 /// next frame knows whether there is ground.
-pub fn full_walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32) {
+pub fn full_walk_move(
+    mv: &mut MoveData,
+    tracer: &mut Tracer<'_>,
+    holes: &PortalHoles,
+    vars: &MoveVars,
+    dt: f32,
+) {
     start_gravity(mv, vars, dt);
 
     // The water branch (`CheckWater`, `WaterMove`, `WaterJump`) is not ported —
@@ -1526,7 +1889,7 @@ pub fn full_walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVar
     if mv.ground.is_some() {
         walk_move(mv, tracer, vars, dt);
     } else {
-        air_move(mv, tracer, vars, dt);
+        air_move(mv, tracer, holes, vars, dt);
     }
 
     categorize_position(mv, tracer, vars);
@@ -2153,9 +2516,14 @@ pub fn player_move<'a>(
         mv.view_offset = VEC_DEAD_VIEWHEIGHT;
     }
 
+    // A map with no portals still walks, and `air_move` still asks the list —
+    // it just has nothing in it. Built here rather than threaded as an
+    // `Option` because the funnel's loop over an empty list is one branch and
+    // an `Option` at every use is not.
+    let no_portals = PortalHoles::default();
     match mv.move_type {
         MoveType::Noclip => full_noclip_move(mv, vars, dt),
-        MoveType::Walk => full_walk_move(mv, tracer, vars, dt),
+        MoveType::Walk => full_walk_move(mv, tracer, portals.unwrap_or(&no_portals), vars, dt),
         MoveType::FlyGravity => full_toss_move(mv, tracer, vars, dt),
     }
 
@@ -2951,8 +3319,149 @@ mod tests {
         assert!(mv.angles.pitch.abs() < 1e-2 && mv.angles.roll.abs() < 1e-2);
     }
 
+    /// A floor portal and its partner, in an otherwise empty world, with
+    /// nothing to land on — the funnel's fixture.
+    ///
+    /// The portal faces straight up (`pitch -90` puts `forward` on `+Z`) and
+    /// sits at the origin; the partner is a thousand units away, because
+    /// `player_should_funnel` only asks about linked portals and never looks
+    /// at where the partner is.
+    fn a_floor_portal() -> (CollisionBsp, PortalHoles) {
+        use crate::engine::trace::{LivePortal, PortalLink};
+        use crate::server::classes::portal::teleport_matrix;
+
+        let floor_at = (Vec3::ZERO, Vec3::new(-90.0, 0.0, 0.0));
+        let exit_at = (Vec3::new(1000.0, 0.0, 0.0), Vec3::ZERO);
+        let hole = |(origin, angles): (Vec3, Vec3)| PortalHole::new(origin, angles, 32.0, 56.0);
+
+        // One brush, far below and far to the side: the fall has to be free,
+        // but `PortalHoles::sync` wants a collision model to carve against.
+        let mut fixture = fixture::Fixture::default();
+        fixture.add_box(
+            Vec3::new(-2000.0, -2000.0, -2000.0),
+            Vec3::new(2000.0, 2000.0, -1900.0),
+            Contents::SOLID,
+            true,
+        );
+        let collision = fixture.single_leaf();
+
+        let live = [
+            LivePortal {
+                id: 1,
+                hole: hole(floor_at),
+                link: Some(PortalLink {
+                    exit_id: 2,
+                    exit: hole(exit_at),
+                    to_exit: teleport_matrix(floor_at, exit_at),
+                    to_entrance: teleport_matrix(exit_at, floor_at),
+                }),
+            },
+            LivePortal {
+                id: 2,
+                hole: hole(exit_at),
+                link: Some(PortalLink {
+                    exit_id: 1,
+                    exit: hole(floor_at),
+                    to_exit: teleport_matrix(exit_at, floor_at),
+                    to_entrance: teleport_matrix(floor_at, exit_at),
+                }),
+            },
+        ];
+        let mut holes = PortalHoles::default();
+        holes.sync(&collision, &live);
+        (collision, holes)
+    }
+
+    /// **The funnel.** A player falling past a floor portal, off its axis and
+    /// looking down, is pulled onto it — and the same fall with no portal in
+    /// the level is not.
+    ///
+    /// This is `IsFloorPortal`'s one remaining consumer on the player's path;
+    /// see [`player_should_funnel`] for where the other three went.
+    #[test]
+    fn falling_towards_a_floor_portal_pulls_the_player_onto_its_axis() {
+        let (collision, holes) = a_floor_portal();
+
+        // Off the axis, well above it, already falling fast enough to qualify
+        // (`velocity.z < -165`) and looking down (`pitch 60` puts the view
+        // forward's `z` at `-sin 60`, which clears the `-0.7` threshold).
+        let start = Vec3::new(40.0, 0.0, 400.0);
+        let drop = |holes: &PortalHoles| {
+            let mut mv = walker(start);
+            mv.angles = ViewAngles::new(60.0, 0.0);
+            mv.velocity = Vec3::new(0.0, 0.0, -300.0);
+            run_portals(&mut mv, &collision, holes, 30, |_| {});
+            mv
+        };
+
+        let funnelled = drop(&holes);
+        let control = drop(&PortalHoles::default());
+
+        assert!(
+            control.origin.x == start.x && control.velocity.x == 0.0,
+            "the control drifted with no portal in the level: {}",
+            control.origin
+        );
+        assert!(
+            funnelled.velocity.x < -10.0,
+            "the funnel did not pull the player towards the axis: {}",
+            funnelled.velocity
+        );
+        assert!(
+            funnelled.origin.x < start.x - 5.0,
+            "…and did not move them: {} from {start}",
+            funnelled.origin
+        );
+        assert!(
+            funnelled.origin.x > 0.0,
+            "the funnel overshot the portal's axis: {}",
+            funnelled.origin
+        );
+    }
+
+    /// The funnel's own three refusals, each one alone: a fling is not
+    /// funnelled, a player steering hard is not funnelled, and a player who is
+    /// not looking down is not funnelled into a portal below them.
+    #[test]
+    fn the_funnel_refuses_a_fling_a_steer_and_a_player_looking_up() {
+        let (collision, holes) = a_floor_portal();
+        let start = Vec3::new(40.0, 0.0, 400.0);
+
+        let drift = |velocity: Vec3, pitch: f32, sidemove: f32| {
+            let mut mv = walker(start);
+            mv.angles = ViewAngles::new(pitch, 0.0);
+            mv.velocity = velocity;
+            run_portals(&mut mv, &collision, &holes, 30, |mv| {
+                mv.sidemove = sidemove;
+            });
+            mv.origin.x - start.x
+        };
+
+        let falling = Vec3::new(0.0, 0.0, -300.0);
+        assert!(drift(falling, 60.0, 0.0) < -5.0, "the control funnels");
+        // Past `MIN_FLING_SPEED` horizontally the branch is the fling
+        // cancellation instead, and the funnel never runs.
+        let flung = Vec3::new(0.0, 400.0, -300.0);
+        assert!(
+            drift(flung, 60.0, 0.0).abs() < 1.0,
+            "a fling was funnelled"
+        );
+        // Looking ahead rather than down.
+        assert!(
+            drift(falling, 0.0, 0.0).abs() < 1.0,
+            "a player not looking into the portal was funnelled"
+        );
+        // Steering hard sideways — `|wishdir| > 64` on a horizontal axis. At
+        // yaw 0 `right` is `-Y`, so the steer itself moves the player along
+        // `y` and leaves `x` to say whether the funnel ran.
+        assert!(
+            drift(falling, 60.0, SV_SPEED_NORMAL).abs() < 1.0,
+            "a player steering hard sideways was still pulled in"
+        );
+    }
+
     /// The trigger is the box's **centre** crossing the plane, not its near
-    /// face touching it.
+    /// face touching it.""
     ///
     /// A player walked up to the portal is in its environment — which is what
     /// makes the next move traced against the carve — and has not gone
@@ -3198,6 +3707,13 @@ mod tests {
 
         let (mut pairs, mut walked, mut skipped, mut blocked) = (0usize, 0usize, 0usize, 0usize);
         let mut mismatched = 0usize;
+        // How each pair tilts the player's up axis — the number the transition
+        // ramp exists for. `|m[2][2]|` is `ShouldPortalTransitionCrouch`'s own
+        // quantity: 1 means up stays up, below `cos 30°` means an AABB cannot
+        // make the trip standing, and *between* the two is the case Valve
+        // calls "slightly angled" and builds `pAABBAngleTransformCollideable`
+        // to rescue.
+        let (mut flat, mut angled, mut crouching) = (0usize, 0usize, 0usize);
         let (mut carved, mut worst) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let (mut pieces, mut tube, mut remote) = (0usize, 0usize, 0usize);
         let mut report: Vec<String> = Vec::new();
@@ -3245,6 +3761,12 @@ mod tests {
                     })
                 };
                 pairs += 1;
+                let tilt = teleport_matrix(a, b).z_axis.z.abs();
+                match tilt {
+                    _ if tilt > 0.9999 => flat += 1,
+                    _ if tilt < COS_PI_OVER_SIX => crouching += 1,
+                    _ => angled += 1,
+                }
 
                 let live = [
                     LivePortal {
@@ -3344,7 +3866,9 @@ mod tests {
              {mismatched} adjacent pairs were different sizes.\n  \
              {pieces} carved pieces, {tube} tube slabs and {remote} remote pieces \
              between them; carving a linked pair took {:.2} ms on average and \
-             {:.2} ms at worst.",
+             {:.2} ms at worst.\n  \
+             {flat} keep the up axis, {crouching} turn it far enough to force a \
+             crouch, {angled} land in between — the transition ramp's case.",
             carved.as_secs_f32() * 1000.0 / pairs.max(1) as f32,
             worst.as_secs_f32() * 1000.0,
         );
