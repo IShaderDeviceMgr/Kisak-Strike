@@ -285,6 +285,7 @@ pub struct MoveData { /* origin, velocity, angles, forwardmove, sidemove, upmove
                         buttons, old_buttons, max_speed, move_type, ground,
                         surface_friction, ducked, ducking, duck_time_msecs,
                         view_offset, speed_cropped,
+                        out_wish_vel, touched_physics,
                         move_start, portal_environment, teleported */ }
 
 /// What a teleport did, for the caller to finish — see "The teleport" below.
@@ -857,6 +858,35 @@ Same ordering: most likely to bite first.
   pogo stick and duck reads it for press and release edges — both are questions about the
   *previous* command, so a `MoveData` built fresh each frame has to carry it in and out.
   Drop the round-trip and jump fires every frame the key is held.
+
+- **`out_wish_vel` is not a velocity the player has.** `m_outWishVel`
+  (`igamemovement.h:69`) is *"this is where you tried"*: how much velocity the
+  move **asked** for, accumulated by `accelerate` and `walk_move` as it was
+  applied and given back by `friction` as it was taken away, and cleared at the
+  top of every `player_move`. It has exactly one consumer — the player's
+  physics shadow (`rustdocs/VPHYSICS.md` §4c) — and the reason it exists rather
+  than the velocity is that **a player walking into a wall has a velocity of
+  nearly zero and a wish velocity of nearly 175**, which is precisely the case
+  where a cube should still be pushed.
+
+  Two things about the accumulation are Valve's and look wrong:
+  `air_accelerate` deliberately does **not** contribute (only
+  `CGameMovement::Accelerate` does, `gamemovement.cpp:1999`), so what the
+  shadow may push with is earned on the ground; and `friction`'s subtraction
+  runs with a *proportion* here where Valve's runs with an absolute speed on
+  every airborne tick — a bug, corrected, recorded in
+  `portdocs/VPHYSICS_SHADOW.md` §6 beside the other one it is a twin of.
+
+- **`touched_physics` is `m_bTouchedPhysObject`, and it is sticky for the whole
+  command.** Set by any player trace a prop won (`Trace::hit_prop`), cleared
+  once per `player_move`. Its consumer is `Client::run_move`'s tail, which is
+  `PostThinkVPhysics` (`baseplayer_shared.cpp:3316`): **when the move did not
+  touch a prop, the accumulated `out_wish_vel` is thrown away and replaced by
+  `(max_speed, max_speed, max_speed)`.** Without that the shadow would be
+  capped at one tick of acceleration and would lag the player constantly,
+  teleporting to catch up. Valve reads the same fact off the entity touch list
+  (`CBasePlayer::Touch`, `player.cpp:4920`) because their trace cannot answer;
+  ours can, which is why `Trace` grew a field.
 
 - **`speed_cropped` must be false at the start of every command.** It is
   `m_iSpeedCropped`, and it exists so the ducking speed crop applies once; leave it set

@@ -221,6 +221,56 @@ impl Work<'_> {
     }
 }
 
+/// What one swept box met among the **physics props** — the answer
+/// [`Tracer::with_props`] merges into a trace.
+///
+/// Three fields, because three is what `CPhysicsCollision::TraceBox`
+/// (`vphysics/physics_collide.cpp`) fills in: the shipped engine's
+/// `ClipRayToVPhysics` (`engine/enginetrace.cpp:1115`) hands it a bare
+/// `trace_t` and everything else in the result is written by the engine
+/// afterwards from the *entity*, not from the collision.
+///
+/// **No entity, deliberately.** [`Trace`] has no `m_pEnt` either and for the
+/// same reason (`portdocs/ENGINE_TRACE.md` §4.2) — a caller that needs to know
+/// *which* prop it hit is asking a physics question and should ask the physics
+/// module, which is the only place the answer is a stable identity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropHit {
+    /// How far along the sweep, in `[0, 1]`. **Before** `DIST_EPSILON` is
+    /// taken off — the merge does that, so that an implementor does not have
+    /// to know this module's slack convention.
+    pub fraction: f32,
+    /// The normal of the surface hit, pointing out of it.
+    pub normal: Vec3,
+    /// The box was already inside this prop when the sweep began.
+    pub start_solid: bool,
+}
+
+/// The physics props, as something a [`Tracer`] can sweep against.
+///
+/// # Why this is a trait and not a slice
+///
+/// `with_entities` takes a slice because a brush model is geometry this module
+/// already understands. A physics prop is not: its hulls live in
+/// `src/vphysics/`, they are Rapier shapes, and they are indexed by a broad
+/// phase that module owns. Copying them here would mean two collision
+/// representations of the same cube that are free to disagree.
+///
+/// So the sweep is asked for, and the dependency points the way every other
+/// seam in this port does: **`engine/` implements it over the server's
+/// physics**, `server/` never names `engine::trace`, and `trace/` never names
+/// `vphysics`. It is `super::super::TouchQuery`'s shape with the two ends
+/// swapped.
+pub trait PropQuery {
+    /// Sweep an axis-aligned box of half-extents `half`, centred on `start`,
+    /// to `end`.
+    ///
+    /// `half`/`start` are the *centred* form — `Ray`'s, not the caller's — so
+    /// an implementor never has to know where an entity's origin sits inside
+    /// its hull.
+    fn sweep(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<PropHit>;
+}
+
 /// Traces against one collision model.
 ///
 /// Holds the per-trace scratch, so **make one and keep it**: a fresh `Tracer`
@@ -228,7 +278,6 @@ impl Work<'_> {
 /// `BeginTrace`/`EndTrace` pair (`engine/cmodel.cpp:66`, `:111`) expressed as a
 /// borrow — including the re-entrancy those two managed by hand with
 /// `PushTraceVisits` and a depth counter, which here is [`Visits`].
-#[derive(Debug)]
 pub struct Tracer<'a> {
     bsp: &'a CollisionBsp,
     visits: Visits,
@@ -253,6 +302,26 @@ pub struct Tracer<'a> {
     /// Outside the hole entirely, so that setting it before or after
     /// [`with_hole`](Tracer::with_hole) is the same thing.
     exit_extents: Option<Vec3>,
+    /// The physics props in the clip chain — see
+    /// [`with_props`](Tracer::with_props). `None` by default, which is every
+    /// trace in the port that is not the player's movement.
+    ///
+    /// A trait object, so the `Debug` the rest of a `Tracer` derives has to be
+    /// written by hand below.
+    props: Option<&'a dyn PropQuery>,
+}
+
+impl std::fmt::Debug for Tracer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracer")
+            .field("bsp", &self.bsp)
+            .field("visits", &self.visits)
+            .field("entities", &self.entities)
+            .field("hole", &self.hole)
+            .field("exit_extents", &self.exit_extents)
+            .field("props", &self.props.map(|_| "..."))
+            .finish()
+    }
 }
 
 /// One attached hole, with a set of visit stamps per model it sweeps.
@@ -294,6 +363,7 @@ impl<'a> Tracer<'a> {
             entities: &[],
             hole: None,
             exit_extents: None,
+            props: None,
         }
     }
 
@@ -325,6 +395,32 @@ impl<'a> Tracer<'a> {
     /// is needed.
     pub fn with_entities(mut self, entities: &'a [BrushModel]) -> Tracer<'a> {
         self.entities = entities;
+        self
+    }
+
+    /// Puts the **physics props** in the clip chain — the thing that makes a
+    /// cube a wall.
+    ///
+    /// `CEngineTrace::ClipRayToVPhysics` (`engine/enginetrace.cpp:1115`) is
+    /// what this stands in for, and the shipped engine reaches it for exactly
+    /// the entities whose `GetSolid()` is `SOLID_VPHYSICS`. Which props those
+    /// are is the game's decision and not this module's, the same way
+    /// [`with_entities`](Tracer::with_entities)' is — see [`PropQuery`].
+    ///
+    /// **Additive, like `with_entities` and unlike
+    /// [`with_hole`](Tracer::with_hole).** The prop sweep runs after the
+    /// world and the brush entities and the nearest of the three wins, which
+    /// is `CEngineTrace::ClipRayToEntity`'s own order.
+    ///
+    /// > **It runs only for a mask containing [`Contents::SOLID`].** A
+    /// > physics prop reports `CONTENTS_SOLID` and nothing else here, where
+    /// > Valve reads `studiohdr_t::contents` (`enginetrace.cpp:1099`) — see
+    /// > `portdocs/VPHYSICS_SHADOW.md` §2.3. The consequence is that a light
+    /// > trace, a `MASK_OPAQUE` trace and a paint trace are all unaffected by
+    /// > props, which is right for the first two and is a divergence for
+    /// > nothing that currently exists.
+    pub fn with_props(mut self, props: &'a dyn PropQuery) -> Tracer<'a> {
+        self.props = Some(props);
         self
     }
 
@@ -419,7 +515,7 @@ impl<'a> Tracer<'a> {
     /// answer *or* the portal's carved one, whichever went further. See
     /// [`with_hole`](Tracer::with_hole), which is the only way to get one.
     pub fn trace(&mut self, ray: &Ray, mask: Contents) -> Trace {
-        let real = match self.entities.is_empty() {
+        let real = match self.entities.is_empty() && self.props.is_none() {
             true => self.trace_world(ray, mask),
             false => self.trace_chain(ray, mask),
         };
@@ -760,6 +856,20 @@ impl<'a> Tracer<'a> {
             clip_trace_to_trace(&clip, &mut trace);
             if trace.all_solid {
                 break;
+            }
+        }
+
+        // The props, swept against the same rescaled ray the brush entities
+        // were — which is what keeps the `*= world_fraction` below correct for
+        // all three sources at once.
+        if let Some(props) = self.props.filter(|_| !trace.all_solid) {
+            if mask.intersects(Contents::SOLID) {
+                let start = entity_ray.start;
+                let hit = props.sweep(entity_ray.extents, start, start + entity_ray.delta);
+                if let Some(hit) = hit {
+                    let clip = prop_trace(&entity_ray, &hit);
+                    clip_trace_to_trace(&clip, &mut trace);
+                }
             }
         }
 
@@ -1173,6 +1283,66 @@ fn compute_trace_endpoints(ray: &Ray, trace: &mut Trace) {
     trace.start = start + ray.delta * trace.fraction_left_solid;
 }
 
+/// A [`PropHit`] as a [`Trace`], with this module's slack convention applied.
+///
+/// The two things the physics sweep cannot know about:
+///
+/// - **`DIST_EPSILON`.** The brush sweep bakes 1/32 of a unit into every plane
+///   it tests (`hull.rs:77`), so it stops just short of the surface and a
+///   player never fuses to a wall. A shape cast has no equivalent, so the
+///   backoff is taken off the fraction here — converted from a distance to a
+///   fraction by the sweep's own length, which is why a zero-length sweep
+///   skips it rather than dividing by zero.
+/// - **The trace fields that describe a *brush*.** `contents`, `surface`,
+///   `surface_flags` and `disp_flags` all come from `.bsp` data a prop has
+///   none of. `contents` is [`Contents::SOLID`] because that is what every
+///   consumer needs to see to treat the hit as solid at all; the other three
+///   stay at their miss values, so a caller asking "what material did I hit"
+///   gets the null surface rather than a wrong one.
+fn prop_trace(ray: &Ray, hit: &PropHit) -> Trace {
+    let length = ray.delta.length();
+    let backoff = match length > 0.0 {
+        true => DIST_EPSILON / length,
+        false => 0.0,
+    };
+    let fraction = match hit.start_solid {
+        true => 0.0,
+        false => (hit.fraction - backoff).max(0.0),
+    };
+    let start = ray.origin();
+    Trace {
+        start,
+        end: start + ray.delta * fraction,
+        normal: hit.normal,
+        plane_dist: hit.normal.dot(start + ray.delta * fraction),
+        fraction,
+        // **A ray that starts inside a prop reports no exit fraction**, where
+        // the brush sweep would. `fraction_left_solid` is "how far along the
+        // sweep it stopped being inside", and a shape cast reports the entry
+        // and not the exit; getting it would take a second cast from the far
+        // end. Valve's own comment on computing it for a *box* is that it
+        // needs "*a lot* more computation", and `trace_chain` zeroes it for
+        // every box sweep two dozen lines below regardless — so the divergence
+        // is a **ray** that begins inside a prop, and the conservative answer
+        // (zero) only ever leaves the merge preferring whatever the world
+        // said about where the sweep really started.
+        fraction_left_solid: 0.0,
+        contents: Contents::SOLID,
+        surface: None,
+        disp_flags: 0,
+        surface_flags: 0,
+        // A shape cast reports penetration; it does not report *never having
+        // left* it, which is what `all_solid` means. Reporting `all_solid`
+        // from a penetrating start would stop the whole chain
+        // (`trace_chain`'s `break`) on a cube the player is merely clipping
+        // the corner of.
+        all_solid: false,
+        start_solid: hit.start_solid,
+        portal_ramp: false,
+        hit_prop: true,
+    }
+}
+
 /// `CEngineTrace::ClipTraceToTrace` (`engine/enginetrace.cpp:1524`) — keep
 /// whichever of the two hits is nearer, and merge the start-solid state.
 ///
@@ -1377,6 +1547,157 @@ mod tests {
             axial,
         );
         fixture.single_leaf()
+    }
+
+    /// A [`PropQuery`] that reports one axis-aligned box, so that the clip
+    /// chain can be tested without a physics world.
+    struct OneProp {
+        mins: Vec3,
+        maxs: Vec3,
+    }
+
+    impl PropQuery for OneProp {
+        fn sweep(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<PropHit> {
+            // A slab test of the swept box against the prop's box, expanded by
+            // the sweeper's half-extents. Enough for a test and nothing more —
+            // the real one is `Environment::sweep_box`.
+            let mins = self.mins - half;
+            let maxs = self.maxs + half;
+            let delta = end - start;
+            let (mut enter, mut exit) = (0.0f32, 1.0f32);
+            for axis in 0..3 {
+                if delta[axis].abs() < 1e-6 {
+                    if start[axis] < mins[axis] || start[axis] > maxs[axis] {
+                        return None;
+                    }
+                    continue;
+                }
+                let inv = 1.0 / delta[axis];
+                let (mut t0, mut t1) = (
+                    (mins[axis] - start[axis]) * inv,
+                    (maxs[axis] - start[axis]) * inv,
+                );
+                if t0 > t1 {
+                    std::mem::swap(&mut t0, &mut t1);
+                }
+                enter = enter.max(t0);
+                exit = exit.min(t1);
+            }
+            if enter > exit {
+                return None;
+            }
+            let start_solid = enter <= 0.0;
+            // The face the sweep entered through, as an outward normal.
+            let mut normal = Vec3::ZERO;
+            if !start_solid {
+                for axis in 0..3 {
+                    if delta[axis].abs() < 1e-6 {
+                        continue;
+                    }
+                    let inv = 1.0 / delta[axis];
+                    let t0 = (mins[axis] - start[axis]) * inv;
+                    let t1 = (maxs[axis] - start[axis]) * inv;
+                    if (t0.min(t1) - enter).abs() < 1e-6 {
+                        normal[axis] = match delta[axis] > 0.0 {
+                            true => -1.0,
+                            false => 1.0,
+                        };
+                    }
+                }
+            }
+            Some(PropHit {
+                fraction: enter.max(0.0),
+                normal,
+                start_solid,
+            })
+        }
+    }
+
+    /// **A prop stops a sweep that the world would have let through**, which
+    /// is the whole of stage 2 of `portdocs/VPHYSICS_SHADOW.md`: the cube is a
+    /// wall.
+    #[test]
+    fn a_prop_in_the_clip_chain_stops_a_sweep_the_world_would_not() {
+        let world = wall(true);
+        let prop = OneProp {
+            mins: Vec3::new(40.0, -16.0, -16.0),
+            maxs: Vec3::new(72.0, 16.0, 16.0),
+        };
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0));
+
+        let without = world.tracer().trace(&ray, Contents::MASK_PLAYERSOLID);
+        assert!((without.end.x - (100.0 - DIST_EPSILON)).abs() < 1e-3, "{without:?}");
+        assert!(!without.hit_prop);
+
+        let with = world
+            .tracer()
+            .with_props(&prop)
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+        // The prop's near face is at x = 40, and the prop sweep takes the same
+        // `DIST_EPSILON` off that the brush sweep takes off a plane.
+        assert!((with.end.x - (40.0 - DIST_EPSILON)).abs() < 1e-3, "{with:?}");
+        assert_eq!(with.normal, Vec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(with.contents, Contents::SOLID);
+        assert!(with.hit_prop, "the flag `TouchedPhysics()` is derived from");
+    }
+
+    /// …and it does **not** stop one the world already stopped earlier. The
+    /// merge is `ClipTraceToTrace`, so the nearer answer wins whichever source
+    /// it came from.
+    #[test]
+    fn a_prop_behind_a_wall_changes_nothing() {
+        let world = wall(true);
+        let prop = OneProp {
+            mins: Vec3::new(300.0, -16.0, -16.0),
+            maxs: Vec3::new(332.0, 16.0, 16.0),
+        };
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(400.0, 0.0, 0.0));
+        let hit = world
+            .tracer()
+            .with_props(&prop)
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+        assert!((hit.end.x - (100.0 - DIST_EPSILON)).abs() < 1e-3, "{hit:?}");
+        assert!(!hit.hit_prop, "the wall won, so this is not a prop contact");
+    }
+
+    /// **A mask without `CONTENTS_SOLID` never asks the props at all** — a
+    /// light trace, a paint trace. The prop would otherwise report itself as
+    /// solid to a query that was not about solidity.
+    #[test]
+    fn a_mask_without_solid_does_not_see_props() {
+        let world = wall(true);
+        let prop = OneProp {
+            mins: Vec3::new(40.0, -16.0, -16.0),
+            maxs: Vec3::new(72.0, 16.0, 16.0),
+        };
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0));
+        let hit = world
+            .tracer()
+            .with_props(&prop)
+            .trace(&ray, Contents::WATER);
+        assert_eq!(hit.fraction, 1.0, "nothing in this fixture is water");
+        assert!(!hit.hit_prop);
+    }
+
+    /// A sweep that begins inside a prop reports `startsolid` with a fraction
+    /// of zero — and **not** `allsolid`, which would stop the rest of the clip
+    /// chain from being asked at all.
+    #[test]
+    fn a_sweep_starting_inside_a_prop_is_start_solid_but_not_all_solid() {
+        let world = wall(true);
+        let prop = OneProp {
+            mins: Vec3::new(-16.0, -16.0, -16.0),
+            maxs: Vec3::new(16.0, 16.0, 16.0),
+        };
+        let ray = Ray::line(Vec3::ZERO, Vec3::new(200.0, 0.0, 0.0));
+        let hit = world
+            .tracer()
+            .with_props(&prop)
+            .trace(&ray, Contents::MASK_PLAYERSOLID);
+        assert!(hit.start_solid);
+        assert!(!hit.all_solid);
+        assert_eq!(hit.fraction, 0.0);
+        assert!(hit.hit_prop);
     }
 
     #[test]

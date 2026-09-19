@@ -1786,7 +1786,7 @@ walks on — [`rustdocs/CLIENT.md`](CLIENT.md) is its one real consumer.
 |---|---|
 | Replaces | `engine/cmodel.cpp`'s trace, `engine/cmodel_disp.cpp`, `public/dispcoll_common.cpp`, `engine/cmodel_bsp.cpp`'s load, `CCollisionBSPData` |
 | Depends on | `world::bsp` (the lumps), `glam`, `crate::math`. **No GPU, no window, no I/O** |
-| Status | world brushes, brush models, displacements **and the clip chain** — no static props, no vcollide |
+| Status | world brushes, brush models, displacements, **the clip chain** and **the physics props** — no static-prop vcollide |
 
 ### Quick start
 
@@ -1953,6 +1953,9 @@ impl Tracer<'_> {
     pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
     /// Stage 4: put brush entities in the clip chain. See below.
     pub fn with_entities(self, entities: &[BrushModel]) -> Tracer<'_>;
+    /// Put the **physics props** in the clip chain — the thing that makes a
+    /// cube a wall. See below.
+    pub fn with_props(self, props: &dyn PropQuery) -> Tracer<'_>;
     /// `GetBrushesInAABB` — the world brushes an axis-aligned box overlaps,
     /// as indices into the collision model's own table. See below.
     pub fn brushes_in_box(&mut self, mins: Vec3, maxs: Vec3, mask: Contents) -> Vec<usize>;
@@ -2066,6 +2069,58 @@ The chain is walked linearly — Valve's spatial partition replaced by nothing, 
 A Portal 2 map has a few hundred brush entities (78 on `sp_a1_intro1`), each rejected by a
 bounding-box test at the top of its own BSP descent, and §5 of the portdoc already records
 that `parry`'s `Qbvh` is where a broadphase comes from when one is needed.
+
+### The props in the chain — `with_props` and `PropQuery`
+
+`CEngineTrace::ClipRayToVPhysics` (`engine/enginetrace.cpp:1115`), and the reason the
+player is stopped by a cube. In the shipped engine the trace reaches it for any entity
+whose `GetSolid()` is `SOLID_VPHYSICS`, asks that entity's physics object for its
+`CPhysCollide`, and sweeps the box against it — no BSP, no brush list, nothing this module
+understands.
+
+So this half is a **trait**, where `with_entities` takes a slice:
+
+```rust
+pub trait PropQuery {
+    /// `half`/`start` are the *centred* form — `Ray`'s, not the caller's.
+    fn sweep(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<PropHit>;
+}
+
+pub struct PropHit {
+    /// Before `DIST_EPSILON`; the merge takes that off.
+    pub fraction: f32,
+    pub normal: Vec3,
+    pub start_solid: bool,
+}
+```
+
+A prop's hulls live in `src/vphysics/`, are Rapier shapes, and are indexed by a broad
+phase that module owns; copying them here would be two collision representations of the
+same cube, free to disagree. **The one implementation is `engine/mod.rs`'s
+`PhysicsProps`**, over the server's `Physics` — `trace/` must not name `vphysics` and
+`server/` must not name `engine`, and `engine/` may name both. It is `TouchQuery`'s
+arrangement with the two ends swapped.
+
+Three things about the merge:
+
+- **It is additive**, like `with_entities` and unlike `with_hole`: the prop sweep runs
+  after the world and the brush entities, against the same shortened ray, and
+  `ClipTraceToTrace` keeps the nearest of the three.
+- **It runs only for a mask containing `CONTENTS_SOLID`.** A prop reports `CONTENTS_SOLID`
+  and nothing else here, where Valve reads `studiohdr_t::contents`
+  (`enginetrace.cpp:1099`); the port has never parsed that field. Every mask that matters
+  contains the bit, so the only divergence would be a physics prop compiled
+  `$contents grate`, and the game ships none that gets a body.
+- **A prop hit never reports `all_solid`.** A shape cast reports penetration, not *never
+  having left* it, and reporting `all_solid` would stop the whole chain on a cube the
+  player is clipping the corner of.
+
+`Trace::hit_prop` is set by this and by nothing else. It is the second field on `Trace`
+that is not about the surface hit (`portal_ramp` is the first), and it exists because
+`CBasePlayer::TouchedPhysics()` decides how hard the player's physics shadow may push —
+see `rustdocs/CLIENT.md` on `MoveData::out_wish_vel`. Valve gets that fact from the entity
+touch list instead, because their trace throws the entity away before
+`PostThinkVPhysics` runs.
 
 ### The box query — `brushes_in_box`
 

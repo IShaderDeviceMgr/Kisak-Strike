@@ -174,6 +174,14 @@ pub struct Server {
     /// `PhysicsTouchTriggers( &vecPrevOrigin )`. Updated by the pass and by
     /// nothing else, so it spans however many rendered frames a tick took.
     player_prev_origin: Vec3,
+    /// `m_vNewVPhysicsVelocity` as the client last reported it — see
+    /// [`PlayerState::wish_velocity`].
+    ///
+    /// Held on the server rather than on the player's [`EntityCore`] because
+    /// no entity has one: it is a *movement* output that exists only to be
+    /// handed to the physics shadow, and putting it on the core would offer it
+    /// to 49 classes that must not read it.
+    player_wish_velocity: Vec3,
     /// Scratch for the touch query, so that a tick does not allocate.
     overlaps: Vec<usize>,
     /// Scratch for the [`Solid::Obb`](movement::Solid::Obb) half of the same
@@ -486,6 +494,15 @@ pub struct PlayerState {
     /// `logic_playerproxy`, which fires `OnJump` and `OnDuck` on the press
     /// edge.
     pub buttons: u32,
+    /// `m_vNewVPhysicsVelocity` (`player.h:1304`) — **the client's**, read by
+    /// the server and never written.
+    ///
+    /// What the last move *asked* for, after
+    /// `PostThinkVPhysics`'s substitution. Its one reader is the player's
+    /// physics shadow ([`crate::vphysics::shadow`]), which uses it as the cap
+    /// on how hard it may push a prop: it is why walking into a cube pushes it
+    /// and standing against one does not.
+    pub wish_velocity: Vec3,
 }
 
 /// One entity's studio model, as the renderer needs to see it.
@@ -757,6 +774,7 @@ impl Server {
             player: None,
             player_was_ducked: false,
             player_prev_origin: Vec3::ZERO,
+            player_wish_velocity: Vec3::ZERO,
             overlaps: Vec::new(),
             obb_overlaps: Vec::new(),
             pending_spawn: Vec::new(),
@@ -1148,6 +1166,13 @@ impl Server {
         }
     }
 
+    /// The level's physics, for a caller that needs to *ask* it something —
+    /// `physenv`. The one consumer outside this module is `engine/`'s
+    /// `PhysicsProps`, which puts the props in the player's clip chain.
+    pub fn physics(&self) -> Option<&physics::Physics> {
+        self.physics.as_ref()
+    }
+
     /// What the level's physics is made of, for the load-time line and for the
     /// depot test. `None` when the level has no environment.
     pub fn physics_stats(&self) -> Option<&physics::PhysicsStats> {
@@ -1217,7 +1242,7 @@ impl Server {
         // `CPhysicsHook::FrameUpdatePostEntityThink` — after every think and
         // before the touch sweep, so that a cube which moved this tick is in
         // its new place when `check_for_entity_untouch` looks.
-        self.step_physics();
+        self.step_physics(query);
         self.refresh_attachment_children();
         self.check_for_entity_untouch();
         self.service_events();
@@ -1367,25 +1392,56 @@ impl Server {
         let Some(player) = self.player else {
             return;
         };
-        let Some(entity) = self.entities.get(player) else {
+        if self.entities.get(player).is_none() {
             // The handle stopped resolving — a `Kill` at `!player`, which two
             // shipped connections send.
             self.player = None;
             return;
-        };
+        }
+        let start = self.player_prev_origin;
+        if let Some(settled) = self.touch_triggers(player, start, query) {
+            self.player_prev_origin = settled;
+        }
+    }
+
+    /// `PhysicsTouchTriggers( &vecPrevOrigin )` for **any** solid non-trigger
+    /// — the player, and every physics prop that moved this tick.
+    ///
+    /// Returns where the entity ended up, for the caller to keep as the next
+    /// sweep's start, or `None` if the entity was not eligible at all (gone,
+    /// or not solid).
+    ///
+    /// > **The prop half is what makes a cube press a floor button.** Valve
+    /// > reaches it from `VPhysicsUpdate` (`baseentity_shared.cpp:1317`),
+    /// > which is `PhysFrame`'s second phase; this port did the
+    /// > `SetAbsOrigin`/`SetAbsAngles` of that phase from the day the cube
+    /// > could fall and left this out, because a cube that could not move was
+    /// > not going to enter anything.
+    ///
+    /// > **The branch is the same for both.** `GetRequiredTriggerFlags` picks
+    /// > `isSolidCheckTriggers` for anything that `IsSolid()` and is not
+    /// > itself `FSOLID_TRIGGER`, which is as true of a `SOLID_VPHYSICS` cube
+    /// > as it is of the player, so the only per-entity input is the swept
+    /// > box.
+    fn touch_triggers(
+        &mut self,
+        id: EntityId,
+        start: Vec3,
+        query: &mut dyn TouchQuery,
+    ) -> Option<Vec3> {
+        let entity = self.entities.get(id)?;
         if !entity.core.is_solid() {
-            return;
+            return None;
         }
         let (origin, mins, maxs) = (
             entity.core.origin,
             entity.core.model_bounds.mins,
             entity.core.model_bounds.maxs,
         );
-        let start = std::mem::replace(&mut self.player_prev_origin, origin);
 
         // `SetCheckUntouch( true )` — before the marks, so that this tick's
         // stamp is what they are written with and last tick's are stale.
-        self.set_check_untouch(player);
+        self.set_check_untouch(id);
 
         let mut overlaps = std::mem::take(&mut self.overlaps);
         overlaps.clear();
@@ -1425,13 +1481,13 @@ impl Server {
             // `serverGameEnts->MarkEntitiesAsTouching( m_TouchedEntities[i], m_pEnt )`
             // — **the trigger first**, which is what decides that the
             // trigger's link is the one carrying `FTOUCHLINK_START_TOUCH`.
-            self.mark_entities_as_touching(trigger, player);
+            self.mark_entities_as_touching(trigger, id);
         }
         self.overlaps = overlaps;
 
         let mut obb_found = obb_found;
         for &trigger in obb_found.iter() {
-            self.mark_entities_as_touching(trigger, player);
+            self.mark_entities_as_touching(trigger, id);
         }
         obb_found.clear();
         self.obb_overlaps = obb_found;
@@ -1444,11 +1500,10 @@ impl Server {
         // > `PhysicsTouchTriggers()` with **no** previous origin, and without
         // > it a teleport that lands you 1,000 units away sweeps a box the
         // > length of the level and fires every trigger between the two.
-        if let Some(entity) = self.entities.get(player) {
-            if entity.core.origin != origin {
-                self.player_prev_origin = entity.core.origin;
-            }
-        }
+        Some(match self.entities.get(id) {
+            Some(entity) => entity.core.origin,
+            None => origin,
+        })
     }
 
     /// The [`Solid::Obb`](movement::Solid::Obb) half of `CTouchLinks`'s
@@ -1996,7 +2051,8 @@ impl Server {
     /// > (`baseentity_shared.cpp:1317`), and so does this: a body whose entity
     /// > has a parent is being carried by something else, and letting the
     /// > solver write its world position would tear it off.
-    fn step_physics(&mut self) {
+    fn step_physics(&mut self, query: &mut dyn TouchQuery) {
+        self.drive_player_shadow();
         let Some(physics) = &mut self.physics else {
             return;
         };
@@ -2006,6 +2062,10 @@ impl Server {
             return;
         }
         let now = self.clock.time().curtime;
+        // Where each body's entity *was*, so that the trigger sweep below has
+        // a start — `VPhysicsUpdate`'s `vecPrevOrigin`, captured before the
+        // writeback overwrites it.
+        let mut previous = Vec::with_capacity(moved.len());
         for (id, origin, angles) in moved {
             let Some(entity) = self.entities.get_mut(id) else {
                 continue;
@@ -2013,6 +2073,7 @@ impl Server {
             if entity.core.parent().is_some() {
                 continue;
             }
+            previous.push((id, entity.core.origin));
             entity.core.set_abs_placement(origin, angles);
             hierarchy::propagate_id(
                 id,
@@ -2022,6 +2083,50 @@ impl Server {
                     now,
                 },
             );
+        }
+        // `PhysicsTouchTriggers( &prevOrigin )`, the third statement of
+        // `VPhysicsUpdate` and the one this port left out until the shadow
+        // controller landed. **A prop that moved enters and leaves triggers**,
+        // which is how a cube presses a floor button.
+        for (id, start) in previous {
+            self.touch_triggers(id, start, query);
+        }
+    }
+
+    /// `CBasePlayer::UpdateVPhysicsPosition` (`baseplayer_shared.cpp:3381`),
+    /// run immediately before the step so that the shadow's velocity is set
+    /// for the step that is about to happen.
+    ///
+    /// Valve runs it from `CBasePlayer::PhysicsSimulate`, once per usercmd,
+    /// which at 64 Hz is once per tick — here.
+    fn drive_player_shadow(&mut self) {
+        let Some(player) = self.player else {
+            return;
+        };
+        let Some(entity) = self.entities.get(player) else {
+            return;
+        };
+        // A dead or noclipping player has no business shoving cubes, and
+        // Valve gets the same answer through `SetVCollisionState`'s
+        // `VPHYS_NOCLIP`, which turns the shadow's collisions off entirely.
+        if entity.core.move_type != movement::MoveType::Walk {
+            if let Some(physics) = &mut self.physics {
+                physics.destroy_player();
+            }
+            return;
+        }
+        let (origin, mins, maxs) = (
+            entity.core.origin,
+            entity.core.model_bounds.mins,
+            entity.core.model_bounds.maxs,
+        );
+        let wish = self.player_wish_velocity;
+        // `physics.cpp:265` pins the physics step at 1/64 s regardless of the
+        // game's tick rate, and `Environment::step` is built on that; this is
+        // the same number and not the server's own interval for that reason.
+        let dt = crate::vphysics::env::TIMESTEP;
+        if let Some(physics) = &mut self.physics {
+            physics.drive_player(origin, wish, mins, maxs, dt);
         }
     }
 
@@ -2380,6 +2485,7 @@ impl Server {
         core.set_abs_placement(state.origin, state.angles);
         core.velocity = state.velocity;
         core.base_velocity = state.base_velocity;
+        self.player_wish_velocity = state.wish_velocity;
         core.model_bounds = ModelBounds {
             mins: state.mins,
             maxs: state.maxs,
@@ -2431,6 +2537,10 @@ impl Server {
                 .behaviour
                 .downcast_ref::<classes::Player>()
                 .map_or(0, classes::Player::buttons),
+            // In-only, like `buttons`: the server keeps the last one it was
+            // given so that the round trip reads as an identity, and nothing
+            // here derives one.
+            wish_velocity: self.player_wish_velocity,
         })
     }
 

@@ -345,6 +345,7 @@ pub struct PlayerState {
     pub flags: u32,            // FL_FROZEN; FL_ONGROUND is masked out
     // The CLIENT's, and never written by the server.
     pub buttons: u32,          // IN_*, as a raw mask
+    pub wish_velocity: Vec3,   // m_outWishVel, for the physics shadow
 }
 ```
 
@@ -366,6 +367,15 @@ writes them onto `client::Player`.
 for buttons, `logic_playerproxy` fires on the press edge) and never writes it.
 **A press and release inside one server tick is lost**, which is Valve's too —
 a shipped server sees one usercmd per tick and computes the same edge from it.
+
+`wish_velocity` is the second field of that kind and the newest.
+`m_vNewVPhysicsVelocity` (`player.h:1304`): what the client's last move
+*asked* for, after `PostThinkVPhysics`'s substitution. Its only reader is
+`Server::drive_player_shadow`, which hands it to the player's physics shadow —
+it is what decides how hard a cube is pushed, and it is not the player's
+velocity. It is held on `Server` rather than on the player's `EntityCore`
+because no entity has one: it is a *movement* output, and putting it on the
+core would offer it to 49 classes that must not read it.
 
 ### `ModelEntityState` (`mod.rs`)
 
@@ -4520,6 +4530,29 @@ to a physics prop rides it; and a body whose entity *has* a parent is skipped
 entirely, which is `VPhysicsUpdate`'s own early return
 (`baseentity_shared.cpp:1317`).
 
+**`step_physics` has three statements now, not two.** Before the step,
+`drive_player_shadow` is `CBasePlayer::UpdateVPhysicsPosition` — it writes the
+player's shadow body's velocity for the step that is about to run, from the
+player's origin, hull and `PlayerState::wish_velocity`. After the writeback,
+every entity the solver moved runs `touch_triggers`, which is
+`VPhysicsUpdate`'s third statement, `PhysicsTouchTriggers( &prevOrigin )`.
+
+`touch_triggers` is `player_touch_triggers` generalised: the branch
+`GetRequiredTriggerFlags` picks is `isSolidCheckTriggers`, true of anything
+that `IsSolid()` and is not itself `FSOLID_TRIGGER`, which is as true of a
+`SOLID_VPHYSICS` cube as it is of the player. So the only per-entity input is
+the swept box, and the player's call is now one caller of the shared pass
+rather than the whole of it. **This is how a cube presses a floor button** —
+and `portdocs/VPHYSICS_SHADOW.md` §7 is the measurement that says no shipped
+map lets it, because every one of the game's 98 cubes spawns away from the
+nearest of its 78 buttons and it is the player who is meant to carry it there.
+
+**A dead or noclipping player has no shadow at all.** `drive_player_shadow`
+destroys it when the movetype leaves `MOVETYPE_WALK`, which is
+`SetVCollisionState`'s `VPHYS_NOCLIP` reaching the same conclusion by turning
+the body's collisions off. The next tick that walks builds a new one; the body
+is cheap and nothing holds its id.
+
 **What it changed elsewhere.** `MoveType::VPhysics` exists, which
 `trigger_push` branches on — a physics prop is pushed with a *force* rather
 than a velocity, and `SF_TRIGGER_PUSH_USE_MASS` (13 of the game's 192
@@ -4529,7 +4562,10 @@ and took `io.accepted` from 5,042 to 5,043: **one connection in the game fires
 `EnableMotion` inside two seconds**, and it is the one that unfreezes
 `sp_a2_pull_the_rug`'s single `SF_PHYSPROP_MOTIONDISABLED` cube.
 
-**What it did not change.** The cube is in the physics world and not in
-`trace/`'s, so the player walks through it and it cannot press a floor button.
-That is the shadow controller, and `rustdocs/VPHYSICS.md` §7 is the list it
-heads.
+**What the shadow controller then changed.** The cube is in `trace/`'s world
+too — `Tracer::with_props`, over `Physics::sweep_box` — so the player is
+stopped by it, can stand on it, and shoves it along the floor by walking into
+it. `PlayerState` grew `wish_velocity` to carry the one number the shove is
+allowed to use. What is still missing is `CGrabController`: you cannot pick a
+cube up, which is the other half of every cube puzzle in the game.
+`rustdocs/VPHYSICS.md` §7 is the list it now heads.

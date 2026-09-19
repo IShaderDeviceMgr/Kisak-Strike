@@ -42,9 +42,10 @@
 
 use glam::{Mat3, Quat, Vec3};
 use rapier3d::dynamics::{MassProperties, RigidBodyBuilder, RigidBodyHandle, RigidBodyType};
-use rapier3d::geometry::{ColliderBuilder, SharedShape};
+use rapier3d::geometry::{Collider, ColliderBuilder, ColliderHandle, SharedShape};
 use rapier3d::math::Pose;
-use rapier3d::pipeline::PhysicsWorld;
+use rapier3d::parry::query::{ShapeCastOptions, ShapeCastStatus};
+use rapier3d::pipeline::{PhysicsWorld, QueryFilter};
 use rapier3d::prelude::CoefficientCombineRule;
 
 use super::collide::{Solid, SolidParams, UNITS_PER_METER};
@@ -116,6 +117,76 @@ pub enum Motion {
     Kinematic,
     /// Moved by the solver. A physics prop. The cube.
     Dynamic,
+    /// Moved by the solver, but driven every tick towards where the *game*
+    /// says the player is — `CreatePlayerController`'s object.
+    ///
+    /// Dynamic, so that a cube it walks into is pushed and so that the world
+    /// can stop it; rotation-locked, because Valve gives it an inertia of
+    /// `1e24` and damps its spin by 100 to the same end; and weightless,
+    /// because the player's height is decided by `client/`'s movement and
+    /// gravity here would only fight it.
+    ///
+    /// > **[`sweep_box`](Environment::sweep_box) must not return it**, which
+    /// > is why this is its own variant rather than [`Dynamic`](Motion::Dynamic)
+    /// > with some flags: the player's own movement trace would otherwise be
+    /// > stopped dead by the player's own shadow, one unit into every step.
+    Player,
+}
+
+/// What [`Environment::sweep_box`] found: `trace_t`, cut down to the three
+/// fields a vphysics clip actually fills in.
+///
+/// `CPhysicsCollision::TraceBox` (`physics_collide.cpp`) writes `fraction`,
+/// `plane.normal` and `startsolid` into the caller's `trace_t` and leaves
+/// everything else to the engine — the surface, the contents, the entity — so
+/// those are what cross this boundary. Naming the *body* rather than the
+/// entity is deliberate: `vphysics/` does not know entities exist, and
+/// `server/physics.rs` already holds the map from one to the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sweep {
+    /// How far along `start → end` the box got, in `[0, 1]`.
+    pub fraction: f32,
+    /// The normal of the surface it stopped against, pointing **out of what
+    /// was hit** and so back towards the sweeper — Source's
+    /// `trace_t::plane::normal` convention.
+    ///
+    /// Zero when [`start_solid`](Sweep::start_solid) is set and the overlap is
+    /// deep enough that there is no meaningful contact plane.
+    pub normal: Vec3,
+    /// Which body stopped it.
+    pub body: BodyId,
+    /// `trace_t::startsolid` — the box was already inside this body before it
+    /// moved at all.
+    pub start_solid: bool,
+}
+
+/// One contact on a body — one step of Valve's `IPhysicsFrictionSnapshot`.
+///
+/// `CFrictionSnapshot` (`physics_friction.cpp`) is a cursor over an object's
+/// contact points with four accessors; this is those four as a value, and
+/// [`Environment::contacts`] is the loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    /// Pointing **from the body that was asked towards the other one** —
+    /// `CFrictionSnapshot::GetSurfaceNormal`'s convention, sign included. A
+    /// body resting on the floor reports a normal with `z ≈ -1`.
+    pub normal: Vec3,
+    /// The other body, or `None` when it is geometry with no [`BodyId`] — the
+    /// world's own solids have one, so in practice this is `None` only for a
+    /// body removed between the step and the question.
+    pub other: Option<BodyId>,
+    /// `IPhysicsObject::IsMoveable` — false for the world, for a static prop
+    /// and for a frozen one.
+    pub moveable: bool,
+    /// `IPhysicsObject::GetMass`, and `None` for anything not moveable, which
+    /// is Valve's `!pOther->IsMoveable()` reaching the same conclusion first.
+    pub mass: Option<f32>,
+    /// `IPhysicsFrictionSnapshot::GetNormalForce`, in kg·units/s².
+    ///
+    /// > Rapier accumulates an *impulse* over the step rather than a force,
+    /// > so this is the impulse divided by [`TIMESTEP`]. Valve's
+    /// > `IVP_Contact_Point_API::get_vert_force` is already a force.
+    pub normal_force: f32,
 }
 
 /// A collision model converted to Rapier shapes **once**, ready to be placed
@@ -177,6 +248,30 @@ impl Hulls {
             Ok(builder) => out.shapes.push(builder.build().shared_shape().clone()),
             Err(_) => out.degenerate += 1,
         }
+        out
+    }
+
+    /// An axis-aligned box — `PhysCreateBbox( mins, maxs )`
+    /// (`physics_shared.cpp`), which is how the player's hull is made and the
+    /// only shape in the game that does not come out of a file.
+    ///
+    /// > **Wrapped in a compound so that the offset survives.** A Source hull
+    /// > is not centred on its entity's origin — the player's is
+    /// > `(-16,-16,0)`–`(16,16,72)`, because the origin is on the floor
+    /// > between the feet — and a bare `SharedShape::cuboid` is centred on
+    /// > whatever it is attached to. A one-child compound carries the shift,
+    /// > which keeps [`Environment::add`] free of a per-shape pose it would
+    /// > otherwise need for this one caller.
+    pub fn from_box(mins: Vec3, maxs: Vec3) -> Hulls {
+        let mut out = Hulls::default();
+        let half = (maxs - mins) * 0.5;
+        if half.min_element() <= 0.0 {
+            out.degenerate += 1;
+            return out;
+        }
+        let cuboid = SharedShape::cuboid(half.x, half.y, half.z);
+        let pose = Pose::from_parts((mins + maxs) * 0.5, Quat::IDENTITY);
+        out.shapes.push(SharedShape::compound(vec![(pose, cuboid)]));
         out
     }
 
@@ -279,6 +374,14 @@ impl Mass {
 struct Body {
     handle: RigidBodyHandle,
     generation: u32,
+    /// Whether this body was created [`Motion::Dynamic`].
+    ///
+    /// Not the same question as `RigidBody::body_type()`, and that is the
+    /// point: `EnableMotion( false )` makes a dynamic body *fixed*, which is
+    /// exactly what the world's own bodies are. Only the creating call can
+    /// tell a frozen cube from a wall, so it is recorded then and
+    /// [`sweep_box`](Environment::sweep_box) reads it back.
+    dynamic: bool,
 }
 
 /// The environment. `physenv`.
@@ -355,9 +458,16 @@ impl Environment {
         let builder = match motion {
             Motion::Static => RigidBodyBuilder::fixed(),
             Motion::Kinematic => RigidBodyBuilder::kinematic_position_based(),
-            Motion::Dynamic => RigidBodyBuilder::dynamic(),
+            Motion::Dynamic | Motion::Player => RigidBodyBuilder::dynamic(),
         };
         let mut builder = builder.pose(pose).user_data(id.to_user_data());
+        if motion == Motion::Player {
+            // `AttachObject`'s `rot_speed_damp_factor = (100,100,100)` and
+            // `SetupVPhysicsShadow`'s `solid.params.inertia = 1e24`, which are
+            // two ways of saying the same thing, plus `EnableGravity( false )`
+            // — see [`Motion::Player`].
+            builder = builder.lock_rotations().gravity_scale(0.0);
+        }
         if let Some(mass) = mass {
             builder = builder
                 .additional_mass_properties(MassProperties::new(mass.center, mass.mass, mass.inertia))
@@ -374,6 +484,7 @@ impl Environment {
         self.bodies[id.slot as usize] = Some(Body {
             handle,
             generation: id.generation,
+            dynamic: matches!(motion, Motion::Dynamic),
         });
         self.live += 1;
         Some(id)
@@ -423,6 +534,78 @@ impl Environment {
             } else {
                 body.set_position(pose, true);
             }
+        }
+    }
+
+    /// A body's linear velocity, and the setter the player's controller
+    /// drives it with.
+    ///
+    /// `IVP_Core::speed` read and written, which is what
+    /// `ComputeController` does to it directly in the shipped tree — the
+    /// controller runs *inside* the solver there and has the core in hand.
+    pub fn velocity(&self, id: BodyId) -> Vec3 {
+        self.handle(id)
+            .and_then(|handle| self.world.bodies.get(handle))
+            .map_or(Vec3::ZERO, |body| body.linvel())
+    }
+
+    /// See [`velocity`](Environment::velocity).
+    pub fn set_velocity(&mut self, id: BodyId, velocity: Vec3) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_linvel(velocity, true);
+        }
+    }
+
+    /// `IVP_Real_Object::beam_object_to_new_position` — put a body somewhere
+    /// without sweeping it there.
+    ///
+    /// `CPlayerController::TryTeleportObject` disables collision detection
+    /// across the call so that the beam cannot generate an impulse against
+    /// whatever the body lands in. Rapier's `set_position` is not a swept
+    /// move and generates no contact of its own, so there is nothing to
+    /// disable: the next narrow phase sees the new pose and nothing sees the
+    /// transit.
+    pub fn teleport(&mut self, id: BodyId, origin: Vec3) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            let pose = Pose::from_parts(origin, body.position().rotation);
+            body.set_position(pose, true);
+        }
+    }
+
+    /// Replaces a body's shape, keeping its pose, its velocity and its id.
+    ///
+    /// `IPhysicsPlayerController::SetObject`, which the shipped game uses for
+    /// exactly one thing: swapping the player between the standing hull and
+    /// the crouching one (`CBasePlayer::SetVCollisionState`). Valve builds
+    /// *two objects* and moves the controller between them; one body whose
+    /// colliders are replaced is the same thing with one fewer identity to
+    /// keep in step.
+    ///
+    /// > **It does not check that the new hull fits.** Neither does Valve's:
+    /// > `CGameMovement::CanUnduck` has already asked that question on the
+    /// > trace side, and by the time this is called the player's own origin
+    /// > has already moved.
+    pub fn set_hulls(&mut self, id: BodyId, hulls: &Hulls, surface: &str) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        let existing: Vec<_> = match self.world.bodies.get(handle) {
+            Some(body) => body.colliders().to_vec(),
+            None => return,
+        };
+        for collider in existing {
+            self.world.remove_collider(collider);
+        }
+        let surface = self.surfaces.resolve(surface).clone();
+        for shape in &hulls.shapes {
+            let collider = collider(shape.clone(), &surface);
+            self.world.insert_collider(collider, Some(handle));
         }
     }
 
@@ -494,6 +677,195 @@ impl Environment {
         }
     }
 
+    /// Sweeps an axis-aligned box from `start` to `end` against the physics
+    /// props, and reports the first one it meets.
+    ///
+    /// This is `CEngineTrace::ClipRayToVPhysics` (`enginetrace.cpp:1115`)
+    /// minus the dispatch that gets there: the shipped engine reaches it once
+    /// per `SOLID_VPHYSICS` entity the spatial partition offers, asks that
+    /// entity's physics object for its `CPhysCollide`, and calls
+    /// `physcollision->TraceBox`. Here the broad phase is Rapier's and one
+    /// call covers every prop at once, so there is no per-entity loop to
+    /// write.
+    ///
+    /// `half` is the box's half-extents; the box is centred on `start` and
+    /// stays axis-aligned, because Source's `Ray_t` for a hull trace is an
+    /// AABB sweep and every caller here is one. A hull that is not centred on
+    /// its entity's origin — the player's is not — is the caller's to shift,
+    /// exactly as `Ray_t::Init` shifts it.
+    ///
+    /// > **Only bodies created [`Motion::Dynamic`], and that is correctness
+    /// > rather than thrift.** The world, its displacements, its static props
+    /// > and its brush entities are all in this environment *and* all already
+    /// > in `trace/`. A sweep that returned them would clip the same geometry
+    /// > twice, with two implementations that do not have to agree — and the
+    /// > brush entities' half would be the worse answer of the two, because
+    /// > `trace/` carves portal holes out of them and this does not.
+    ///
+    /// > **The test is `Body::dynamic`, not `RigidBody::body_type()`.**
+    /// > `EnableMotion( false )` freezes a prop by making it a *fixed* body
+    /// > (see [`enable_motion`](Environment::enable_motion)), which is
+    /// > indistinguishable from a wall by type alone. Filtering on the type
+    /// > would make a frozen cube stop stopping the player — and every cube in
+    /// > the game spawns frozen if its map says so.
+    pub fn sweep_box(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
+        if half.min_element() < 0.0 {
+            return None;
+        }
+        let delta = end - start;
+        let shape = SharedShape::cuboid(half.x, half.y, half.z);
+        let pose = Pose::from_parts(start, Quat::IDENTITY);
+        // `max_time_of_impact = 1` with the velocity set to the whole
+        // displacement makes the reported time *be* the fraction, which is the
+        // number `trace_t` wants and saves dividing by a length that can be
+        // zero. A zero-length sweep is therefore still a legitimate query —
+        // it is Source's `startsolid` test — and comes back with a fraction of
+        // 0 and the flag set.
+        let options = ShapeCastOptions {
+            max_time_of_impact: 1.0,
+            target_distance: 0.0,
+            stop_at_penetration: true,
+            compute_impact_geometry_on_penetration: true,
+        };
+        let is_prop = |_: ColliderHandle, collider: &Collider| -> bool {
+            self.body_of(collider).is_some_and(|body| body.dynamic)
+        };
+        let filter = QueryFilter::default()
+            .exclude_sensors()
+            .predicate(&is_prop);
+        // **A zero-length sweep takes a different query.** Source asks for
+        // these constantly — `CM_UnsweptBoxTrace`, and every "am I stuck"
+        // test — and `cast_shape` answers `None` for them: with no velocity
+        // there is no time of impact to find, and `stop_at_penetration`'s
+        // separating-velocity test has nothing to judge. So the position test
+        // is an intersection test, which is what it is.
+        if delta.length_squared() <= 0.0 {
+            let (_, collider) = self
+                .world
+                .intersect_shape(pose, &*shape, filter)
+                .next()?;
+            return Some(Sweep {
+                fraction: 0.0,
+                // No contact plane: the shapes overlap, and which face of the
+                // prop is "the" one the box came through is not a question an
+                // intersection test can answer. `Sweep::normal` documents the
+                // zero.
+                normal: Vec3::ZERO,
+                body: self.id_of(collider)?,
+                start_solid: true,
+            });
+        }
+        let (collider, hit) = self
+            .world
+            .cast_shape(&pose, delta, &*shape, options, filter)?;
+        let body = self
+            .world
+            .colliders
+            .get(collider)
+            .and_then(|collider| self.id_of(collider))?;
+        Some(Sweep {
+            // **`normal1`, and that is not what parry's field names suggest.**
+            // Read literally, `normal1` is the outward normal on the *first*
+            // shape — the moving box — which for a box swept east into a wall
+            // points east, and Source's `plane.normal` points west. Rapier's
+            // query pipeline casts the collider against the shape and flips
+            // the result, so the two are exchanged by the time they arrive
+            // here. Asserted by `the_sweep_normal_points_back_at_the_sweeper`,
+            // which is the only reason this is knowable.
+            normal: hit.normal1,
+            fraction: hit.time_of_impact.clamp(0.0, 1.0),
+            body,
+            start_solid: hit.status == ShapeCastStatus::PenetratingOrWithinTargetDist,
+        })
+    }
+
+    /// The [`BodyId`] a collider belongs to, or `None` if its body has been
+    /// removed and its slot reused since the handle was issued.
+    fn id_of(&self, collider: &Collider) -> Option<BodyId> {
+        let handle = collider.parent()?;
+        let id = BodyId::from_user_data(self.world.bodies.get(handle)?.user_data);
+        self.slot(id).map(|_| id)
+    }
+
+    fn body_of(&self, collider: &Collider) -> Option<&Body> {
+        let handle = collider.parent()?;
+        let id = BodyId::from_user_data(self.world.bodies.get(handle)?.user_data);
+        self.slot(id)
+    }
+
+    /// The live record for a handle — `None` once the body has been removed,
+    /// which is what makes [`BodyId`] generational rather than an index.
+    fn slot(&self, id: BodyId) -> Option<&Body> {
+        self.bodies
+            .get(id.slot as usize)?
+            .as_ref()
+            .filter(|body| body.generation == id.generation)
+    }
+
+    /// Every contact a body currently has — `IPhysicsFrictionSnapshot`, which
+    /// is `CreateFrictionSnapshot` and the `while ( pSnapshot->IsValid() )`
+    /// loop around it (`physics_friction.cpp:144`), collected in one go.
+    ///
+    /// Returned by value rather than as an iterator because the one caller —
+    /// [`PlayerController`](super::shadow::PlayerController) — needs `&mut
+    /// Environment` immediately afterwards to act on what it found, and
+    /// because a body in this game has a handful of contacts rather than a
+    /// stream of them.
+    ///
+    /// **After a step, not before.** Rapier's narrow phase fills the contact
+    /// set during `step`, so this answers about the *last* step. That is also
+    /// what Valve's does: `do_simulation_controller` runs inside the
+    /// simulation and reads contacts the previous PSI established.
+    pub fn contacts(&self, id: BodyId) -> Vec<Contact> {
+        let Some(handle) = self.handle(id) else {
+            return Vec::new();
+        };
+        let Some(body) = self.world.bodies.get(handle) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &own in body.colliders() {
+            for pair in self.world.contact_pairs_with(own) {
+                let mine_is_first = pair.collider1 == own;
+                let theirs = match mine_is_first {
+                    true => pair.collider2,
+                    false => pair.collider1,
+                };
+                let Some(other) = self.world.colliders.get(theirs) else {
+                    continue;
+                };
+                let other_body = other.parent().and_then(|h| self.world.bodies.get(h));
+                let moveable = other_body.is_some_and(|b| b.is_dynamic());
+                let mass = other_body.filter(|b| b.is_dynamic()).map(|b| b.mass());
+                let id = self.id_of(other);
+                for manifold in &pair.manifolds {
+                    if manifold.points.is_empty() {
+                        continue;
+                    }
+                    // `CFrictionSnapshot::GetSurfaceNormal`'s
+                    // `out *= sign[m_synapseIndex]`: the normal is reported
+                    // **pointing from the asking object towards the other
+                    // one**, which is why Valve's ground test reads
+                    // `normal.z < -0.7` rather than `> 0.7`. Rapier's is
+                    // collider1 → collider2, so it is the same vector when we
+                    // are collider1 and its negation when we are not.
+                    let normal = match mine_is_first {
+                        true => manifold.data.normal,
+                        false => -manifold.data.normal,
+                    };
+                    out.push(Contact {
+                        normal,
+                        other: id,
+                        moveable,
+                        mass,
+                        normal_force: pair.total_impulse_magnitude() / TIMESTEP,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// `physenv->Simulate( TICK_INTERVAL )`. One fixed step; see the module
     /// docs on why there is no accumulator here.
     pub fn step(&mut self) {
@@ -526,11 +898,7 @@ impl Environment {
     }
 
     fn handle(&self, id: BodyId) -> Option<RigidBodyHandle> {
-        self.bodies
-            .get(id.slot as usize)?
-            .as_ref()
-            .filter(|b| b.generation == id.generation)
-            .map(|b| b.handle)
+        self.slot(id).map(|body| body.handle)
     }
 
     fn reserve(&mut self) -> BodyId {
@@ -643,6 +1011,230 @@ mod tests {
         let hulls = Hulls::from_solid(&solid);
         env.add(Motion::Static, &hulls, Vec3::ZERO, Vec3::ZERO, "default", None)
             .expect("a floor")
+    }
+
+    /// A cube of half-extent 16 at `origin`, as a dynamic prop.
+    fn prop(env: &mut Environment, origin: Vec3) -> BodyId {
+        let solid = cube_solid(16.0);
+        let hulls = Hulls::from_solid(&solid);
+        env.add(
+            Motion::Dynamic,
+            &hulls,
+            origin,
+            Vec3::ZERO,
+            "default",
+            Some(Mass::from_solid(&solid, &params(40.0))),
+        )
+        .expect("a prop")
+    }
+
+    /// The sweep is for **props**, and the world is already in `trace/`.
+    ///
+    /// A floor and a cube in the same environment: a box swept down through
+    /// both must report the cube and must not report the floor, because
+    /// `trace/` will clip against its own copy of the floor and clipping twice
+    /// against two implementations is how the two get to disagree.
+    #[test]
+    fn a_sweep_reports_the_prop_and_not_the_world() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let ground = floor(&mut env);
+        let cube = prop(&mut env, Vec3::new(0.0, 0.0, 100.0));
+        env.step();
+
+        let hit = env
+            .sweep_box(
+                Vec3::splat(1.0),
+                Vec3::new(0.0, 0.0, 300.0),
+                Vec3::new(0.0, 0.0, -32.0),
+            )
+            .expect("the cube is in the way");
+        assert_eq!(hit.body, cube, "the cube, not the floor");
+        assert_ne!(hit.body, ground);
+
+        // …and with the cube gone, the floor is still invisible to it.
+        env.remove(cube);
+        env.step();
+        assert_eq!(
+            env.sweep_box(
+                Vec3::splat(1.0),
+                Vec3::new(0.0, 0.0, 300.0),
+                Vec3::new(0.0, 0.0, -32.0),
+            ),
+            None,
+            "the world is `trace/`'s job"
+        );
+    }
+
+    /// **A frozen prop still stops a sweep**, which is why the filter reads
+    /// `Body::dynamic` rather than `RigidBody::body_type()`.
+    ///
+    /// `EnableMotion( false )` makes a prop a *fixed* body, indistinguishable
+    /// by type from the world; filtering on the type would let the player walk
+    /// through every cube a map spawns frozen.
+    #[test]
+    fn a_frozen_prop_still_stops_a_sweep() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let cube = prop(&mut env, Vec3::new(0.0, 0.0, 100.0));
+        env.enable_motion(cube, false);
+        env.step();
+
+        let hit = env.sweep_box(
+            Vec3::splat(1.0),
+            Vec3::new(0.0, 0.0, 300.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+        assert_eq!(hit.map(|hit| hit.body), Some(cube));
+    }
+
+    /// The player's own shadow must not stop the player's own movement trace,
+    /// which is the whole reason [`Motion::Player`] is a variant rather than a
+    /// flag on [`Motion::Dynamic`].
+    #[test]
+    fn the_players_shadow_is_not_swept_against() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let hulls = Hulls::from_box(Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 72.0));
+        env.add(
+            Motion::Player,
+            &hulls,
+            Vec3::new(0.0, 0.0, 100.0),
+            Vec3::ZERO,
+            "default",
+            Some(Mass {
+                mass: 85.0,
+                center: Vec3::ZERO,
+                inertia: Vec3::splat(85.0),
+                damping: 0.0,
+                rot_damping: 0.0,
+            }),
+        )
+        .expect("a shadow");
+        env.step();
+
+        assert_eq!(
+            env.sweep_box(
+                Vec3::splat(1.0),
+                Vec3::new(0.0, 0.0, 300.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            None
+        );
+    }
+
+    /// Source's `trace_t::plane::normal` points **out of the surface hit**, so
+    /// a box swept east into a cube gets a westward normal.
+    #[test]
+    fn the_sweep_normal_points_back_at_the_sweeper() {
+        let mut env = Environment::new(SurfaceProps::default());
+        prop(&mut env, Vec3::new(200.0, 0.0, 0.0));
+        env.step();
+
+        let hit = env
+            .sweep_box(Vec3::splat(2.0), Vec3::ZERO, Vec3::new(400.0, 0.0, 0.0))
+            .expect("the cube is in the way");
+        assert!(
+            hit.normal.x < -0.9,
+            "swept +x into a cube, expected a -x normal, got {:?}",
+            hit.normal
+        );
+        // 200 - 16 (the cube) - 2 (the box) = 182 of the 400 swept.
+        assert!(
+            (hit.fraction - 182.0 / 400.0).abs() < 0.01,
+            "fraction {}",
+            hit.fraction
+        );
+        assert!(!hit.start_solid);
+    }
+
+    /// A sweep that begins inside a prop reports `startsolid` and a fraction
+    /// of zero, which is what `trace_chain` needs to stop the whole chain
+    /// where it is.
+    #[test]
+    fn a_sweep_that_starts_inside_a_prop_is_start_solid() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let cube = prop(&mut env, Vec3::ZERO);
+        env.step();
+
+        let hit = env
+            .sweep_box(Vec3::splat(2.0), Vec3::ZERO, Vec3::new(400.0, 0.0, 0.0))
+            .expect("inside it");
+        assert_eq!(hit.body, cube);
+        assert!(hit.start_solid);
+        assert_eq!(hit.fraction, 0.0);
+    }
+
+    /// A zero-length sweep is a *position test* — Source asks them constantly
+    /// — and must not divide by the length it has not got.
+    #[test]
+    fn a_zero_length_sweep_is_a_position_test() {
+        let mut env = Environment::new(SurfaceProps::default());
+        prop(&mut env, Vec3::ZERO);
+        env.step();
+
+        let inside = env.sweep_box(Vec3::splat(2.0), Vec3::ZERO, Vec3::ZERO);
+        assert!(inside.is_some_and(|hit| hit.start_solid));
+        let clear = env.sweep_box(
+            Vec3::splat(2.0),
+            Vec3::new(500.0, 0.0, 0.0),
+            Vec3::new(500.0, 0.0, 0.0),
+        );
+        assert_eq!(clear, None);
+    }
+
+    /// **A zero-extent sweep is a ray**, and `SharedShape::cuboid(0,0,0)` is a
+    /// degenerate shape that has to survive it.
+    ///
+    /// Nothing in the port currently asks — `Tracer::with_props` is attached
+    /// only to the player's movement, whose rays are all `Ray::hull` — but the
+    /// API allows it and a `NaN` out of a degenerate support function would
+    /// come back as a fraction the clip chain would believe.
+    #[test]
+    fn a_ray_against_a_prop_is_a_zero_extent_sweep() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let cube = prop(&mut env, Vec3::new(200.0, 0.0, 0.0));
+        env.step();
+
+        let hit = env
+            .sweep_box(Vec3::ZERO, Vec3::ZERO, Vec3::new(400.0, 0.0, 0.0))
+            .expect("the cube is in the way");
+        assert_eq!(hit.body, cube);
+        assert!(hit.fraction.is_finite() && hit.normal.is_finite());
+        // 200 - 16 of the 400 swept, with no box to expand by.
+        assert!(
+            (hit.fraction - 184.0 / 400.0).abs() < 0.01,
+            "fraction {}",
+            hit.fraction
+        );
+        assert!(hit.normal.x < -0.9, "normal {:?}", hit.normal);
+
+        // …and one that misses stays a miss rather than becoming a NaN.
+        assert_eq!(
+            env.sweep_box(Vec3::ZERO, Vec3::new(0.0, 500.0, 0.0), Vec3::new(400.0, 500.0, 0.0)),
+            None
+        );
+    }
+
+    /// A body resting on a floor reports a contact whose normal points
+    /// **down**, which is `CFrictionSnapshot::GetSurfaceNormal`'s convention
+    /// and the reason Valve's ground test reads `normal.z < -0.7`.
+    #[test]
+    fn a_resting_bodys_contact_normal_points_at_what_it_rests_on() {
+        let mut env = Environment::new(SurfaceProps::default());
+        floor(&mut env);
+        let cube = prop(&mut env, Vec3::new(0.0, 0.0, 17.0));
+        for _ in 0..192 {
+            env.step();
+        }
+        let contacts = env.contacts(cube);
+        assert!(!contacts.is_empty(), "a cube on a floor touches it");
+        assert!(
+            contacts.iter().all(|contact| contact.normal.z < -0.7),
+            "expected downward normals, got {:?}",
+            contacts.iter().map(|c| c.normal).collect::<Vec<_>>()
+        );
+        assert!(
+            contacts.iter().all(|contact| !contact.moveable),
+            "the floor is not moveable"
+        );
     }
 
     /// The whole units decision, checked against a closed form rather than

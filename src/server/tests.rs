@@ -3220,7 +3220,7 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
 fn every_shipped_map_spawns_its_entities() {
     use crate::engine::world::bsp::Bsp;
     use crate::filesystem::Vfs;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// How long to run each map for, in seconds of server time.
     const RUN_SECONDS: f32 = 2.0;
@@ -3269,6 +3269,14 @@ fn every_shipped_map_spawns_its_entities() {
     // that place a studio model end up on a skin family other than 0, and how
     // many of those actually draw a different material for it.
     let (mut entity_skins, mut entity_skins_remapped) = (0usize, 0usize);
+    // A placement that does not remap has two quite different reasons for it,
+    // and the count alone cannot tell them apart: the model may name a family
+    // it has not got (Valve's clamp, `studio::family`), or the model may be one
+    // this port cannot load at all — in which case nothing is known about its
+    // table and the placement is not evidence of anything. Split, so the number
+    // above means what it says.
+    let mut entity_skins_unloadable = 0usize;
+    let mut entity_skins_flat: BTreeSet<(String, i32)> = BTreeSet::new();
     let mut skin_tables: BTreeMap<String, Option<Vec<Vec<String>>>> = BTreeMap::new();
 
     for name in &names {
@@ -3314,12 +3322,17 @@ fn every_shipped_map_spawns_its_entities() {
                         .map(|model| model.batches.into_iter().map(|b| b.materials).collect())
                 })
                 .as_ref();
-            let Some(families) = families else { continue };
+            let Some(families) = families else {
+                entity_skins_unloadable += 1;
+                continue;
+            };
             if families.iter().any(|materials| {
                 let family = crate::studio::family(state.skin, materials.len());
                 family != 0 && materials[family] != materials[0]
             }) {
                 entity_skins_remapped += 1;
+            } else {
+                entity_skins_flat.insert((state.model.clone(), state.skin));
             }
         }
 
@@ -3672,21 +3685,51 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("prop_dynamic_glow"), None);
     assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
     // 98 across 59 maps, one of them on `sp_a1_intro1`. Every one of them is
-    // drawn, and none of them falls.
+    // drawn, in the skin its map asked for, and every one of them falls —
+    // `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` is the one that is
+    // watched all the way down.
     assert_eq!(per_class.get("prop_weighted_cube"), Some(&98));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
-         {entity_skins_remapped} of them draw a different material"
+         {entity_skins_remapped} of them draw a different material, \
+         {entity_skins_unloadable} name a model that does not load"
     );
+    for (model, skin) in &entity_skins_flat {
+        println!("    flat: {model} skin {skin}");
+    }
     // The entity half of the skin-family measurement. Fewer than the 771
     // non-zero `skin` keys the entity lump carries, because a key on a class
     // this port has no model path for never reaches the draw — 663 is the
-    // number that does, and the 4 that do not remap name a family their model
-    // has not got.
+    // number that does.
     assert_eq!(entity_skins, 663, "model entities on a non-zero skin family");
     assert_eq!(
         entity_skins_remapped, 659,
         "…of which draw a different material for it"
+    );
+    // **Every one of the 663 names a model that loads**, so the four that do
+    // not remap are four maps asking for a family their model has not got and
+    // getting family 0 from `studio::family` — not four models this port
+    // failed to read. The distinction is invisible in the count and is the
+    // whole reason for the split; see the declarations above.
+    assert_eq!(entity_skins_unloadable, 0, "…and none is an unreadable model");
+    // The other side of the same fact, named rather than counted: all three
+    // models have **exactly one skin family**, so there is no family 1 or 2
+    // for the map to have meant. A fourth name appearing here would be a
+    // model whose table is real and whose extra row happens to repeat family
+    // 0's materials, which is a different thing and is not currently in the
+    // game.
+    let flat: Vec<_> = entity_skins_flat
+        .iter()
+        .map(|(model, skin)| (model.as_str(), *skin))
+        .collect();
+    assert_eq!(
+        flat,
+        [
+            ("models/props_backstage/vacum_turret.mdl", 1),
+            ("models/props_office/chair_swivel.mdl", 1),
+            ("models/props_vac_anim/turret_box_lowres.mdl", 2),
+        ],
+        "the placements whose skin key names a family their model has not got"
     );
     println!("  what each shipped cube ends up wearing:");
     for ((model, skin), count) in &cube_skins {
@@ -4020,6 +4063,7 @@ fn player_at(origin: Vec3) -> PlayerState {
         life_state: Default::default(),
         flags: 0,
         buttons: 0,
+        wish_velocity: Vec3::ZERO,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),
     }

@@ -859,8 +859,19 @@ impl<'a> Engine<'a> {
         let player = self.scene.client.player();
         let environment = player.portal_environment;
         let world = self.scene.world.as_ref();
+        // **The physics props in the clip chain** — `portdocs/VPHYSICS_SHADOW.md`
+        // stage 2, and the thing that stops the player walking through a cube.
+        // Named as a separate binding for the reason the comment above gives
+        // for `world`: it borrows `scene.server` while `run_move` borrows
+        // `scene.client` exclusively, and an accessor returning both would
+        // borrow all of `Scene`.
+        let props = self.scene.server.physics().map(PhysicsProps);
         let mut tracer = world.map(|w| {
             let tracer = w.collision.tracer().with_entities(w.clip_models());
+            let tracer = match props.as_ref() {
+                Some(props) => tracer.with_props(props),
+                None => tracer,
+            };
             let Some(wall) = environment.and_then(|id| w.portal_holes.get(id)) else {
                 return tracer;
             };
@@ -1244,6 +1255,30 @@ fn group_sequences<'a>(
     out
 }
 
+/// The server's physics props, as something a [`trace::Tracer`] can sweep against —
+/// `CEngineTrace::ClipRayToVPhysics`, and the only implementation of
+/// [`trace::PropQuery`] there is.
+///
+/// # Why it is here and not in either module it joins
+///
+/// `trace/` defines the trait and must not name `vphysics`; `server/` owns the
+/// environment and must not name `engine`. `engine/` may name both, and it is
+/// the module that builds the movement tracer in the first place. Same
+/// arrangement as [`TouchQuery`](crate::server::TouchQuery), which `server/`
+/// declares and this file implements — with the two ends swapped.
+struct PhysicsProps<'a>(&'a crate::server::physics::Physics);
+
+impl trace::PropQuery for PhysicsProps<'_> {
+    fn sweep(&self, half: glam::Vec3, start: glam::Vec3, end: glam::Vec3) -> Option<trace::PropHit> {
+        let sweep = self.0.sweep_box(half, start, end)?;
+        Some(trace::PropHit {
+            fraction: sweep.fraction,
+            normal: sweep.normal,
+            start_solid: sweep.start_solid,
+        })
+    }
+}
+
 /// `client::Player` as the server's copy of it. See
 /// [`PlayerState`](crate::server::PlayerState) for why the copy exists.
 fn player_state(client: &Client) -> server::PlayerState {
@@ -1281,6 +1316,8 @@ fn player_state(client: &Client) -> server::PlayerState {
         },
         // The one field that is purely the client's.
         buttons: client.buttons_bits(),
+        // …and the second, which arrived with the player's physics shadow.
+        wish_velocity: player.wish_velocity,
     }
 }
 

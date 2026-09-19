@@ -92,6 +92,28 @@ pub struct Trace {
     /// trace in the port leaves it `false`, which is what
     /// [`hit_portal_ramp`](Trace::hit_portal_ramp) then answers.
     pub portal_ramp: bool,
+    /// What stopped the sweep was a **physics prop** rather than the world or
+    /// a brush entity — `CBasePlayer::TouchedPhysics()`.
+    ///
+    /// # The second field here that is not about the surface hit
+    ///
+    /// Valve does not get this from the trace at all: `CBasePlayer::Touch`
+    /// (`player.cpp:4920`) sets `m_bTouchedPhysObject` when the *entity* touch
+    /// pass reports a `MOVETYPE_VPHYSICS`, `SOLID_VPHYSICS`, non-trigger,
+    /// moveable other. That is a different mechanism for the same fact, and it
+    /// is a different mechanism because Valve's trace cannot answer — the
+    /// engine's `trace_t` names the entity, but `CGameMovement` throws it away
+    /// before `PostThinkVPhysics` runs.
+    ///
+    /// It is here because the answer decides how hard the player's physics
+    /// shadow may push (`PostThinkVPhysics`'s `m_outWishVel.Init( maxSpeed,
+    /// maxSpeed, maxSpeed )` substitution — `baseplayer_shared.cpp:3316`), and
+    /// because the prop sweep that stage 2 of `portdocs/VPHYSICS_SHADOW.md`
+    /// adds already knows it for free.
+    ///
+    /// **Only [`Tracer::with_props`](super::Tracer::with_props) ever sets it**,
+    /// and only on an answer the prop sweep won.
+    pub hit_prop: bool,
 }
 
 impl Trace {
@@ -113,6 +135,7 @@ impl Trace {
             all_solid: false,
             start_solid: false,
             portal_ramp: false,
+            hit_prop: false,
         }
     }
 

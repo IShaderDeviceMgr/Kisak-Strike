@@ -9,7 +9,7 @@ evidence; this is how to use what landed.
 | Replaces | `legacy/vphysics/` (22,607 lines) and all of `legacy/ivp/` |
 | Depends on | `rapier3d` 0.35, `filesystem::keyvalues`, `math` |
 | Consumers | `engine/world/physics.rs` (fills it), `server/physics.rs` (owns it) |
-| State | **the cube falls.** No shadow controller, no constraints, no collision events — §7 |
+| State | **the cube falls, and the player pushes it.** No constraints, no collision events, no grab controller — §7 |
 
 [Rapier]: https://rapier.rs
 
@@ -36,13 +36,14 @@ for (body, origin, angles) in env.active() { /* VPhysicsUpdate */ }
 
 ---
 
-## 1. The three modules
+## 1. The four modules
 
 | Module | Is | Answers |
 |---|---|---|
 | [`collide`](../src/vphysics/collide.rs) | Valve's format: `.phy` and `LUMP_PHYSCOLLIDE` | "what shape is this model?" |
 | [`surfaceprops`](../src/vphysics/surfaceprops.rs) | `scripts/surfaceproperties*.txt` | "how slippery is it?" |
 | [`env`](../src/vphysics/env.rs) | Rapier | "where does it end up?" |
+| [`shadow`](../src/vphysics/shadow.rs) | `physics_shadow.cpp`'s `CPlayerController` | "what does the player shove?" |
 
 `vphysics::Model` ties the three together — hulls, the `solid { }` block, and
 the mass properties — and is what a consumer usually holds.
@@ -99,16 +100,70 @@ them, because a ledge's point array is shared with its siblings in the file.
 ```rust,ignore
 Hulls::from_solid(&Solid) -> Hulls                       // one collider per ledge
 Hulls::from_mesh(points, indices) -> Hulls               // a displacement
+Hulls::from_box(mins, maxs) -> Hulls                     // PhysCreateBbox: the player
 Mass::from_solid(&Solid, &SolidParams) -> Mass
 Environment::add(Motion, &Hulls, origin, angles, surface, Option<Mass>) -> Option<BodyId>
 ```
 
-`Motion` is Valve's three entry points: `Static` is `VPhysicsInitStatic`,
-`Kinematic` is `VPhysicsInitShadow` (a door), `Dynamic` is
-`VPhysicsInitNormal` (a cube). Only `Dynamic` takes a `Mass`.
+`Motion` is Valve's three entry points plus one: `Static` is
+`VPhysicsInitStatic`, `Kinematic` is `VPhysicsInitShadow` (a door), `Dynamic`
+is `VPhysicsInitNormal` (a cube), and `Player` is `CreatePlayerController`'s
+object — dynamic, rotation-locked and weightless. `Static` and `Kinematic` take
+no `Mass`.
 
 `Hulls` is cheap to clone — the shapes are reference-counted — so a model placed
-fifty times is hulled once.
+fifty times is hulled once. `from_box` is the one that does not come from a
+file, and it wraps its cuboid in a one-child compound so that a hull which is
+not centred on its entity's origin (the player's is not) carries its own shift.
+
+## 4b. Asking the environment a question
+
+```rust,ignore
+Environment::sweep_box(half, start, end) -> Option<Sweep>   // ClipRayToVPhysics
+Environment::contacts(BodyId) -> Vec<Contact>               // IPhysicsFrictionSnapshot
+Environment::velocity(BodyId) -> Vec3
+Environment::set_velocity(BodyId, Vec3)
+Environment::teleport(BodyId, origin)                       // beam_object_to_new_position
+Environment::set_hulls(BodyId, &Hulls, surface)             // the duck/stand swap
+```
+
+**`sweep_box` is how the props get into `trace/`.** It is a swept AABB against
+**only the bodies created `Motion::Dynamic`** — not the world, not the static
+props, not the brush entities, all of which `trace/` already holds its own copy
+of, and not the player's own shadow. The filter reads the environment's record
+of how each body was *created*, because `EnableMotion( false )` makes a prop a
+fixed body and filtering on the Rapier body type would let the player walk
+through every cube a map spawns frozen.
+
+`Sweep::normal` follows Source's `trace_t::plane::normal` — it points **out of
+what was hit**, back towards the sweeper — and is zero on a `start_solid`
+answer, where there is no contact plane to report. `Contact::normal` follows
+`CFrictionSnapshot::GetSurfaceNormal` and points the *other* way, from the body
+asked towards what it is touching, which is why a ground test on one reads
+`normal.z < -0.7`. The two conventions are opposite and both are Valve's.
+
+## 4c. The player's shadow
+
+```rust,ignore
+PlayerController::new(&mut Environment, origin, mins, maxs) -> Option<PlayerController>
+PlayerController::set_bounds(&mut Environment, mins, maxs)   // ducking
+PlayerController::drive(&mut Environment, target, wish_velocity, dt)
+PlayerController::in_contact() -> bool
+PlayerController::destroy(self, &mut Environment)
+```
+
+`portdocs/VPHYSICS_SHADOW.md` is the design. The two things to know before
+calling it:
+
+- **`target` is an input and never an output.** The player's position is
+  decided by `client/`'s movement against `trace/`; the body is dragged to it,
+  is allowed to lag, and is teleported when it falls more than 24 units behind.
+  Nothing reads a position back out of it.
+- **`wish_velocity` is not the player's velocity.** It is `m_outWishVel`, what
+  the move *asked* for, and the difference is the whole feature: a player
+  walking into a cube has a velocity of nearly zero and a wish velocity of
+  nearly 175, and it is the second that decides how hard the cube is shoved.
+  Pass the real velocity and a player pressed against a cube stops pushing it.
 
 ## 5. Invariants and gotchas, most likely to bite first
 
@@ -245,19 +300,38 @@ playerclip and monsterclip (gotcha 6).
 `portdocs/VPHYSICS.md` §9 has the reasons; this is the list, ordered by what
 would be noticed first.
 
-- **The shadow controller and the player controller** (`physics_shadow.cpp`,
-  1,455 lines). This is why **the player walks through a cube** rather than
-  pushing it, and why a cube cannot hold a floor button down. A *door* is a
-  kinematic body here, which is the half of the shadow controller a moving
-  brush actually uses.
+- **`CGrabController`** (`portal_grabcontroller_shared.cpp`, 3,252 lines) —
+  picking a cube up. It is the other half of every cube puzzle in the game, and
+  it is why "a cube holds a floor button down" is *reachable* here and not
+  *demonstrable*: **no cube in Portal 2 ships on a button.** All 98 come out of
+  a dropper or sit on a shelf, the nearest one 128–256 units from the nearest of
+  the game's 78 buttons, and it is the player who carries it there.
+  `portdocs/VPHYSICS_SHADOW.md` §7.
+- **`CCubeRotationController`** (`prop_weightedcube.h:35`) — the
+  `IMotionEvent` that turns a tumbling cube upright as it lands, which is why a
+  dropped cube in the shipped game settles square and this port's visibly does
+  not.
 - **Collision events** — impact sounds, impact damage, `CCollisionEvent`.
 - **Constraints, springs, motion controllers, fluids, ragdolls, vehicles.**
 - **Bone followers**, which is collision that follows an animation. A model whose
   `.phy` carries more than one solid (51 of the game's 1,056) therefore gets no
   body at all rather than its first bone frozen in the bind pose.
-- **`trace/` integration.** The cube is in the physics world and not in the
-  trace world. Same seam as the first item.
 - **Per-triangle world materials** — gotcha 7.
+- **`StepUp`.** `CBasePlayer::PostThinkVPhysics` beams the shadow up by
+  `m_outStepHeight` after the movement steps the player up a stair. With the
+  teleport at 24 units and a step height of 18 the shadow recovers on its own
+  within a tick, so what `StepUp` buys is that it recovers without the body
+  briefly being inside the step.
+- **The ground *entity*.** `CBasePlayer::GetGroundVPhysics` is the other half
+  of `PostThinkVPhysics`'s condition — a player standing on a moveable physics
+  object makes that object a local coordinate frame for the controller, so the
+  shadow chases the player *relative to the thing carrying them*. `MoveData`'s
+  ground is a plane, not an entity, so the port has only the first half. It
+  matters the day something in Portal 2 is rideable; nothing currently is.
+- **`CShadowController` itself**, which is a *replacement* rather than an
+  omission: Rapier has kinematic bodies and IVP did not, so the game-driven
+  half of `physics_shadow.cpp` is `Physics::follow_movers` and always has been.
+  `portdocs/VPHYSICS_SHADOW.md` §0.1.
 - **Save/restore**, and `phys_timescale`/`phys_speeds`.
 
 ## 8. Which test guards what
@@ -286,6 +360,23 @@ would be noticed first.
 | **Every shipped map's lump 29** | `every_shipped_map_carries_a_world_collision_model` *(depot)* |
 | The surface database, and the five superelastic surfaces | `the_surface_property_database_resolves_the_cubes_chain` *(depot)* |
 | **The real cube on the real map** | `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` *(depot)* |
+| The sweep reports props and not the world | `a_sweep_reports_the_prop_and_not_the_world` |
+| …including a *frozen* prop, which is a fixed body | `a_frozen_prop_still_stops_a_sweep` |
+| …and never the player's own shadow | `the_players_shadow_is_not_swept_against` |
+| The sweep normal is Source's, not parry's | `the_sweep_normal_points_back_at_the_sweeper` |
+| A degenerate zero-extent sweep is a ray, not a NaN | `a_ray_against_a_prop_is_a_zero_extent_sweep` |
+| A sweep from inside a prop, and a zero-length one | `a_sweep_that_starts_inside_a_prop_is_start_solid`, `a_zero_length_sweep_is_a_position_test` |
+| A contact normal points at what is touched | `a_resting_bodys_contact_normal_points_at_what_it_rests_on` |
+| `ComputeController` closes the gap in one step | `the_controller_closes_the_gap_in_one_step` |
+| …with a **per-axis** clamp, so a diagonal reaches √3 | `the_clamp_is_per_axis_so_a_diagonal_reaches_root_three` |
+| `MaxSpeed` leaves nothing when the wish is met | `nothing_is_available_when_the_wish_is_already_being_delivered` |
+| `CNormalList::ClampVector`'s three cases | `a_clamped_vector_slides_creases_and_stops` |
+| Immovable forbids the push; a light prop is capped | `an_immovable_contact_forbids_the_push`, `a_light_prop_is_pushed_at_the_speed_limit_and_no_faster` |
+| The floor is not clamped against | `the_ground_is_not_a_plane_the_push_is_clamped_against` |
+| A walking player shoves a cube; a standing one does not | `a_walking_player_shoves_a_cube`, `a_standing_player_does_not_push` |
+| A shadow left behind is teleported, not driven | `a_shadow_left_too_far_behind_is_teleported` |
+| …and a *disabled* one is stopped and recovered too | `a_standing_players_shadow_is_stopped_rather_than_left_coasting` |
+| **The real player shoving the real cube** | `the_player_shadow_shoves_the_cube_on_sp_a1_intro1` *(depot)* |
 
 ## 9. Extending it
 
@@ -294,7 +385,11 @@ would be noticed first.
 - **A new query** (a ray cast for the trace module, say) belongs on
   `Environment` over `PhysicsWorld::query_pipeline`; do not hand a
   `RigidBodyHandle` out — `BodyId` is generational and the handle is not.
-- **The shadow controller** is the one piece that would change shapes rather
-  than add to them: it needs `client/`'s movement, `trace/` and the environment
-  to agree about where the player is, which is a design question rather than an
-  implementation.
+- **A new query** on the environment goes beside
+  [`sweep_box`](#4b-asking-the-environment-a-question), over
+  `PhysicsWorld::query_pipeline`, and is filtered on `Body::dynamic` rather
+  than on the Rapier body type for the reason §4b gives.
+- **Reaching `trace/` with it** goes through `engine::trace::PropQuery`, whose
+  only implementation is `engine/mod.rs`'s `PhysicsProps`. `trace/` must not
+  name `vphysics` and `server/` must not name `engine`; `engine/` may name
+  both, which is why the impl lives there and not at either end.

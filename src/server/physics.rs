@@ -41,7 +41,8 @@ use glam::Vec3;
 
 use super::entity::{EntityId, EntityList};
 use super::movement::{MoveType, Solid};
-use crate::vphysics::env::{BodyId, Environment, Motion};
+use crate::vphysics::env::{BodyId, Environment, Motion, Sweep};
+use crate::vphysics::shadow::PlayerController;
 use crate::vphysics::Model;
 
 /// Something a class asked the environment to do, queued until the dispatch it
@@ -100,6 +101,14 @@ pub struct Physics {
     /// a write into the broad phase. Valve's equivalent is `PhysFrame`'s
     /// `if ( pPhysics && !pPhysics->IsAsleep() )`.
     movers: Vec<(EntityId, BodyId, (Vec3, Vec3))>,
+    /// The player's shadow — `CBasePlayer::m_pPhysicsController`.
+    ///
+    /// Created on the first tick that has a player rather than in
+    /// [`Physics::new`], because the environment is built by the *engine*
+    /// before the map's entities are spawned and there is no player then.
+    /// `CBasePlayer::InitVCollision` has the same deferral for the same
+    /// reason: it runs from `Spawn`, not from `LevelInitPreEntity`.
+    player: Option<PlayerController>,
     stats: PhysicsStats,
 }
 
@@ -142,6 +151,7 @@ impl Physics {
             brush_models: brush_models.into_iter().collect(),
             owners: HashMap::new(),
             movers: Vec::new(),
+            player: None,
             stats: PhysicsStats {
                 static_bodies,
                 ..Default::default()
@@ -425,6 +435,61 @@ impl Physics {
             }
             true
         });
+    }
+
+    /// One swept box against every physics prop —
+    /// [`Environment::sweep_box`], which is the whole of it.
+    ///
+    /// Here rather than reached through an accessor on the environment because
+    /// this is the module that owns the environment's lifetime, and because
+    /// the one caller is outside `server/` entirely: `engine/mod.rs`
+    /// implements [`PropQuery`](crate::engine::trace::PropQuery) over this and
+    /// hands it to the player's movement tracer.
+    pub fn sweep_box(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
+        self.env.sweep_box(half, start, end)
+    }
+
+    /// `CBasePlayer::SetupVPhysicsShadow` on the first tick there is a player,
+    /// then `UpdateVPhysicsPosition` on every tick after it.
+    ///
+    /// `target` is where the movement put the player, `wish` is
+    /// `m_vNewVPhysicsVelocity` and `mins`/`maxs` are the live hull. Returns
+    /// whether the shadow is touching something the solver moves —
+    /// `IPhysicsPlayerController::IsInContact`.
+    ///
+    /// **Call it before [`step`](Physics::step)**: it writes the velocity for
+    /// the step that is about to run.
+    pub fn drive_player(
+        &mut self,
+        target: Vec3,
+        wish: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        dt: f32,
+    ) -> bool {
+        let controller = match &mut self.player {
+            Some(controller) => controller,
+            None => {
+                self.player = PlayerController::new(&mut self.env, target, mins, maxs);
+                match &mut self.player {
+                    Some(controller) => controller,
+                    // A degenerate hull, which cannot happen for a player and
+                    // would otherwise retry once a tick forever.
+                    None => return false,
+                }
+            }
+        };
+        controller.set_bounds(&mut self.env, mins, maxs);
+        controller.drive(&mut self.env, target, wish, dt);
+        controller.in_contact()
+    }
+
+    /// `CBasePlayer::VPhysicsDestroyObject` — the shadow goes when the player
+    /// does.
+    pub fn destroy_player(&mut self) {
+        if let Some(controller) = self.player.take() {
+            controller.destroy(&mut self.env);
+        }
     }
 
     /// `physenv->Simulate()` followed by the `GetActiveObjects` loop.
@@ -978,5 +1043,113 @@ mod depot {
         // The abs/local pair moved together — a bare write to `origin` would
         // leave `local_origin` where the lump put it.
         assert_eq!(core.local_origin, core.origin);
+    }
+
+    /// The shadow controller, on the real cube on the real map.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shoves_the_cube -- --ignored --nocapture
+    /// ```
+    ///
+    /// Drops the cube the way the test above does, then puts a player beside
+    /// it and walks them into it. What is being tested is the *server* half —
+    /// `UpdateVPhysicsPosition` and the controller under it — so the player's
+    /// origin is advanced by hand rather than by `client/`'s movement, which
+    /// is what the running game's trace would do and which
+    /// `a_prop_in_the_clip_chain_stops_a_sweep_the_world_would_not` covers on
+    /// its own side.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_player_shadow_shoves_the_cube_on_sp_a1_intro1() {
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let bsp = Bsp::load(&vfs, "sp_a1_intro1").expect("load the map");
+        let props = Props::load("sp_a1_intro1", &bsp).expect("the prop lump");
+        let mut built = world_physics::build(
+            "sp_a1_intro1",
+            &bsp,
+            &props,
+            &vfs,
+            world_physics::surface_properties(&vfs),
+        );
+        let mut server = Server::new();
+        server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
+        let names: Vec<String> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| e.model)
+            .collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+
+        let cube = name::find_by_name(&server.entities, "box")
+            .next()
+            .expect("the cube named `box`");
+        // Let it land and go to sleep first — the whole point is that a
+        // *sleeping* cube is still pushable.
+        for _ in 0..320 {
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        }
+        let resting = server.entities.get(cube).expect("the cube").core.origin;
+
+        // The player, standing 48 units west of the cube with their feet at
+        // the cube's floor. 48 is the player's own half-width plus the cube's
+        // plus a margin, so nothing starts overlapping.
+        let feet = Vec3::new(resting.x - 48.0, resting.y, resting.z - 16.0);
+        let mut state = crate::server::PlayerState {
+            origin: feet,
+            angles: Vec3::ZERO,
+            velocity: Vec3::new(175.0, 0.0, 0.0),
+            base_velocity: Vec3::ZERO,
+            on_ground: true,
+            move_type: MoveType::Walk,
+            mins: Vec3::new(-16.0, -16.0, 0.0),
+            maxs: Vec3::new(16.0, 16.0, 72.0),
+            health: 100,
+            life_state: Default::default(),
+            flags: 0,
+            buttons: 0,
+            // What the movement would have asked for, walking east.
+            wish_velocity: Vec3::new(175.0, 0.0, 0.0),
+        };
+        server.spawn_player(state);
+
+        // A second of walking east, the player's origin advanced the way the
+        // movement code would advance it against open floor.
+        let mut furthest = 0.0f32;
+        for tick in 0..64 {
+            state.origin.x += 175.0 / 64.0;
+            server.set_player_state(state);
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+            let now = server.entities.get(cube).expect("the cube").core.origin;
+            furthest = furthest.max((now - resting).length());
+            if tick % 16 == 0 {
+                eprintln!("  t{tick}: player {:?} cube {now:?}", state.origin);
+            }
+        }
+        let after = server.entities.get(cube).expect("the cube").core.origin;
+        eprintln!(
+            "cube rested at {resting:?}, player walked from {feet:?}; \
+             shoved {furthest:.1} units at most, ended {after:?}"
+        );
+
+        // **The measurement is the furthest it got, not where it ended**, and
+        // that is the map rather than the port: the cube on `sp_a1_intro1`
+        // comes to rest on the slope it fell onto (`the_cube_on_sp_a1_intro1_
+        // falls_and_comes_to_rest`), so a shove eastward is a shove *uphill*
+        // and the cube rolls back down behind the player as they walk past it.
+        // Watching it go 18 units up the slope is the whole of what the
+        // shadow controller does; watching where it settles afterwards is a
+        // test of the slope.
+        assert!(
+            furthest > 8.0,
+            "the player should have shoved the cube: it never got further than \
+             {furthest:.2} units from {resting:?}"
+        );
     }
 }

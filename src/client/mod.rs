@@ -900,6 +900,8 @@ impl Client {
             speed_cropped: false,
             // Filled in by `player_move` itself.
             move_start: self.player.origin,
+            out_wish_vel: Vec3::ZERO,
+            touched_physics: false,
             portal_environment: self.player.portal_environment,
             teleported: None,
         };
@@ -925,6 +927,23 @@ impl Client {
         self.player.view_offset = mv.view_offset;
         self.player.old_buttons = mv.old_buttons;
         self.player.portal_environment = mv.portal_environment;
+        // `CBasePlayer::PostThinkVPhysics` (`baseplayer_shared.cpp:3316`),
+        // the half of it this port has: **when the move did not touch a
+        // physics prop, the accumulated wish velocity is thrown away and
+        // replaced by the max speed on every axis.** Without that the shadow
+        // would be capped at one tick's worth of acceleration and would fall
+        // behind the player constantly, teleporting to catch up; with it, the
+        // cap only becomes meaningful when there is a prop to be gentle with.
+        //
+        // Valve's condition is `!(TouchedPhysics() || pPhysGround)` and this
+        // is the first half. The second — the player standing on a *moveable
+        // physics object*, which makes that object a local coordinate frame —
+        // needs a ground *entity*, and `MoveData::ground` is a plane. See
+        // `portdocs/VPHYSICS_SHADOW.md` §9.
+        self.player.wish_velocity = match mv.touched_physics {
+            true => mv.out_wish_vel,
+            false => Vec3::splat(mv.max_speed),
+        };
 
         // **The one thing the move cannot do to itself.** `MoveData` has no
         // view angles — see [`movement::Teleport`] — so a teleport hands the

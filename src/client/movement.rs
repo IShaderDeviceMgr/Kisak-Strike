@@ -368,6 +368,39 @@ pub struct MoveData {
     /// applied at most once per command.
     pub speed_cropped: bool,
 
+    /// `m_outWishVel` (`igamemovement.h:69`) — *"this is where you tried"*.
+    ///
+    /// Not a velocity the player has; a record of how much velocity this move
+    /// **asked** for, accumulated as it was applied and given back by friction
+    /// as it was taken away. Cleared at the top of every
+    /// [`player_move`], exactly as `CGameMovement::PlayerMove` clears it
+    /// (`gamemovement.cpp:5001`).
+    ///
+    /// It exists for one consumer: the player's physics shadow
+    /// ([`crate::vphysics::shadow`]), which uses it as the cap on how hard it
+    /// may push a prop. That is why walking into a wall still pushes a cube —
+    /// the *velocity* is zero there and this is not — and why standing still
+    /// does not.
+    ///
+    /// Three sites write it, all Valve's: [`accelerate`], [`friction`] and
+    /// [`walk_move`]. [`air_accelerate`] deliberately does not.
+    pub out_wish_vel: Vec3,
+    /// `m_bTouchedPhysObject` (`player.h:1130`) — this move's hull met a
+    /// **physics prop**.
+    ///
+    /// Cleared with [`out_wish_vel`](MoveData::out_wish_vel) and set by any
+    /// player trace that a prop won, which needs
+    /// [`Tracer::with_props`](crate::engine::trace::Tracer::with_props) to be
+    /// attached — so it is always false in a test with no physics world.
+    ///
+    /// Its consumer is `PostThinkVPhysics` (`baseplayer_shared.cpp:3316`):
+    /// when the player is *not* touching a prop the accumulated
+    /// [`out_wish_vel`](MoveData::out_wish_vel) is thrown away and replaced by
+    /// `(maxspeed, maxspeed, maxspeed)`, so the shadow tracks the player
+    /// freely and only becomes gentle when there is something to be gentle
+    /// with.
+    pub touched_physics: bool,
+
     /// `m_vMoveStartPosition` (`portal_gamemovement.h:156`) — where the feet
     /// were before this move ran.
     ///
@@ -484,12 +517,19 @@ fn simple_spline(value: f32) -> f32 {
 /// `CGameMovement::TracePlayerBBox` (`gamemovement.h:308`) — sweep the player's
 /// current hull, against the world only.
 fn trace_player_bbox(
-    mv: &MoveData,
+    mv: &mut MoveData,
     tracer: &mut Tracer<'_>,
     start: Vec3,
     end: Vec3,
 ) -> crate::engine::trace::Trace {
-    trace_hull(tracer, start, end, mv.ducked)
+    let trace = trace_hull(tracer, start, end, mv.ducked);
+    // `CBasePlayer::Touch`'s `SetTouchedPhysics( true )`, reached from the
+    // trace instead of from the touch list — see
+    // [`Trace::hit_prop`](crate::engine::trace::Trace::hit_prop). Sticky for
+    // the whole command, like Valve's, because it is cleared once per
+    // [`player_move`] and not once per trace.
+    mv.touched_physics |= trace.hit_prop;
+    trace
 }
 
 /// The same, for the one caller that needs a hull other than the current one.
@@ -540,6 +580,12 @@ pub fn accelerate(mv: &mut MoveData, wishdir: Vec3, wishspeed: f32, accel: f32, 
     let accelspeed = (accel * dt * acceleration_scale * mv.surface_friction).min(addspeed);
 
     mv.velocity += wishdir * accelspeed;
+    // `mv->m_outWishVel[i] += accelspeed * wishdir[i]` (`gamemovement.cpp:1999`)
+    // — see [`MoveData::out_wish_vel`]. **`air_accelerate` has no equivalent
+    // line**, and that is Valve's: `CGameMovement::AirAccelerate` never
+    // touches it, so what the player's physics shadow is allowed to push with
+    // is accumulated on the ground only.
+    mv.out_wish_vel += wishdir * accelspeed;
 }
 
 /// `CPortalGameMovement::AirAccelerate` (`portal_gamemovement.cpp:626`).
@@ -885,6 +931,12 @@ fn walk_move(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f3
     // First try just moving to the destination.
     let dest = mv.origin + mv.velocity * dt;
     let pm = trace_player_bbox(mv, tracer, mv.origin, dest);
+
+    // `mv->m_outWishVel += wishdir * wishspeed` (`gamemovement.cpp:2248`),
+    // which Valve puts between the trace and the test of its result — so it
+    // runs whether or not the move was blocked, and runs exactly once per
+    // `WalkMove` rather than once per clipped attempt.
+    mv.out_wish_vel += wishdir * wishspeed;
 
     if pm.fraction == 1.0 {
         mv.origin = pm.end;
@@ -1289,9 +1341,30 @@ fn friction(mv: &mut MoveData, tracer: &mut Tracer<'_>, vars: &MoveVars, dt: f32
     }
 
     let newspeed = (speed - drop).max(0.0);
+    let ratio = newspeed / speed;
     if newspeed != speed {
-        mv.velocity *= newspeed / speed;
+        mv.velocity *= ratio;
     }
+    // `mv->m_outWishVel -= (1.f-newspeed) * mv->m_vecVelocity`
+    // (`gamemovement.cpp:1931`) — friction takes back out of the wish velocity
+    // whatever proportion of the real velocity it just removed.
+    //
+    // > **Valve's `newspeed` is not a proportion on every path through this**,
+    // > and this one is. The division `newspeed /= speed` happens *inside*
+    // > `if ( newspeed != speed )`, so when there is no drop at all — which is
+    // > every airborne tick, because the only thing that fills `drop` is
+    // > ground friction — the subtraction runs with `newspeed` still an
+    // > absolute speed. At a walking 175 u/s it becomes
+    // > `m_outWishVel += 174 * velocity`. It survives into the physics shadow
+    // > only when the player is airborne *and* touching a physics prop (see
+    // > [`MoveData::touched_physics`]), where its effect is to leave the
+    // > shadow's push cap effectively unbounded.
+    // >
+    // > Written as the proportion it means, for the same reason
+    // > `vphysics::shadow::max_speed` corrects its own: both bugs only ever
+    // > *loosen* a clamp on the player's own shadow, and no shipped content
+    // > can be tuned against either. `portdocs/VPHYSICS_SHADOW.md` §6.
+    mv.out_wish_vel -= (1.0 - ratio) * mv.velocity;
 }
 
 /// `CPortalGameMovement::StartGravity` (`portal_gamemovement.cpp:3078`).
@@ -2483,6 +2556,11 @@ pub fn player_move<'a>(
     // ran.
     mv.move_start = mv.origin;
     mv.teleported = None;
+    // `mv->m_outWishVel.Init()` (`gamemovement.cpp:5001`) and
+    // `m_bTouchedPhysObject = false` (`player.cpp:3910`) — one per command,
+    // which is one per call to this.
+    mv.out_wish_vel = Vec3::ZERO;
+    mv.touched_physics = false;
 
     check_parameters(mv, old_angles);
     reduce_timers(mv, dt);
@@ -2604,6 +2682,8 @@ mod tests {
             view_offset: VEC_VIEW,
             speed_cropped: false,
             move_start: origin,
+            out_wish_vel: Vec3::ZERO,
+            touched_physics: false,
             portal_environment: None,
             teleported: None,
         }
@@ -2704,6 +2784,41 @@ mod tests {
             "and actually travelled: {}",
             mv.origin.x
         );
+    }
+
+    /// `m_outWishVel` is what the player's physics shadow pushes with, so the
+    /// two things that matter about it are that walking fills it and standing
+    /// still does not.
+    ///
+    /// **It is not the velocity.** A player walking into a wall has a velocity
+    /// of nearly zero and a wish velocity of nearly `sv_speed_normal`, which
+    /// is exactly the case the shadow exists for — and is why a cube in a
+    /// corner can still be pushed.
+    #[test]
+    fn the_wish_velocity_records_what_a_move_asked_for_and_not_what_it_got() {
+        let world = room();
+
+        let mut standing = settled(&world);
+        run(&mut standing, &world, 30, TICK, |_| {});
+        assert!(
+            standing.out_wish_vel.length() < 1.0,
+            "a standing player asks for nothing: {:?}",
+            standing.out_wish_vel
+        );
+
+        let mut walking = settled(&world);
+        run(&mut walking, &world, 30, TICK, |mv| {
+            mv.forwardmove = SV_SPEED_NORMAL;
+        });
+        assert!(
+            walking.out_wish_vel.x > 10.0,
+            "a walking player asks for something: {:?}",
+            walking.out_wish_vel
+        );
+
+        // Nothing in the fixture is a physics prop, and there is no
+        // `PropQuery` attached, so the flag the shadow reads stays false.
+        assert!(!walking.touched_physics);
     }
 
     /// Friction stops a walk rather than letting it coast for ever, and the
@@ -3055,7 +3170,8 @@ mod tests {
                     angles,
                 );
 
-                let stuck = trace_player_bbox(&mv, &mut tracer, mv.origin, mv.origin);
+                let at = mv.origin;
+                let stuck = trace_player_bbox(&mut mv, &mut tracer, at, at);
                 assert!(!stuck.start_solid, "stuck at {:?} facing {yaw}", mv.origin);
             }
         }

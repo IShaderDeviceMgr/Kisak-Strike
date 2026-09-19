@@ -101,6 +101,17 @@ pub struct Player {
     /// Carried between commands, which is what makes `sv_noclipaccelerate`
     /// mean anything: without it every frame would start from a standstill.
     pub velocity: Vec3,
+    /// `m_vNewVPhysicsVelocity` (`player.h:1304`) — what the last move *asked*
+    /// for, which is the only thing the player's physics shadow is allowed to
+    /// push a prop with.
+    ///
+    /// Written by `Client::run_move` from
+    /// [`MoveData::out_wish_vel`](crate::client::movement::MoveData::out_wish_vel),
+    /// through `PostThinkVPhysics`'s substitution; read by the server, which
+    /// hands it to [`crate::vphysics::shadow::PlayerController::drive`]. It is
+    /// **not** a velocity the player has and nothing in the movement reads it
+    /// back.
+    pub wish_velocity: Vec3,
     /// `m_vecBaseVelocity` — the velocity of whatever is carrying the player.
     ///
     /// **The server owns it.** A `trigger_push` writes it every tick it is
@@ -172,6 +183,7 @@ impl Player {
         Player {
             origin,
             velocity: Vec3::ZERO,
+            wish_velocity: Vec3::ZERO,
             base_velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
             // `MOVETYPE_WALK`, which is what a player spawns as

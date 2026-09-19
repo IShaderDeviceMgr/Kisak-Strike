@@ -9,6 +9,9 @@
 //!   `LUMP_PHYSCOLLIDE` — into convex hulls. This is the only part of IVP that
 //!   is *ported*; every engine needs those hulls and none can read them.
 //! - [`surfaceprops`] is the friction and elasticity database.
+//! - [`shadow`] is the player's body — `physics_shadow.cpp`'s
+//!   `CPlayerController`, which is the half of that file that is a port rather
+//!   than a replacement. `portdocs/VPHYSICS_SHADOW.md`.
 //! - [`env`](mod@env) is the simulation, and **it runs in Source units** rather than in
 //!   Valve's metres. Rapier's `length_unit` is the reason it can.
 //!
@@ -16,6 +19,7 @@
 
 pub mod collide;
 pub mod env;
+pub mod shadow;
 pub mod surfaceprops;
 
 use collide::{SolidParams, VCollide};
