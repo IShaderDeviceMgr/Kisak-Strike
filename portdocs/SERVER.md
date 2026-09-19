@@ -1154,12 +1154,16 @@ movement block on `EntityCore`, two new `Behaviour` methods, and `ThinkList`
 turned into the real `CSimThinkManager`. **API: `rustdocs/SERVER.md`.**
 
 Deliberately **not** in this stage, as planned: pushing the player.
-`CPhysicsPushedEntities` (`physics_main.cpp:130-1130`, ~1,000 lines of
+`CPhysicsPushedEntities` (`physics_main.cpp:122-1130`, ~1,000 lines of
 speculative push, blocker enumeration and rollback) is most of the complexity
 and none of the payoff, and it wants `trace/` stage 4 underneath it anyway. So
-`PerformPush` is ported with the blocker always null, which is the branch the
+`PerformPush` was ported with the blocker always null, which is the branch the
 shipped game takes on almost every tick; `Blocked`/`StartBlocked`/`EndBlocked`,
-`m_bDoorGroup`, `forceclosed` and the block-damage keys are parsed and unread.
+`m_bDoorGroup`, `forceclosed` and the block-damage keys were parsed and unread.
+
+> **It has since landed**, as `src/server/push.rs` — see "Beyond" below and
+> `rustdocs/SERVER.md`, "The pusher". `m_bDoorGroup` is the only piece of that
+> list still parsed and unread.
 
 Ends with: test-chamber doors open.
 
@@ -1719,12 +1723,17 @@ props are posed by `rot_z(+90)` rather than the identity.
 **The five stages are done, so what follows is individual classes and
 subsystems rather than a staged plan.** In the order they are worth doing:
 
-- **`CPhysicsPushedEntities` — a door that shoves the player.** ~1,000 lines of
-  speculative push, blocker enumeration and rollback (`physics_main.cpp:130`),
-  and `EntityCore::local_time` is already the field its answer goes in. It is
-  the first puzzle that cannot be solved without standing on something that
-  moves, and it is also what would make a `func_door` able to *crush*, which is
-  the damage type 71 of the game's `trigger_hurt`s are labelled with.
+- ~~**`CPhysicsPushedEntities` — a door that shoves the player.**~~ — **done**,
+  in `src/server/push.rs`. `EntityCore::local_time` was indeed the field its
+  answer goes in, and it now runs slow while a mover is held. Measured on the
+  shipped maps: **54 linear movers shove the player out of the doorway they
+  close over and 13 are stopped dead by them**, the furthest shove 234.4 units.
+  Block damage came with it (`blockdamage` on 6 `func_movelinear`s, `dmg` on 7
+  `func_rotating`s), so a mover can now crush. What is left of the list is
+  `m_bDoorGroup` — a blocked leaf reopening the *other* leaf of a double door —
+  which needs cross-entity dispatch; see `rustdocs/SERVER.md`, "The pusher",
+  for that and for the four findings, one of which is a `CBaseDoor::Spawn`
+  solidity bug that had been sitting in this port since stage 3.
 - ~~**The local/abs transform pair on `EntityCore`**~~ — **done**, in
   `src/server/hierarchy.rs`. It took `SetParent`/`ClearParent` and the 201
   parented movers with it; what is left of the family is
@@ -1819,16 +1828,20 @@ question into a number.
    **Settled.** That class is ported and the shape named here is exactly what it
    uses: `Context::entity` to read a branch's value and `Context::behaviour_mut` to
    register with it in `Activate`. No cell, no `unsafe`.
-4. **How much of `CPhysicsPushedEntities` is really needed.** Stage 3 deferred all
-   of it, as planned, and the shape it left behind is the right one: `PerformPush`
-   is ported with the blocker always null, `EntityCore::local_time` is real and
-   correct and simply never goes backwards, and the keys that feed the blocked
-   path (`forceclosed`, `dmg`, `BlockDamage`) are parsed and unread. Portal 2 has
-   crushing doors and moving platforms the player rides; the condition that forces
-   the port is the first puzzle that cannot be solved without standing on something
-   that moves. **`ENGINE_TRACE.md` stage 4 is no longer in the way** — a door
-   is a wall to the player now — so this is the next thing in the module worth
-   doing, alongside the local/abs pair below.
+4. ~~**How much of `CPhysicsPushedEntities` is really needed.**~~ **Answered by
+   porting it**, and the answer is "nearly all of the structure and almost none
+   of the bookkeeping". The three trace filters, the speculative move, the
+   hierarchy list, the rollback and the three blocked callbacks are all load
+   bearing; `UpdatePusherPhysicsEndOfTick`, `StoreMovedEntities` and the
+   physics-shadow updates are `vphysics` and are gone, and `FinishPush`'s touch
+   work is already done by the tick's own touch pass. `EntityCore::local_time`
+   was the right field and now runs slow.
+
+   The shape stage 3 left behind was the right one in one more way than
+   expected: because only `movement::simulate` needed the collision query, the
+   whole seam is one `&mut dyn TouchQuery` threaded from `Server::run_tick`
+   through `run_think_functions` into the closure `dispatch` runs — no field on
+   `Context`, no change at any other call site.
 
    **A second, smaller question opened underneath it, and it has since been
    answered.** A mover that is *parented* moves in the parent's frame in Valve's
@@ -1838,10 +1851,11 @@ question into a number.
    integrate, and `SetParent`/`ClearParent` are accepted. The prediction that
    "whichever of the two forces it, both are fixed at once" held: the
    `SetParent` family was what forced it and the movers came free.
-   `CPhysicsPushedEntities` is now the only one of the two still open, and the
-   pair gave it something it will want — `SetupAllInHierarchy` builds the
-   pusher's children into the push list, and the child list it walks is
-   `EntityCore::children()`.
+   Both are now closed. The pair gave the pusher exactly what was predicted —
+   `SetupAllInHierarchy` builds the pusher's children into the push list, and
+   the child list it walks is `EntityCore::children()` — and one thing that was
+   not: `hierarchy::root_move_parent`, which `CBaseDoor::Spawn` needed to
+   choose its solidity correctly and had been getting wrong.
 5. **The 41 reconstructed classes.** §1.3. The risk is silent divergence: reconstructed
    behaviour that looks right and is not. Mark them, and lean on the FGD check (§7.3)
    for at least the interface.

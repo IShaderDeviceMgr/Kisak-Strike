@@ -44,12 +44,13 @@ use glam::Vec3;
 use crate::server::class::{
     Behaviour, Context, InputDef, InputDefs, SpawnResult, UseType, NEVER_THINK,
 };
+use crate::server::damage::{DamageInfo, DMG_CRUSH};
 use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input, Variant};
 use crate::server::keyvalue::{atof, atoi};
 use crate::server::movement::{
-    anglemod, dot_product_abs, move_dir, MoveType, Solid, Toggle, ToggleState, EF_NODRAW,
-    FSOLID_NOT_SOLID,
+    anglemod, dot_product_abs, move_dir, CollisionGroup, MoveType, Solid, Toggle, ToggleState,
+    EF_NODRAW, FL_UNBLOCKABLE_BY_PLAYER, FSOLID_NOT_SOLID,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,10 +65,23 @@ use crate::server::movement::{
 const _SF_DOOR_START_OPEN_OBSOLETE: u32 = 1;
 /// `SF_DOOR_ROTATE_BACKWARDS` — 79 of the game's 346 rotating doors.
 const SF_DOOR_ROTATE_BACKWARDS: u32 = 2;
-/// `SF_DOOR_NONSOLID_TO_PLAYER` — 141. Solidity is stage 4's; recorded.
-const _SF_DOOR_NONSOLID_TO_PLAYER: u32 = 4;
-/// `SF_DOOR_PASSABLE` — 116. Ditto.
-const _SF_DOOR_PASSABLE: u32 = 8;
+/// `SF_DOOR_NONSOLID_TO_PLAYER` — 141 of the game's 621 doors, 118 of them
+/// rotating.
+///
+/// `COLLISION_GROUP_PASSABLE_DOOR` plus `FL_UNBLOCKABLE_BY_PLAYER`. The player
+/// walks through such a door and cannot stop it; see
+/// [`CollisionGroup`](crate::server::movement::CollisionGroup) for the one
+/// `ShouldCollide` rule that is left and
+/// [`push`](crate::server::push) for what the flag changes.
+const SF_DOOR_NONSOLID_TO_PLAYER: u32 = 4;
+/// `SF_DOOR_PASSABLE` — 116. `FSOLID_NOT_SOLID`: the door is scenery.
+///
+/// `EFL_USE_PARTITION_WHEN_NOT_SOLID` goes with it in the C++ and has no
+/// counterpart — it keeps a non-solid entity in the spatial partition so
+/// triggers still find it, and this port's touch query sweeps every brush
+/// model whatever its solidity says (see
+/// [`TouchQuery`](crate::server::TouchQuery)).
+const SF_DOOR_PASSABLE: u32 = 8;
 /// `SF_DOOR_NO_AUTO_RETURN` — 200. A door that stays open until told to shut.
 const SF_DOOR_NO_AUTO_RETURN: u32 = 32;
 /// `SF_DOOR_LOCKED` — 2 doors in the whole game.
@@ -407,18 +421,37 @@ impl Behaviour for Door {
     /// The two are one function here because `CRotDoor::Spawn` begins with
     /// `BaseClass::Spawn()` and the base's own work is already branched on
     /// `IsRotatingDoor()`.
-    fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
+    fn spawn(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) -> SpawnResult {
         // `AngleVectors( angMoveDir, &m_vecMoveDir )`.
         self.move_dir = move_dir(self.move_dir);
 
-        // `if ( GetMoveParent() && GetRootMoveParent()->GetSolid() == SOLID_BSP )`
-        // (`doors.cpp:231`). This port has no *root* parent walk — a parent is
-        // a handle and nothing rebases through it — so a parented door takes
-        // the `SOLID_VPHYSICS` branch, which for a brush entity is the same
-        // brushes either way. 87 of the game's 621 doors name a parent.
-        entity.solid = match entity.parent().is_some() {
-            true => Solid::VPhysics,
-            false => Solid::Bsp,
+        // `if ( GetMoveParent() && GetRootMoveParent()->GetSolid() == SOLID_BSP )
+        //     SetSolid( SOLID_BSP ); else SetSolid( SOLID_VPHYSICS );`
+        // (`doors.cpp:233`).
+        //
+        // > **This is not `CBaseTrigger::InitTrigger`'s rule and it is very
+        // > nearly its opposite.** A trigger is `GetParent() ? SOLID_VPHYSICS
+        // > : SOLID_BSP`; a door is `SOLID_VPHYSICS` *unless* it is parented
+        // > to a hierarchy whose root is `SOLID_BSP`. Stage 3 ported the
+        // > trigger's rule here, when the root-parent walk did not exist and
+        // > the two names were interchangeable — and they were, until
+        // > [`push`](crate::server::push) made
+        // > `ComputeRotationalPushDirection` branch on this exact test.
+        // > **87 of the game's 621 doors name a parent**, and the walk they
+        // > need is [`root_move_parent`](crate::server::hierarchy::root_move_parent),
+        // > which the transform pair added.
+        //
+        // The root is walked from the *parent* rather than from this entity,
+        // because this entity is not in the list while its own `Spawn` runs.
+        entity.solid = match entity.parent() {
+            Some(parent) => {
+                let root = crate::server::hierarchy::root_move_parent(parent, cx.entities());
+                match cx.entity(root).map(|root| root.core.solid) {
+                    Some(Solid::Bsp) => Solid::Bsp,
+                    _ => Solid::VPhysics,
+                }
+            }
+            None => Solid::VPhysics,
         };
         entity.move_type = MoveType::Push;
         // "Don't allow zero or negative speeds" is `CFuncMoveLinear`'s wording;
@@ -428,6 +461,19 @@ impl Behaviour for Door {
         }
         if entity.has_spawn_flags(SF_DOOR_LOCKED) {
             self.locked = true;
+        }
+
+        // The two solidity spawnflags, which decide whether this door is a
+        // wall at all — and, since [`push`](crate::server::push) landed,
+        // whether it shoves the player. The `func_water` guard around them in
+        // the C++ is moot: `func_water` is `CBaseDoor`'s other classname and
+        // this port does not register it (no shipped Portal 2 map places one).
+        if entity.has_spawn_flags(SF_DOOR_PASSABLE) {
+            entity.add_solid_flags(FSOLID_NOT_SOLID);
+        }
+        if entity.has_spawn_flags(SF_DOOR_NONSOLID_TO_PLAYER) {
+            entity.collision_group = CollisionGroup::PassableDoor;
+            entity.flags |= FL_UNBLOCKABLE_BY_PLAYER;
         }
 
         self.toggle.position1 = entity.local_origin;
@@ -483,6 +529,98 @@ impl Behaviour for Door {
             self.toggle.state = ToggleState::AtBottom;
         }
         SpawnResult::Ok
+    }
+
+    /// `CBaseDoor::StartBlocked` (`doors.cpp:1141`) — which of the two
+    /// blocked outputs, decided by which way the door was going.
+    ///
+    /// `TS_GOING_DOWN` is closing; everything else — including a door blocked
+    /// while standing still, which cannot happen — is opening.
+    fn start_blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        let output = match self.toggle.state {
+            ToggleState::GoingDown => "OnBlockedClosing",
+            _ => "OnBlockedOpening",
+        };
+        // `m_OnBlockedClosing.FireOutput( pOther, this )` — the **blocker** is
+        // the activator, which is what makes `!activator` in the chain resolve
+        // to whoever is standing in the doorway.
+        let me = Some(entity.id());
+        entity.fire_output(output, Variant::Void, Some(other), me, 0.0, cx);
+    }
+
+    /// `CBaseDoor::EndBlocked` (`doors.cpp:1242`).
+    ///
+    /// The mirror image, and note that here the *door* is the activator:
+    /// `m_OnUnblockedClosing.FireOutput( this, this )`. By the time it fires
+    /// there is no blocker to name.
+    fn end_blocked(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        let output = match self.toggle.state {
+            ToggleState::GoingDown => "OnUnblockedClosing",
+            _ => "OnUnblockedOpening",
+        };
+        let me = Some(entity.id());
+        entity.fire_output(output, Variant::Void, me, me, 0.0, cx);
+    }
+
+    /// `CBaseDoor::Blocked` (`doors.cpp:1161`) — hurt the blocker, then turn
+    /// round.
+    ///
+    /// # A door with a negative `wait` does not turn round
+    ///
+    /// "if a door has a negative wait, it would never come back if blocked, so
+    /// let it just squash the object to death real fast" — and that is not an
+    /// edge case in Portal 2: **503 of the game's 621 doors have `wait < 0`**
+    /// (242 rotating, 261 plain), because a chamber door that opens and stays
+    /// open is written `wait -1`. So for four doors in five, being blocked
+    /// means the door keeps pushing and the player keeps being shoved,
+    /// which is exactly what the shipped game does.
+    ///
+    /// `m_bForceClosed` returns even earlier — 87 doors set it — and skips the
+    /// group below as well.
+    ///
+    /// # What is not here
+    ///
+    /// **`GetDoorMovementGroup`**, the `m_bDoorGroup` block: a blocked door
+    /// reaches into every *other* door sharing its `targetname` (itself
+    /// excluded, `doors.cpp:1106`), copies its own origin onto the ones
+    /// travelling in the same direction at the same speed, and reverses all of
+    /// them. Valve's own comment on the middle of it is *"this is the most
+    /// hacked, evil, bastardized thing I've ever seen. kjb"*. It needs a
+    /// handler to run another entity's `DoorGoUp` **and** to write that
+    /// entity's origin and velocity, which is the cross-entity dispatch this
+    /// port defers through [`Context`](crate::server::class::Context) and
+    /// which a queued input cannot express.
+    ///
+    /// It is **reachable content**, not a measured-out branch: 121 of the
+    /// game's 621 doors share a `targetname` with another door and **48 of
+    /// those have `wait >= 0`**, so the group loop's own guard would let them
+    /// through. What is missing is a double door where blocking one leaf
+    /// reopens the other; blocking one leaf still reopens *that* leaf.
+    ///
+    /// **`EntityPhysics_CreateSolver`**, the `vphysics` escape hatch for a
+    /// prop a force-closed door cannot damage.
+    fn blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        // "Hurt the blocker a little." Zero on every door in the shipped game
+        // — `blockdamage` is set on six `func_movelinear`s and nothing else —
+        // so this is the reference's shape rather than live content.
+        if self.block_damage != 0.0 {
+            let me = Some(entity.id());
+            cx.take_damage(other, DamageInfo::new(me, me, self.block_damage, DMG_CRUSH));
+        }
+
+        // "If we're set to force ourselves closed, keep going."
+        if self.force_closed {
+            return;
+        }
+
+        if self.toggle.wait < 0.0 {
+            return;
+        }
+
+        match self.toggle.state {
+            ToggleState::GoingDown => self.go_up(entity, cx),
+            _ => self.go_down(entity, cx),
+        }
     }
 
     fn accept_input(
@@ -809,6 +947,28 @@ impl Behaviour for MoveLinear {
             ("startposition", self.start_position.to_string()),
             ("blockdamage", self.block_damage.to_string()),
         ]
+    }
+
+    /// `CFuncMoveLinear::Blocked` (`func_movelinear.cpp:355`) — "hurt the
+    /// blocker", and nothing else.
+    ///
+    /// **A `func_movelinear` does not reverse.** A blocked piston keeps
+    /// pushing for as long as the thing in front of it survives, which is what
+    /// a Portal 2 crusher is. `blockdamage` is set on **6 of the game's 196**
+    /// and is the only live block damage in the shipped content; the other 190
+    /// push without hurting.
+    ///
+    /// Valve's `DAMAGE_EVENTS_ONLY` branch removes a `gib`, which is a
+    /// classname this port does not have.
+    /// `CFuncMoveLinear::Blocked` (`func_movelinear.cpp:355`) — guarded, unlike
+    /// `func_rotating`'s. Its `DAMAGE_EVENTS_ONLY` arm removes a `"gib"`; there
+    /// are no gibs here and no class sets that `m_takedamage`.
+    fn blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        if self.block_damage == 0.0 {
+            return;
+        }
+        let me = Some(entity.id());
+        cx.take_damage(other, DamageInfo::new(me, me, self.block_damage, DMG_CRUSH));
     }
 }
 
@@ -1566,6 +1726,31 @@ impl Behaviour for Rotating {
         self.ang_start = entity.local_angles;
 
         SpawnResult::Ok
+    }
+
+    /// `CFuncRotating::Blocked` (`bmodels.cpp:1375`) — one line, and
+    /// **unguarded**.
+    ///
+    /// `pOther->TakeDamage( CTakeDamageInfo( this, this, m_flBlockDamage,
+    /// DMG_CRUSH ) )` with no `if`, where `CBaseDoor` and `CFuncMoveLinear`
+    /// both test the amount first. That difference is preserved: a zero-damage
+    /// hit still reaches `OnTakeDamage`, which is observable through a
+    /// `filter_damage_type` and through `m_OnHurt`-shaped logic.
+    ///
+    /// **A blocked fan does not stop.** `CFuncRotating` has no `MoveDone` and
+    /// no reversal; the blocker simply stays in the way, and the fan's local
+    /// time stops advancing for as long as it does. `dmg` is set on **7 of the
+    /// game's 27** `func_rotating`s — the grinders and the shredder, which is
+    /// the one place in Portal 2 where standing in a mover kills you through
+    /// this path rather than through a `trigger_hurt`.
+    /// `CFuncRotating::Blocked` (`bmodels.cpp:1375`) — one line, and **no
+    /// `if ( m_flBlockDamage )` guard**, where its linear sibling four files
+    /// away has one. The asymmetry is Valve's and is kept: a `dmg` of zero
+    /// still runs the victim's `OnTakeDamage`, which is observable through a
+    /// damage filter even when no health moves.
+    fn blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        let me = Some(entity.id());
+        cx.take_damage(other, DamageInfo::new(me, me, self.block_damage, DMG_CRUSH));
     }
 
     fn accept_input(

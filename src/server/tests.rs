@@ -4096,9 +4096,34 @@ fn probe_inside(
 struct Placed<'a> {
     collision: &'a crate::engine::trace::CollisionBsp,
     models: &'a [crate::engine::world::PlacedBrushModel],
+    /// [`push_trace`](TouchQuery::push_trace)'s scratch clip chain, exactly as
+    /// `WorldTouchQuery` holds one.
+    chain: Vec<crate::engine::trace::BrushModel>,
 }
 
 impl TouchQuery for Placed<'_> {
+    fn push_trace(
+        &mut self,
+        clip: crate::server::PushClip,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        pushers: &[crate::server::Pusher],
+    ) -> crate::server::PushHit {
+        crate::engine::push_trace(
+            self.collision,
+            self.models,
+            &mut self.chain,
+            clip,
+            start,
+            end,
+            mins,
+            maxs,
+            pushers,
+        )
+    }
+
     fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool {
         let ray = crate::engine::trace::Ray::hull(origin, origin, mins, maxs);
         self.collision
@@ -4257,6 +4282,7 @@ fn every_shipped_maps_triggers_notice_the_player() {
             let mut query = Placed {
                 collision: &collision,
                 models: &owned,
+                chain: Vec::new(),
             };
             // Two ticks, and a touch on **either** counts: a
             // `trigger_teleport` moves the player out of itself on the first
@@ -5344,6 +5370,7 @@ fn every_shipped_trigger_hurt_kills_the_player_standing_in_it() {
             let mut query = Placed {
                 collision: &collision,
                 models: &owned,
+                chain: Vec::new(),
             };
             let interval = server.time().interval;
             let ticks = (SECONDS / interval).round() as u32;
@@ -7884,4 +7911,810 @@ fn switching_a_portal_on_resets_both_of_its_clocks() {
     let blue = portal_named(&server, "blue");
     assert_eq!((blue.opened_at, blue.static_at), (now, now));
     assert!(blue.linked.is_none(), "orange is still off");
+}
+
+// ---------------------------------------------------------------------------
+// the pusher — `src/server/push.rs`
+// ---------------------------------------------------------------------------
+
+/// A [`TouchQuery`] with a pusher's three clip chains over axis-aligned boxes.
+///
+/// [`BoxTriggers`] is the same idea for the touch test: the *shape* of the
+/// engine's answer with none of its geometry, so that a test about what the
+/// pusher decides is not also a test of the BSP sweep. The real one is
+/// `crate::engine::push_trace`, and the depot test below runs the pusher
+/// against *that* over every shipped map.
+///
+/// # What it models, and what it does not
+///
+/// Overlap is **strict** — touching is not overlapping — which is what makes a
+/// player resting exactly on a platform not also stuck inside it, and it is
+/// the same convention `DIST_EPSILON` buys in the real sweep.
+///
+/// A blocked sweep stops dead at its start rather than sliding to the contact
+/// point: there is no fraction between 0 and 1 here. That is a coarser answer
+/// than the engine's and it is the conservative one — a push that the real
+/// trace would have let through part way is refused outright — so a test that
+/// passes against this is not relying on a partial shove.
+///
+/// Angles are handled by bounding the rotated box, which is exact at right
+/// angles and conservative in between.
+struct PushBoxes {
+    /// `("*N" index, model-space mins, model-space maxs)` — the brush models
+    /// the pushers name.
+    models: Vec<(usize, Vec3, Vec3)>,
+    /// World-space solid boxes that are not entities: the walls a push can
+    /// squash something against.
+    world: Vec<(Vec3, Vec3)>,
+}
+
+impl PushBoxes {
+    fn new(models: &[(usize, Vec3, Vec3)], world: &[(Vec3, Vec3)]) -> PushBoxes {
+        PushBoxes {
+            models: models.to_vec(),
+            world: world.to_vec(),
+        }
+    }
+
+    /// Does a hull at `origin` overlap this pusher's brush model?
+    ///
+    /// [`swept_box_touches_obb`](crate::server::obb::swept_box_touches_obb) —
+    /// the real `IntersectRayWithOBB`, which the port already has for triggers
+    /// — rather than a bounded AABB, because a `func_door_rotating`'s bounding
+    /// box at 45° is nearly twice the slab and a test built on it would report
+    /// contact with thin air.
+    fn touches(
+        &self,
+        pusher: &crate::server::Pusher,
+        origin: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+    ) -> bool {
+        let Some(&(_, obb_mins, obb_maxs)) =
+            self.models.iter().find(|(i, _, _)| *i == pusher.model)
+        else {
+            return false;
+        };
+        crate::server::obb::swept_box_touches_obb(
+            origin,
+            origin,
+            mins,
+            maxs,
+            pusher.origin,
+            pusher.angles,
+            obb_mins,
+            obb_maxs,
+        )
+    }
+}
+
+/// Strictly overlapping, on all three axes.
+fn boxes_overlap(a: (Vec3, Vec3), b: (Vec3, Vec3)) -> bool {
+    (0..3).all(|i| a.0[i] < b.1[i] && a.1[i] > b.0[i])
+}
+
+impl TouchQuery for PushBoxes {
+    fn start_solid(&mut self, _: Vec3, _: Vec3, _: Vec3) -> bool {
+        false
+    }
+
+    fn brush_models_touching(&mut self, _: Vec3, _: Vec3, _: Vec3, _: Vec3, _: &mut Vec<usize>) {}
+
+    fn push_trace(
+        &mut self,
+        clip: crate::server::PushClip,
+        start: Vec3,
+        end: Vec3,
+        mins: Vec3,
+        maxs: Vec3,
+        pushers: &[crate::server::Pusher],
+    ) -> crate::server::PushHit {
+        use crate::server::PushClip;
+
+        let world = clip != PushClip::PushersOnly;
+        let entities = clip != PushClip::WithoutPushers;
+
+        let hits = |origin: Vec3| {
+            let hull = (origin + mins, origin + maxs);
+            (world && self.world.iter().any(|&b| boxes_overlap(hull, b)))
+                || (entities
+                    && pushers
+                        .iter()
+                        .any(|pusher| self.touches(pusher, origin, mins, maxs)))
+        };
+
+        let start_solid = hits(start);
+        match start_solid || hits(end) {
+            true => crate::server::PushHit {
+                fraction: 0.0,
+                end: start,
+                start_solid,
+            },
+            false => crate::server::PushHit {
+                fraction: 1.0,
+                end,
+                start_solid,
+            },
+        }
+    }
+}
+
+/// The player, standing on the floor at `origin` and nothing else —
+/// [`player_at`] with the hull spelled out so the arithmetic in these tests is
+/// readable: `x ± 16`, `z + 0..72`.
+fn pushed_player(origin: Vec3) -> PlayerState {
+    player_at(origin)
+}
+
+/// A `func_door` sliding along `+X`, with `extra` keys layered on.
+///
+/// Model `*1` is [`door_models`]' 66×10×66 slab, so `CBaseDoor::Spawn`'s
+/// `vecOBB -= Vector(2,2,2)` leaves a travel of exactly **64** and a `speed`
+/// of 64 makes it **one unit a tick**. Every position assertion below is
+/// counted in those units.
+fn sliding_door_map(extra: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let blocked = conn("blocked", "Add", "1", "0", "-1");
+    let unblocked = conn("unblocked", "Add", "1", "0", "-1");
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("classname", "func_door"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("origin", "0 0 0"),
+        // `AngleVectors( 0 0 0 )` is `+X`.
+        ("movedir", "0 0 0"),
+        ("lip", "0"),
+        ("speed", "64"),
+        ("OnBlockedOpening", &blocked),
+        ("OnUnblockedOpening", &unblocked),
+    ];
+    pairs.extend_from_slice(extra);
+    vec![
+        block(&pairs),
+        block(&[("classname", "math_counter"), ("targetname", "blocked")]),
+        block(&[("classname", "math_counter"), ("targetname", "unblocked")]),
+    ]
+}
+
+/// The door's box, in world space, for the assertions below.
+fn door_x(server: &Server) -> f32 {
+    placement(server, "door").0.x
+}
+
+fn player_x(server: &Server) -> f32 {
+    server.player_state().expect("a player").origin.x
+}
+
+/// **The headline: a door told to open shoves the player out of its way.**
+///
+/// The door's leading face starts at x = 33 and the player's trailing face at
+/// x = 44, so nothing happens for the first eleven ticks; from then on the
+/// player travels exactly as far as the door does, and ends up 64 − 11 units
+/// downrange of where they began.
+#[test]
+fn an_opening_door_pushes_the_player_along_in_front_of_it() {
+    let map = sliding_door_map(&[("wait", "-1")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    server.spawn_player(pushed_player(Vec3::new(60.0, 0.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        &[],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    // Ten ticks: the door has moved ten units and has not reached the player.
+    ticks_touching(&mut server, &mut query, 10);
+    assert!((door_x(&server) - 10.0).abs() < 0.01, "{}", door_x(&server));
+    assert_eq!(player_x(&server), 60.0, "not touched yet");
+
+    // All the way open. The player has been carried the rest of the travel.
+    ticks_touching(&mut server, &mut query, 60);
+    assert!((door_x(&server) - 64.0).abs() < 0.01, "{}", door_x(&server));
+    assert!(
+        (player_x(&server) - 113.0).abs() < 1.5,
+        "the player should be in front of the door, not at {}",
+        player_x(&server)
+    );
+    assert_eq!(counter_value(&server, "blocked"), 0.0, "never blocked");
+}
+
+/// **The other half: a player with their back to a wall stops the door.**
+///
+/// The same door, with a wall two units behind the player. The push is refused,
+/// the player is put back, the door is put back, and the move is retried from
+/// the same place next tick — for ever, because this door's `wait` is negative
+/// and `CBaseDoor::Blocked` refuses to reverse one of those.
+#[test]
+fn a_player_against_a_wall_blocks_the_door_and_holds_its_clock() {
+    let map = sliding_door_map(&[("wait", "-1")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    server.spawn_player(pushed_player(Vec3::new(60.0, 0.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        // A wall starting two units past the player's back.
+        &[(Vec3::new(78.0, -64.0, -64.0), Vec3::new(300.0, 64.0, 64.0))],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    // Two whole seconds — twice the travel time — and it is still short of its
+    // destination, jammed a unit or two past first contact.
+    ticks_touching(&mut server, &mut query, 128);
+    let stalled = door_x(&server);
+    assert!(
+        (11.0..16.0).contains(&stalled),
+        "the door should be stuck just past first contact, not at {stalled}"
+    );
+    assert_eq!(
+        counter_value(&server, "blocked"),
+        1.0,
+        "one edge, not one a tick"
+    );
+
+    // The blocker is remembered, and it is the player.
+    let blocker = find_named(&server, "door").blocker;
+    assert_eq!(blocker, server.player(), "the player is the blocker");
+
+    // Let them out of the way: the door resumes from where it stopped rather
+    // than catching up, because its local time never advanced.
+    server.set_player_state(pushed_player(Vec3::new(400.0, 0.0, -33.0)));
+    ticks_touching(&mut server, &mut query, 1);
+    assert_eq!(
+        counter_value(&server, "unblocked"),
+        1.0,
+        "OnUnblockedOpening"
+    );
+    assert_eq!(find_named(&server, "door").blocker, None);
+
+    ticks_touching(&mut server, &mut query, 64);
+    assert!((door_x(&server) - 64.0).abs() < 0.01, "{}", door_x(&server));
+}
+
+/// A blocked door whose `wait` is not negative turns round instead —
+/// `CBaseDoor::Blocked`'s `if (m_flWait >= 0)`. 118 of the game's 621 doors
+/// take this branch and 503 take the one above.
+#[test]
+fn a_blocked_door_with_a_wait_reverses() {
+    let map = sliding_door_map(&[("wait", "3")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    server.spawn_player(pushed_player(Vec3::new(60.0, 0.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        &[(Vec3::new(78.0, -64.0, -64.0), Vec3::new(300.0, 64.0, 64.0))],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    ticks_touching(&mut server, &mut query, 20);
+    assert_eq!(counter_value(&server, "blocked"), 1.0);
+
+    // It went back rather than staying jammed.
+    ticks_touching(&mut server, &mut query, 44);
+    assert!(
+        door_x(&server) < 1.0,
+        "a reversed door goes home, not to {}",
+        door_x(&server)
+    );
+}
+
+/// **A platform carries what is standing on it.**
+///
+/// `IsStandingOnPusher` is the branch that does it, and it is not an
+/// optimisation: something resting *on* a mover is beside it, not inside it,
+/// so the interpenetration test says no and only the ground test says yes.
+#[test]
+fn a_platform_carries_a_player_standing_on_top_of_it() {
+    let map = sliding_door_map(&[("wait", "-1")]);
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    // Feet exactly on the slab's top face, which is z = 33.
+    server.spawn_player(pushed_player(Vec3::new(0.0, 0.0, 33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        &[],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+
+    ticks_touching(&mut server, &mut query, 64);
+    assert!((door_x(&server) - 64.0).abs() < 0.01, "{}", door_x(&server));
+    assert!(
+        (player_x(&server) - 64.0).abs() < 1.5,
+        "the rider should have gone with it, not stayed at {}",
+        player_x(&server)
+    );
+}
+
+/// Neither of the two doors the player walks through pushes them —
+/// `SF_DOOR_PASSABLE` makes the door non-solid and
+/// `SF_DOOR_NONSOLID_TO_PLAYER` puts it in `COLLISION_GROUP_PASSABLE_DOOR`.
+/// **257 of the game's 621 doors set one or the other.**
+#[test]
+fn a_door_the_player_can_walk_through_neither_pushes_nor_is_blocked() {
+    for (flag, what) in [(8, "SF_DOOR_PASSABLE"), (4, "SF_DOOR_NONSOLID_TO_PLAYER")] {
+        let spawnflags = flag.to_string();
+        let map = sliding_door_map(&[("wait", "-1"), ("spawnflags", &spawnflags)]);
+        let mut server = Server::new();
+        server.level_init("test", &map, &door_models());
+        server.spawn_player(pushed_player(Vec3::new(60.0, 0.0, -33.0)));
+
+        let mut query = PushBoxes::new(
+            &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+            &[(Vec3::new(78.0, -64.0, -64.0), Vec3::new(300.0, 64.0, 64.0))],
+        );
+
+        let door = find_named(&server, "door").id();
+        server.accept_input(door, "Open", Variant::Void, None, None, 0);
+        ticks_touching(&mut server, &mut query, 70);
+
+        assert!(
+            (door_x(&server) - 64.0).abs() < 0.01,
+            "{what}: the door should have opened through the player, not stopped at {}",
+            door_x(&server)
+        );
+        assert_eq!(player_x(&server), 60.0, "{what}: the player was not moved");
+        assert_eq!(
+            counter_value(&server, "blocked"),
+            0.0,
+            "{what}: never blocked"
+        );
+    }
+}
+
+/// A rotating door sweeps its blocker **sideways**, along the arc rather than
+/// along any axis — `ComputeRotationalPushDirection`, which is the only way to
+/// get a translation out of a rotation for something that does not itself
+/// turn.
+///
+/// # Which side of the hinge the player is on decides the outcome
+///
+/// The push is measured from **one corner** of the blocker's world box, and
+/// with a zero previous push that is the low corner on all three axes — see
+/// [`push`](crate::server::push)'s finding 2. A leaf swinging counterclockwise
+/// from `+X` sweeps the first quadrant with one end and the third with the
+/// other, and the low corner's radius is the *smallest* of the four in the
+/// first quadrant and the *largest* in the third. So the same door under-pushes
+/// on one side and over-pushes on the other; this test takes the third
+/// quadrant, and [`a_rotating_door_under_pushes_on_the_other_side_and_jams`]
+/// pins the other.
+#[test]
+fn a_rotating_door_sweeps_the_player_around_its_hinge() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door_rotating"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("origin", "0 0 0"),
+            ("distance", "90"),
+            ("speed", "90"),
+            ("wait", "-1"),
+        ]),
+        block(&[("classname", "math_counter"), ("targetname", "blocked")]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    // Out in the quadrant the leaf swings through, and clear of it at rest:
+    // the slab lies along X when closed and reaches this corner at about 45
+    // degrees.
+    server.spawn_player(pushed_player(Vec3::new(-30.0, -30.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        &[],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    ticks_touching(&mut server, &mut query, 64);
+
+    let moved = server.player_state().expect("a player").origin;
+    // Swept **along the arc**: counterclockwise about the hinge is −X and +Y
+    // together, which is what tells a rotational push apart from a linear one.
+    assert!(
+        moved.x > -29.0 && moved.y < -31.0,
+        "the leaf should have swept the player along its arc, not left them at {moved}"
+    );
+}
+
+/// A push moves the pusher's **children** too, and something standing in front
+/// of a child is pushed by the hierarchy as a whole —
+/// `SetupAllInHierarchy` is what puts them in the pusher list.
+#[test]
+fn a_child_of_a_moving_door_pushes_as_the_door_does() {
+    let map = vec![
+        block(&[
+            ("classname", "func_door"),
+            ("targetname", "door"),
+            ("model", "*1"),
+            ("origin", "0 0 0"),
+            ("movedir", "0 0 0"),
+            ("lip", "0"),
+            ("speed", "64"),
+            ("wait", "-1"),
+        ]),
+        // A second slab bolted to the first, 66 units further along +X, so it
+        // is what reaches the player first.
+        block(&[
+            ("classname", "func_brush"),
+            ("targetname", "rider"),
+            ("parentname", "door"),
+            ("model", "*2"),
+            ("origin", "66 0 0"),
+        ]),
+    ];
+    let models = vec![
+        model([-512.0, -512.0, -512.0], [512.0, 512.0, 512.0]),
+        model([-33.0, -5.0, -33.0], [33.0, 5.0, 33.0]),
+        model([-33.0, -5.0, -33.0], [33.0, 5.0, 33.0]),
+    ];
+
+    let mut server = Server::new();
+    server.level_init("test", &map, &models);
+    // The child's leading face is at x = 99; the player's back is at 110.
+    server.spawn_player(pushed_player(Vec3::new(126.0, 0.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[
+            (1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0)),
+            (2, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0)),
+        ],
+        &[],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    ticks_touching(&mut server, &mut query, 70);
+
+    assert!((door_x(&server) - 64.0).abs() < 0.01, "{}", door_x(&server));
+    assert!(
+        (placement(&server, "rider").0.x - 130.0).abs() < 0.01,
+        "the child rode the parent"
+    );
+    assert!(
+        (player_x(&server) - 179.0).abs() < 1.5,
+        "the child pushed the player, not {}",
+        player_x(&server)
+    );
+}
+
+/// The other side of the hinge, and the reason
+/// [`a_rotating_door_sweeps_the_player_around_its_hinge`] has to say which
+/// quadrant it stands in.
+///
+/// In the first quadrant the low corner of the player's box is the one
+/// **nearest** the hinge, so the arc it computes is shorter than the one the
+/// contact point actually travels — the player is pushed, and is still inside
+/// the leaf when they get there. `IsPushedPositionValid` then refuses, the
+/// whole tick is rolled back, and the door jams a few degrees into its swing.
+///
+/// This is Valve's `Vector vecAbsPush;` — uninitialised on the first pass —
+/// reproduced with a zero in place of the stack garbage. It is **not** a
+/// choice this port made, and it is the reason the reference's own comment on
+/// the branch reads *"BUGBUG: This will break, but not as badly as the
+/// previous solution!!!"*.
+#[test]
+fn a_rotating_door_under_pushes_on_the_other_side_and_jams() {
+    let map = vec![block(&[
+        ("classname", "func_door_rotating"),
+        ("targetname", "door"),
+        ("model", "*1"),
+        ("origin", "0 0 0"),
+        ("distance", "90"),
+        ("speed", "90"),
+        ("wait", "-1"),
+    ])];
+    let mut server = Server::new();
+    server.level_init("test", &map, &door_models());
+    server.spawn_player(pushed_player(Vec3::new(30.0, 30.0, -33.0)));
+
+    let mut query = PushBoxes::new(
+        &[(1, Vec3::new(-33.0, -5.0, -33.0), Vec3::new(33.0, 5.0, 33.0))],
+        &[],
+    );
+
+    let door = find_named(&server, "door").id();
+    server.accept_input(door, "Open", Variant::Void, None, None, 0);
+    ticks_touching(&mut server, &mut query, 128);
+
+    let yaw = placement(&server, "door").1.y;
+    assert!(
+        (5.0..45.0).contains(&yaw),
+        "the leaf should have jammed part way, not reached {yaw}"
+    );
+    assert_eq!(
+        find_named(&server, "door").blocker,
+        server.player(),
+        "and it knows who did it"
+    );
+    // The roll-back put them back: a blocked push leaves nothing behind.
+    close(
+        server.player_state().expect("a player").origin,
+        Vec3::new(30.0, 30.0, -33.0),
+    );
+}
+
+/// **Every linear mover in the shipped game, with a player standing in front
+/// of it.**
+///
+/// The stage's headline measurement, and the one that could not be faked: for
+/// each `func_door` and `func_movelinear` the port has a class for, it works
+/// out which way the mover travels by opening it once and watching, then puts
+/// a real player hull two units clear of the face that is coming and opens it
+/// again — through
+/// [`crate::engine::push_trace`], the same three sweeps the running game uses.
+/// Each mover then lands in exactly one of four buckets:
+///
+/// - **pushed** — the player was carried out of the way, which is the feature;
+/// - **blocked** — the player could not be moved and the mover is jammed
+///   against them, with `m_pBlocker` naming the player;
+/// - **missed** — the mover travelled and never reached the probe, which is a
+///   mover whose swept volume does not pass through the point in front of its
+///   own bounding box (an L-shaped brush model, or one that slides *along* its
+///   long axis);
+/// - **no room** — the probe point is inside the world or another brush model,
+///   so there is nowhere for a player to stand and be pushed from.
+///
+/// Rotating doors are **not** here: the probe is "in front of the face that is
+/// coming", and a leaf that turns in place has no such face until you know its
+/// hinge. They are covered by
+/// [`a_rotating_door_sweeps_the_player_around_its_hinge`] and its jamming
+/// twin, which are where the quadrant asymmetry of Valve's corner hack is
+/// pinned.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_mover -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_mover_pushes_the_player_standing_in_front_of_it() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+        .expect("the game mounts");
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    /// Long enough for a shipped mover to finish: the slowest travel in the
+    /// game is under two seconds, and a jammed one is jammed by the first
+    /// contact.
+    const SECONDS: f32 = 2.0;
+    /// How far a mover has to travel before it is worth probing. Below this a
+    /// mover cannot clear a 32-unit-wide player hull anyway; it is also what
+    /// takes out the 53 `SF_BUTTON_DONTMOVE`-shaped zero travels.
+    const MIN_TRAVEL: f32 = 8.0;
+
+    let mut candidates = 0usize;
+    let mut pushed = 0usize;
+    let mut blocked = 0usize;
+    let mut missed = 0usize;
+    let mut no_room = 0usize;
+    // Doors the player walks through: `SF_DOOR_PASSABLE` or
+    // `SF_DOOR_NONSOLID_TO_PLAYER`, counted rather than probed.
+    let mut passable = 0usize;
+    let mut furthest = 0.0f32;
+
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let collision = CollisionBsp::build(&bsp);
+        let entities = bsp.entities();
+        let placed = find_brush_models(&entities, &collision);
+
+        // Pass one: open everything and watch where it goes, which is the only
+        // way to learn a mover's travel direction without reading its class's
+        // private state.
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+
+        let mut movers: Vec<(EntityId, Vec3)> = Vec::new();
+        for (id, entity) in server.entities.iter() {
+            if !matches!(entity.classname(), "func_door" | "func_movelinear") {
+                continue;
+            }
+            if entity.core.brush_model_index().is_none() {
+                continue;
+            }
+            if !entity.core.is_solid() || !entity.core.collides_with_player() {
+                passable += 1;
+                continue;
+            }
+            movers.push((id, entity.core.origin));
+        }
+
+        for &(id, _) in &movers {
+            server.accept_input(id, "Open", Variant::Void, None, None, 0);
+        }
+        let interval = server.time().interval;
+        let ticks = (SECONDS / interval).round() as u32;
+        for _ in 0..ticks {
+            server.frame(interval, &mut NoTouchQuery);
+        }
+
+        let travels: Vec<(EntityId, Vec3, Vec3)> = movers
+            .iter()
+            .filter_map(|&(id, spawn)| {
+                let now = server.entities.get(id)?.core.origin;
+                Some((id, spawn, now - spawn))
+            })
+            .filter(|(_, _, travel)| travel.length() > MIN_TRAVEL)
+            .collect();
+        if travels.is_empty() {
+            continue;
+        }
+
+        // Pass two: a fresh level, and one mover at a time.
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+        server.spawn_player(player_at(Vec3::ZERO));
+
+        // `sync_brush_models`' body, which the running game does once a
+        // frame and this does whenever the movers have moved: **`find_brush_models`
+        // leaves every model solid and unowned**, so a chain built straight
+        // from it holds every trigger in the map as a wall and there is
+        // nowhere in a test chamber a player can stand.
+        let synced = |server: &Server| -> Vec<PlacedBrushModel> {
+            placed
+                .iter()
+                .filter_map(|p| {
+                    let entity = server.brush_entity(p.index)?;
+                    let mut p = p.clone();
+                    p.owned = true;
+                    p.solid = entity.is_solid() && entity.collides_with_player();
+                    p.model.set_placement(entity.origin, entity.angles);
+                    Some(p)
+                })
+                .collect()
+        };
+
+        for (id, spawn, travel) in travels {
+            candidates += 1;
+            let Some(entity) = server.entities.get(id) else {
+                continue;
+            };
+            let bounds = entity.core.model_bounds;
+            let direction = travel.normalize();
+
+            // **Stand in the doorway and let the door close on you.**
+            //
+            // That is the one probe the shipped content admits, and working
+            // out why is most of what this test is worth. A Portal 2 door
+            // slides along its own long axis into a pocket in the wall, so "in
+            // front of the leading face" is inside that wall and "where it is
+            // going" is inside the pocket. The only place on a mover's path a
+            // player can stand is the place the mover *itself* occupies when
+            // shut — so it is opened first, and then told to close over the
+            // space it has just vacated.
+            let extent = (bounds.maxs - bounds.mins) * 0.5;
+            let centre = spawn + (bounds.mins + bounds.maxs) * 0.5;
+
+            // A small lattice rather than the centre alone: a mover's box
+            // reaches into the floor and into the frame either side of it, so
+            // its middle is very often inside something. Same reason
+            // `probe_inside` lattices a trigger; the first point a standing
+            // hull fits in wins.
+            let lateral: Vec<Vec3> = [Vec3::X, Vec3::Y, Vec3::Z]
+                .into_iter()
+                .filter(|axis| axis.dot(direction).abs() < 0.9 && axis.z == 0.0)
+                .collect();
+            let mut probes: Vec<Vec3> = Vec::new();
+            for &up in &[1.0f32, 8.0, 24.0] {
+                for across in [0.0f32, 0.4, -0.4] {
+                    let mut probe = centre;
+                    for &axis in &lateral {
+                        probe += axis * (across * axis.dot(extent).abs());
+                    }
+                    probe.z = spawn.z + bounds.mins.z + up;
+                    probes.push(probe);
+                }
+            }
+
+            // Open it and let it finish, with the player parked far away, so
+            // that the doorway is empty before anybody stands in it.
+            server.set_player_state(player_at(Vec3::splat(1.0e6)));
+            server.accept_input(id, "Open", Variant::Void, None, None, 0);
+            {
+                let owned = synced(&server);
+                let mut query = Placed {
+                    collision: &collision,
+                    models: &owned,
+                    chain: Vec::new(),
+                };
+                for _ in 0..ticks {
+                    server.frame(interval, &mut query);
+                }
+            }
+
+            // …and the clip chain has to be rebuilt now that it has moved, or
+            // the room test below finds the door still standing where it was.
+            let owned = synced(&server);
+            let mut query = Placed {
+                collision: &collision,
+                models: &owned,
+                chain: Vec::new(),
+            };
+
+            let hull = player_at(Vec3::ZERO);
+            let Some(probe) = probes.into_iter().find(|&probe| {
+                !query
+                    .push_trace(
+                        crate::server::PushClip::Everything,
+                        probe,
+                        probe,
+                        hull.mins,
+                        hull.maxs,
+                        &[],
+                    )
+                    .start_solid
+            }) else {
+                // Nowhere to stand: the world, or another brush model, is there.
+                no_room += 1;
+                continue;
+            };
+
+            server.set_player_state(player_at(probe));
+            server.accept_input(id, "Close", Variant::Void, None, None, 0);
+            for _ in 0..ticks {
+                server.frame(interval, &mut query);
+            }
+
+            let moved = server
+                .player_state()
+                .map_or(0.0, |state| (state.origin - probe).length());
+            let jammed = server
+                .entities
+                .get(id)
+                .is_some_and(|e| e.core.blocker == server.player() && e.core.blocker.is_some());
+            furthest = furthest.max(moved);
+            match (moved > 1.0, jammed) {
+                (true, _) => pushed += 1,
+                (false, true) => blocked += 1,
+                (false, false) => missed += 1,
+            }
+        }
+    }
+
+    println!("\n{} maps", names.len());
+    println!(
+        "  {candidates} linear movers probed: {pushed} pushed the player, \
+         {blocked} were blocked by them,\n  \
+         {missed} never reached the probe, {no_room} had nowhere to stand;\n  \
+         {passable} more are doors the player walks through and cannot be pushed by."
+    );
+    println!("  furthest a mover shoved the player: {furthest:.1} units");
+
+    // Exact, the way the other depot tests are exact: the seed is fixed and
+    // the maps do not change, so a number that moves is a behaviour that
+    // moved. **67 of the 263 engaged the pusher** — 54 shoved the player out
+    // of the doorway and 13 were stopped dead by them.
+    assert_eq!(
+        (pushed, blocked, missed, no_room, passable),
+        (54, 13, 52, 144, 163),
+        "the pusher's census over the shipped maps has changed"
+    );
+    assert!(
+        (234.0..235.0).contains(&furthest),
+        "the furthest shove was {furthest:.1} units"
+    );
 }

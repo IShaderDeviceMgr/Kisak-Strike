@@ -595,6 +595,33 @@ impl<'a> Context<'a> {
         super::hierarchy::propagate(core, self.entities);
     }
 
+    /// The whole entity list, to read. [`push`](super::push)'s, and nothing
+    /// else's: it walks the pusher's hierarchy and scans for candidates, and
+    /// both are questions about the list rather than about one entity.
+    pub(super) fn entities(&self) -> &EntityList {
+        self.entities
+    }
+
+    /// The whole entity list, to write. [`push`](super::push)'s, and nothing
+    /// else's.
+    ///
+    /// [`entity_mut`](Context::entity_mut) is the one a class should use: it
+    /// registers each handle it hands out so that the simulation list is
+    /// reconciled afterwards. The pusher moves one entity's origin a dozen
+    /// times inside a single tick — a speculative shove, four nudges, a
+    /// restore — and wants **one** reconciliation rather than a dozen, so it
+    /// takes the list directly and calls
+    /// [`note_changed`](Context::note_changed) once when it is done.
+    pub(super) fn entities_mut(&mut self) -> &mut EntityList {
+        self.entities
+    }
+
+    /// Register an entity for the same post-handler reconciliation
+    /// [`entity_mut`](Context::entity_mut) registers, without borrowing it.
+    pub(super) fn note_changed(&mut self, id: EntityId) {
+        self.changed.push(id);
+    }
+
     /// `CBaseEntity::SetParent` — re-point this entity's move parent, holding
     /// its world placement still.
     ///
@@ -949,6 +976,30 @@ pub trait Behaviour: Any {
     /// mover a fraction of a tick past its destination with its velocity
     /// still set.
     fn move_done(&mut self, _entity: &mut EntityCore, _cx: &mut Context<'_>) {}
+
+    /// `StartBlocked( pOther )` — the first tick this pusher could not move
+    /// because `other` was in the way.
+    ///
+    /// The **edge**, fired once, which is why
+    /// [`EntityCore::blocker`](super::entity::EntityCore::blocker) is a field
+    /// rather than a local: the comparison that produces this call needs last
+    /// tick's answer. One class implements it — `CBaseDoor`, which fires
+    /// `OnBlockedOpening` or `OnBlockedClosing` depending on which way it was
+    /// going.
+    fn start_blocked(&mut self, _entity: &mut EntityCore, _other: EntityId, _cx: &mut Context<'_>) {
+    }
+
+    /// `Blocked( pOther )` — **every** tick this pusher is blocked, including
+    /// the first.
+    ///
+    /// Where a door reverses, and where block damage is dealt. Note that
+    /// `CBaseEntity::Blocked` also forwards the event to the mover's *parent*;
+    /// see [`push`](super::push) for why that forwarding is not here.
+    fn blocked(&mut self, _entity: &mut EntityCore, _other: EntityId, _cx: &mut Context<'_>) {}
+
+    /// `EndBlocked()` — the first tick after a block cleared. Takes no
+    /// blocker, because by then there isn't one.
+    fn end_blocked(&mut self, _entity: &mut EntityCore, _cx: &mut Context<'_>) {}
 
     /// `Use()` — `m_pfnUse`, dispatched by `CBaseEntity::InputUse`.
     ///

@@ -715,7 +715,13 @@ impl<'a> Engine<'a> {
             // them asks. The fields are named separately so that the borrow of
             // `scene.world` and the one of `scene.server` stay disjoint —
             // `portdocs/CLIENT.md` §6.4's rule, again.
-            Some(world) => server.frame(seconds, &mut WorldTouchQuery { world }),
+            Some(world) => server.frame(
+                seconds,
+                &mut WorldTouchQuery {
+                    world,
+                    chain: Vec::new(),
+                },
+            ),
             None => server.frame(seconds, &mut crate::server::NoTouchQuery),
         };
         if let Some(state) = server.player_state() {
@@ -1136,7 +1142,16 @@ fn sync_brush_models(world: &mut World, server: &Server) {
             // solid, and a `func_button` with `SF_BUTTON_NOTSOLID` is
             // `SOLID_NONE`. Reading only the bit would have put every trigger
             // in the game into the player's clip chain as a wall.
-            solid: entity.is_solid(),
+            //
+            // …and `collides_with_player()`, which is the pusher's rule read
+            // from the other side. **The clip chain has exactly one consumer**
+            // — the player's own move, `Engine::update_client` — so "solid"
+            // here means "solid to the player", and the 141 doors that set
+            // `SF_DOOR_NONSOLID_TO_PLAYER` are ones the shipped game lets you
+            // walk straight through. Leaving them in would make a door the
+            // player cannot pass *and* cannot block, which is the worst of
+            // both readings.
+            solid: entity.is_solid() && entity.collides_with_player(),
         })
     });
 }
@@ -1310,6 +1325,9 @@ fn apply_player_state(client: &mut Client, state: server::PlayerState) {
 /// [`TouchQuery`](crate::server::TouchQuery).
 struct WorldTouchQuery<'a> {
     world: &'a World,
+    /// The clip chain one push sweep is traced against, kept between calls so
+    /// that a pusher's dozen sweeps a tick reuse one allocation.
+    chain: Vec<crate::engine::trace::BrushModel>,
 }
 
 impl server::TouchQuery for WorldTouchQuery<'_> {
@@ -1327,6 +1345,123 @@ impl server::TouchQuery for WorldTouchQuery<'_> {
 
     fn start_solid(&mut self, origin: glam::Vec3, mins: glam::Vec3, maxs: glam::Vec3) -> bool {
         self.world.start_solid(origin, mins, maxs)
+    }
+
+    fn push_trace(
+        &mut self,
+        clip: server::PushClip,
+        start: glam::Vec3,
+        end: glam::Vec3,
+        mins: glam::Vec3,
+        maxs: glam::Vec3,
+        pushers: &[server::Pusher],
+    ) -> server::PushHit {
+        push_trace(
+            &self.world.collision,
+            &self.world.brush_models,
+            &mut self.chain,
+            clip,
+            start,
+            end,
+            mins,
+            maxs,
+            pushers,
+        )
+    }
+}
+
+/// [`TouchQuery::push_trace`](crate::server::TouchQuery::push_trace)'s body —
+/// the engine's whole half of `src/server/push.rs`.
+///
+/// Free rather than a method, and taking the two things it needs rather than a
+/// [`World`], for the reason
+/// [`world::brush_models_touching`](world::brush_models_touching) is: the
+/// depot test has no GPU and so cannot build a `World`, and a push that was
+/// only tested against a copy of this code would not be tested at all.
+///
+/// **This is where the two vocabularies meet**, which is why it is here rather
+/// than in `world/`: `server/` names no collision type and `world/` names no
+/// server type, so the translation from [`PushClip`](crate::server::PushClip)
+/// to a clip chain lives in the module that is allowed to name both — the same
+/// arrangement [`sync_brush_models`] already has.
+///
+/// The mask is `MASK_PLAYERSOLID` throughout, which is
+/// `PhysicsSolidMaskForEntity()` for the only thing in this port that can be
+/// pushed; see `src/server/push.rs`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_trace(
+    collision: &crate::engine::trace::CollisionBsp,
+    models: &[world::PlacedBrushModel],
+    chain: &mut Vec<crate::engine::trace::BrushModel>,
+    clip: server::PushClip,
+    start: glam::Vec3,
+    end: glam::Vec3,
+    mins: glam::Vec3,
+    maxs: glam::Vec3,
+    pushers: &[server::Pusher],
+) -> server::PushHit {
+    use crate::engine::trace::{Contents, Ray};
+
+    let placed =
+        |pusher: &server::Pusher| collision.brush_model(pusher.model, pusher.origin, pusher.angles);
+    let is_pusher = |index: usize| pushers.iter().any(|pusher| pusher.model == index);
+
+    chain.clear();
+    match clip {
+        server::PushClip::PushersOnly => chain.extend(pushers.iter().filter_map(placed)),
+        // `UnlinkPusherList` — the pushers are hidden from the partition for
+        // the whole of the speculative move and put back afterwards. Leaving
+        // them out of the chain is the same subtraction without the
+        // bookkeeping, because the chain is rebuilt per sweep anyway.
+        server::PushClip::WithoutPushers => chain.extend(
+            models
+                .iter()
+                .filter(|model| model.owned && model.solid && !is_pusher(model.index))
+                .map(|model| model.model),
+        ),
+        // Everything, with the pushers substituted at the placement the push
+        // is proposing rather than at the one `world/` was last told about.
+        server::PushClip::Everything => {
+            chain.extend(
+                models
+                    .iter()
+                    .filter(|model| model.owned && model.solid && !is_pusher(model.index))
+                    .map(|model| model.model),
+            );
+            chain.extend(pushers.iter().filter_map(placed));
+        }
+    }
+
+    let ray = Ray::hull(start, end, mins, maxs);
+    let mut tracer = collision.tracer();
+
+    // `TRACE_ENTITIES_ONLY` — `CTraceFilterAgainstEntityList` does not look at
+    // the world at all, which is what makes "am I inside the door" a different
+    // question from "am I inside anything".
+    if clip == server::PushClip::PushersOnly {
+        let mut hit = server::PushHit {
+            fraction: 1.0,
+            end,
+            start_solid: false,
+        };
+        for index in 0..chain.len() {
+            let trace = tracer.trace_model(&ray, &chain[index], Contents::MASK_PLAYERSOLID);
+            hit.start_solid |= trace.start_solid;
+            if trace.fraction < hit.fraction {
+                hit.fraction = trace.fraction;
+                hit.end = trace.end;
+            }
+        }
+        return hit;
+    }
+
+    let trace = tracer
+        .with_entities(chain)
+        .trace(&ray, Contents::MASK_PLAYERSOLID);
+    server::PushHit {
+        fraction: trace.fraction,
+        end: trace.end,
+        start_solid: trace.start_solid,
     }
 }
 

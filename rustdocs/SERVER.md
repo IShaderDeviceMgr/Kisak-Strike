@@ -8,10 +8,10 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal` and the local/abs transform pair.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, and **what is parented to a mover rides it**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair and the pusher.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it**, and **a door closing on you shoves you out of the way, or is stopped by you**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
-| Tests | 201 unit tests + ten depot tests over all 106 shipped maps |
+| Tests | 209 unit tests + eleven depot tests over all 106 shipped maps |
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -20,10 +20,22 @@ and the think schedule. Porting doc:
 kills**: 138 of the game's 215 kill a player standing in them, and the other 77
 are switched off, admit no clients or have nowhere to stand.
 
-**What the transform pair added** (the most recent thing to land, and not a
-stage): `hierarchy.rs`, `local_origin`/`local_angles` on `EntityCore`, and the
+**What the pusher added** (the most recent thing to land, and not a stage):
+`push.rs` — `CPhysicsPushedEntities` — plus `TouchQuery::push_trace`,
+`EntityCore::blocker`, a two-valued `CollisionGroup`, and
+`Behaviour::blocked`/`start_blocked`/`end_blocked`. **A mover no longer moves
+through what is standing in it**: 54 of the game's linear movers shove the
+player out of the doorway they close over, 13 are stopped dead by them, and the
+furthest single shove is 234.4 units. See
+[the pusher](#the-pusher--a-door-that-shoves-the-player) for the four findings,
+one of which is a solidity bug that had been sitting here since stage 3.
+
+**What the transform pair added** (before the pusher, and also not a stage):
+`hierarchy.rs`, `local_origin`/`local_angles` on `EntityCore`, and the
 `SetParent`/`ClearParent` inputs. 4,582 of the game's entities name a parent
-and 201 of them are movers; before this they all moved in world space.
+and 201 of them are movers; before this they all moved in world space. It is
+also what made the pusher possible: `SetupAllInHierarchy` is the pusher's list,
+and that list is `EntityCore::children()`.
 
 **What `prop_dynamic` added** (after stage 5, not part of it): `CDynamicProp`
 across its four classnames — **8,462 entities, the commonest thing in a Portal 2
@@ -81,9 +93,9 @@ it and `Context` grew `punch_penetrating_players`, which queues the work the way
 read as bugs.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
-it needs the portal system), the armour, drowning, and
-**nothing pushes what is in its way** — a door moves through the player rather
-than shoving it (`portdocs/SERVER.md` stage 3 says why). **43 of the 200
+it needs the portal system), the armour, drowning, and `SetParentAttachment*`,
+which is 1,362 shipped connections waiting on `studio/`'s
+`LookupAttachment`. **43 of the 200
 classnames the shipped maps place are implemented**, out of 48 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
@@ -205,7 +217,7 @@ it twice replaces rather than appends.
 
 It cannot fail. A block with no classname, a classname with no implementation, a
 key nobody understands and a `parentname` naming nothing are all *counted*, not
-errors — see [`LevelStats`](#levelstats).
+errors — see [`LevelStats`](#levelstats-modrs).
 
 `models` is the `.bsp`'s model lump. It is there for one reason: a mover
 computes how far it travels from the size of its own brushes, and that size is
@@ -217,7 +229,7 @@ model too; the unit tests pass it.
 `frame` takes the host's already-clamped frame time and returns how many server
 ticks it bought. **Zero is the normal answer** at a high frame rate. Its
 `query` is the engine's collision half — see
-[`TouchQuery`](#touchquery-mod-rs); pass [`NoTouchQuery`](#touchquery-mod-rs)
+[`TouchQuery`](#touchquery-modrs); pass [`NoTouchQuery`](#touchquery-modrs)
 when nothing can be walked into.
 
 `brush_entity` is the seam `world/` and `trace/` read, keyed by the `"*N"`
@@ -227,7 +239,7 @@ model index — see [The brush-entity seam](#the-brush-entity-seam).
 entity list has no player until a client connects either, and keeping it that
 way is what lets every test here run without one. `set_player_state` and
 `player_state` are the two halves of the copy `Engine::frame` makes either
-side of the ticks — see [`PlayerState`](#playerstate-mod-rs).
+side of the ticks — see [`PlayerState`](#playerstate-modrs).
 
 The four commands are `game/server/client.cpp`'s, all `FCVAR_CHEAT` there.
 **`noclip` is one of them again**: it lived in `src/client/` from `client/`
@@ -255,7 +267,27 @@ pub trait TouchQuery {
     /// `enginetrace->TraceRay(…).startsolid` for an unswept box — the
     /// **world's** solid, not the brush models'.
     fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
+
+    /// One of the pusher's three sweeps. **Has a default** — "nothing is in
+    /// the way" — so a fixture that only cares about touching does not have
+    /// to answer it.
+    fn push_trace(
+        &mut self, clip: PushClip,
+        start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3,
+        pushers: &[Pusher],
+    ) -> PushHit;
 }
+
+/// Where one entity of a pushing hierarchy is *this instant* — a `"*N"` model
+/// index and the placement the push is proposing, which is **not** the one
+/// `world/` holds.
+pub struct Pusher { pub model: usize, pub origin: Vec3, pub angles: Vec3 }
+
+/// Which clip chain a push sweep runs against. See [`push`](#push-pushrs--the-pusher).
+pub enum PushClip { PushersOnly, WithoutPushers, Everything }
+
+/// `trace_t`, reduced to the three fields the pusher reads.
+pub struct PushHit { pub fraction: f32, pub end: Vec3, pub start_solid: bool }
 
 pub struct NoTouchQuery;   // reports nothing, and nothing is solid
 ```
@@ -278,6 +310,12 @@ models. Two properties of the answer are load-bearing:
   `FSOLID_TRIGGER`, which is *this* module's live state; an engine-side copy
   would be a frame stale every time something was enabled. The server filters,
   and pays one brush sweep per non-trigger brush entity per tick.
+
+`push_trace` is the same seam widened by the pusher, and it differs from the
+other two in one way that matters: it takes the **placements** with it. The
+other two ask about a world the engine already knows; a push asks about a door
+the engine has not been told has moved, because `sync_brush_models` runs after
+the ticks and the move may yet be rolled back.
 
 ### `PlayerState` (`mod.rs`)
 
@@ -425,7 +463,7 @@ each way so that the same sweep can be asked again in the exit portal's space.
 It travels rather than being recomputed on the far side because
 `portdocs/PORTAL.md` §3.2's whole warning is that a second spelling of it can
 silently lose the 180° turn, and this way
-[`teleport_matrix`](#the-teleport-matrix) is the only place in the port that
+[`teleport_matrix`](#classes-classes) is the only place in the port that
 computes one. `linked` became the partner's *key* for the same reason: the carve
 has to know which other hole a hole leads to, and `World::sync_portals` resolves
 the pairing from this one list.
@@ -462,7 +500,7 @@ blocks matched, 65 created and 27,634 spawned.
 entity's `Spawn` through [`Context::create_entity`](#classdef-behaviour-and-context-classrs).
 Today that is one `trigger_portal_button` per `prop_floor_button` and nothing
 else. The *run*-side metric is
-[`IoStats`](#iostats), which `report_entities` prints alongside it.
+[`IoStats`](#iostats-iors), which `report_entities` prints alongside it.
 
 ### `Entity` and `EntityCore` (`entity.rs`)
 
@@ -645,6 +683,13 @@ pub trait Behaviour: Any {
     fn activate(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>);
     fn think(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>);
     fn move_done(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>);
+
+    // the pusher — `CBaseEntity::StartBlocked`/`Blocked`/`EndBlocked`. The
+    // edges fire once each; the middle one fires every tick the mover is held.
+    fn start_blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+    fn blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+    fn end_blocked(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>);
+
     fn use_entity(
         &mut self, entity: &mut EntityCore, use_type: UseType,
         input: &Input<'_>, cx: &mut Context<'_>,
@@ -728,6 +773,12 @@ impl Context<'_> {
     // reason on top of that one: the test needs the engine's world. See
     // gotcha 83.
     pub fn punch_penetrating_players(&mut self, portal: EntityId);
+
+    // the pusher's, and nothing else's — `pub(super)`, not public API.
+    // See [`push`](#push-pushrs--the-pusher).
+    pub(super) fn entities(&self) -> &EntityList;
+    pub(super) fn entities_mut(&mut self) -> &mut EntityList;
+    pub(super) fn note_changed(&mut self, id: EntityId);
 }
 
 /// The read-only view a `filter_*` class evaluates against.
@@ -740,7 +791,7 @@ impl Filters<'_> {
 pub struct PointEntity;   // CPointEntity — no state, no behaviour
 ```
 
-All seventeen trait methods have defaults, so a class with no state is
+All twenty-one trait methods have defaults, so a class with no state is
 `impl Behaviour for Thing {}`. `move_done` and `use_entity` are `m_pfnMoveDone`
 and `m_pfnUse`, the two function pointers `CBaseEntity` dispatches through: a
 class that has one keeps its own enum in place of the pointer and matches on
@@ -788,6 +839,14 @@ shared `EntityCore` and this reaches the class's own state, which is
 `pTrigger->m_pOwnerButton = pOwner`. It deliberately does **not** hand out
 `&mut dyn Behaviour` — calling into another class from inside a class is the
 re-entrancy `create_entity` exists to avoid.
+
+**`entities`/`entities_mut`/`note_changed` are the pusher's, and `pub(super)`
+for that reason.** `entity_mut` registers every handle it hands out so the
+simulation list can be reconciled once the handler returns; the pusher moves one
+entity's origin a dozen times inside a single tick — a speculative shove, four
+nudges, a restore — and wants **one** reconciliation rather than a dozen. So it
+takes the list directly and calls `note_changed` once at the end. A class should
+use `entity_mut`.
 
 **Activation follows `ServerActivate`, which walks the entity list rather than
 the spawn list** (`gameinterface.cpp:1316`): an entity created during
@@ -1072,8 +1131,16 @@ pub const FSOLID_VOLUME_CONTENTS: u32 = 0x0020;
 pub const FL_ONGROUND: u32 = 1 << 0;
 pub const FL_CLIENT: u32 = 1 << 8;
 pub const FL_BASEVELOCITY: u32 = 1 << 24;
+/// The pusher's — a mover carrying this is never stopped by a player.
+pub const FL_UNBLOCKABLE_BY_PLAYER: u32 = 1 << 31;
 pub const SF_DOOR_ROTATE_ROLL: u32 = 64;
 pub const SF_DOOR_ROTATE_PITCH: u32 = 128;
+
+/// `Collision_Group_t`, reduced to the one distinction anything here makes:
+/// `COLLISION_GROUP_PASSABLE_DOOR` is a door the player walks through.
+/// `EntityCore::collides_with_player()` is the whole of `ShouldCollide` that
+/// survives, and `world/`'s clip chain reads it too.
+pub enum CollisionGroup { None, PassableDoor }
 
 /// The `"*N"` brush model's box, put on the entity by `level_init`.
 pub struct ModelBounds { pub mins: Vec3, pub maxs: Vec3 }
@@ -1100,8 +1167,11 @@ impl Toggle {
     pub fn set_final_dest(&mut self, dest: Vec3);
 }
 
-/// `Physics_SimulateEntity` — think, then push. One entity, one tick.
-pub fn simulate(&mut EntityCore, &mut dyn Behaviour, &mut Context<'_>);
+/// `Physics_SimulateEntity` — think, then push. One entity, one tick. The
+/// `TouchQuery` is the pusher's and nothing else in here reads it.
+pub fn simulate(
+    &mut EntityCore, &mut dyn Behaviour, &mut Context<'_>, &mut dyn TouchQuery,
+);
 
 pub fn anglemod(a: f32) -> f32;                  // the 16-bit fixed-point fold
 pub fn dot_product_abs(a: Vec3, b: Vec3) -> f32; // NOT |a·b|
@@ -1119,11 +1189,10 @@ an error: it means *the destination is where we already are*, and the caller
 must run `Behaviour::move_done` **itself, before firing any output** — see
 gotcha 7.
 
-**Nothing is pushed out of the way.** `CPhysicsPushedEntities`
-(`physics_main.cpp:130-1130`) is ~1,000 lines of speculative push, blocker
-enumeration and rollback, and it is deliberately absent: a door moves *through*
-the player. `EntityCore::local_time` is where a future rollback would put its
-answer, and it is real and correct today — it just never goes backwards.
+**What is in the way is pushed, and what cannot be pushed stops the mover** —
+that is [`push`](#push-pushrs--the-pusher), which is a module of its own.
+`EntityCore::local_time` is where the rollback puts its answer, and since that
+landed it really does go backwards.
 
 ### `obb` (`obb.rs`)
 
@@ -1141,7 +1210,7 @@ pub fn swept_box_touches_obb(
 
 **Why it is here and not in `engine::trace`.** Every other collision question
 this port asks is about data the *engine* owns, so it goes out through
-[`TouchQuery`](#touchquery-mod-rs) and comes back as a `"*N"` index. A
+[`TouchQuery`](#touchquery-modrs) and comes back as a `"*N"` index. A
 `SOLID_OBB` trigger has no map data in it at all: it is a box the game invented,
 at a placement the game chose, in the game's own `ModelBounds`. There is nothing
 to ask the engine about — and `collisionutils.cpp` lives in `public/` and is
@@ -1271,6 +1340,154 @@ unaffected — **zero of the 4,582 parented entities in the game use it.**
 `CalcAbsoluteVelocity`'s pair is absent for the same kind of reason: nothing
 reads a parented entity's absolute velocity yet. It is needed the moment
 something rides a moving parent and is then let go.
+
+### `push` (`push.rs`) — the pusher
+
+```rust
+/// The whole public surface. `CBaseEntity::PerformPush`, called once a tick
+/// from `movement::physics_pusher` for every MOVETYPE_PUSH entity.
+pub fn perform_push(
+    entity: &mut EntityCore,
+    behaviour: &mut dyn Behaviour,
+    cx: &mut Context<'_>,
+    query: &mut dyn TouchQuery,
+    movetime: f32,
+);
+```
+
+```rust
+/// On EntityCore, and written only by the above.
+pub blocker: Option<EntityId>;              // m_pBlocker
+pub collision_group: CollisionGroup;        // m_CollisionGroup, reduced to two
+pub fn collides_with_player(&self) -> bool; // the one ShouldCollide rule left
+pub fn is_point_sized(&self) -> bool;       // BoundingRadius() == 0
+pub fn brush_model_index(&self) -> Option<usize>;  // "*12" -> 12
+pub fn world_space_aabb(&self) -> (Vec3, Vec3);    // CCollisionProperty's
+
+/// On Behaviour — the three callbacks a blocked mover gets.
+fn start_blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+fn blocked(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>);
+fn end_blocked(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>);
+```
+
+`CPhysicsPushedEntities` (`physics_main.cpp:122-1130`) and the three
+`CBaseEntity` methods that drive it. **A mover no longer moves through what is
+standing in it**: everything solid it now overlaps is shoved out of the way,
+and if any of it cannot be shoved the whole tick is rolled back — origin,
+angles, local time, and every entity the attempt displaced.
+
+```text
+PerformPush( movetime )
+  rotating? PhysicsPushRotate -> PerformRotatePush   ─┐
+  moving?   PhysicsPushMove   -> PerformLinearPush   ─┤
+    SetupAllInHierarchy         the root + everything parented under it
+    Rotate/LinearlyMoveRootEntity   the speculative move, children dragged
+    GenerateBlockingEntityList      what is in the way now
+    SpeculativelyCheckPush          shove each one; can any not be shoved?
+      blocked -> RegisterBlockage, put the root back, RestoreEntities
+      clear   -> FinishPush
+  StartBlocked / Blocked / EndBlocked
+  MoveDone, if the arrival alarm has come round
+```
+
+#### Only the player can be pushed, and that is the filter's doing
+
+`IsPushableMoveType` (`baseentity_shared.h:316`) lists the four movetypes that
+*cannot* be pushed — `PUSH`, `NONE`, `VPHYSICS`, `NOCLIP` — and three of this
+port's four [`MoveType`](#movement-movementrs)s are on it (`VPHYSICS` has no
+variant here at all). What is left is `Walk`: **the player**, and nothing else
+in the entity list. A noclipping player is not pushed, which is Valve's rule and
+the same one `trigger_push` follows. The rule is written as Valve spells it — the
+four that are *not*, negated — rather than as "is it the player", so a fifth
+movetype needs no change here, and neither does `prop_physics` when it lands.
+
+#### The three sweeps, and why there are three
+
+`TouchQuery::push_trace` takes a [`PushClip`](#touchquery-modrs), which is
+Valve's three trace filters:
+
+| Mode | Valve | The question |
+|---|---|---|
+| `PushersOnly` | `CTraceFilterAgainstEntityList`, `TRACE_ENTITIES_ONLY` | is this entity inside the door? (`IntersectsPushers`, and the ground probe) |
+| `WithoutPushers` | `CTraceFilterPushMove` under `UnlinkPusherList` | the speculative shove — how far can it go? |
+| `Everything` | `CTraceFilterPushFinal` | did it end up stuck? (`IsPushedPositionValid`) |
+
+The middle one is the one worth saying twice: **the pushers are hidden for it**,
+because the entity being shoved is by definition already inside the door, and a
+sweep that could see the door would refuse to move at fraction zero every time.
+
+The placements handed across are the **speculative** ones — where the door is
+mid-tick, which is not where `world/` thinks it is, because
+`Engine::sync_brush_models` runs after the ticks. The engine's half is
+`crate::engine::push_trace`, which is a free function in `engine/mod.rs` for the
+same reason `world::brush_models_touching` is: the depot test has no GPU, and a
+push tested against a copy of that code would not be tested.
+
+#### `IsStandingOnPusher` is rebuilt from geometry
+
+`CPushBlockerEnum::IsStandingOnPusher` reads the **ground entity**, which this
+port does not track — the player's ground is found by `client/`'s own move and
+only `FL_ONGROUND` comes back across the seam. So the two-unit drop
+`CGameMovement::CategorizePosition` used to *set* that entity is redone here,
+against the pushers alone.
+
+It is not an optimisation and skipping it would be visible: something standing
+*on* a mover is beside it, not inside it, so `IntersectsPushers` answers no and
+only this answers yes. Without it a platform slides out from under whoever is
+riding it. The broadphase box is grown by the same two units for the same
+reason — a search tighter than the test it gates drops the rider before the test
+runs.
+
+The one thing the answer is used for besides "is this a candidate" is the
+ground-centre nudge in the failure path, which wants `ground->GetAbsOrigin()`;
+what it gets is the **root** pusher's origin, because a `PushHit` says whether
+something was hit and not what. The members of a hierarchy share a frame, which
+is what makes that substitution legitimate.
+
+#### Three things the reference does that are worth knowing
+
+1. **`UnblockPusher` is `// TODO`.** `CGameMovement::UnblockPusher`
+   (`gamemovement.cpp:3752`) has an empty body in the shipped tree, and
+   `SpeculativelyCheckPush` calls it and then asks
+   `if ( pBlocker->GetAbsOrigin() == blockerOrigin )` — always true, since
+   nothing moved. **So a player who is stuck after being shoved always
+   blocks**, and the whole "fix the player" ladder below that call is dead code
+   in the shipped game. The four half-inch nudges under it are in the `else`
+   branch, for blockers that are not players. Reproduced as written, because
+   the shape is what says where the missing implementation goes.
+2. **`SpeculativelyCheckRotPush` reads uninitialised memory.**
+   `Vector vecAbsPush;` is declared without a value and handed to
+   `ComputeRotationalPushDirection`, which reads its *sign* to pick which
+   corner of the blocker's box to rotate about — before writing it. Here it
+   starts at zero, which selects the low corner on all three axes. That is not
+   cosmetic: a leaf swinging counterclockwise from `+X` sweeps the first
+   quadrant with one end and the third with the other, and the low corner's
+   radius is the **smallest** of the four in the first quadrant and the
+   **largest** in the third — so the same door under-pushes on one side and
+   jams, and over-pushes on the other and flings you clear. Both are pinned by
+   tests.
+3. **`PerformPush` runs both halves and keeps the larger clock.** A mover that
+   translates *and* rotates advances local time twice from the same starting
+   value and takes the greater; Valve's own comment is "Choose the *greater* of
+   the two?!? That's strange...".
+
+#### What is not here
+
+- **`UpdatePusherPhysicsEndOfTick`, `StoreMovedEntities`,
+  `UpdatePhysicsShadowToCurrentPosition`** — `vphysics` bookkeeping, so that a
+  `physicspushlist_t` can undo the push if the *physics* system blocks later.
+  There is no physics system.
+- **`PhysicsTouchTriggers` and `PhysicsImpact` in `FinishPush`** — a push moves
+  at most the player, and `Server::run_tick` already sweeps the player against
+  every trigger once a tick from the previous tick's origin. The touch is
+  generated anyway, half a tick later, by the pass that exists for it.
+- **`CBaseEntity::Blocked`'s forwarding to the mover's parent.** One line,
+  `if (m_pParent) m_pParent->Blocked(pOther)`, and it is cross-entity dispatch
+  from inside a handler — the thing `Context` defers everywhere else.
+- **`CBaseDoor::Blocked`'s `m_bDoorGroup` block** — see the divergence table.
+- **`CBaseEntity::CanPushEntity`** (a virtual returning `true` that nothing
+  overrides), **`CTraceFilterPushFinal`'s teammate and `MOVETYPE_VPHYSICS`
+  tests** (no teams, no vphysics), and **`NotifyPushMove`** (no NPCs).
 
 ### `touch` (`touch.rs`)
 
@@ -1582,9 +1799,19 @@ depend on all three of these:**
 The middle step is `Physics_SimulateEntity` for every entity in the simulation
 list, which is [`movement::simulate`]: run the think if it is due, then, for a
 `MOVETYPE_PUSH` entity, advance its local clock by `min(time left, one tick)`,
-integrate its two velocities, and fire the arrival alarm if it has come round.
+integrate its two velocities **through [`push`](#push-pushrs--the-pusher)**, and
+fire the arrival alarm if it has come round.
 **The last step of a move is exactly as long as the travel that is left**, so a
-door arrives on the tick it was scheduled for rather than the tick after.
+door arrives on the tick it was scheduled for rather than the tick after — or it
+does not arrive at all, because something was standing in it and the clock was
+rolled back with the move.
+
+**That is why `query` reaches this far in.** `Server::frame`'s collision half is
+handed down through `run_think_functions` into the closure `dispatch` runs, as a
+plain `&mut dyn TouchQuery` parameter rather than as a field on `Context`: the
+pusher is its only consumer, `dispatch` itself never touches it, and reborrowing
+it inside the loop keeps the two borrows disjoint. No other `dispatch` call site
+changed when the pusher landed.
 
 ### The simulation list holds movers as well as thinkers
 
@@ -1618,10 +1845,14 @@ Ordered by how likely each is to bite. **1-25 are stages 1 and 2; 26-34 are
 stage 3's and are about movement; 35-46 are stage 4's and are about touch, the
 player, and solidity; 47-51 came with `prop_floor_button` and are about
 entities that make other entities; 52-59 are stage 5's and are about damage,
-death and the move type** — if a door is in the wrong place or at the wrong
-time start at 26, if a trigger does not fire start at 35, if something an
-entity built is not there start at 47, and if something will not die start at
-52.
+death and the move type; 60-70 came with `prop_dynamic` and
+`prop_testchamber_door` and are about animation; 71-73 are
+`logic_branch_listener`'s; 74-84 are `prop_portal`'s; 85 is the transform
+pair's; 86-90 are the pusher's** — if a door is in the wrong place or at the
+wrong time start at 26, if a trigger does not fire start at 35, if something an
+entity built is not there start at 47, if something will not die start at 52,
+if a model is posed wrong start at 60, if an oval is in the wrong place start at
+74, and if a mover walks through the player or jams against them start at 86.
 
 1. **The server's `curtime` is not `Scene::curtime`.** The server's is
    `tick * interval` and moves in steps of 1/64 s; the scene's is the
@@ -2264,6 +2495,54 @@ entity built is not there start at 47, and if something will not die start at
     doors the shipped game does not move. `doors.cpp` `CRotDoor::Spawn` against
     `CBaseDoor::Spawn`, four lines apart.
 
+86. **A player who is stuck after being shoved always blocks, and the code
+    that would fix that is `// TODO` in the shipped tree.**
+    `SpeculativelyCheckPush` restores the player, calls
+    `g_pGameMovement->UnblockPusher`, and then decides they are blocked if
+    their origin did not change — and `CGameMovement::UnblockPusher`
+    (`gamemovement.cpp:3752`) is an empty body. So the whole "fix the player"
+    ladder below that call is unreachable in the shipped game, and the four
+    half-inch nudges under it are in the `else` branch, for blockers that are
+    not players. Reproduced as written.
+
+87. **`SpeculativelyCheckRotPush` reads uninitialised memory, and which side of
+    the hinge you stand on decides what it does to you.** `Vector vecAbsPush;`
+    is handed to `ComputeRotationalPushDirection`, which reads its *sign* to
+    pick which corner of the blocker's box to rotate about — before writing it.
+    Zero here, which selects the low corner on all three axes. A leaf swinging
+    counterclockwise from `+X` sweeps the first quadrant with one end and the
+    third with the other, and that corner's radius is the **smallest** of the
+    four in the first quadrant and the **largest** in the third: so the same
+    door under-pushes on one side and jams against you, and over-pushes on the
+    other and flings you clear. Both are pinned by tests, and Valve's own
+    comment on the branch is *"BUGBUG: This will break, but not as badly as the
+    previous solution!!!"*.
+
+88. **`CBaseDoor::Blocked` reverses only when `wait >= 0`, and four doors in
+    five in Portal 2 have a negative one.** "if a door has a negative wait, it
+    would never come back if blocked, so let it just squash the object to death
+    real fast" — **503 of the game's 621 doors**, because a chamber door that
+    opens and stays open is written `wait -1`. For those, being blocked means
+    the door keeps pushing every tick and its local time never advances.
+    `m_bForceClosed` (87 doors) returns even earlier.
+
+89. **A blocked push rolls local time back, and that is what makes the alarm
+    survive it.** `PhysicsPushMove` increments local time, tries the push, and
+    subtracts it again if anything blocked. The mover therefore resumes exactly
+    where it stopped rather than catching up when the blocker steps aside —
+    and `EntityCore::local_time`, which had been "seconds spent simulating"
+    since stage 3, is finally a clock that can run slow.
+
+90. **`func_rotating` hurts its blocker unguarded and `func_movelinear` does
+    not, and that asymmetry is Valve's.** `CFuncRotating::Blocked`
+    (`bmodels.cpp:1375`) is one line with no `if ( m_flBlockDamage )` around
+    it; `CFuncMoveLinear::Blocked` (`func_movelinear.cpp:355`) has the guard.
+    So a `func_rotating` with no `dmg` key still runs its blocker's
+    `OnTakeDamage` with zero, which a damage filter can see even though no
+    health moves. Kept as written. The linear one's other arm —
+    `DAMAGE_EVENTS_ONLY`, which removes a `"gib"` — has no port: there are no
+    gibs and no class here sets that `m_takedamage`.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2300,6 +2579,13 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CLogicBranchList::Activate`'s `FindEntityGeneric` | Falls back to `FindEntityByClassname` when the name matches nothing, so `Branch01 "logic_branch"` would monitor every branch in the map | `Context::find_all_by_name`, which searches names only | All 350 `Branch*` keys in the game resolve by name, to exactly one entity each — no empty slot, no wildcard, nothing named that is not a `logic_branch` — so the fallback is unreachable. |
 | Entities created *by* a spawn | Bounded only by the stack | Bounded at 4,096 per dispatch, then dropped with a warning | Same shape as the zero-delay event chain's bound. The most any map creates is four. |
 | `Enable`/`Disable`/`Toggle` on a trigger | Calls `PhysicsTouchTriggers()` at once, so enabling a trigger you are standing in fires `OnStartTouch` in the same tick | Fires it on the **next** tick | The touch pass is player-driven and runs at one fixed point in the tick. At most 15.6 ms late; the condition for closing it is a touch query the server can ask mid-tick. |
+| `CBaseDoor::Spawn`'s solidity | `GetMoveParent() && GetRootMoveParent()->GetSolid() == SOLID_BSP ? SOLID_BSP : SOLID_VPHYSICS` | **The same, as of the pusher** — it used to be `CBaseTrigger::InitTrigger`'s rule, which is nearly the opposite | Listed because it was wrong for two stages and nothing noticed: `SOLID_BSP` and `SOLID_VPHYSICS` are the same brushes and nothing read which, until `ComputeRotationalPushDirection` started branching on exactly this test. The root walk it needs is `hierarchy::root_move_parent`, which the transform pair added. 87 of the game's 621 doors name a parent. |
+| `CPhysicsPushedEntities`' blocker enumeration | `::partition->EnumerateElementsInBox` per pusher | One linear pass over the entity list against the union of the pushers' boxes | Same precedent as `Tracer::with_entities`: the first test is a movetype comparison and it rejects every entity in a Portal 2 map but one. A union can only admit *more* candidates than the per-pusher boxes, and every candidate then goes through the exact test. |
+| `CPhysicsPushedEntities`' allocation | One file-scope `g_pPushedEntities` with two `CUtlVector`s reused for the whole level | Built per push | A push only happens on a tick a mover is actually moving, and the two vectors hold one and three entries on the shipped maps. The global exists to avoid exactly the allocation it costs; this is the same trade with the numbers on the other side. |
+| `SpeculativelyCheckPush`' `vecAbsPush` | Uninitialised on the first pass, and the previous blocker's push after it | Zero | Uninitialised memory has no port. Zero selects the low corner on all three axes, which is a defensible reading of what the stack usually holds — and it is the one that makes the behaviour reproducible. See [`push`](#push-pushrs--the-pusher). |
+| `LinearlyMoveRootEntity`'s push vector | `GetAbsVelocity() * movetime` | The displacement the root actually underwent | This port has no velocity pair (`hierarchy`), and the displacement is the same number for an unparented root and the *right* number for a parented one, where Valve's is a tick stale whenever the parent is itself moving. |
+| `IsStandingOnPusher` | Reads the ground entity | Redoes `CategorizePosition`'s two-unit drop against the pushers | There is no ground entity: the player's ground is found by `client/`'s move and only `FL_ONGROUND` crosses the seam. The nudge that wants `ground->GetAbsOrigin()` gets the root pusher's, since a `PushHit` names nothing. |
+| `SF_DOOR_NONSOLID_TO_PLAYER` in the **clip chain** | `CTraceFilterSimple` asks `ShouldCollide( COLLISION_GROUP_PLAYER, COLLISION_GROUP_PASSABLE_DOOR )` per trace | The door is left out of `world/`'s clip chain entirely, through `Placement::solid` | The clip chain has exactly one consumer — the player's own move — so "solid" there means "solid to the player". 141 of the game's 621 doors are ones the shipped game lets you walk straight through; leaving them in would give a door the player can neither pass nor block. |
 | `!player_blue` / `!player_orange` | `GetGlobalTeam( … )->GetPlayer( 0 )` | Reported as "no such player" | Single player has no teams, so Valve answers null here too — this is a report line rather than a divergence, and it is 74 of the depot's unhandled procedurals. |
 
 ---
@@ -2308,10 +2594,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 | | Why |
 |---|---|
-| **Pushing what is in the way** — `CPhysicsPushedEntities`, `Blocked`/`StartBlocked`/`EndBlocked`, `m_bDoorGroup`, `forceclosed`, `dmg`/`BlockDamage` | ~1,000 lines of speculative push and rollback, and it wants `ENGINE_TRACE.md` stage 4 underneath it. A door that moves through the player is a better state than a door that does not move. The keys are parsed so they are not counted as unknown; nothing reads them. |
+| `CBaseDoor::Blocked`'s **`m_bDoorGroup`** block | A blocked door reaches into every *other* door sharing its `targetname`, writes its own origin onto the ones travelling identically, and reverses all of them; Valve's comment on the middle of it is *"this is the most hacked, evil, bastardized thing I've ever seen. kjb"*. It needs a handler to run another entity's `DoorGoUp` **and** write that entity's origin, which is the cross-entity dispatch `Context` defers everywhere. **Reachable content, not a measured-out branch**: 121 of the game's 621 doors share a name with another door and 48 of those have `wait >= 0`. What is missing is a double door where blocking one leaf reopens the other; blocking one leaf still reopens that leaf. |
 | `SOLID_*` — `SOLID_BSP` versus `SOLID_VPHYSICS`, and `solidbsp` | Nothing chooses between *those two*: for a brush entity they are the same brushes. `SOLID_OBB` is different and is now real — it decides that a shape is answered by `obb` rather than by the engine (gotcha 48). |
 | The **physics force** a hurt imparts — `GuessDamageForce`, `VPhysicsTakeDamage`, `CBaseEntity::OnTakeDamage`'s impulse | The damage itself landed at stage 5; the force needs `rapier`. `DamageInfo` carries neither the force nor the position, because a field nothing reads is a field nothing checks — and the impulse branch is unreachable anyway: it demands `!info.GetAttacker()->IsSolidFlagSet( FSOLID_TRIGGER )` and the only attacker in the port is a `trigger_hurt`. |
-| Everything else that can hurt you — turrets (`npc_portal_turret_floor`), crushers (`CPhysicsPushedEntities`), `prop_physics` | Each is a class or a subsystem that is not ported. `trigger_hurt` is the whole damage surface the shipped maps reach. |
+| Everything else that can hurt you — turrets (`npc_portal_turret_floor`), `prop_physics` | Each is a class or a subsystem that is not ported. `trigger_hurt` is the whole damage surface the shipped maps reach — plus, since the pusher landed, block damage: `blockdamage` on 6 `func_movelinear`s and `dmg` on 7 `func_rotating`s. |
 | The **armour** — `m_ArmorValue`, `ARMOR_RATIO`, `ARMOR_BONUS`, `old_armor` | Portal has no armour and no item that gives any, so the block in `CBasePlayer::OnTakeDamage` is thirty lines of arithmetic on a value that is always zero. |
 | Drowning, the HEV suit's `SetSuitUpdate` voice lines, `m_DmgTake`/`m_bitsHUDDamage`, the geiger counter | A HUD, a sound system and a suit, none of which exist. |
 | **Fall damage** | Not deferred — **deleted**, and it is a measurement: `CPortalGameRules::FlPlayerFallDamage` is `{ return 0.0f; } //no fall damage in portal` (`portal_gamerules.h:61`), and the multiplayer rules agree in words. Nothing in Portal 2 can be killed by landing, whatever the height, which is why 34 of the game's `trigger_hurt`s carry `DMG_FALL`: the pit does the killing, not the fall. |
@@ -2323,7 +2609,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `trigger_look` (41), `trigger_playerteam` (645), `trigger_catapult` (185), `trigger_portal_cleanser` (371), `trigger_transition` (62), `trigger_autosave` (57), `trigger_ping_detector` (20) | Either reconstruction jobs with no C++ in this tree (`portdocs/SERVER.md` §1.3) or wanting a subsystem that does not exist — saves, co-op teams, the paint system. |
 | `CTriggerHurt`'s geiger counter, and `CTriggerTeleport`'s `CheckDestIfClearForPlayer` | A client-side HUD element, and `g_pGameRules->IsSpawnPointValid`. Zero shipped maps set the second. |
 | Sound — `noise1`/`noise2`/`startclosesound`/`closesound`/`StartSound`/`StopSound`/`sounds`/`message`, the lock sentences, `MovingSoundThink` | There is no sound system. The names are parsed and printed by `ent_dump`; `MovingSoundThink` is a *named think context*, which is also not ported and is the only thing in the game that wanted one. |
-| `CBaseDoor::Activate`'s movement group and `UpdateAreaPortals` | `m_bDoorGroup` is read only by `Blocked`, above; area portals are the engine's visibility system, which is not written. |
+| `CBaseDoor::Activate`'s `UpdateAreaPortals` | Area portals are driven by `func_areaportal` itself here rather than by the door that names one. |
 | `CBaseDoor::DoorActivate`, `DoorTouch`, `ChainUse`, `ButtonTouch`, `ButtonResponseToTouch`, `OnTakeDamage` | The touch and damage entry points. Nothing reaches them through I/O — and the damage one is now a *measurement*: `CBaseDoor::Spawn` and `CBaseButton::Spawn` only set `m_takedamage = DAMAGE_YES` when `health > 0`, and **all 682 `health` keys in the shipped game are `0`**, so no door or button in Portal 2 is shootable. |
 | Which way a rotating door swings away from you (`DoorGoUp`'s 40-line cross product) | It needs the activator's position, and the activator is a player in every case that reaches it. Without one Valve's `sign` stays `1.0`, which is the branch every door in Portal 2 takes because every door in Portal 2 is opened by I/O. |
 | `func_door`'s `SetToggleState` input | Declared `FIELD_FLOAT` and read with `value.Int()` (`doors.cpp:495`), which `variant_t` answers with **zero** for a float — so in the shipped game it always means `TS_AT_TOP`. Zero shipped connections fire it. |
@@ -2606,6 +2892,15 @@ case values.
 | `tests::moving_a_portal_reopens_it_and_fills_its_partner_with_static` | gotcha 82 — the three rows of the table, in one test |
 | `tests::switching_a_portal_on_resets_both_of_its_clocks` | the one row `OnActiveStateChanged` differs from `OnPortalMoved` in |
 | `tests::every_shipped_portal_is_on_a_wall` | **the deleted placement snap, measured**: 15 flush, 2 proud, 4 floating — and not one more than 0.00 degrees off its surface |
+| `tests::an_opening_door_pushes_the_player_along_in_front_of_it` | **the pusher, in one test** — the mover moves, the player goes with it, exactly as far |
+| `tests::a_player_against_a_wall_blocks_the_door_and_holds_its_clock` | the rollback: the door jams, `m_pBlocker` names the player, `OnBlockedOpening` fires **once**, and the clock is held — so the door resumes rather than catching up. Gotchas 88 and 89 |
+| `tests::a_blocked_door_with_a_wait_reverses` | `CBaseDoor::Blocked`'s other branch — the 118 doors with `wait >= 0` |
+| `tests::a_platform_carries_a_player_standing_on_top_of_it` | `IsStandingOnPusher`, rebuilt from the ground probe — the branch without which a platform slides out from under its rider |
+| `tests::a_door_the_player_can_walk_through_neither_pushes_nor_is_blocked` | `SF_DOOR_PASSABLE` and `SF_DOOR_NONSOLID_TO_PLAYER`, both flags, 257 shipped doors |
+| `tests::a_rotating_door_sweeps_the_player_around_its_hinge` | `ComputeRotationalPushDirection` — an arc, not an axis |
+| `tests::a_rotating_door_under_pushes_on_the_other_side_and_jams` | gotcha 87, the other quadrant, and that a rolled-back push leaves nothing behind |
+| `tests::a_child_of_a_moving_door_pushes_as_the_door_does` | `SetupAllInHierarchy` — the pusher list is the hierarchy, not the entity |
+| `tests::every_shipped_mover_pushes_the_player_standing_in_front_of_it` | **every linear mover in the game, closed on a real player hull**: 54 pushed, 13 blocked, the furthest shove 234.4 units |
 
 Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
 
@@ -2617,6 +2912,7 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release testchamber_door -- --ignor
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_intro_maps_door -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release branch_listener -- --ignored --nocapture
 KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_portal -- --ignored --nocapture
+KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_mover -- --ignored --nocapture
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
@@ -2891,10 +3187,11 @@ arrival alarm — plus `PerformPush` with the blocker always null, and
 `src/server/classes/brush.rs` is six classes: `func_brush` (2,502), `func_door_rotating`
 (346), `func_door` (275), `func_movelinear` (196), `func_button` (64) and
 `func_rotating` (27), **3,410 entities**, taking the port to 22 classnames and 22,639
-of the game's 60,925 blocks. Pushing the player is deliberately absent —
-`CPhysicsPushedEntities` is ~1,000 lines of speculative push and rollback that want
-`ENGINE_TRACE.md` stage 4 underneath them — so a door moves *through* a player rather
-than shoving one.
+of the game's 60,925 blocks. Pushing the player was deliberately absent at this
+stage — `CPhysicsPushedEntities` is ~1,000 lines of speculative push and rollback
+that want `ENGINE_TRACE.md` stage 4 underneath them — so a door moved *through* a
+player rather than shoving one. (It has since landed; see
+[the pusher](#the-pusher--a-door-that-shoves-the-player), below.)
 Measured over the depot: two seconds of each of the 106 maps now moves **67 brush
 entities off their spawn placement, 34 of them still travelling** when the clock stops.
 Before stage 3 that number was zero. **To see it, load a co-op map**: no
@@ -3671,3 +3968,83 @@ One quirk kept rather than fixed: `CRotDoor::Spawn` spawns open through
 four lines apart, with a *local* destination in both. **3 of the game's 63
 parented `func_door_rotating`s spawn open** and land where the shipped game
 lands them, which is not where the mapper drew them.
+
+### The pusher — a door that shoves the player
+
+The last of `portdocs/SERVER.md`'s named next steps, and the one stage 3
+explicitly deferred: `src/server/push.rs` is `CPhysicsPushedEntities`
+(`physics_main.cpp:122-1130`) with `PerformPush`, `PhysicsPushMove` and
+`PhysicsPushRotate` on top of it. **A mover no longer moves through what is
+standing in it.** Before this, `movement::perform_push` was Valve's function
+with the blocker hard-coded to null.
+
+What it needed underneath it was `trace/` stage 4 — a clip chain that holds
+brush entities — and the transform pair, because `SetupAllInHierarchy` is the
+pusher's list and that list is `EntityCore::children()`. Both were already
+there, which is why this landed as one module and one trait method rather than
+as a stage.
+
+What it bought, measured over the 106 shipped maps by
+`every_shipped_mover_pushes_the_player_standing_in_front_of_it`:
+
+- **67 of 263 linear movers engage the pusher on real geometry** — 54 shove the
+  player out of the doorway they are closing over, 13 are stopped dead by them.
+  The furthest single shove is **234.4 units**.
+- **52 never reach the probe and 144 have nowhere to stand**, and the reason is
+  the content rather than the port: a Portal 2 door slides *along its own long
+  axis* into a pocket in the wall, so there is no standable point in front of
+  its leading face or at its destination. The only place on a door's path a
+  player can be is the place the door itself occupies when shut — which is why
+  the test opens each mover first and then closes it over the space it just
+  vacated.
+- **163 more doors are ones the player walks through** and can never be pushed
+  by: 116 set `SF_DOOR_PASSABLE` (`FSOLID_NOT_SOLID`) and 141 set
+  `SF_DOOR_NONSOLID_TO_PLAYER` (`COLLISION_GROUP_PASSABLE_DOOR`), which is a
+  quarter of the game's 621 doors and which had been solid here since stage 3.
+
+**Four findings.**
+
+First, **`UnblockPusher` is `// TODO` in the shipped tree**, and that makes a
+whole ladder of `SpeculativelyCheckPush` dead code. The function restores the
+player, calls it, and then decides they are blocked if their origin did not
+change — which it cannot have, because the body is empty. So in the shipped
+game a player who is stuck after being shoved *always* blocks, and the four
+half-inch nudges below that call are in the `else` branch, for blockers that
+are not players. Reproduced as written rather than tidied: the shape is what
+says where the missing implementation goes.
+
+Second, **`SpeculativelyCheckRotPush` reads uninitialised memory, and which
+side of the hinge you stand on decides what it does to you.** `Vector
+vecAbsPush;` is handed to `ComputeRotationalPushDirection`, which reads its
+sign to pick which corner of the blocker's box to rotate about — before writing
+it. Zero here, which selects the low corner on all three axes. A leaf swinging
+counterclockwise from `+X` sweeps the first quadrant with one end and the third
+with the other, and that corner's radius is the *smallest* of the four in the
+first quadrant and the *largest* in the third: the same door under-pushes on
+one side and jams against you, and over-pushes on the other and flings you
+clear. Both are pinned by tests rather than smoothed over.
+
+Third, **there is no ground entity here, and `IsStandingOnPusher` needs one.**
+The player's ground is found by `client/`'s own move and only `FL_ONGROUND`
+crosses the seam, so the two-unit drop that *set* that entity is redone against
+the pushers alone. It is not an optimisation: something standing on a mover is
+beside it, not inside it, so the interpenetration test answers no and only this
+answers yes. Without it a platform slides out from under whoever is riding it,
+which is exactly the puzzle `CLAUDE.md` named as the condition for doing this
+work.
+
+Fourth, and found by writing the rotation: **`CBaseDoor::Spawn`'s solidity had
+been inverted since stage 3.** A door is `SOLID_VPHYSICS` *unless* it hangs off
+a `SOLID_BSP` root; the port had `CBaseTrigger::InitTrigger`'s nearly opposite
+rule, copied when the root-parent walk did not exist and the two names were
+interchangeable. They were — until `ComputeRotationalPushDirection` started
+branching on exactly that test. The walk it wanted,
+`hierarchy::root_move_parent`, is something the transform pair had already
+added.
+
+What is still not here is `CBaseDoor::Blocked`'s `m_bDoorGroup` block — a
+blocked door reopening the *other* leaf of a double door. It needs to run
+another entity's `DoorGoUp` and write that entity's origin, which is the
+cross-entity dispatch `Context` defers everywhere else, and unlike most of the
+things in the absent table it is reachable content: 121 of the game's doors
+share a name with another door and 48 of those have `wait >= 0`.

@@ -307,6 +307,16 @@ pub struct EntityCore {
     /// [`FL_BASEVELOCITY`](super::movement::FL_BASEVELOCITY) is set by
     /// `trigger_push` and cleared by the player's move.
     pub flags: u32,
+    /// `m_CollisionGroup` — who this entity collides with at all. See
+    /// [`CollisionGroup`](super::movement::CollisionGroup) for why there are
+    /// two of them rather than twenty-three.
+    pub collision_group: super::movement::CollisionGroup,
+    /// `m_pBlocker` — what stopped this pusher last tick, or `None`.
+    ///
+    /// A mover's state rather than the pusher's, because the *edges* are what
+    /// `StartBlocked` and `EndBlocked` fire on and an edge needs the previous
+    /// answer. Written only by [`push::perform_push`](super::push::perform_push).
+    pub blocker: Option<EntityId>,
     /// The entities this one is touching. Valve's `TOUCHLINK` data object
     /// (`game/shared/touchlink.h`), which is a doubly-linked list hung off the
     /// entity by name.
@@ -763,6 +773,78 @@ impl EntityCore {
         ]
     }
 
+    /// `g_pGameRules->ShouldCollide( COLLISION_GROUP_PLAYER,
+    /// GetCollisionGroup() )` — the one pairwise rule that survives.
+    ///
+    /// Read in two places and they have to agree, which is the reason it is
+    /// one method: the clip chain the player's move is traced against
+    /// (`Server::brush_entity` → `world::Placement::solid`), and the pusher's
+    /// candidate filter, which refuses to push what it cannot collide with.
+    /// A door the player walks through must not shove them, and a door that
+    /// shoves them must not be walked through.
+    pub fn collides_with_player(&self) -> bool {
+        self.collision_group != super::movement::CollisionGroup::PassableDoor
+    }
+
+    /// `IsPointSized()` (`baseentity.h:2178`) — `CollisionProp()->BoundingRadius()
+    /// == 0.0f`.
+    ///
+    /// The pusher's early-out: a point-sized blocker is moved and then
+    /// believed, because there is no box to be stuck in. Every point entity in
+    /// the game answers `true` here, which is what
+    /// [`ModelBounds`](super::movement::ModelBounds)' zero default is for.
+    pub fn is_point_sized(&self) -> bool {
+        self.model_bounds.mins == Vec3::ZERO && self.model_bounds.maxs == Vec3::ZERO
+    }
+
+    /// The `.bsp` model lump index this entity's `model` key names, if it
+    /// names one — `"*12"` is `Some(12)`.
+    ///
+    /// **Model 0 is excluded.** It is the world, which `worldspawn` names and
+    /// which is not a placement; the same exclusion `Server::level_init` and
+    /// `world::find_brush_models` both make, spelled once.
+    pub fn brush_model_index(&self) -> Option<usize> {
+        self.model
+            .as_deref()
+            .and_then(|name| name.strip_prefix('*'))
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&i| i != 0)
+    }
+
+    /// `CCollisionProperty::WorldSpaceAABB` (`collisionproperty.cpp:756`) —
+    /// this entity's own box, bounded in world space.
+    ///
+    /// For an unturned entity that is the box translated, which is the branch
+    /// almost every brush entity in a map takes; for a turned one it is
+    /// `TransformAABB`, the eight corners through
+    /// [`to_world`](EntityCore::to_world) and re-bounded — deliberately not
+    /// the tighter `CollisionAABBToWorldAABB` centre-and-extents form, which
+    /// is the same box by a cheaper route and which this is not hot enough to
+    /// need.
+    ///
+    /// Used as the pusher's broadphase, where Valve uses a spatial partition
+    /// (`::partition->EnumerateElementsInBox`); see [`push`](super::push).
+    pub fn world_space_aabb(&self) -> (Vec3, Vec3) {
+        let (mins, maxs) = (self.model_bounds.mins, self.model_bounds.maxs);
+        if self.angles == Vec3::ZERO {
+            return (self.origin + mins, self.origin + maxs);
+        }
+        let frame = self.to_world();
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for i in 0..8 {
+            let corner = Vec3::new(
+                if i & 1 == 0 { mins.x } else { maxs.x },
+                if i & 2 == 0 { mins.y } else { maxs.y },
+                if i & 4 == 0 { mins.z } else { maxs.z },
+            );
+            let world = frame.transform_point3(corner);
+            lo = lo.min(world);
+            hi = hi.max(world);
+        }
+        (lo, hi)
+    }
+
     /// `IsSolidFlagSet`. Takes a mask and asks whether *any* of it is set,
     /// which is what the C++'s `( m_usSolidFlags & flags ) != 0` does.
     pub fn is_solid_flag_set(&self, flags: u32) -> bool {
@@ -991,6 +1073,8 @@ impl Entity {
                 solid: Solid::None,
                 solid_flags: 0,
                 flags: 0,
+                collision_group: super::movement::CollisionGroup::None,
+                blocker: None,
                 touch_links: Vec::new(),
                 touch_stamp: 0,
                 check_untouch: false,

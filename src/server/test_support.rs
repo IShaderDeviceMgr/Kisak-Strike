@@ -92,7 +92,11 @@ impl Harness {
             self.player,
             &self.sequences,
         );
-        super::movement::simulate(core, behaviour, &mut cx);
+        // No collision either, so nothing a mover pushes against can block it
+        // — see [`TouchQuery::push_trace`](super::TouchQuery::push_trace)'s
+        // default. A test that wants a door to be blocked hands a real query
+        // to a real [`Server`](super::Server).
+        super::movement::simulate(core, behaviour, &mut cx, &mut super::NoTouchQuery);
     }
 
     /// Whether `class`'s handler takes `name`, given a value of the type it

@@ -205,6 +205,34 @@ pub fn descendants(core: &EntityCore, entities: &EntityList) -> Vec<EntityId> {
     found
 }
 
+/// `GetRootMoveParent()` (`baseentity.cpp:6960`) — the top of the chain `id`
+/// hangs from, which is `id` itself when it has no parent.
+///
+/// > **An id the list cannot resolve is a root**, and that is not a failure
+/// > case: the entity being dispatched is
+/// > detached for the whole of its handler, so a child
+/// > of the pusher walks up to a parent that is not there — and that parent is
+/// > exactly the root the caller is asking about. See [`push`](super::push),
+/// > which is the one caller.
+///
+/// The walk is bounded by the list's length. `set_parent` refuses to make an
+/// entity its own parent and nothing builds a longer cycle, but a cycle here
+/// would hang the tick rather than produce a wrong answer, which is the wrong
+/// way round.
+pub fn root_move_parent(id: EntityId, entities: &EntityList) -> EntityId {
+    let mut current = id;
+    for _ in 0..=entities.len() {
+        let Some(entity) = entities.get(current) else {
+            return current;
+        };
+        match entity.core.parent() {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

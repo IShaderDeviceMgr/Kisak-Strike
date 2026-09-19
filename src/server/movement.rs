@@ -20,13 +20,12 @@
 //! `portdocs/SERVER.md` §4.7 is right that it is astonishingly simple.
 //!
 //! What is *not* simple is pushing whatever is standing in the way, and that
-//! is deliberately absent: `CPhysicsPushedEntities`
-//! (`physics_main.cpp:130-1130`) is ~1,000 lines of speculative push, blocker
-//! enumeration and rollback, it needs `ENGINE_TRACE.md` stage 4 underneath it,
-//! and a door that moves through the player is a better state than a door that
-//! does not move. So [`perform_push`] is `PerformPush` with the blocker always
-//! null — which is the branch the shipped game takes on almost every tick
-//! anyway.
+//! is a module of its own: `CPhysicsPushedEntities`
+//! (`physics_main.cpp:122-1130`) is a thousand lines of speculative push,
+//! blocker enumeration and rollback, and it lives in [`push`](super::push).
+//! What is left here is the part that is four lines — set a velocity,
+//! integrate it, snap on arrival — and the enumerations that say how an entity
+//! exists in the world.
 //!
 //! # The alarm is not the think schedule
 //!
@@ -40,10 +39,10 @@
 //! The alarm runs on **local time**, not on `curtime`:
 //! [`EntityCore::local_time`](super::entity::EntityCore::local_time) is a clock
 //! that only advances while the entity is being pushed, which is what lets a
-//! blocked pusher fall behind the world and catch up later. Nothing blocks
-//! here, so in this port local time is simply "seconds this entity has spent
-//! simulating" — but the arithmetic is Valve's and the field is where a future
-//! blocker rollback puts its answer.
+//! blocked pusher fall behind the world and catch up later — and since
+//! [`push`](super::push) landed, that is a live path rather than an
+//! arithmetic curiosity: a door held open by the player stops its clock for as
+//! long as they stand in it and resumes exactly where it was.
 
 use glam::Vec3;
 
@@ -80,7 +79,7 @@ pub enum MoveType {
     None,
     /// `MOVETYPE_PUSH`. Every mover: doors, platforms, panels, buttons, fans.
     /// Integrates its own velocity, does not clip to the world, and pushes
-    /// what is in the way — except here, where nothing is pushed yet.
+    /// what is in the way — see [`push`](super::push).
     Push,
     /// `MOVETYPE_WALK`. The player, walking. Simulated by `client/`.
     Walk,
@@ -175,6 +174,18 @@ pub const FL_FROZEN: u32 = 1 << 6;
 /// that is not a player. Only the first is reachable here.
 pub const FL_GODMODE: u32 = 1 << 15;
 
+/// `FL_UNBLOCKABLE_BY_PLAYER` (`public/const.h:160`) — "pusher that can't be
+/// blocked by the player".
+///
+/// Set by two `Spawn`s in the whole game and only one of them exists here:
+/// `CBaseDoor::Spawn` sets it for `SF_DOOR_NONSOLID_TO_PLAYER`
+/// (`doors.cpp:309`), and `CFuncTrackTrain::Spawn` sets it for a spawnflag of
+/// its own. **141 shipped doors set it** — the same 141 that get
+/// [`CollisionGroup::PassableDoor`], which is the point: the flag is Valve's
+/// belt and braces for the door's *children*, which do not inherit the
+/// collision group. See [`push`](super::push) for what it changes.
+pub const FL_UNBLOCKABLE_BY_PLAYER: u32 = 1 << 31;
+
 /// `FL_NOTARGET` (`public/const.h:141`). Set alongside [`FL_FROZEN`] by
 /// `CRevertSaved::InputReload` and read by the AI, which is not ported —
 /// carried so that the flag word an `ent_dump` prints is the one the shipped
@@ -254,6 +265,36 @@ impl Solid {
             _ => Option::None,
         }
     }
+}
+
+/// `Collision_Group_t` (`public/const.h:390`), reduced to the one distinction
+/// this port can act on.
+///
+/// Valve declares twenty-three and `CGameRules::ShouldCollide`
+/// (`gamerules.cpp:660`) is fifty lines of pairwise rules over them, almost
+/// all of them about NPCs, debris, vehicles and weapons — none of which
+/// exists here. **One rule survives**, and it is one a Portal 2 map leans on:
+///
+/// ```text
+/// if ( collisionGroup0 == COLLISION_GROUP_PLAYER &&
+///      collisionGroup1 == COLLISION_GROUP_PASSABLE_DOOR )
+///     return false;
+/// ```
+///
+/// `CBaseDoor::Spawn` puts a door in that group for
+/// `SF_DOOR_NONSOLID_TO_PLAYER`, and **141 of the game's 621 doors set it** —
+/// 118 `func_door_rotating` and 23 `func_door`. Without the rule every one of
+/// them is a wall the player cannot walk through and, from this stage
+/// onwards, a wall that shoves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollisionGroup {
+    /// `COLLISION_GROUP_NONE`, and also `COLLISION_GROUP_PLAYER` — the two are
+    /// never distinguished by the one rule that is left.
+    #[default]
+    None,
+    /// `COLLISION_GROUP_PASSABLE_DOOR` — "doors that the player shouldn't
+    /// collide with".
+    PassableDoor,
 }
 
 /// The bounding box of the brush model an entity names, in the model's own
@@ -529,11 +570,20 @@ pub const SF_DOOR_ROTATE_PITCH: u32 = 128;
 /// every entity that will think this tick *or* is a mover with a live alarm —
 /// see [`ThinkList`](super::think::ThinkList).
 ///
-/// The base-velocity block, the ground-entity check and the move-parent
-/// recursion are all absent because the state they read does not exist: there
-/// is no ground, no base velocity, and parenting resolves a handle and moves
-/// nothing (see [`perform_push`]).
-pub fn simulate(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &mut Context<'_>) {
+/// The base-velocity block and the move-parent recursion are absent because
+/// the state they read does not exist: there is no base velocity on anything
+/// the server simulates, and the hierarchy is walked eagerly by
+/// [`hierarchy`](super::hierarchy) rather than recursed here.
+///
+/// `query` is the collision seam, and it is threaded this far down for one
+/// caller: [`push::perform_push`](super::push::perform_push), which is the
+/// only thing in the server that asks the world a question mid-tick.
+pub fn simulate(
+    entity: &mut EntityCore,
+    behaviour: &mut dyn Behaviour,
+    cx: &mut Context<'_>,
+    query: &mut dyn super::TouchQuery,
+) {
     match entity.move_type {
         // `PhysicsNone` (`physics_main.cpp:1722`) — "non moving objects can
         // only think". The player's three movetypes take this branch as well,
@@ -544,7 +594,7 @@ pub fn simulate(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &mut
         MoveType::None | MoveType::Walk | MoveType::Noclip | MoveType::FlyGravity => {
             physics_run_think(entity, behaviour, cx);
         }
-        MoveType::Push => physics_pusher(entity, behaviour, cx),
+        MoveType::Push => physics_pusher(entity, behaviour, cx, query),
     }
 }
 
@@ -585,7 +635,16 @@ fn physics_run_think(
 /// tick. `GetMoveDoneTime()` is `-1` when nothing is armed, which is `<= 0`
 /// and therefore not a move — so a `MOVETYPE_PUSH` entity that is standing
 /// still costs exactly one comparison.
-fn physics_pusher(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &mut Context<'_>) {
+///
+/// The move itself is [`push::perform_push`](super::push::perform_push), and
+/// it is a module of its own because shoving what is in the way is a thousand
+/// lines where integrating a velocity is two.
+fn physics_pusher(
+    entity: &mut EntityCore,
+    behaviour: &mut dyn Behaviour,
+    cx: &mut Context<'_>,
+    query: &mut dyn super::TouchQuery,
+) {
     if !physics_run_think(entity, behaviour, cx) {
         return;
     }
@@ -598,90 +657,7 @@ fn physics_pusher(entity: &mut EntityCore, behaviour: &mut dyn Behaviour, cx: &m
         movetime = cx.time.interval;
     }
 
-    perform_push(entity, behaviour, cx, movetime);
-}
-
-/// `CBaseEntity::PerformPush` (`physics_main.cpp:1590`) with no blocker.
-///
-/// Three things happen and the order is Valve's: local time advances, the
-/// entity rotates and then translates, and the arrival alarm is tested.
-///
-/// > **The last step of a move is exactly as long as the travel that is left**,
-/// > because `PhysicsPusher` clamps `movetime` to the *remaining* time rather
-/// > than always taking a whole tick. So the alarm goes off on the tick the
-/// > move ends, not the tick after, and `local_time` lands on
-/// > `move_done_time` rather than stepping over it. Get this wrong and every
-/// > door in the game arrives up to a sixty-fourth of a second late and a
-/// > fraction of a unit long.
-///
-/// # What the blocker would have done
-///
-/// `PerformPush` calls `PhysicsPushRotate` and `PhysicsPushMove`, each of
-/// which asks `CPhysicsPushedEntities` to move the whole hierarchy and rolls
-/// local time *back* if something was in the way; the blocker then reaches
-/// `StartBlocked`/`Blocked`/`EndBlocked`. None of that is here
-/// (`portdocs/SERVER.md` stage 3 excludes it), so the two branches collapse
-/// into "rotate if rotating, translate if translating" and local time never
-/// goes backwards.
-///
-/// # A parented mover moves in its parent's frame
-///
-/// Valve integrates `GetLocalVelocity()` into `GetLocalOrigin()`, which for an
-/// entity with a parent is that parent's frame — and so does this, since
-/// [`EntityCore`] grew the transform pair. **201 of the game's movers name a
-/// parent** (87 `func_movelinear`, 63 `func_door_rotating`, 24 `func_door`,
-/// 16 `func_button`, 9 `func_rotating`, 1 each of `momentary_rot_button` and
-/// `func_tracktrain`), and before the pair existed every one of them drove
-/// itself back towards a fixed world position whenever the thing it is bolted
-/// to moved.
-///
-/// **Nothing here pushes the change down to the children.**
-/// `SetupAllInHierarchy` (`physics_main.cpp:889`) is what does that in the
-/// C++; here it is one call in `Server::dispatch`, after the handler returns,
-/// so that a mover that moves *and then snaps* in `MoveDone` drags its subtree
-/// exactly once and onto the final placement — see
-/// [`hierarchy`](super::hierarchy).
-fn perform_push(
-    entity: &mut EntityCore,
-    behaviour: &mut dyn Behaviour,
-    cx: &mut Context<'_>,
-    movetime: f32,
-) {
-    if movetime > 0.0 {
-        // `IncrementLocalTime( movetime )`, which both push paths do and
-        // which happens *before* the velocity is looked at — a pusher with no
-        // velocity still spends the time, and that is what lets the alarm
-        // double as a plain wait timer (`CBaseDoor::DoorHitTop` sets it to
-        // `m_flWait` with the door standing still).
-        entity.local_time += movetime;
-
-        // `RotateRootEntity` then `LinearlyMoveRootEntity`, in that order.
-        // Valve runs rotation first and says so; with no blocker the order is
-        // not observable, and it is kept because the ordering *is* observable
-        // the moment a blocker exists.
-        //
-        // Both are `SetLocal*( GetLocal*() + GetLocal*Velocity() * movetime )`
-        // (`physics_main.cpp:993` and `:1057`) — **the pusher integrates in
-        // the parent's frame**, which is what makes a door on a moving
-        // platform open relative to the platform instead of driving itself
-        // back to a fixed world position every tick.
-        if entity.angular_velocity != Vec3::ZERO {
-            entity.set_local_angles(entity.local_angles + entity.angular_velocity * movetime);
-        }
-        if entity.velocity != Vec3::ZERO {
-            entity.set_local_origin(entity.local_origin + entity.velocity * movetime);
-        }
-    }
-
-    // `if ( m_flMoveDoneTime <= m_flLocalTime && m_flMoveDoneTime > 0 )`
-    // (`physics_main.cpp:1685`). Note that both halves test the *absolute*
-    // alarm rather than the remaining time, so an alarm set for local time
-    // zero never fires.
-    let alarm = entity.raw_move_done_time();
-    if alarm <= entity.local_time && alarm > 0.0 {
-        entity.set_move_done_time(-1.0);
-        behaviour.move_done(entity, cx);
-    }
+    super::push::perform_push(entity, behaviour, cx, query, movetime);
 }
 
 /// `anglemod` (`public/mathlib/mathlib.h:952`) — an angle folded into

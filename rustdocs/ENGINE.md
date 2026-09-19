@@ -248,6 +248,13 @@ pub fn draw_translucent(&self, pass: &mut Pass<'_>, curtime: f32, list: &Translu
 /// `TouchQuery::start_solid`.
 pub fn start_solid(&self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 pub fn sync_brush_models(&mut self, placement: impl Fn(usize) -> Option<Placement>);
+/* and, in `engine/mod.rs` rather than here, the pusher's half — see below */
+pub(crate) fn push_trace(
+    collision: &trace::CollisionBsp, models: &[world::PlacedBrushModel],
+    chain: &mut Vec<trace::BrushModel>,
+    clip: server::PushClip, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3,
+    pushers: &[server::Pusher],
+) -> server::PushHit;
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
 /// two halves meet.
@@ -501,6 +508,20 @@ Four things about it:
   game's 2,502 start switched off; `draw_brush_models` skips an invisible one
   and the `trace` command skips a non-solid one. `render_mode` stays a load-time
   decision beside them because it cannot change.
+- **A push asks about a placement the world has not been told about yet.**
+  `sync_brush_models` runs *after* the ticks, and `src/server/push.rs` moves a
+  door speculatively mid-tick and may roll it back — so `push_trace` takes the
+  pushers' live placements as arguments and substitutes them into the chain for
+  the duration of one sweep. It lives in `engine/mod.rs` beside
+  `WorldTouchQuery` rather than in `world/` because it is the one function that
+  has to name both `server::PushClip` and a `BrushModel`; `world/` names no
+  server type. `rustdocs/SERVER.md`'s "The pusher" is the other half.
+- **"Solid" here means "solid to the player."** The clip chain has exactly one
+  consumer — `Engine::update_client`'s move — so `Placement::solid` folds in
+  `EntityCore::collides_with_player()` as well as `IsSolid()`, which keeps the
+  141 shipped doors flagged `SF_DOOR_NONSOLID_TO_PLAYER` out of it. The shipped
+  game lets you walk straight through those; leaving them in would give a door
+  the player can neither pass nor block.
 - **Neither module names the other.** `world/` defines `Placement` and
   `src/server/` answers with an `EntityCore`; `engine/mod.rs` converts, the same
   arrangement `console/` and `input/` already have.
@@ -4431,7 +4452,7 @@ world draw are verified by running the binary — see [Quick start](#quick-start
 
 **`src/engine/` — 6 of 14 modules ported: `window/`, `host/`, `world/`'s geometry,
 lightmaps, terrain and light cache, `trace/` (stages 1-4 of 5, plus the portal
-carve), `input/` (stages 1-4
+carve and the pusher's three clip chains), `input/` (stages 1-4
 of 5), and `console/` (all five stages, complete)**
 (`portdocs/ENGINE.md`, **`rustdocs/ENGINE.md`** — read that before calling in).
 Conclusion stands: don't port `engine` as one unit; each of its 23 subsystems becomes
@@ -4884,11 +4905,15 @@ more world draw at **0.27 ms**, where the same draw before visibility landed was
 1.81. What it still does not do is *warp*: a portal's surface does not refract
 what is behind it and it has no opening animation, both of which are
 `PortalRefract`'s `$Stage 0`.
-It is **still not a runnable game** — no sound, no netcode, no weapon, and
-a door moves *through* the player rather than shoving it (a chamber door is
-walked through for the same reason) — but the boot path is
-continuous from `main` to a rendered, lit, self-starting level you can walk
-around, interact with and die in.
+It is **still not a runnable game** — no sound, no netcode and no weapon — but
+the boot path is continuous from `main` to a rendered, lit, self-starting level
+you can walk around, interact with and die in, and **a door closing on you now
+shoves you out of the way, or is stopped by you**: `src/server/push.rs` is
+`CPhysicsPushedEntities`, and the three clip chains it sweeps against are
+`engine::push_trace` (see [The placement is *live*](#the-placement-is-live--sync_brush_models)).
+A `prop_testchamber_door` is still walked through, but for a different reason —
+the clip chain holds brush models, and a chamber door is a studio prop with no
+`.phy` behind it.
 
 **`sp_a1_intro1` draws lit**: 5,523 of 5,638 world faces, 73 of its 76 materials
 resolving, 4,857 surfaces with real baked lighting over 13 atlas pages, and **1,080 static

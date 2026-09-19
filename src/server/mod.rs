@@ -75,6 +75,7 @@ pub mod keyvalue;
 pub mod movement;
 pub mod name;
 pub mod obb;
+pub mod push;
 pub mod random;
 pub mod sequences;
 pub mod think;
@@ -272,6 +273,98 @@ pub trait TouchQuery {
     /// (`portdocs/PORTAL.md` §8) — so the extra sweeps could only ever answer
     /// "yes" for a reason that is not the hole.
     fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
+
+    /// One of the pusher's three sweeps — [`push`](super::push), and the
+    /// engine's whole half of "a door that shoves the player".
+    ///
+    /// `mins`/`maxs` are the swept box relative to `start`, the same
+    /// convention [`brush_models_touching`](TouchQuery::brush_models_touching)
+    /// takes. `pushers` is **where the pushing hierarchy is right now**, which
+    /// is not where `world/` thinks it is: the placements are synced to the
+    /// renderer once a frame, after the ticks, and a push happens mid-tick
+    /// against a door that has already been moved speculatively. See
+    /// [`PushClip`] for what each mode traces against.
+    ///
+    /// The default is `NoTouchQuery`'s answer — nothing is in the way, so
+    /// nothing is ever blocked — because a server with no collision has no
+    /// geometry that could block a door and every synthetic test in this
+    /// module wants exactly that.
+    fn push_trace(
+        &mut self,
+        _clip: PushClip,
+        start: Vec3,
+        end: Vec3,
+        _mins: Vec3,
+        _maxs: Vec3,
+        _pushers: &[Pusher],
+    ) -> PushHit {
+        let _ = start;
+        PushHit {
+            fraction: 1.0,
+            end,
+            start_solid: false,
+        }
+    }
+}
+
+/// Where one entity of a pushing hierarchy is *this instant*, for
+/// [`TouchQuery::push_trace`].
+///
+/// A brush model index and a placement, which is the same `"*N"` join key the
+/// rest of this seam speaks in — so a push crosses into the engine without
+/// either side naming the other's types, exactly as
+/// [`brush_models_touching`](TouchQuery::brush_models_touching) does.
+///
+/// **The placement is the speculative one.** `PerformLinearPush` moves the
+/// root *before* it asks what is in the way, and asks about the position it
+/// moved to; the copy `world/` holds is still last frame's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pusher {
+    /// `"model" "*12"`'s 12.
+    pub model: usize,
+    /// `m_vecAbsOrigin`, after the speculative move.
+    pub origin: Vec3,
+    /// `m_angAbsRotation`, after the speculative move.
+    pub angles: Vec3,
+}
+
+/// Which clip chain one of the pusher's sweeps runs against.
+///
+/// Valve's three trace filters, which is three different answers to "is the
+/// door in the way" and the reason the push works at all:
+///
+/// | Mode | Valve | Asked by |
+/// |---|---|---|
+/// | [`PushersOnly`](PushClip::PushersOnly) | `CTraceFilterAgainstEntityList`, `TRACE_ENTITIES_ONLY` | `IntersectsPushers` — is this entity inside the door? |
+/// | [`WithoutPushers`](PushClip::WithoutPushers) | `CTraceFilterPushMove` under `UnlinkPusherList` | the speculative shove — how far can it go? |
+/// | [`Everything`](PushClip::Everything) | `CTraceFilterPushFinal` | `IsPushedPositionValid` — did it end up stuck? |
+///
+/// The middle one is the one that needs explaining: the pushers are **hidden**
+/// for it, because the entity being pushed is by definition already inside the
+/// door and a sweep that saw the door would refuse to move at fraction zero
+/// every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushClip {
+    /// The pushers and nothing else — not even the world.
+    PushersOnly,
+    /// The world and every solid brush model **except** the pushers.
+    WithoutPushers,
+    /// The world and every solid brush model, pushers included, at the
+    /// placement the push is proposing.
+    Everything,
+}
+
+/// What one [`TouchQuery::push_trace`] found — `trace_t`, reduced to the three
+/// fields the pusher reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PushHit {
+    /// `trace.fraction`.
+    pub fraction: f32,
+    /// `trace.endpos`, in the same frame `start` was given in — the box's
+    /// position, not its centre.
+    pub end: Vec3,
+    /// `trace.startsolid`. The whole of what `IsPushedPositionValid` reads.
+    pub start_solid: bool,
 }
 
 /// The player, as the two halves of the port that own pieces of it agree to
@@ -1010,7 +1103,7 @@ impl Server {
         // either side of it.
         self.player_pre_think();
         self.player_touch_triggers(query);
-        self.run_think_functions();
+        self.run_think_functions(query);
         self.check_for_entity_untouch();
         self.service_events();
         // `m_hLinkedPortal->PunchAllPenetratingPlayers()`, which the C++ does
@@ -1285,7 +1378,15 @@ impl Server {
     /// thinkers, and a mover is copied out every tick whatever its schedule
     /// says — so the "is the think due" question moved down into
     /// `movement::simulate` with it.
-    fn run_think_functions(&mut self) {
+    ///
+    /// `query` goes with it, and this is the only step of the tick that takes
+    /// one that is not about the player: it is what a `MOVETYPE_PUSH` entity
+    /// asks in order to find out whether it is allowed to move
+    /// ([`push`](push)). The borrow is disjoint from `self` because the query
+    /// arrives as a parameter of [`frame`](Server::frame) rather than as a
+    /// field, which is the same arrangement that lets `engine/` hand over a
+    /// `&World` while `&mut Server` is live.
+    fn run_think_functions(&mut self, query: &mut dyn TouchQuery) {
         let tick = self.clock.time().tick;
         let mut due = std::mem::take(&mut self.due);
         self.thinks.due(tick, &mut due);
@@ -1297,10 +1398,11 @@ impl Server {
             if !alive {
                 continue;
             }
+            let query = &mut *query;
             let thought = self
                 .dispatch(id, |core, behaviour, cx| {
                     let before = core.next_think_tick();
-                    movement::simulate(core, behaviour, cx);
+                    movement::simulate(core, behaviour, cx, query);
                     // What `PhysicsRunSpecificThink` did: the schedule is
                     // cleared before the think runs, so a think that happened
                     // is one whose tick is no longer the one it was.

@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,054 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,062 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -150,10 +150,10 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace and the transition ramp), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation and `$includemodel`. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals and the **local/abs transform pair** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals, the **local/abs transform pair** and the **pusher** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -162,14 +162,14 @@ in. World geometry, terrain, brush entities, static props and entity-placed
 models all draw, lit the way the shipped game lights them and auto-exposed to
 the map's own limits. The entity logic runs on a 64 Hz tick: doors and panels
 move, triggers fire, a floor button presses when you stand on it, a chamber
-door opens as you approach and shuts behind you, and a `trigger_hurt` can kill
-you. Two portals draw as coloured ovals — **and they work, and you can see
+door opens as you approach and shuts behind you, a `trigger_hurt` can kill you,
+and **a mover shoves you out of its way or is stopped by you**. Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
 
-**It is not a runnable game**: no sound, no netcode, no weapon, no skybox, and
-a door moves *through* the player rather than shoving one.
+**It is not a runnable game**: no sound, no netcode, no weapon and no skybox —
+but a door closing on you now shoves you out of the way, or is stopped by you.
 **The portals work, and you can see through them.** `portdocs/PORTAL.md` stages
 3 and 4 landed the teleport — you walk into one oval and come out of the other,
 rotated, with your velocity rotated and clamped and your view turned with you;
@@ -265,12 +265,29 @@ because `MatrixAngles(AngleMatrix(a))` is not `a` and a still parent would other
 walk its children sideways every tick; and `SetParentAttachment*` is genuinely a
 different problem from `SetParent`, not the same one twice.
 
-- **`CPhysicsPushedEntities` — a door that shoves the player.** `trace/` stage 4
-  is no longer in the way, so this is unblocked for the first time:
-  `physics_main.cpp:130-1130`, ~1,000 lines of speculative push, blocker
-  enumeration and rollback, and `EntityCore::local_time` is already the field
-  its answer goes in. The condition is the first puzzle that cannot be solved
-  without standing on something that moves.
+**The pusher has landed** — `src/server/push.rs`, `CPhysicsPushedEntities`
+(`physics_main.cpp:122-1130`) — so **a door closing on you shoves you out of the
+way, or is stopped by you**. It needed `trace/` stage 4 (a clip chain that holds
+brush entities) and the transform pair (`SetupAllInHierarchy` is the pusher's
+list, and that list is `EntityCore::children()`), both of which were already
+there. The collision goes out through one new `TouchQuery` method carrying
+three clip chains — the pushers alone, everything *but* the pushers, and
+everything — because those are Valve's three trace filters and each answers a
+different question. Measured over the shipped maps: **54 linear movers shove
+the player out of the doorway they close over and 13 are stopped dead by
+them**, the furthest shove 234.4 units, and 163 more are doors the player walks
+through (`SF_DOOR_PASSABLE`, `SF_DOOR_NONSOLID_TO_PLAYER`) and can never be
+pushed by. Four findings, in `rustdocs/SERVER.md`: `CGameMovement::UnblockPusher`
+is `// TODO` in the shipped tree, which makes a whole ladder of
+`SpeculativelyCheckPush` dead code and a stuck player always a blocker;
+`SpeculativelyCheckRotPush` reads uninitialised memory to pick which corner of
+the blocker to rotate about, so a rotating door under-pushes on one side of its
+hinge and over-pushes on the other; there is no ground *entity* here, so
+`IsStandingOnPusher` — the branch that makes a platform carry its rider — is
+rebuilt from a two-unit drop against the pushers; and `CBaseDoor::Spawn`'s
+solidity had been inverted since stage 3, invisibly, until
+`ComputeRotationalPushDirection` started reading it.
+
 - **`LookupAttachment` on a studio model**, which is what is left of the parenting
   family and would be `server/`'s first dependency on `studio/`. The transform pair
   landed and took `SetParent`/`ClearParent` with it; the two

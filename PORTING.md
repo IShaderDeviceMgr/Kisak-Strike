@@ -797,10 +797,11 @@ reading `game/server/` would reach.
 `PerformPush` with the blocker always null, plus six classes: `func_brush`,
 `func_door_rotating`, `func_door`, `func_movelinear`, `func_button` and
 `func_rotating`, **3,410 entities**. Doors open and shut, panels slide, buttons
-press in and come back out, fans spin up to speed. Pushing the player is
-deliberately absent (~1,000 lines of speculative push and rollback that want
-`ENGINE_TRACE.md` stage 4 underneath them), so a door moves *through* a player
-rather than shoving one.
+press in and come back out, fans spin up to speed. Pushing the player was
+deliberately absent at this stage (~1,000 lines of speculative push and rollback
+that want `ENGINE_TRACE.md` stage 4 underneath them), so a door moved *through* a
+player rather than shoving one. **It has since landed** — `src/server/push.rs`,
+after `trace/` stage 4 and the transform pair; `rustdocs/SERVER.md`, "The pusher".
 
 Four things it settled. **The scope of "brush entities" is not the mover
 census**: §4.7 counted 1,164 movers and the six classes are 3,410 entities,
