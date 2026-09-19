@@ -24,16 +24,18 @@
 //! what crosses the boundary is a `&'static str`, three floats and a model
 //! path.
 //!
-//! # Posing without skinning
+//! # Posing
 //!
-//! A model is drawn one **bone run** at a time — see
-//! [`StudioModel::rigid_bones`](crate::studio::StudioModel::rigid_bones). Each
-//! batch's triangles were sorted by bone at load, so each bone's are a
-//! contiguous index range that can be drawn under that bone's own matrix, and
-//! the vertex format, the shaders and the bind groups are untouched. For a
-//! `prop_floor_button` that is two draws where a static prop is one: 7,263
-//! triangles' worth of body under the identity and 666 of plate under whatever
-//! the animation says.
+//! One [`Pass::set_bones`] per instance, then the instance's batches drawn as
+//! they are — the pose is pass state and the palette is read by the vertex
+//! shader, so a batch is one draw whatever its skeleton is doing.
+//!
+//! The pose itself is [`PropModel::pose`], which is `boneToWorld *
+//! poseToBone` per bone; the *placement* stays out of it and rides the draw's
+//! own model matrix. A model with no bones sets none and is drawn unskinned,
+//! which is every static prop.
+//!
+//! [`Pass::set_bones`]: crate::materials::context::Pass::set_bones
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -201,10 +203,15 @@ pub struct EntityModelStats {
     /// Instances whose model has more than one bone — the ones the pose is
     /// actually for.
     pub animated: usize,
-    /// Models whose vertices are **not** each bound to exactly one bone, and
-    /// which are therefore drawn in their bind pose rather than wrongly. See
-    /// [`StudioModel::rigid_bones`](crate::studio::StudioModel::rigid_bones).
-    pub models_not_rigid: usize,
+    /// Models with a vertex that more than one bone moves — the ones that
+    /// needed skinning rather than the per-bone draw split this port used
+    /// until it landed.
+    ///
+    /// Kept as a measurement rather than as a warning: it counted the models
+    /// that were drawn wrong before, and it is what says whether a map has any
+    /// now. **74 of the 591 readable models the game's props name are one, and
+    /// 290 entities wear one**, seven of them on `sp_a1_intro1`.
+    pub models_skinned: usize,
     /// Models whose sequences came out of a `$includemodel` companion, and the
     /// instances wearing one.
     ///
@@ -458,16 +465,8 @@ impl EntityModels {
                     stats.models_missing += 1;
                     return None;
                 }
-                if model.bones.len() > 1 && model.rigid_bones().is_none() {
-                    // Drawn in its bind pose rather than wrongly: the per-bone
-                    // split cannot express a vertex two bones share. No model
-                    // the port loads reaches this.
-                    eprintln!(
-                        "source-engine: entity models: {}: vertices are shared between bones; \
-                         drawing it unanimated",
-                        model.path
-                    );
-                    stats.models_not_rigid += 1;
+                if model.vertices.iter().any(|v| v.bone_weights[1] != 0.0) {
+                    stats.models_skinned += 1;
                 }
 
                 let batches: Vec<PropBatch> = model
@@ -483,7 +482,6 @@ impl EntityModels {
                         ),
                         first_index: batch.first_index,
                         index_count: batch.index_count,
-                        bones: batch.bones.clone(),
                     })
                     .collect();
 
@@ -638,8 +636,8 @@ impl EntityModels {
         if s.models_missing > 0 {
             out += &format!(", {} missing", s.models_missing);
         }
-        if s.models_not_rigid > 0 {
-            out += &format!(", {} not rigid (drawn unanimated)", s.models_not_rigid);
+        if s.models_skinned > 0 {
+            out += &format!(", {} skinned", s.models_skinned);
         }
         if s.models_with_includes > 0 {
             out += &format!(
@@ -747,34 +745,31 @@ impl EntityModels {
         };
         pass.set_model_lighting(&instance.lighting);
         pass.bind_static_light(&unlit);
-        let pose = model.pose(instance.sequence, self.cycle(instance, curtime));
-        self.record_batch(pass, model, instance, &pose, &model.batches[batch]);
+        pass.set_bones(&model.pose(instance.sequence, self.cycle(instance, curtime)));
+        self.record_batch(pass, model, instance, &model.batches[batch]);
     }
 
-    /// One instance's one batch, bone run by bone run.
+    /// One instance's one batch, under whatever pose the pass currently holds.
+    ///
+    /// **The caller sets the pose**, because a pose is per instance and a
+    /// batch is per material: setting it here would upload the whole skeleton
+    /// once per material the model wears.
     fn record_batch(
         &self,
         pass: &mut Pass<'_>,
         model: &PropModel,
         instance: &Instance,
-        pose: &[Mat4],
         batch: &PropBatch,
     ) {
         let vertices = model.vertices.slice();
-        for run in &batch.bones {
-            let bone = pose
-                .get(usize::from(run.bone))
-                .copied()
-                .unwrap_or(Mat4::IDENTITY);
-            let indices = model.indices.range(run.first_index, run.index_count);
-            pass.draw_modulated(
-                &batch.material,
-                &vertices,
-                &indices,
-                instance.transform * bone,
-                instance.modulation,
-            );
-        }
+        let indices = model.indices.range(batch.first_index, batch.index_count);
+        pass.draw_modulated(
+            &batch.material,
+            &vertices,
+            &indices,
+            instance.transform,
+            instance.modulation,
+        );
     }
 
     fn record(&self, pass: &mut Pass<'_>, curtime: f32, refracting: bool, visible: BoxVisible<'_>) {
@@ -799,20 +794,19 @@ impl EntityModels {
                 continue;
             };
 
-            // One pose per instance per frame: three `Mat4`s for a button.
-            // Taken before the batch loop because every batch of one instance
-            // shares it.
-            let pose = model.pose(instance.sequence, self.cycle(instance, curtime));
-
             pass.set_model_lighting(&instance.lighting);
             pass.bind_static_light(&unlit);
+            // One pose per instance per frame: three `Mat4`s for a button,
+            // 248 for a piece of `container_ride` debris. Set before the batch
+            // loop because every batch of one instance shares it.
+            pass.set_bones(&model.pose(instance.sequence, self.cycle(instance, curtime)));
 
             for batch in &model.batches {
                 let translucent = instance.modulation[3] != 1.0;
                 if GeometryPass::of_instance(&batch.material, translucent) != wanted {
                     continue;
                 }
-                self.record_batch(pass, model, instance, &pose, batch);
+                self.record_batch(pass, model, instance, batch);
             }
         }
     }
@@ -1451,8 +1445,8 @@ mod tests {
         world.load_entity_models(&vfs, &mut materials, &device, std::slice::from_ref(&door));
         assert_eq!(world.entity_models.stats.models_missing, 0);
         assert_eq!(
-            world.entity_models.stats.models_not_rigid, 0,
-            "it must pose"
+            world.entity_models.stats.models_skinned, 0,
+            "the chamber door's vertices each answer to one bone"
         );
         assert_eq!(world.entity_models.instances.len(), 1);
         println!("{}", world.entity_models.summary());
@@ -1464,7 +1458,6 @@ mod tests {
         // from along whichever horizontal axis the door is *thinnest* in,
         // which is the way a doorway is looked through.
         let studio = StudioModel::load(&vfs, &door.model).expect("the door model");
-        let bones = studio.rigid_bones().expect("rigid").to_vec();
         // Taken by value so that the borrow ends here: `sync` below needs the
         // list mutably, and the pose of a held door does not change.
         let (transform, shut, opened) = {
@@ -1476,12 +1469,10 @@ mod tests {
                 model.pose(instance.sequence, 1.0),
             )
         };
+        // Skinned on the CPU exactly as the vertex shader skins it, then
+        // placed — which is the same order `skin_model_matrix` applies them in.
         let world_vertex = |i: usize, pose: &[Mat4]| {
-            let bone = pose
-                .get(usize::from(bones[i]))
-                .copied()
-                .unwrap_or(Mat4::IDENTITY);
-            (transform * bone).transform_point3(Vec3::from(studio.vertices[i].position))
+            transform.transform_point3(crate::studio::anim::skin(&studio.vertices[i], pose))
         };
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for i in 0..studio.vertices.len() {
@@ -1664,7 +1655,10 @@ mod tests {
             let mut furthest = vec![0.0f32; studio.bones.len()];
             let mut spinner = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             for i in 0..studio.vertices.len() {
-                let bone = usize::from(bones[i]);
+                // Every vertex of this model answers to one bone, asserted
+                // by `the_chamber_door_model_poses_the_way_the_class_assumes`;
+                // slot 0 is therefore the whole answer.
+                let bone = usize::from(studio.vertices[i].bone_indices[0]);
                 let (was, now) = (world_vertex(i, &shut), world_vertex(i, pose));
                 let distance = was.distance(now);
                 if distance > 0.5 {

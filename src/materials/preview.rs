@@ -1918,6 +1918,196 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Skinning
+    // ---------------------------------------------------------------------
+    // The bone palette, drawn rather than asserted about. Every one of these
+    // would pass against a shader that quietly ignored the palette and used
+    // `draw.model` alone, were it not for where the quad lands.
+
+    /// A quad spanning `x` in `left..right`, every vertex wholly on `bone`.
+    ///
+    /// Lit by a bright static-light stream so the test can read "drawn" as a
+    /// white pixel and "not drawn" as the cleared black — which is what makes
+    /// *where it landed* the assertion.
+    fn skinned_quad(
+        left: f32,
+        right: f32,
+        bone: u8,
+    ) -> ([ModelVertex; 4], [StaticLightVertex; 4], [u16; 6]) {
+        let (mut vertices, light, indices) = model_quad([0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 1.0]);
+        for vertex in &mut vertices {
+            vertex.position[0] = left + vertex.position[0] * (right - left);
+            vertex.bone_weights = [1.0, 0.0, 0.0];
+            vertex.bone_indices = [bone, 0, 0, 0];
+        }
+        (vertices, light, indices)
+    }
+
+    /// A palette of `count` identity bones with `bone` translated by `x`.
+    fn palette(count: usize, bone: usize, x: f32) -> Vec<Mat4> {
+        let mut bones = vec![Mat4::IDENTITY; count];
+        bones[bone] = Mat4::from_translation(Vec3::new(x, 0.0, 0.0));
+        bones
+    }
+
+    #[test]
+    fn a_skinned_vertex_rides_the_bone_its_weights_name() {
+        // The quad's own coordinates put it on the left; bone 1 moves it to
+        // the right, and the draw's model matrix is the identity. So the only
+        // thing that can have moved it is the palette.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        let (vertices, light, indices) = skinned_quad(0.0, 0.5, 1);
+
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            pass.set_bones(&palette(2, 1, 0.5));
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(
+            pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0],
+            255,
+            "the quad did not ride bone 1 to the right half"
+        );
+        assert_eq!(
+            pixel(&pixels, TARGET / 4, TARGET / 2)[0],
+            0,
+            "the quad is still where its vertices say, so the palette was not read"
+        );
+    }
+
+    #[test]
+    fn two_bones_at_half_weight_put_the_vertex_between_them() {
+        // The case the per-bone draw split could not express at all, and the
+        // whole reason skinning was written: a vertex that belongs to two
+        // bones lands at neither of them.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        let (mut vertices, light, indices) = skinned_quad(0.0, 0.25, 0);
+        for vertex in &mut vertices {
+            vertex.bone_weights = [0.5, 0.5, 0.0];
+            vertex.bone_indices = [0, 1, 0, 0];
+        }
+
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            // Bone 0 leaves it alone, bone 1 moves it half a screen; half of
+            // each is a quarter.
+            pass.set_bones(&palette(2, 1, 0.5));
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(
+            pixel(&pixels, 3 * TARGET / 8, TARGET / 2)[0],
+            255,
+            "a 50/50 blend did not land the quad half way"
+        );
+        assert_eq!(
+            pixel(&pixels, TARGET / 8, TARGET / 2)[0],
+            0,
+            "it did not leave bone 0's position"
+        );
+        assert_eq!(
+            pixel(&pixels, 5 * TARGET / 8, TARGET / 2)[0],
+            0,
+            "it went all the way to bone 1's position"
+        );
+    }
+
+    #[test]
+    fn clearing_the_pose_draws_the_vertex_where_it_was_authored() {
+        // `bSkinning` off. The palette is still bound — it has to be, the
+        // layout declares it — and must not be read.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        let (vertices, light, indices) = skinned_quad(0.0, 0.5, 1);
+
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            pass.set_bones(&palette(2, 1, 0.5));
+            pass.clear_bones();
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(
+            pixel(&pixels, TARGET / 4, TARGET / 2)[0],
+            255,
+            "the unskinned draw did not stay where its vertices put it"
+        );
+        assert_eq!(
+            pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0],
+            0,
+            "a cleared pose still moved the quad"
+        );
+    }
+
+    #[test]
+    fn a_palette_that_outgrows_its_buffer_keeps_the_poses_already_recorded() {
+        // The hazard the whole arena design is about, in its bone half: the
+        // second `set_bones` here needs more rows than the buffer was made
+        // with, so the buffer is replaced *while a draw naming the old one is
+        // already recorded*. `grow_bones` flushes before the swap and keeps
+        // the staged rows, and this is what says so.
+        //
+        // 2,000 bones a palette, against `INITIAL_BONE_ROWS`' 2,730 bones'
+        // worth: the first fits and the second cannot.
+        let mut h = harness!(false);
+        let material = h.model_material("");
+        let mut lighting = dark_lighting();
+        lighting.static_light = 1;
+        // Bone 200 rather than bone 1,999: `ModelVertex::bone_indices` is a
+        // byte, as `mstudioboneweight_t::bone` is. The *palette* is what is
+        // oversized here, not the index.
+        let (right_to_left, light, indices) = skinned_quad(0.5, 1.0, 200);
+        let (left_to_right, _, _) = skinned_quad(0.0, 0.5, 200);
+
+        let pixels = h.render(|pass| {
+            pass.set_model_lighting(&lighting);
+            let l = pass.vertices(&light);
+            pass.bind_static_light(&l);
+            let i = pass.indices(&indices);
+
+            pass.set_bones(&palette(2_000, 200, -0.5));
+            let v = pass.vertices(&right_to_left);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+
+            pass.set_bones(&palette(2_000, 200, 0.5));
+            let v = pass.vertices(&left_to_right);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        assert_eq!(
+            pixel(&pixels, TARGET / 4, TARGET / 2)[0],
+            255,
+            "the draw recorded before the growth lost its palette"
+        );
+        assert_eq!(
+            pixel(&pixels, 3 * TARGET / 4, TARGET / 2)[0],
+            255,
+            "the draw recorded after the growth did not read the new buffer"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // Phong
     // ---------------------------------------------------------------------
     // Same reasoning as the block above: these are the only place

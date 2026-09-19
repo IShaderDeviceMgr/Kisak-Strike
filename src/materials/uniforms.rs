@@ -253,8 +253,15 @@ pub struct DrawUniforms {
     /// Valve had no such register: an unskinned draw still went through
     /// `SkinPosition` with `cModel[0]` — the first bone — as its transform
     /// (`common_vs_fxc.h:170`). One matrix in a per-draw block says the same
-    /// thing without the skinning path, and when skinning lands it becomes
-    /// bone 0 of group 3's storage buffer.
+    /// thing without the skinning path.
+    ///
+    /// **It stayed a matrix of its own when skinning landed**, rather than
+    /// becoming bone 0 of the palette as the note here used to predict. The
+    /// two are not the same quantity: this is the *placement* — where the
+    /// entity is in the world — and the palette is the *pose*, in the model's
+    /// own space. Folding the placement into every bone would mean rewriting
+    /// the whole palette whenever a prop moved without animating, which is
+    /// most of what moves.
     pub model: ColumnMajor,
 
     /// `cModulationColor`, VS `c47`: `$color * $alpha`, times whatever the
@@ -265,10 +272,28 @@ pub struct DrawUniforms {
     /// alpha by a per-instance modulation before every draw, and material
     /// proxies rewrite `$color` between draws of the same material.
     pub modulation: [f32; 4],
+
+    /// Where this draw's bone palette is, and whether it has one.
+    ///
+    /// `x` is the first **row** of the palette in the bone buffer — group 2's
+    /// second binding, `BONE_ROWS` rows per bone — and `y` is Valve's
+    /// `bSkinning`: zero leaves [`model`](DrawUniforms::model) to place the
+    /// vertex on its own and the palette unread. `z` and `w` pad to a `vec4`.
+    ///
+    /// # Why a row index and not a dynamic offset
+    ///
+    /// Every other per-draw block in this port is a slot of a fixed stride
+    /// that a dynamic offset selects. A palette cannot be, because a fixed
+    /// stride has to be the *worst* case: `MAXSTUDIOBONES` is 256
+    /// (`studio.h:77`) and `models/container_ride/finedebris_part12` really
+    /// does use 248 of them, so the stride would be 12,288 bytes — paid by a
+    /// three-bone door as well, at one copy per draw. Indexing by row instead
+    /// costs each draw exactly its own bones and puts no ceiling on the count.
+    pub skinning: [u32; 4],
 }
 
 impl DrawUniforms {
-    /// One draw of an untransformed, unmodulated thing.
+    /// One draw of an untransformed, unmodulated, unskinned thing.
     // `Pass::draw_modulated` builds these from a model matrix and a modulation
     // instead; this is what a caller with neither wants.
     #[allow(dead_code)]
@@ -276,8 +301,41 @@ impl DrawUniforms {
         DrawUniforms {
             model: IDENTITY,
             modulation: [1.0, 1.0, 1.0, 1.0],
+            skinning: [0; 4],
         }
     }
+}
+
+/// How many `vec4` rows one bone's matrix takes in the bone buffer.
+///
+/// A bone transform is a `matrix3x4_t` — Valve's own storage for one
+/// (`studio.h`, and every `boneToWorld` array in `bone_setup.cpp`) — and the
+/// fourth row of an affine matrix is `(0, 0, 0, 1)` in every one of them. So
+/// three rows go to the GPU and the shader reconstructs the fourth, which is
+/// exactly what `mul4x3` in `common_vs_fxc.h:161` does.
+pub const BONE_ROWS: usize = 3;
+
+/// One bone matrix as the palette holds it: three **rows** of four.
+///
+/// # This is the one transpose in the skinning path
+///
+/// [`from_mat4`] does not transpose, because `glam` and WGSL agree. This does,
+/// because the palette is not read as a matrix at all: the shader takes a row
+/// at a time and `dot`s it against the vertex, which is `mul4x3`'s shape and
+/// the reason three rows fit where four columns would not.
+///
+/// Row `i` is therefore `(m.x_axis[i], m.y_axis[i], m.z_axis[i],
+/// m.w_axis[i])` — the translation lands in `w`, one component per row. If a
+/// skinned model draws collapsed onto a point, this is the first thing to
+/// check: a palette written column-wise puts the translation in row 3, which
+/// is the row that is never uploaded.
+pub fn bone_rows(matrix: Mat4) -> [[f32; 4]; BONE_ROWS] {
+    let m = matrix.to_cols_array_2d();
+    [
+        [m[0][0], m[1][0], m[2][0], m[3][0]],
+        [m[0][1], m[1][1], m[2][1], m[3][1]],
+        [m[0][2], m[1][2], m[2][2], m[3][2]],
+    ]
 }
 
 /// How many local lights a draw can carry. `MaxNumLights()` on the PC path.
@@ -589,7 +647,7 @@ mod tests {
         // ABI: WGSL rounds a struct up to a multiple of its largest member's
         // alignment, and a mismatch here binds garbage rather than failing.
         assert_eq!(size_of::<FrameUniforms>(), 64 + 5 * 16);
-        assert_eq!(size_of::<DrawUniforms>(), 64 + 16);
+        assert_eq!(size_of::<DrawUniforms>(), 64 + 16 + 16);
         assert_eq!(size_of::<FrameUniforms>() % 16, 0);
         assert_eq!(size_of::<DrawUniforms>() % 16, 0);
 
@@ -686,6 +744,32 @@ mod tests {
             flat,
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn a_bone_matrix_puts_its_translation_in_the_w_of_each_row() {
+        // The opposite transpose to the one below, and the one that collapses
+        // a skinned model onto a point when it is missed: the palette is read
+        // a *row* at a time, so the translation is spread one component per
+        // row rather than kept as a column. Written column-wise it would land
+        // in the fourth row, which is the row that is never uploaded.
+        let matrix = Mat4::from_translation(glam::Vec3::new(10.0, 20.0, 30.0));
+        assert_eq!(
+            bone_rows(matrix),
+            [
+                [1.0, 0.0, 0.0, 10.0],
+                [0.0, 1.0, 0.0, 20.0],
+                [0.0, 0.0, 1.0, 30.0],
+            ]
+        );
+
+        // And the rotation is *not* transposed by this — a row of the 3x4 is
+        // a row of the mathematical matrix. A quarter turn about `z` sends
+        // `+x` to `+y`, so row 1 (the `y` output) must read `x`.
+        let turn = Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let rows = bone_rows(turn);
+        assert!((rows[1][0] - 1.0).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][1] + 1.0).abs() < 1e-6, "{rows:?}");
     }
 
     #[test]

@@ -83,12 +83,15 @@
 //! > would share four lines and two unused fields.
 //!
 //! Also absent, and each measured rather than assumed: the weighted cube and
-//! the monster box (`prop_weighted_cube` is not ported, so **the player is the
-//! only thing in this port that can press a button** — which is what
-//! `prop_floor_button` is for, and is why its three siblings are not here);
-//! the co-op team outputs, which need `GameRules()->IsMultiplayer()`; the
-//! `ACH.BOX_HOLE_IN_ONE` achievement think; and `sv_slippery_cube_button`'s
-//! surface-property swap, which is vphysics.
+//! the monster box halves of the press. [`WeightedCube`] *is* ported now, but
+//! it cannot press anything — a cube here has no vphysics, so it never moves,
+//! never touches and never enters a trigger. **The player is still the only
+//! thing in this port that can press a button**, which is what
+//! `prop_floor_button` is for and is why its three siblings are not here.
+//! Also absent: the co-op team outputs, which need
+//! `GameRules()->IsMultiplayer()`; the `ACH.BOX_HOLE_IN_ONE` achievement
+//! think; and `sv_slippery_cube_button`'s surface-property swap, which is
+//! vphysics.
 //!
 //! **`UpdateOnRemove` is not ported either, so a killed button leaves its
 //! trigger behind.** `CPropFloorButton::UpdateOnRemove` is
@@ -274,9 +277,10 @@ impl FloorButton {
         self.reset_sequence(DOWN_SEQUENCE, cx);
 
         // `CPropFloorButton::OnPressed` (`:334`). Its multiplayer half needs
-        // `GameRules()->IsMultiplayer()` and its `prop_monster_box` and
-        // `prop_weighted_cube` halves need classes this port has not got, so
-        // what is left is the last line.
+        // `GameRules()->IsMultiplayer()`, and its `prop_monster_box` and
+        // `prop_weighted_cube` halves need an activator that is one — which a
+        // cube here can never be, because it does not move and so never
+        // touches a trigger. What is left is the last line.
         let me = entity.id();
         entity.fire_output("OnPressed", Variant::Void, activator, Some(me), 0.0, cx);
     }
@@ -456,9 +460,10 @@ impl ButtonTrigger {
     /// makes a floor button ignore everything that is not a player or a cube
     /// even though its trigger allows physics objects in general.
     ///
-    /// The cube half is not written: `prop_weighted_cube` and
-    /// `prop_monster_box` are not ported, so nothing can reach it and a
-    /// `false` is the whole of the remaining branch.
+    /// The cube half is not written. [`WeightedCube`] exists now, but a cube
+    /// here has no vphysics and so never moves into a trigger to be asked
+    /// about; `prop_monster_box` is not ported at all. Nothing can reach the
+    /// branch, and a `false` is the whole of what remains.
     fn passes_trigger_filters(
         &self,
         entity: &EntityCore,
@@ -1818,6 +1823,648 @@ impl Behaviour for TestChamberDoor {
                     false => "off".to_owned(),
                 },
             ),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPropWeightedCube
+// ---------------------------------------------------------------------------
+
+/// `WeightedCubeType_e` (`prop_weightedcube.h:20`) — which cube this is.
+///
+/// The map writes it as `CubeType`, or — far more often — leaves it to
+/// [`WeightedCube::convert_old_skins`] to derive from the `skin` key. It
+/// decides the model, and with [`WeightedCube::rusted`] and the painted power
+/// it decides the skin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CubeType {
+    Standard,
+    Companion,
+    Reflective,
+    Sphere,
+    Antique,
+    /// The one that never happens. `CPropWeightedCube::SetCubeType` opens with
+    /// `if ( m_nCubeType == CUBE_SCHRODINGER ) m_nCubeType = CUBE_REFLECTIVE;`
+    /// under a `// FIXME: Remove for DLC2`, so the `case CUBE_SCHRODINGER`
+    /// twenty lines below it — the twin-linking one — is **dead code in the
+    /// shipped game**, and so is the `CUBE_SCHRODINGER` arm of `SetCubeSkin`.
+    /// `Precache` is the only place that still sees it.
+    ///
+    /// Kept as a variant so the remap is written down where it happens rather
+    /// than lost in a `from_key` that never returns it.
+    Schrodinger,
+}
+
+impl CubeType {
+    /// The integer a `CubeType` key or an old `skin` key carries. Anything
+    /// else is `CUBE_STANDARD`, which is what a C++ cast to an enum leaves a
+    /// default-constructed `m_nCubeType` as.
+    fn from_int(value: i32) -> CubeType {
+        match value {
+            1 => CubeType::Companion,
+            2 => CubeType::Reflective,
+            3 => CubeType::Sphere,
+            4 => CubeType::Antique,
+            5 => CubeType::Schrodinger,
+            _ => CubeType::Standard,
+        }
+    }
+
+    /// The model `SetCubeType` names for this cube — the six `const char *`s
+    /// at `prop_weightedcube.cpp:329`.
+    ///
+    /// **This overrides whatever the map wrote**, because `SetCubeType` calls
+    /// `SetModelName` unconditionally. No shipped `prop_weighted_cube` writes
+    /// a `model` key at all, so nothing is being overridden in practice.
+    fn model(self) -> &'static str {
+        match self {
+            CubeType::Standard | CubeType::Companion => "models/props/metal_box.mdl",
+            // The Schrodinger cube's model is the reflective one, and it is
+            // remapped to `Reflective` before this is ever asked anyway.
+            CubeType::Reflective | CubeType::Schrodinger => "models/props/reflection_cube.mdl",
+            CubeType::Sphere => "models/props_gameplay/mp_ball.mdl",
+            CubeType::Antique => "models/props_underground/underground_weighted_cube.mdl",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            CubeType::Standard => "standard",
+            CubeType::Companion => "companion",
+            CubeType::Reflective => "reflective",
+            CubeType::Sphere => "sphere",
+            CubeType::Antique => "antique",
+            CubeType::Schrodinger => "schrodinger",
+        }
+    }
+}
+
+/// `PaintPowerType` (`public/game/shared/portal2/paint_enum.h:9`).
+///
+/// Only [`Bounce`](PaintPower::Bounce) and [`Speed`](PaintPower::Speed) change
+/// a cube's skin; the other three all take `SetCubeSkin`'s `default` arm. The
+/// header's own warning — "keep that in mind when modifying it" — is about the
+/// numbering being networked, which is why these are transcribed in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintPower {
+    Bounce,
+    /// `REFLECT_POWER`, which Hammer calls "Stick".
+    Reflect,
+    Speed,
+    Portal,
+    /// `NO_POWER`, and the default — `PropPaintPowerUser`'s constructor
+    /// (`prop_paint_power_user.h:136`).
+    None,
+}
+
+impl PaintPower {
+    fn from_int(value: i32) -> PaintPower {
+        match value {
+            0 => PaintPower::Bounce,
+            1 => PaintPower::Reflect,
+            2 => PaintPower::Speed,
+            3 => PaintPower::Portal,
+            _ => PaintPower::None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            PaintPower::Bounce => "bounce",
+            PaintPower::Reflect => "reflect",
+            PaintPower::Speed => "speed",
+            PaintPower::Portal => "portal",
+            PaintPower::None => "none",
+        }
+    }
+}
+
+/// `CPropWeightedCube` (`prop_weightedcube.cpp:285`) — the cube you pick up,
+/// minus the picking up.
+///
+/// **98 across 59 of the game's 106 maps**, one of them on `sp_a1_intro1`, and
+/// they carry 63 `OnFizzled` connections — nearly all of them a cube dropper
+/// being told to make another one.
+///
+/// # What a cube is here, and what it is not
+///
+/// `CPropWeightedCube` is a `PlayerPickupPaintPowerUser< CPhysicsProp >`, and
+/// **this port has neither half of that**: no vphysics, so a cube does not
+/// fall, does not collide and cannot be picked up or thrown; no paint, so it
+/// cannot be painted by a blob. What is left is everything that is decided at
+/// spawn and everything that arrives as an input — which is most of what a map
+/// actually uses a cube for, because a cube's *identity* (which model, which
+/// skin, whether it funnels, whether it may be picked up) is map data and not
+/// simulation.
+///
+/// So the honest summary: **a cube is drawn, in the right model for its type,
+/// and it fizzles when told to.** It hangs in the air where the map put it.
+///
+/// | Reachable | Not reachable, and why |
+/// |---|---|
+/// | `CubeType` → the model, `SkinType`/`PaintPower` → the skin | `Use`, `OnPhysGunPickup`/`Drop`, the carry angles — all `CBasePlayer` pickup |
+/// | `Dissolve`, `SilentDissolve` → `OnFizzled` and removal | the fizzler *effect*, `CUBE_FX_FIZZLER_MODEL` — see [`WeightedCube::dissolve`] |
+/// | `EnablePortalFunnel` / `DisablePortalFunnel` | what reads the flag: `CProp_Portal`'s funnel, which acts on physics objects |
+/// | `DisablePickup` / `EnablePickup` | ditto — `Use` is the only reader |
+/// | `SetPaint` → `OnPainted` and the skin | the physics material index, and the paint blobs that would send it |
+/// | `OnFizzled`, `OnPainted` | `OnBluePickUp` / `OnOrangePickUp` / `OnPlayerPickup` / `OnPhysGunDrop` — pickup again, and the first two need `IsMultiplayer()` |
+///
+/// Also absent and deliberately: the whole Schrodinger half (twin linking, the
+/// think, the sound), which `SetCubeType`'s own `FIXME` makes unreachable —
+/// see [`CubeType::Schrodinger`]; `ConvertOldSkins`' sibling in the *disabled*
+/// state machine (`DisabledThink`, `EnterDisabledState`), which is a reflective
+/// cube being nudged by a physics touch; and the tractor-beam pair.
+///
+/// # The `skin` key is not the skin
+///
+/// The most surprising thing about this class, and the one that would look
+/// like a content bug rather than a port bug. A map writes `skin` and the cube
+/// **throws it away**: `ConvertOldSkins` reads it as a *cube type*, and
+/// `SetCubeSkin` then computes a fresh skin from the type, the rust flag and
+/// the painted power. A cube with `skin 3` ends up with skin **0** and a
+/// reflective model.
+///
+/// That path is the normal one, not the legacy one, whatever its name says:
+/// **77 of the game's 98 cubes have no `NewSkins` key at all**, so their type
+/// comes from `skin` and not from `CubeType`. Only 19 write `CubeType`.
+pub struct WeightedCube {
+    /// `m_nCubeType`, from `CubeType` or from `ConvertOldSkins`.
+    pub cube_type: CubeType,
+    /// `m_bRusted` — the `SkinType` key. 23 shipped cubes write it, 10 of them
+    /// `1`.
+    pub rusted: bool,
+    /// `m_bNewSkins` — "Use the values in the Cube Type and Skin Type fields
+    /// instead of the Skin(OLD) field". [`convert_old_skins`] sets it `true`
+    /// whatever the map said, so it is only ever read once.
+    ///
+    /// [`convert_old_skins`]: WeightedCube::convert_old_skins
+    pub new_skins: bool,
+    /// `m_bActivated` — set by `SetActivated`, whose only callers are the
+    /// laser-catcher path (`SetLaser`) and the disabled-state machine. Nothing
+    /// reaches it here, so it is always `false` and the six `*_ACTIVATED_SKIN`
+    /// constants are unreachable; kept because it is half of the skin ladder
+    /// and leaving it out would make that ladder unreadable against the
+    /// original.
+    pub activated: bool,
+    /// `m_nSkin` — what `SetCubeSkin` computed, **not** what the map wrote.
+    ///
+    /// > Carried to the renderer through [`ModelState::skin`] and **not drawn
+    /// > there**: a model's skin families are `portdocs/STUDIO.md` stage 6 and
+    /// > `.mdl`'s skin table is not read at all yet. So a companion cube draws
+    /// > today with the standard cube's materials. The four types that differ
+    /// > by *model* — reflective, sphere, antique and standard — are correct.
+    pub skin: i32,
+    /// `m_PrePaintedPower` (`prop_paint_power_user.h:65`) — the `PaintPower`
+    /// key, "Power to start with on load". All 98 shipped cubes write it: 75
+    /// `None` and 23 `Portal`.
+    pub pre_painted_power: PaintPower,
+    /// `m_iPaintPower` (`paintable_entity.h`) — what `GetPaintedPower()`
+    /// returns, and what the skin ladder branches on.
+    pub painted_power: PaintPower,
+    /// `m_nCurrentPaintedType` — the *previous* value, kept only so
+    /// [`set_painted_material`](WeightedCube::set_painted_material) can tell a
+    /// change from a repeat and fire `OnPainted` once.
+    pub current_painted_type: PaintPower,
+    /// `m_bAllowPortalFunnel` — `CPhysicsProp`'s `allowfunnel` key
+    /// (`props.cpp:2704`), which this class's two inputs write. 75 shipped
+    /// cubes write the key, 15 of them `0`.
+    pub allow_portal_funnel: bool,
+    /// `m_bPickupDisabled`, set `false` by `Spawn` and toggled by the two
+    /// pickup inputs. Read by `Use`, which is not reachable here.
+    pub pickup_disabled: bool,
+}
+
+/// The nine inputs (`prop_weightedcube.cpp:308`).
+///
+/// `skin` is **not** among them: `CBaseAnimating`'s `DEFINE_INPUT( m_nSkin, …,
+/// "skin" )` is on the class, but a cube that took it would have the value
+/// overwritten by the next `SetCubeSkin`. It is declared here anyway, as
+/// `prop_floor_button` declares it, because 22 shipped `OnUser1` connections
+/// fire `Skin` at things and a cube is a plausible target — and because
+/// dropping it would make the input "not handled" rather than "handled and
+/// then recomputed".
+pub static WEIGHTED_CUBE_INPUTS: InputDefs = &[
+    InputDef::new("Dissolve", FieldType::Void),
+    InputDef::new("SilentDissolve", FieldType::Void),
+    InputDef::new("PreDissolveJoke", FieldType::Void),
+    InputDef::new("DisablePortalFunnel", FieldType::Void),
+    InputDef::new("EnablePortalFunnel", FieldType::Void),
+    InputDef::new("ExitDisabledState", FieldType::Void),
+    InputDef::new("SetPaint", FieldType::Int),
+    InputDef::new("DisablePickup", FieldType::Void),
+    InputDef::new("EnablePickup", FieldType::Void),
+    InputDef::new("skin", FieldType::Int),
+];
+
+/// The four outputs (`:318`) plus the two the FGD declares and the datadesc
+/// does not.
+///
+/// `OnPlayerPickup` and `OnPhysGunDrop` are `CBaseEntity`'s — they come from
+/// `CBaseAnimating`'s player-pickup mixin rather than from this `DECLARE`
+/// block — and eight shipped connections use them. They are listed so those
+/// connections parse as outputs rather than as unknown keys, which is the same
+/// reason `prop_floor_button` lists its two co-op outputs.
+pub static WEIGHTED_CUBE_OUTPUTS: &[&str] = &[
+    "OnFizzled",
+    "OnOrangePickUp",
+    "OnBluePickUp",
+    "OnPainted",
+    "OnPlayerPickup",
+    "OnPhysGunDrop",
+];
+
+/// The keys this class consumes itself. `model`, `origin`, `angles`,
+/// `targetname` and the render keys are `CBaseEntity::KeyValue`'s and are
+/// already in [`base_key_value`](crate::server::keyvalue::base_key_value).
+pub static WEIGHTED_CUBE_KEYS: &[&str] = &[
+    "skin",
+    "CubeType",
+    "SkinType",
+    "NewSkins",
+    "PaintPower",
+    "allowfunnel",
+];
+
+impl WeightedCube {
+    pub fn create() -> Box<dyn Behaviour> {
+        Box::new(WeightedCube {
+            // The constructor's initialiser list (`:344`), plus the two fields
+            // it leaves to `Spawn`.
+            cube_type: CubeType::Standard,
+            rusted: false,
+            new_skins: false,
+            activated: false,
+            skin: 0,
+            pre_painted_power: PaintPower::None,
+            painted_power: PaintPower::None,
+            current_painted_type: PaintPower::None,
+            // `CPhysicsProp`'s own default: "Whether or not this object should
+            // auto-funnel into a portal", 1 in the FGD.
+            allow_portal_funnel: true,
+            pickup_disabled: false,
+        })
+    }
+
+    /// `ConvertOldSkins` (`:324`) — "HACK HACK: Make the cubes choose skins
+    /// using the new method even though the maps have not been updated to use
+    /// them."
+    ///
+    /// Valve's comment calls it a hack for maps that were not updated; the
+    /// measurement says the maps were *never* updated, so this is the path 77
+    /// of the game's 98 cubes take and `CubeType` is the exception.
+    ///
+    /// The decrement is the whole subtlety. The old `skin` list had **six**
+    /// entries where the type list has five, because slot 2 was "Standard
+    /// Activated" — so everything from 2 up shifts down one and skins 1 and 2
+    /// both land on `Companion`:
+    ///
+    /// | `skin` | Hammer called it | becomes |
+    /// |---|---|---|
+    /// | 0 | Standard | `Standard` |
+    /// | 1 | Companion | `Companion` |
+    /// | 2 | Standard Activated | `Companion` |
+    /// | 3 | Reflective | `Reflective` |
+    /// | 4 | Sphere | `Sphere` |
+    /// | 5 | Antique | `Antique` |
+    ///
+    /// Run twice — `Spawn` calls it and so does `Precache`, which `Spawn` then
+    /// calls — and idempotent because of the flag it sets on the way out.
+    fn convert_old_skins(&mut self) {
+        if self.new_skins {
+            return;
+        }
+        if self.skin > 1 {
+            self.skin -= 1;
+        }
+        self.cube_type = CubeType::from_int(self.skin);
+        self.new_skins = true;
+    }
+
+    /// `SetCubeType` (`:341`) — pick the model, then the skin.
+    ///
+    /// The `CreateRotationController` and `AddSpawnFlags(
+    /// SF_PHYSPROP_ENABLE_ON_PHYSCANNON )` a reflective cube also gets are
+    /// both vphysics and are not here; the rotation controller is an
+    /// `IMotionEvent` that keeps a reflective cube's face square to the world.
+    fn set_cube_type(&mut self, entity: &mut EntityCore) {
+        // "FIXME: Remove for DLC2" — and it was never removed, so the
+        // Schrodinger cube is a reflective one. See `CubeType::Schrodinger`.
+        if self.cube_type == CubeType::Schrodinger {
+            self.cube_type = CubeType::Reflective;
+        }
+        entity.model = Some(self.cube_type.model().to_owned());
+        self.set_cube_skin();
+    }
+
+    /// `SetCubeSkin` (`:412`) — the ladder, as a table.
+    ///
+    /// Valve writes this as five nested `switch`es and 60-odd `SetSkin` calls;
+    /// the axes are the same three every time — type, then painted power, then
+    /// `m_bActivated` or `m_bRusted` — so it is written here as the lookup it
+    /// is. Every number below is transcribed from the six enums at
+    /// `prop_weightedcube.cpp:36`.
+    ///
+    /// Three of Valve's arms are worth keeping visible rather than folding
+    /// away, because they are not what the shape suggests:
+    ///
+    /// - **The reflective cube's two `m_bRusted` branches are identical** and
+    ///   both marked `// FIXME` — a bounce-painted rusted cube and a
+    ///   bounce-painted clean one get the same skin. Only the unpainted arm
+    ///   really reads the flag.
+    /// - **The companion and sphere cubes ignore `m_bActivated` when painted**:
+    ///   `CUBE_COMPANION_BOUNCE_SKIN` and `..._BOUNCE_ACTIVATED_SKIN` are both
+    ///   8, and the sphere's pair are both 2.
+    /// - **Only the standard cube reads `m_bRusted`** alongside paint, and it
+    ///   reads it *first*: "Rusted cubes don't show paint", so a rusted
+    ///   standard cube takes 3 or 5 whatever it has been painted with.
+    ///
+    /// # What the shipped maps actually reach
+    ///
+    /// **The painted arms are unreachable from map data.** `PaintPower` is
+    /// `None` on 75 cubes and `Portal` on the other 23, and neither is
+    /// `Bounce` or `Speed` — so every shipped cube takes a `default` arm. With
+    /// [`activated`](WeightedCube::activated) never set either, the skins a
+    /// shipped map can produce are exactly four: 0 (standard clean, reflective
+    /// clean, sphere clean, antique clean), 1 (companion clean, reflective
+    /// rusted) and 3 (standard rusted).
+    fn set_cube_skin(&mut self) {
+        let painted = self.painted_power;
+        let on = self.activated;
+        self.skin = match self.cube_type {
+            // "Rusted cubes don't show paint" — the rust test is outside the
+            // paint switch here exactly as it is there.
+            CubeType::Standard if self.rusted => match on {
+                false => 3,
+                true => 5,
+            },
+            CubeType::Standard => match (painted, on) {
+                (PaintPower::Bounce, false) => 6,
+                (PaintPower::Bounce, true) => 10,
+                (PaintPower::Speed, false) => 7,
+                (PaintPower::Speed, true) => 11,
+                (_, false) => 0,
+                (_, true) => 2,
+            },
+            CubeType::Companion => match (painted, on) {
+                // 8 and 9 whether activated or not: Valve's two pairs of
+                // constants are equal.
+                (PaintPower::Bounce, _) => 8,
+                (PaintPower::Speed, _) => 9,
+                (_, false) => 1,
+                (_, true) => 4,
+            },
+            // The one type with no activated skins at all, and the one that
+            // reads `m_bRusted` in its unpainted arm.
+            CubeType::Reflective | CubeType::Schrodinger => match (painted, self.rusted) {
+                (PaintPower::Bounce, _) => 2,
+                (PaintPower::Speed, _) => 3,
+                (_, false) => 0,
+                (_, true) => 1,
+            },
+            CubeType::Sphere => match (painted, on) {
+                (PaintPower::Bounce, _) => 2,
+                (PaintPower::Speed, _) => 3,
+                (_, false) => 0,
+                (_, true) => 1,
+            },
+            CubeType::Antique => match painted {
+                PaintPower::Bounce => 1,
+                PaintPower::Speed => 2,
+                _ => 0,
+            },
+        };
+    }
+
+    /// `SetPaintedMaterial` (`:1120`), minus the physics material index that
+    /// is the whole of its body.
+    ///
+    /// What survives is the guard at the top, and it is the only thing here
+    /// that a map can observe: **`OnPainted` fires on a *change* to a real
+    /// power**, so painting a cube the colour it already is fires nothing, and
+    /// painting it `None` never fires at all.
+    fn set_painted_material(
+        &mut self,
+        entity: &mut EntityCore,
+        paint: PaintPower,
+        cx: &mut Context<'_>,
+    ) {
+        if self.current_painted_type != paint && paint != PaintPower::None {
+            let me = Some(entity.id());
+            entity.fire_output("OnPainted", Variant::Void, me, me, 0.0, cx);
+        }
+        self.current_painted_type = paint;
+    }
+
+    /// `CPropWeightedCube::Paint` (`:1105`) — `BaseClass::Paint` (which is the
+    /// one line `m_iPaintPower = type`, `paintable_entity.h:101`), then the
+    /// material, then the skin.
+    ///
+    /// The Schrodinger twin this also paints is unreachable — see
+    /// [`CubeType::Schrodinger`].
+    fn paint(&mut self, entity: &mut EntityCore, paint: PaintPower, cx: &mut Context<'_>) {
+        self.painted_power = paint;
+        self.set_painted_material(entity, paint, cx);
+        self.set_cube_skin();
+    }
+
+    /// `InputDissolve` (`:884`) and `InputSilentDissolve` (`:892`), which in
+    /// this port are the same thing.
+    ///
+    /// > **`Dissolve` cannot be ported faithfully, because its implementation
+    /// > is not in this tree.** It is
+    /// > `CTriggerPortalCleanser::FizzleBaseAnimating( NULL, this )`, and
+    /// > `CTriggerPortalCleanser` is declared in no header the reference tree
+    /// > ships — three files name it and none defines it. What is known of it
+    /// > is its two callers here and the model the cube precaches for it
+    /// > (`models/props/metal_box_fx_fizzler.mdl`), which says it swaps in a
+    /// > fizzling effect prop before removing the cube.
+    /// >
+    /// > So `Dissolve` is implemented as `SilentDissolve` — the output and the
+    /// > removal, without the effect — which is the part a map can observe
+    /// > through its 63 `OnFizzled` connections. When the cleanser lands, this
+    /// > is the seam to revisit.
+    fn dissolve(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        // `OnFizzled()` — the inline override at `prop_weightedcube.h:82`,
+        // minus its `mp_coop_paint_red_racer` achievement special case, which
+        // calls a VScript.
+        let me = Some(entity.id());
+        entity.fire_output("OnFizzled", Variant::Void, me, me, 0.0, cx);
+        entity.remove();
+    }
+}
+
+impl Behaviour for WeightedCube {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        // Every one of these is a `DEFINE_KEYFIELD` on this class or on
+        // `CPhysicsProp`; the comparison is case-insensitive because a `.bsp`
+        // writes what Hammer wrote and Hammer writes the FGD's spelling.
+        if key.eq_ignore_ascii_case("skin") {
+            self.skin = atoi(value);
+            return true;
+        }
+        if key.eq_ignore_ascii_case("CubeType") {
+            self.cube_type = CubeType::from_int(atoi(value));
+            return true;
+        }
+        if key.eq_ignore_ascii_case("SkinType") {
+            self.rusted = atoi(value) != 0;
+            return true;
+        }
+        if key.eq_ignore_ascii_case("NewSkins") {
+            self.new_skins = atoi(value) != 0;
+            return true;
+        }
+        if key.eq_ignore_ascii_case("PaintPower") {
+            self.pre_painted_power = PaintPower::from_int(atoi(value));
+            return true;
+        }
+        if key.eq_ignore_ascii_case("allowfunnel") {
+            self.allow_portal_funnel = atoi(value) != 0;
+            return true;
+        }
+        false
+    }
+
+    /// `CPropWeightedCube::Spawn` (`:356`), in its own order.
+    ///
+    /// The order is load-bearing in one place: `ConvertOldSkins` runs
+    /// **before** `SetCubeType`, so a map's `skin` key has already become a
+    /// cube type by the time the model is chosen. Swapping the two gives every
+    /// cube in the game the standard model.
+    ///
+    /// Absent, each because the subsystem is: `Precache` (nothing to
+    /// pre-load), `m_nBouncyMaterialIndex` and `SetCollisionGroup` (vphysics),
+    /// `SetInteraction( PROPINTER_PHYSGUN_ALLOW_OVERHEAD )` (the physics gun),
+    /// the Schrodinger think, `g_PortalGameStats`, `VisibilityMonitor_…` (the
+    /// pickup hint) and the two fade calls.
+    fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
+        self.convert_old_skins();
+        self.current_painted_type = PaintPower::None;
+        self.pickup_disabled = false;
+        self.set_cube_type(entity);
+
+        // `CPhysicsProp::Spawn`'s `SOLID_VPHYSICS` and `MOVETYPE_VPHYSICS`.
+        // There is no `MoveType::VPhysics` here and nothing would step it if
+        // there were, so the cube is `None` and hangs where the map put it —
+        // the same thing `prop_floor_button` does with the same solidity, and
+        // for the same reason: `World::clip_models` only ever sees brush
+        // models, so nothing collides with either.
+        entity.solid = Solid::VPhysics;
+        entity.move_type = MoveType::None;
+        SpawnResult::Ok
+    }
+
+    /// `CPropWeightedCube::Activate` (`:395`) and the base's (`:155`).
+    ///
+    /// Two calls, in this order, and the order is the whole of what a map
+    /// sees: `SetPaintedMaterial( m_PrePaintedPower )` first — which fires
+    /// `OnPainted` for any power but `None` — and then `BaseClass::Activate`,
+    /// whose `if ( m_PrePaintedPower != NO_POWER ) Paint( … )` reaches
+    /// `SetPaintedMaterial` a second time with the same value and so fires
+    /// nothing more.
+    ///
+    /// **So the 23 cubes that ship with `PaintPower 3` fire `OnPainted` on
+    /// the first tick of the map**, from an entity nothing has touched. That
+    /// is Valve's, it is what the double call is for, and one shipped
+    /// connection listens (`sp_a3_speed_ramp`'s `@door_box_slide`).
+    fn activate(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        let pre = self.pre_painted_power;
+        self.set_painted_material(entity, pre, cx);
+        if pre != PaintPower::None {
+            self.paint(entity, pre, cx);
+        }
+    }
+
+    fn accept_input(
+        &mut self,
+        entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        let is = |name: &str| input.name.eq_ignore_ascii_case(name);
+
+        // `InputDissolve` (`:884`) and `InputSilentDissolve` (`:892`) — see
+        // `dissolve` for why the two are one here.
+        if is("Dissolve") || is("SilentDissolve") {
+            self.dissolve(entity, cx);
+            return true;
+        }
+        // `InputPreDissolveJoke` (`:901`) — `FindEntityByName( "@glados" )`
+        // and `RunScript( "CoopCubeFizzle()" )`. There is no VScript, so this
+        // is an input that is accepted and does nothing; it is declared rather
+        // than dropped so that a map firing it is not reported as unhandled.
+        if is("PreDissolveJoke") {
+            return true;
+        }
+        if is("DisablePortalFunnel") {
+            self.allow_portal_funnel = false;
+            return true;
+        }
+        if is("EnablePortalFunnel") {
+            self.allow_portal_funnel = true;
+            return true;
+        }
+        // `InputExitDisabledState` (`:1266`) — `ExitDisabledState()`, which
+        // re-enables a reflective cube's motion after the disabled-state
+        // machine froze it. Nothing here can enter that state (it is entered
+        // from a physics touch), so leaving it is a no-op rather than a stub.
+        if is("ExitDisabledState") {
+            return true;
+        }
+        // `InputSetPaint` (`:1333`) — `Paint( in.value.Int(), vec3_origin )`.
+        if is("SetPaint") {
+            let paint = PaintPower::from_int(input.value.int());
+            self.paint(entity, paint, cx);
+            return true;
+        }
+        if is("DisablePickup") {
+            self.pickup_disabled = true;
+            return true;
+        }
+        if is("EnablePickup") {
+            self.pickup_disabled = false;
+            return true;
+        }
+        // `CBaseAnimating`'s `skin` input. Written and then overwritten by the
+        // next `SetCubeSkin`, which is Valve's behaviour and not a shortcut:
+        // nothing in this class re-reads `m_nSkin` before recomputing it.
+        if is("skin") {
+            self.skin = input.value.int();
+            return true;
+        }
+        false
+    }
+
+    /// What the renderer needs to draw the cube.
+    ///
+    /// A cube has no sequence: `CPhysicsProp` is a `CBaseAnimating` that never
+    /// calls `ResetSequence`, so `m_nSequence` stays 0 and `CBaseProp::Spawn`
+    /// leaves the playback rate at **0**. The empty label is what
+    /// [`ModelState`] means by "sequence 0, whatever that is" — the same thing
+    /// a `prop_dynamic` with no `DefaultAnim` sends.
+    fn model_state(&self) -> Option<ModelState<'_>> {
+        Some(ModelState {
+            sequence: "",
+            cycle: 0.0,
+            anim_time: 0.0,
+            playback_rate: 0.0,
+            skin: self.skin,
+        })
+    }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("cube_type", self.cube_type.name().to_owned()),
+            ("rusted", self.rusted.to_string()),
+            ("skin", self.skin.to_string()),
+            ("painted_power", self.painted_power.name().to_owned()),
+            (
+                "pre_painted_power",
+                self.pre_painted_power.name().to_owned(),
+            ),
+            ("allow_portal_funnel", self.allow_portal_funnel.to_string()),
+            ("pickup_disabled", self.pickup_disabled.to_string()),
         ]
     }
 }

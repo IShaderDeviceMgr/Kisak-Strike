@@ -743,16 +743,20 @@ or was changed by the prop. `prop_testchamber_door` then added 2 more instances
 and 1 more model to that map, for **93 entity models from 54 models**, and
 changed nothing here at all — which is the point of the list below.
 
-> **The chamber door is what says the per-bone draw split generalises.** A
-> floor button is two bone runs, one of which moves; a door is **five**, of
-> which three move, and they move in two separate acts — the two spinner rings
-> turn about their own axes over the first 62% of `open`, *inside* the door's
-> own thickness, and only then do the two leaves slide 53 units apart. So the
-> first two thirds of the animation draw pixel-identically from outside and the
-> doorway clears all at once, which is the model rather than the port;
-> `entities::tests::the_chamber_door_draws_and_opens` measures both acts
-> geometrically for that reason, and checks the pixels only where they can say
-> anything.
+> **The chamber door is the model this pass was built against.** A floor
+> button has two bones, one of which moves; a door has **five** with geometry
+> on them, of which three move, and they move in two separate acts — the two
+> spinner rings turn about their own axes over the first 62% of `open`,
+> *inside* the door's own thickness, and only then do the two leaves slide 53
+> units apart. So the first two thirds of the animation draw pixel-identically
+> from outside and the doorway clears all at once, which is the model rather
+> than the port; `entities::tests::the_chamber_door_draws_and_opens` measures
+> both acts geometrically for that reason, and checks the pixels only where
+> they can say anything.
+>
+> Until skinning landed a door was also **five draws**, one per bone run,
+> because the port split a batch's triangles by bone instead of skinning them.
+> It is one now.
 
 Seven things about it are worth knowing.
 
@@ -4811,7 +4815,13 @@ number: it added 2 batches and 1,408 triangles to a frame whose cost is 1,080 pr
 sub-benchmarks are now 0.25 ms of world brushes, 0.10 of brush models, 1.01 of static
 props and **0.72 of entity models**, so the class costs about 60% of what all 1,080
 static props do — for 91 instances, because they carry **355,469 triangles against the
-props' 224,924** and each bone run is its own draw.
+props' 224,924** and each bone run was its own draw.
+**Skinning then took the bone runs away** and the pass got cheaper for it: an A/B of
+`frame_cost`, each run on its own, reads `entity models` **0.14 ms before and 0.12
+after**, with `everything` 0.35 against 0.36 — a batch that was one draw per bone is now
+one draw, and the 16 bytes per vertex the weights added did not show up. `sp_a1_intro1`'s
+93 entity models include **7 skinned** ones, the `models/container_ride/finedebris_part*`
+set, which were drawn in their bind pose before.
 **`prop_testchamber_door` barely moved it**, and the exact numbers are the ones to
 quote rather than the timings: 91 instances became 93, 52 models 54, and 355,469
 triangles **361,072** — one more model and ten more draws, because a door is five bone
@@ -4869,7 +4879,7 @@ second is A/B/A, not A/B.
 > map — the numbers to re-measure after a change to the draw path or the entity
 > list, and the three materials that still do not resolve.
 
-There is a unit test suite (`cargo test`, 1,032 tests, plus 34 depot-gated), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 1,092 tests, plus 38 depot-gated), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and

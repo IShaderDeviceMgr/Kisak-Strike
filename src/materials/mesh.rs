@@ -337,14 +337,44 @@ pub struct ModelVertex {
     /// zero mirrors every bumped surface's lighting along the V axis; the
     /// `.vvd` stores ±1 and nothing else should be written here.
     pub tangent: [f32; 4],
+
+    /// `vBoneWeights`: how much of each of [`bone_indices`] moves this vertex,
+    /// summing to 1.
+    ///
+    /// `mstudioboneweight_t::weight[3]` straight through. Three and not four:
+    /// `MAX_NUM_BONES_PER_VERT` is 3 (`studio.h:87`), which is the format's
+    /// limit and not a choice made here.
+    ///
+    /// **`[1, 0, 0]` is the neutral value**, not `[0, 0, 0]` — a vertex with
+    /// no weights at all blends nothing and collapses to the origin. See
+    /// [`ModelVertex::new`], which is what a caller that has no skeleton gets.
+    ///
+    /// [`bone_indices`]: ModelVertex::bone_indices
+    pub bone_weights: [f32; 3],
+
+    /// `vBoneIndices`: which bones those weights name, as indices into the
+    /// draw's palette.
+    ///
+    /// Four slots for three bones, because the vertex format's smallest
+    /// integer vector is four wide; the fourth is always zero and is never
+    /// read. `u8` is exact rather than tight: `mstudioboneweight_t::bone` is a
+    /// `byte` and `MAXSTUDIOBONES` is 256 (`studio.h:77,1438`), so an index
+    /// that does not fit in a `u8` is a file this reader has already refused.
+    pub bone_indices: [u8; 4],
 }
 
 impl ModelVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x2,
         3 => Float32x4,
+        // Locations 4 is the second stream's — see `StaticLightVertex` — so
+        // the skinning pair carries on from 5. The macro lays these out in
+        // declaration order, which is why the struct above must stay in this
+        // order too.
+        5 => Float32x3,
+        6 => Uint8x4,
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -362,6 +392,12 @@ impl ModelVertex {
             normal,
             texcoord,
             tangent: [1.0, 0.0, 0.0, 1.0],
+            // Wholly on bone 0. A caller building a vertex by hand has no
+            // skeleton, and a draw with no palette bound does not read these
+            // at all — but a zero weight vector would put the vertex at the
+            // origin the moment one was, so the neutral value is spelled out.
+            bone_weights: [1.0, 0.0, 0.0],
+            bone_indices: [0; 4],
         }
     }
 }

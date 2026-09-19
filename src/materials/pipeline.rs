@@ -366,7 +366,7 @@ impl BindLayouts {
     pub fn new(device: &wgpu::Device) -> BindLayouts {
         BindLayouts {
             frame: uniform_layout(device, "frame"),
-            draw: uniform_layout(device, "draw"),
+            draw: draw_layout(device),
             unlit_material: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("material: UnlitGeneric"),
                 entries: &[
@@ -723,6 +723,55 @@ const fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     }
+}
+
+/// Group 2's layout: the per-draw block, and the bone palette it indexes.
+///
+/// Binding 0 is [`uniform_layout`]'s dynamic-offset uniform. Binding 1 is the
+/// bone palette — a **read-only storage buffer bound whole**, which
+/// [`DrawUniforms::skinning`](super::uniforms::DrawUniforms::skinning)
+/// indexes by row.
+///
+/// # Why it is declared for every shader and not just the model ones
+///
+/// Group 2's layout is shared by every pipeline (`pipeline_layout` names
+/// `layouts.draw` unconditionally), so a world surface's pipeline declares the
+/// palette as well and never reads it. Making it conditional would mean two
+/// group-2 layouts, two arenas to bind them and a rule about which shader gets
+/// which — to save one bind-group entry that costs nothing when unread.
+///
+/// Vertex-stage only. Nothing skins in a fragment shader, and WebGPU allows a
+/// writable storage buffer in no vertex stage at all — read-only is the form
+/// that works in the stage that wants it.
+fn draw_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("draw"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    // Bound whole rather than by a dynamic offset: see
+                    // `DrawUniforms::skinning` for why a palette cannot have a
+                    // fixed stride.
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
 }
 
 /// A layout holding one uniform buffer at binding 0, visible to both stages,

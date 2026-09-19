@@ -45,12 +45,6 @@ pub struct PropBatch {
     pub material: Arc<Material>,
     pub first_index: u32,
     pub index_count: u32,
-    /// The same indices, split into contiguous runs by the bone that moves
-    /// them — [`studio::BoneRun`], carried through unchanged.
-    ///
-    /// One run under bone 0 for a model with one bone, which is every static
-    /// prop in the game, so the static path can ignore this and does.
-    pub bones: Vec<crate::studio::BoneRun>,
 }
 
 /// One distinct model, uploaded once and drawn by every instance of it.
@@ -207,7 +201,7 @@ impl PropModel {
     pub fn upload(device: &wgpu::Device, model: StudioModel, batches: Vec<PropBatch>) -> PropModel {
         // See the module docs: the file's winding is the reverse of what this
         // port's `front_face` names. Reversing each triangle **in place**
-        // leaves every batch's and every bone run's index range where it was.
+        // leaves every batch's index range where it was.
         let mut indices = model.indices.clone();
         for triangle in indices.chunks_exact_mut(3) {
             triangle.swap(0, 2);
@@ -332,7 +326,6 @@ impl PropModels {
                             material,
                             first_index: batch.first_index,
                             index_count: batch.index_count,
-                            bones: batch.bones.clone(),
                         }
                     })
                     .collect();

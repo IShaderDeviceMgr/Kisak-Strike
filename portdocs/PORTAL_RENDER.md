@@ -438,8 +438,9 @@ all, and it is still never drawn.
   twice, the second time by a "ghost" renderable transformed through the matrix,
   so that the half sticking out of the far side is visible. The player is the
   only thing that can be in a portal here and the player has no drawn model.
-  **Reversed by:** `prop_weighted_cube`, which is also what
-  `prop_floor_cube_button` and the entity teleport are waiting on.
+  **Reversed by:** a cube that *moves* — `prop_weighted_cube` has landed but has
+  no vphysics, so what this and `prop_floor_cube_button` and the entity teleport
+  are all waiting on is `MOVETYPE_VPHYSICS`.
 
 - **The 3D skybox through a portal** (`Draw3dSkyboxworld_Portal`,
   `IsSkyboxVisibleFromExitPortal`). There is no skybox yet. When there is,

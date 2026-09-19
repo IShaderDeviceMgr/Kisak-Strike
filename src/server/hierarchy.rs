@@ -244,8 +244,9 @@ pub fn propagate_id(id: EntityId, entities: &mut EntityList, poser: Poser<'_>) {
 /// Almost every child takes the parent's own transform and the whole function
 /// is one copy. The attachment path is the exception, and it **caches by
 /// attachment index** because posing a skeleton is the expensive half and a
-/// Hammer instance parents its whole clip set to the same point — 883 of the
-/// game's `func_brush`es arrive through one input name on a handful of arms.
+/// Hammer instance parents its whole clip set to the same point — 903 of the
+/// game's 1,037 resolvable attachment connections name a `func_brush`, and
+/// they arrive through one input name on a handful of arms.
 fn frames_for(
     entity_to_world: Affine3A,
     posed: Option<Posed<'_>>,

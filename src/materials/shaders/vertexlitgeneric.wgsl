@@ -206,16 +206,20 @@ struct VertexOutput {
 fn vs_main(vertex: ModelVertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    let world = world_position(vertex.position);
-    // The upper 3x3 of the model matrix, which is what `SkinPositionAndNormal`
-    // applies (`common_vs_fxc.h:200`) — a bone transform, so rigid, so no
-    // inverse transpose. A model matrix with non-uniform scale would bend
-    // these; nothing produces one, and the day something does this is where it
-    // shows up.
+    // The pose this vertex rides, with the entity's placement already folded
+    // in — `draw.model` alone when the draw is not skinned. See
+    // `skin_model_matrix` in the prelude.
+    let model = skin_model_matrix(vertex.bone_weights, vertex.bone_indices);
+    let world = (model * vec4<f32>(vertex.position, 1.0)).xyz;
+    // The upper 3x3 of that matrix, which is what `SkinPositionAndNormal`
+    // applies (`common_vs_fxc.h:200`) — a placement times a blend of bone
+    // transforms, all rigid, so no inverse transpose. A model matrix with
+    // non-uniform scale would bend these; nothing produces one, and the day
+    // something does this is where it shows up.
     let normal_matrix = mat3x3<f32>(
-        draw.model[0].xyz,
-        draw.model[1].xyz,
-        draw.model[2].xyz,
+        model[0].xyz,
+        model[1].xyz,
+        model[2].xyz,
     );
     let world_normal = normalize(normal_matrix * vertex.normal);
     let world_tangent = normalize(normal_matrix * vertex.tangent.xyz);

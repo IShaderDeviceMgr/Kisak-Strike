@@ -1061,13 +1061,14 @@ Valve's register map is really a *frequency* map, and that frequency is the bind
 |---|---|---|---|
 | 0 | `FrameUniforms` | once a frame | VS `c2`, `c8..c11`, `c16`; PS `c29`, `c30`, `c32` |
 | 1 | the shader's own block, plus its textures and samplers | once a material | the shader-specific block |
-| 2 | `DrawUniforms` | once a draw | VS `c4..c7`, `c47` |
+| 2 | `DrawUniforms`, **and the bone palette it indexes** | once a draw | VS `c4..c7`, `c47`; `cModel[0..53]` |
 | 3 | *the render-context state this shader reads* — see below | once a batch, once a model, or once a pass | PS `s1` (`TEXTURE_LIGHTMAP`), PS `s2` (`TEXTURE_FRAME_BUFFER_FULL_TEXTURE_0`); VS `c21..c26` + `c27..c46` |
 
 <a id="portaloverlay"></a>
 
 **Group 3 is whichever piece of per-shader state the shader reads**, not skinning as
-stage 4 reserved it for. It has four shapes:
+stage 4 reserved it for — skinning landed in group 2, beside the draw block whose rate it
+shares. It has four shapes:
 
 ```rust
 pub enum ContextBinding { LightmapPage, ModelLighting, FrameBufferCopy, PortalOverlay }
@@ -1137,7 +1138,13 @@ pub struct FrameUniforms {
 pub struct DrawUniforms {
     pub model: ColumnMajor,
     pub modulation: [f32; 4],               // cModulationColor
+    pub skinning: [u32; 4],                 // x = first palette row, y = bSkinning
 }
+
+pub const BONE_ROWS: usize = 3;             // a matrix3x4_t is three rows
+/// One bone matrix as the palette holds it: three ROWS of four, which is the
+/// one transpose in the skinning path. See "The bone palette" below.
+pub fn bone_rows(matrix: Mat4) -> [[f32; 4]; BONE_ROWS];
 
 pub const MAX_LIGHTS: usize = 4;            // MATERIAL_MAX_LIGHT_COUNT
 pub const AMBIENT_CUBE_FACES: usize = 6;
@@ -1347,11 +1354,13 @@ pub struct WorldVertex {
 impl WorldVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> WorldVertex; }
 
 #[repr(C)]
-pub struct ModelVertex {
+pub struct ModelVertex {                       // 64 bytes
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub texcoord: [f32; 2],
     pub tangent: [f32; 4],            // xyz tangent S, w the binormal's sign
+    pub bone_weights: [f32; 3],       // mstudioboneweight_t; NEUTRAL IS [1,0,0]
+    pub bone_indices: [u8; 4],        // three bones, one slot of padding
 }
 impl ModelVertex {
     pub const fn new(position: [f32; 3], normal: [f32; 3], texcoord: [f32; 2]) -> ModelVertex;
@@ -1661,6 +1670,60 @@ far, then keeps the staged bytes and the slot counter, so an offset handed out e
 still names the same block — which is what lets `push_model_lighting` take a batch of
 slots up front and draw with them later.
 
+<a id="the-bone-palette"></a>
+
+### The bone palette — the one per-draw block that is not a slot
+
+Skinning needs a matrix per bone per draw, and that is the one shape the arena above
+cannot hold: a slot has a **fixed stride**, and a palette's stride would have to be the
+worst case. `MAXSTUDIOBONES` is 256 (`studio.h:77`) and
+`models/container_ride/finedebris_part12` really does use 248 of them, so the stride
+would be 12,288 bytes — paid by a three-bone door as well, at one copy per draw, on a map
+that draws 1,080 props.
+
+So the palette is **a read-only storage buffer at group 2 binding 1, bound whole**, and
+`DrawUniforms::skinning` carries the row it starts at:
+
+```rust
+impl Pass<'_> {
+    /// One matrix per bone, in MODEL space — `studio::anim::pose`'s output.
+    /// Pass state, like `set_model_lighting`: a model is one pose and many
+    /// meshes. An empty slice is `clear_bones`.
+    pub fn set_bones(&mut self, bones: &[Mat4]);
+    /// Back to placing the vertex by the draw's model matrix alone.
+    pub fn clear_bones(&mut self);
+}
+```
+
+Four things about it are worth knowing before touching it:
+
+- **The placement is not in the palette.** `DrawUniforms::model` stays the entity's
+  transform and the shader computes `draw.model * blend`. Folding the placement into
+  every bone would mean rewriting the whole skeleton whenever a prop moved without
+  animating, which is most of what moves.
+- **`bSkinning` is Valve's, and it is why there is no identity palette.**
+  `skinning.y == 0` leaves the palette unread, so a static prop, a preview cube and every
+  world surface cost nothing — the binding is still bound, because the layout declares it
+  for every pipeline, and nothing reads it.
+- **`bone_rows` is the one transpose in the path.** The shader reads a *row* at a time and
+  `dot`s it against the vertex, which is `mul4x3`'s shape and the reason three rows fit
+  where four columns would not. Written column-wise the translation lands in the fourth
+  row — the row that is never uploaded — and the model collapses onto a point.
+- **The palette lives inside the group-2 arena** rather than beside it, because the two
+  share one bind group and a bind group has to be rebuilt when either buffer is replaced.
+  It grows by the same rule and with the same trick: flush before the swap, keep the
+  staged rows, so a base row handed out before a growth still means the same thing after.
+  `a_palette_that_outgrows_its_buffer_keeps_the_poses_already_recorded` is the regression
+  test, and it forces a growth *mid-pass* with a draw already recorded.
+
+`INITIAL_BONE_ROWS` is 8,192 — 128 KiB, 2,730 bones — sized off a *pose* rather than off a
+model: a draw costs its own bone count and nothing more.
+
+**It cost nothing measurable.** `frame_cost` A/B on `sp_a1_intro1`, each run on its own:
+`everything` 0.35 ms before and 0.36 after, `entity models` **0.14 before and 0.12
+after** — the entity pass got *cheaper*, because a batch that used to be one draw per bone
+run is now one draw. The 16 bytes skinning added to every model vertex did not show up.
+
 ### Redundant state is elided
 
 `Pass` remembers the pipeline, bind groups 0, 1 and 3, and both vertex buffers and the
@@ -1736,6 +1799,10 @@ pub fn bind_lightmap_page(&mut self, page: &LightmapPage);
 pub fn set_model_lighting(&mut self, lighting: &ModelLighting);
 pub fn push_model_lighting(&mut self, lighting: &ModelLighting) -> LightingSlot;
 pub fn set_model_lighting_slot(&mut self, slot: LightingSlot);
+/// The pose every subsequent model draw is skinned by, in MODEL space —
+/// `studio::anim::pose`'s output. See "The bone palette".
+pub fn set_bones(&mut self, bones: &[Mat4]);
+pub fn clear_bones(&mut self);
 pub fn set_portal_overlay(&mut self, overlay: &PortalOverlay);
 pub fn target_format(&self) -> TargetFormat;
 ```
@@ -2561,13 +2628,14 @@ error material. Measured against the mounted game by
   Every one is a combo pinned off in the bucketing, and four of the pins are content
   measurements rather than capability ones: **no Portal 2 material sets
   `$compress`/`$stretch`, `$decaltexture`, `$tintmasktexture` or `$rimmask`.**
-- **Skinning and morphing.** `ModelVertex` has no bone weights or indices, and
-  `SkinPositionAndNormal` is replaced by the per-draw model matrix — which is what an
-  unskinned draw did anyway, through `cModel[0]`. This is what makes group 3's "skinning"
-  reservation from stage 4 land somewhere else.
+- **Morphing.** `ApplyMorph` and the GPU morph accumulator. Skinning has landed (see
+  "The bone palette" above); morphing is the other half of `common_vs_fxc.h` that was
+  deferred with it, and it needs flex data the `.vtx` reader refuses.
 - **Vertex compression** (`VERTEX_FORMAT_COMPRESSED`, packed normals and bone weights).
-  Still open, and answered *with* skinning: the shaders unpack what the vertex format
-  packs, so the two halves are one decision.
+  Still open. Skinning landed *uncompressed* — three `f32` weights and four `u8` indices,
+  16 bytes on top of a 48-byte vertex — because the exact form is easier to verify and
+  the bandwidth is not a measured problem: the A/B below moved no benchmark. The trigger
+  is a frame where model vertex fetch shows up.
 - **32-bit indices.** `MATERIAL_INDEX_FORMAT_32BIT` exists in the enum but nothing in the
   engine's draw paths asks for it — a batch is bounded by `GetMaxIndicesToRender` long
   before it reaches 65,536 vertices.

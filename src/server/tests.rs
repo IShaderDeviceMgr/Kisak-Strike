@@ -2392,6 +2392,295 @@ fn a_movelinear_measures_its_ends_from_where_it_was_drawn() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// prop_weighted_cube
+// ---------------------------------------------------------------------------
+
+/// A cube, and whatever is worth reading back off it.
+fn cube<'a>(server: &'a Server, name: &str) -> &'a classes::WeightedCube {
+    find_named(server, name)
+        .behaviour
+        .downcast_ref::<classes::WeightedCube>()
+        .expect("a WeightedCube")
+}
+
+fn cube_map(pairs: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut keys: Vec<(&str, &str)> = vec![
+        ("classname", "prop_weighted_cube"),
+        ("targetname", "cube"),
+        ("origin", "0 0 0"),
+    ];
+    keys.extend_from_slice(pairs);
+    vec![block(&keys)]
+}
+
+/// **The `skin` key is a cube *type*, not a skin**, and that is the single
+/// most surprising thing about this class.
+///
+/// `ConvertOldSkins`' table, every row of it, including the two that collide:
+/// the old list had a "Standard Activated" entry at 2 that the type list does
+/// not, so everything from 2 up shifts down one and skins 1 and 2 both mean
+/// "companion". Getting the decrement wrong gives 70 of the game's 98 cubes
+/// the wrong model, and gives it to them *plausibly* — every value still maps
+/// to some real cube.
+#[test]
+fn an_old_skin_key_is_read_as_a_cube_type_and_shifted() {
+    // (skin, expected model, expected recomputed skin)
+    let cases = [
+        (0, "models/props/metal_box.mdl", 0),
+        (1, "models/props/metal_box.mdl", 1),
+        // The collision: 2 is "Standard Activated" in the old list and becomes
+        // a companion cube, exactly as 1 does.
+        (2, "models/props/metal_box.mdl", 1),
+        (3, "models/props/reflection_cube.mdl", 0),
+        (4, "models/props_gameplay/mp_ball.mdl", 0),
+        (5, "models/props_underground/underground_weighted_cube.mdl", 0),
+    ];
+    for (skin, model, recomputed) in cases {
+        let mut server = Server::new();
+        server.level_init("test", &cube_map(&[("skin", &skin.to_string())]), &[]);
+        let entity = find_named(&server, "cube");
+        assert_eq!(
+            entity.core.model.as_deref(),
+            Some(model),
+            "skin {skin} chose the wrong model"
+        );
+        // …and the key it came from is *gone*: the skin is recomputed from the
+        // type, so a cube that shipped with `skin 3` draws with skin 0.
+        assert_eq!(
+            cube(&server, "cube").skin,
+            recomputed,
+            "skin {skin} was not recomputed"
+        );
+    }
+}
+
+/// `NewSkins 1` takes `CubeType` instead, and then `skin` really is ignored.
+#[test]
+fn new_skins_takes_the_cube_type_key_and_leaves_the_skin_key_alone() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &cube_map(&[("NewSkins", "1"), ("CubeType", "3"), ("skin", "5")]),
+        &[],
+    );
+    // `CubeType 3` is a sphere. The `skin 5` would have been an antique cube
+    // had `ConvertOldSkins` run, so this distinguishes the two paths.
+    assert_eq!(
+        find_named(&server, "cube").core.model.as_deref(),
+        Some("models/props_gameplay/mp_ball.mdl")
+    );
+    assert_eq!(cube(&server, "cube").cube_type, classes::prop::CubeType::Sphere);
+}
+
+/// The skin ladder, on the four combinations a shipped map can actually
+/// produce — `SetCubeSkin`'s `default` arms, because no shipped cube is
+/// bounce- or speed-painted and nothing here can set `m_bActivated`.
+#[test]
+fn the_skin_comes_from_the_type_and_the_rust_flag() {
+    // (CubeType, SkinType, expected skin)
+    let cases = [
+        (0, 0, 0),
+        // "Rusted cubes don't show paint" — the standard cube is the only one
+        // that reads the flag outside the paint switch.
+        (0, 1, 3),
+        (1, 0, 1),
+        // The companion cube has no rusted skin at all: the flag is not read
+        // on its arm, so it stays 1.
+        (1, 1, 1),
+        (2, 0, 0),
+        // …but the reflective cube does read it, in its unpainted arm.
+        (2, 1, 1),
+        (3, 0, 0),
+        (4, 0, 0),
+    ];
+    for (cube_type, skin_type, expected) in cases {
+        let mut server = Server::new();
+        server.level_init(
+            "test",
+            &cube_map(&[
+                ("NewSkins", "1"),
+                ("CubeType", &cube_type.to_string()),
+                ("SkinType", &skin_type.to_string()),
+            ]),
+            &[],
+        );
+        assert_eq!(
+            cube(&server, "cube").skin,
+            expected,
+            "CubeType {cube_type} SkinType {skin_type}"
+        );
+    }
+}
+
+/// `SetPaint` repaints, and the skin follows — the paint arms of the ladder,
+/// which no shipped map reaches but the input does.
+#[test]
+fn painting_a_cube_changes_its_skin_and_fires_onpainted_once() {
+    let map = vec![
+        block(&[
+            ("classname", "prop_weighted_cube"),
+            ("targetname", "cube"),
+            ("origin", "0 0 0"),
+            ("NewSkins", "1"),
+            ("CubeType", "0"),
+            ("OnPainted", &conn("painted", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "painted"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    let id = find_named(&server, "cube").id();
+    assert_eq!(cube(&server, "cube").skin, 0);
+    assert_eq!(counter_value(&server, "painted"), 0.0, "not painted yet");
+
+    // `BOUNCE_POWER` — `CUBE_STANDARD_BOUNCE_SKIN`.
+    server.accept_input(id, "SetPaint", Variant::Int(0), None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(cube(&server, "cube").skin, 6);
+    assert_eq!(counter_value(&server, "painted"), 1.0);
+
+    // **Painting it the colour it already is fires nothing** — the guard at
+    // the top of `SetPaintedMaterial` compares before it assigns.
+    server.accept_input(id, "SetPaint", Variant::Int(0), None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(counter_value(&server, "painted"), 1.0, "a repeat is not a change");
+
+    // `SPEED_POWER`, which is a change and does fire.
+    server.accept_input(id, "SetPaint", Variant::Int(2), None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(cube(&server, "cube").skin, 7);
+    assert_eq!(counter_value(&server, "painted"), 2.0);
+
+    // …and `NO_POWER` never fires, whatever it is changing from.
+    server.accept_input(id, "SetPaint", Variant::Int(4), None, None, 0);
+    run(&mut server, 0.02);
+    assert_eq!(cube(&server, "cube").skin, 0, "back to the clean skin");
+    assert_eq!(counter_value(&server, "painted"), 2.0, "NO_POWER is not a paint");
+}
+
+/// **A cube that ships pre-painted fires `OnPainted` on the first tick**, from
+/// an entity nothing has touched.
+///
+/// That is `CPropWeightedCube::Activate` calling `SetPaintedMaterial` and
+/// *then* `BaseClass::Activate`, which paints again — the first call is the
+/// change and fires, the second is a repeat and does not. 23 of the game's 98
+/// cubes ship with `PaintPower 3` and reach exactly this.
+#[test]
+fn a_cube_with_a_prepainted_power_fires_onpainted_when_the_map_starts() {
+    let map = vec![
+        block(&[
+            ("classname", "prop_weighted_cube"),
+            ("targetname", "cube"),
+            ("origin", "0 0 0"),
+            // `PORTAL_POWER`, which is what those 23 write.
+            ("PaintPower", "3"),
+            ("OnPainted", &conn("painted", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "math_counter"),
+            ("targetname", "painted"),
+            ("max", "10"),
+        ]),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    run(&mut server, 0.05);
+    assert_eq!(counter_value(&server, "painted"), 1.0, "once, not twice");
+    // `PORTAL_POWER` takes `SetCubeSkin`'s `default` arm, so the skin is the
+    // clean one despite the cube being painted — which is why all 98 shipped
+    // cubes end up on one of four skins.
+    assert_eq!(cube(&server, "cube").skin, 0);
+    assert_eq!(
+        cube(&server, "cube").painted_power,
+        classes::prop::PaintPower::Portal
+    );
+}
+
+/// Both dissolve inputs fire `OnFizzled` and remove the cube.
+///
+/// 63 shipped connections listen to `OnFizzled`, nearly all of them a dropper
+/// being told to make another cube — so this is the one thing a map does with
+/// a cube that this port can carry through end to end.
+#[test]
+fn dissolving_a_cube_fires_onfizzled_and_removes_it() {
+    for input in ["Dissolve", "SilentDissolve"] {
+        let map = vec![
+            block(&[
+                ("classname", "prop_weighted_cube"),
+                ("targetname", "cube"),
+                ("origin", "0 0 0"),
+                ("OnFizzled", &conn("fizzled", "Add", "1", "0", "-1")),
+            ]),
+            block(&[
+                ("classname", "math_counter"),
+                ("targetname", "fizzled"),
+                ("max", "10"),
+            ]),
+        ];
+        let mut server = Server::new();
+        server.level_init("test", &map, &[]);
+        let id = find_named(&server, "cube").id();
+
+        server.accept_input(id, input, Variant::Void, None, None, 0);
+        run(&mut server, 0.05);
+        assert_eq!(counter_value(&server, "fizzled"), 1.0, "{input}");
+        assert!(
+            server.entities.get(id).is_none(),
+            "{input} left the cube alive"
+        );
+    }
+}
+
+/// The four flags that are parsed, kept and toggled but that nothing in this
+/// port reads — recorded as behaviour so that the day something does read one,
+/// the plumbing is already known to work.
+#[test]
+fn the_funnel_and_pickup_flags_are_kept_and_toggled() {
+    let mut server = Server::new();
+    server.level_init("test", &cube_map(&[("allowfunnel", "0")]), &[]);
+    let id = find_named(&server, "cube").id();
+    assert!(!cube(&server, "cube").allow_portal_funnel, "the key is read");
+    assert!(!cube(&server, "cube").pickup_disabled, "Spawn clears it");
+
+    server.accept_input(id, "EnablePortalFunnel", Variant::Void, None, None, 0);
+    server.accept_input(id, "DisablePickup", Variant::Void, None, None, 0);
+    run(&mut server, 0.02);
+    assert!(cube(&server, "cube").allow_portal_funnel);
+    assert!(cube(&server, "cube").pickup_disabled);
+
+    server.accept_input(id, "DisablePortalFunnel", Variant::Void, None, None, 0);
+    server.accept_input(id, "EnablePickup", Variant::Void, None, None, 0);
+    run(&mut server, 0.02);
+    assert!(!cube(&server, "cube").allow_portal_funnel);
+    assert!(!cube(&server, "cube").pickup_disabled);
+}
+
+/// `SetCubeType`'s opening line makes the Schrodinger cube a reflective one,
+/// under a `FIXME` that was never acted on — so the twin-linking arm below it
+/// is dead code in the shipped game, and this is what says so.
+#[test]
+fn a_schrodinger_cube_is_remapped_to_a_reflective_one() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &cube_map(&[("NewSkins", "1"), ("CubeType", "5")]),
+        &[],
+    );
+    assert_eq!(
+        cube(&server, "cube").cube_type,
+        classes::prop::CubeType::Reflective
+    );
+    assert_eq!(
+        find_named(&server, "cube").core.model.as_deref(),
+        Some("models/props/reflection_cube.mdl")
+    );
+}
+
 /// A button goes in, fires `OnIn`, waits on the **think** schedule, comes back
 /// out and fires `OnOut` — the full cycle, and the one class here that uses a
 /// think rather than the alarm for its wait.
@@ -2957,6 +3246,7 @@ fn every_shipped_map_spawns_its_entities() {
     let mut total = LevelStats::default();
     let mut io = IoStats::default();
     let mut per_class: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut cube_skins: BTreeMap<(String, i32), usize> = BTreeMap::new();
     let mut named_lights = 0;
     let mut maps_with_a_master = 0;
     let mut custom_max = 0;
@@ -3007,6 +3297,20 @@ fn every_shipped_map_spawns_its_entities() {
 
         for (_, entity) in server.entities.iter() {
             *per_class.entry(entity.classname()).or_default() += 1;
+            // What every shipped cube ends up wearing, after `ConvertOldSkins`
+            // has turned its `skin` key into a type and `SetCubeSkin` has
+            // computed a fresh skin from that. See `WeightedCube`.
+            if let Some(cube) = entity
+                .behaviour
+                .downcast_ref::<classes::prop::WeightedCube>()
+            {
+                *cube_skins
+                    .entry((
+                        entity.core.model.clone().unwrap_or_default(),
+                        cube.skin,
+                    ))
+                    .or_default() += 1;
+            }
             if entity.classname().starts_with("light") {
                 assert!(
                     entity.name.is_some(),
@@ -3232,8 +3536,12 @@ fn every_shipped_map_spawns_its_entities() {
     // `SetFadeStartDistance` and 43 `SetFadeEndDistance`) rather than being
     // declared and ignored: the distance fade is not ported, and an input
     // that is accepted and does nothing is worse than one that is reported.
-    assert_eq!(total.matched, 35_232);
-    assert_eq!(total.spawned, 28_360);
+    //
+    // **+98 for `prop_weighted_cube`**, across 59 maps — the first
+    // `CPhysicsProp` here, and one whose simulation is entirely absent while
+    // its map-facing half is not.
+    assert_eq!(total.matched, 35_330);
+    assert_eq!(total.spawned, 28_458);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3246,13 +3554,20 @@ fn every_shipped_map_spawns_its_entities() {
     // surface in the shipped game: `sp_a1_intro1`'s
     // `portal_red_0.OnPlayerTeleportFromMe`. The other four outputs the class
     // declares are connected by no map.
-    assert_eq!(total.outputs, 54_535);
+    // **+96 for the cubes**: 63 `OnFizzled`, 22 `OnUser1`, 7 `OnPlayerPickup`
+    // and one each of `OnBluePickUp`, `OnOrangePickUp`, `OnPainted` and
+    // `OnPhysGunDrop`. Four of those names are pickup outputs the port cannot
+    // fire; they are declared so the connection parses as an output rather
+    // than as an unknown key. See `WEIGHTED_CUBE_OUTPUTS`.
+    assert_eq!(total.outputs, 54_631);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
     // **-2 and -409 again** for the two areaportal classnames, both of which
     // every map that has them places.
-    assert_eq!(total.unknown.len(), 157);
-    assert_eq!(total.unknown.values().sum::<usize>(), 25_693);
+    // **-1 classname and -98 occurrences** for `prop_weighted_cube`, which
+    // every map that has cubes places.
+    assert_eq!(total.unknown.len(), 156);
+    assert_eq!(total.unknown.values().sum::<usize>(), 25_595);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3328,6 +3643,46 @@ fn every_shipped_map_spawns_its_entities() {
     );
     assert_eq!(per_class.get("prop_dynamic_glow"), None);
     assert_eq!(per_class.get("trigger_portal_button"), Some(&65));
+    // 98 across 59 maps, one of them on `sp_a1_intro1`. Every one of them is
+    // drawn, and none of them falls.
+    assert_eq!(per_class.get("prop_weighted_cube"), Some(&98));
+    println!("  what each shipped cube ends up wearing:");
+    for ((model, skin), count) in &cube_skins {
+        println!("    {count:>4}  {model} skin {skin}");
+    }
+    // **The whole of what the shipped maps can produce**, and the measurement
+    // behind two claims. First, that `ConvertOldSkins` is doing its job: the
+    // four distinct models are the four cube types the maps actually place,
+    // and 77 of the 98 got there from a `skin` key rather than a `CubeType`.
+    // Second, the size of the skin-family gap — **15 of the 98 end on a
+    // non-zero skin** (5 companion, 8 rusted standard, 2 rusted reflective)
+    // and the renderer draws skin 0 for all of them, because `.mdl`'s skin
+    // table is not read yet. One of the 15 is on `sp_a1_intro1`.
+    assert_eq!(
+        cube_skins
+            .iter()
+            .map(|((m, s), n)| (m.as_str(), *s, *n))
+            .collect::<Vec<_>>(),
+        vec![
+            ("models/props/metal_box.mdl", 0, 31),
+            ("models/props/metal_box.mdl", 1, 5),
+            ("models/props/metal_box.mdl", 3, 8),
+            ("models/props/reflection_cube.mdl", 0, 24),
+            ("models/props/reflection_cube.mdl", 1, 2),
+            ("models/props_gameplay/mp_ball.mdl", 0, 14),
+            ("models/props_underground/underground_weighted_cube.mdl", 0, 14),
+        ],
+        "what the shipped cubes wear has changed"
+    );
+    assert_eq!(
+        cube_skins
+            .iter()
+            .filter(|((_, skin), _)| *skin != 0)
+            .map(|(_, n)| n)
+            .sum::<usize>(),
+        15,
+        "cubes whose skin the renderer cannot yet draw"
+    );
     // `portdocs/PORTAL.md` stage 2. 21 across 10 maps, two of them on
     // `sp_a1_intro1` — the map this port loads by default, which makes this
     // the rare class whose test bed is already on screen.
@@ -3368,7 +3723,12 @@ fn every_shipped_map_spawns_its_entities() {
     // back, so a declared input that ran and declined is *handled*. This test
     // therefore measures that they are reached; what they do with a model in
     // hand is `every_shipped_attachment_connection_puts_its_entity_on_a_bone`.
-    assert_eq!(io.accepted, 5_037);
+    //
+    // **+5 with `prop_weighted_cube`**, and that is the whole of what the
+    // shipped maps fire at a cube inside two seconds. A cube is scenery that
+    // is acted on late — its 63 `OnFizzled` connections are *outputs*, and
+    // what fires its inputs is a dropper or a fizzler the player has to reach.
+    assert_eq!(io.accepted, 5_042);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3383,7 +3743,11 @@ fn every_shipped_map_spawns_its_entities() {
     // at all; now they find 203 windows that do not implement the distance
     // fade. The 86 moved from `no_target` to `unhandled`, which is the list
     // below.
-    assert_eq!(io.no_target, 1_036);
+    //
+    // **-11 with `prop_weighted_cube`**: six more events than the five
+    // accepted above now find a cube, and are refused by it rather than
+    // finding nothing — they are on the unhandled list below.
+    assert_eq!(io.no_target, 1_025);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -3404,6 +3768,12 @@ fn every_shipped_map_spawns_its_entities() {
     // Three of the remaining names are the player procedurals (stage 5's), one
     // is `RunScriptCode` (`portdocs/SERVER.md` §9), and
     // `prop_dynamic.Disabled` is eight connections misspelling `Disable`.
+    //
+    // **`prop_weighted_cube` added two names and six occurrences, and both
+    // belong here rather than in the class.** `EnableMotion` is
+    // `CPhysicsProp`'s and there is no motion to enable; `AddOutput` is
+    // `CBaseEntity`'s and no class in the port implements it. Declaring either
+    // would make it accepted and inert, which this list exists to avoid.
     let unhandled: Vec<(&str, usize)> =
         io.unhandled.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_eq!(
@@ -3422,6 +3792,8 @@ fn every_shipped_map_spawns_its_entities() {
             ("logic_relay.RunScriptCode", 1),
             ("player.SetFogController", 97),
             ("prop_dynamic.Disabled", 8),
+            ("prop_weighted_cube.AddOutput", 5),
+            ("prop_weighted_cube.Enablemotion", 1),
         ],
         "the set of inputs nothing handles has changed"
     );
@@ -6283,10 +6655,12 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // would not load, which is an entity that draws nothing.
     let mut loaded: BTreeMap<String, Option<Vec<(String, sequences::SequenceInfo)>>> =
         BTreeMap::new();
-    // …and, for each that did load, whether the renderer can pose it: a model
-    // with more than one bone whose vertices are **not** each bound to exactly
-    // one bone cannot be drawn by `EntityModels`' per-bone split and is drawn
-    // in its bind pose instead. See `StudioModel::rigid_bones`.
+    // …and, for each that did load, `(has a skeleton, shares a vertex between
+    // bones)`. The second used to decide whether the renderer could pose the
+    // model at all — the per-bone draw split could not express a shared vertex
+    // — and since skinning landed it decides nothing. It is kept as the
+    // measurement that made skinning worth writing, and as the count of what
+    // it bought.
     let mut rigidity: BTreeMap<String, (bool, bool)> = BTreeMap::new();
 
     let mut spawned = 0usize;
@@ -6297,7 +6671,7 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     let mut unresolved = 0usize;
     let mut animating = 0usize;
     let mut animatable = 0usize;
-    let mut not_rigid = 0usize;
+    let mut skinned = 0usize;
     let mut solid_key = [0usize; 2];
     let mut maps_with_a_prop = 0usize;
 
@@ -6328,7 +6702,8 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
                     model.to_ascii_lowercase(),
                     (
                         studio.bones.len() > 1,
-                        studio.bones.len() > 1 && studio.rigid_bones().is_none(),
+                        studio.bones.len() > 1
+                            && studio.vertices.iter().any(|v| v.bone_weights[1] != 0.0),
                     ),
                 );
                 Some(
@@ -6384,7 +6759,7 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
                 invisible += 1;
             }
             match rigidity.get(&model.to_ascii_lowercase()) {
-                Some((_, true)) => not_rigid += 1,
+                Some((_, true)) => skinned += 1,
                 Some((true, false)) => animatable += 1,
                 _ => {}
             }
@@ -6432,8 +6807,9 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
          {unresolved} it does not"
     );
     println!(
-        "  {animatable} wear a model the renderer can pose; \
-         {not_rigid} wear one it cannot ({} of the {} models)",
+        "  {animatable} wear a model with a skeleton; \
+         {skinned} wear one that shares a vertex between bones \
+         ({} of the {} models)",
         rigidity.values().filter(|(_, shared)| *shared).count(),
         rigidity.len()
     );
@@ -6492,20 +6868,20 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     assert_eq!(resolved, 2_556);
     assert_eq!(unresolved, 182);
 
-    // **The measured cost of having no skinning**, which `portdocs/STUDIO.md`
-    // called the condition that would make real skinning worth writing.
-    // `prop_dynamic` is what makes it concrete: **74 of the 591 readable
-    // models share a vertex between two bones**, so the per-bone draw split
-    // cannot express them and they are drawn in their bind pose — and **290
-    // entities wear one**. Seven of those models are on `sp_a1_intro1`
-    // (`models/container_ride/finedebris_part*.mdl`), so it is visible on the
+    // **What skinning bought**, and before it landed the measured cost of not
+    // having it. `prop_dynamic` is what made it concrete: **74 of the 591
+    // readable models share a vertex between two bones**, which the per-bone
+    // draw split could not express, and **290 entities wear one** — all of
+    // them drawn in their bind pose until skinning landed. Seven of those
+    // models are on `sp_a1_intro1`
+    // (`models/container_ride/finedebris_part*.mdl`), so it was visible on the
     // map this port loads by default rather than only in a census.
     assert_eq!(
         rigidity.values().filter(|(_, shared)| *shared).count(),
         74,
         "models whose vertices are shared between bones"
     );
-    assert_eq!(not_rigid, 290, "entities drawn in their bind pose");
+    assert_eq!(skinned, 290, "entities that needed skinning to pose at all");
     assert_eq!(
         animatable, 3_323,
         "entities whose model the renderer can pose"

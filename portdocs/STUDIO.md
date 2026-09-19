@@ -46,6 +46,12 @@ called out.
    *absent from the data*. That deletes ~6,400 lines of `studiorender/` outright for this
    target. §3.
 
+   > **True of static props, and only of them.** This survey predates entity-placed
+   > models, which name a much larger set: **141 of the game's 420 multi-bone models
+   > share a vertex between bones**, and 290 entities wear one. Skinning was written for
+   > those and has landed — `rustdocs/STUDIO.md`, "Skinning". Flexes and sub-d are still
+   > absent from everything this port draws.
+
 5. **Only `sprp` version 9 needs to be read.** All 106 shipped maps are `.bsp` version 21
    carrying `sprp` version 9 at 72 bytes per prop. `gamebspfile.h` defines seven layouts
    (V4–V10); six of them are dead code for Portal 2. §4.1.
@@ -125,7 +131,7 @@ Portal 2 places as static props, traversed at LOD 0.
 
 | Measurement | Result | Consequence |
 |---|---|---|
-| `numbones` | **1 on all 968** | No skinning. No bone matrix palette. One `mat4` per instance. |
+| `numbones` | **1 on all 968** | No skinning *for a static prop*. One `mat4` per instance — still true, and `bSkinning` is off for every one of them. The models an *entity* places needed the palette; see the note above. |
 | Strip group flags | **`0x02` on all 1,130** (`STRIPGROUP_IS_HWSKINNED`) | No `STRIPGROUP_IS_DELTA_FLEXED` ⇒ **no flexes** |
 | Strip flags | **`STRIP_IS_TRILIST` on 1,129 of 1,130** | No `STRIP_IS_QUADLIST_*` ⇒ **no sub-d** |
 | `StripHeader_t::numBones` | **0 on all 1,130** | The bone-state-change path is never taken |
@@ -911,13 +917,16 @@ cycles.
   `.ani`, so their labels now *resolve* and their poses are empty (1, 1, 0, 0,
   0 and 2 animations with data respectively).
 
-  > **All six, and the personality sphere as well, are models this port draws
-  > in its bind pose for want of skinning**, so neither `.ani` nor anything
-  > else changes a pixel for them until skinning lands. That is the order to do
-  > them in, and it is why the panel arms are the whole visible payoff of the
-  > merge: they are the only two of the nine that are rigid.
-- **Sequence bone weights** (`mstudioseqdesc_t::weightlistindex`), as above:
-  85 sequences, all on models this port cannot pose anyway.
+  > **Skinning has since landed, which spends this paragraph's argument.**
+  > Until it did, all six — and the personality sphere — were models this port
+  > drew in its bind pose whatever their animation said, so reading `.ani`
+  > changed no pixel for them and the panel arms were the whole visible payoff
+  > of the merge. All nine can be posed now, and what they are missing is the
+  > animation data itself, so `.ani` is the next thing worth doing here.
+- **Sequence bone weights** (`mstudioseqdesc_t::weightlistindex`): 85
+  sequences, all on the same three models above. `pose` takes an `Animation`
+  and not a `Sequence`, so this would change its signature; the condition is a
+  model that both needs the weights and has animation data to pose with.
 - **One parse per host, not per file.** Both panel arms include the same 1.3 MB
   companion, so a map placing both reads and expands it twice — about 50 ms and
   7 MB each, at level load and not per frame. Valve gets sharing free from

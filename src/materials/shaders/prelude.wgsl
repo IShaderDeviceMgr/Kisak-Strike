@@ -67,9 +67,21 @@ struct DrawUniforms {
     model: mat4x4<f32>,
     // cModulationColor, VS c47: $color * $color2 in rgb, $alpha in w.
     modulation: vec4<f32>,
+    // x = the first row of this draw's bone palette, y = `bSkinning`.
+    skinning: vec4<u32>,
 }
 
 @group(2) @binding(0) var<uniform> draw: DrawUniforms;
+
+// The bone palette: `matrix3x4_t` rows, three to a bone, for every skinned
+// draw in the frame at once. `draw.skinning.x` says where this draw's start.
+//
+// Bound whole rather than windowed by a dynamic offset like every other
+// per-draw block here, because a palette has no fixed size — see
+// `uniforms::DrawUniforms::skinning`. Declared for every shader, because
+// group 2's layout is shared by every pipeline; the ones that take no model
+// vertex never read it.
+@group(2) @binding(1) var<storage, read> bone_rows: array<vec4<f32>>;
 
 // ---------------------------------------------------------------------------
 // Vertex input
@@ -227,6 +239,59 @@ struct ModelVertexInput {
     // It is per placement rather than per model, which is why it is its own
     // stream; see `mesh::StaticLightVertex`.
     @location(4) color: vec4<f32>,
+    // `vBoneWeights` and `vBoneIndices`. Three bones, because
+    // `MAX_NUM_BONES_PER_VERT` is 3; the fourth index is padding the vertex
+    // format forces and nothing reads it.
+    @location(5) bone_weights: vec3<f32>,
+    @location(6) bone_indices: vec4<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Skinning
+// ---------------------------------------------------------------------------
+
+// `SkinPositionAndNormal` (`common_vs_fxc.h:629`), as a matrix rather than as
+// a position and a normal.
+//
+// Valve's version takes the vertex apart, blends the bone matrices and applies
+// the result to the position and the normal separately, because its `cModel[]`
+// already carried the model-to-world placement and there was nothing else to
+// combine with. Here the placement is `draw.model`, so the useful thing to
+// hand back is one object-to-world matrix: every caller then transforms its
+// position, its normal and its tangent through the same matrix it would have
+// used unskinned, and the skinned and unskinned paths stay one piece of code.
+//
+// **Blend the matrices, then transform** — not transform, then blend. Valve's
+// comment calls it out and it is worth keeping: the two agree exactly for
+// affine matrices, and one is three multiply-adds on a matrix where the other
+// is three full transforms of every attribute.
+//
+// The rows are `matrix3x4_t` rows, so `mul4x3`'s shape: the fourth row of an
+// affine matrix is `(0,0,0,1)` and is reconstructed here rather than uploaded.
+fn skin_model_matrix(weights: vec3<f32>, indices: vec4<u32>) -> mat4x4<f32> {
+    if draw.skinning.y == 0u {
+        return draw.model;
+    }
+    let base = draw.skinning.x;
+    let a = base + indices.x * 3u;
+    let b = base + indices.y * 3u;
+    let c = base + indices.z * 3u;
+    let r0 = bone_rows[a] * weights.x + bone_rows[b] * weights.y + bone_rows[c] * weights.z;
+    let r1 = bone_rows[a + 1u] * weights.x
+        + bone_rows[b + 1u] * weights.y
+        + bone_rows[c + 1u] * weights.z;
+    let r2 = bone_rows[a + 2u] * weights.x
+        + bone_rows[b + 2u] * weights.y
+        + bone_rows[c + 2u] * weights.z;
+    // Rows to columns. `r0.w`, `r1.w`, `r2.w` are the translation, which is
+    // why it ends up spread across the last column and not in a row of its own.
+    let pose = mat4x4<f32>(
+        vec4<f32>(r0.x, r1.x, r2.x, 0.0),
+        vec4<f32>(r0.y, r1.y, r2.y, 0.0),
+        vec4<f32>(r0.z, r1.z, r2.z, 0.0),
+        vec4<f32>(r0.w, r1.w, r2.w, 1.0),
+    );
+    return draw.model * pose;
 }
 
 // ---------------------------------------------------------------------------

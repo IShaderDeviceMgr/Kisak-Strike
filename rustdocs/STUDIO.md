@@ -15,15 +15,15 @@ behind the scoping: `portdocs/STUDIO.md`.
 | 4 | the `.bsp` pak lump and `.vhv` per-vertex light | **done** |
 | 5 | the leaf ambient cube | **done** |
 | 6 | LOD selection and fade | **not started** (optional) |
-| — | bones, sequences and animation | **done** for rigid models — `studio/anim.rs`, below |
+| — | bones, sequences and animation | **done** — `studio/anim.rs`, below |
 | — | `$includemodel` | **done** — `studio/include.rs`, below; 25 shipped models declare one, 9 of them worn by 926 `prop_dynamic`s |
 | — | attachment points | **done** — `Attachment`, `bone_to_model`, `attachment_to_model`; 266 shipped models carry 1,952 points. `src/server/attachment.rs` is what asks |
+| — | **skinning** | **done** — `anim::skin`, `ModelVertex::bone_weights`/`bone_indices`, and the GPU palette in `materials::context`. Replaced the per-bone draw split |
 
 Not implemented and not planned here: `.phy` collision (that is
 `ENGINE_TRACE.md` stage 5), the prop leaf lists as a *visibility* structure
-(read and kept, unused), decals, flexes and sub-d surfaces — and **skinning**,
-which `anim.rs` deliberately substitutes a per-bone draw split for. See "What
-is deliberately absent" below.
+(read and kept, unused), decals, flexes and sub-d surfaces. See "What is
+deliberately absent" below.
 
 ---
 
@@ -79,12 +79,10 @@ impl StudioModel {
     pub fn animation(&self, sequence: usize) -> Option<&anim::Animation>;
     /// LookupAttachment — ZERO-based, `None` for "no such attachment".
     pub fn attachment(&self, name: &str) -> Option<usize>;
-    /// Which bone moves each vertex — `Some` only if EVERY vertex answers to
-    /// exactly one. See gotcha 9.
-    pub fn rigid_bones(&self) -> Option<&[u8]>;
+    /// The largest bone index any vertex is weighted to, plus one — how many
+    /// palette entries a draw of this model reads. At most `bones.len()`.
+    pub fn skinned_bones(&self) -> usize;
 }
-
-pub struct BoneRun { pub bone: u16, pub first_index: u32, pub index_count: u32 }
 
 impl StudioModel {
     pub fn load(vfs: &Vfs, name: &str) -> Result<StudioModel, StudioError>;
@@ -191,7 +189,54 @@ pub fn bone_to_model(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Ve
 /// CBaseAnimating::GetAttachment, in model space. `bones` is
 /// `bone_to_model`'s output, NOT `pose`'s.
 pub fn attachment_to_model(attachment: &Attachment, bones: &[Mat4]) -> Option<Mat4>;
+
+/// MAX_NUM_BONES_PER_VERT (studio.h:87). The format's limit, not a choice.
+pub const MAX_BONES_PER_VERTEX: usize = 3;
+/// SkinPositionAndNormal on the CPU: where one vertex ends up under a pose.
+/// `bones` is `pose`'s output. The vertex shader's `skin_model_matrix` is the
+/// same arithmetic — see "Skinning" below.
+pub fn skin(vertex: &ModelVertex, bones: &[Mat4]) -> Vec3;
 ```
+
+<a id="skinning"></a>
+
+#### Skinning — and why the CPU and the GPU spell it differently
+
+Every `ModelVertex` carries `bone_weights: [f32; 3]` and `bone_indices: [u8; 4]`,
+straight out of `mstudioboneweight_t`, and the vertex shader blends up to three
+of the draw's bone-palette matrices. **The palette is `pose`'s output** —
+`boneToWorld * poseToBone` per bone, in model space — and the entity's
+*placement* stays out of it, on the draw's own model matrix.
+
+The two spellings of the blend are deliberately different:
+
+| | what it does | why |
+|---|---|---|
+| `anim::skin` (CPU) | transform by each bone, then blend the points | reads directly; used by every census and cull-box check |
+| `skin_model_matrix` (WGSL) | blend the matrices, then transform once | three multiply-adds on a matrix instead of three full transforms |
+
+They are equal for affine matrices — `Σ wᵢ(Aᵢp + tᵢ) = (Σ wᵢAᵢ)p + Σ wᵢtᵢ` —
+and `skinning_on_the_cpu_matches_what_the_shader_does` builds the shader's
+matrix the shader's way and compares, because every posed bound in this port is
+computed on one side and drawn on the other.
+
+**The neutral weight is `[1, 0, 0]`, not `[0, 0, 0]`.** A vertex with no
+weights blends nothing and collapses onto the entity's origin, so
+`ModelVertex::new` spells the neutral value out and `assemble` pads a vertex's
+unused index slots with bone 0 at weight 0.
+
+**`assemble` refuses a file whose vertex names a bone the model has not got.**
+The shader indexes the palette without checking and `wgpu`'s bounds checking
+returns zero for an out-of-range storage read — which collapses the vertex
+rather than erroring, so the check is cheaper here where the message can name
+the model.
+
+Measured over the depot: **1,876 models weight every vertex to one bone, 63
+reach two and 78 reach three**; 141 of the 420 multi-bone models share a vertex
+between bones, and the most bones any one model is skinned by is **248**
+(`models/container_ride/finedebris_part12`), against `MAXSTUDIOBONES`' 256.
+Seven of that family are on `sp_a1_intro1`, which is why the palette is sized
+off a *pose* rather than off a model — see `rustdocs/MATERIALS.md`.
 
 `bonesetup/bone_decode.cpp` plus the slice of `studiorender/r_studio.cpp`'s
 `R_StudioSetupBones` that a model with one animation, no layers, no pose
@@ -618,31 +663,6 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 
 ## What is deliberately absent
 
-- **Skinning** — replaced rather than deferred, and `prop_dynamic` has now put
-  a price on it. A model is drawn
-  one [`BoneRun`](#studiomodel) at a time, each under its own bone's matrix,
-  which is **exact** when every vertex answers to exactly one bone and needs no
-  change to the vertex format, the shaders or the bind groups. A
-  `prop_floor_button`'s 7,929 vertices split 7,263 on the body and 666 on the
-  plate, and every model the port drew until `prop_dynamic` was like that.
-
-  **It does not generalise, and the number is known.** Across the game 420 of
-  2,017 models have more than one bone and **141 of those share a vertex
-  between two** — the `a4_destruction` set, Wheatley's chamber falling apart.
-  `StudioModel::rigid_bones` is where the precondition is checked rather than
-  assumed; a model that fails it is drawn in its **bind pose** and counted.
-
-  > **`prop_dynamic` turned that from a bound into a bill.** It is the first
-  > class that places models the map chose rather than models the compiler
-  > placed, so it reaches them: **74 of the 591 readable models the game's
-  > props name share a vertex between bones, and 290 entities wear one**. Seven
-  > of the 74 are on `sp_a1_intro1` — the `models/container_ride/finedebris_part*`
-  > set — so the substitution is visible on the default map rather than only in
-  > a census, and the startup log says so per model.
-  > `server::tests::every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for`
-  > pins both numbers. **With `$includemodel` merged it is now the largest gap
-  > in this module**, and it gates the next one: the six include hosts whose
-  > animation is in an `.ani` are all models this cannot pose anyway.
 - **Everything in `bone_setup.cpp` that blends** — ~5,000 lines of layering,
   pose parameters, IK, procedural bones, bone controllers and blend sequences.
   A sequence here has one animation (`numblends` is 1 for every sequence in
@@ -669,10 +689,14 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   almost all of theirs in an `.ani`, so their labels now resolve and their
   poses are empty.
 
-  > **Every model that reaches those six is also drawn in its bind pose for
-  > want of skinning — and so is the personality sphere** — so reading `.ani`
-  > buys nothing on its own. Skinning first. The panel arms are the only two
-  > of the nine that are rigid, and they are the whole visible payoff.
+  > **Skinning has landed, so this is now the largest gap in the module.**
+  > Until it did, every model that reaches those six was drawn in its bind
+  > pose anyway — the panel arms were the only two of the nine that could be
+  > posed at all — and reading `.ani` bought nothing. That argument is spent:
+  > all nine can be posed now, and what they are missing is the animation
+  > data itself. **135 models pose outside the box their own sequences
+  > declare, the worst by 23,029 units**, and since `studiomdl` computes that
+  > box from the animated geometry it is the pose that is wrong.
 - **Sequence bone weights** (`mstudioseqdesc_t::weightlistindex`) — a
   per-sequence, per-bone weight that `CalcVirtualAnimation` uses to leave a
   bone at its bind pose. 85 sequences across the nine companions set one to
@@ -747,6 +771,12 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
 | `engine::world::entities::tests::the_cull_box_follows_the_sequence_the_entity_plays` | the sequence box being merged in |
 | `engine::world::entities::tests::the_old_cull_box_would_have_dropped_most_of_the_games_props` | **the size of gotcha 24**, against the depot: 7,515 of 8,072 `prop_dynamic` placements wear a model that escapes the box the port used to build |
 | `studio::tests::every_shipped_studio_model_parses` | also the census behind gotchas 24 and 25, and the assertion that **no** static prop reaches outside its render bounds |
+| `studio::anim::tests::skinning_on_the_cpu_matches_what_the_shader_does` | **`anim::skin` against the vertex shader's own arithmetic**, built the shader's way through `bone_rows` — the two spellings the whole skinning path rests on |
+| `studio::anim::tests::an_unweighted_slot_contributes_nothing` | that the *weight* and not the index decides, including for a bone the palette has not got |
+| `materials::preview::tests::a_skinned_vertex_rides_the_bone_its_weights_name` | the palette being read at all, on a real GPU — the quad's own coordinates put it on the left and the bone moves it right |
+| `materials::preview::tests::two_bones_at_half_weight_put_the_vertex_between_them` | the case the per-bone draw split could not express, which is why skinning was written |
+| `materials::preview::tests::clearing_the_pose_draws_the_vertex_where_it_was_authored` | `bSkinning` off — the palette bound and not read |
+| `materials::preview::tests::a_palette_that_outgrows_its_buffer_keeps_the_poses_already_recorded` | the bone buffer growing **mid-pass** with a draw already recorded against the old one |
 | `studio::anim::tests::a_radian_euler_is_roll_pitch_yaw_and_not_a_qangle` | gotcha 14 |
 | `studio::anim::tests::the_rle_walk_repeats_the_last_valid_value` | `ExtractAnimValue`'s run encoding |
 | `studio::anim::tests::a_compressed_quaternion_rebuilds_its_w` | `Quaternion48`/`Quaternion64` |

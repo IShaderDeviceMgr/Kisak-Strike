@@ -166,14 +166,6 @@ pub struct Batch {
     /// Offset into [`StudioModel::indices`].
     pub first_index: u32,
     pub index_count: u32,
-    /// This batch's indices, split into contiguous runs by the **bone** that
-    /// moves them.
-    ///
-    /// One run covering the whole batch for a model with one bone, which is
-    /// every static prop in the game. See
-    /// [`StudioModel::rigid_bones`] for why the split is a substitute for
-    /// skinning and when it stops being one.
-    pub bones: Vec<BoneRun>,
     /// Which body part and model within it this came from.
     ///
     /// Batches are grouped by material *within* a model and never across one,
@@ -183,19 +175,6 @@ pub struct Batch {
     /// merging across them would make body-group selection impossible to add.
     pub body_part: u16,
     pub model: u16,
-}
-
-/// One bone's slice of a [`Batch`]'s indices.
-///
-/// The triangles a batch draws are sorted by bone at load, so each bone's are
-/// contiguous and can be drawn as one range under that bone's matrix. That is
-/// this port's substitute for skinning — see [`StudioModel::rigid_bones`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BoneRun {
-    pub bone: u16,
-    /// Offset into [`StudioModel::indices`], not into the batch.
-    pub first_index: u32,
-    pub index_count: u32,
 }
 
 /// A studio model, resolved and ready to upload.
@@ -267,12 +246,6 @@ pub struct StudioModel {
     /// [`include`](self::include) for what merging one does; a model that
     /// *declares* an include which could not be read does not list it here.
     pub includes: Vec<String>,
-    /// Which bone moves each vertex, parallel to
-    /// [`vertices`](StudioModel::vertices).
-    ///
-    /// `None` when some vertex is moved by more than one — see
-    /// [`rigid_bones`](StudioModel::rigid_bones).
-    vertex_bones: Option<Vec<u8>>,
 }
 
 /// One studio mesh, as the *hardware* would hold it.
@@ -384,32 +357,22 @@ impl StudioModel {
             .position(|a| a.name.eq_ignore_ascii_case(name))
     }
 
-    /// Which bone moves each vertex — `Some` only if **every** vertex is moved
-    /// by exactly one.
+    /// The largest bone index any vertex is weighted to, plus one — how many
+    /// palette entries a draw of this model reads.
     ///
-    /// # Why this decides how a model is drawn
-    ///
-    /// Valve skins: every vertex is transformed on the way to the GPU by a
-    /// weighted blend of up to three bone matrices. This port does not, and
-    /// draws each bone's triangles as their own range under that bone's matrix
-    /// instead — which needs no change to the vertex format, no bone matrices
-    /// on the GPU and no change to any shader, and is **exact** for a model
-    /// whose vertices each answer to one bone.
-    ///
-    /// That is a measurement, not a hope — and it is a *bounded* one. Every
-    /// vertex of all four floor-button models binds to exactly one bone, and a
-    /// `prop_floor_button`'s 7,929 split 7,263 on the body and 666 on the
-    /// plate. But across the whole game **420 of 2,017 models have more than
-    /// one bone and 141 of those share a vertex between two**, so the split is
-    /// exact for 279 of them and not for the rest — the `a4_destruction` set,
-    /// which is Wheatley's chamber falling apart.
-    ///
-    /// So `None` is not hypothetical: it is the 141, and it is the measured
-    /// condition that makes real skinning worth writing. A model that returns
-    /// it is drawn in its **bind pose** rather than wrongly, and counted
-    /// (`EntityModelStats::models_not_rigid`).
-    pub fn rigid_bones(&self) -> Option<&[u8]> {
-        self.vertex_bones.as_deref()
+    /// Always at most [`bones`](StudioModel::bones)`.len()`, because
+    /// [`assemble`] refuses a file where it is not. Useful as a bound rather
+    /// than as a fact about the skeleton: a model can carry bones no vertex
+    /// answers to, and every attachment point on one of those still has to be
+    /// posed.
+    pub fn skinned_bones(&self) -> usize {
+        self.vertices
+            .iter()
+            .flat_map(|v| v.bone_indices.iter().take(3))
+            .map(|&bone| usize::from(bone) + 1)
+            .max()
+            .unwrap_or(0)
+            .min(self.bones.len())
     }
 }
 
@@ -858,8 +821,9 @@ mod tests {
         let model = assemble_spec(&Spec::default()).expect("a well-formed trio");
         assert_eq!(
             size_of::<ModelVertex>(),
-            48,
-            "position, normal, texcoord and tangent — and no colour"
+            64,
+            "position, normal, texcoord, tangent and the bone weights — \
+             and no colour"
         );
         assert_eq!(model.vertices.len(), 3);
     }
@@ -915,7 +879,12 @@ mod tests {
         // The measurement the whole animation path rests on: how many models
         // in the game have a vertex that answers to more than one bone, and so
         // could not be posed by splitting their triangles between bones.
-        let (mut multi_bone, mut not_rigid) = (0usize, Vec::new());
+        let (mut multi_bone, mut skinned) = (0usize, Vec::new());
+        // What the palette has to hold and what the vertex format has to
+        // carry: the most bones one model is skinned by, and how many models
+        // reach one, two and three weights per vertex.
+        let (mut max_bones, mut max_bones_at) = (0usize, String::new());
+        let (mut total_vertices, mut weighted) = (0usize, [0usize; 3]);
         let (mut sequences, mut widest_animation) = (0usize, 0usize);
         // Attachment points: how many models have any, how many there are, how
         // many arrived through a `$includemodel`, and how many are world
@@ -1040,9 +1009,9 @@ mod tests {
                         // `prop_dynamic`: a bind-pose vertex outside the hull
                         // is not necessarily drawn there, and a posed one is.
                         // Drawn exactly the way `EntityModels` draws it —
-                        // per-vertex bone when the model is rigid, bind pose
-                        // when it is not.
-                        if let Some(vertex_bones) = model.rigid_bones() {
+                        // skinned, through the same arithmetic the vertex
+                        // shader runs.
+                        {
                             for sequence in 0..model.sequences.len() {
                                 // `STUDIO_DELTA`: the sequence *adds* to a
                                 // base pose rather than replacing it, so both
@@ -1062,13 +1031,8 @@ mod tests {
                                     );
                                     let mut plo = Vec3::splat(f32::MAX);
                                     let mut phi = Vec3::splat(f32::MIN);
-                                    for (i, v) in model.vertices.iter().enumerate() {
-                                        let bone = bones
-                                            .get(usize::from(vertex_bones[i]))
-                                            .copied()
-                                            .unwrap_or(glam::Mat4::IDENTITY);
-                                        let p = bone
-                                            .transform_point3(Vec3::from_array(v.position));
+                                    for v in &model.vertices {
+                                        let p = anim::skin(v, &bones);
                                         plo = plo.min(p);
                                         phi = phi.max(p);
                                     }
@@ -1162,10 +1126,27 @@ mod tests {
                     );
                     if model.bones.len() > 1 {
                         multi_bone += 1;
-                        if model.rigid_bones().is_none() {
-                            not_rigid.push(path.clone());
+                        // A vertex with a second weight is one the per-bone
+                        // draw split could not have expressed — the
+                        // measurement that made skinning worth writing, kept
+                        // now as the measurement of what it bought.
+                        if model.vertices.iter().any(|v| v.bone_weights[1] != 0.0) {
+                            skinned.push(path.clone());
                         }
                     }
+                    total_vertices += model.vertices.len();
+                    if model.skinned_bones() > max_bones {
+                        max_bones = model.skinned_bones();
+                        max_bones_at = path.clone();
+                    }
+                    weighted[model
+                        .vertices
+                        .iter()
+                        .map(|v| v.bone_weights.iter().filter(|&&w| w != 0.0).count())
+                        .max()
+                        .unwrap_or(1)
+                        .clamp(1, 3)
+                        - 1] += 1;
                     if is_static && model.vertices.len() > widest {
                         widest = model.vertices.len();
                         widest_at = path.clone();
@@ -1205,7 +1186,13 @@ mod tests {
             "{multi_bone} of {loaded} models have more than one bone; \
              {} of those share a vertex between bones; \
              {sequences} sequences, longest animation {widest_animation} frames",
-            not_rigid.len()
+            skinned.len()
+        );
+        println!(
+            "skinning: at most {max_bones} bones in one model ({max_bones_at}); \
+             {} models weight a vertex to one bone, {} to two, {} to three; \
+             {total_vertices} vertices carry a weight",
+            weighted[0], weighted[1], weighted[2]
         );
         println!(
             "{declares} models declare a $includemodel; {merged} include(s) merged, \
@@ -1266,7 +1253,7 @@ mod tests {
              a degenerate cull box would have been hidden by the pad \
              `engine::world::entities::cull_box` adds"
         );
-        for line in not_rigid.iter().take(10) {
+        for line in skinned.iter().take(10) {
             println!("  shares vertices between bones: {line}");
         }
         for line in animated_failed.iter().take(5) {
@@ -1281,16 +1268,16 @@ mod tests {
             failed.len()
         );
 
-        // **The two numbers the animation path's shape rests on, and both of
-        // them bound it rather than bless it.**
+        // **The two numbers the animation path's shape rests on.**
         //
         // 420 models have a skeleton worth posing and **141 of those share a
-        // vertex between bones**, so the per-bone draw split
-        // ([`StudioModel::rigid_bones`]) is exact for 279 of them and not for
-        // the rest. That is fine today — every model an *entity* places is in
-        // the 279 — and it is the measurement that says real skinning is worth
-        // writing the moment something places one of the 141. They are the
-        // `a4_destruction` set, which is Wheatley's chamber falling apart.
+        // vertex between bones**. Until skinning landed those 141 were drawn
+        // in their bind pose, because the per-bone draw split that replaced
+        // skinning could not express a vertex two bones move; this is the
+        // count that said it was worth writing, kept as the count of what it
+        // bought. They are the `a4_destruction` set — Wheatley's chamber
+        // falling apart — and the `container_ride` debris, which is on
+        // `sp_a1_intro1`.
         //
         // And the longest animation in the game is **4,050 frames**, against
         // the 11 a floor button's has. `anim.rs` expands every animation at
@@ -1313,10 +1300,17 @@ mod tests {
         assert_eq!(declares, 25, "models that name a $includemodel");
         assert_eq!(merged, 24, "companions that could be read");
         assert_eq!(multi_bone, 420, "models with more than one bone");
-        assert_eq!(
-            not_rigid.len(),
-            141,
-            "models that share a vertex between bones"
+        assert_eq!(skinned.len(), 141, "models that share a vertex between bones");
+        // **What the skinning path has to hold.** The palette is indexed per
+        // draw rather than windowed at a fixed stride, so this is a
+        // measurement and not a limit — but it is the number that says why:
+        // at 248 bones a fixed stride would be 12 KiB, paid by every
+        // three-bone door as well.
+        assert_eq!(max_bones, 248, "the most bones one model is skinned by");
+        assert!(
+            max_bones <= 256,
+            "MAXSTUDIOBONES is 256 and `mstudioboneweight_t::bone` is a byte; \
+             {max_bones} bones cannot be addressed by either"
         );
         // Was 5,434 before the merge, and the difference is what every
         // `prop_dynamic` naming an `anim_wp/room_transform` sequence was
@@ -1410,12 +1404,15 @@ mod anim_depot_tests {
             "`up` should retrace `down`: {up_travel} vs {down_travel}"
         );
 
-        // Every vertex is moved by exactly one bone, and both bones are used —
-        // the measurement the per-bone draw split depends on.
-        let rigid = model.rigid_bones().expect("every vertex binds to one bone");
+        // Every vertex is moved by exactly one bone, and both bones are used.
         let mut counts = [0usize; 3];
-        for &bone in rigid {
-            counts[bone as usize] += 1;
+        for v in &model.vertices {
+            assert_eq!(
+                v.bone_weights,
+                [1.0, 0.0, 0.0],
+                "a floor-button vertex is shared between bones"
+            );
+            counts[usize::from(v.bone_indices[0])] += 1;
         }
         println!("  vertices per bone: {counts:?}");
         assert_eq!(counts[1] + counts[2], model.vertices.len());
@@ -1517,12 +1514,16 @@ mod anim_depot_tests {
         assert!(left > 1.0, "the left leaf does not move: {left}");
         assert!(right > 1.0, "the right leaf does not move: {right}");
 
-        // Every vertex on exactly one bone — the precondition
-        // `EntityModels`' per-bone draw split needs.
-        let rigid = model.rigid_bones().expect("every vertex binds to one bone");
+        // Every vertex on exactly one bone — which was the precondition the
+        // per-bone draw split needed, and is now just a fact about this model.
         let mut counts = vec![0usize; model.bones.len()];
-        for &bone in rigid {
-            counts[bone as usize] += 1;
+        for v in &model.vertices {
+            assert_eq!(
+                v.bone_weights,
+                [1.0, 0.0, 0.0],
+                "a chamber door vertex is shared between bones"
+            );
+            counts[usize::from(v.bone_indices[0])] += 1;
         }
         println!("  vertices per bone: {counts:?}");
         assert_eq!(counts.iter().sum::<usize>(), model.vertices.len());
@@ -1530,9 +1531,15 @@ mod anim_depot_tests {
             counts[4] > 0 && counts[5] > 0,
             "the leaves have no geometry"
         );
-        // …and one material, so the whole door is five draws and not fifty.
+        // …and one material, so the whole door is **one** draw. It was five
+        // before skinning landed — one per bone with any geometry on it —
+        // which is the cost the split was paying on every animated model.
         assert_eq!(model.batches.len(), 1);
-        assert_eq!(model.batches[0].bones.len(), 5);
+        assert_eq!(
+            model.batches[0].index_count as usize,
+            model.indices.len(),
+            "the one batch must cover every index"
+        );
     }
 
     /// `$includemodel`, read out of the real game: the panel arm whose 1,350
@@ -1732,11 +1739,12 @@ mod anim_depot_tests {
             let m = StudioModel::load(&vfs, path).expect("a host model");
             let with_data = m.animations.iter().filter(|a| !a.tracks.is_empty()).count();
             println!(
-                "  {path}: {} sequences, {}/{} animations with data, rigid={}",
+                "  {path}: {} sequences, {}/{} animations with data, \
+                 skinned by {} bones",
                 m.sequences.len(),
                 with_data,
                 m.animations.len(),
-                m.rigid_bones().is_some()
+                m.skinned_bones()
             );
             assert_eq!(m.includes.len(), 1, "{path} should have merged one include");
             assert!(!m.sequences.is_empty(), "{path} has no sequences");

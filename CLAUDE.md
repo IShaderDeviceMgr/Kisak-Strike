@@ -58,7 +58,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,077 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,092 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -152,8 +152,8 @@ before calling into a module.** This table is the index.
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (4 of 5, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
-| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel` and **attachment points**. No LOD selection, no `.phy`, **no skinning**, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the two areaportals, the **local/abs transform pair**, the **pusher** and **attachment parenting** — **48 classnames, 35,232 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points** and **skinning**. No LOD selection, no `.phy`, no skin families, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher** and **attachment parenting** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -164,7 +164,11 @@ the map's own limits. The entity logic runs on a 64 Hz tick: doors and panels
 move, triggers fire, a floor button presses when you stand on it, a chamber
 door opens as you approach and shuts behind you, a `trigger_hurt` can kill you,
 **a mover shoves you out of its way or is stopped by you**, and **what is
-bolted to a moving arm rides the point on it the map named**. Two portals draw as coloured ovals — **and they work, and you can see
+bolted to a moving arm rides the point on it the map named**. **Every model is
+skinned**, so the seven pieces of falling debris on the default map bend with
+their skeletons instead of standing in their bind pose, and the weighted cube
+in the corner is drawn — in the right model, though not yet in the rusted skin
+the map asked for. Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
@@ -310,21 +314,51 @@ checkpoint rather than a pose** — `AnimThink` stops re-arming once there is
 nothing left to decide — so the live cycle has to be derived on the side that
 owns the `.mdl`, through the same arithmetic the *drawn* pose goes through, or
 a clip brush ends up a few units from the arm it is bolted to.
-- **Skinning in `src/studio/`**, which `$includemodel` promoted to the largest gap in
-  the model path and which now gates the second largest. The per-bone draw split is
-  exact only when every vertex answers to one bone, and **74 of the 591 readable models
-  the game's props name share a vertex between two — 290 entities wear one**, drawn in
-  their bind pose. Seven of the 74 are on `sp_a1_intro1`
-  (`models/container_ride/finedebris_part*`), so it is visible on the default map. It
-  gates **external `.ani` animation blocks**, because every `$includemodel` host but
-  the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
-  and the personality sphere — is a model this cannot pose anyway, so reading `.ani`
-  before skinning buys nothing. **There is now a number on what the missing `.ani`
-  costs**: 135 models pose outside the box their own sequences declare, the worst by
-  23,029 units, and since `studiomdl` computes that box from the animated geometry the
-  pose is what is wrong. `every_shipped_studio_model_parses` prints the list. `vtx` stops
-  discarding `StripHeader_t`'s bone plumbing and the bone matrices move to the GPU;
-  `vvd::BoneWeights` already carries the indices and weights.
+
+**Skinning has landed** — `ModelVertex` grew `mstudioboneweight_t`, `materials/`
+grew a bone palette, and the per-bone draw split that stood in for it since
+animation arrived is gone. It was the largest gap in the model path: **141 of
+the game's 420 multi-bone models share a vertex between bones and 290 entities
+wear one**, seven of them on `sp_a1_intro1` (the `container_ride` debris), and
+every one of those was drawn in its bind pose. The palette is a **read-only
+storage buffer indexed by row** rather than a dynamic-offset slot like every
+other per-draw block, and that is a measurement: `MAXSTUDIOBONES` is 256 and
+`finedebris_part12` uses 248, so a fixed stride would be 12 KiB paid by every
+three-bone door as well. **It cost nothing** — an A/B of `frame_cost` reads
+`entity models` 0.14 ms before and **0.12 after**, because a batch that was one
+draw per bone run is now one draw.
+
+**`prop_weighted_cube` has landed** — 98 cubes across 59 maps, one on
+`sp_a1_intro1` — and it is the first class here whose *base* is missing rather
+than whose siblings are: `CPhysicsProp` is vphysics, so a cube is drawn, in the
+right model for its type, and hangs in the air. Three findings, in
+`rustdocs/SERVER.md`: **the `skin` key is a cube *type*, not a skin**, and 77 of
+the 98 take that path rather than `CubeType`; the Schrodinger cube is dead code
+in the shipped game under an unacted `FIXME`; and a cube that ships pre-painted
+fires `OnPainted` on the first tick, which 23 of them do. **`Dissolve` could
+not be ported faithfully** — it calls `CTriggerPortalCleanser`, which is
+declared in no header this tree ships — so it is implemented as
+`SilentDissolve`, which is the half a map can observe through its 63 shipped
+`OnFizzled` connections.
+- **External `.ani` animation blocks** (`animblock != 0`), which skinning just promoted
+  to the largest gap in the model path. Until skinning landed, every `$includemodel` host
+  but the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
+  and the personality sphere — was a model the port could not pose anyway, so reading
+  `.ani` bought nothing. All nine can be posed now and what they lack is the data.
+  **There is a number on what it costs**: 135 models pose outside the box their own
+  sequences declare, the worst by 23,029 units, and since `studiomdl` computes that box
+  from the animated geometry the pose is what is wrong.
+  `every_shipped_studio_model_parses` prints the list.
+- **Skin families in `src/studio/`** — `studiohdr_t`'s `skinindex` table, which remaps a
+  mesh's material by `m_nSkin`. `portdocs/STUDIO.md` stage 6's other half, and
+  `prop_weighted_cube` is what put a price on it: the class computes its skin correctly
+  and the renderer ignores it, so a **companion cube draws with the standard cube's
+  materials and a rusted cube draws clean**. Measured by
+  `every_shipped_map_spawns_its_entities`: **15 of the game's 98 cubes end on a non-zero
+  skin** — 5 companion, 8 rusted standard, 2 rusted reflective — and **one of the 15 is
+  the cube on `sp_a1_intro1`**, so it is visible on the default map. It needs `PropBatch`
+  to carry a material per skin family rather than one, and the draw to pick by
+  instance.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view

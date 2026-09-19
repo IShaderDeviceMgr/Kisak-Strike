@@ -789,8 +789,10 @@ Each of these is a decision, not an omission, and each names what would reverse 
   `physicsclonearea.cpp` (280), `CPortalSimulator`'s entire ownership/cloning tower
   (`TakeOwnershipOfEntity`, `StartCloningEntityAcrossPortals`, ~1,400 lines),
   `CPortal_CollisionEvent`, and `TeleportTouchingEntity`'s 520 lines — the *entity*
-  teleport path, as opposed to the player's in `HandlePortalling`. **Reversed by:**
-  `prop_weighted_cube`, which is also what `prop_floor_cube_button` is waiting on.
+  teleport path, as opposed to the player's in `HandlePortalling`. **Reversed by:** a
+  cube that *moves* — `prop_weighted_cube` has landed but has no vphysics, so the blocker
+  is now `MOVETYPE_VPHYSICS` rather than the class. Same for
+  `prop_floor_cube_button`.
 - **The recursive view** — `portalrender.cpp` (2,113) and the stencil/depth-doubler/ghost
   path (`c_portalghostrenderable.cpp`, 980). This is the module's whole visual identity
   and it is explicitly out of scope; it also wants a second camera and render target per

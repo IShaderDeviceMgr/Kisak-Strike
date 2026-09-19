@@ -769,6 +769,43 @@ pub fn pose(bones: &[Bone], anim: Option<&Animation>, cycle: f32) -> Vec<Mat4> {
     matrices
 }
 
+/// Where one vertex ends up under a pose — the CPU spelling of the vertex
+/// shader's `skin_model_matrix`.
+///
+/// `SkinPositionAndNormal` (`common_vs_fxc.h:629`), in model space: the blend
+/// of up to [`MAX_BONES_PER_VERTEX`] bone matrices the vertex's weights name,
+/// applied to its bind-pose position. `bones` is what [`pose`] returned.
+///
+/// > **The two spellings must agree.** This is what the tests and the depot
+/// > census measure a model's posed extent with, and the shader is what
+/// > actually draws it; a divergence between them would show as a model whose
+/// > cull box is right and whose picture is not. They are kept together by
+/// > `skinning_on_the_cpu_matches_what_the_shader_does`, which builds the
+/// > shader's matrix the shader's way and compares.
+///
+/// A bone index past the end of `bones` contributes nothing, which matches
+/// `wgpu`'s bounds-checked storage read. [`assemble`](super::assemble) refuses
+/// a file that has one, so this is a floor and not a path.
+pub fn skin(vertex: &crate::materials::mesh::ModelVertex, bones: &[Mat4]) -> Vec3 {
+    let position = Vec3::from_array(vertex.position);
+    let mut skinned = Vec3::ZERO;
+    for slot in 0..MAX_BONES_PER_VERTEX {
+        let weight = vertex.bone_weights[slot];
+        if weight == 0.0 {
+            continue;
+        }
+        let Some(bone) = bones.get(usize::from(vertex.bone_indices[slot])) else {
+            continue;
+        };
+        skinned += weight * bone.transform_point3(position);
+    }
+    skinned
+}
+
+/// `MAX_NUM_BONES_PER_VERT` (`studio.h:87`) — how many bones can move one
+/// vertex. The format's limit, not a choice made here.
+pub const MAX_BONES_PER_VERTEX: usize = 3;
+
 /// Steps 1 and 2 of [`pose`] alone: where each bone's **own frame** is, in
 /// model space, at `cycle` through `anim`.
 ///
@@ -840,6 +877,99 @@ pub fn attachment_to_model(attachment: &Attachment, bones: &[Mat4]) -> Option<Ma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`skin`] and the vertex shader must agree, and they are written
+    /// differently on purpose.
+    ///
+    /// `skin` transforms the vertex by each bone and blends the results;
+    /// `skin_model_matrix` blends the matrices and transforms once. The two
+    /// are equal for affine matrices — `Σ wᵢ(Aᵢp + tᵢ) = (Σ wᵢAᵢ)p + Σ wᵢtᵢ` —
+    /// and the shader takes the cheaper side, but "equal" is the thing worth
+    /// checking rather than assuming, because every `.mdl` census and every
+    /// cull box in the port is computed on this side and drawn on the other.
+    ///
+    /// This builds the shader's matrix the shader's way: through
+    /// [`bone_rows`](crate::materials::uniforms::bone_rows), which is the
+    /// transpose the palette goes through, and back out row by row.
+    #[test]
+    fn skinning_on_the_cpu_matches_what_the_shader_does() {
+        use crate::materials::mesh::ModelVertex;
+        use crate::materials::uniforms::{bone_rows, BONE_ROWS};
+
+        // Three bones that are nothing like each other, so that a blend of
+        // them is nothing like any one of them.
+        let bones = [
+            Mat4::from_rotation_translation(
+                Quat::from_rotation_z(0.9),
+                Vec3::new(3.0, -4.0, 5.0),
+            ),
+            Mat4::from_rotation_translation(
+                Quat::from_rotation_x(-2.1),
+                Vec3::new(-11.0, 7.0, 0.5),
+            ),
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.3), Vec3::new(0.0, 0.0, 60.0)),
+        ];
+
+        // The shader's side, transcribed from `skin_model_matrix`: the
+        // weighted sum of the *rows*, reassembled into a matrix.
+        let shader = |weights: [f32; 3], indices: [u8; 4]| -> Mat4 {
+            let rows: Vec<[[f32; 4]; BONE_ROWS]> = bones.iter().map(|b| bone_rows(*b)).collect();
+            let mut blended = [[0.0f32; 4]; BONE_ROWS];
+            for slot in 0..MAX_BONES_PER_VERTEX {
+                let w = weights[slot];
+                let source = &rows[usize::from(indices[slot])];
+                for row in 0..BONE_ROWS {
+                    for c in 0..4 {
+                        blended[row][c] += w * source[row][c];
+                    }
+                }
+            }
+            Mat4::from_cols_array_2d(&[
+                [blended[0][0], blended[1][0], blended[2][0], 0.0],
+                [blended[0][1], blended[1][1], blended[2][1], 0.0],
+                [blended[0][2], blended[1][2], blended[2][2], 0.0],
+                [blended[0][3], blended[1][3], blended[2][3], 1.0],
+            ])
+        };
+
+        for (weights, indices) in [
+            ([1.0, 0.0, 0.0], [0u8, 0, 0, 0]),
+            ([0.0, 1.0, 0.0], [0, 1, 0, 0]),
+            ([0.5, 0.5, 0.0], [0, 1, 0, 0]),
+            ([0.25, 0.25, 0.5], [0, 1, 2, 0]),
+            ([0.7, 0.2, 0.1], [2, 0, 1, 0]),
+        ] {
+            let mut vertex = ModelVertex::new([12.0, -3.5, 7.25], [0.0, 0.0, 1.0], [0.0, 0.0]);
+            vertex.bone_weights = weights;
+            vertex.bone_indices = indices;
+
+            let ours = skin(&vertex, &bones);
+            let theirs = shader(weights, indices).transform_point3(Vec3::from(vertex.position));
+            assert!(
+                (ours - theirs).length() < 1e-4,
+                "weights {weights:?} indices {indices:?}: {ours:?} vs {theirs:?}"
+            );
+        }
+    }
+
+    /// A weight of zero must contribute nothing **whatever bone it names** —
+    /// including a bone the model does not have.
+    ///
+    /// `build::assemble` pads every vertex's unused index slots with bone 0,
+    /// so in practice the padding names a real bone; this is the guard that
+    /// says the weight, and not the index, is what decides.
+    #[test]
+    fn an_unweighted_slot_contributes_nothing() {
+        use crate::materials::mesh::ModelVertex;
+
+        let bones = [Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0))];
+        let mut vertex = ModelVertex::new([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        vertex.bone_weights = [1.0, 0.0, 0.0];
+        // Slots 1 and 2 name bone 250, which is not in the palette at all.
+        vertex.bone_indices = [0, 250, 250, 0];
+
+        assert_eq!(skin(&vertex, &bones), Vec3::new(101.0, 2.0, 3.0));
+    }
 
     /// The Euler convention, against `AngleQuaternion` evaluated by hand.
     /// Getting this wrong turns a button's plate about the wrong axis, which

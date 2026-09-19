@@ -35,7 +35,7 @@
 use super::mdl::Mdl;
 use super::vtx::Vtx;
 use super::vvd::Vvd;
-use super::{Batch, BoneRun, HardwareMesh, StudioError, StudioModel};
+use super::{Batch, HardwareMesh, StudioError, StudioModel};
 use crate::materials::mesh::ModelVertex;
 
 pub(super) fn build(
@@ -62,6 +62,18 @@ pub(super) fn build(
                 normal: v.normal.to_array(),
                 texcoord: v.texcoord.to_array(),
                 tangent: tangent.to_array(),
+                // `mstudioboneweight_t` straight through, padded to the four
+                // indices the vertex format takes. The unused slots are bone 0
+                // at weight 0, which contributes nothing whatever bone 0 is
+                // doing — as opposed to leaving them uninitialised, which
+                // would read a bone the model may not have.
+                bone_weights: v.bones.weights,
+                bone_indices: [
+                    v.bones.bones[0],
+                    v.bones.bones[1],
+                    v.bones.bones[2],
+                    0,
+                ],
                 // No colour here: the baked static light is per *placement*,
                 // not per model, and lives in the second vertex stream that
                 // `engine::world::props` fills from the map's `.vhv` files.
@@ -82,14 +94,26 @@ pub(super) fn build(
         })
         .collect();
 
-    // Which bone moves each vertex, or `None` if any of them answers to more
-    // than one — see `StudioModel::rigid_bones`.
-    let vertex_bones: Option<Vec<u8>> = vvd
-        .vertices
-        .iter()
-        .map(|v| v.bones.rigid())
-        .collect::<Option<Vec<u8>>>()
-        .filter(|_| mdl.bones.len() > 1);
+    // Every weight names a bone the model has. The shader indexes the palette
+    // by these without checking, and an index past its end reads zero under
+    // `wgpu`'s bounds checking — which collapses the vertex onto the entity's
+    // origin rather than erroring. Cheaper to refuse the file here, where the
+    // message can say which model and which bone.
+    let bone_count = mdl.bones.len().max(1) as u32;
+    for (i, v) in vvd.vertices.iter().enumerate() {
+        for slot in 0..usize::from(v.bones.count).min(3) {
+            if u32::from(v.bones.bones[slot]) >= bone_count {
+                return Err(StudioError::Corrupt {
+                    path: vvd.path.clone(),
+                    what: format!(
+                        "vertex {i} is weighted to bone {} of {}",
+                        v.bones.bones[slot],
+                        mdl.bones.len()
+                    ),
+                });
+            }
+        }
+    }
 
     let mut indices: Vec<u32> = Vec::new();
     let mut batches: Vec<Batch> = Vec::new();
@@ -163,12 +187,11 @@ pub(super) fn build(
                 }
                 let first_index = indices.len() as u32;
                 let index_count = group.len() as u32;
-                let bones = append_grouped_by_bone(&mut indices, group, vertex_bones.as_deref());
+                indices.extend(group);
                 batches.push(Batch {
                     material: materials.get(material).cloned().unwrap_or_default(),
                     first_index,
                     index_count,
-                    bones,
                     body_part: bp_index as u16,
                     model: model_index as u16,
                 });
@@ -194,73 +217,7 @@ pub(super) fn build(
         // `StudioModel::load` fills this in; `assemble` joins three files and
         // has no filesystem to resolve a fourth against.
         includes: Vec::new(),
-        vertex_bones,
     })
-}
-
-/// Appends one batch's indices, with its **triangles sorted by bone**, and
-/// reports where each bone's run ended up.
-///
-/// A stable sort by the bone of the triangle's first vertex: stable so that a
-/// single-bone model's index order is byte-for-byte what it was before
-/// animation landed, and by the *first* vertex because a triangle whose three
-/// vertices disagree has no single answer.
-///
-/// > **A triangle that spans two bones is put with the first of them and
-/// > counted nowhere.** It cannot be drawn correctly without skinning: half of
-/// > it belongs to one matrix and half to another. No triangle in any model
-/// > this port loads spans bones — `every_shipped_studio_model_parses` checks
-/// > it across all 2,017 — so this is the behaviour for a case that does not
-/// > arise rather than a policy.
-fn append_grouped_by_bone(
-    indices: &mut Vec<u32>,
-    group: Vec<u32>,
-    vertex_bones: Option<&[u8]>,
-) -> Vec<BoneRun> {
-    let first_index = indices.len() as u32;
-
-    let Some(vertex_bones) = vertex_bones else {
-        // One bone, or a model that cannot be split: one run over everything,
-        // under bone 0 — whose matrix is the identity in the bind pose.
-        let index_count = group.len() as u32;
-        indices.extend(group);
-        return match index_count {
-            0 => Vec::new(),
-            _ => vec![BoneRun {
-                bone: 0,
-                first_index,
-                index_count,
-            }],
-        };
-    };
-
-    let bone_of = |triangle: &[u32]| -> u16 {
-        triangle
-            .first()
-            .and_then(|&v| vertex_bones.get(v as usize))
-            .map_or(0, |&b| u16::from(b))
-    };
-
-    let mut triangles: Vec<&[u32]> = group.chunks_exact(3).collect();
-    triangles.sort_by_key(|triangle| bone_of(triangle));
-
-    let mut runs: Vec<BoneRun> = Vec::new();
-    for triangle in triangles {
-        let bone = bone_of(triangle);
-        match runs.last_mut() {
-            Some(run) if run.bone == bone => run.index_count += 3,
-            _ => runs.push(BoneRun {
-                bone,
-                first_index: indices.len() as u32,
-                index_count: 3,
-            }),
-        }
-        indices.extend_from_slice(triangle);
-    }
-    // `chunks_exact` drops a trailing partial triangle; a `.vtx` whose index
-    // count is not a multiple of three is already refused by `vtx.rs`, so this
-    // is belt and braces rather than a path.
-    runs
 }
 
 /// The format's own guard against a stale companion file.

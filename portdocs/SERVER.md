@@ -1754,8 +1754,21 @@ subsystems rather than a staged plan.** In the order they are worth doing:
   It was never a class: nine models, **926 entities**, drawn in their bind pose
   because their sequences live in a companion `*_animation.mdl`.
   `CStudioHdr::ResolveIncludedModels`' bone remapping by name is what it
-  wanted, and `portdocs/STUDIO.md` §12 is the writeup. **Skinning is what
-  `prop_dynamic` left that is still open** — 74 models, 290 entities.
+  wanted, and `portdocs/STUDIO.md` §12 is the writeup. ~~Skinning is what
+  `prop_dynamic` left that is still open~~ — **skinning is done too**, so those
+  74 models and 290 entities are posed rather than frozen.
+- ~~**`prop_weighted_cube`**~~ — **done**, in `classes/prop.rs`. 98 cubes
+  across 59 maps. The first class here whose *base* is missing rather than its
+  siblings: `CPhysicsProp` is vphysics, so a cube is drawn in the right model
+  for its type and hangs where the map put it. Three findings, in
+  `rustdocs/SERVER.md`: **the `skin` key is a cube *type*** and 77 of the 98
+  take that path; the Schrodinger cube is dead code under an unacted `FIXME`;
+  and 23 cubes fire `OnPainted` on the first tick. `Dissolve` could not be
+  ported faithfully — `CTriggerPortalCleanser` is declared in no header this
+  tree ships. **What it does not unblock is the three sibling buttons**: a cube
+  with no vphysics never moves into a trigger, so `prop_floor_cube_button` and
+  `prop_floor_ball_button` are still waiting on `MOVETYPE_VPHYSICS` rather than
+  on the class.
 - `prop_physics` (132) and `func_physbox` need `rapier`. The 41 reconstructed
   Portal 2 classes (§1.3) need the paint and portal systems. Each gets its own
   portdoc.

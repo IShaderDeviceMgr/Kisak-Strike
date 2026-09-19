@@ -1785,6 +1785,21 @@ impl TestChamberDoor {
     pub fn is_animating(&self) -> bool;  // m_bIsAnimating: a `fully` is owed
     pub fn is_locked(&self) -> bool;     // m_bIsLocked
 }
+/// `prop_weighted_cube` — the first `CPhysicsProp` here, and this port has no
+/// physics, so what it is is a model, a skin ladder and nine inputs.
+/// **The `skin` key is a cube *type*, not a skin** — see the section below.
+/// The two enums are reached as `classes::prop::CubeType` /
+/// `classes::prop::PaintPower` — only the tests name them, so they are not
+/// re-exported at `classes`.
+pub enum CubeType { Standard, Companion, Reflective, Sphere, Antique, Schrodinger }
+pub enum PaintPower { Bounce, Reflect, Speed, Portal, None }
+pub struct WeightedCube {
+    pub cube_type: CubeType, pub rusted: bool, pub new_skins: bool,
+    pub activated: bool, pub skin: i32,
+    pub pre_painted_power: PaintPower, pub painted_power: PaintPower,
+    pub current_painted_type: PaintPower,
+    pub allow_portal_funnel: bool, pub pickup_disabled: bool,
+}
 // classes/player.rs — stage 5's two
 pub struct LogicPlayerProxy;
 pub struct RevertSaved { /* private; player_loadsaved */ }
@@ -1812,8 +1827,8 @@ impl PropPortal {
 pub fn teleport_matrix(entrance: (Vec3, Vec3), exit: (Vec3, Vec3)) -> Mat4;
 ```
 
-Forty-eight classnames, **35,232 of the shipped game's 60,925 entity blocks**.
-**Forty-three of them are among the 200 classnames the maps place**; the other
+Forty-nine classnames, **35,330 of the shipped game's 60,925 entity blocks**.
+**Forty-four of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2711,7 +2726,8 @@ the arm's origin start at 91.
     > *trigger* riding an attachment is tested against where it was one tick
     > ago. That is the same one-tick relationship the rest of the tick order
     > already has — the player's touch test runs before the thinks on purpose
-    > — and 21 of the game's attachment connections aim at a trigger.
+    > — and 23 of the game's attachment connections aim at a trigger (18
+    > `trigger_hurt`, 3 `trigger_once`, 2 `trigger_multiple`).
 
 92. **`m_flCycle` is a checkpoint, and reading it as the pose puts an
     attachment where the picture is not.** `CDynamicProp::AnimThink` writes it
@@ -2826,8 +2842,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
 | ~~`$includemodel`~~ | **Landed** in `src/studio/include.rs`, and it was measured here first: 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**. Of the 2,738 props playing a sequence two seconds into their map, the labels that resolve went from 1,666 to **2,556** and the ones that do not from 897 to **182** — and that remainder is Valve's own map errors, 183 `DefaultAnim` keys naming a sequence in no model at all. `animating` rose with it, because an animation that can now *end* fires `OnAnimationDone` into the game's 5,311 `SetAnimation` connections. |
 | `prop_dynamic_ornament` (`COrnamentProp`) | A prop that `FollowEntity`s another, which needs the same local/abs transform pair the `SetParent` family does. **Zero placed by any shipped map.** |
-| `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls, and `prop_weighted_cube` is not ported — so in this port they would be furniture that nothing can ever press. The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
-| `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | All of it needs `prop_weighted_cube`, which needs `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
+| `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls. `prop_weighted_cube` is ported now, but a cube here has no vphysics — it never falls, never moves and never enters a trigger — so those two would still be furniture nothing can press. **The blocker moved from the class to `MOVETYPE_VPHYSICS`.** The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
+| `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
 | **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
 | **The movement, still** — `CGameMovement` on the server, `CPlayerMove::RunCommand` | Stage 5 moved the *authority* (the move type, the health, the life state) and deliberately left the *integration* in `client/` on the rendered frame. §5 of the porting doc is the argument: `CPrediction` re-runs the same movement code on the client, so a one-process port with no `net/` already has the client half and would gain nothing but a 64 Hz camera by moving it. Revisit when `net/` exists. |
@@ -3104,6 +3120,15 @@ case values.
 | `attachment::tests::only_an_entity_wearing_a_studio_model_can_be_posed` | `GetBaseAnimating()` — a brush model is not one |
 | `attachment::tests::a_snapshot_is_not_taken_for_an_entity_nothing_hangs_off` | the pusher's snapshot not allocating for the 59,017 entities with no children |
 | `tests::every_shipped_attachment_connection_puts_its_entity_on_a_bone` | **every `SetParentAttachment*` in the game, followed through** — against the engine's real attachment table, with no GPU |
+| `tests::an_old_skin_key_is_read_as_a_cube_type_and_shifted` | `ConvertOldSkins`' whole table, including the two rows that collide — the path 77 of the game's 98 cubes take |
+| `tests::new_skins_takes_the_cube_type_key_and_leaves_the_skin_key_alone` | the other path, and that the two cannot be confused |
+| `tests::the_skin_comes_from_the_type_and_the_rust_flag` | `SetCubeSkin`'s eight reachable rows, including the three arms that are not what their shape suggests |
+| `tests::painting_a_cube_changes_its_skin_and_fires_onpainted_once` | `SetPaintedMaterial`'s change-vs-repeat guard, and that `NO_POWER` is never a paint |
+| `tests::a_cube_with_a_prepainted_power_fires_onpainted_when_the_map_starts` | `Activate`'s double call — the 23 shipped cubes that fire an output on tick one |
+| `tests::dissolving_a_cube_fires_onfizzled_and_removes_it` | both dissolve inputs, and the 63 shipped `OnFizzled` connections that listen |
+| `tests::the_funnel_and_pickup_flags_are_kept_and_toggled` | the four flags nothing reads yet, so the plumbing is known good when something does |
+| `tests::a_schrodinger_cube_is_remapped_to_a_reflective_one` | `SetCubeType`'s unacted `FIXME`, and the dead code below it |
+| `tests::every_shipped_map_spawns_its_entities` (the cube tally) | **what all 98 shipped cubes end up wearing**, model by model and skin by skin — which is both the proof that `ConvertOldSkins` works on real map data and the size of the skin-family gap (15 of 98) |
 
 Every depot test is `--ignored` and gated on `KISAK_GAME_DIR`:
 
@@ -3120,11 +3145,11 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 35,232 matched, 65
-created, 28,360 spawned, 6,937 lights deleted, 213 kept, 54,535 connections,
-157 unimplemented classnames, the full 49-name unhandled-key table, 5,787
-events dispatched, 5,037 inputs accepted, 7,318 thinks, 1,036 events that found
-no target, zero bad conversions, the **five**-name unhandled-input table, a peak
+server time**, and asserts exact totals: 60,925 blocks, 35,330 matched, 65
+created, 28,458 spawned, 6,937 lights deleted, 213 kept, 54,631 connections,
+156 unimplemented classnames, the full 49-name unhandled-key table, 5,787
+events dispatched, 5,042 inputs accepted, 7,318 thinks, 1,025 events that found
+no target, zero bad conversions, the **seven**-name unhandled-input table, a peak
 of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
@@ -3576,26 +3601,19 @@ Measured on the real file: `portal_button.mdl` is **3 bones, 4 sequences
 travels **7.29 units**, with `up` retracing `down` exactly.
 
 Four decisions there are worth knowing.
-**There is no skinning, and that is a substitution rather than a gap — with a
-measured expiry date.** Every vertex of every model the port *draws* answers
-to exactly one bone — a button's 7,929 split 7,263 on the body and 666 on the
-plate — so each batch's triangles are sorted by bone at load and each bone's
-contiguous run is drawn under its own matrix. That needs no change to the
-vertex format, the shaders or the bind groups, and it is **exact** for this
-data. It does **not** generalise: across the game 420 of 2,017 models have
-more than one bone and **141 of those share a vertex between two** (the
-`a4_destruction` set), so `StudioModel::rigid_bones` checks the precondition
-rather than assuming it, a model that fails it is drawn in its bind pose and
-counted, and those 141 are the condition that makes real skinning worth
-writing. **`prop_dynamic` cashed that condition in.** It places models rather
-than static props, so it reaches them: **74 of the 591 readable models the
-game's props name share a vertex between bones, and 290 entities wear one**,
-drawn in their bind pose instead of animating. Seven of those models are on
-`sp_a1_intro1` — the `models/container_ride/finedebris_part*` set — so it is
-visible on the map this port loads by default rather than only in a census.
-With `$includemodel` merged, skinning is now the **largest** gap in the model
-path — and it gates the next one, because the six include hosts whose
-animation is in an `.ani` are all models it cannot pose anyway.
+**Skinning was a substitution, and it has since been paid off.** Until it was,
+each batch's triangles were sorted by bone at load and each bone's contiguous
+run drawn under its own matrix — exact for a model whose vertices each answer
+to one bone, which a floor button's 7,929 do (7,263 on the body, 666 on the
+plate), and wrong for one whose do not. The condition that made real skinning
+worth writing was this class's own census: across the game 420 of 2,017 models
+have more than one bone and **141 of those share a vertex between two**, and
+**`prop_dynamic` cashed it in** by placing models rather than static props —
+**74 of the 591 readable models the game's props name share a vertex between
+bones, and 290 entities wear one**, seven of them on `sp_a1_intro1` (the
+`models/container_ride/finedebris_part*` set), all drawn in their bind pose.
+Skinning has landed — `rustdocs/STUDIO.md`, "Skinning" — so all 290 are posed,
+and the bone runs are gone: a batch is one draw again.
 **The RLE stream is expanded at load, not walked at draw**, because a whole
 button model's animation is a few hundred bytes — the game's longest is
 **4,050 frames**, which is the matching bound on that decision.
@@ -3633,8 +3651,9 @@ its trigger — and no connection in any shipped map fires `Kill` at one; an
 orphan does nothing, because its owner handle stops resolving and its filter
 then refuses everything. And **the three sibling classes are deliberately not
 here**: `prop_floor_cube_button` and `prop_floor_ball_button` accept *only*
-cubes and balls, and `prop_weighted_cube` is not ported, so in this port they
-would be furniture nothing could ever press.
+cubes and balls, and although `prop_weighted_cube` is ported now, a cube here
+has no vphysics and so never moves into a trigger — they would still be
+furniture nothing could press.
 
 The measurement that says *this* works is
 `server::tests::every_shipped_floor_button_presses_when_stood_on` — the
@@ -4031,7 +4050,8 @@ to `0`, inside the same tick.
 port already loads by default. That takes the port to **46 registered classnames and
 34,823 of the game's 60,925 entity blocks** — 41 of them among the 200 the maps
 place. (The two areaportal classnames landed afterwards, with `world/`'s
-visibility, taking those figures to 48 and 35,232.) All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
+visibility, taking those figures to 48 and 35,232; `prop_weighted_cube` then
+took them to 49 and 35,330.) All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
 `HalfWidth`/`HalfHeight`, so the whole of shipped content is "two default-sized
 portals in group 0, switched on by map logic": **31 `SetActivatedState`, 4
 `NewLocation`, and exactly one output connection in the entire game**, which is
@@ -4276,10 +4296,11 @@ What it bought, measured over the 106 shipped maps by
   maps, against `SetParent`'s 143 — the larger half of the family by nearly
   ten to one, and the reason this was worth doing before skinning.
 - **1,040 entities end the first two seconds riding a bone** rather than
-  sitting at their parent's origin, across **83 of the 106 maps**. 883 of the
-  connections are `func_brush.SetParentAttachmentMaintainOffset`, which is a
-  Hammer instance parenting its clip brushes to an arm through a `logic_auto`
-  bootstrap. The furthest point from its parent's origin is **7,050 units** —
+  sitting at their parent's origin, across **83 of the 106 maps**. Of the
+  1,037 connections whose target resolves to an entity, **903 name a
+  `func_brush`** — a Hammer instance parenting its clip brushes to an arm
+  through a `logic_auto` bootstrap — 98 a `prop_dynamic` or
+  `prop_dynamic_override`, 23 a trigger and 13 an `info_target`. The furthest point from its parent's origin is **7,050 units** —
   `sp_a2_bts6`'s `tube_ride_chell_proxy`, on `props_vac_anim/chell_bts6.mdl`,
   which is an animation that carries Chell across the map.
 - **174 connections name a point the parent's model has not got**, 6 aim at an
@@ -4323,3 +4344,92 @@ needed, and a Portal 2 chamber spends its opening seconds still. But it does
 mean the carrying half is thinly exercised by shipped content in that window,
 and `an_attachment_child_follows_the_bone_as_the_parent_animates` is what
 actually holds it.
+
+### `prop_weighted_cube` — a class with its simulation removed
+
+The first `CPhysicsProp` here, and the port has no vphysics — so this is the
+first class whose *base* is missing rather than whose siblings are. The
+interesting thing is how much of it survives that: a cube's identity is map
+data, and map data is exactly what this port has.
+
+**98 cubes across 59 of the game's 106 maps**, one of them on `sp_a1_intro1`,
+carrying 63 `OnFizzled` connections — nearly all of them a dropper being told
+to make another cube.
+
+What reaches the player: **the cube is drawn, in the right model for its type,
+and it fizzles when told to.** It hangs in the air where the map put it,
+because nothing falls here. What does not: pickup, throwing, the physics gun,
+the rotation controller that keeps a reflective cube's face square, the
+disabled-state machine, the tractor beam, and the whole Schrodinger half —
+which is unreachable in the shipped game anyway, see below.
+
+**Three findings, and the first is the one that would have looked like a
+content bug.**
+
+**The `skin` key is a cube *type*, not a skin.** `ConvertOldSkins`
+(`prop_weightedcube.cpp:324`) reads `m_nSkin` as a `WeightedCubeType_e` and
+throws the original away; `SetCubeSkin` then computes a fresh skin from the
+type, the rust flag and the painted power. A cube shipped with `skin 3` gets
+the **reflective model and skin 0**. Valve's comment calls this a "HACK HACK"
+for maps that were not updated to the new fields — and the maps were never
+updated, so it is the normal path: **77 of the 98 cubes have no `NewSkins` key
+at all** and only 19 write `CubeType`. The decrement inside it is the subtle
+part, because the old `skin` list had six entries where the type list has five
+(slot 2 was "Standard Activated"), so everything from 2 up shifts down one and
+skins 1 and 2 *both* mean companion cube. Get it wrong and 70 of the game's 98
+cubes wear the wrong model, plausibly — every value still maps to some real
+cube. `an_old_skin_key_is_read_as_a_cube_type_and_shifted` walks all six rows.
+
+**The Schrodinger cube is dead code in the shipped game, and its own `FIXME`
+says so.** `SetCubeType` opens with `if ( m_nCubeType == CUBE_SCHRODINGER )
+m_nCubeType = CUBE_REFLECTIVE;` under a `// FIXME: Remove for DLC2` that was
+never acted on — so the `case CUBE_SCHRODINGER` twenty lines below it, the one
+that links the twins, can never run, and neither can `SetCubeSkin`'s
+Schrodinger arm or the twin the `UpdateOnRemove` fizzles. Only `Precache` still
+sees the value. The variant is kept here so the remap is written where it
+happens; `a_schrodinger_cube_is_remapped_to_a_reflective_one` pins it.
+
+**A cube that ships pre-painted fires `OnPainted` on the first tick**, from an
+entity nothing has touched. `CPropWeightedCube::Activate` calls
+`SetPaintedMaterial( m_PrePaintedPower )` and *then* `BaseClass::Activate`,
+whose own `if ( m_PrePaintedPower != NO_POWER ) Paint( … )` reaches
+`SetPaintedMaterial` a second time — the first call is a change and fires, the
+second is a repeat and does not. **23 of the 98 cubes ship with `PaintPower 3`**
+and reach exactly this; one connection in the game listens.
+
+**What the shipped maps can actually produce is four skins.** `SetCubeSkin` has
+arms for bounce and speed paint and for an `m_bActivated` flag, and none is
+reachable from map data: `PaintPower` is `None` on 75 cubes and `Portal` on the
+other 23 — neither of which is a paint the ladder branches on — and
+`SetActivated`'s only callers are the laser-catcher path and the disabled-state
+machine, neither of which exists here. So every shipped cube ends on skin 0, 1
+or 3. The ladder is written out in full anyway, because it is the class.
+
+**Two things are declared and do nothing, and both are deliberate.**
+`PreDissolveJoke` is `RunScript( "CoopCubeFizzle()" )` and there is no VScript;
+`ExitDisabledState` leaves a state nothing here can enter. Both are *accepted*
+rather than dropped, so a map firing one is not reported as an unhandled input
+— which is the same reasoning `SetParentAttachment*`'s guards use.
+
+> **`Dissolve` cannot be ported faithfully, because its implementation is not
+> in this tree.** It is `CTriggerPortalCleanser::FizzleBaseAnimating( NULL,
+> this )`, and `CTriggerPortalCleanser` is *declared in no header the reference
+> tree ships* — three files name it and none defines it. What is known of it is
+> its two callers and the model the cube precaches for it
+> (`models/props/metal_box_fx_fizzler.mdl`), which says it swaps in a fizzling
+> effect prop before removing the cube. So `Dissolve` is implemented as
+> `SilentDissolve` — `OnFizzled` and the removal, without the effect — which is
+> the part a map can observe. When the cleanser lands, that is the seam.
+
+**One gap that is the renderer's and not this class's:** `m_nSkin` is computed
+correctly, carried to the renderer through `ModelState::skin`, and **not
+drawn** — `.mdl`'s skin table is not read at all yet, which is
+`portdocs/STUDIO.md` stage 6. So a companion cube draws with the standard
+cube's materials and a rusted one draws clean.
+
+`every_shipped_map_spawns_its_entities` puts a number on it by tallying what
+every shipped cube ends up wearing: **83 of the 98 end on skin 0 and are
+therefore correct; 15 are not** — 5 companion (skin 1), 8 rusted standard (skin
+3) and 2 rusted reflective (skin 1). **One of the 15 is `sp_a1_intro1`'s**, a
+rusted standard cube, so the gap is visible on the map this port loads by
+default. The four types that differ by *model* are all correct.

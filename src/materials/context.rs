@@ -378,12 +378,15 @@ impl RenderContext {
                 size_of::<FrameUniforms>() as u64,
                 INITIAL_PASSES,
             ),
-            draws: UniformArena::new(
+            // Group 2's layout declares the bone palette, so group 2's arena
+            // is the one that carries it — see `BoneBuffer`.
+            draws: UniformArena::with_bones(
                 device,
                 "draw uniforms",
                 layouts.draw(),
                 size_of::<DrawUniforms>() as u64,
                 INITIAL_DRAWS,
+                INITIAL_BONE_ROWS,
             ),
             lights: UniformArena::new(
                 device,
@@ -732,6 +735,7 @@ impl RenderContext {
             draws: &mut self.draws,
             lights: &mut self.lights,
             lighting_offset,
+            bone_base: None,
             portals: &mut self.portals,
             portal_offset,
             dynamic: &mut self.dynamic,
@@ -882,6 +886,13 @@ pub struct Pass<'a> {
     /// [`set_model_lighting`](Pass::set_model_lighting); starts at the
     /// fullbright block this pass allocated when it opened.
     lighting_offset: u32,
+    /// The bone palette every subsequent model draw is posed by: the first row
+    /// of it, and whether there is one at all.
+    ///
+    /// `None` is Valve's `bSkinning == false` — the vertex is placed by the
+    /// draw's model matrix alone and the palette is not read. A pass starts
+    /// there, and [`clear_bones`](Pass::clear_bones) goes back to it.
+    bone_base: Option<u32>,
     /// Cloned rather than borrowed because the arena it belongs to may be
     /// replaced by a growing draw allocation, and `set_bind_group` needs
     /// something that outlives that. `wgpu::BindGroup` is a refcounted handle.
@@ -1077,6 +1088,40 @@ impl Pass<'_> {
         self.lighting_offset = slot.0;
     }
 
+    /// Sets the pose every subsequent model draw is skinned by: one matrix per
+    /// bone, in **model space**.
+    ///
+    /// `CStudioRender::R_StudioSetupSkinAndLighting`'s half of the pair above,
+    /// and pass state for exactly the same reason — a model is one pose and
+    /// many meshes, so a palette bound per draw would re-upload the whole
+    /// skeleton once per material the model wears.
+    ///
+    /// What goes in is what [`studio::anim::pose`] returns: `boneToWorld *
+    /// poseToBone` for each bone, which maps a vertex from the bind pose the
+    /// `.vvd` stores into the posed model. **Not multiplied by the entity's
+    /// placement** — that is the draw's own model matrix, and folding it in
+    /// here would mean rewriting the palette whenever the entity moved.
+    ///
+    /// An empty slice is [`clear_bones`](Pass::clear_bones): a model with no
+    /// bones has no pose, and the bind-pose vertex is already where it belongs.
+    ///
+    /// [`studio::anim::pose`]: crate::studio::anim::pose
+    pub fn set_bones(&mut self, bones: &[Mat4]) {
+        if bones.is_empty() {
+            return self.clear_bones();
+        }
+        self.bone_base = Some(self.draws.push_bones(self.device, self.queue, bones));
+    }
+
+    /// Goes back to placing vertices by the draw's model matrix alone.
+    ///
+    /// What every non-model draw wants and what a static prop in its bind pose
+    /// wants: the palette would be one identity matrix, and not reading it is
+    /// cheaper than uploading it.
+    pub fn clear_bones(&mut self) {
+        self.bone_base = None;
+    }
+
     /// Sets the three numbers every subsequent
     /// [`PortalRefract`](super::shader::ShaderKind::PortalRefract) draw reads:
     /// how far open this portal is, how settled it is, and what time it is.
@@ -1263,6 +1308,10 @@ impl Pass<'_> {
                 material.modulation[2] * modulation[2],
                 material.modulation[3] * modulation[3],
             ],
+            // `bSkinning` and the row the palette starts at. A draw whose
+            // shader takes no model vertex never reads either; the field is
+            // written unconditionally because the block is one layout.
+            skinning: [self.bone_base.unwrap_or(0), self.bone_base.is_some() as u32, 0, 0],
         };
 
         let key = PipelineKey {
@@ -1426,12 +1475,70 @@ const INITIAL_LIGHTING: u64 = 1024;
 /// and can have at most two of them active at once; the slack is for the
 /// `portal` console command, which can make as many pairs as it is asked for.
 const INITIAL_PORTALS: u64 = 16;
+/// Rows in a fresh bone palette — 8,192 of them, which is 128 KiB and 2,730
+/// bones.
+///
+/// Sized off a *pose* rather than off a model: an instance costs its own bone
+/// count and nothing more, so this is "how many bones are posed in one frame",
+/// not "how big can one model get". A map's animated props are tens of
+/// entities of a few bones each; the outlier is
+/// `models/container_ride/finedebris_part12` at 248 bones, and `sp_a1_intro1`
+/// places seven of that family.
+const INITIAL_BONE_ROWS: u64 = 8192;
 
 /// A uniform buffer sub-allocated a slot at a time, bound with a dynamic
 /// offset.
 ///
 /// The per-frame and per-draw constant blocks are both this, at different
 /// rates. See the module docs for the hazard it exists to prevent.
+/// The bone palette that group 2's layout declares beside the per-draw block.
+///
+/// A flat array of `vec4` **rows**, three to a bone
+/// ([`BONE_ROWS`](super::uniforms::BONE_ROWS)), bound whole and indexed by
+/// [`DrawUniforms::skinning`](super::uniforms::DrawUniforms::skinning) rather
+/// than windowed by a dynamic offset — see that field for why a palette cannot
+/// have a fixed stride.
+///
+/// It lives *inside* [`UniformArena`] rather than beside it because the two
+/// share one bind group, and a bind group has to be rebuilt when either of its
+/// buffers is replaced. Splitting them would mean each growth telling the
+/// other half to rebind, which is the same coupling with a seam through it.
+struct BoneBuffer {
+    buffer: wgpu::Buffer,
+    /// Capacity, in rows.
+    rows: u64,
+    used: u64,
+    demand: u64,
+    /// The CPU mirror, flushed once a pass — the same batching `staged` does
+    /// for the uniform half, and for the same reason.
+    staged: Vec<[f32; 4]>,
+    flushed: u64,
+}
+
+impl BoneBuffer {
+    fn allocate(device: &wgpu::Device, label: &'static str, rows: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: rows * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        if self.used <= self.flushed {
+            return;
+        }
+        let (from, to) = (self.flushed as usize, self.used as usize);
+        queue.write_buffer(
+            &self.buffer,
+            from as u64 * 16,
+            bytemuck::cast_slice(&self.staged[from..to]),
+        );
+        self.flushed = self.used;
+    }
+}
+
 struct UniformArena {
     label: &'static str,
     layout: wgpu::BindGroupLayout,
@@ -1460,6 +1567,9 @@ struct UniformArena {
     /// than the whole frame's worth, so several passes cost several small
     /// writes rather than one growing quadratically.
     flushed: u64,
+    /// Binding 1, for the one arena whose layout declares it —
+    /// [`with_bones`](UniformArena::with_bones).
+    bones: Option<BoneBuffer>,
 }
 
 impl UniformArena {
@@ -1470,6 +1580,35 @@ impl UniformArena {
         size: u64,
         slots: u64,
     ) -> UniformArena {
+        Self::build(device, label, layout, size, slots, None)
+    }
+
+    /// [`new`](UniformArena::new) for the one arena whose layout also declares
+    /// a bone palette — group 2's.
+    ///
+    /// A separate constructor rather than a method that attaches one
+    /// afterwards, because the bind group is built from the layout and the
+    /// layout has two bindings: an arena that made its bind group first and
+    /// grew a palette second would fail validation in between.
+    fn with_bones(
+        device: &wgpu::Device,
+        label: &'static str,
+        layout: &wgpu::BindGroupLayout,
+        size: u64,
+        slots: u64,
+        rows: u64,
+    ) -> UniformArena {
+        Self::build(device, label, layout, size, slots, Some(rows))
+    }
+
+    fn build(
+        device: &wgpu::Device,
+        label: &'static str,
+        layout: &wgpu::BindGroupLayout,
+        size: u64,
+        slots: u64,
+        rows: Option<u64>,
+    ) -> UniformArena {
         // A dynamic offset must be a multiple of
         // `min_uniform_buffer_offset_alignment` — 256 on the portable floor
         // this port targets, so a 96-byte block still costs a 256-byte slot.
@@ -1477,7 +1616,24 @@ impl UniformArena {
         // per draw, and it is a good trade.
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let slot = size.next_multiple_of(alignment);
-        let (buffer, bind_group) = Self::allocate(device, label, layout, slot, slots, size);
+        let bones = rows.map(|rows| BoneBuffer {
+            buffer: BoneBuffer::allocate(device, "bone palette", rows),
+            rows,
+            used: 0,
+            demand: 0,
+            staged: vec![[0.0; 4]; rows as usize],
+            flushed: 0,
+        });
+        let (buffer, bind_group) = Self::allocate(
+            device,
+            label,
+            layout,
+            slot,
+            slots,
+            size,
+            None,
+            bones.as_ref().map(|b| &b.buffer),
+        );
         UniformArena {
             label,
             layout: layout.clone(),
@@ -1490,7 +1646,70 @@ impl UniformArena {
             demand: 0,
             staged: vec![0; (slot * slots) as usize],
             flushed: 0,
+            bones,
         }
+    }
+
+    /// Reserves `matrices.len()` bones' worth of rows, writes them, and
+    /// returns the **row** the palette starts at.
+    ///
+    /// # Panics
+    ///
+    /// If this arena has no bone palette. Only group 2's layout declares one,
+    /// and only group 2's arena is ever asked — a programming error rather
+    /// than a data one.
+    fn push_bones(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, matrices: &[Mat4]) -> u32 {
+        let wanted = (matrices.len() * uniforms::BONE_ROWS) as u64;
+        let (used, rows) = {
+            let bones = self.bones.as_mut().expect("arena has no bone palette");
+            bones.demand += wanted;
+            (bones.used, bones.rows)
+        };
+        if used + wanted > rows {
+            self.grow_bones(device, queue, (used + wanted).next_power_of_two());
+        }
+        let bones = self.bones.as_mut().expect("arena has no bone palette");
+        let base = bones.used;
+        for (i, matrix) in matrices.iter().enumerate() {
+            let rows = uniforms::bone_rows(*matrix);
+            let at = base as usize + i * uniforms::BONE_ROWS;
+            bones.staged[at..at + uniforms::BONE_ROWS].copy_from_slice(&rows);
+        }
+        bones.used += wanted;
+        base as u32
+    }
+
+    /// Replaces the bone buffer with a larger one, keeping every row already
+    /// handed out.
+    ///
+    /// The same trick [`grow`](UniformArena::grow) plays, and it has to be the
+    /// same one: draws already recorded name the *old* bind group, so the old
+    /// buffer is flushed before the swap and stays alive for them, while
+    /// `used` and `staged` carry over so a base row means the same thing on
+    /// both sides of the growth.
+    fn grow_bones(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rows: u64) {
+        let buffer = {
+            let Some(bones) = self.bones.as_mut() else {
+                return;
+            };
+            bones.flush(queue);
+            bones.rows = rows;
+            bones.buffer = BoneBuffer::allocate(device, "bone palette", rows);
+            bones.staged.resize(rows as usize, [0.0; 4]);
+            bones.flushed = 0;
+            bones.buffer.clone()
+        };
+        let (_, bind_group) = Self::allocate(
+            device,
+            self.label,
+            &self.layout,
+            self.slot,
+            self.slots,
+            self.size,
+            Some(&self.buffer),
+            Some(&buffer),
+        );
+        self.bind_group = bind_group;
     }
 
     fn allocate(
@@ -1500,27 +1719,50 @@ impl UniformArena {
         slot: u64,
         slots: u64,
         size: u64,
+        // The uniform buffer to rebind over, instead of making a new one —
+        // what a bone-only growth wants, since its uniform half is unchanged.
+        existing: Option<&wgpu::Buffer>,
+        // Binding 1, for the arena that has a bone palette. Left out and the
+        // bind group declares binding 0 alone, which is what the layouts of
+        // groups 0 and 3 want.
+        bones: Option<&wgpu::Buffer>,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: slot * slots,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let buffer = match existing {
+            Some(buffer) => buffer.clone(),
+            None => device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: slot * slots,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        };
+        let uniform = wgpu::BindGroupEntry {
+            binding: 0,
+            // The binding is one *slot*, not the whole buffer: a dynamic
+            // offset moves this window, and its size is what bounds the
+            // offset `wgpu` will accept.
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(size),
+            }),
+        };
+        let entries: Vec<wgpu::BindGroupEntry> = match bones {
+            // Bound whole, and deliberately: the palette is indexed by row
+            // from inside the shader, so there is no window to move.
+            Some(palette) => vec![
+                uniform,
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette.as_entire_binding(),
+                },
+            ],
+            None => vec![uniform],
+        };
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                // The binding is one *slot*, not the whole buffer: a dynamic
-                // offset moves this window, and its size is what bounds the
-                // offset `wgpu` will accept.
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(size),
-                }),
-            }],
+            entries: &entries,
         });
         (buffer, bind_group)
     }
@@ -1532,6 +1774,20 @@ impl UniformArena {
         self.used = 0;
         self.demand = 0;
         self.flushed = 0;
+        // The palette resets on the same boundary and grows by the same rule:
+        // a frame that needed more rows than the buffer held gets them before
+        // it is asked again, so the growth happens between frames rather than
+        // in the middle of one wherever the demand is steady.
+        if let Some(bones) = self.bones.as_mut() {
+            let demand = bones.demand;
+            let rows = bones.rows;
+            bones.used = 0;
+            bones.demand = 0;
+            bones.flushed = 0;
+            if demand > rows {
+                self.grow_bones(device, queue, demand.next_power_of_two());
+            }
+        }
     }
 
     fn grow(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, wanted: u64) {
@@ -1540,6 +1796,7 @@ impl UniformArena {
         // So it has to be handed over before the swap, not after.
         self.flush(queue);
         self.slots = wanted.next_power_of_two();
+        let palette = self.bones.as_ref().map(|bones| bones.buffer.clone());
         let (buffer, bind_group) = Self::allocate(
             device,
             self.label,
@@ -1547,6 +1804,8 @@ impl UniformArena {
             self.slot,
             self.slots,
             self.size,
+            None,
+            palette.as_ref(),
         );
         self.buffer = buffer;
         self.bind_group = bind_group;
@@ -1568,6 +1827,9 @@ impl UniformArena {
     /// property that makes a *rewritten* slot reach every draw in the frame,
     /// and so the reason each draw gets its own slot in the first place.
     fn flush(&mut self, queue: &wgpu::Queue) {
+        if let Some(bones) = self.bones.as_mut() {
+            bones.flush(queue);
+        }
         if self.used <= self.flushed {
             return;
         }

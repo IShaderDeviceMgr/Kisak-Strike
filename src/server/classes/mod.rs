@@ -74,7 +74,7 @@ pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Re
 pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
 pub use point::PointTeleport;
 pub use portal::PropPortal;
-pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor};
+pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
 
@@ -458,7 +458,18 @@ pub(super) static CLASSES: &[ClassDef] = &[
         outputs: prop::TESTCHAMBER_DOOR_OUTPUTS,
         create: TestChamberDoor::create,
     },
-    // …and the third, which is `portdocs/PORTAL.md` stage 2. 21 across 10
+    // …and the third. **98 across 59 maps, one of them on `sp_a1_intro1`**,
+    // and the first class here that is a `CPhysicsProp` — which this port has
+    // no physics for, so what it is is a model, a skin ladder and nine inputs.
+    // See [`WeightedCube`] for the accounting of what that leaves out.
+    ClassDef {
+        name: "prop_weighted_cube",
+        keys: prop::WEIGHTED_CUBE_KEYS,
+        inputs: WEIGHTED_CUBE_INPUTS,
+        outputs: prop::WEIGHTED_CUBE_OUTPUTS,
+        create: WeightedCube::create,
+    },
+    // …and the fourth, which is `portdocs/PORTAL.md` stage 2. 21 across 10
     // maps, **two of them on `sp_a1_intro1`**. It draws no model — see
     // [`PropPortal::model_state`] — and what you see where one is, is
     // `engine::world::portals`' overlay quad.
@@ -580,6 +591,7 @@ static TRIGGER_INPUTS: InputDefs = trigger::BASE_TRIGGER_INPUTS;
 static FLOOR_BUTTON_INPUTS: InputDefs = prop::FLOOR_BUTTON_INPUTS;
 static DYNAMIC_PROP_INPUTS: InputDefs = prop::DYNAMIC_PROP_INPUTS;
 static TESTCHAMBER_DOOR_INPUTS: InputDefs = prop::TESTCHAMBER_DOOR_INPUTS;
+static WEIGHTED_CUBE_INPUTS: InputDefs = prop::WEIGHTED_CUBE_INPUTS;
 static PORTAL_INPUTS: InputDefs = portal::PORTAL_INPUTS;
 /// `CBaseTrigger`'s two keys, which a `trigger_portal_button` is never offered
 /// — it is built from code — but which its `key_value` forwards, so they are
