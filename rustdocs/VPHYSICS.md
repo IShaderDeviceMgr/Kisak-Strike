@@ -36,7 +36,7 @@ for (body, origin, angles) in env.active() { /* VPhysicsUpdate */ }
 
 ---
 
-## 1. The four modules
+## 1. The five modules
 
 | Module | Is | Answers |
 |---|---|---|
@@ -44,6 +44,7 @@ for (body, origin, angles) in env.active() { /* VPhysicsUpdate */ }
 | [`surfaceprops`](../src/vphysics/surfaceprops.rs) | `scripts/surfaceproperties*.txt` | "how slippery is it?" |
 | [`env`](../src/vphysics/env.rs) | Rapier | "where does it end up?" |
 | [`shadow`](../src/vphysics/shadow.rs) | `physics_shadow.cpp`'s `CPlayerController` | "what does the player shove?" |
+| [`grab`](../src/vphysics/grab.rs) | `portal_grabcontroller_shared.cpp`'s `CGrabController` | "what is the player carrying?" |
 
 `vphysics::Model` ties the three together — hulls, the `solid { }` block, and
 the mass properties — and is what a consumer usually holds.
@@ -181,6 +182,45 @@ calling it:
   correct. `PlayerState::vphysics_position` carries it, and
   `portdocs/VPHYSICS_SHADOW.md` §3.3 has the arithmetic and the measurement.
 
+## 4d. Carrying something
+
+```rust,ignore
+GrabController::attach(&mut Environment, BodyId) -> GrabController
+GrabController::drive(&mut Environment, target, rotation: Quat, player_speed, dt)
+GrabController::error(&mut self, &Environment) -> f32
+GrabController::detach(self, &mut Environment, player_velocity, max_speed)
+GrabController::body() -> BodyId
+```
+
+`portdocs/VPHYSICS_GRAB.md` is the design, and
+[`server::grab`](../src/server/grab.rs) is the half that decides *where* to
+hold something. Five things to know before calling it:
+
+- **It is the shadow control again, with rotation.** Same
+  `ComputeShadowControllerIVP` as [`shadow`](#4c-the-players-shadow), but
+  driving a body's orientation as well as its position — so `drive` takes a
+  `Quat` and writes an angular velocity.
+- **`ComputeController` has two overloads and they are not interchangeable.**
+  The shadow control uses the **scalar** one (`physics_shadow.cpp:46`), which
+  clamps the correction by vector magnitude and keeps damping as a second
+  clamped term; `CPlayerController` uses the **per-axis** one (`:94`).
+  `shadow::compute_controller` is the per-axis one and `grab`'s is the scalar
+  one, and swapping them lets a diagonal carry through at √3 times the
+  intended speed.
+- **A held object weighs one kilogram.** `attach` saves the real mass and
+  writes `CARRY_MASS` (1 kg); `detach` puts it back. Nothing else may write a held
+  body's mass in between, and `load_weight()` is what the *real* mass is still
+  called when a contact has to be judged heavy or light.
+- **A held body is invisible to [`sweep_box`](#4b-asking-the-environment-a-question)**
+  and does not collide with the player's own shadow. Both come from
+  `Environment::set_held`, which sets a flag the sweep filter reads and a
+  collider interaction group the solver reads. Without the first the player
+  cannot walk forwards while carrying anything, because their own movement
+  trace is stopped by the cube in their hands.
+- **`error()` has a side effect.** It consumes the accumulated time, so a
+  second call in the same tick returns zero — which is also why Valve's second
+  drop threshold is unreachable (`portdocs/VPHYSICS_GRAB.md` §6.1).
+
 ## 5. Invariants and gotchas, most likely to bite first
 
 1. **`IVP_Compact_Surface::rotation_inertia` is not a moment of inertia, and
@@ -316,13 +356,23 @@ playerclip and monsterclip (gotcha 6).
 `portdocs/VPHYSICS.md` §9 has the reasons; this is the list, ordered by what
 would be noticed first.
 
-- **`CGrabController`** (`portal_grabcontroller_shared.cpp`, 3,252 lines) —
-  picking a cube up. It is the other half of every cube puzzle in the game, and
-  it is why "a cube holds a floor button down" is *reachable* here and not
-  *demonstrable*: **no cube in Portal 2 ships on a button.** All 98 come out of
-  a dropper or sit on a shelf, the nearest one 128–256 units from the nearest of
-  the game's 78 buttons, and it is the player who carries it there.
-  `portdocs/VPHYSICS_SHADOW.md` §7.
+- **The VM grab** — `AttachEntityVM`, `UpdateObjectVM`,
+  `C_PlayerHeldObjectClone` and the rest of the roughly one third of
+  `portal_grabcontroller_shared.cpp` that draws a held object as a **view
+  model** clone. `CPortal_Player::UpdateVMGrab` (`portal_player.cpp:3835`)
+  picks it per object, and in single player only `npc_personality_core` takes
+  it — 21 in the game, a class this port does not have — so a cube goes the
+  physics way. There is also no view model to draw into.
+  `portdocs/VPHYSICS_GRAB.md` §0.1.
+- **Carrying a held object through a portal** — and the blocker is *not* the
+  grab controller. Nothing but the player teleports here at all, so the ~300
+  lines of portal branches in `UpdateObject`, `ComputeError`, `AttachEntity`
+  and `CheckPortalOscillation` have nothing to stand on.
+  `portdocs/VPHYSICS_GRAB.md` §9.
+- **`FindSafePlacementLocation`** (270 lines) — the three-pass search for
+  somewhere to put a held object down. Called only from `DetachEntityVM`, so it
+  leaves with the VM path; the physics drop refuses instead, through
+  `TestIntersectionVsHeldObjectCollide`.
 - **`CCubeRotationController`** (`prop_weightedcube.h:35`) — the
   `IMotionEvent` that turns a tumbling cube upright as it lands, which is why a
   dropped cube in the shipped game settles square and this port's visibly does
@@ -354,6 +404,13 @@ would be noticed first.
 
 | Behaviour | Test |
 |---|---|
+| A held object drops to 1 kg and gets its mass back | `attaching_drops_the_mass_to_one_kilogram_and_detaching_puts_it_back` |
+| A held object goes where it is told, and holds its height against gravity | `a_held_cube_is_driven_to_where_it_is_told_to_be`, `a_held_cube_does_not_fall` |
+| …and takes the orientation it is given | `a_held_cube_is_turned_to_the_orientation_it_is_given` |
+| The angular delta is world-space and shortest-arc | `the_angular_delta_is_world_space_and_takes_the_short_way_round` |
+| The scalar `ComputeController` clamps by magnitude, not per axis | `the_scalar_controller_clamps_the_whole_vector_not_each_axis` |
+| The grace second, and that `error()` consumes its own time | `error_is_zero_for_the_first_second_of_a_hold`, `a_second_error_query_in_one_tick_reads_zero` |
+| A held body is invisible to a sweep, and visible again once dropped | `a_held_cube_is_invisible_to_a_sweep` |
 | A world solid's contents decide whether it stops a prop | `world::physics::add_world`, asserted by `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` *(depot)* |
 | The `.phy` byte layout, all of it | `a_box_round_trips_through_the_compact_surface_layout` |
 | Both container layouts agree | `the_bare_ivps_layout_reads_the_same_as_the_vphy_one` |

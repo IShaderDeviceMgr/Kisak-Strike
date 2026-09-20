@@ -19,6 +19,7 @@
 
 pub mod collide;
 pub mod env;
+pub mod grab;
 pub mod shadow;
 pub mod surfaceprops;
 

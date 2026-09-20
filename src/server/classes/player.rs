@@ -68,6 +68,13 @@ pub const IN_JUMP: u32 = 1 << 1;
 /// never reaches that branch: `sp_fade_and_force_respawn` gets there first.
 pub const IN_DUCK: u32 = 1 << 2;
 
+/// `IN_USE` — the key that picks a cube up and puts it down.
+///
+/// Read on its **press edge** only (`m_afButtonPressed`): a held key must not
+/// re-grab every tick, and `CPortal_Player::PlayerUse` debounces it for the
+/// same reason.
+pub const IN_USE: u32 = 1 << 5;
+
 /// `VEC_DUCK_HULL_MAX.z` (`portal_mp_gamerules.cpp:177`) — 36, against 72
 /// standing.
 ///

@@ -82,12 +82,15 @@
 //! > sequence, and an `AnimThink` it replaces with its own. Composing them
 //! > would share four lines and two unused fields.
 //!
-//! Also absent, and each measured rather than assumed: the weighted cube and
-//! the monster box halves of the press. [`WeightedCube`] *is* ported now, but
-//! it cannot press anything — a cube here has no vphysics, so it never moves,
-//! never touches and never enters a trigger. **The player is still the only
-//! thing in this port that can press a button**, which is what
-//! `prop_floor_button` is for and is why its three siblings are not here.
+//! **The cube half of the press has landed.** It was absent for two stages
+//! and for two different reasons: first because a cube had no vphysics and so
+//! never moved, never touched and never entered a trigger; then, once it
+//! could be shoved, because **no cube in the game ships within 128 units of a
+//! button** and shoving does not cover the distance. The grab controller
+//! (`portdocs/VPHYSICS_GRAB.md`) closed it — a carried cube reaches a button —
+//! so [`ButtonTrigger::passes_trigger_filters`] now has Valve's second arm.
+//! The monster box half is still absent, because `prop_monster_box` has no
+//! class here.
 //! Also absent: the co-op team outputs, which need
 //! `GameRules()->IsMultiplayer()`; the `ACH.BOX_HOLE_IN_ONE` achievement
 //! think; and `sv_slippery_cube_button`'s surface-property swap, which is
@@ -221,6 +224,18 @@ impl FloorButton {
     /// thing that distinguishes them at this level. It is asked of the *owner*
     /// by [`ButtonTrigger::passes_trigger_filters`], which is Valve's
     /// `m_pOwnerButton->ShouldPlayerTouch()`.
+    /// `CPropFloorButton::AcceptsBall` (`:91`) — `true`, and `false` only on
+    /// the cube button, which this port does not have.
+    pub fn accepts_ball(&self) -> bool {
+        true
+    }
+
+    /// `CPropFloorButton::OnlyAcceptBall` (`:90`) — `false`, and `true` only
+    /// on the ball button, which this port does not have either.
+    pub fn only_accept_ball(&self) -> bool {
+        false
+    }
+
     pub fn should_player_touch(&self) -> bool {
         true
     }
@@ -486,7 +501,36 @@ impl ButtonTrigger {
             .and_then(|e| e.behaviour.downcast_ref::<FloorButton>())
             .is_some_and(FloorButton::should_player_touch);
 
-        accepts_players && other_core.has_flags(FL_CLIENT)
+        if accepts_players && other_core.has_flags(FL_CLIENT) {
+            return true;
+        }
+
+        // **"did a cube touch me?"** (`prop_floor_button.cpp:536`). This arm
+        // could not fire until the grab controller landed: a cube had no way
+        // to reach a button, because none ships within 128 units of one and
+        // shoving does not cover the distance. Carrying one does.
+        //
+        // The ball gates are `m_pOwnerButton->AcceptsBall()` and
+        // `OnlyAcceptBall()`, and for `prop_floor_button` — the only one of
+        // the four sibling classes this port has — they are `true` and `false`
+        // respectively (`:90`), so **every** cube type passes. The test is
+        // written out rather than collapsed to `true` because the siblings
+        // disagree and this is where they would differ.
+        if other_core.class.name != "prop_weighted_cube" {
+            return false;
+        }
+        let is_ball = cx
+            .entity(other)
+            .and_then(|e| e.behaviour.downcast_ref::<WeightedCube>())
+            .is_some_and(|cube| cube.cube_type == CubeType::Sphere);
+        let owner = self.owner.and_then(|id| cx.entity(id));
+        let accepts_ball = owner
+            .and_then(|e| e.behaviour.downcast_ref::<FloorButton>())
+            .is_some_and(FloorButton::accepts_ball);
+        let only_ball = owner
+            .and_then(|e| e.behaviour.downcast_ref::<FloorButton>())
+            .is_some_and(FloorButton::only_accept_ball);
+        (is_ball && accepts_ball) || (!is_ball && !only_ball)
     }
 }
 

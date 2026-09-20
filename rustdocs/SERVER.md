@@ -277,6 +277,17 @@ pub trait TouchQuery {
     /// **world's** solid, not the brush models'.
     fn start_solid(&mut self, origin: Vec3, mins: Vec3, maxs: Vec3) -> bool;
 
+    /// `MASK_SOLID_BRUSHONLY` — the world and its solid brush models, and
+    /// nothing else. The grab controller's carry ray and floor bump.
+    /// **Has a default**, "nothing is in the way".
+    ///
+    /// Not `push_trace` with an empty pusher list: that runs
+    /// `MASK_PLAYERSOLID`, which contains `CONTENTS_PLAYERCLIP`, and a player
+    /// clip is exactly what a held object passes through.
+    fn solid_trace(
+        &mut self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3,
+    ) -> PushHit;
+
     /// One of the pusher's three sweeps. **Has a default** — "nothing is in
     /// the way" — so a fixture that only cares about touching does not have
     /// to answer it.
@@ -295,7 +306,8 @@ pub struct Pusher { pub model: usize, pub origin: Vec3, pub angles: Vec3 }
 /// Which clip chain a push sweep runs against. See [`push`](#push-pushrs--the-pusher).
 pub enum PushClip { PushersOnly, WithoutPushers, Everything }
 
-/// `trace_t`, reduced to the three fields the pusher reads.
+/// `trace_t`, reduced to the three fields the pusher — and now the carry —
+/// reads. Named for its first caller; there is nothing about pushing in it.
 pub struct PushHit { pub fraction: f32, pub end: Vec3, pub start_solid: bool }
 
 pub struct NoTouchQuery;   // reports nothing, and nothing is solid
@@ -347,6 +359,7 @@ pub struct PlayerState {
     pub buttons: u32,          // IN_*, as a raw mask
     pub wish_velocity: Vec3,   // m_outWishVel, for the physics shadow
     pub vphysics_position: Vec3, // m_vNewVPhysicsPosition — where the shadow is sent
+    pub view_offset: Vec3,     // m_vecViewOffset; the eye is origin + this
 }
 ```
 
@@ -1685,6 +1698,58 @@ these two stopped overlapping":
 So an `EndTouch` costs nothing to detect — and a trigger that is switched off
 simply stops being reported by the query, and everything inside it leaves on
 the next tick.
+
+### `grab` (`grab.rs`) — carrying a prop
+
+```rust
+/// `CPlayerPickupController`'s game state; the controller itself is on `Physics`.
+pub struct Carry {
+    pub entity: EntityId,
+    pub angles_player_space: Vec3,
+    pub center_object_space: Vec3,
+    pub radius: f32,
+    pub up_offset: f32,
+    pub floor_bump: f32,
+}
+
+/// `CBasePlayer::CanPickupObject` with Portal 2's 85 kg / 128 unit limits.
+pub fn can_pickup(mass: f32, size: Vec3, standing_on_it: bool) -> bool;
+
+/// `CGrabController::UpdateObject`'s geometry — where a held object's
+/// **origin** and orientation should be this tick.
+pub fn hold_placement(&Hold, floor_bump: &mut f32, &mut dyn TouchQuery) -> (Vec3, Quat);
+
+/// The eleven rays `CPortal_Player::FindUseEntity` casts, in order.
+pub fn use_rays(eye: Vec3, view: Vec3) -> Vec<(Vec3, Vec3, f32)>;
+
+pub fn align_angles(angles: Vec3, cosine: f32) -> Vec3;
+pub fn from_player_space(angles_player_space: Vec3, yaw: f32) -> Quat;
+pub fn to_player_space(angles: Vec3, yaw: f32) -> Vec3;
+```
+
+`portdocs/VPHYSICS_GRAB.md` is the design; [`vphysics::grab`] drives the body.
+Everything here is a **pure function taking a query**, so the geometry is
+tested without a map — `Server::player_use`, `pick_up`, `drop_carried` and
+`drive_carry` are the four methods that string them together, and they sit at
+`ItemPreFrame` and `PostThink` in the tick exactly where Valve's do.
+
+Four things that are not obvious:
+
+- **The carry is a column, not a stick.** `player_hold_object_in_column`
+  defaults to 1, and with it the hold distance is measured to a *vertical
+  plane* a fixed distance in front of the player rather than along the look
+  vector. The object keeps its horizontal stand-off and rides up and down as
+  you look up and down. `player_hold_column_max_size` (96) bounds it, and for
+  a cube that bound bites at about 38° of pitch.
+- **Pitch does not reach the held object.** `SetIgnorePitch( true )` makes the
+  player-space transform yaw-only, so looking up and down moves the cube but
+  never tips it.
+- **`align_angles` must snap Z first.** Valve's loop runs `for ( int j = 3;
+  --j >= 0; )` with the note *"NOTE: Must align z first"* and
+  re-orthogonalises after each snap; doing X first can flip Z.
+- **The up offset lands twice and the trace fraction is scaled by the wrong
+  length**, both reproduced — see `hold_placement`'s comments. They are worth
+  at most ten units of reach and every shipped carry is tuned against them.
 
 ### The brush-entity seam
 

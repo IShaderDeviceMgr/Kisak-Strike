@@ -4065,6 +4065,7 @@ fn player_at(origin: Vec3) -> PlayerState {
         buttons: 0,
         wish_velocity: Vec3::ZERO,
         vphysics_position: origin,
+        view_offset: crate::client::player::VEC_VIEW,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),
     }
@@ -4128,8 +4129,9 @@ fn walking_into_a_trigger_fires_its_outputs() {
 }
 
 /// `SF_TRIGGER_ALLOW_CLIENTS` is what makes a trigger notice a player, and a
-/// trigger without it notices nothing — 141 of the game's `trigger_multiple`s
-/// are physics-only in exactly this way.
+/// trigger without it notices nothing — **307 of the game's 899
+/// `trigger_multiple`s** set `SF_TRIGGER_ALLOW_PHYSICS` and not
+/// `SF_TRIGGER_ALLOW_CLIENTS`, and are physics-only in exactly this way.
 #[test]
 fn a_trigger_that_does_not_allow_clients_ignores_the_player() {
     let mut map = trigger_map("trigger_multiple", "OnStartTouch", &[]);
@@ -9752,4 +9754,315 @@ fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
         (1362, 1040, 6, 6, 0, 174),
         "the attachment census over the shipped maps has changed"
     );
+}
+
+/// A 44-unit cube's collision model, built by hand — the shipped
+/// `metal_box.phy` is 40 kg and about this size.
+fn test_cube_model() -> crate::vphysics::Model {
+    use crate::vphysics::collide::{Ledge, Solid, SolidParams};
+    use crate::vphysics::env::{Hulls, Mass};
+
+    let half = 22.0;
+    let mut points = Vec::new();
+    for i in 0..8 {
+        points.push(Vec3::new(
+            if i & 1 == 0 { -half } else { half },
+            if i & 2 == 0 { -half } else { half },
+            if i & 4 == 0 { -half } else { half },
+        ));
+    }
+    let solid = Solid {
+        mass_center: Vec3::ZERO,
+        rotation_inertia: Vec3::splat((2.0 * half).powi(2) / 12.0 * 2f32.sqrt()),
+        radius: half * 3f32.sqrt(),
+        ledges: vec![Ledge {
+            points,
+            triangles: Vec::new(),
+            material: 0,
+            mixed_materials: false,
+        }],
+    };
+    let params = SolidParams {
+        mass: 40.0,
+        ..Default::default()
+    };
+    crate::vphysics::Model {
+        hulls: Hulls::from_solid(&solid),
+        mass: Mass::from_solid(&solid, &params),
+        params,
+        jointed: false,
+    }
+}
+
+/// An environment holding a floor at `z = 0` and the cube's collision model,
+/// so that a `prop_weighted_cube` in a synthetic map gets a real body and
+/// something to land on.
+fn cube_physics(server: &mut Server) {
+    use crate::vphysics::collide::{Ledge, Solid};
+    use crate::vphysics::env::{Environment, Hulls, Motion};
+    use crate::vphysics::surfaceprops::SurfaceProps;
+
+    let mut env = Environment::new(SurfaceProps::default());
+    // A 4,096-unit floor, its top face exactly at z = 0 — so a 44-unit cube
+    // comes to rest with its origin at z = 22 and its box spanning 0..44,
+    // which overlaps the button trigger's 0..14 the way a real one does.
+    let mut points = Vec::new();
+    for i in 0..8 {
+        points.push(Vec3::new(
+            if i & 1 == 0 { -4096.0 } else { 4096.0 },
+            if i & 2 == 0 { -4096.0 } else { 4096.0 },
+            if i & 4 == 0 { -64.0 } else { 0.0 },
+        ));
+    }
+    let floor = Solid {
+        mass_center: Vec3::ZERO,
+        rotation_inertia: Vec3::ONE,
+        radius: 4096.0,
+        ledges: vec![Ledge {
+            points,
+            triangles: Vec::new(),
+            material: 0,
+            mixed_materials: false,
+        }],
+    };
+    env.add(
+        Motion::Static,
+        &Hulls::from_solid(&floor),
+        Vec3::ZERO,
+        Vec3::ZERO,
+        "default",
+        None,
+    )
+    .expect("a floor");
+
+    let mut models = std::collections::HashMap::new();
+    models.insert("models/props/metal_box.mdl".to_owned(), test_cube_model());
+    server.set_physics(env, models, Vec::new());
+}
+
+/// **A cube presses a floor button**, which is the whole point of
+/// `portdocs/VPHYSICS_GRAB.md` and could not happen before it.
+///
+/// `CPortalButtonTrigger::PassesTriggerFilters`
+/// (`prop_floor_button.cpp:536`) has two arms — a player, or a
+/// `prop_weighted_cube`/`prop_monster_box` — and this port had only the first,
+/// correctly, for as long as a cube could not move. It can now, so the second
+/// arm is here and this is its test.
+///
+/// No map and no player: the cube is dropped through the trigger under
+/// gravity, which is enough to prove the filter and the touch path. What it
+/// takes to *get* a cube to a button on shipped content is
+/// `the_player_carries_the_cube_to_the_floor_button_on_sp_a1_intro1`.
+#[test]
+fn a_falling_cube_presses_a_floor_button() {
+    let mut map = button_map(&[("origin", "0 0 0")]);
+    map.push(block(&[
+        ("classname", "prop_weighted_cube"),
+        ("targetname", "box"),
+        ("origin", "0 0 80"),
+    ]));
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    cube_physics(&mut server);
+
+    assert!(!pad(&server).pressed, "nothing on it yet");
+    // Long enough for a 60-unit drop at Source gravity, plus the settle.
+    run_touching(&mut server, &mut NoTouchQuery, 1.0);
+
+    assert!(
+        pad(&server).pressed,
+        "a cube in the trigger should press the pad"
+    );
+    assert_eq!(counter_value(&server, "down"), 1.0, "and fire OnPressed once");
+}
+
+/// The other half of the filter: a prop that is **not** a cube does not press
+/// it, so the arm is a classname test rather than "anything solid".
+#[test]
+fn a_falling_prop_that_is_not_a_cube_does_not_press_a_floor_button() {
+    let mut map = button_map(&[("origin", "0 0 0")]);
+    map.push(block(&[
+        ("classname", "prop_physics"),
+        ("targetname", "crate"),
+        ("origin", "0 0 60"),
+    ]));
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    cube_physics(&mut server);
+
+    run_touching(&mut server, &mut NoTouchQuery, 1.0);
+    assert!(
+        !pad(&server).pressed,
+        "only a cube or a monster box presses a floor button"
+    );
+}
+
+// ===========================================================================
+// CGrabController — picking a cube up
+// ===========================================================================
+
+/// A map with a floor, a cube on it and nothing else.
+fn carry_map(cube_origin: &str) -> Vec<bsp::Entity> {
+    vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[
+            ("classname", "prop_weighted_cube"),
+            ("targetname", "box"),
+            ("origin", cube_origin),
+        ]),
+    ]
+}
+
+/// A player at `origin` with `+use` held or not, looking along +X.
+fn player_using(origin: Vec3, pitch: f32, use_key: bool) -> PlayerState {
+    let mut state = player_at(origin);
+    state.angles = Vec3::new(pitch, 0.0, 0.0);
+    state.buttons = match use_key {
+        true => crate::server::classes::IN_USE,
+        false => 0,
+    };
+    state
+}
+
+/// **`+use` picks a cube up**, and the ten tangent rays are why: the player is
+/// looking dead level and the cube is on the floor sixty units away, so the
+/// 1,024-unit line misses it entirely and one of `FindUseEntity`'s downward
+/// fans is what finds it.
+#[test]
+fn pressing_use_while_looking_at_a_cube_picks_it_up() {
+    let mut server = Server::new();
+    server.level_init("test", &carry_map("60 0 22"), &[]);
+    cube_physics(&mut server);
+    let cube = find_named(&server, "box").id();
+
+    server.spawn_player(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+    assert_eq!(server.carried(), None, "nothing held before the key");
+
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(server.carried(), Some(cube), "`+use` should pick the cube up");
+}
+
+/// And pressing it again puts the cube down — the press *edge*, so holding the
+/// key does not drop what it just picked up.
+#[test]
+fn pressing_use_again_puts_the_cube_down() {
+    let mut server = Server::new();
+    server.level_init("test", &carry_map("60 0 22"), &[]);
+    cube_physics(&mut server);
+    let cube = find_named(&server, "box").id();
+
+    server.spawn_player(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(server.carried(), Some(cube));
+
+    // Held down: still carried, because only the press edge counts.
+    run_touching(&mut server, &mut NoTouchQuery, 0.5);
+    assert_eq!(server.carried(), Some(cube), "holding the key is not a drop");
+
+    // Release, then press again.
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, false));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(server.carried(), None, "a second press drops it");
+}
+
+/// A carried cube is **held in front of the eye and rides the player's yaw**,
+/// which is the whole of `UpdateObject` seen from outside.
+#[test]
+fn a_carried_cube_follows_the_player() {
+    let mut server = Server::new();
+    server.level_init("test", &carry_map("60 0 22"), &[]);
+    cube_physics(&mut server);
+    let cube = find_named(&server, "box").id();
+
+    server.spawn_player(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(server.carried(), Some(cube));
+
+    // Let the controller pull it into place.
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.5);
+    let held = find_named(&server, "box").origin;
+    assert!(held.x > 20.0, "it should be out in front of the eye: {held}");
+    assert!(held.z > 30.0, "and lifted off the floor: {held}");
+
+    // Walk 200 units east; the cube comes along and keeps its stand-off.
+    let reach = held.distance(Vec3::new(0.0, 0.0, 64.0));
+    for step in 1..=40 {
+        let mut state = player_using(Vec3::new(step as f32 * 5.0, 0.0, 0.0), 0.0, false);
+        state.velocity = Vec3::new(175.0, 0.0, 0.0);
+        server.set_player_state(state);
+        ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    }
+    assert_eq!(server.carried(), Some(cube), "still carrying it after 200 units");
+    let moved = find_named(&server, "box").origin;
+    assert!(moved.x > 180.0, "the cube came with the player: {moved}");
+    let reach_now = moved.distance(Vec3::new(200.0, 0.0, 64.0));
+    assert!(
+        (reach_now - reach).abs() < 24.0,
+        "and kept its distance from the eye: {reach:.1} then {reach_now:.1}"
+    );
+}
+
+/// Turning turns the cube around you, because the carry angles are held in the
+/// player's **yaw** frame.
+#[test]
+fn a_carried_cube_swings_round_when_the_player_turns() {
+    let mut server = Server::new();
+    server.level_init("test", &carry_map("60 0 22"), &[]);
+    cube_physics(&mut server);
+
+    server.spawn_player(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.5);
+    let east = find_named(&server, "box").origin;
+
+    let mut turned = player_using(Vec3::ZERO, 0.0, false);
+    turned.angles = Vec3::new(0.0, 90.0, 0.0);
+    server.set_player_state(turned);
+    run_touching(&mut server, &mut NoTouchQuery, 0.5);
+    let north = find_named(&server, "box").origin;
+
+    assert!(east.x > 20.0 && east.y.abs() < 20.0, "held east: {east}");
+    assert!(north.y > 20.0 && north.x.abs() < 20.0, "held north: {north}");
+}
+
+/// **The held cube must not block the player's own movement trace.** It hangs
+/// fifteen units in front of the eye; if `sweep_box` reported it, the player
+/// could not walk forwards while carrying anything.
+#[test]
+fn a_held_cube_does_not_stop_the_player_who_holds_it() {
+    let mut server = Server::new();
+    server.level_init("test", &carry_map("60 0 22"), &[]);
+    cube_physics(&mut server);
+    let cube = find_named(&server, "box").id();
+
+    server.spawn_player(player_using(Vec3::ZERO, 0.0, false));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+    server.set_player_state(player_using(Vec3::ZERO, 0.0, true));
+    ticks_touching(&mut server, &mut NoTouchQuery, 1);
+    assert_eq!(server.carried(), Some(cube));
+    run_touching(&mut server, &mut NoTouchQuery, 0.25);
+
+    let body = find_named(&server, "box").physics.expect("the cube's body");
+    let physics = server.physics().expect("an environment");
+    // The sweep a walking player makes, straight through where the cube is.
+    let held = find_named(&server, "box").origin;
+    let from = Vec3::new(held.x - 48.0, held.y, held.z);
+    let to = Vec3::new(held.x + 48.0, held.y, held.z);
+    assert!(
+        physics.sweep_box(Vec3::splat(16.0), from, to).is_none(),
+        "a held cube must be invisible to the sweep of the player holding it"
+    );
+    let _ = body;
 }

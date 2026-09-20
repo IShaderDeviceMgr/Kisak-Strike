@@ -42,7 +42,9 @@
 
 use glam::{Mat3, Quat, Vec3};
 use rapier3d::dynamics::{MassProperties, RigidBodyBuilder, RigidBodyHandle, RigidBodyType};
-use rapier3d::geometry::{Collider, ColliderBuilder, ColliderHandle, SharedShape};
+use rapier3d::geometry::{
+    Collider, ColliderBuilder, ColliderHandle, Group, InteractionGroups, SharedShape,
+};
 use rapier3d::math::Pose;
 use rapier3d::parry::query::{ShapeCastOptions, ShapeCastStatus};
 use rapier3d::pipeline::{PhysicsWorld, QueryFilter};
@@ -374,6 +376,13 @@ impl Mass {
     }
 }
 
+/// The player's shadow, for collision filtering. One bit, because the port
+/// has exactly one player.
+const GROUP_PLAYER: Group = Group::GROUP_1;
+
+/// A body the player is carrying — `COLLISION_GROUP_PLAYER_HELD`.
+const GROUP_HELD: Group = Group::GROUP_2;
+
 struct Body {
     handle: RigidBodyHandle,
     generation: u32,
@@ -385,6 +394,19 @@ struct Body {
     /// tell a frozen cube from a wall, so it is recorded then and
     /// [`sweep_box`](Environment::sweep_box) reads it back.
     dynamic: bool,
+    /// Whether the player is carrying this body right now —
+    /// `FVPHYSICS_PLAYER_HELD` and `COLLISION_GROUP_PLAYER_HELD` together.
+    ///
+    /// Read by [`sweep_box`](Environment::sweep_box), which must **not**
+    /// report it: the object is held fifteen units in front of the eye, so
+    /// the player's own movement trace would otherwise be stopped by the cube
+    /// in their hands and they could not walk forwards. Valve reaches the
+    /// same place with `CTraceFilterSkipTwoEntities` at every call site; one
+    /// flag on the body is the same rule stated once.
+    ///
+    /// The solver needs the rule as well as the trace, and that half is
+    /// collider interaction groups — see [`set_held`](Environment::set_held).
+    held: bool,
 }
 
 /// The environment. `physenv`.
@@ -480,14 +502,36 @@ impl Environment {
         let handle = self.world.insert_body(builder);
 
         let surface = self.surfaces.resolve(surface).clone();
+        // The player's shadow is the only body that needs a membership of its
+        // own, and it needs one so that a *held* object can name it in a
+        // filter — see [`set_held`](Environment::set_held). Everything else
+        // keeps Rapier's default of "in every group, collides with every
+        // group", which is what `COLLISION_GROUP_NONE` means.
+        let groups = match motion {
+            Motion::Player => InteractionGroups::all().with_memberships(GROUP_PLAYER),
+            _ => InteractionGroups::all(),
+        };
         for shape in &hulls.shapes {
-            let collider = collider(shape.clone(), &surface);
+            let mut collider = collider(shape.clone(), &surface);
+            collider.set_collision_groups(groups);
             self.world.insert_collider(collider, Some(handle));
+        }
+        // **Fold the mass properties in now rather than at the first step.**
+        // Rapier recomputes `local_mprops` from the colliders and the
+        // additional properties during `step`, so until then a body created
+        // this tick reports a mass of zero — and
+        // [`mass`](Environment::mass) and [`set_mass`](Environment::set_mass)
+        // would both answer about a body that does not weigh anything yet.
+        // Nothing depended on that while mass was read-only; `grab` saves the
+        // mass it is about to replace, and would save the zero.
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.recompute_mass_properties_from_colliders(&self.world.colliders);
         }
         self.bodies[id.slot as usize] = Some(Body {
             handle,
             generation: id.generation,
             dynamic: matches!(motion, Motion::Dynamic),
+            held: false,
         });
         self.live += 1;
         Some(id)
@@ -559,6 +603,214 @@ impl Environment {
         };
         if let Some(body) = self.world.bodies.get_mut(handle) {
             body.set_linvel(velocity, true);
+        }
+    }
+
+    /// A body's angular velocity, in radians per second about each world
+    /// axis, and the setter the grab controller drives it with.
+    ///
+    /// `IVP_Core::rot_speed`, the companion to
+    /// [`velocity`](Environment::velocity). Nothing needed it until
+    /// [`grab`](super::grab): the player's own shadow is rotation-locked
+    /// ([`Motion::Player`]) and a mover's spin is written as a pose, so this
+    /// is the first controller here that steers a body's *rotation* through
+    /// the solver.
+    pub fn angular_velocity(&self, id: BodyId) -> Vec3 {
+        self.handle(id)
+            .and_then(|handle| self.world.bodies.get(handle))
+            .map_or(Vec3::ZERO, |body| body.angvel())
+    }
+
+    /// See [`angular_velocity`](Environment::angular_velocity).
+    pub fn set_angular_velocity(&mut self, id: BodyId, angular: Vec3) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_angvel(angular, true);
+        }
+    }
+
+    /// A body's orientation as a quaternion.
+    ///
+    /// [`pose`](Environment::pose) answers the same question as a Source
+    /// `QAngle`, which is what an *entity* wants. This is for the caller that
+    /// wants to take a difference: `QuaternionDiff` composed with
+    /// `QuaternionAxisAngle` is how `ComputeShadowControllerIVP`
+    /// (`physics_shadow.cpp:826`) turns "you are here, go there" into an
+    /// angular error, and routing that through Euler angles and back would
+    /// lose the shortest-arc property that makes it work.
+    pub fn rotation(&self, id: BodyId) -> Option<Quat> {
+        let handle = self.handle(id)?;
+        Some(self.world.bodies.get(handle)?.position().rotation)
+    }
+
+    /// `IPhysicsObject::SetMass`, keeping the body's *shape* of inertia and
+    /// scaling its magnitude with the mass.
+    ///
+    /// `CGrabController::AttachEntity` drops a held object to
+    /// [`CARRY_MASS`](super::grab::CARRY_MASS) and puts the original back on
+    /// detach, which is the whole reason a held cube cannot fling the player.
+    ///
+    /// > **Inertia scales with the mass and the shape does not.** Valve's
+    /// > `CPhysicsObject::SetMass` does `SetInertia( m_pObject->get_rot_inertia()
+    /// > * (mass / m_pObject->get_mass()) )` — the *ratio*, not a recomputation
+    /// > — because the inertia tensor of a rigid shape is linear in its mass.
+    /// > Recomputing it from the hulls would also throw away
+    /// > [`Mass::from_solid`]'s deliberate reproduction of IVP's
+    /// > `rotation_inertia` bug, and every throw in Portal 2 is tuned against
+    /// > that (`portdocs/VPHYSICS.md` §0).
+    pub fn set_mass(&mut self, id: BodyId, mass: f32) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        let Some(body) = self.world.bodies.get_mut(handle) else {
+            return;
+        };
+        let current = body.mass();
+        if current <= 0.0 || mass <= 0.0 {
+            return;
+        }
+        let props = body.mass_properties().local_mprops;
+        let ratio = mass / current;
+        let inertia = props.reconstruct_inertia_matrix() * ratio;
+        body.set_additional_mass_properties(
+            MassProperties::with_inertia_matrix(props.local_com, mass, inertia),
+            true,
+        );
+        // As in [`add`](Environment::add): the effective properties are only
+        // folded together during a step, and a caller that sets a mass and
+        // reads it back in the same tick — which is exactly what attaching and
+        // detaching a grab controller does — would see the old one.
+        // The colliders contribute nothing (they are built at density 0), so
+        // this resolves to precisely what was just set.
+        body.recompute_mass_properties_from_colliders(&self.world.colliders);
+    }
+
+    /// `IPhysicsObject::SetDamping`'s rotational half.
+    ///
+    /// `AttachEntity` raises a held object's rotational damping to 10 so that
+    /// it stops tumbling in the player's hands; `DetachEntity` restores what
+    /// the `.phy`'s `SolidParams` asked for.
+    pub fn angular_damping(&self, id: BodyId) -> f32 {
+        self.handle(id)
+            .and_then(|handle| self.world.bodies.get(handle))
+            .map_or(0.0, |body| body.angular_damping())
+    }
+
+    /// See [`angular_damping`](Environment::angular_damping).
+    pub fn set_angular_damping(&mut self, id: BodyId, damping: f32) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_angular_damping(damping);
+        }
+    }
+
+    /// Does `body`'s own collision overlap the box `half` at `at`?
+    ///
+    /// `TestIntersectionVsHeldObjectCollide`'s `SOLID_BBOX` arm
+    /// (`portal_grabcontroller_shared.cpp:2130`), which is the question
+    /// `CGrabController::DetachEntity` asks before it lets go: *would putting
+    /// this down leave it inside the player?* If it would, the drop is
+    /// refused and the hold continues.
+    ///
+    /// **One named body, not the world.** [`sweep_box`](Environment::sweep_box)
+    /// answers "what is in the way" over every dynamic prop; this answers "is
+    /// it *that* one", which is what the drop test needs — a cube overlapping
+    /// some *other* prop is not a reason to refuse.
+    pub fn overlaps_box(&self, body: BodyId, half: Vec3, at: Vec3) -> bool {
+        let Some(handle) = self.handle(body) else {
+            return false;
+        };
+        let Some(rigid) = self.world.bodies.get(handle) else {
+            return false;
+        };
+        if half.min_element() < 0.0 {
+            return false;
+        }
+        let shape = SharedShape::cuboid(half.x, half.y, half.z);
+        let pose = Pose::from_parts(at, Quat::IDENTITY);
+        rigid.colliders().iter().any(|&collider| {
+            self.world.colliders.get(collider).is_some_and(|other| {
+                rapier3d::parry::query::intersection_test(
+                    &pose,
+                    shape.as_ref(),
+                    other.position(),
+                    other.shape(),
+                )
+                .unwrap_or(false)
+            })
+        })
+    }
+
+    /// A body's collision bounds **in its own frame** — `CCollisionProperty`'s
+    /// `OBBMins`/`OBBMaxs`.
+    ///
+    /// Three callers want it and all three are the grab controller's:
+    /// `CanPickupObject`'s 128-unit size limit, `BoundingRadius()` for the
+    /// carry stand-off, and `m_attachedPositionObjectSpace` — the object's
+    /// *centre*, which is what makes a carry target an origin rather than a
+    /// centre.
+    ///
+    /// > **Taken from the collision model rather than from the studio model.**
+    /// > Valve reads `CBaseEntity::CollisionProp()`, which for a
+    /// > `SOLID_VPHYSICS` prop is built from the `.phy` — the same hulls these
+    /// > colliders are. `server/` never reads a `.mdl`'s bounds for a prop at
+    /// > all (`EntityCore::model_bounds` is only filled for brush models), so
+    /// > this is also the only answer available here.
+    pub fn local_bounds(&self, id: BodyId) -> Option<(Vec3, Vec3)> {
+        let handle = self.handle(id)?;
+        let body = self.world.bodies.get(handle)?;
+        let (mut mins, mut maxs) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let mut any = false;
+        for &handle in body.colliders() {
+            let Some(collider) = self.world.colliders.get(handle) else {
+                continue;
+            };
+            // The collider's own pose *within* the body, which is identity for
+            // every hull this port builds — but reading it costs nothing and
+            // a compound placed off-centre would otherwise be wrong.
+            let aabb = collider.shape().compute_aabb(collider.position_wrt_parent()?);
+            mins = mins.min(aabb.mins);
+            maxs = maxs.max(aabb.maxs);
+            any = true;
+        }
+        any.then_some((mins, maxs))
+    }
+
+    /// `IPhysicsObject::SetCollisionGroup( COLLISION_GROUP_PLAYER_HELD )`
+    /// (`const.h:410`) — *"Held objects that shouldn't collide with players"*.
+    ///
+    /// The player's shadow is a **dynamic** body here
+    /// (`portdocs/VPHYSICS_SHADOW.md` §3), so a 1 kg cube held fifteen units
+    /// in front of an 85 kg driven one would be in permanent contact with it
+    /// and would fight the controller every step. Valve names a collision
+    /// group and lets a table decide; Rapier puts the table on the collider as
+    /// a membership/filter pair, which is the same idea with the indices
+    /// swapped.
+    pub fn set_held(&mut self, id: BodyId, held: bool) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        let colliders: Vec<_> = match self.world.bodies.get(handle) {
+            Some(body) => body.colliders().to_vec(),
+            None => return,
+        };
+        let groups = match held {
+            true => InteractionGroups::all()
+                .with_memberships(GROUP_HELD)
+                .with_filter(Group::ALL & !GROUP_PLAYER),
+            false => InteractionGroups::all(),
+        };
+        if let Some(body) = self.bodies.get_mut(id.slot as usize).and_then(Option::as_mut) {
+            body.held = held;
+        }
+        for handle in colliders {
+            if let Some(collider) = self.world.colliders.get_mut(handle) {
+                collider.set_collision_groups(groups);
+            }
         }
     }
 
@@ -745,7 +997,8 @@ impl Environment {
             compute_impact_geometry_on_penetration: true,
         };
         let is_prop = |_: ColliderHandle, collider: &Collider| -> bool {
-            self.body_of(collider).is_some_and(|body| body.dynamic)
+            self.body_of(collider)
+                .is_some_and(|body| body.dynamic && !body.held)
         };
         let filter = QueryFilter::default()
             .exclude_sensors()

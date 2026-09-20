@@ -70,6 +70,7 @@ pub mod class;
 pub mod classes;
 pub mod damage;
 pub mod entity;
+pub mod grab;
 pub mod hierarchy;
 pub mod io;
 pub mod keyvalue;
@@ -182,6 +183,14 @@ pub struct Server {
     /// handed to the physics shadow, and putting it on the core would offer it
     /// to 49 classes that must not read it.
     player_wish_velocity: Vec3,
+
+    /// What the player is carrying — `CPlayerPickupController`'s game state.
+    /// See [`grab::Carry`], and [`physics::Physics::grab`] for the body half.
+    carry: Option<grab::Carry>,
+
+    /// [`PlayerState::view_offset`], kept for the tick the way
+    /// [`player_wish_velocity`](Server::player_wish_velocity) is.
+    player_view_offset: Vec3,
     /// `m_vNewVPhysicsPosition` as the client last reported it — see
     /// [`PlayerState::vphysics_position`]. Here for the same reason
     /// [`player_wish_velocity`](Server::player_wish_velocity) is.
@@ -336,6 +345,40 @@ pub trait TouchQuery {
     /// nothing is ever blocked — because a server with no collision has no
     /// geometry that could block a door and every synthetic test in this
     /// module wants exactly that.
+    /// `UTIL_TraceLine`/`UTIL_TraceHull` against **`MASK_SOLID_BRUSHONLY`** —
+    /// the world and its solid brush models, and nothing else.
+    ///
+    /// The grab controller's two traces
+    /// (`portal_grabcontroller_shared.cpp:1884` and `:1800`) ask this: how far
+    /// in front of the eye can a carried object hang before a wall is in the
+    /// way, and how far off the floor does it have to be lifted.
+    ///
+    /// > **Not [`push_trace`](TouchQuery::push_trace) with an empty pusher
+    /// > list**, although the sweep would be the same one. That runs
+    /// > `MASK_PLAYERSOLID`, which contains `CONTENTS_PLAYERCLIP`, and a
+    /// > player clip is exactly what a held object is supposed to pass
+    /// > through — `CPortal_Player::FindUseEntity` carries Valve's own note
+    /// > about it (*"BUG 61818: Allowing pickup through playerclips because
+    /// > we'd like to be abled to drop through them"*). One mask is the whole
+    /// > difference between the two.
+    ///
+    /// `mins`/`maxs` are relative to `start`, as everywhere else on this
+    /// trait; passing zero for both makes it a line trace, which is what the
+    /// carry ray is.
+    ///
+    /// The default answers "nothing is in the way", so a server with no
+    /// collision holds an object at arm's length and every synthetic test in
+    /// this module gets the geometry without a world.
+    fn solid_trace(&mut self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> PushHit {
+        let (_, _) = (mins, maxs);
+        let _ = start;
+        PushHit {
+            fraction: 1.0,
+            end,
+            start_solid: false,
+        }
+    }
+
     fn push_trace(
         &mut self,
         _clip: PushClip,
@@ -401,8 +444,12 @@ pub enum PushClip {
     Everything,
 }
 
-/// What one [`TouchQuery::push_trace`] found — `trace_t`, reduced to the three
-/// fields the pusher reads.
+/// What one [`TouchQuery::push_trace`] or [`TouchQuery::solid_trace`] found —
+/// `trace_t`, reduced to the three fields either caller reads.
+///
+/// Named for the pusher because that is what wanted it first; the grab
+/// controller's carry ray reads the same three and there is nothing in the
+/// shape that is about pushing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PushHit {
     /// `trace.fraction`.
@@ -512,6 +559,16 @@ pub struct PlayerState {
     /// on how hard it may push a prop: it is why walking into a cube pushes it
     /// and standing against one does not.
     pub wish_velocity: Vec3,
+    /// `m_vecViewOffset` — **the client's**, read by the server and never
+    /// written.
+    ///
+    /// The eye is `origin + view_offset`, and the server needs it because
+    /// `CGrabController::UpdateObject` measures the whole carry from
+    /// `Weapon_ShootPosition()`. It is carried rather than re-derived from the
+    /// hull because ducking changes it (`VEC_VIEW` to `VEC_DUCK_VIEW`) and the
+    /// client already owns that decision — re-deriving it here would be a
+    /// second copy of a rule that can change.
+    pub view_offset: Vec3,
     /// `m_vNewVPhysicsPosition` — **the client's**, read by the server and
     /// never written.
     ///
@@ -793,6 +850,8 @@ impl Server {
             player_was_ducked: false,
             player_prev_origin: Vec3::ZERO,
             player_wish_velocity: Vec3::ZERO,
+            carry: None,
+            player_view_offset: crate::client::player::VEC_VIEW,
             player_shadow_target: None,
             overlaps: Vec::new(),
             obb_overlaps: Vec::new(),
@@ -1256,6 +1315,12 @@ impl Server {
         // "every tick, first", so it is a step of the tick like the two
         // either side of it.
         self.player_pre_think();
+        // `CBasePlayer::ItemPreFrame`'s first statement
+        // (`baseplayer_shared.cpp:228`) — *"Called every usercmd by the player
+        // PreThink"*. The press edge that starts and ends a carry, so it is
+        // before the thinks and well before the physics step that moves what
+        // is being carried.
+        self.player_use(query);
         self.player_touch_triggers(query);
         self.run_think_functions(query);
         // `CPhysicsHook::FrameUpdatePostEntityThink` — after every think and
@@ -2072,6 +2137,11 @@ impl Server {
     /// > solver write its world position would tear it off.
     fn step_physics(&mut self, query: &mut dyn TouchQuery) {
         self.drive_player_shadow();
+        // `CPlayerPickupController::UsePickupController( USE_SET )`, which
+        // `CBasePlayer::PostThink` (`player.cpp:4807`) runs once a tick — and
+        // like the shadow above it, it writes velocities for the step that is
+        // about to run, so it has to be on this side of it.
+        self.drive_carry(query);
         let Some(physics) = &mut self.physics else {
             return;
         };
@@ -2109,6 +2179,253 @@ impl Server {
         // which is how a cube presses a floor button.
         for (id, start) in previous {
             self.touch_triggers(id, start, query);
+        }
+    }
+
+    /// What the player is carrying, if anything —
+    /// `GetPlayerHeldEntity( pPlayer )`
+    /// (`portal_grabcontroller_shared.cpp`'s free function).
+    ///
+    /// `#[allow(dead_code)]` on the same terms as
+    /// [`Environment::pose`](crate::vphysics::env::Environment::pose): it is
+    /// the question the rest of the game will ask — a HUD, the portal gun's
+    /// alternate fire, `ent_dump` — and today its callers are the tests that
+    /// pin the carry.
+    #[allow(dead_code)]
+    pub fn carried(&self) -> Option<EntityId> {
+        self.carry.map(|carry| carry.entity)
+    }
+
+    /// `CPortal_Player::PlayerUse` (`portal_player.cpp:2722`) — the press
+    /// edge that starts and ends a carry.
+    ///
+    /// The shipped game prefers an entity the *client* picked and sent up in
+    /// the usercmd (`ucmd->player_held_entity`) and falls back to
+    /// `PollForUseEntity`'s own trace. This port has no netcode and runs both
+    /// halves in one process, so the fallback is the only path — and it is the
+    /// one whose rules are in `legacy/`, rather than in a client this port
+    /// does not have.
+    fn player_use(&mut self, query: &mut dyn TouchQuery) {
+        let Some(player) = self.player else { return };
+        let pressed = self
+            .entities
+            .get(player)
+            .and_then(|entity| entity.behaviour.downcast_ref::<classes::Player>())
+            .is_some_and(|class| class.pressed_buttons() & classes::IN_USE != 0);
+        if !pressed {
+            return;
+        }
+        // "Currently using a latched entity?" — a press while holding is a
+        // drop, and never also a new pickup.
+        if self.carry.is_some() {
+            self.drop_carried(false);
+            return;
+        }
+        let Some(target) = self.find_use_entity(query) else {
+            return;
+        };
+        self.pick_up(target);
+    }
+
+    /// `CPortal_Player::FindUseEntity`
+    /// (`portal_player_shared.cpp:1155`) — one long ray, then ten tangent
+    /// hulls, and the first thing any of them finds that can be lifted.
+    ///
+    /// **The world has to win ties.** Each ray is cast against the brushes and
+    /// against the props independently, and a prop only counts if it is nearer
+    /// than whatever brush geometry the same ray hit — otherwise a cube
+    /// through a wall would be pickable.
+    ///
+    /// The radius search `FindUseEntity` falls back to a third time is not
+    /// here: it exists for `FCAP_USE_IN_RADIUS` entities — buttons and levers
+    /// made of clip brushes — and every class in this port that can be
+    /// *carried* is a physics prop that the rays already reach.
+    fn find_use_entity(&mut self, query: &mut dyn TouchQuery) -> Option<EntityId> {
+        let player = self.player?;
+        let (origin, angles) = {
+            let entity = self.entities.get(player)?;
+            (entity.core.origin, entity.core.angles)
+        };
+        let eye = origin + self.player_view_offset;
+        for (start, end, half) in grab::use_rays(eye, angles) {
+            let extent = Vec3::splat(half);
+            let brush = query.solid_trace(start, end, -extent, extent);
+            let Some(physics) = &self.physics else { continue };
+            let Some(sweep) = physics.sweep_box(extent, start, end) else {
+                continue;
+            };
+            // The brush trace and the prop sweep both report a fraction of the
+            // same ray, so they compare directly.
+            if sweep.fraction > brush.fraction {
+                continue;
+            }
+            let hit = start + (end - start) * sweep.fraction;
+            if !grab::within_use_radius(eye, hit) {
+                continue;
+            }
+            if let Some(id) = physics.owner(sweep.body) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// `CPortal_Player::PickupObject` (`portal_player_shared.cpp:1022`) into
+    /// `CPlayerPickupController::InitGrabController` (`:1215`).
+    fn pick_up(&mut self, target: EntityId) {
+        let Some(player) = self.player else { return };
+        let Some(physics) = &self.physics else { return };
+        let Some(body) = self
+            .entities
+            .get(target)
+            .and_then(|entity| entity.core.physics)
+        else {
+            return;
+        };
+        let Some(mass) = physics.entity_mass(&self.entities, target) else {
+            return;
+        };
+        let Some((mins, maxs)) = physics.local_bounds(body) else {
+            return;
+        };
+        let (player_origin, player_angles, hull_mins, hull_maxs) = {
+            let Some(entity) = self.entities.get(player) else {
+                return;
+            };
+            (
+                entity.core.origin,
+                entity.core.angles,
+                entity.core.model_bounds.mins,
+                entity.core.model_bounds.maxs,
+            )
+        };
+        let standing_on = physics.standing_on(
+            body,
+            (hull_maxs - hull_mins) * 0.5,
+            player_origin + (hull_mins + hull_maxs) * 0.5,
+        );
+        if !grab::can_pickup(mass, maxs - mins, standing_on) {
+            return;
+        }
+        let Some(target_angles) = self.entities.get(target).map(|e| e.core.angles) else {
+            return;
+        };
+        let Some(physics) = &mut self.physics else { return };
+        if !physics.grab(&self.entities, target) {
+            return;
+        }
+        // `m_attachedAnglesPlayerSpace = TransformAnglesToPlayerSpace(...)`
+        // and then `AlignAngles( …, m_angleAlignment )`, which is what makes a
+        // carried cube square rather than however it happened to be lying.
+        let angles_player_space = grab::align_angles(
+            grab::to_player_space(target_angles, player_angles.y),
+            grab::ANGLE_ALIGNMENT,
+        );
+        self.carry = Some(grab::Carry {
+            entity: target,
+            angles_player_space,
+            center_object_space: (mins + maxs) * 0.5,
+            radius: (maxs - mins).length() * 0.5,
+            up_offset: match self
+                .entities
+                .get(target)
+                .is_some_and(|e| e.core.class.name == "prop_weighted_cube")
+            {
+                true => grab::CUBE_UP_OFFSET,
+                false => 0.0,
+            },
+            floor_bump: 0.0,
+        });
+    }
+
+    /// `CPlayerPickupController::Shutdown` (`:1277`) — let go.
+    ///
+    /// > **A drop can be refused.** If putting the object down would leave it
+    /// > intersecting the player, `DetachEntity` returns false and the hold
+    /// > continues — which is what stops a cube being dropped *inside* you
+    /// > when you back it into a wall. `forced` skips the test, for the paths
+    /// > that must let go whatever the consequences (death, level change).
+    fn drop_carried(&mut self, forced: bool) {
+        let Some(carry) = self.carry else { return };
+        let Some(player) = self.player else { return };
+        let (origin, mins, maxs, velocity) = {
+            let Some(entity) = self.entities.get(player) else {
+                return;
+            };
+            (
+                entity.core.origin,
+                entity.core.model_bounds.mins,
+                entity.core.model_bounds.maxs,
+                entity.core.velocity,
+            )
+        };
+        let half = (maxs - mins) * 0.5;
+        let centre = origin + (mins + maxs) * 0.5;
+        let Some(physics) = &mut self.physics else { return };
+        if !forced && physics.held_overlaps(half, centre) {
+            return;
+        }
+        physics.release_grab(velocity, crate::client::movement::SV_SPEED_NORMAL);
+        self.carry = None;
+        let _ = carry;
+    }
+
+    /// `CPlayerPickupController::UsePickupController( USE_SET )` (`:1356`)
+    /// and, through it, `CGrabController::UpdateObject` (`:1506`).
+    ///
+    /// Runs once a tick, immediately before the physics step.
+    fn drive_carry(&mut self, query: &mut dyn TouchQuery) {
+        let Some(mut carry) = self.carry else { return };
+        let Some(player) = self.player else { return };
+        // "Adrian: Oops, our object became motion disabled, let go!", and the
+        // entity going away entirely.
+        let gone = self
+            .entities
+            .get(carry.entity)
+            .is_none_or(|entity| entity.core.physics.is_none());
+        if gone {
+            self.carry = None;
+            if let Some(physics) = &mut self.physics {
+                physics.release_grab(Vec3::ZERO, 0.0);
+            }
+            return;
+        }
+        // `ComputeError() > flMaxError` — the object has been left too far
+        // behind, so the hold breaks. Asked **before** the update, exactly as
+        // `UsePickupController` asks it.
+        if let Some(physics) = &mut self.physics {
+            if physics.grab_error() > crate::vphysics::grab::MAX_ERROR {
+                // **Not a forced drop.** `UsePickupController` breaks the hold
+                // by calling `Shutdown()`, which goes through `DetachEntity`
+                // and is refused like any other if letting go would leave the
+                // object inside the player — so an object that is both too far
+                // behind *and* overlapping stays held until one of the two
+                // stops being true.
+                self.drop_carried(false);
+                return;
+            }
+        }
+        let Some(entity) = self.entities.get(player) else {
+            return;
+        };
+        let hold = grab::Hold {
+            eye: entity.core.origin + self.player_view_offset,
+            view: entity.core.angles,
+            mins: entity.core.model_bounds.mins,
+            maxs: entity.core.model_bounds.maxs,
+            radius: carry.radius,
+            up_offset: carry.up_offset,
+            angles_player_space: carry.angles_player_space,
+            center_object_space: carry.center_object_space,
+            velocity: entity.core.velocity,
+            max_speed: crate::vphysics::grab::MAX_SPEED,
+            tick: crate::vphysics::env::TIMESTEP,
+        };
+        let speed = entity.core.velocity.length();
+        let (target, rotation) = grab::hold_placement(&hold, &mut carry.floor_bump, query);
+        self.carry = Some(carry);
+        if let Some(physics) = &mut self.physics {
+            physics.drive_grab(target, rotation, speed, crate::vphysics::env::TIMESTEP);
         }
     }
 
@@ -2515,6 +2832,7 @@ impl Server {
         core.velocity = state.velocity;
         core.base_velocity = state.base_velocity;
         self.player_wish_velocity = state.wish_velocity;
+        self.player_view_offset = state.view_offset;
         self.player_shadow_target = Some(state.vphysics_position);
         core.model_bounds = ModelBounds {
             mins: state.mins,
@@ -2571,6 +2889,7 @@ impl Server {
             // given so that the round trip reads as an identity, and nothing
             // here derives one.
             wish_velocity: self.player_wish_velocity,
+            view_offset: self.player_view_offset,
             vphysics_position: self.player_shadow_target.unwrap_or(core.origin),
         })
     }

@@ -888,6 +888,13 @@ Same ordering: most likely to bite first.
   the raw accumulated `out_wish_vel` and the velocity uses the substituted
   one**, in that order, which is Valve's.
 
+- **`Player::view_offset` crosses the seam too**, because the *whole carry* is
+  measured from the eye: `CGrabController::UpdateObject`'s stand-off, its
+  `MASK_SOLID_BRUSHONLY` ray and `FindUseEntity`'s eleven rays all start at
+  `Weapon_ShootPosition()`. It is carried rather than re-derived on the server
+  because ducking changes it — `VEC_VIEW` to `VEC_DUCK_VIEW` — and this module
+  already owns that decision. `PlayerState::view_offset`.
+
 - **`touched_physics` is `m_bTouchedPhysObject`, and it is sticky for the whole
   command.** Set by any player trace a prop won (`Trace::hit_prop`), cleared
   once per `player_move`. Its consumer is `Client::run_move`'s tail, which is

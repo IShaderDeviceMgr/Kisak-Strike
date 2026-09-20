@@ -64,7 +64,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,160 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,185 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -160,7 +160,7 @@ before calling into a module.** This table is the index.
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning** and **skin families**. No LOD selection, no body groups, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting** and the **vphysics seam** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
-| `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller**, so the player pushes a cube and is stopped by one. No grab controller, so you cannot pick one up; no constraints, collision events, ragdolls or vehicles | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md` |
+| `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it**. No constraints, collision events, ragdolls or vehicles, and a held object cannot cross a portal | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -177,15 +177,17 @@ their skeletons instead of standing in their bind pose, and **the weighted cube
 falls**: it drops 255 units out of its dropper onto the chamber floor, settles
 in two seconds and goes to sleep lying on the slope it landed on, in the right
 model **and in the rusted skin its map asked for** — **and you can walk into
-it and shove it, and you cannot walk through it.** Two portals draw as coloured ovals — **and they work, and you can see
+it and shove it, and you cannot walk through it — and you can pick it up,
+carry it across the chamber and stand it on the floor button, which goes
+down.** Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
 what makes a portal's second camera affordable.
 
 **It is not a runnable game**: no sound, no netcode, no weapon and no skybox —
 but a door closing on you now shoves you out of the way, or is stopped by you,
-and a cube on the floor is something you bump into rather than something you
-walk through.
+and a cube on the floor is something you bump into, shove, pick up and carry
+onto the button it belongs on rather than something you walk through.
 **The portals work, and you can see through them.** `portdocs/PORTAL.md` stages
 3 and 4 landed the teleport — you walk into one oval and come out of the other,
 rotated, with your velocity rotated and clamped and your view turned with you;
@@ -362,11 +364,19 @@ with a single mesh on slot 0, so grouping by material would have collapsed all
 twelve into one. And **`uses_bumpmapping` had to widen with it**, because it is
 `bStaticLighting`'s deciding half and a model that is per-pixel only at skin 2
 must answer yes for every placement — which is why Valve ORs it over the whole
-`ppMaterials` array. It is the one change here that had a **measurable frame
-cost and needed a second change to pay it back**: with 269 differently-skinned
-props interleaved among 1,080, the material bind group changed on nearly every
-draw, so `PropModels::load` now sorts each model's instance list by family and
-the opaque pass binds once per (batch, family) again.
+`ppMaterials` array. It is also the one change here whose **cost was asserted and
+then measured, and the measurement did not support the assertion**. The worry
+was that 269 differently-skinned props interleaved among 1,080 would change the
+material bind group on nearly every draw, so `PropModels::load` sorts each
+model's instance list by family and the opaque pass binds once per (batch,
+family). The sort is correct and it stays — but it is worth **54 redundant
+material binds out of 194 on `sp_a1_intro1`**, 778 across the game's 106 maps,
+which is not "nearly every draw" of 1,080; and an interleaved six-round A/B of
+the sort against itself reads `props only` **0.190 ms without it and 0.180
+with**, one quantisation tick, in rounds where `translucent` — which neither arm
+touches — moved 25%. **Skin families cost the frame nothing measurable, with or
+without the sort.** `rustdocs/ENGINE.md`, "Frame cost, measured", has the method
+and the reason a single control row is not enough to trust one of these.
 
 What `sp_a1_intro1` ends up with, printed by
 `sp_a1_intro1_drops_its_cube_through_the_whole_server_path`: **667 static
@@ -504,14 +514,69 @@ against either, which is why these are corrected where
 `IVP_Compact_Surface::rotation_inertia`'s is reproduced. **`m_onground` is
 commented out in the shipped tree** (`:678`), which makes the controller's
 anti-gravity branch dead code, so the body is simply weightless here. And the
-honest one: **no cube in Portal 2 ships on a button.** All 98 come out of a
-dropper or sit on a shelf, the nearest one 128–256 units from the nearest of
-the game's 78 buttons, and it is the *player* who carries it there — which is
-`CGrabController` (3,252 lines), and is not ported. So "a cube can hold a floor
-button down" is now reachable and is still not demonstrable from shipped
-content. What is demonstrable, on the default map: the cube falls out of its
-dropper, and **the player shoves it 18.8 units up the slope it landed on**
-before it rolls back down behind them.
+honest one, which the grab controller below has since closed: **no cube in
+Portal 2 ships on a button.** All 98 come out of a dropper or sit on a shelf,
+and it is the *player* who carries it there.
+
+**The grab controller has landed** — `portdocs/VPHYSICS_GRAB.md` — and **the
+player picks the cube up, carries it and puts it down on the button**. It is
+the other half of `physics_shadow.cpp`'s story and it is again smaller than it
+looks: `portal_grabcontroller_shared.cpp` is 3,252 lines and roughly a third of
+them are the **VM grab**, a clone of the held object drawn in the *view model*.
+`CPortal_Player::UpdateVMGrab` (`portal_player.cpp:3835`) picks between the two
+per object, and in single player it answers "physics" for everything except
+`npc_personality_core` — 21 in the game, and a class this port does not have.
+So a cube takes the physics path, which is the one that can be drawn here.
+
+- **It is the shadow control again with rotation turned on**, and the trap is
+  that **`ComputeController` has two overloads**: `physics_shadow.cpp:46`
+  clamps the correction by vector *magnitude* against a scalar limit and keeps
+  damping as a second clamped term, `:94` clamps **per axis**. The shadow
+  control calls the first and `CPlayerController` the second, so
+  `vphysics/shadow.rs`'s existing one is the wrong one and `grab.rs` has its
+  own. Reusing it would let a diagonal carry through at √3 times the intended
+  speed.
+- **The frame is different too.** `QuaternionDiff( p, q )` is `q⁻¹ · p`, a
+  delta in the body's *own* frame, because IVP keeps `rot_speed` in core
+  space; Rapier's `angvel` is world space, so the same delta is `p · q⁻¹`.
+  And `physics_shadow.cpp` defines its **own** `QuaternionAxisAngle` returning
+  **radians** where `mathlib_base.cpp:2447`'s returns degrees — reading the
+  wrong one is an angular error 57 times too large.
+- **A held object weighs one kilogram.** `REDUCED_CARRY_MASS` is `1.0`, written
+  over a 40 kg cube and restored on release, and it is the whole reason a held
+  object cannot be used to fling the player.
+- **A held body has to be invisible twice over** — to the *trace*, or the
+  player's own movement sweep is stopped by the cube in their hands fifteen
+  units in front of the eye and they cannot walk forwards; and to the
+  *solver*, or a 1 kg cube in permanent contact with the 85 kg driven body of
+  the player's shadow fights the controller every step. One flag on the body
+  and one collider interaction group.
+- **The carry is a column, not a stick**, and it is the thing that gives
+  Portal 2 its feel. `player_hold_object_in_column` defaults to 1, and with it
+  the hold distance is measured to a *vertical plane* a fixed distance in
+  front of the player rather than along the look vector — so the object keeps
+  its horizontal stand-off and rides up and down as you look up and down,
+  instead of diving at your feet.
+
+**Three things had to be fixed underneath it, and none was in the grab
+controller.** A `prop_weighted_cube` was a **point** to every box test in
+`server/`: `EntityCore::model_bounds` is only filled for brush models, so a
+studio prop had no bounds at all — and the button's trigger is 14 units tall
+while a resting cube's *origin* is 22 above the pad, so the point sat above the
+box and no press could ever happen. `VPhysicsInitNormal` now takes the bounds
+from the `.phy`, which is where `SOLID_VPHYSICS` gets them in the original.
+`CBaseTrigger::PassesTriggerFilters` was missing its
+`SF_TRIGGER_ALLOW_PHYSICS` arm (`triggers.cpp:367`), the one a cube takes —
+**841 shipped triggers set that bit and 481 of them allow no clients at
+all**, so every one of those was inert here. And
+`CPortalButtonTrigger::PassesTriggerFilters` (`prop_floor_button.cpp:536`) has
+two arms, a player and a cube, and this port had only the first — correctly,
+for as long as a cube could not reach a button.
+
+**What is now demonstrable on the default map**, which was the whole point:
+`sp_a1_intro1` has one cube and one floor button, the cube comes to rest
+**345 units** from the pad, and the player picks it up, walks it over and the
+pad goes down. Shoving moved it 18.8 units.
 
 - **External `.ani` animation blocks** (`animblock != 0`), which skinning just promoted
   to the largest gap in the model path. Until skinning landed, every `$includemodel` host
@@ -527,14 +592,13 @@ before it rolls back down behind them.
   geometry rather than materials, and `build.rs` already keeps body parts in separate
   batches so that it can be added without a rewrite. 959 of 968 models have exactly one
   body part, so it is near-vestigial on props and matters for characters.
-- **`CGrabController`** — `legacy/game/shared/portal2/portal_grabcontroller_shared.cpp`
-  (3,252 lines), picking a cube up. It is now the single most visible gap the cube opened,
-  and it is the other half of every cube puzzle in the game: with the shadow controller
-  landed a cube can be shoved along the floor and cannot be carried, and **no shipped map
-  places a cube on the button it belongs on** (`portdocs/VPHYSICS_SHADOW.md` §7), so
-  carrying is what makes 78 floor buttons mean anything. It needs `+use` tracing, a
-  held-object constraint and the portal gun's alternate fire.
-  `rustdocs/VPHYSICS.md` §7 is the list it now heads.
+- **A physics prop that can cross a portal**, which is what the grab controller
+  stopped short of (`portdocs/VPHYSICS_GRAB.md` §9) and is **not** a grab-controller gap:
+  nothing but the *player* teleports here at all, because `handle_portalling` lives in
+  `client/movement.rs` and takes a `MoveData`. Until a cube can go through an oval on its
+  own, the ~300 lines of portal branches in `UpdateObject`, `ComputeError`,
+  `AttachEntity` and `CheckPortalOscillation` have nothing to stand on. Fix the teleport
+  first; the grab's half is then the target transform and little else.
 - **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
   `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
   geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view

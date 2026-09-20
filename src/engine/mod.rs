@@ -1295,6 +1295,11 @@ fn player_state(client: &Client) -> server::PlayerState {
         on_ground: player.ground.is_some(),
         mins: crate::client::movement::player_mins(player.ducked),
         maxs: crate::client::movement::player_maxs(player.ducked),
+        // `m_vecViewOffset`, which the client already keeps ducking-aware —
+        // the whole carry is measured from the eye, and re-deriving it on the
+        // far side would be a second copy of a rule that changes when the
+        // player crouches.
+        view_offset: player.view_offset,
         // **The four fields the server owns are filled in anyway, and
         // `Server::set_player_state` ignores all four.** That is deliberate:
         // the struct is one vocabulary rather than two, and a round trip that
@@ -1421,6 +1426,24 @@ impl server::TouchQuery for WorldTouchQuery<'_> {
         self.world.start_solid(origin, mins, maxs)
     }
 
+    fn solid_trace(
+        &mut self,
+        start: glam::Vec3,
+        end: glam::Vec3,
+        mins: glam::Vec3,
+        maxs: glam::Vec3,
+    ) -> server::PushHit {
+        solid_trace(
+            &self.world.collision,
+            &self.world.brush_models,
+            &mut self.chain,
+            start,
+            end,
+            mins,
+            maxs,
+        )
+    }
+
     fn push_trace(
         &mut self,
         clip: server::PushClip,
@@ -1532,6 +1555,43 @@ pub(crate) fn push_trace(
     let trace = tracer
         .with_entities(chain)
         .trace(&ray, Contents::MASK_PLAYERSOLID);
+    server::PushHit {
+        fraction: trace.fraction,
+        end: trace.end,
+        start_solid: trace.start_solid,
+    }
+}
+
+/// [`TouchQuery::solid_trace`](crate::server::TouchQuery::solid_trace)'s body
+/// — the world and every solid brush model, at `MASK_SOLID_BRUSHONLY`.
+///
+/// Free and taking the two pieces it needs rather than a [`World`], for the
+/// same reason [`push_trace`] is: the depot tests have no GPU and so cannot
+/// build a `World`, and a carry that was only tested against a copy of this
+/// code would not be tested at all.
+pub(crate) fn solid_trace(
+    collision: &crate::engine::trace::CollisionBsp,
+    models: &[world::PlacedBrushModel],
+    chain: &mut Vec<crate::engine::trace::BrushModel>,
+    start: glam::Vec3,
+    end: glam::Vec3,
+    mins: glam::Vec3,
+    maxs: glam::Vec3,
+) -> server::PushHit {
+    use crate::engine::trace::{Contents, Ray};
+
+    chain.clear();
+    chain.extend(
+        models
+            .iter()
+            .filter(|model| model.owned && model.solid)
+            .map(|model| model.model),
+    );
+    let ray = Ray::hull(start, end, mins, maxs);
+    let trace = collision
+        .tracer()
+        .with_entities(chain)
+        .trace(&ray, Contents::MASK_SOLID_BRUSHONLY);
     server::PushHit {
         fraction: trace.fraction,
         end: trace.end,

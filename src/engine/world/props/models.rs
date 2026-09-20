@@ -389,9 +389,17 @@ impl PropModels {
         // **Grouped by skin family**, because `record`'s inner loop is over the
         // instances of one batch and the material is now per instance: with
         // 269 of `sp_a1_intro1`'s 1,080 props on a family other than 0 and
-        // interleaved with the rest, group 1 was re-bound on nearly every draw
-        // instead of once per run. Sorting here makes it once per (batch,
-        // family) again.
+        // interleaved with the rest, group 1 is re-bound once per *run* of
+        // equal family rather than once per family. Sorting here makes it once
+        // per (batch, family) again.
+        //
+        // **Worth 54 binds out of 194 on `sp_a1_intro1`** — 778 across the
+        // game's 106 maps — which is real but is not the "nearly every draw"
+        // this was first justified by, and is below what `world::bench` can
+        // resolve: an A/B against a build with only this line disabled reads
+        // `props only` 0.190 ms without and 0.180 with, one quantisation tick.
+        // It stays because it is one `sort_by_key` at load; don't expect a
+        // benchmark to defend it. `rustdocs/ENGINE.md`, "Frame cost, measured".
         //
         // Safe because this list feeds only the opaque and refracting passes,
         // where the order of two props that do not overlap in depth is not

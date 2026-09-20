@@ -71,7 +71,9 @@ pub use filter::{
 };
 pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Relay, Timer};
-pub use player::{LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP};
+pub use player::{
+    LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP, IN_USE,
+};
 pub use point::PointTeleport;
 pub use portal::PropPortal;
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};

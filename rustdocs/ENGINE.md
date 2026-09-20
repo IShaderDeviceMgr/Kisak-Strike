@@ -255,6 +255,16 @@ pub(crate) fn push_trace(
     clip: server::PushClip, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3,
     pushers: &[server::Pusher],
 ) -> server::PushHit;
+/// `MASK_SOLID_BRUSHONLY` — the world and every solid brush model, and nothing
+/// else. `server/`'s, through `TouchQuery::solid_trace`, for the grab
+/// controller's carry ray and its floor bump. The mask is the whole difference
+/// from `push_trace`: that one is `MASK_PLAYERSOLID`, which contains
+/// `CONTENTS_PLAYERCLIP`, and a held object is meant to pass through one.
+pub(crate) fn solid_trace(
+    collision: &trace::CollisionBsp, models: &[world::PlacedBrushModel],
+    chain: &mut Vec<trace::BrushModel>,
+    start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3,
+) -> server::PushHit;
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
 /// two halves meet.
@@ -4946,6 +4956,57 @@ and 77 models' `.phy` files; and then **0.010 ms a tick while a cube is falling 
 0.06% of one on physics and a map at rest spends none — islands are why, and it is
 the reason `Environment::active()` is the writeback's only input.
 
+**Skin families cost nothing, and the sort that was supposed to pay for them is
+worth less than this harness can see.** Reading `studiohdr_t`'s replaceable
+texture table put 269 of `sp_a1_intro1`'s 1,080 props on a material other than
+family 0's, which was expected to change the material bind group often enough to
+show up — so `PropModels::load` sorts each model's instance list by family. Both
+halves were then measured and **neither is visible**. A three-way interleaved A/B
+across `2e787b2e` (pre-skin), `ad5feb28` (skin families) and `d682d826` reads
+`props only` **0.180 / 0.180 / 0.170** and `everything` **0.280 / 0.280 /
+0.270**; a second, two-way A/B of the sort against a build with only the sort
+disabled reads `props only` **0.190 without it and 0.180 with**. One
+quantisation tick, in both directions, against a `brushes only` control that
+moved 0.120 to 0.140 on code that is byte-identical in every arm.
+**What the sort is actually worth is exact and is not a timing**: the opaque
+pass binds once per run of equal family within a model's instance list, so the
+sort's whole effect is `runs -> distinct families`, which the lump answers
+without a renderer — **54 redundant binds out of 194 on `sp_a1_intro1`**, and
+**778 across the game's 106 maps**, worst `sp_a4_jump_polarity` at 58. The sort
+stays, because 54 fewer binds for one `sort_by_key` at load is the right trade
+whether or not a benchmark can resolve it. But the claim it was introduced under
+— that the bind group changed on "nearly every draw" — was wrong by an order of
+magnitude, and `CLAUDE.md` has been corrected.
+
+**The shadow controller cost the draw path nothing, and this time that was
+predicted rather than discovered**: it adds a dynamic body, a sweep query and a
+per-tick controller, none of which the draw path calls. Every row of the
+`d682d826` column above is flat or one tick better than `ad5feb28`.
+
+**The grab controller was not benchmarked, and that is a statement rather than
+an omission.** Nothing under `engine/world/` names it: it is a per-tick
+controller on one body, one extra flag on the sweep filter, and eleven rays on
+the ticks a `+use` is pressed. The one change it made that a *draw* could see
+is that a physics prop now has collision bounds — and those are read by
+`server/`'s box tests, not by the renderer, which has always taken a prop's
+size from its `.mdl`. Reach for `frame_cost` when something changes what is
+recorded into a pass; this changes what the server believes about a box.
+
+**Two rules for A/B-ing this benchmark came out of those runs, and they are the
+reusable part.** First, **interleave the arms and take the per-line minimum,
+never the mean**. Each round is the same deterministic work, so a slow round is
+contamination and never signal; running arm A to completion and then arm B
+measures the thermal ramp between them at least as much as the change. The shape
+that works is a git worktree per arm, *all of them pre-built* so no round pays
+for a compile, a fixed sleep between rounds, and six rounds round-robin. Second,
+**carry a control row and believe it**. An earlier single-tree run "passed" its
+control at 0.16 while the row under test read 0.36 against a clean 0.18, and the
+conclusion drawn from it was wrong; the control was simply too insensitive to
+notice the machine had changed underneath it. With real interleaving the control
+rows say the floor on this machine is about **±0.02 ms**, or roughly ±15% on the
+sub-0.2 ms rows — so **a sub-0.02 ms result from this harness is "no measurable
+difference", and must be written down as that rather than as a small win.**
+
 Run the sub-benchmarks on their own — back to back they share thermal
 state and read 2-3x high. The two rules that came out of it live in `rustdocs/MATERIALS.md`:
 **uniform writes are staged and flushed once per pass, not queued per draw**, and
@@ -4959,7 +5020,7 @@ second is A/B/A, not A/B.
 > map — the numbers to re-measure after a change to the draw path or the entity
 > list, and the three materials that still do not resolve.
 
-There is a unit test suite (`cargo test`, 1,129 tests, plus 44 depot-gated), and the binary now **runs, loads a
+There is a unit test suite (`cargo test`, 1,185 tests, plus 48 depot-gated), and the binary now **runs, loads a
 map, lets you fly around it and has a working developer console**: it mounts the game
 filesystem, opens a window, runs an
 engine frame loop with a real host state machine, **reads the shipped `cfg/config_default.cfg` and

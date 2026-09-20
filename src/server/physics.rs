@@ -37,11 +37,16 @@
 
 use std::collections::HashMap;
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
 use super::entity::{EntityId, EntityList};
 use super::movement::{MoveType, Solid};
 use crate::vphysics::env::{BodyId, Environment, Motion, Sweep};
+/// `CategorizePosition`'s ground probe, in units — the same number
+/// [`push`](super::push) uses, and for the same missing ground entity.
+const GROUND_PROBE: f32 = 2.0;
+
+use crate::vphysics::grab::GrabController;
 use crate::vphysics::shadow::PlayerController;
 use crate::vphysics::Model;
 
@@ -109,6 +114,15 @@ pub struct Physics {
     /// `CBasePlayer::InitVCollision` has the same deferral for the same
     /// reason: it runs from `Spawn`, not from `LevelInitPreEntity`.
     player: Option<PlayerController>,
+    /// What the player is carrying — `CPlayerPickupController::m_grabController`
+    /// plus the entity it is attached to.
+    ///
+    /// The controller lives here because this module owns the
+    /// [`Environment`]; the *game* state
+    /// that goes with it — the carry angles, the floor bump — is
+    /// [`Carry`](super::grab::Carry) on the `Server`, because none of it is
+    /// about a body.
+    grab: Option<(EntityId, GrabController)>,
     stats: PhysicsStats,
 }
 
@@ -152,6 +166,7 @@ impl Physics {
             owners: HashMap::new(),
             movers: Vec::new(),
             player: None,
+            grab: None,
             stats: PhysicsStats {
                 static_bodies,
                 ..Default::default()
@@ -350,6 +365,23 @@ impl Physics {
             return false;
         };
         entity.core.physics = Some(body);
+        // **The prop's collision bounds, which nothing filled in before.**
+        // `VPhysicsInitNormal` sets `SOLID_VPHYSICS`, and a `SOLID_VPHYSICS`
+        // entity's `CCollisionProperty` takes its bounds from the *physics*
+        // model — `CBaseEntity::SetSolid` → `CollisionProp()->SetSolid`, which
+        // for this solid type reads the `CPhysCollide`'s.
+        //
+        // Until the grab controller nothing noticed: `EntityCore::model_bounds`
+        // is only filled for brush models, so a studio prop was a **point** to
+        // every box test in `server/`. That is why a cube could not press a
+        // floor button even once it could reach one — the button's trigger is
+        // 14 units tall and a resting cube's *origin* is 22 above the pad, so
+        // the point sat above the box. It also made every prop
+        // [`is_point_sized`](super::entity::EntityCore::is_point_sized) to the
+        // pusher, which a cube is not.
+        if let Some((mins, maxs)) = self.env.local_bounds(body) {
+            entity.core.model_bounds = super::movement::ModelBounds { mins, maxs };
+        }
         // `SetSolid( solidType ); SetMoveType( MOVETYPE_VPHYSICS )`. The
         // solidity is the caller's — `CPhysicsProp` passes `SOLID_VPHYSICS`
         // and the cube's `Spawn` has already set it — but the movetype is
@@ -482,6 +514,98 @@ impl Physics {
         controller.set_bounds(&mut self.env, mins, maxs);
         controller.drive(&mut self.env, target, wish, dt);
         controller.in_contact()
+    }
+
+    /// Which entity a body belongs to — `IPhysicsObject::GetGameData`.
+    ///
+    /// The `+use` trace needs it: [`sweep_box`](Physics::sweep_box) reports a
+    /// [`BodyId`], and the thing that gets picked up is an entity.
+    pub fn owner(&self, body: BodyId) -> Option<EntityId> {
+        self.owners.get(&body).copied()
+    }
+
+    /// `PhysGetEntityMass` — what an entity's body weighs, for
+    /// `CanPickupObject`'s 85 kg limit.
+    pub fn entity_mass(&self, entities: &EntityList, id: EntityId) -> Option<f32> {
+        let body = entities.get(id)?.core.physics?;
+        self.env.mass(body)
+    }
+
+    /// A body's collision bounds in its own frame — see
+    /// [`Environment::local_bounds`](crate::vphysics::env::Environment::local_bounds).
+    pub fn local_bounds(&self, body: BodyId) -> Option<(Vec3, Vec3)> {
+        self.env.local_bounds(body)
+    }
+
+    /// Is the box `half` at `origin` resting on `body`?
+    ///
+    /// `CategorizePosition`'s two-unit drop, redone against the props —
+    /// exactly as [`push`](super::push)'s `GROUND_PROBE` is redone against the
+    /// pushers, and for the same reason: **there is no ground entity in this
+    /// port**, only a ground plane that `client/`'s move found. It answers
+    /// `CPortal_Player::PickupObject`'s first guard, *"can't pick up what
+    /// you're standing on"*.
+    pub fn standing_on(&self, body: BodyId, half: Vec3, origin: Vec3) -> bool {
+        self.env
+            .sweep_box(half, origin, origin - Vec3::Z * GROUND_PROBE)
+            .is_some_and(|sweep| sweep.body == body)
+    }
+
+    /// `CGrabController::AttachEntity` — start carrying `id`.
+    ///
+    /// Returns false if the entity has no body, which is
+    /// `PlayerPickupObject`'s own first guard (*"Don't pick up if we don't
+    /// have a phys object"*).
+    pub fn grab(&mut self, entities: &EntityList, id: EntityId) -> bool {
+        let Some(body) = entities.get(id).and_then(|entity| entity.core.physics) else {
+            return false;
+        };
+        if let Some((_, controller)) = self.grab.take() {
+            controller.detach(&mut self.env, Vec3::ZERO, 0.0);
+        }
+        self.grab = Some((id, GrabController::attach(&mut self.env, body)));
+        true
+    }
+
+    /// `CGrabController::UpdateObject`'s tail: aim the held object and run one
+    /// step of its controller.
+    ///
+    /// **Call it before [`step`](Physics::step)**, for the reason
+    /// [`drive_player`](Physics::drive_player) says.
+    pub fn drive_grab(&mut self, target: Vec3, rotation: Quat, player_speed: f32, dt: f32) {
+        if let Some((_, controller)) = &mut self.grab {
+            controller.drive(&mut self.env, target, rotation, player_speed, dt);
+        }
+    }
+
+    /// `CGrabController::ComputeError` — and it consumes the accumulated time,
+    /// so asking twice in one tick gives zero the second time.
+    pub fn grab_error(&mut self) -> f32 {
+        match &mut self.grab {
+            Some((_, controller)) => controller.error(&self.env),
+            None => 0.0,
+        }
+    }
+
+    /// `CGrabController::DetachEntity` — let go.
+    ///
+    /// Returns the entity that was released, or `None` if nothing was held.
+    pub fn release_grab(&mut self, player_velocity: Vec3, max_speed: f32) -> Option<EntityId> {
+        let (id, controller) = self.grab.take()?;
+        controller.detach(&mut self.env, player_velocity, max_speed);
+        Some(id)
+    }
+
+    /// `TestIntersectionVsHeldObjectCollide`'s `SOLID_BBOX` arm — would
+    /// letting go right now leave the held object inside the box `half` at
+    /// `at`?
+    ///
+    /// The box is the player's, and a true answer **refuses the drop**.
+    pub fn held_overlaps(&self, half: Vec3, at: Vec3) -> bool {
+        match &self.grab {
+            Some((_, controller)) => self.env.overlaps_box(controller.body(), half, at),
+            None => false,
+        }
     }
 
     /// `CBasePlayer::VPhysicsDestroyObject` — the shadow goes when the player
@@ -1118,6 +1242,7 @@ mod depot {
             wish_velocity: Vec3::new(175.0, 0.0, 0.0),
             // Rewritten every tick inside the loop below; see there.
             vphysics_position: feet,
+            view_offset: crate::client::player::VEC_VIEW,
         };
         server.spawn_player(state);
 
@@ -1307,6 +1432,7 @@ mod depot {
                         }
                         false => mv.origin,
                     },
+                    view_offset: crate::client::player::VEC_VIEW,
                 };
                 match server.player() {
                     Some(_) => server.set_player_state(state),
@@ -1413,4 +1539,291 @@ mod depot {
             })
         }
     }
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release carries_the_cube -- --ignored --nocapture
+    /// ```
+    ///
+    /// **The grab controller end to end on shipped content**: the movement
+    /// code drives the player, `+use` picks the cube up, the carry tracks the
+    /// player as they walk, and putting it down on the chamber's floor button
+    /// presses it.
+    ///
+    /// `sp_a1_intro1` is the map for this because it *is* this puzzle: one
+    /// `prop_weighted_cube`, one `prop_floor_button`, and the cube comes to
+    /// rest **345 units** from the pad — far past what shoving covers, which
+    /// is what `portdocs/VPHYSICS_SHADOW.md` §7 measured and could not close.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_player_carries_the_cube_to_the_floor_button_on_sp_a1_intro1() {
+        use crate::client::movement::{
+            player_maxs, player_mins, player_move, MoveData, MoveVars,
+        };
+        use crate::engine::trace::{CollisionBsp, Contents, Ray};
+
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let bsp = Bsp::load(&vfs, "sp_a1_intro1").expect("load the map");
+        let collision = CollisionBsp::build(&bsp);
+        let props = Props::load("sp_a1_intro1", &bsp).expect("the prop lump");
+        let mut built = world_physics::build(
+            "sp_a1_intro1",
+            &bsp,
+            &props,
+            &vfs,
+            world_physics::surface_properties(&vfs),
+        );
+        let mut server = Server::new();
+        server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
+        let names: Vec<String> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| e.model)
+            .collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+
+        let cube = name::find_by_name(&server.entities, "box")
+            .next()
+            .expect("the cube named `box`");
+        // Out of the dropper and asleep on the chamber floor.
+        for _ in 0..320 {
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        }
+        let resting = server.entities.get(cube).expect("the cube").core.origin;
+        let (button, button_at) = server
+            .entities
+            .iter()
+            .find(|(_, e)| e.core.class.name == "prop_floor_button")
+            .map(|(id, e)| (id, e.core.origin))
+            .expect("the chamber's floor button");
+        println!(
+            "cube rests at {resting}, button at {button_at}, {:.1} units apart",
+            resting.distance(button_at)
+        );
+
+        // Somewhere to stand within reach of the cube. The chamber puts it in
+        // a corner on a slope, so rather than reason about which side is
+        // clear, every spot on a few rings is tried and the **pickup itself**
+        // is the test of whether it was a good one.
+        let (mins, maxs) = (player_mins(false), player_maxs(false));
+        let mut candidates = Vec::new();
+        for radius in [40.0f32, 48.0, 56.0, 64.0, 72.0] {
+            for i in 0..24 {
+                let a = std::f32::consts::TAU * i as f32 / 24.0;
+                let out = Vec3::new(a.cos(), a.sin(), 0.0) * radius;
+                let above = resting + out + Vec3::Z * 8.0;
+                let down = Ray::hull(above, above - Vec3::Z * 96.0, mins, maxs);
+                let ground = collision.tracer().trace(&down, Contents::MASK_PLAYERSOLID);
+                if ground.did_hit() && !ground.start_solid {
+                    candidates.push(ground.end + Vec3::Z);
+                }
+            }
+        }
+        println!("{} places to stand near the cube", candidates.len());
+        assert!(!candidates.is_empty(), "nowhere to stand next to the cube");
+
+        // One tick of the whole loop: move, hand the server the player, run
+        // the tick. `buttons` carries `+use` on the ticks that press it.
+        let step = |server: &mut Server, mv: &mut MoveData, forward: f32, use_key: bool| {
+            let physics = server.physics().map(PhysicsPropsForTest);
+            {
+                let mut plain = collision.tracer();
+                let mut with = physics.as_ref().map(|p| collision.tracer().with_props(p));
+                let tracer: &mut crate::engine::trace::Tracer<'_> =
+                    with.as_mut().unwrap_or(&mut plain);
+                mv.forwardmove = forward;
+                let angles = mv.angles;
+                player_move(mv, Some(tracer), None, &MoveVars::PORTAL2, 1.0 / 64.0, angles);
+            }
+            let mut state = crate::server::PlayerState {
+                origin: mv.origin,
+                angles: Vec3::new(mv.angles.pitch, mv.angles.yaw, 0.0),
+                velocity: mv.velocity,
+                base_velocity: mv.base_velocity,
+                on_ground: mv.ground.is_some(),
+                move_type: MoveType::Walk,
+                mins: player_mins(mv.ducked),
+                maxs: player_maxs(mv.ducked),
+                health: 100,
+                life_state: Default::default(),
+                flags: 0,
+                buttons: match use_key {
+                    true => crate::server::classes::IN_USE,
+                    false => 0,
+                },
+                wish_velocity: match mv.touched_physics {
+                    true => mv.out_wish_vel,
+                    false => Vec3::splat(mv.max_speed),
+                },
+                vphysics_position: match mv.touched_physics && mv.ground.is_some() {
+                    true => (mv.origin + (mv.move_start + mv.out_wish_vel / 64.0)) * 0.5,
+                    false => mv.origin,
+                },
+                view_offset: crate::client::player::VEC_VIEW,
+            };
+            state.vphysics_position = state.origin;
+            match server.player() {
+                Some(_) => server.set_player_state(state),
+                None => {
+                    server.spawn_player(state);
+                }
+            }
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        };
+
+        // Stand at each candidate in turn, look at the cube and press `+use`.
+        // A spot that cannot see the cube simply fails to pick it up and the
+        // next one is tried; nothing else about the world has changed.
+        let mut mv = MoveData::standing_at(candidates[0]);
+        let mut from = None;
+        for &stand in &candidates {
+            mv = MoveData::standing_at(stand);
+            for _ in 0..8 {
+                step(&mut server, &mut mv, 0.0, false);
+            }
+            let here = server.entities.get(cube).expect("the cube").core.origin;
+            let eye = mv.origin + crate::client::player::VEC_VIEW;
+            let look = (here - eye).normalize_or_zero();
+            mv.angles = crate::client::view::ViewAngles::new(
+                -look.z.asin().to_degrees(),
+                look.y.atan2(look.x).to_degrees(),
+            );
+            step(&mut server, &mut mv, 0.0, true);
+            if server.carried() == Some(cube) {
+                from = Some((stand, eye.distance(here)));
+                break;
+            }
+            // Release the key so the next attempt is a fresh press edge.
+            step(&mut server, &mut mv, 0.0, false);
+        }
+        let (stand, reach) = from.expect("`+use` should pick the cube up from somewhere beside it");
+        println!("picked the cube up from {stand}, {reach:.1} units away");
+
+        // It should now be held in front of the eye rather than on the floor.
+        for _ in 0..16 {
+            step(&mut server, &mut mv, 0.0, false);
+        }
+        let held = server.entities.get(cube).expect("the cube").core.origin;
+        let reach = held.distance(mv.origin + crate::client::player::VEC_VIEW);
+        println!("held at {held}, {reach:.1} units from the eye");
+        assert!(
+            reach < 110.0,
+            "a held cube should be in front of the player, not {reach:.1} units away"
+        );
+
+        // Carry it to the button. **Steer by where the *cube* is, not by where
+        // the player is**: it hangs about seventy-five units in front of the
+        // eye, so walking the player onto the pad puts the cube well past it.
+        let pressed = |server: &Server| {
+            server
+                .entities
+                .get(button)
+                .and_then(|e| e.behaviour.downcast_ref::<crate::server::classes::FloorButton>())
+                .map(|b| b.pressed)
+                .expect("the button's state")
+        };
+        let mut closest = f32::MAX;
+        let mut carried_for = 0;
+        for tick in 0..1200 {
+            let to = (button_at - mv.origin).truncate();
+            mv.angles = crate::client::view::ViewAngles::new(
+                0.0,
+                to.y.atan2(to.x).to_degrees(),
+            );
+            step(&mut server, &mut mv, 175.0, false);
+            if server.carried() == Some(cube) {
+                carried_for += 1;
+            }
+            let held = server.entities.get(cube).expect("the cube").core.origin;
+            let flat = (button_at - held).truncate().length();
+            closest = closest.min(flat);
+            if tick % 120 == 0 {
+                println!(
+                    "  tick {tick}: cube {flat:.0} from the pad, carrying {}",
+                    server.carried().is_some()
+                );
+            }
+            if flat < 12.0 {
+                break;
+            }
+        }
+        println!("closest the cube came to the pad: {closest:.1}, carried for {carried_for} ticks");
+        assert_eq!(
+            server.carried(),
+            Some(cube),
+            "the cube should still be held after walking {:.0} units",
+            resting.distance(button_at)
+        );
+        assert!(
+            closest < 16.0,
+            "the cube should reach the pad; closest was {closest:.1} units"
+        );
+
+        // **Stand still first.** `DetachEntity` clamps the outgoing velocity
+        // *relative to the player* (`ClampPhysicsVelocity`, `:860`), so a cube
+        // let go at a run keeps the run: dropping this one mid-stride put it
+        // 48 units past the pad. Stopping is what a player does, and it is
+        // also the only way the release means "put down" rather than "throw".
+        for _ in 0..48 {
+            step(&mut server, &mut mv, 0.0, false);
+        }
+        let over = server.entities.get(cube).expect("the cube").core.origin;
+        println!(
+            "standing still, the cube hangs {:.1} from the pad",
+            (button_at - over).truncate().length()
+        );
+
+        // Let go, and let it settle onto the pad.
+        step(&mut server, &mut mv, 0.0, true);
+        for _ in 0..192 {
+            step(&mut server, &mut mv, 0.0, false);
+        }
+        assert_eq!(server.carried(), None, "`+use` again should drop it");
+        let dropped = server.entities.get(cube).expect("the cube").core.origin;
+        println!(
+            "dropped at {dropped}, {:.1} from the pad",
+            (button_at - dropped).truncate().length()
+        );
+
+        // **Now walk the player away.** Standing next to a pad presses it, so
+        // a press with the player still on it proves nothing — the whole claim
+        // is that the *cube* holds it down.
+        for _ in 0..192 {
+            let away = (mv.origin - button_at).truncate().normalize_or_zero();
+            mv.angles = crate::client::view::ViewAngles::new(
+                0.0,
+                away.y.atan2(away.x).to_degrees(),
+            );
+            step(&mut server, &mut mv, 175.0, false);
+            if (mv.origin - button_at).truncate().length() > 160.0 {
+                break;
+            }
+        }
+        let player_away = (mv.origin - button_at).truncate().length();
+        println!("player walked {player_away:.0} units off the pad");
+        assert!(
+            player_away > 120.0,
+            "the player has to be clear of the pad for this to mean anything, got {player_away:.0}"
+        );
+        for _ in 0..64 {
+            step(&mut server, &mut mv, 0.0, false);
+        }
+
+        let settled = server.entities.get(cube).expect("the cube").core.origin;
+        assert!(
+            (button_at - settled).truncate().length() < 24.0,
+            "the cube should have been put down on the pad, not at {settled}"
+        );
+        assert!(
+            pressed(&server),
+            "with the player {player_away:.0} units away, the pad is held down by the cube alone"
+        );
+        println!("the floor button is held down by the cube, with nobody standing on it");
+    }
+
 }

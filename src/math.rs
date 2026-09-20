@@ -46,6 +46,23 @@ pub fn angle_matrix(angles: Vec3) -> Mat3 {
     Mat3::from_rotation_z(yaw) * Mat3::from_rotation_y(pitch) * Mat3::from_rotation_x(roll)
 }
 
+/// `AngleVectors` (`mathlib/mathlib_base.cpp:1027`) — forward, right, up for
+/// a `QAngle`.
+///
+/// Derived from [`angle_matrix`]'s columns rather than from its own trig, so
+/// that the two cannot drift: column 0 is forward, column 1 is **left** — so
+/// right is its negation — and column 2 is up. Source is Z-up right-handed and
+/// "right" is `-Y` when facing `+X`, which is the sign that makes
+/// `+moveright` add `right * cl_sidespeed`.
+///
+/// [`crate::client::view::ViewAngles::vectors`] is the same function for the
+/// client's own angle type and spells the trig out; a test pins the two
+/// together.
+pub fn angle_vectors(angles: Vec3) -> (Vec3, Vec3, Vec3) {
+    let matrix = angle_matrix(angles);
+    (matrix.x_axis, -matrix.y_axis, matrix.z_axis)
+}
+
 /// `MatrixAngles` (`mathlib/mathlib_base.cpp:217`) — the `QAngle` a rotation
 /// came from, which is [`angle_matrix`]'s inverse.
 ///
@@ -130,6 +147,30 @@ pub fn vector_angles(forward: Vec3, pseudo_up: Vec3) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
+
+    /// [`angle_vectors`] must agree with the client's own spelled-out
+    /// `AngleVectors`, or the carry direction and the view would disagree.
+    #[test]
+    fn angle_vectors_agrees_with_the_client_view() {
+        for angles in [
+            Vec3::ZERO,
+            Vec3::new(0.0, 90.0, 0.0),
+            Vec3::new(-30.0, 45.0, 0.0),
+            Vec3::new(75.0, -170.0, 0.0),
+            Vec3::new(12.5, 200.0, 33.0),
+        ] {
+            let view = crate::client::view::ViewAngles {
+                pitch: angles.x,
+                yaw: angles.y,
+                roll: angles.z,
+            };
+            let (ef, er, eu) = view.vectors();
+            let (f, r, u) = angle_vectors(angles);
+            assert!((f - ef).length() < 1e-5, "forward {angles}: {f} vs {ef}");
+            assert!((r - er).length() < 1e-5, "right {angles}: {r} vs {er}");
+            assert!((u - eu).length() < 1e-5, "up {angles}: {u} vs {eu}");
+        }
+    }
     use super::*;
 
     /// Each axis against the column of `matrix3x4_t` the original writes,

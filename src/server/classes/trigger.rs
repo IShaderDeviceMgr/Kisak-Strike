@@ -80,8 +80,16 @@ const SF_TRIGGER_ALLOW_CLIENTS: u32 = 0x01;
 const SF_TRIGGER_ALLOW_NPCS: u32 = 0x02;
 /// `func_pushable`s can. No shipped Portal 2 map places one.
 const SF_TRIGGER_ALLOW_PUSHABLES: u32 = 0x04;
-/// `MOVETYPE_VPHYSICS` objects can — cubes, mostly. `ENGINE_TRACE.md` stage 5.
-const _SF_TRIGGER_ALLOW_PHYSICS: u32 = 0x08;
+/// `MOVETYPE_VPHYSICS` objects can — cubes, mostly.
+///
+/// Unused until the grab controller landed, because nothing with that move
+/// type could reach a trigger: a cube had no body, then had one it could not
+/// be carried by. **841 shipped triggers set it**, across eight classes —
+/// 325 `trigger_multiple`s, 250 `trigger_portal_cleanser`s, 115
+/// `trigger_catapult`s and the rest — and **481 of those allow no clients at
+/// all**, so they are physics-only and notice no player. Every one of them was
+/// inert here until this arm existed.
+const SF_TRIGGER_ALLOW_PHYSICS: u32 = 0x08;
 /// *If* NPCs can, only player-ally ones.
 const SF_TRIGGER_ONLY_PLAYER_ALLY_NPCS: u32 = 0x10;
 /// *If* players can, only ones in a vehicle. Portal 2 has no vehicles, so this
@@ -304,7 +312,15 @@ impl BaseTrigger {
                 && other_core.has_flags(FL_CLIENT))
             || (entity.has_spawn_flags(SF_TRIGGER_ALLOW_NPCS) && other_core.has_flags(FL_NPC))
             || (entity.has_spawn_flags(SF_TRIGGER_ALLOW_PUSHABLES)
-                && other_core.classname().eq_ignore_ascii_case("func_pushable"));
+                && other_core.classname().eq_ignore_ascii_case("func_pushable"))
+            // `(HasSpawnFlags(SF_TRIGGER_ALLOW_PHYSICS) && pOther->GetMoveType()
+            // == MOVETYPE_VPHYSICS)` (`triggers.cpp:367`) — **the arm a cube
+            // takes**, and the last one this port was missing. It is a
+            // *movetype* test rather than a class test, so it lets in anything
+            // the solver moves; `prop_floor_button`'s own filter then narrows
+            // it back to cubes.
+            || (entity.has_spawn_flags(SF_TRIGGER_ALLOW_PHYSICS)
+                && other_core.move_type == super::super::movement::MoveType::VPhysics);
         if !allowed {
             return false;
         }
