@@ -182,6 +182,15 @@ pub struct Server {
     /// handed to the physics shadow, and putting it on the core would offer it
     /// to 49 classes that must not read it.
     player_wish_velocity: Vec3,
+    /// `m_vNewVPhysicsPosition` as the client last reported it — see
+    /// [`PlayerState::vphysics_position`]. Here for the same reason
+    /// [`player_wish_velocity`](Server::player_wish_velocity) is.
+    ///
+    /// `None` until the first [`set_player_state`](Server::set_player_state),
+    /// which is a real state rather than a sentinel: a player can legitimately
+    /// stand at the world origin, so "no target yet" cannot be spelled
+    /// `Vec3::ZERO`.
+    player_shadow_target: Option<Vec3>,
     /// Scratch for the touch query, so that a tick does not allocate.
     overlaps: Vec<usize>,
     /// Scratch for the [`Solid::Obb`](movement::Solid::Obb) half of the same
@@ -503,6 +512,15 @@ pub struct PlayerState {
     /// on how hard it may push a prop: it is why walking into a cube pushes it
     /// and standing against one does not.
     pub wish_velocity: Vec3,
+    /// `m_vNewVPhysicsPosition` — **the client's**, read by the server and
+    /// never written.
+    ///
+    /// Where the player's physics shadow is told to go, which is *ahead* of
+    /// the player whenever the move touched a prop on the ground. See
+    /// [`crate::client::player::Player::vphysics_position`]; without the bias
+    /// the shove does not work, because a blocked player is a target the
+    /// shadow catches up with.
+    pub vphysics_position: Vec3,
 }
 
 /// One entity's studio model, as the renderer needs to see it.
@@ -775,6 +793,7 @@ impl Server {
             player_was_ducked: false,
             player_prev_origin: Vec3::ZERO,
             player_wish_velocity: Vec3::ZERO,
+            player_shadow_target: None,
             overlaps: Vec::new(),
             obb_overlaps: Vec::new(),
             pending_spawn: Vec::new(),
@@ -2120,13 +2139,23 @@ impl Server {
             entity.core.model_bounds.mins,
             entity.core.model_bounds.maxs,
         );
+        // **The shadow is aimed at `m_vNewVPhysicsPosition`, not at the
+        // player.** They are the same point except while the player is
+        // touching a prop on the ground, and that exception is the whole of
+        // why a cube can be shoved at all — see
+        // [`PlayerState::vphysics_position`]. A shadow that has never been
+        // given one aims at the player, which is what
+        // `CBasePlayer::SetupVPhysicsShadow`'s
+        // `UpdatePhysicsShadowToPosition( vecAbsOrigin )` does on the tick the
+        // body is created.
+        let target = self.player_shadow_target.unwrap_or(origin);
         let wish = self.player_wish_velocity;
         // `physics.cpp:265` pins the physics step at 1/64 s regardless of the
         // game's tick rate, and `Environment::step` is built on that; this is
         // the same number and not the server's own interval for that reason.
         let dt = crate::vphysics::env::TIMESTEP;
         if let Some(physics) = &mut self.physics {
-            physics.drive_player(origin, wish, mins, maxs, dt);
+            physics.drive_player(target, wish, mins, maxs, dt);
         }
     }
 
@@ -2486,6 +2515,7 @@ impl Server {
         core.velocity = state.velocity;
         core.base_velocity = state.base_velocity;
         self.player_wish_velocity = state.wish_velocity;
+        self.player_shadow_target = Some(state.vphysics_position);
         core.model_bounds = ModelBounds {
             mins: state.mins,
             maxs: state.maxs,
@@ -2541,6 +2571,7 @@ impl Server {
             // given so that the round trip reads as an identity, and nothing
             // here derives one.
             wish_velocity: self.player_wish_velocity,
+            vphysics_position: self.player_shadow_target.unwrap_or(core.origin),
         })
     }
 

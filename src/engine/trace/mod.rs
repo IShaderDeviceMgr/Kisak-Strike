@@ -1613,6 +1613,133 @@ mod tests {
         }
     }
 
+    /// A [`PropQuery`] over a **real** [`Environment`], so that the seam
+    /// between this module's conventions and Rapier's is exercised rather than
+    /// mocked.
+    ///
+    /// [`Environment`]: crate::vphysics::env::Environment
+    struct RealProps(crate::vphysics::env::Environment);
+
+    impl PropQuery for RealProps {
+        fn sweep(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<PropHit> {
+            let sweep = self.0.sweep_box(half, start, end)?;
+            Some(PropHit {
+                fraction: sweep.fraction,
+                normal: sweep.normal,
+                start_solid: sweep.start_solid,
+            })
+        }
+    }
+
+    /// An environment holding one 32-unit cube centred on `at`.
+    fn one_real_cube(at: Vec3) -> RealProps {
+        use crate::vphysics::collide::{Ledge, Solid, SolidParams};
+        use crate::vphysics::env::{Environment, Hulls, Mass, Motion};
+        use crate::vphysics::surfaceprops::SurfaceProps;
+
+        let mut points = Vec::new();
+        for i in 0..8 {
+            points.push(Vec3::new(
+                if i & 1 == 0 { -16.0 } else { 16.0 },
+                if i & 2 == 0 { -16.0 } else { 16.0 },
+                if i & 4 == 0 { -16.0 } else { 16.0 },
+            ));
+        }
+        let solid = Solid {
+            mass_center: Vec3::ZERO,
+            rotation_inertia: Vec3::splat(32.0f32.powi(2) / 12.0 * 2f32.sqrt()),
+            radius: 16.0 * 3f32.sqrt(),
+            ledges: vec![Ledge {
+                points,
+                triangles: Vec::new(),
+                material: 0,
+                mixed_materials: false,
+            }],
+        };
+        let params = SolidParams {
+            mass: 40.0,
+            ..Default::default()
+        };
+        let mut env = Environment::new(SurfaceProps::default());
+        env.add(
+            Motion::Dynamic,
+            &Hulls::from_solid(&solid),
+            at,
+            Vec3::ZERO,
+            "default",
+            Some(Mass::from_solid(&solid, &params)),
+        )
+        .expect("a cube");
+        env.step();
+        RealProps(env)
+    }
+
+    /// **Walking into a cube must not trap the player against it.**
+    ///
+    /// The sequence a player actually performs: sweep up to the cube, take
+    /// the trace's own endpoint as the new position, and sweep again. The
+    /// second sweep starts `DIST_EPSILON` from the cube's face, and if *that*
+    /// comes back `start_solid` the player can never move again in any
+    /// direction — which is the bug this test was written for.
+    #[test]
+    fn a_player_who_walks_into_a_cube_can_walk_away_again() {
+        let world = wall(true);
+        // In front of the wall the fixture puts at x = 100, so the cube is
+        // what the sweep meets first: it spans x 44..76, and a hull whose
+        // half-width is 16 stops at 28.
+        let props = one_real_cube(Vec3::new(60.0, 0.0, 36.0));
+
+        let approach = Ray::hull(
+            Vec3::ZERO,
+            Vec3::new(400.0, 0.0, 0.0),
+            HULL_MIN,
+            HULL_MAX,
+        );
+        let stopped = world
+            .tracer()
+            .with_props(&props)
+            .trace(&approach, Contents::MASK_PLAYERSOLID);
+        assert!(stopped.hit_prop, "the cube should have stopped it: {stopped:?}");
+        assert!(
+            (stopped.end.x - (28.0 - DIST_EPSILON)).abs() < 0.1,
+            "stopped at {:?}, expected just short of 28",
+            stopped.end
+        );
+
+        // Standing where the last trace left us, press forward again.
+        let again = Ray::hull(
+            stopped.end,
+            stopped.end + Vec3::new(10.0, 0.0, 0.0),
+            HULL_MIN,
+            HULL_MAX,
+        );
+        let nudge = world
+            .tracer()
+            .with_props(&props)
+            .trace(&again, Contents::MASK_PLAYERSOLID);
+        assert!(
+            !nudge.start_solid,
+            "a player resting against a cube is not inside it: {nudge:?}"
+        );
+
+        // …and backing away must be completely free.
+        let away = Ray::hull(
+            stopped.end,
+            stopped.end - Vec3::new(64.0, 0.0, 0.0),
+            HULL_MIN,
+            HULL_MAX,
+        );
+        let back = world
+            .tracer()
+            .with_props(&props)
+            .trace(&away, Contents::MASK_PLAYERSOLID);
+        assert_eq!(
+            back.fraction, 1.0,
+            "walking away from a cube must not be blocked: {back:?}"
+        );
+        assert!(!back.start_solid, "{back:?}");
+    }
+
     /// **A prop stops a sweep that the world would have let through**, which
     /// is the whole of stage 2 of `portdocs/VPHYSICS_SHADOW.md`: the cube is a
     /// wall.

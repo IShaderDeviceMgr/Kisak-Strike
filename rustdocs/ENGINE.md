@@ -2114,6 +2114,12 @@ Three things about the merge:
 - **A prop hit never reports `all_solid`.** A shape cast reports penetration, not *never
   having left* it, and reporting `all_solid` would stop the whole chain on a cube the
   player is clipping the corner of.
+- **A sweep that starts inside a prop and moves *out* of it is not a hit.** The
+  environment's cast discards a time-zero impact whose velocity is separating, so a
+  player who is overlapped by a shoved prop for one tick can walk out again. Get this
+  wrong and the move is zeroed in all six directions, permanently, because this port has
+  no `CheckStuck` — see `rustdocs/VPHYSICS.md` §4b. Valve's brush sweep has the same
+  property for free, from its `DIST_EPSILON`-offset planes.
 
 `Trace::hit_prop` is set by this and by nothing else. It is the second field on `Trace`
 that is not about the surface hit (`portal_ramp` is the first), and it exists because

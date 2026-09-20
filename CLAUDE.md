@@ -64,7 +64,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,159 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,160 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -460,7 +460,36 @@ pieces, and only the middle one is the file's own:
   statement and was the one this port had left out, because a cube that could
   not move was not going to enter anything.
 
-Four findings, in `portdocs/VPHYSICS_SHADOW.md` §6 and §7. **`m_outWishVel` is
+**Two defects got past every test and were caught by playing it**, and they
+came from the same blind spot: the depot test that checked the shove advanced
+the player's origin **by hand**, straight through the cube, and a player driven
+that way never gets stuck on anything and never runs the controller out of
+error. Both are worth knowing before writing the next physics query.
+
+- **`parry`'s `stop_at_penetration` defaults to `true`**, and with it a sweep
+  that *starts* overlapping reports a fraction of zero whichever way it is
+  going — including straight away from what it is inside. A player whom a
+  shoved cube overlapped for a single tick was then pinned against it for good,
+  the move zeroed in all six directions and `noclip` the only way out, because
+  there is no `CheckStuck` here. `false` discards a time-zero impact whose
+  velocity is *separating*, which is what Valve's brush sweep gets for free
+  from its `DIST_EPSILON`-offset planes.
+- **The shadow is aimed *ahead* of the player, not at them.**
+  `CBasePlayer::PostThinkVPhysics` (`baseplayer_shared.cpp:3286`) puts the
+  target at the midpoint between where the player is and where the wish
+  velocity would have taken them, whenever the move touched a prop on the
+  ground. Without it the shove does not work at all: the player's own trace is
+  stopped by the cube, so a shadow aimed at the player's origin catches up to a
+  target that is not moving, so the controller has no error left to correct.
+  Two seconds of walking into the cube moved it **1.3 units** before this and
+  **25** after.
+
+The regression test for both is the first here to drive the *movement code* on
+a real map with the solver running underneath, from every approach the chamber
+leaves open. **A harness that supplies the answer under test — here, the
+player's position — cannot fail the way the game does.**
+
+Four more findings, in `portdocs/VPHYSICS_SHADOW.md` §6 and §7. **`m_outWishVel` is
 what the shove is allowed to use, and it is not the player's velocity** — a
 player walking into a cube has a velocity of nearly zero and a wish velocity of
 nearly 175, which is exactly the case the controller exists for; the movement

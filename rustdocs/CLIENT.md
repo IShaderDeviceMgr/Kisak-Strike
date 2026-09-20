@@ -877,6 +877,17 @@ Same ordering: most likely to bite first.
   every airborne tick — a bug, corrected, recorded in
   `portdocs/VPHYSICS_SHADOW.md` §6 beside the other one it is a twin of.
 
+- **`Player::vphysics_position` is where the *shadow* is sent, and it is not
+  where the player is.** `Client::run_move`'s tail computes
+  `PostThinkVPhysics`'s forward bias
+  (`baseplayer_shared.cpp:3286`): whenever the move touched a prop on the
+  ground, the target is the midpoint between the player's origin and
+  `move_start + out_wish_vel * dt`. Without it the shove does not work at all —
+  the player's own trace is stopped by the cube, so a shadow aimed at the
+  player catches up and the controller runs out of error. **The position uses
+  the raw accumulated `out_wish_vel` and the velocity uses the substituted
+  one**, in that order, which is Valve's.
+
 - **`touched_physics` is `m_bTouchedPhysObject`, and it is sticky for the whole
   command.** Set by any player trace a prop won (`Trace::hit_prop`), cleared
   once per `player_move`. Its consumer is `Client::run_move`'s tail, which is

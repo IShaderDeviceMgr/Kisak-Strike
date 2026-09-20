@@ -108,8 +108,24 @@ answers.
 `Sweep` reports the fraction, the surface normal, the `BodyId` and
 `start_solid`.
 
-> **Two things about the answer are not what the API names suggest**, and both
-> cost a test to find. `parry`'s `ShapeCastHit::normal1` is documented as the
+> **`stop_at_penetration` must be `false`, and getting it wrong traps the
+> player.** With `true` — the obvious reading, and parry's default — a sweep
+> that *starts* overlapping reports a time of impact of zero whichever way it
+> is going, including straight away from the thing it is inside. A player who
+> ends up inside a prop for one tick, which happens whenever a prop is shoved
+> into them, then has `fraction == 0` in all six directions and is stuck for
+> good: there is no `CheckStuck` in this port to nudge them out, and `noclip`
+> is the only way. `false` discards a time-zero impact whose relative velocity
+> is *separating*, which is exactly what Valve's brush sweep gets for free —
+> `CM_ClipBoxToBrush` tests planes offset by `DIST_EPSILON`, so a box leaving
+> a brush it is inside is never stopped by it. Approaching still collides, so
+> nothing becomes easier to walk through.
+> `a_sweep_can_leave_a_prop_it_starts_inside` and
+> `a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again` are
+> the guards; the second is the bug report, reproduced.
+
+> **Two more things about the answer are not what the API names suggest**, and
+> both cost a test to find. `parry`'s `ShapeCastHit::normal1` is documented as the
 > outward normal on the *first* shape — the moving box — which would point the
 > way the box is going; Source's `trace_t::plane::normal` points the other way.
 > Rapier's query pipeline casts the collider against the shape and flips the
@@ -218,6 +234,48 @@ usercmd. `Update` (`:640`) does four things:
 Then `do_simulation_controller` (`:486`) runs inside the step: teleport if the
 error exceeds 24 units, run `ComputeController`, and clamp the result against
 every contact normal (§3.4).
+
+> **The target is not the player's origin, and if it were the shove would not
+> work at all.** `CBasePlayer::PostThinkVPhysics` (`baseplayer_shared.cpp:3286`)
+> computes what `Update` is given:
+>
+> ```c
+> newPosition = GetAbsOrigin();
+> if ( !pPhysGround && m_bTouchedPhysObject
+>      && g_pMoveData->m_outStepHeight <= 0.f && (GetFlags() & FL_ONGROUND) )
+> {
+>     newPosition = m_oldOrigin + frametime * g_pMoveData->m_outWishVel;
+>     newPosition = (GetAbsOrigin() * 0.5f) + (newPosition * 0.5f);
+> }
+> ```
+>
+> Whenever the move touched a prop on the ground, the shadow is aimed **ahead**
+> of the player, at the midpoint between where they are and where the wish
+> velocity would have taken them. The loop it breaks closes on itself
+> otherwise: the player's own trace is stopped by the cube, so a shadow aimed
+> at the player's origin catches up to a target that is not moving, so
+> `ComputeController` has no error left to correct, so it pushes with nothing.
+> Aiming at where the player *tried* to go keeps a persistent error — about 1.4
+> units at a walk — for as long as they keep walking.
+>
+> Measured on `sp_a1_intro1`, two seconds of walking into the cube from three
+> approaches: **1.3, 0.1 and 10.9 units** of shove without the bias, **25.3,
+> 15.2 and 22.7** with it. This was missed on the first pass because the depot
+> test that checked the shove advanced the player's origin *by hand*, straight
+> through the cube, which keeps the error alive artificially; only a player
+> whose position comes from the trace runs into it.
+>
+> **Two of the four conditions are not ported and neither exists to be
+> missed.** `!pPhysGround` asks whether the player stands on a *moveable
+> physics object*, which needs a ground entity where `MoveData::ground` is a
+> plane (§9). `m_outStepHeight <= 0` excludes a frame the player stepped up
+> in, because the shadow gets `StepUp` instead on those — and `StepUp` is §9's
+> as well.
+>
+> **The order of the two outputs matters**: `newPosition` uses the *real*
+> accumulated `m_outWishVel` (`:3296`) and the velocity handed to the
+> controller uses the one substituted by `m_outWishVel.Init( maxSpeed, … )`
+> (`:3318`), which happens afterwards.
 
 Here the two clocks are already reconciled — this port's tick and its physics
 step are both 1/64 s (`portdocs/VPHYSICS.md` §4.1) — so the update and the
@@ -478,11 +536,31 @@ independent of both.
 
 **All five landed**, and the order held. What the plan did not have, and the
 implementation needed, is in §2.2, §2.3, §3.1 and §6.4: the sweep filter is a
-predicate rather than `only_dynamic`; the normal that comes back is `normal1`
-rather than `normal2`; a zero-length sweep needs a different query; the two
-hulls became one body; and `m_outWishVel` had to be ported into
+predicate rather than `only_dynamic`; `stop_at_penetration` has to be `false`
+or a player who touches a prop is trapped against it; the normal that comes
+back is `normal1` rather than `normal2`; a zero-length sweep needs a different
+query; the two hulls became one body; and `m_outWishVel` had to be ported into
 `client/movement.rs` before stage 4 had anything to drive with, which brought
 a fifth Valve bug with it.
+
+**Two of those were found by playing rather than by testing**, and they were
+the two that mattered most: everything above passed, the depot tests passed,
+and walking at the cube on `sp_a1_intro1` both pinned the player against it
+*and* barely moved it. Both came from the same blind spot — the depot test
+that checked the shove advanced the player's origin **by hand**, straight
+through the cube, and a player driven that way never gets stuck on anything
+and always keeps the controller's error alive.
+
+The test that now guards both,
+`a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again`, is the
+first here to drive the *movement code* on a real map with the solver running
+underneath, so the player's position comes from the trace exactly as it does in
+the running game. It walks in from every one of the eight compass points the
+chamber leaves open, for two seconds, then walks away for two, and asserts
+three things: the cube moved, the player got away, and the player is not
+standing inside it at the end. **The lesson is cheap to state and was expensive
+to learn: a harness that supplies the answer under test — here, the player's
+position — cannot fail the way the game does.**
 
 ---
 
@@ -490,14 +568,16 @@ a fifth Valve bug with it.
 
 | | before | after |
 |---|---|---|
-| `cargo test` | 1,135 | **1,159** |
-| tests guarding this | — | 23, plus 1 depot |
+| `cargo test` | 1,135 | **1,160** |
+| tests guarding this | — | 24, plus 2 depot |
 | `trace/` stages | 4 of 5 | **5 of 5** |
 
-- **The player shoves the real cube on the real map**:
-  `the_player_shadow_shoves_the_cube_on_sp_a1_intro1` walks a player into the
-  cube on `sp_a1_intro1` after it has fallen and gone to sleep, and the cube
-  moves **18.8 units at most** before rolling back.
+- **The player shoves the real cube on the real map.** Driven by the movement
+  code, from the three of eight approaches the chamber leaves open, two seconds
+  of walking moves it **25.3, 15.2 and 22.7 units** — against 1.3, 0.1 and 10.9
+  before the forward-biased target landed (§3.3). The number is **not
+  calibrated against the shipped game**, which this port cannot run; it is a
+  regression guard on a mechanism that is known to fail silently.
 - **The measurement is the furthest it got, not where it ended**, and that is
   the map rather than the port: the cube comes to rest on the slope it fell
   onto, so a shove eastward is a shove *uphill* and the cube rolls back down

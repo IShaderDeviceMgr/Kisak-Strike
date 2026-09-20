@@ -4064,6 +4064,7 @@ fn player_at(origin: Vec3) -> PlayerState {
         flags: 0,
         buttons: 0,
         wish_velocity: Vec3::ZERO,
+        vphysics_position: origin,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),
     }

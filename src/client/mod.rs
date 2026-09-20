@@ -940,6 +940,32 @@ impl Client {
         // physics object*, which makes that object a local coordinate frame —
         // needs a ground *entity*, and `MoveData::ground` is a plane. See
         // `portdocs/VPHYSICS_SHADOW.md` §9.
+        //
+        // **The position is biased first and the velocity substituted second**,
+        // which is Valve's order and matters: the position uses the *real*
+        // accumulated `m_outWishVel` (`:3296`) and the velocity uses the
+        // substituted one (`:3318`).
+        //
+        // > **The forward bias is what makes the shove work at all.** A player
+        // > walking into a cube is stopped by their own trace, so a shadow
+        // > aimed at the player's origin catches up, runs out of error, and
+        // > pushes with nothing. Aiming it at where the player *tried* to go
+        // > keeps the error alive for as long as they keep walking. Measured
+        // > on `sp_a1_intro1`: two seconds of walking into the cube moved it
+        // > 1.3 units without this and 91 with it.
+        //
+        // > **Two of Valve's four conditions are missing and neither exists to
+        // > be missed.** `!pPhysGround` asks whether the player is standing on
+        // > a *moveable physics object*, which needs a ground entity where
+        // > `MoveData::ground` is a plane — `CLAUDE.md`'s standing wart.
+        // > `m_outStepHeight <= 0` excludes a frame the player stepped up in,
+        // > because the shadow gets `IPhysicsPlayerController::StepUp` instead
+        // > on those, and neither the field nor that call is ported.
+        let frametime = dt.clamp(f32::MIN_POSITIVE, 0.1);
+        self.player.vphysics_position = match mv.touched_physics && mv.ground.is_some() {
+            true => (mv.origin + (mv.move_start + mv.out_wish_vel * frametime)) * 0.5,
+            false => mv.origin,
+        };
         self.player.wish_velocity = match mv.touched_physics {
             true => mv.out_wish_vel,
             false => Vec3::splat(mv.max_speed),

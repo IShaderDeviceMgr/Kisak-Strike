@@ -1316,8 +1316,10 @@ fn player_state(client: &Client) -> server::PlayerState {
         },
         // The one field that is purely the client's.
         buttons: client.buttons_bits(),
-        // …and the second, which arrived with the player's physics shadow.
+        // …and the second and third, which arrived with the player's physics
+        // shadow.
         wish_velocity: player.wish_velocity,
+        vphysics_position: player.vphysics_position,
     }
 }
 

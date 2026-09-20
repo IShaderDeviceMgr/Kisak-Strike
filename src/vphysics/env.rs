@@ -150,8 +150,11 @@ pub struct Sweep {
     /// was hit** and so back towards the sweeper — Source's
     /// `trace_t::plane::normal` convention.
     ///
-    /// Zero when [`start_solid`](Sweep::start_solid) is set and the overlap is
-    /// deep enough that there is no meaningful contact plane.
+    /// **Zero for a zero-length sweep**, which is a position test: there is no
+    /// direction, so there is no face the box can be said to have come in
+    /// through. A *swept* answer always carries a real normal, including a
+    /// penetrating one — `compute_impact_geometry_on_penetration` is set for
+    /// exactly that.
     pub normal: Vec3,
     /// Which body stopped it.
     pub body: BodyId,
@@ -724,7 +727,21 @@ impl Environment {
         let options = ShapeCastOptions {
             max_time_of_impact: 1.0,
             target_distance: 0.0,
-            stop_at_penetration: true,
+            // **`false`, and this is the whole of why a player can walk out of
+            // a cube again.** With `true` a sweep that *starts* overlapping
+            // reports a time of impact of zero whatever direction it is going
+            // — including straight away from the thing it is inside — so a
+            // player who ends up inside a prop for one tick is trapped there
+            // for good, with `fraction == 0` in all six directions and no
+            // `CheckStuck` in this port to nudge them out.
+            //
+            // `false` discards a time-zero impact whose relative velocity is
+            // *separating*, which is the same thing Valve's brush sweep gets
+            // for free: `CM_ClipBoxToBrush` tests planes offset by
+            // `DIST_EPSILON`, so a box leaving a brush it is inside is never
+            // stopped by it. Approaching still collides, so nothing gets
+            // easier to walk through.
+            stop_at_penetration: false,
             compute_impact_geometry_on_penetration: true,
         };
         let is_prop = |_: ColliderHandle, collider: &Collider| -> bool {
@@ -1145,21 +1162,48 @@ mod tests {
         assert!(!hit.start_solid);
     }
 
-    /// A sweep that begins inside a prop reports `startsolid` and a fraction
-    /// of zero, which is what `trace_chain` needs to stop the whole chain
-    /// where it is.
+    /// **A sweep that begins inside a prop and moves *out* of it is not
+    /// blocked, and one that moves further *in* is.**
+    ///
+    /// This is the fix for a player who walked into the cube on
+    /// `sp_a1_intro1` and could not walk away again: with
+    /// `stop_at_penetration` set, every sweep from a penetrating start
+    /// reported a fraction of zero whatever direction it was going, so the
+    /// move was zeroed in all six directions and nothing but `noclip` got the
+    /// player out. There is no `CheckStuck` in this port to nudge them.
+    ///
+    /// Valve's brush sweep has the same property for free — `CM_ClipBoxToBrush`
+    /// offsets its planes by `DIST_EPSILON`, so a box leaving a brush it is
+    /// inside is never stopped by it.
     #[test]
-    fn a_sweep_that_starts_inside_a_prop_is_start_solid() {
+    fn a_sweep_can_leave_a_prop_it_starts_inside() {
         let mut env = Environment::new(SurfaceProps::default());
         let cube = prop(&mut env, Vec3::ZERO);
         env.step();
 
-        let hit = env
-            .sweep_box(Vec3::splat(2.0), Vec3::ZERO, Vec3::new(400.0, 0.0, 0.0))
-            .expect("inside it");
-        assert_eq!(hit.body, cube);
-        assert!(hit.start_solid);
-        assert_eq!(hit.fraction, 0.0);
+        // Eight units inside the cube's +x face, which is at x = 16.
+        let inside = Vec3::new(8.0, 0.0, 0.0);
+        // Straight out through the near face.
+        assert_eq!(
+            env.sweep_box(Vec3::splat(2.0), inside, inside + Vec3::new(400.0, 0.0, 0.0)),
+            None,
+            "a box already inside a prop must be free to leave it"
+        );
+        // Straight further in.
+        let deeper = env
+            .sweep_box(Vec3::splat(2.0), inside, inside - Vec3::new(400.0, 0.0, 0.0))
+            .expect("driving deeper into a prop still collides");
+        assert_eq!(deeper.body, cube);
+        assert!(deeper.start_solid);
+        assert_eq!(deeper.fraction, 0.0);
+
+        // …and the *position* test still reports the overlap, because that is
+        // what `startsolid` means and nothing about it depends on a direction.
+        let here = env
+            .sweep_box(Vec3::splat(2.0), inside, inside)
+            .expect("a position test inside a prop is start-solid");
+        assert!(here.start_solid);
+        assert_eq!(here.fraction, 0.0);
     }
 
     /// A zero-length sweep is a *position test* — Source asks them constantly

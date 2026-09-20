@@ -346,6 +346,7 @@ pub struct PlayerState {
     // The CLIENT's, and never written by the server.
     pub buttons: u32,          // IN_*, as a raw mask
     pub wish_velocity: Vec3,   // m_outWishVel, for the physics shadow
+    pub vphysics_position: Vec3, // m_vNewVPhysicsPosition — where the shadow is sent
 }
 ```
 
@@ -368,7 +369,8 @@ for buttons, `logic_playerproxy` fires on the press edge) and never writes it.
 **A press and release inside one server tick is lost**, which is Valve's too —
 a shipped server sees one usercmd per tick and computes the same edge from it.
 
-`wish_velocity` is the second field of that kind and the newest.
+`wish_velocity` and `vphysics_position` are the second and third fields of
+that kind and the newest.
 `m_vNewVPhysicsVelocity` (`player.h:1304`): what the client's last move
 *asked* for, after `PostThinkVPhysics`'s substitution. Its only reader is
 `Server::drive_player_shadow`, which hands it to the player's physics shadow —
@@ -376,6 +378,14 @@ it is what decides how hard a cube is pushed, and it is not the player's
 velocity. It is held on `Server` rather than on the player's `EntityCore`
 because no entity has one: it is a *movement* output, and putting it on the
 core would offer it to 49 classes that must not read it.
+
+`vphysics_position` is where that shadow is *sent*, and it is deliberately not
+the player's origin: `CBasePlayer::PostThinkVPhysics` biases it ahead of the
+player whenever the move touched a prop on the ground, because a blocked player
+is a target the shadow catches up with and a caught-up shadow pushes nothing.
+`Server::drive_player_shadow` prefers it over `core.origin` and falls back to
+the origin only before the client has ever sent one — which is
+`SetupVPhysicsShadow`'s own `UpdatePhysicsShadowToPosition( vecAbsOrigin )`.
 
 ### `ModelEntityState` (`mod.rs`)
 

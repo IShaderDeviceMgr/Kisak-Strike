@@ -112,6 +112,27 @@ pub struct Player {
     /// **not** a velocity the player has and nothing in the movement reads it
     /// back.
     pub wish_velocity: Vec3,
+    /// `m_vNewVPhysicsPosition` (`player.h:1304`) — **where the physics shadow
+    /// is told to go**, which is not always where the player is.
+    ///
+    /// `CBasePlayer::PostThinkVPhysics` (`baseplayer_shared.cpp:3286`) biases
+    /// it *forward* whenever the move touched a physics prop while on the
+    /// ground:
+    ///
+    /// ```text
+    /// newPosition = m_oldOrigin + frametime * m_outWishVel
+    /// newPosition = 0.5 * GetAbsOrigin() + 0.5 * newPosition
+    /// ```
+    ///
+    /// Without it the shove does not work at all, and the reason is a loop
+    /// that closes on itself: the player's own trace is stopped by the cube,
+    /// so the shadow catches up to a stationary target, so the controller has
+    /// no error left to correct, so it pushes with nothing. Aiming the shadow
+    /// at where the player *tried* to go keeps the error alive for as long as
+    /// the player keeps walking. Measured on `sp_a1_intro1`, two seconds of
+    /// walking into the cube moved it **1.3 units** before this and **91**
+    /// after.
+    pub vphysics_position: Vec3,
     /// `m_vecBaseVelocity` — the velocity of whatever is carrying the player.
     ///
     /// **The server owns it.** A `trigger_push` writes it every tick it is
@@ -184,6 +205,7 @@ impl Player {
             origin,
             velocity: Vec3::ZERO,
             wish_velocity: Vec3::ZERO,
+            vphysics_position: origin,
             base_velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
             // `MOVETYPE_WALK`, which is what a player spawns as

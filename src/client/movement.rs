@@ -427,6 +427,47 @@ pub struct MoveData {
     pub teleported: Option<Teleport>,
 }
 
+impl MoveData {
+    /// A standing, unmoving player at `origin`, facing `+X` — every
+    /// per-command field cleared and every persistent one at the value
+    /// `CBasePlayer::Spawn` leaves it.
+    ///
+    /// `Client::run_move` builds its own from the player and the `UserCmd`;
+    /// this is for callers that have a position and nothing else, which is
+    /// every test that drives the movement directly — which is the only
+    /// caller, hence the gate.
+    #[cfg(test)]
+    pub(crate) fn standing_at(origin: Vec3) -> MoveData {
+        MoveData {
+            origin,
+            velocity: Vec3::ZERO,
+            angles: ViewAngles::new(0.0, 0.0),
+            forwardmove: 0.0,
+            sidemove: 0.0,
+            upmove: 0.0,
+            buttons: ButtonBits::NONE,
+            old_buttons: ButtonBits::NONE,
+            max_speed: SV_SPEED_NORMAL,
+            move_type: MoveType::Walk,
+            health: 100,
+            frozen: false,
+            ground: None,
+            base_velocity: Vec3::ZERO,
+            surface_friction: 1.0,
+            ducked: false,
+            ducking: false,
+            duck_time_msecs: 0,
+            view_offset: VEC_VIEW,
+            speed_cropped: false,
+            move_start: origin,
+            out_wish_vel: Vec3::ZERO,
+            touched_physics: false,
+            portal_environment: None,
+            teleported: None,
+        }
+    }
+}
+
 /// What a teleport did, for the caller to finish.
 ///
 /// Everything `HandlePortalling` does to the *movement* it does in place —
@@ -2660,33 +2701,7 @@ mod tests {
 
     /// A walking player at `origin`, facing `+X`, holding nothing.
     fn walker(origin: Vec3) -> MoveData {
-        MoveData {
-            origin,
-            velocity: Vec3::ZERO,
-            angles: ViewAngles::new(0.0, 0.0),
-            forwardmove: 0.0,
-            sidemove: 0.0,
-            upmove: 0.0,
-            buttons: ButtonBits::NONE,
-            old_buttons: ButtonBits::NONE,
-            max_speed: SV_SPEED_NORMAL,
-            move_type: MoveType::Walk,
-            health: 100,
-            frozen: false,
-            ground: None,
-            base_velocity: Vec3::ZERO,
-            surface_friction: 1.0,
-            ducked: false,
-            ducking: false,
-            duck_time_msecs: 0,
-            view_offset: VEC_VIEW,
-            speed_cropped: false,
-            move_start: origin,
-            out_wish_vel: Vec3::ZERO,
-            touched_physics: false,
-            portal_environment: None,
-            teleported: None,
-        }
+        MoveData::standing_at(origin)
     }
 
     /// Runs `frames` commands, letting the caller fill each one in.

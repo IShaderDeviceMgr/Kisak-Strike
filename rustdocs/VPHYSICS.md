@@ -135,9 +135,18 @@ of how each body was *created*, because `EnableMotion( false )` makes a prop a
 fixed body and filtering on the Rapier body type would let the player walk
 through every cube a map spawns frozen.
 
+**A sweep that starts inside a prop can leave it.** `stop_at_penetration` is
+`false`, so a time-zero impact whose relative velocity is *separating* is
+discarded: moving out of a prop you are inside is not a collision, moving
+further in still is. Without that a player who is overlapped by a shoved prop
+for one tick has `fraction == 0` in every direction and is trapped, because
+this port has no `CheckStuck`. Valve's brush sweep gets the same property from
+its `DIST_EPSILON`-offset planes.
+
 `Sweep::normal` follows Source's `trace_t::plane::normal` — it points **out of
 what was hit**, back towards the sweeper — and is zero on a `start_solid`
-answer, where there is no contact plane to report. `Contact::normal` follows
+answer from a *position test*, where there is no direction and so no contact
+plane to report. `Contact::normal` follows
 `CFrictionSnapshot::GetSurfaceNormal` and points the *other* way, from the body
 asked towards what it is touching, which is why a ground test on one reads
 `normal.z < -0.7`. The two conventions are opposite and both are Valve's.
@@ -164,6 +173,13 @@ calling it:
   walking into a cube has a velocity of nearly zero and a wish velocity of
   nearly 175, and it is the second that decides how hard the cube is shoved.
   Pass the real velocity and a player pressed against a cube stops pushing it.
+- **`target` is not the player's origin either.** It is
+  `m_vNewVPhysicsPosition`, which `CBasePlayer::PostThinkVPhysics` biases
+  *ahead* of the player whenever the move touched a prop on the ground. Pass
+  the origin and the shove stops working entirely, because a blocked player is
+  a target the shadow catches up with and the controller then has no error to
+  correct. `PlayerState::vphysics_position` carries it, and
+  `portdocs/VPHYSICS_SHADOW.md` §3.3 has the arithmetic and the measurement.
 
 ## 5. Invariants and gotchas, most likely to bite first
 
@@ -365,7 +381,10 @@ would be noticed first.
 | …and never the player's own shadow | `the_players_shadow_is_not_swept_against` |
 | The sweep normal is Source's, not parry's | `the_sweep_normal_points_back_at_the_sweeper` |
 | A degenerate zero-extent sweep is a ray, not a NaN | `a_ray_against_a_prop_is_a_zero_extent_sweep` |
-| A sweep from inside a prop, and a zero-length one | `a_sweep_that_starts_inside_a_prop_is_start_solid`, `a_zero_length_sweep_is_a_position_test` |
+| **Leaving a prop you start inside is free; going deeper is not** | `a_sweep_can_leave_a_prop_it_starts_inside` |
+| A zero-length sweep is a position test | `a_zero_length_sweep_is_a_position_test` |
+| A player can walk into a cube and out again | `a_player_who_walks_into_a_cube_can_walk_away_again` |
+| …on the real map, from every approach | `a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again` *(depot)* |
 | A contact normal points at what is touched | `a_resting_bodys_contact_normal_points_at_what_it_rests_on` |
 | `ComputeController` closes the gap in one step | `the_controller_closes_the_gap_in_one_step` |
 | …with a **per-axis** clamp, so a diagonal reaches √3 | `the_clamp_is_per_axis_so_a_diagonal_reaches_root_three` |
@@ -374,6 +393,7 @@ would be noticed first.
 | Immovable forbids the push; a light prop is capped | `an_immovable_contact_forbids_the_push`, `a_light_prop_is_pushed_at_the_speed_limit_and_no_faster` |
 | The floor is not clamped against | `the_ground_is_not_a_plane_the_push_is_clamped_against` |
 | A walking player shoves a cube; a standing one does not | `a_walking_player_shoves_a_cube`, `a_standing_player_does_not_push` |
+| **The shove survives the player being blocked by what they push** | `a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again` *(depot)* |
 | A shadow left behind is teleported, not driven | `a_shadow_left_too_far_behind_is_teleported` |
 | …and a *disabled* one is stopped and recovered too | `a_standing_players_shadow_is_stopped_rather_than_left_coasting` |
 | **The real player shoving the real cube** | `the_player_shadow_shoves_the_cube_on_sp_a1_intro1` *(depot)* |

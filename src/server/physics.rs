@@ -1116,6 +1116,8 @@ mod depot {
             buttons: 0,
             // What the movement would have asked for, walking east.
             wish_velocity: Vec3::new(175.0, 0.0, 0.0),
+            // Rewritten every tick inside the loop below; see there.
+            vphysics_position: feet,
         };
         server.spawn_player(state);
 
@@ -1124,6 +1126,15 @@ mod depot {
         let mut furthest = 0.0f32;
         for tick in 0..64 {
             state.origin.x += 175.0 / 64.0;
+            // **The shadow's target moves with the player here.** This test
+            // walks the origin straight through the cube rather than letting a
+            // trace stop it, so there is no blocked player for
+            // `PostThinkVPhysics`'s forward bias to rescue and the honest
+            // target is simply where the player now is. The bias is the
+            // *movement's* to compute, and
+            // `a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again`
+            // is what exercises it.
+            state.vphysics_position = state.origin;
             server.set_player_state(state);
             server.frame(1.0 / 64.0, &mut NoTouchQuery);
             let now = server.entities.get(cube).expect("the cube").core.origin;
@@ -1151,5 +1162,255 @@ mod depot {
             "the player should have shoved the cube: it never got further than \
              {furthest:.2} units from {resting:?}"
         );
+    }
+
+    /// **Walking into the cube must not trap the player against it.**
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release walks_into_the_cube -- --ignored --nocapture
+    /// ```
+    ///
+    /// The one path neither of the tests above covers: the *movement code*
+    /// driving the player, so that the player's origin is decided by
+    /// `Tracer::with_props` rather than advanced by hand, while the shadow and
+    /// the solver run underneath it. Walk at the cube for a second, then walk
+    /// away for a second, and the player has to end up further from it than
+    /// they started.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn a_player_who_walks_into_the_cube_on_sp_a1_intro1_can_walk_away_again() {
+        use crate::client::movement::{
+            player_maxs, player_mins, player_move, MoveData, MoveVars, SV_SPEED_NORMAL,
+        };
+        use crate::engine::trace::{CollisionBsp, Contents, Ray};
+
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let bsp = Bsp::load(&vfs, "sp_a1_intro1").expect("load the map");
+        let collision = CollisionBsp::build(&bsp);
+        let props = Props::load("sp_a1_intro1", &bsp).expect("the prop lump");
+        let mut built = world_physics::build(
+            "sp_a1_intro1",
+            &bsp,
+            &props,
+            &vfs,
+            world_physics::surface_properties(&vfs),
+        );
+        let mut server = Server::new();
+        server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
+        let names: Vec<String> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| e.model)
+            .collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+
+        let cube = name::find_by_name(&server.entities, "box")
+            .next()
+            .expect("the cube named `box`");
+        for _ in 0..320 {
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        }
+        let resting = server.entities.get(cube).expect("the cube").core.origin;
+
+        // **Every direction the cube can be approached from**, because a
+        // stuck player is a geometry accident and one approach proves
+        // nothing. The map puts the cube on a slope in a corner, so some of
+        // the eight are inside a wall and are skipped.
+        let (mins, maxs) = (player_mins(false), player_maxs(false));
+        let mut tried = 0;
+        let mut stuck = Vec::new();
+        let mut shoves: Vec<f32> = Vec::new();
+        for step_index in 0..8 {
+            let angle = std::f32::consts::TAU * step_index as f32 / 8.0;
+            let out = Vec3::new(angle.cos(), angle.sin(), 0.0) * 72.0;
+            // The cube's own base is `resting.z - 16`, so start a little above
+            // that rather than far overhead: the chamber has a ceiling.
+            let above = resting + out + Vec3::Z * 8.0;
+            let down = Ray::hull(above, above - Vec3::Z * 64.0, mins, maxs);
+            let ground = collision.tracer().trace(&down, Contents::MASK_PLAYERSOLID);
+            if !ground.did_hit() || ground.start_solid {
+                continue;
+            }
+            let feet = ground.end + Vec3::Z;
+            let beside = Vec3::new(resting.x, resting.y, feet.z);
+            // A short fraction is fine and expected — the cube sits on a
+            // slope, so the straight line to it runs into the slope and the
+            // movement code walks up it. Only starting *inside* something
+            // disqualifies a spot.
+            if collision
+                .tracer()
+                .trace(&Ray::hull(feet, beside, mins, maxs), Contents::MASK_PLAYERSOLID)
+                .start_solid
+            {
+                continue;
+            }
+            tried += 1;
+
+            // **Aim at where the cube is now, not where it started.** Earlier
+            // approaches will have shoved it; putting the entity's origin back
+            // would not move its *body*, and the trace follows the body.
+            let target = server.entities.get(cube).expect("the cube").core.origin;
+            let mut mv = MoveData::standing_at(feet);
+            let toward = (target - feet).truncate().normalize_or_zero();
+            mv.angles = crate::client::view::ViewAngles::new(
+                0.0,
+                toward.y.atan2(toward.x).to_degrees(),
+            );
+
+            let drive = |server: &mut Server, mv: &mut MoveData, forward: f32| {
+                let physics = server.physics().map(PhysicsPropsForTest);
+                {
+                    let mut plain = collision.tracer();
+                    let mut with = physics.as_ref().map(|p| collision.tracer().with_props(p));
+                    let tracer: &mut crate::engine::trace::Tracer<'_> =
+                        with.as_mut().unwrap_or(&mut plain);
+                    mv.forwardmove = forward;
+                    let angles = mv.angles;
+                    player_move(
+                        mv,
+                        Some(tracer),
+                        None,
+                        &MoveVars::PORTAL2,
+                        1.0 / 64.0,
+                        angles,
+                    );
+                }
+                let state = crate::server::PlayerState {
+                    origin: mv.origin,
+                    angles: Vec3::new(mv.angles.pitch, mv.angles.yaw, 0.0),
+                    velocity: mv.velocity,
+                    base_velocity: mv.base_velocity,
+                    on_ground: mv.ground.is_some(),
+                    move_type: MoveType::Walk,
+                    mins: player_mins(mv.ducked),
+                    maxs: player_maxs(mv.ducked),
+                    health: 100,
+                    life_state: Default::default(),
+                    flags: 0,
+                    buttons: 0,
+                    // `PostThinkVPhysics`'s substitution, which `Client::run_move`
+                    // does in the running game.
+                    wish_velocity: match mv.touched_physics {
+                        true => mv.out_wish_vel,
+                        false => Vec3::splat(mv.max_speed),
+                    },
+                    vphysics_position: match mv.touched_physics && mv.ground.is_some() {
+                        true => {
+                            (mv.origin + (mv.move_start + mv.out_wish_vel / 64.0)) * 0.5
+                        }
+                        false => mv.origin,
+                    },
+                };
+                match server.player() {
+                    Some(_) => server.set_player_state(state),
+                    None => {
+                        server.spawn_player(state);
+                    }
+                }
+                server.frame(1.0 / 64.0, &mut NoTouchQuery);
+            };
+
+            for _ in 0..16 {
+                drive(&mut server, &mut mv, 0.0);
+            }
+            // Two seconds walking at it, which is long enough to get the cube
+            // into a corner and keep pushing.
+            for _ in 0..128 {
+                drive(&mut server, &mut mv, SV_SPEED_NORMAL);
+            }
+            let against = mv.origin;
+            // …then two seconds walking away.
+            for _ in 0..128 {
+                drive(&mut server, &mut mv, -SV_SPEED_NORMAL);
+            }
+            let retreated = (mv.origin - against).truncate().length();
+            let shoved = (server.entities.get(cube).expect("the cube").core.origin - target)
+                .truncate()
+                .length();
+            eprintln!(
+                "  approach {step_index}: shoved the cube {shoved:.1} units, \
+                 ended against it at {against:?}, backed off {retreated:.1} units"
+            );
+            shoves.push(shoved);
+            // Where they ended up, as the trace sees it. A `start_solid`
+            // here is a player standing inside the cube, which is the state
+            // this test exists to catch.
+            let here = Ray::hull(mv.origin, mv.origin, mins, maxs);
+            let physics = server.physics().map(PhysicsPropsForTest);
+            let probe = match physics.as_ref() {
+                Some(p) => collision
+                    .tracer()
+                    .with_props(p)
+                    .trace(&here, Contents::MASK_PLAYERSOLID),
+                None => collision.tracer().trace(&here, Contents::MASK_PLAYERSOLID),
+            };
+            if retreated < 32.0 || probe.start_solid {
+                eprintln!(
+                    "    stuck: position test start_solid={} hit_prop={}, cube at {:?}",
+                    probe.start_solid,
+                    probe.hit_prop,
+                    server.entities.get(cube).expect("the cube").core.origin
+                );
+                stuck.push((step_index, against, mv.origin, retreated));
+            }
+        }
+
+        assert!(tried >= 3, "only {tried} of the eight approaches were usable");
+        // **Walking into a cube has to move it, from every approach.** Two
+        // seconds of walking at 175 u/s against a 40 kg cube on the slope
+        // `sp_a1_intro1` leaves it on moves it 15–25 units, and the threshold
+        // is set well under that: what this is guarding against is not a
+        // slightly weaker shove but the shove stopping altogether.
+        //
+        // > **That is what happens without `PostThinkVPhysics`'s
+        // > forward-biased target** (`PlayerState::vphysics_position`): the
+        // > player's own trace is stopped by the cube, so a shadow aimed at
+        // > the player's origin catches up, runs out of error and pushes with
+        // > nothing. The same three approaches measured **1.3, 0.1 and 10.9
+        // > units** before that landed and **25.3, 15.2 and 22.7** after.
+        //
+        // > **The number is not calibrated against the shipped game**, which
+        // > this port cannot run. It is a regression guard on a mechanism that
+        // > is known to fail silently, not a claim that a Portal 2 cube slides
+        // > exactly this far.
+        let worst = shoves.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            worst > 8.0,
+            "the player barely moved the cube from at least one approach: {shoves:?}"
+        );
+        assert!(
+            stuck.is_empty(),
+            "the player is stuck on the cube after walking into it. \
+             Each entry is (approach, where they ended up against it, where they \
+             got to backing off, units): {stuck:#?}"
+        );
+    }
+
+    /// The test's own [`PropQuery`](crate::engine::trace::PropQuery) — the
+    /// same three lines `engine/mod.rs`'s `PhysicsProps` is, which this module
+    /// cannot reach into.
+    struct PhysicsPropsForTest<'a>(&'a Physics);
+
+    impl crate::engine::trace::PropQuery for PhysicsPropsForTest<'_> {
+        fn sweep(
+            &self,
+            half: Vec3,
+            start: Vec3,
+            end: Vec3,
+        ) -> Option<crate::engine::trace::PropHit> {
+            let sweep = self.0.sweep_box(half, start, end)?;
+            Some(crate::engine::trace::PropHit {
+                fraction: sweep.fraction,
+                normal: sweep.normal,
+                start_solid: sweep.start_solid,
+            })
+        }
     }
 }
