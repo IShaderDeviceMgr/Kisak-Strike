@@ -443,9 +443,13 @@ all, and it is still never drawn.
   are all waiting on is `MOVETYPE_VPHYSICS`.
 
 - **The 3D skybox through a portal** (`Draw3dSkyboxworld_Portal`,
-  `IsSkyboxVisibleFromExitPortal`). There is no skybox yet. When there is,
-  `m_nSkyboxVisibleFromCorners` in `PortalMoved` is the flag it wants, and the
-  five PVS origins of §4.1 are already the array `Map_VisSetup` would take.
+  `IsSkyboxVisibleFromExitPortal`). **The skybox itself has landed** —
+  `portdocs/ENGINE_WORLD_SKY.md` — so what is left here is only the *through a
+  portal* half: `m_nSkyboxVisibleFromCorners` in `PortalMoved` is the flag it
+  wants, and the five PVS origins of §4.1 are already the array
+  `Map_VisSetup` would take. **Four shipped maps place both a `prop_portal` and
+  a `sky_camera`** — `sp_a1_intro1`, `sp_a4_finale1`, `sp_a4_finale2` and
+  `sp_a4_finale4` — so this is reachable content rather than a hypothetical.
 
 - **Fog through a portal** (`ShiftFogForExitPortalView`, the fog backup/restore
   around every recursion). No fog volumes are ported.

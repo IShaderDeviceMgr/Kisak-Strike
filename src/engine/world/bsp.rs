@@ -194,10 +194,41 @@ pub mod surf {
 
     /// Every flag that means "this surface is not world geometry".
     ///
-    /// `SKY`/`SKY2D` are in here because the 3D skybox is drawn by a separate
-    /// pass over a separate camera that does not exist yet — leaving them in
-    /// would drape the map in whatever the sky material resolves to.
+    /// `SKY`/`SKY2D` are in here because a sky surface is a **hole**, not a
+    /// picture: `R_DrawSurface` (`gl_rsurf.cpp:3760`) turns one into
+    /// `m_bSkyVisible = true` and emits no geometry, and what shows through is
+    /// whatever the sky pass left in the frame buffer. See
+    /// [`sky`](super::sky).
     pub const NOT_DRAWN: i32 = SKY | SKY2D | NODRAW | HINT | SKIP | TRIGGER;
+
+    /// The two together: what makes a face a hole onto the sky.
+    pub const ANY_SKY: i32 = SKY | SKY2D;
+}
+
+/// Leaf flags, from `public/bspfile.h:891` — the `flags:7` half of
+/// [`Leaf::area_flags`].
+///
+/// **`vbsp` sets [`SKY`](leaf::SKY) on every leaf it writes**
+/// (`utils/vbsp/writebsp.cpp:146`, *"By default, assume the leaf can see the
+/// skybox. VRAD will do the actual computation"*), and `vrad` clears it only
+/// inside `BuildVisForLightEnvironment` (`utils/vrad/lightmap.cpp:1459`),
+/// which nothing calls unless the map places a `light_environment` or a
+/// `light_directional`. **80 of Portal 2's 106 maps place neither**, so on
+/// those every leaf keeps the default and 194,641 of the game's 220,537
+/// leaves claim to see a 3D sky. That is why the flag is one of three gates
+/// and not the only one — `portdocs/ENGINE_WORLD_SKY.md` §2.2.
+pub mod leaf {
+    /// This leaf has 3D sky in its PVS.
+    pub const SKY: u16 = 0x01;
+    /// This leaf culled away some portals due to radial vis. **No leaf in
+    /// Portal 2 carries it**, which is what makes `Map_VisForceFullSky()` a
+    /// constant `false` and keeps it out of this port.
+    #[allow(dead_code)]
+    pub const RADIAL: u16 = 0x02;
+    /// This leaf has 2D sky in its PVS. **No leaf in Portal 2 carries it
+    /// either**, and no face in the game is `SURF_SKY2D`, so
+    /// `SKYBOX_2DSKYBOX_VISIBLE` is unreachable on this content.
+    pub const SKY2D: u16 = 0x04;
 }
 
 /// `dedge_t` (`public/bspfile.h:767`).
@@ -394,8 +425,7 @@ impl Leaf {
         self.area_flags & 0x01FF
     }
 
-    #[allow(dead_code)]
-    /// The `flags:7` half.
+    /// The `flags:7` half — see [`leaf`].
     pub fn flags(&self) -> u16 {
         self.area_flags >> 9
     }

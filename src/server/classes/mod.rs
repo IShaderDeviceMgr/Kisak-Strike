@@ -6,12 +6,14 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Forty-six classnames, 34,823 of the shipped game's 60,925 entity
-//! blocks.** Five of the 46 are placed by no map: `player` (the engine makes
-//! it when a client connects), `trigger_portal_button` (a `prop_floor_button`
-//! makes it in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **41 of
-//! the 200 classnames the maps place** are implemented.
+//! **Fifty classnames, 35,337 of the shipped game's 60,925 entity blocks.**
+//! Five of the 50 are placed by no map: `player` (the engine makes it when a
+//! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
+//! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
+//! `light_glspot`, each registered because Valve registers it — so **45 of
+//! the 200 classnames the maps place** are implemented. The exact totals are
+//! asserted by `every_shipped_map_spawns_its_entities`, which is where to
+//! look when this paragraph and the table disagree.
 //!
 //! Stage 1 brought ten of them — `worldspawn`, the light family,
 //! `info_target`, `info_player_start`, `logic_relay` and
@@ -31,9 +33,12 @@
 //! — and `prop_testchamber_door`, which is 138 across 71 maps and is the
 //! chamber door itself. `logic_branch_listener` (158, across 46 maps) came
 //! after it, because it is what shuts those doors again. `prop_portal` (21,
-//! across 10 maps) is the newest, and is `portdocs/PORTAL.md` stage 2: it
-//! links to its partner and computes the teleport matrix, but carves no hole
-//! and teleports nobody.
+//! across 10 maps) is `portdocs/PORTAL.md` stage 2: it links to its partner
+//! and computes the teleport matrix. **`sky_camera` is the newest and by far
+//! the rarest** — 7 in the whole game, one each on the seven maps with a 3D
+//! skybox — and it is here for the reason `logic_playerproxy` is: it is the
+//! *whole* of a feature's input, and one of the seven is on `sp_a1_intro1`.
+//! See `portdocs/ENGINE_WORLD_SKY.md`.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -58,6 +63,7 @@ pub mod player;
 pub mod point;
 pub mod portal;
 pub mod prop;
+pub mod sky;
 pub mod trigger;
 pub mod world;
 
@@ -76,6 +82,7 @@ pub use player::{
 };
 pub use point::PointTeleport;
 pub use portal::PropPortal;
+pub use sky::SkyCamera;
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
@@ -498,6 +505,16 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: &[],
         outputs: &[],
         create: PointEntity::create,
+    },
+    // Seven in the game, one per map on seven maps, and the rarest class here
+    // by instance count — but it is the whole of the 3D skybox's input, and
+    // one of the seven is on `sp_a1_intro1`. `portdocs/ENGINE_WORLD_SKY.md`.
+    ClassDef {
+        name: "sky_camera",
+        keys: sky::SKY_CAMERA_KEYS,
+        inputs: sky::SKY_CAMERA_INPUTS,
+        outputs: &[],
+        create: SkyCamera::create,
     },
     ClassDef {
         name: "worldspawn",

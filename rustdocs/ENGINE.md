@@ -6,7 +6,7 @@ module into 23 subsystems, 14 of which become modules here. **Five exist so far.
 | Module | Subsystem | Status |
 |---|---|---|
 | [`host`](#engine-host) | `host_state.cpp`, `sys_engine.cpp` (§7.2) | state machine + frame clock done; no simulation |
-| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain, props, **visibility** and the **recursive portal view** done; no 3D skybox |
+| [`world`](#engine-world) | `modelloader.cpp`, `cmodel.cpp` (§7.14) | `.bsp` geometry, lightmaps, brush models, terrain, props, **visibility**, the **recursive portal view** and the **sky** done; no dynamic lights |
 | [`input`](#engine-input) | `inputsystem/`, `keys.cpp`, `in_*.cpp` (§7.3/§7.4) | buttons, mouse look, bindings, UI precedence and a free-fly camera done; no controllers |
 | [`console`](#srcengineconsole) | `convar.cpp`, `commandbuffer.cpp`, `cmd.cpp`, `cvar.cpp`, `console.cpp`, `consoledialog.cpp` (§7.4) | complete — cvars, commands, buffer, `exec`, `stuffcmds`, `bind`, `config.cfg`, the list commands and the `egui` dialog |
 | [`window`](#engine-window) | `sys_mainwind.cpp`, `sys_getmodes.cpp`, `sdlmgr.cpp` (§7.3) | window, event loop, input translation and the `egui` boundary done |
@@ -18,7 +18,8 @@ by the map's baked lightmaps, packed into an atlas at load. On `sp_a1_intro1` th
 surfaces with real lighting across 13 atlas pages — plus 26 of its 78 brush entities and
 1,080 static props — and **WASD and the mouse walk through it**.
 What is still missing is listed under
-[Known limits](#known-limits-of-what-is-drawn); the largest item is the 3D skybox.
+[Known limits](#known-limits-of-what-is-drawn); the largest items are fog and dynamic
+lights.
 
 ---
 
@@ -1679,6 +1680,235 @@ This port's own, like `trace` and `tonemap`. Valve's nearest equivalents —
 `r_ShowViewerArea`, `mat_leafvis`, `r_DrawPortals` — all draw rather than print, and the
 numbers are what tell you whether the PVS is doing anything. The example is
 `sp_a1_intro1`'s spawn, which is inside the sealed starting container: 1.7% is right.
+
+### `world::sky` — the sky, and the room behind it
+
+Two things share the name and they nest. `portdocs/ENGINE_WORLD_SKY.md` is the analysis;
+this is the API.
+
+- **The 2D skybox** is `Sky`: six quads of `skybox/<skyname><rt|bk|lf|ft|up|dn>` drawn
+  around the camera at the far plane, so that whichever way you look there is a picture
+  behind everything. `engine/gl_warp.cpp`.
+- **The 3D skybox** is `Sky3d`: a second room, built at 1/16 scale, sitting somewhere else
+  inside the *same* `.bsp` and sealed off from the playable map, drawn from a second
+  camera before the real map is. `CSkyboxView` (`game/client/viewrender.cpp:698`).
+
+The second draws the first inside itself. A map's sky *surfaces* are never drawn at all —
+`R_DrawSurface` (`gl_rsurf.cpp:3760`) turns a `SURFDRAW_SKY` face into `m_bSkyVisible =
+true` and emits no geometry — so they are **holes** through which the first picture shows.
+
+```rust
+// engine::world::sky
+pub const SKY_ZNEAR: f32 = 2.0;                          // CSkyboxView::DrawInternal's
+pub const SKY_ZFAR:  f32 = 1.732_050_8 * 2.0 * 16384.0;  // MAX_TRACE_LENGTH, 56,755.8
+
+pub struct Sky { /* six materials, or none */ }
+impl Sky {
+    pub fn none() -> Sky;
+    pub fn load(vfs: &Vfs, materials: &mut MaterialCache, name: Option<&str>) -> Sky;
+    pub fn is_loaded(&self) -> bool;
+    pub fn summary(&self) -> String;
+    pub fn draw(&self, pass: &mut Pass<'_>, eye: Vec3, z_far: f32);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sky3d { pub origin: Vec3, pub scale: f32 }
+impl Sky3d { pub fn eye(&self, view_origin: Vec3) -> Vec3; }
+
+// engine::world::World
+pub sky: Sky;
+pub sky_name: Option<String>;
+pub sky_faces: Vec<u32>;                        // by .bsp face index
+pub fn sky_visible_from(&self, eye: Vec3) -> vis::SkyVisibility;
+pub fn sky_visible(&self, visible: &vis::VisibleSet) -> bool;      // m_bSkyVisible
+pub fn sky_visible_set(&self, camera: &Camera, sky: &Sky3d, novis: bool) -> vis::VisibleSet;
+pub fn draw_sky_view(&self, pass: &mut Pass<'_>, curtime: f32,
+                     camera: &Camera, visible: &vis::VisibleSet, draw_box: bool);
+
+// engine::world::vis
+pub enum SkyVisibility { None, Sky2d, Sky3d }   // SkyboxVisibility_t
+impl SkyVisibility { pub fn any(self) -> bool; }
+impl Visibility { pub fn sky_visible_from(&self, point: Vec3) -> SkyVisibility; }
+
+// server::Server
+pub fn sky3d(&self) -> Option<Sky3d>;           // the map's current sky_camera
+```
+
+#### The shape of the frame
+
+| when | camera | `Load` | draws |
+|---|---|---|---|
+| the map has a `sky_camera` **and** the view leaf says `Sky3d` | `Engine::sky_camera` | `Clear` | the box, then the skybox room, then its translucents |
+| then, always | the player's | **`ClearDepth`** | everything the frame already did |
+| no `sky_camera`, but the leaf says *any* sky | the player's | `Clear` | the box first, inside the scene pass |
+
+`Load::ClearDepth` is new and has exactly one caller. It is `CSkyboxView::Setup`'s
+
+```c
+*pClearFlags &= ~( VIEW_CLEAR_COLOR | VIEW_CLEAR_DEPTH | VIEW_CLEAR_STENCIL | VIEW_CLEAR_FULL_TARGET );
+*pClearFlags |= VIEW_CLEAR_DEPTH;
+```
+
+spelled once: the two pictures share a colour buffer and must not share a depth buffer. It
+clears the **stencil** with the depth, which the recursive portal view depends on — that
+starts every frame at stencil reference 0.
+
+**The whole sky view is one pass.** The only thing in this port's frame that forces a pass
+boundary is the frame-buffer copy, and there is no refracting draw in a skybox: `DrawWorld`,
+`DrawOpaqueRenderables` and `DrawTranslucentRenderables` are `DrawInternal`'s own three and
+all three fit.
+
+#### Three gates, and only the third is trustworthy
+
+`CSkyboxView::Setup` asks three questions and the port asks the same three:
+
+1. `r_3dsky` — default 1, and not a cheat.
+2. `engine->IsSkyboxVisibleFromPoint( origin )` — a leaf-flag lookup.
+3. `local->m_skybox3d.area != 255` — "is there a `sky_camera`", which here is
+   `Server::sky3d()` returning `Some`.
+
+**The second is `true` almost everywhere, and that is a compiler artefact.** `vbsp` writes
+`leaf_p->flags = LEAF_FLAGS_SKY` on every leaf it emits (`utils/vbsp/writebsp.cpp:146`,
+over the comment *"By default, assume the leaf can see the skybox. VRAD will do the actual
+computation"*), and `vrad` clears it only inside `BuildVisForLightEnvironment`, which
+nothing calls unless the map places a `light_environment` or a `light_directional`. **80 of
+Portal 2's 106 maps place neither**, so **194,641 of the game's 220,537 leaves claim to see
+a 3D sky** — from inside sealed rooms. Two of the seven maps that *have* a sky camera
+(`sp_a4_finale2`, `sp_a4_finale3`) are among them, so their 3D skybox is drawn from every
+leaf in the map. That is the shipped behaviour and it is reproduced, not tidied.
+
+The gate with teeth is the third: **7 of the game's 106 maps place a `sky_camera`**, all at
+`scale 16`, and **no map places two**.
+
+#### `m_bSkyVisible` — a fourth gate, on the box only
+
+The six quads are drawn only when a `SURF_SKY` face is in the set the view is about to
+draw. Valve gets that free from the render-list walk (`gl_rsurf.cpp:3763`); this port keeps
+the sky faces' `.bsp` indices in `World::sky_faces` and scans them — at most 266
+(`sp_a3_01`'s), short-circuited at the first hit. `World::sky_visible` folds
+`Sky::is_loaded` in with it, so `draw_box` is one boolean.
+
+`Map_VisForceFullSky()`, which the original ORs in beside it, is **not** ported: it is
+`LEAF_FLAGS_RADIAL` on the view leaf and **no leaf in the game carries that flag**.
+
+#### What is actually inside a skybox, measured
+
+`the_3d_skybox_of_every_map_that_has_one` loads all seven, spawns each one's entities and
+measures from the map's own `info_player_start`:
+
+| map | sky faces | `SURF_SKY` in it | props | brush | translucent faces | refracting | box drawn | leaf says sky |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| `e1912` | 161 | 0 | 0 | 0 | 60 | 0 | no — `sky_day01_01` is missing | yes |
+| `sp_a1_intro1` | 98 | 21 | 3 | 0 | 4 | 0 | yes | **no** |
+| `sp_a3_01` | 93 | 87 | 0 | 1 | 6 | 0 | yes | no |
+| `sp_a4_finale1` | 62 | 23 | 12 | 0 | 10 | 0 | yes | no |
+| `sp_a4_finale2` | 51 | 19 | 48 | 0 | 10 | 0 | yes | yes |
+| `sp_a4_finale3` | 50 | 32 | 2 | 0 | 2 | 0 | yes | yes |
+| `sp_a4_finale4` | 51 | 0 | 0 | 0 | 0 | 0 | no — no sky brush in the room | no |
+
+Four things fall out of that table.
+
+**No skybox room in the game contains anything refracting**, which is why `draw_sky_view`
+needs no `update_refract_texture` and therefore no second pass.
+
+**Six of the seven contain translucent world geometry**, between 2 and 60 faces — so
+leaving the translucent draw out would have been a visible hole, not a saving.
+
+**A skybox room is small**: 50 to 161 world faces and 0 to 48 props, against a whole map's
+thousands. The second camera is cheap for the same reason the recursive portal view is.
+
+**The sky does not draw from `sp_a1_intro1`'s own spawn.** That map's spawn leaf does not
+claim to see the sky — the player wakes up inside a sealed container — so `+map
+sp_a1_intro1` shows no sky until you walk out of the room. It is not broken; it is the
+shipped game's answer, and it is the first thing to check before hunting a bug.
+
+The test also asserts the invariant the whole design rests on: **no face is in both the sky
+view's set and the player's**, on all seven maps. The skybox room is sealed, and the PVS is
+what keeps the two pictures apart.
+
+#### Invariants and gotchas (sky)
+
+1. **Portal 2's sky materials are `UnlitGeneric`, not `Sky`.** All 24 `.vmt`s the game can
+   load name it; the six that name `sky` are a Left 4 Dead import (`sky_l4d_c4m1_hdr*`)
+   that **no shipped map's `skyname` selects**. `Sky_HDR_DX9` and its five `.fxc`s are not
+   ported, and there is no HDR decode here.
+2. **`sky_day01_01` does not exist.** 60 maps name it and the game ships no material for
+   it. `R_LoadSkys`' fallback to `sky_urb01` is not ported, because that is not in the game
+   either — the fallback can only turn one checkerboard into another. The only map with a
+   sky surface to show it through is `e1912`, a cut map. `Sky::load` answers **all six or
+   none**: five sixths of a sky would put a checkerboard on one wall of the world.
+3. **A sky material may have no texture at all.** `sky_fog*` is
+   `UnlitGeneric { $color "{70 85 100}" }` and nothing else; five maps' whole sky is that
+   one colour. It works because `Material::new` binds the *white* texture for an unset
+   texture parameter — a fallback that bound the checkerboard instead would ruin five skies.
+4. **The face names are Hammer's, not the player's.** Derived from `st_to_vec` and
+   `skytexorder`: **`rt` is `+x`, `lf` is `-x`, `bk` is `+y`, `ft` is `-y`**, `up` and `dn`
+   as expected. A player at yaw 0 faces `+x` and therefore sees `rt`. Guessing the obvious
+   way puts the sky's four walls a quarter-turn out, which is invisible on Portal 2's
+   near-uniform skies and glaring on anything with a horizon.
+   `the_box_surrounds_the_camera_in_six_colours` pins it with six distinct colours.
+5. **The box is drawn with culling off**, deliberately. `MakeSkyVec` maps `(s, t, width)`
+   onto a different *signed* axis triple per face, and carrying that through this port's
+   front-face convention (gotcha 1 above) is a winding argument through two sign
+   conventions — the kind `portdocs/ENGINE_WORLD_DISP.md` already got wrong once. There is
+   nothing to gain by getting it right: the box is a cube centred on the eye, every face is
+   seen from the inside and from one side, and there are six of them.
+6. **`SQRT3INV` is 0.57735 and must not be rounded up.** Valve's own comment is *"a little
+   less than 1 / sqrt(3)"*: a corner of the cube lands at `z_far × 0.999995` and survives
+   an ordinary depth test against a cleared buffer, which is why Portal 2's `UnlitGeneric`
+   skies work without the `MATERIAL_VAR_IGNOREZ` Valve's `Sky` shader forces on. At
+   `0.5773503` the corners of the sky are clipped away.
+7. **The sky camera's eye is a *division*.** `view.origin / scale + sky.origin`, so 16 units
+   of walking is one unit of sky — that is the whole of the parallax. The **angles are not
+   transformed at all**, which is what makes the sky turn with the view.
+8. **The PVS and the area flood are measured from different points, and that is not a
+   mistake.** `ViewSetupVis` is handed the `sky_camera` entity's fixed origin;
+   `R_SetupAreaBits` floods from the scaled camera. `World::sky_visible_set` passes the
+   first as `ViewPoint::origins` and the second as `ViewPoint::eye`. It is the only view in
+   the port where the two differ that way.
+9. **`CSkyboxView::DrawInternal`'s area-bit slam is dead code**, and reproducing it would
+   have been wasted work — `portdocs/ENGINE_WORLD_SKY.md` §4.2 traces the pointer through
+   `m_pAreaBits`, `UpdateAreaBits_BackwardsCompatible` and `SetAreaState` to show that
+   nothing reads it for the rest of the frame. What keeps the playable map out of the sky
+   picture is the **PVS**. A consequence worth knowing: a sky camera whose *scaled* position
+   lands inside the skybox's own terrain is still safe, because the PVS row comes from the
+   entity origin and not from the camera.
+10. **The portal ovals are dropped from the sky view's translucent list.**
+    `World::translucent_list` pushes every live portal unconditionally — deliberately,
+    because a portal's overlay has no opaque half to split off — and the sky view is the
+    first camera in the port for which that is the wrong answer. **Four shipped maps place
+    both a `prop_portal` and a `sky_camera`** (`sp_a1_intro1`, `sp_a4_finale1`,
+    `sp_a4_finale2`, `sp_a4_finale4`), so without the guard an oval sixteen times too big
+    hangs in the skybox the moment map logic switches one on.
+11. **`Sky::load` runs on every map**, because all 106 name a `skyname`, and 70 of them have
+    no sky surface to show it through. The cost is six `.vmt` lookups and, for the four sets
+    that exist, six 64×64 DXT1 textures — about 12 KB, once, at level load. Not worth a gate.
+
+#### Test coverage (sky)
+
+`cargo test engine::world::sky` — 6 plain, 1 needing a GPU but no game files, 1
+depot-gated.
+
+| Test | What it pins |
+|---|---|
+| `a_corner_of_the_box_lands_just_inside_the_far_plane` | gotcha 6 — `SQRT3INV`, on all six faces and all four corners. |
+| `the_six_faces_are_the_six_directions` | that `st_to_vec` builds a cube around the eye, without restating the table. |
+| `the_box_moves_with_the_eye` | `+= CurrentViewOrigin()`. |
+| `the_texture_coordinates_flip_t_and_not_s` | `t = 1.0 - t`, which is a sky upside down. |
+| `the_texture_order_swaps_back_and_left` | `skytexorder` is not the identity. |
+| `the_sky_camera_divides_the_view_origin_by_the_scale` + `a_zero_scale_sky_camera_is_scale_one` | gotcha 7, against `sp_a1_intro1`'s own camera and spawn. |
+| `the_box_surrounds_the_camera_in_six_colours` | **the winding decision** (gotcha 5) and the axis-to-suffix mapping (gotcha 4), by drawing six differently-coloured faces from six directions and reading the middle pixel back. With culling on and the winding the wrong way round the readback is the clear colour, which is what a missing sky looks like in the game. |
+| `the_3d_skybox_of_every_map_that_has_one` | The acceptance test, depot-gated: all seven maps loaded, spawned and measured. Asserts the sky camera sees *something*, and that **no face is in both its set and the player's** — the assumption gotcha 9 rests on. Prints the table above. |
+
+#### Not implemented, and what each waits on
+
+| | |
+|---|---|
+| **Fog** | `Enable3dSkyboxFog`, `GetSkyboxFog*` and `fogparams_t`. There is no fog anywhere in this port — `$nofog` reaches every shader's flag word and nothing reads it — so the 3D skybox is not a special case. `sky_camera`'s six fog keys are parsed and recorded by `server::classes::SkyCamera` so the "every declared key is consumed" invariant holds. **The visible cost is largest on the five maps whose sky *is* a fog colour**: `sky_fog` is a flat `{70 85 100}` meant to disappear into fog that is not being drawn. |
+| The 3D skybox **through a portal** | `CPortalSkyboxView` / `IsSkyboxVisibleFromExitPortal`. Already on `portdocs/PORTAL_RENDER.md` §9's list; `m_nSkyboxVisibleFromCorners` in `PortalMoved` is the flag it wants. |
+| `skybox_swap`, `env_skyboxswapper` | A cheat and a class with **0 instances**; both need two sky cameras and no map has two. `ActivateSkybox` *is* implemented, and no shipped map fires it either. |
+| `r_drawskybox`, `r_skybox_draw_last`, `r_3dsky 2` | Three switches that duplicate or debug what `r_3dsky` and `r_skybox` already gate. |
+| The stereo scale matrix, the `dev/clearalpha` depth-of-field patch, `CGlowOverlay::UpdateSkyOverlays`, `PixelVisibility_EndCurrentView` | Four subsystems that do not exist here. |
 
 ### `world::bsp`
 
@@ -4163,7 +4393,8 @@ Not bugs; each names what it waits on.
 | The *leaf order* of translucent geometry | The translucent pass exists and sorts by box centre; what is missing is `DrawTranslucentRenderables`' leaf walk, which interleaves each leaf's translucent world surfaces with the entities in it. With no PVS there are no leaves. A world batch is a whole map's worth of one material, so two overlapping translucent world materials can sort wrongly. |
 | The two glow render modes | `kRenderGlow` and `kRenderWorldGlow` additionally switch the depth test off (`IgnoresZBuffer()`), which needs a per-draw state override. **No brush entity and no `prop_dynamic` in the shipped game sets one** — they are `env_sprite`'s and `point_spotlight`'s, and neither class is ported. |
 | Brush entities *moving*, and the game state that hides one | They are drawn and solid where the map placed them. Nothing runs `func_door`'s movement or reads `StartDisabled` — that is `server/`. 86 of the game's 2,608 drawable brush entities start disabled. |
-| The 3D skybox | `worldspawn`'s `skyname` is read and recorded; drawing it is a second camera over a second set of geometry. |
+| ~~The 3D skybox~~ | Landed — `world::sky`, `portdocs/ENGINE_WORLD_SKY.md`. Kept as a row because the frame-cost figures recorded before it did not include a second pass. |
+| Fog | No fog anywhere: `$nofog` reaches every shader's flag word and nothing reads it, `env_fog_controller` is not a class and `sky_camera`'s six fog keys are parsed and recorded. Most visible on the five maps whose sky **is** a fog colour (`sky_fog` is a flat `{70 85 100}`) and on the two `sp_a4_finale*` maps whose sky camera asks for a 40,000-unit fog end. |
 | ~~Visibility (PVS), area portals~~ | Landed — `world::vis`, `portdocs/ENGINE_WORLD_VIS.md`. Kept as a row because the figures above this paragraph in "Frame cost, measured" were recorded without it. |
 | Faces with explicit primitives | `BuildIndicesForWorldSurface` reads an index list from `LUMP_PRIMINDICES`; these are fan-triangulated instead. Valve's own assert says the index *count* is identical, so only the arrangement differs — visible solely on the non-convex surfaces the list exists for (water). Counted in `WorldStats::faces_with_primitives`. |
 | Prop collision | `trace/` covers the world's brushes, the brush models and the displacements; `.phy`/vcollide is its stage 5. |
@@ -4520,7 +4751,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-355 tests under `engine::`, 17 of them depot-gated; 1,023 in the crate. (Treat both as a scale rather than a
+382 tests under `engine::`, 21 of them depot-gated; 1,198 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
@@ -4907,6 +5138,18 @@ the pass itself rather than the draws: the 31-batch `brush models` line reads 0.
 the same run. It costs about 3x per draw what the batched passes do, which is what a
 back-to-front sort *is*: one draw per instance instead of one per batch, and Valve pays
 it too.
+**The 3D skybox is a seventh sub-benchmark, `3d skybox`, and it costs what a second view
+costs** — because that is what it is. On `sp_a1_intro1` it records **0.41 ms** against
+`everything`'s 0.44 in the same run, and on `sp_a4_finale2` **0.34** against 0.27. Read
+those as "about one more world draw", not as a fraction: at both spawns the *main* view is
+tiny (99 and 16 faces) and the sky view's is comparable (59 and 41), so the two numbers are
+measuring two views of similar size rather than a cheap thing beside an expensive one.
+**The bench measures it unconditionally**, where the engine asks three questions first —
+`sp_a1_intro1`'s spawn leaf does not claim to see the sky, so reproducing the gate would
+have printed a zero and measured nothing. What it does not capture is the **second render
+pass**: `Load::ClearDepth` on a tile-based GPU is a full colour load, and the bench records
+one pass per sub-benchmark by construction.
+
 **Visibility is the largest single change this benchmark has ever measured.** On
 `sp_a1_intro1`, `everything` went from **1.76 ms to 0.28 ms** — 6.3x — and computing the
 visible set costs **0.004 ms**, the same as the tone mapper's two passes. `everything,

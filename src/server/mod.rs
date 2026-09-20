@@ -134,6 +134,16 @@ pub struct Server {
     /// `CTonemapSystem::m_hMasterController`, resolved at
     /// `LevelInitPostEntity`.
     master_tonemap: Option<EntityId>,
+    /// `g_hActiveSkybox` and `g_SkyList.m_pClassList` collapsed into one
+    /// handle — the map's current `sky_camera`, or `None` on the 99 maps that
+    /// place none.
+    ///
+    /// `GetCurrentSkyCamera()` (`SkyCamera.cpp:45`) returns the activated
+    /// handle if there is one and the class list's **head** otherwise, and
+    /// `CEntityClassList::Insert` pushes to the head — so the fallback is the
+    /// *last* sky camera constructed. Resolved at `LevelInitPostEntity` like
+    /// the tone mapper, and replaced by `ActivateSkybox`.
+    active_sky_camera: Option<EntityId>,
     /// The map whose entities these are, for reporting. `None` between levels.
     map: Option<String>,
     stats: LevelStats,
@@ -840,6 +850,7 @@ impl Server {
             random: RandomStream::new(LEVEL_RANDOM_SEED),
             next_output_id: 0,
             master_tonemap: None,
+            active_sky_camera: None,
             map: None,
             stats: LevelStats::default(),
             io: IoStats::default(),
@@ -1058,6 +1069,7 @@ impl Server {
         // method rather than a `Vec<Box<dyn GameSystem>>` — see
         // [`Server::update_master_tonemap`].
         self.update_master_tonemap();
+        self.update_active_sky_camera();
 
         self.stats = stats.clone();
         stats
@@ -1158,6 +1170,7 @@ impl Server {
         self.random = RandomStream::new(LEVEL_RANDOM_SEED);
         self.next_output_id = 0;
         self.master_tonemap = None;
+        self.active_sky_camera = None;
         self.map = None;
         self.stats = LevelStats::default();
         self.io = IoStats::default();
@@ -2002,6 +2015,7 @@ impl Server {
         let created = cx.take_created();
         let damage = cx.take_damage_queue();
         let punches = cx.take_punch_queue();
+        let activated_skybox = cx.take_activated_skybox();
         let queued_physics = cx.take_physics_queue();
         let reload = cx.take_reload_level();
         // Once a level has any attachment parenting, every tick re-derives
@@ -2066,6 +2080,13 @@ impl Server {
         // [`Context::punch_penetrating_players`] and
         // [`Server::flush_portal_punches`], which is the far end of this.
         self.pending_punches.extend(punches);
+
+        // `g_hActiveSkybox = this`. Applied here rather than in the handler
+        // because the handle belongs to the level — see
+        // [`Context::activate_skybox`].
+        if let Some(camera) = activated_skybox {
+            self.active_sky_camera = Some(camera);
+        }
 
         // `CreateVPhysics`, which in the C++ a `Spawn` calls on itself. It
         // happens here for the reason the spawn flush above does — see
@@ -2629,6 +2650,7 @@ impl Server {
         }
 
         let freed = self.entities.cleanup_delete_list();
+        let mut resolve_sky_camera = false;
         if freed > 0 {
             let entities = &self.entities;
             self.thinks.retain_alive(|id| entities.is_alive(id));
@@ -2638,9 +2660,21 @@ impl Server {
             if self.master_tonemap.is_some_and(|id| !entities.is_alive(id)) {
                 self.master_tonemap = None;
             }
+            // `CSkyCamera::~CSkyCamera` removes itself from the list, and
+            // `GetCurrentSkyCamera` then falls back to the head again — which
+            // is what re-resolving is. Valve's own `ClientData_Update`
+            // dereferences the dead handle here (`playerlocaldata.cpp:331`);
+            // that is not reproduced.
+            resolve_sky_camera |= self
+                .active_sky_camera
+                .is_some_and(|id| !entities.is_alive(id));
             if self.player.is_some_and(|id| !entities.is_alive(id)) {
                 self.player = None;
             }
+        }
+        // After the borrow above ends: re-resolving needs the whole list.
+        if resolve_sky_camera {
+            self.update_active_sky_camera();
         }
         freed
     }
@@ -2675,6 +2709,38 @@ impl Server {
             }
         }
         self.master_tonemap = master;
+    }
+
+    /// `GetCurrentSkyCamera()`'s fallback half (`SkyCamera.cpp:45`): with no
+    /// camera activated, the current one is the class list's head, and
+    /// `CEntityClassList::Insert` pushes to the head — so it is the **last**
+    /// `sky_camera` constructed, which is the last one in map file order.
+    ///
+    /// **No map in the game has two**, so the tie-break is unobservable on
+    /// shipped content; it is reproduced because it is one `rev()`.
+    fn update_active_sky_camera(&mut self) {
+        let mut last = None;
+        for (id, entity) in self.entities.iter() {
+            if entity.classname() == "sky_camera" {
+                last = Some(id);
+            }
+        }
+        self.active_sky_camera = last;
+    }
+
+    /// Where this map's 3D skybox is, or `None` on the 99 maps that place no
+    /// `sky_camera`.
+    ///
+    /// The far end of `ClientData_Update` → thirteen send props →
+    /// `CSkyboxView::PreRender3dSkyboxWorld`, collapsed into one call the way
+    /// [`tonemap_settings`](Server::tonemap_settings) is, and read once per
+    /// **rendered frame** rather than per tick for the same reason:
+    /// `ActivateSkybox` can change the answer on any tick.
+    pub fn sky3d(&self) -> Option<crate::engine::world::sky::Sky3d> {
+        self.active_sky_camera
+            .and_then(|id| self.entities.get(id))
+            .and_then(|entity| entity.behaviour.downcast_ref::<classes::SkyCamera>())
+            .map(classes::SkyCamera::params)
     }
 
     /// What the map's master `env_tonemap_controller` is asking for, or the

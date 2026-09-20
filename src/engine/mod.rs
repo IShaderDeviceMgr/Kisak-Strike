@@ -90,6 +90,15 @@ pub struct Engine<'a> {
     r_novis: Cvar,
     /// `r_portal_stencil_depth` — how many views within views a portal shows.
     r_portal_stencil_depth: Cvar,
+    /// `r_3dsky` — draw the map's second room, at 1/16 scale, behind
+    /// everything. `viewrender.cpp:114`.
+    r_3dsky: Cvar,
+    /// `r_skybox` — draw the six sky quads. `viewrender.cpp:115`.
+    ///
+    /// **`r_drawskybox` is not ported.** `gl_warp.cpp:27` declares a second
+    /// cheat cvar that gates exactly the same six draws one function lower
+    /// down; one switch for one thing is enough.
+    r_skybox: Cvar,
     /// `r_lockpvs` — stop recomputing the visible set so the view can be flown
     /// around it.
     ///
@@ -255,6 +264,23 @@ impl<'a> Engine<'a> {
             Some(f32::from(world::portalview::MAX_RECURSION)),
         );
 
+        // The sky's two, `viewrender.cpp:114`. Held here beside visibility's
+        // for the same reason: what they switch off is a *view*, and the view
+        // is assembled here. `r_3dsky` is not a cheat in the original and
+        // `r_skybox` is.
+        let r_3dsky = console.cvar(
+            "r_3dsky",
+            "1",
+            CvarFlags::NONE,
+            "Enable the rendering of 3d sky boxes.",
+        );
+        let r_skybox = console.cvar(
+            "r_skybox",
+            "1",
+            CvarFlags::CHEAT,
+            "Enable the rendering of sky boxes.",
+        );
+
         // The game client's cvars — `sensitivity`, the mouse factors, the
         // movement speeds — are registered by the client itself, because it is
         // what reads them (`ENGINE_CONSOLE.md` §6.1). This is the line where
@@ -394,6 +420,8 @@ impl<'a> Engine<'a> {
             r_novis,
             r_lockpvs,
             r_portal_stencil_depth,
+            r_3dsky,
+            r_skybox,
             locked_eye: None,
             scene: Scene {
                 vfs,
@@ -911,9 +939,18 @@ impl<'a> Engine<'a> {
     /// shot defeats the purpose — including the exposure, which is why it
     /// draws straight to the back buffer and is never measured.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let camera = self.camera(frame.size());
         let size = frame.size();
+        // The `ViewSetup` and not just the `Camera`: the sky box is sized by
+        // the view's own far plane, and `Camera` deliberately carries the
+        // projection rather than the numbers it was built from.
+        let view = self
+            .scene
+            .client
+            .view(size.0.max(1), size.1.max(1));
+        let camera = Engine::project(&view);
         let curtime = self.scene.curtime;
+        let draw_3d_sky = self.r_3dsky.bool();
+        let draw_sky_box = self.r_skybox.bool();
         // Read here because `frame` is borrowed by the pass that wants it and
         // `self` by the scene that owns the world.
         let portal_depth = self
@@ -994,19 +1031,85 @@ impl<'a> Engine<'a> {
             || (outside && client.player().move_type == crate::client::player::MoveType::Noclip);
         let visible = world.visible(eye, camera.view_proj(), novis);
 
+        // **The sky, before anything else in the frame.**
+        // `CSkyboxView::Setup`'s three conditions, in Valve's own order
+        // (`viewrender.cpp:6949`): `r_3dsky`, the view leaf claims to see a 3D
+        // sky, and the map has a `sky_camera` at all. The third is the one
+        // that carries the weight — `vbsp` sets the leaf flag on every leaf it
+        // writes and only `vrad` clears it, so the second is `true`
+        // everywhere on the 80 maps of the game that place no
+        // `light_environment`. See `portdocs/ENGINE_WORLD_SKY.md` §2.2.
+        //
+        // `r_3dsky 2` — *"draw it even when the leaf says no"* — is not
+        // ported: it is a debug value of a non-cheat cvar and the flag it
+        // overrides is already unreliable in the permissive direction.
+        let sky_visible_here = world.sky_visible_from(eye);
+        let sky3d = server
+            .sky3d()
+            .filter(|_| draw_3d_sky && sky_visible_here == world::vis::SkyVisibility::Sky3d);
+        let drew_3d_sky = match sky3d {
+            Some(sky3d) => {
+                let sky_camera = Engine::sky_camera(&view, &sky3d);
+                // **`false`, not `novis`** — `render->ViewSetupVis( false, 1,
+                // &m_pSky3dParams->origin )` (`viewrender.cpp:6831`) passes
+                // the literal, so `r_novis` does not reach the sky view in the
+                // shipped engine either. It matters more here than there,
+                // because this port's `novis` carries a second term: the
+                // camera being outside the world with `noclip` on, which is a
+                // fact about the *player's* eye and has nothing to say about
+                // the sky camera's. Forwarding either one draws the whole map
+                // a second time at 1/16 scale.
+                let sky_visible = world.sky_visible_set(&sky_camera, &sky3d, false);
+                let scene = post.scene(frame.size());
+                let mut pass = context.target_pass(
+                    frame,
+                    materials.pipelines(),
+                    scene,
+                    &sky_camera,
+                    Load::Clear(CLEAR_COLOR),
+                );
+                world.draw_sky_view(
+                    &mut pass,
+                    curtime,
+                    &sky_camera,
+                    &sky_visible,
+                    draw_sky_box && world.sky_visible(&sky_visible),
+                );
+                true
+            }
+            None => false,
+        };
+
+        // `ViewDrawScene`'s own answer (`viewrender.cpp:2052`): the main view
+        // draws the box itself when the sky view did not, and did not because
+        // the map has no `sky_camera` rather than because there is no sky.
+        // **29 of the game's 36 maps with a sky surface take this path.**
+        let sky_box_in_main_view = !drew_3d_sky
+            && draw_sky_box
+            && sky_visible_here.any()
+            && world.sky_visible(&visible);
+
         // The block ends both borrows of `post` before `resolve` takes it
         // mutably.
         {
             // A drawing frame clears as part of its first pass instead, rather
-            // than paying for two passes over the target.
+            // than paying for two passes over the target. **Unless the sky
+            // view already drew one**, in which case its colour is the
+            // background of this one and only the depth is reset — which is
+            // `CSkyboxView::Setup`'s `*pClearFlags |= VIEW_CLEAR_DEPTH`.
+            let load = match drew_3d_sky {
+                true => Load::ClearDepth,
+                false => Load::Clear(CLEAR_COLOR),
+            };
             let scene = post.scene(frame.size());
-            let mut pass = context.target_pass(
-                frame,
-                materials.pipelines(),
-                scene,
-                &camera,
-                Load::Clear(CLEAR_COLOR),
-            );
+            let mut pass =
+                context.target_pass(frame, materials.pipelines(), scene, &camera, load);
+            if sky_box_in_main_view {
+                // First, at the far plane, against the depth buffer this pass
+                // just cleared — `Shader_WorldEnd`'s `!r_skybox_draw_last`
+                // branch (`gl_rsurf.cpp:3352`).
+                world.sky.draw(&mut pass, camera.eye, view.z_far);
+            }
             world.draw(&mut pass, curtime, &visible);
 
             // `DrawRecursivePortalViews()`' own place in the frame
@@ -1096,11 +1199,15 @@ impl<'a> Engine<'a> {
     /// moves are the same arithmetic — Source is **Z-up right-handed** and
     /// **pitch is positive downwards**, which is the sign error to watch for if
     /// the view looks at the ceiling when it should look at the floor.
-    fn camera(&self, size: (u32, u32)) -> Camera {
-        let (width, height) = size;
-        let view = self.scene.client.view(width.max(1), height.max(1));
+    ///
+    /// Takes the [`ViewSetup`](crate::client::ViewSetup) rather than the
+    /// window size, because a caller may want the same view projected from
+    /// somewhere else. The 3D skybox is the one that does: its camera is this
+    /// one with the eye scaled into the skybox room and both clip planes
+    /// replaced — [`sky_camera`](Engine::sky_camera). The angles are **not**
+    /// touched, which is what makes the sky turn with the view.
+    fn project(view: &crate::client::ViewSetup) -> Camera {
         let (forward, _, up) = view.angles.vectors();
-
         Camera::perspective(
             view.origin,
             glam::camera::rh::view::look_at_mat4(view.origin, view.origin + forward, up),
@@ -1109,6 +1216,23 @@ impl<'a> Engine<'a> {
             view.z_near,
             view.z_far,
         )
+    }
+
+    /// `CSkyboxView::Setup` + `DrawInternal`'s camera
+    /// (`viewrender.cpp:6798-6812`): the player's view, moved into the skybox
+    /// room and given the sky's own clip planes.
+    ///
+    /// The eye is `view.origin / scale + sky.origin`; the angles, the field of
+    /// view and the aspect are the player's untouched. `zNear` becomes 2 and
+    /// `zFar` becomes `MAX_TRACE_LENGTH`, which is exactly twice the main
+    /// view's — see [`sky::SKY_ZNEAR`](world::sky::SKY_ZNEAR).
+    fn sky_camera(view: &crate::client::ViewSetup, sky: &world::sky::Sky3d) -> Camera {
+        Engine::project(&crate::client::ViewSetup {
+            origin: sky.eye(view.origin),
+            z_near: world::sky::SKY_ZNEAR,
+            z_far: world::sky::SKY_ZFAR,
+            ..*view
+        })
     }
 }
 
@@ -1673,8 +1797,13 @@ impl Level for Scene<'_> {
                  the view starts at the centre of the map"
             ),
         }
-        if let Some(sky) = &world.sky_name {
-            eprintln!("source-engine: world: skybox {sky} (not drawn yet)");
+        if world.sky_name.is_some() {
+            eprintln!(
+                "source-engine: world: {}, {} sky face{}",
+                world.sky.summary(),
+                world.sky_faces.len(),
+                if world.sky_faces.len() == 1 { "" } else { "s" },
+            );
         }
         eprintln!("source-engine: server: {}", entities.summary());
 

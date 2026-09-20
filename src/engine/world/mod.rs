@@ -42,6 +42,9 @@ pub mod physics;
 pub mod portals;
 pub mod portalview;
 pub mod props;
+/// The sky — the six quads around the camera, and the 3D skybox's second
+/// camera. `portdocs/ENGINE_WORLD_SKY.md`.
+pub mod sky;
 pub mod vis;
 
 use std::collections::BTreeMap;
@@ -65,6 +68,7 @@ use entities::{EntityModels, ModelEntity};
 use light::LightCache;
 use portals::{Portal, Portals};
 use props::{PropModels, Props};
+use sky::{Sky, Sky3d};
 
 /// Where a batch has to be split.
 ///
@@ -375,9 +379,28 @@ pub struct World {
     /// The world model's bounding box, in Source units.
     pub bounds: (Vec3, Vec3),
     pub spawn: Option<Spawn>,
-    /// `worldspawn`'s `skyname`. Read, recorded, and not yet drawn — the 3D
-    /// skybox is a second camera over a second set of geometry.
+    /// `worldspawn`'s `skyname`. **The one owner** — `sv_skyname` is not
+    /// ported and `server::classes::World::sky_name` keeps its copy only so
+    /// that `ent_dump` can print it (`portdocs/ENGINE_WORLD_SKY.md` §4.1).
     pub sky_name: Option<String>,
+    /// The six materials that name resolves to — [`sky`].
+    ///
+    /// Held here for the reason the lightmap atlas is: derived from this map's
+    /// own `worldspawn` and dead with it.
+    pub sky: Sky,
+    /// Every world face the compiler marked `SURF_SKY` or `SURF_SKY2D`, by
+    /// `.bsp` face index.
+    ///
+    /// None of them is drawn — they are holes, see [`sky`] — so this exists
+    /// only to answer `CWorldRenderList::m_bSkyVisible`
+    /// (`gl_rsurf.cpp:3763`): is a sky surface in the set this view is about
+    /// to draw, and therefore is there any point drawing the box behind it.
+    /// See [`sky_visible`](World::sky_visible).
+    ///
+    /// **World faces only**, which is where Valve sets the flag: the render
+    /// list walk that sets it is `R_RecursiveWorldNode`'s. 1,870 across the
+    /// game, the most on one map being `sp_a3_01`'s 266.
+    pub sky_faces: Vec<u32>,
     /// Which lighting lump the atlas was built from. Portal 2 ships HDR-only
     /// maps; a map with only LDR lighting is dimmer by the overbright factor
     /// the LDR encoding divided out, which is worth knowing before blaming the
@@ -693,6 +716,14 @@ impl World {
         // (`Server::set_physics`, for the same reason).
         let physics = physics::build(name, &bsp, &props, vfs, physics::surface_properties(vfs));
 
+        // Read before the struct literal so that the sky's six materials can
+        // be loaded from it in the same expression that records it.
+        let sky_name = entities
+            .iter()
+            .find(|e| e.classname() == Some("worldspawn"))
+            .and_then(|e| e.get("skyname"))
+            .map(str::to_owned);
+
         Ok(World {
             name: name.to_owned(),
             bsp_version: bsp.version,
@@ -700,11 +731,9 @@ impl World {
             batches,
             bounds: (Vec3::from(model.mins), Vec3::from(model.maxs)),
             spawn: find_spawn(&entities),
-            sky_name: entities
-                .iter()
-                .find(|e| e.classname() == Some("worldspawn"))
-                .and_then(|e| e.get("skyname"))
-                .map(str::to_owned),
+            sky: Sky::load(vfs, materials, sky_name.as_deref()),
+            sky_name,
+            sky_faces: sky_faces(&bsp),
             lighting_is_hdr: bsp.lighting_is_hdr,
             lightmaps,
             models: bsp.models.clone(),
@@ -766,6 +795,137 @@ impl World {
     /// [`Visibility::mark`](vis::Visibility::mark).
     pub fn visible(&self, eye: Vec3, view_proj: glam::Mat4, novis: bool) -> vis::VisibleSet {
         self.vis.mark(eye, view_proj, novis)
+    }
+
+    // -----------------------------------------------------------------------
+    // the sky — `portdocs/ENGINE_WORLD_SKY.md`
+    // -----------------------------------------------------------------------
+
+    /// What kind of sky is visible from `eye` —
+    /// `engine->IsSkyboxVisibleFromPoint`, which is a leaf-flag lookup.
+    ///
+    /// **This is one of three gates and cannot be trusted alone.** `vbsp` sets
+    /// [`leaf::SKY`](bsp::leaf::SKY) on every leaf it writes and only `vrad`
+    /// clears it, so on the 80 maps of the game that place no
+    /// `light_environment` this answers
+    /// [`Sky3d`](vis::SkyVisibility::Sky3d) from inside a sealed room. The
+    /// other two gates are that the map has a `sky_camera` at all, and
+    /// [`sky_visible`](World::sky_visible).
+    pub fn sky_visible_from(&self, eye: Vec3) -> vis::SkyVisibility {
+        self.vis.sky_visible_from(eye)
+    }
+
+    /// Whether any sky surface is in the set this view is about to draw —
+    /// `CWorldRenderList::m_bSkyVisible` (`gl_rsurf.cpp:3763`).
+    ///
+    /// The gate on the six quads, in both the sky view and the main one. A
+    /// scan over at most 266 face indices, short-circuited at the first hit;
+    /// Valve gets the same answer for free because it walks the leaves to
+    /// build a render list and this port does not keep one.
+    ///
+    /// `Map_VisForceFullSky()`, which the original ORs in beside this, is
+    /// **not** here: it is `LEAF_FLAGS_RADIAL` on the view leaf and no leaf in
+    /// Portal 2 carries that flag.
+    pub fn sky_visible(&self, visible: &vis::VisibleSet) -> bool {
+        self.sky.is_loaded() && self.sky_faces.iter().any(|&f| visible.face(f as usize))
+    }
+
+    /// What the 3D skybox's second camera can see.
+    ///
+    /// `render->ViewSetupVis( false, 1, &m_pSky3dParams->origin )`
+    /// (`viewrender.cpp:6831`) plus the area flood `R_BuildWorldLists` runs
+    /// under the pushed sky view — **and the two are measured from different
+    /// points**, which is unique to this view and is not a mistake:
+    ///
+    /// - the **PVS** comes from the `sky_camera` entity's own fixed origin,
+    ///   because that is the one argument `ViewSetupVis` is given;
+    /// - the **area flood** starts at `camera.eye`, the scaled camera, because
+    ///   `R_SetupAreaBits(-1, …)` floods from `g_EngineRenderer->ViewOrigin()`
+    ///   and the sky view has been pushed by then.
+    ///
+    /// That the playable map does not appear in the sky picture is the **PVS**'
+    /// doing, not the area bits': the skybox room is sealed, so the sky
+    /// camera's cluster sees only the skybox's own leaves, and the area test
+    /// can then only remove more. `CSkyboxView::DrawInternal`'s area-bit slam
+    /// is dead code on a modern client — `portdocs/ENGINE_WORLD_SKY.md` §4.2
+    /// traces why — so nothing here reproduces it, and a sky camera whose
+    /// scaled position lands inside the skybox's own terrain stays safe: the
+    /// PVS row still refuses everything outside the room.
+    pub fn sky_visible_set(
+        &self,
+        camera: &crate::materials::context::Camera,
+        sky: &Sky3d,
+        novis: bool,
+    ) -> vis::VisibleSet {
+        self.vis.mark_view(
+            &vis::ViewPoint {
+                eye: camera.eye,
+                origins: std::slice::from_ref(&sky.origin),
+                leaf: None,
+            },
+            camera.view_proj(),
+            novis,
+        )
+    }
+
+    /// Draws the 3D skybox: the box, then the room.
+    ///
+    /// `CSkyboxView::DrawInternal` (`viewrender.cpp:6787`), reduced to what
+    /// this port has. Call it in its **own pass** against the scene target with
+    /// [`Load::Clear`], before the pass that draws the map — which then opens
+    /// with [`Load::ClearDepth`], because the two pictures share a colour
+    /// buffer and must not share a depth buffer.
+    ///
+    /// `draw_box` is `r_skybox`, already ANDed with
+    /// [`sky_visible`](World::sky_visible) for *this* view: the quads are
+    /// drawn first and at the far plane, so everything in the skybox room is
+    /// in front of them.
+    ///
+    /// **The whole sky view is one pass**, because the only thing in the
+    /// frame that forces a pass boundary is the frame-buffer copy, and there
+    /// is no refracting draw here: `DrawWorld`, `DrawOpaqueRenderables` and
+    /// `DrawTranslucentRenderables` are `DrawInternal`'s own three and all
+    /// three fit. What is left out is `draw_refracting`, which would need the
+    /// pass to end, a copy to be taken and a second pass to open — see
+    /// `rustdocs/ENGINE.md`, "The sky", for the measurement that says no
+    /// shipped skybox room contains one.
+    ///
+    /// **The portal ovals are dropped from the translucent list.**
+    /// [`translucent_list`](World::translucent_list) pushes every live portal
+    /// unconditionally — deliberately, because a portal's overlay has no
+    /// opaque half to split off — and this is the first camera in the port for
+    /// which that is the wrong answer: a portal is in the playable map, sixteen
+    /// times too big for this one and nowhere near it. **Four shipped maps
+    /// place both a `prop_portal` and a `sky_camera`** — `sp_a1_intro1`,
+    /// `sp_a4_finale1`, `sp_a4_finale2` and `sp_a4_finale4` — so this is live
+    /// content rather than a precaution.
+    ///
+    /// [`Load::Clear`]: crate::materials::context::Load::Clear
+    /// [`Load::ClearDepth`]: crate::materials::context::Load::ClearDepth
+    pub fn draw_sky_view(
+        &self,
+        pass: &mut Pass<'_>,
+        curtime: f32,
+        camera: &crate::materials::context::Camera,
+        visible: &vis::VisibleSet,
+        draw_box: bool,
+    ) {
+        // First and at the far plane, against the depth buffer this pass
+        // cleared, so that everything in the skybox room is in front of it.
+        if draw_box {
+            self.sky.draw(pass, camera.eye, sky::SKY_ZFAR);
+        }
+        self.draw(pass, curtime, visible);
+
+        let mut translucent = self.translucent_list(camera.eye, camera.forward(), visible);
+        translucent
+            .0
+            .retain(|(_, item)| !matches!(item, Translucent::Portal(_)));
+        if !translucent.is_empty() {
+            // A portal drawn inside the skybox would have no levels left to
+            // open onto anyway; the list it would read this from is empty.
+            self.draw_translucent(pass, curtime, &translucent, visible, 0);
+        }
     }
 
     /// Whether this map has anything that reads the frame it is drawn into,
@@ -2222,6 +2382,25 @@ fn sync_placements(
         placed.solid = p.solid;
         placed.owned = true;
     }
+}
+
+/// Every world face the compiler marked as sky, by `.bsp` face index.
+///
+/// The world model's faces only — [`World::sky_faces`] says why — and the
+/// texinfo test is the same one [`group_faces`] uses to refuse them, so the
+/// two lists partition the same set: a face is either drawn or it is a hole.
+fn sky_faces(bsp: &Bsp) -> Vec<u32> {
+    let model = bsp.world_model();
+    bsp.model_faces(model)
+        .iter()
+        .enumerate()
+        .filter(|(_, face)| {
+            bsp.texinfo
+                .get(face.tex_info.max(0) as usize)
+                .is_some_and(|info| face.tex_info >= 0 && info.flags & bsp::surf::ANY_SKY != 0)
+        })
+        .map(|(offset, _)| model.first_face as u32 + offset as u32)
+        .collect()
 }
 
 /// The player start, if the map has one.

@@ -78,6 +78,8 @@ mod tests {
         // 224,924.
         let mut server = crate::server::Server::new();
         server.level_init(&map, &world.entities, &world.models);
+        // The map's `sky_camera`, if it has one — 7 of the game's 106 do.
+        let sky3d = server.sky3d();
         let placements: Vec<crate::engine::world::entities::ModelEntity> = server
             .model_entities()
             .into_iter()
@@ -251,6 +253,38 @@ mod tests {
             })
         });
         run("everything", &|pass| world.draw(pass, 0.0, &visible));
+        // **The 3D skybox's whole pass**, on the maps that have one — the box
+        // and the room behind it, from the sky camera.
+        //
+        // Measured **unconditionally**, where the running engine asks three
+        // questions first: `sp_a1_intro1`'s spawn is inside the sealed
+        // container the player wakes up in, whose leaf does not claim to see
+        // the sky, so a benchmark that reproduced the gate would print a zero
+        // and measure nothing. What this answers is "what does a sky view cost
+        // when there is one", which is the number that matters for the maps
+        // and viewpoints where it draws.
+        if let Some(sky3d) = sky3d {
+            let sky_camera = Camera::perspective(
+                sky3d.eye(eye),
+                glam::camera::rh::view::look_to_mat4(sky3d.eye(eye), Vec3::X, Vec3::Z),
+                90.0,
+                1.0,
+                crate::engine::world::sky::SKY_ZNEAR,
+                crate::engine::world::sky::SKY_ZFAR,
+            );
+            let sky_visible = world.sky_visible_set(&sky_camera, &sky3d, false);
+            let draw_box = world.sky_visible(&sky_visible);
+            println!(
+                "  {:<16} {} faces, {} clusters, box {}",
+                "sky view sees",
+                sky_visible.stats.faces,
+                sky_visible.stats.clusters,
+                draw_box,
+            );
+            run("3d skybox", &|pass| {
+                world.draw_sky_view(pass, 0.0, &sky_camera, &sky_visible, draw_box)
+            });
+        }
         // The same frame with the PVS off, which is what every measurement in
         // `rustdocs/ENGINE.md` before this was: the number to compare against.
         run("everything, novis", &|pass| {

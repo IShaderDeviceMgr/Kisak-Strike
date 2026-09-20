@@ -568,7 +568,8 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   `mem.cpp`) is deleted as planned — `Vec` and `Drop` are what it was for. **`+map
   sp_a1_intro1` draws the Portal 2 intro room, lit**, at 5,512 of 5,638 faces and
   14.5k triangles, with 4,828 surfaces carrying real baked lighting over 12 atlas pages. Not loaded: visibility (every face is drawn every frame), collision,
-  displacements, brush entities, static props, the 3D skybox, dynamic lights.
+  displacements, brush entities, static props, the 3D skybox, dynamic lights. *(Every
+  one of those has since landed except dynamic lights — see `CLAUDE.md`'s status table.)*
 
   *`input/` — the device and dispatch layers, and a camera to prove them.* Stages 1 and 2
   of `portdocs/ENGINE_INPUT.md`'s five. `inputsystem/`'s 10,649 lines are **answered

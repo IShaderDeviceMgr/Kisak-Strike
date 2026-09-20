@@ -3581,8 +3581,13 @@ fn every_shipped_map_spawns_its_entities() {
     // **+98 for `prop_weighted_cube`**, across 59 maps — the first
     // `CPhysicsProp` here, and one whose simulation is entirely absent while
     // its map-facing half is not.
-    assert_eq!(total.matched, 35_330);
-    assert_eq!(total.spawned, 28_458);
+    //
+    // **+7 for `sky_camera`**, the rarest class in the table and the whole of
+    // the 3D skybox's input: one each on the seven maps that have one, all at
+    // `scale 16`, and never two in a map. It spawns, because it removes
+    // nothing — `portdocs/ENGINE_WORLD_SKY.md`.
+    assert_eq!(total.matched, 35_337);
+    assert_eq!(total.spawned, 28_465);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3607,8 +3612,9 @@ fn every_shipped_map_spawns_its_entities() {
     // every map that has them places.
     // **-1 classname and -98 occurrences** for `prop_weighted_cube`, which
     // every map that has cubes places.
-    assert_eq!(total.unknown.len(), 156);
-    assert_eq!(total.unknown.values().sum::<usize>(), 25_595);
+    // **-1 and -7** for `sky_camera`: seven maps, one each.
+    assert_eq!(total.unknown.len(), 155);
+    assert_eq!(total.unknown.values().sum::<usize>(), 25_588);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the

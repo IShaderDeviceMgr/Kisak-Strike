@@ -442,6 +442,8 @@ pub struct Context<'a> {
     /// What [`punch_penetrating_players`](Context::punch_penetrating_players)
     /// queued — portals that want the player shoved out of them.
     punches: Vec<EntityId>,
+    /// The `sky_camera` that took `ActivateSkybox`, if one did.
+    activated_skybox: Option<EntityId>,
     /// What the `vphysics_*` calls queued — see
     /// [`physics`](super::physics), which is also where the deferral is
     /// justified.
@@ -481,6 +483,7 @@ impl<'a> Context<'a> {
             created: Vec::new(),
             damage: Vec::new(),
             punches: Vec::new(),
+            activated_skybox: None,
             physics: Vec::new(),
             reload_level: false,
             attachments_used: false,
@@ -615,6 +618,20 @@ impl<'a> Context<'a> {
     /// the one that moved is the one being dispatched.
     pub fn punch_penetrating_players(&mut self, portal: EntityId) {
         self.punches.push(portal);
+    }
+
+    /// `g_hActiveSkybox = this` — `CSkyCamera::InputActivateSkybox`
+    /// (`SkyCamera.cpp:180`).
+    ///
+    /// Deferred for the same reason the queues above are, and for one more:
+    /// which sky camera is active is a property of the **map**, not of the
+    /// entity, so it lives beside `Server::master_tonemap` rather than on any
+    /// `Behaviour`. **No shipped map fires this input** — zero connections
+    /// across all 106 — because no shipped map has two sky cameras to switch
+    /// between; it is one assignment and leaving it out would be a hole with
+    /// no upside.
+    pub fn activate_skybox(&mut self, camera: EntityId) {
+        self.activated_skybox = Some(camera);
     }
 
     /// `CBaseEntity::VPhysicsInitNormal( SOLID_VPHYSICS, 0, asleep )` — ask
@@ -927,6 +944,12 @@ impl<'a> Context<'a> {
     /// queued, for `Server::run_tick` to act on.
     pub(super) fn take_punch_queue(&mut self) -> Vec<EntityId> {
         std::mem::take(&mut self.punches)
+    }
+
+    /// The `sky_camera` [`activate_skybox`](Context::activate_skybox) named,
+    /// for `Server::dispatch` to make current.
+    pub(super) fn take_activated_skybox(&mut self) -> Option<EntityId> {
+        self.activated_skybox.take()
     }
 
     /// The physics requests the `vphysics_*` calls queued, for

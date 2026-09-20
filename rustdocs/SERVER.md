@@ -144,6 +144,9 @@ if let Some(entity) = server.brush_entity(12) {
 // What the map's master env_tonemap_controller is asking for.
 let settings = server.tonemap_settings();
 
+// Where the map's 3D skybox is, on the 7 maps that have a sky_camera.
+if let Some(sky) = server.sky3d() { /* …engine::world::sky::Sky3d */ }
+
 server.level_shutdown();
 ```
 
@@ -187,6 +190,11 @@ impl Server {
     pub fn brush_entity(&self, model_index: usize) -> Option<&EntityCore>;
     pub fn brush_entity_count(&self) -> usize;
     pub fn tonemap_settings(&self) -> TonemapSettings;
+    // The map's current `sky_camera`, for the 3D skybox — `Sky3d`'s origin and
+    // scale. `None` on the 99 maps that place none. Read once per **rendered
+    // frame** rather than per tick, for `tonemap_settings`' reason: the
+    // `ActivateSkybox` input can change the answer on any tick.
+    pub fn sky3d(&self) -> Option<crate::engine::world::sky::Sky3d>;
     pub fn model_entities(&self) -> Vec<ModelEntityState>;
     // Every `func_areaportal*`'s key and whether it is open. The fourth of the
     // four seams `Engine::frame` pushes into the world each tick, and the only
@@ -1913,8 +1921,8 @@ impl PropPortal {
 pub fn teleport_matrix(entrance: (Vec3, Vec3), exit: (Vec3, Vec3)) -> Mat4;
 ```
 
-Forty-nine classnames, **35,330 of the shipped game's 60,925 entity blocks**.
-**Forty-four of them are among the 200 classnames the maps place**; the other
+Fifty classnames, **35,337 of the shipped game's 60,925 entity blocks**.
+**Forty-five of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -1966,6 +1974,7 @@ because Valve registers them:
 | `trigger_portal_button` | `CPortalButtonTrigger` | **0 placed** — one per button, 65 |
 | `prop_portal` | `CProp_Portal` | 21, in 10 maps |
 | `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
+| `sky_camera` | `CSkyCamera` | 7, in 7 maps — one each |
 
 ---
 
@@ -3238,9 +3247,9 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 35,330 matched, 65
-created, 28,458 spawned, 6,937 lights deleted, 213 kept, 54,631 connections,
-156 unimplemented classnames, the full 49-name unhandled-key table, 5,787
+server time**, and asserts exact totals: 60,925 blocks, 35,337 matched, 65
+created, 28,465 spawned, 6,937 lights deleted, 213 kept, 54,631 connections,
+155 unimplemented classnames, the full 49-name unhandled-key table, 5,787
 events dispatched, 5,043 inputs accepted, 7,318 thinks, 1,025 events that found
 no target, zero bad conversions, the **six**-name unhandled-input table, a peak
 of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
@@ -4144,7 +4153,8 @@ port already loads by default. That takes the port to **46 registered classnames
 34,823 of the game's 60,925 entity blocks** — 41 of them among the 200 the maps
 place. (The two areaportal classnames landed afterwards, with `world/`'s
 visibility, taking those figures to 48 and 35,232; `prop_weighted_cube` then
-took them to 49 and 35,330.) All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
+took them to 49 and 35,330, and `sky_camera` — the 3D skybox's input — to 50 and
+35,337.) All 21 start `Activated 0`, none writes `LinkageGroupID` and none writes
 `HalfWidth`/`HalfHeight`, so the whole of shipped content is "two default-sized
 portals in group 0, switched on by map logic": **31 `SetActivatedState`, 4
 `NewLocation`, and exactly one output connection in the entire game**, which is

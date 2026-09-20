@@ -64,7 +64,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,185 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,198 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -156,10 +156,10 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 9 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil` — and the **stencil**. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No skybox, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**, the **sky**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No fog, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning** and **skin families**. No LOD selection, no body groups, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting** and the **vphysics seam** — **49 classnames, 35,330 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam** and `sky_camera` — **50 classnames, 35,337 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it**. No constraints, collision events, ragdolls or vehicles, and a held object cannot cross a portal | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
@@ -182,9 +182,12 @@ carry it across the chamber and stand it on the floor button, which goes
 down.** Two portals draw as coloured ovals — **and they work, and you can see
 through them**. **And only what you can see is drawn**: the areas, the PVS and
 the frustum between them took the frame from 1.76 ms to 0.28 ms, which is also
-what makes a portal's second camera affordable.
+what makes a portal's second camera affordable. **And there is a sky** — though
+not from this map's own spawn, which is inside a sealed container: walk out of
+the room and the second camera starts drawing the skybox at 1/16 scale behind
+the holes the map's sky brushes cut.
 
-**It is not a runnable game**: no sound, no netcode, no weapon and no skybox —
+**It is not a runnable game**: no sound, no netcode, no weapon and no fog —
 but a door closing on you now shoves you out of the way, or is stopped by you,
 and a cube on the floor is something you bump into, shove, pick up and carry
 onto the button it belongs on rather than something you walk through.
@@ -199,6 +202,36 @@ on `$PortalOpenAmount` and fades its noise out on `$PortalStatic`, each on its o
 clock, restarted when a portal is switched on or moved. What is still missing is the
 *warp* — a portal's surface does not refract what is behind it — which is
 `PortalRefract`'s `$Stage 0`.
+
+**The sky has landed** — `portdocs/ENGINE_WORLD_SKY.md`, `src/engine/world/sky.rs` —
+and it is two things that nest. The **2D skybox** is six quads around the camera at the far
+plane; the **3D skybox** is a second room at 1/16 scale, elsewhere in the same `.bsp`,
+drawn from a second camera before the real map and then covered by it —
+`Load::ClearDepth`, which is `CSkyboxView::Setup`'s `*pClearFlags |= VIEW_CLEAR_DEPTH`
+spelled once. `sky_camera` is `src/server/classes/sky.rs` and reaches the renderer through
+`Server::sky3d()`, the arrangement `env_tonemap_controller` already had.
+
+**It needed no new shader**, which is most of the work gone and is a measurement:
+**Portal 2's own sky materials are `UnlitGeneric`** — all 24 the game can load — and the
+six that name Valve's `sky` shader are a Left 4 Dead import **no shipped map's `skyname`
+selects**, so `stdshaders/sky_hdr_dx9.cpp` and its five `.fxc`s are deleted. Four more
+findings, in `rustdocs/ENGINE.md`, "The sky". **`vbsp` marks every leaf it writes
+`LEAF_FLAGS_SKY` and only `vrad` clears it**, from a function nothing calls unless the map
+places a `light_environment` — so **194,641 of the game's 220,537 leaves claim to see a 3D
+sky**, 80 of the 106 maps have the flag set everywhere, and it is the *third* gate (is
+there a `sky_camera` at all) that carries the weight: **7 maps, all at `scale 16`, never
+two in a map**. **`CSkyboxView::DrawInternal`'s area-bit slam is dead code** on a modern
+client — the pointer it writes is read by nothing for the rest of the frame — and what
+actually keeps the playable map out of the sky picture is the PVS, asserted over all seven
+maps: **not one face is in both sets**. **The face names are Hammer's, not the player's**
+(`rt` is `+x`, `ft` is `-y`), which a six-colour GPU test pins. And `sky_day01_01`, named
+by **60 maps**, **ships no material at all** — only `e1912`, a cut map, has a sky surface
+to show it through.
+
+The honest one: **`sp_a1_intro1` shows no sky from its own spawn.** That leaf does not
+claim to see one, because the player wakes up inside a sealed container — so the second
+camera starts drawing when you walk out, and 29 of the game's 36 maps with a sky surface
+have no `sky_camera` at all and get the box from the main view instead.
 
 **Visibility has landed** — `portdocs/ENGINE_WORLD_VIS.md`. `mod_vis.cpp`,
 `r_areaportal.cpp`, the areaportal half of `cmodel.cpp` and
@@ -599,13 +632,13 @@ pad goes down. Shoving moved it 18.8 units.
   own, the ~300 lines of portal branches in `UpdateObject`, `ComputeError`,
   `AttachEntity` and `CheckPortalOscillation` have nothing to stand on. Fix the teleport
   first; the grab's half is then the target transform and little else.
-- **`world/`'s 3D skybox** — now that terrain draws, the last structural reason
-  `sp_a1_intro1` does not look like the shipped game. A second camera over a second set of
-  geometry, plus `sky_camera`'s scale. **Visibility made it cheaper and the recursive view
-  built the seam**: `Map_VisSetup` takes an *array* of origins and ORs their PVS rows
-  together precisely so that a skybox camera and the world share one visible set, and
-  `vis::ViewPoint` / `Visibility::mark_view` is now that array. A skybox camera is its
-  second consumer.
+- **Fog** — which the sky just promoted to the largest thing missing from the picture.
+  `fogparams_t`, `env_fog_controller`, `CSkyboxView::Enable3dSkyboxFog` and one uniform
+  every shader's flag word is already carrying a `NO_FOG` bit for. **Five of the game's
+  maps have a sky that is literally a fog colour** — `sky_fog` is `UnlitGeneric
+  { $color "{70 85 100}" }` and nothing else — and two more ask their sky camera for a
+  40,000-unit fog end. Every `sky_camera` key for it is already parsed and recorded by
+  `server::classes::SkyCamera`, so the data is in hand.
 - **Bloom**, now that there is a scene target and a presenting pass to put it between.
   `Generate8BitBloomTexture`'s downsample/blur chain plus `BloomAdd`, three quarter-size
   render targets. It is the most visible thing still missing from the post chain and

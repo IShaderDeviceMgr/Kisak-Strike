@@ -299,6 +299,15 @@ struct Leaf {
     /// outside the map's shell is not solid and still has no cluster.
     solid: bool,
     area: u16,
+    /// The `flags:7` half of the same bitfield the area comes from —
+    /// `LEAF_FLAGS_*` (`public/bspfile.h:891`).
+    ///
+    /// Nothing in visibility reads it; [`sky_visible_from`] does, because
+    /// `engine->IsSkyboxVisibleFromPoint` is a leaf-flag lookup and this is
+    /// the module that already has the tree to find the leaf with.
+    ///
+    /// [`sky_visible_from`]: Visibility::sky_visible_from
+    flags: u16,
     mins: Vec3,
     maxs: Vec3,
     /// This leaf's slice of [`Visibility::leaf_faces`].
@@ -500,6 +509,7 @@ impl Visibility {
                     cluster: i32::from(leaf.cluster),
                     solid: leaf.contents & CONTENTS_SOLID != 0,
                     area: leaf.area(),
+                    flags: leaf.flags(),
                     mins: shorts(leaf.mins),
                     maxs: shorts(leaf.maxs),
                     faces: first..leaf_faces.len() as u32,
@@ -611,6 +621,35 @@ impl Visibility {
         match self.leaves.get(self.leaf_at(point)) {
             Some(leaf) => leaf.area,
             None => 0,
+        }
+    }
+
+    /// What kind of sky, if any, is visible from here —
+    /// `CEngineClient::IsSkyboxVisibleFromPoint` (`cdll_engine_int.cpp:1753`),
+    /// which is a leaf-flag lookup and nothing more.
+    ///
+    /// `mat_fullbright 1`'s unconditional [`Sky3d`](SkyVisibility::Sky3d) is
+    /// not reproduced — there is no `mat_fullbright` — but the comment beside
+    /// it is the interesting half: *"we may have no lighting in the level, and
+    /// vrad is where `LEAF_FLAGS_SKY` is computed"*. See
+    /// [`leaf`](super::bsp::leaf) for how far that goes on this game's
+    /// content, which is further than anyone would guess.
+    ///
+    /// A map with no tree has no flags and answers
+    /// [`None`](SkyVisibility::None) — and a map with no tree draws everything
+    /// anyway, so the sky is the least of it.
+    pub fn sky_visible_from(&self, point: Vec3) -> SkyVisibility {
+        let flags = match self.leaves.get(self.leaf_at(point)) {
+            Some(leaf) => leaf.flags,
+            None => 0,
+        };
+        // Valve's order: the 3D answer wins when a leaf somehow carries both.
+        if flags & super::bsp::leaf::SKY != 0 {
+            SkyVisibility::Sky3d
+        } else if flags & super::bsp::leaf::SKY2D != 0 {
+            SkyVisibility::Sky2d
+        } else {
+            SkyVisibility::None
         }
     }
 
@@ -1109,6 +1148,38 @@ impl Visibility {
     }
 }
 
+/// `SkyboxVisibility_t` (`public/engine/IEngineTrace.h`) — what
+/// [`Visibility::sky_visible_from`] answers.
+///
+/// **Only two of the three are reachable on Portal 2 content.** No face in the
+/// game is `SURF_SKY2D` and no leaf carries
+/// [`leaf::SKY2D`](super::bsp::leaf::SKY2D), so [`Sky2d`](SkyVisibility::Sky2d)
+/// is never returned for any point of any shipped map. It exists because it is
+/// a real answer to a real question, and because the *difference* between it
+/// and [`Sky3d`](SkyVisibility::Sky3d) is exactly the difference between the
+/// two code paths in `Engine::render`: only `Sky3d` gets the second camera,
+/// but **both** get the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkyVisibility {
+    /// `SKYBOX_NOT_VISIBLE` — no sky from here, so no box and no second
+    /// camera.
+    None,
+    /// `SKYBOX_2DSKYBOX_VISIBLE` — the box, drawn by the main view.
+    Sky2d,
+    /// `SKYBOX_3DSKYBOX_VISIBLE` — the second camera, which draws the box
+    /// itself.
+    Sky3d,
+}
+
+impl SkyVisibility {
+    /// Whether any sky is visible at all: Valve's `nSkyboxVisible !=
+    /// SKYBOX_NOT_VISIBLE`, which is the test `ViewDrawScene` makes
+    /// (`viewrender.cpp:2053`).
+    pub fn any(self) -> bool {
+        self != SkyVisibility::None
+    }
+}
+
 /// Which faces, leaves and areas one view reaches. Owned, so that it can be
 /// held across a draw that borrows the world it came from.
 #[derive(Debug)]
@@ -1371,6 +1442,9 @@ mod tests {
                     cluster: 0,
                     solid: false,
                     area: 1,
+                    // `vbsp`'s default, which is what every leaf of a map
+                    // with no `light_environment` really carries.
+                    flags: bsp::leaf::SKY,
                     mins: near_mins,
                     maxs: near_maxs,
                     faces: 0..1,
@@ -1379,6 +1453,7 @@ mod tests {
                     cluster: 1,
                     solid: false,
                     area: 2,
+                    flags: 0,
                     mins: far_mins,
                     maxs: far_maxs,
                     faces: 1..2,

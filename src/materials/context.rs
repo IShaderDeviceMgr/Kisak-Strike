@@ -211,6 +211,25 @@ pub enum Load {
     Clear(wgpu::Color),
     /// Keep it. What every pass after the first in a frame wants.
     Keep,
+    /// Keep the colour, clear the depth (and the stencil with it).
+    ///
+    /// `VIEW_CLEAR_DEPTH` on its own, which is exactly what
+    /// `CSkyboxView::Setup` (`viewrender.cpp:6962`) leaves behind for the pass
+    /// after it:
+    ///
+    /// ```c
+    /// *pClearFlags &= ~( VIEW_CLEAR_COLOR | VIEW_CLEAR_DEPTH | VIEW_CLEAR_STENCIL | VIEW_CLEAR_FULL_TARGET );
+    /// *pClearFlags |= VIEW_CLEAR_DEPTH; // Need to clear depth after rendering the skybox
+    /// ```
+    ///
+    /// The 3D skybox is the only caller: it draws a whole picture, and the
+    /// real map is then drawn on top of it against a fresh depth buffer with
+    /// its colour left alone. The stencil goes with the depth for the reason
+    /// it does in [`Clear`](Load::Clear) — `D3DCLEAR_ZBUFFER` and
+    /// `D3DCLEAR_STENCIL` are set together — and here that is load-bearing
+    /// rather than incidental: the recursive portal view starts every frame at
+    /// stencil reference 0.
+    ClearDepth,
 }
 
 /// Per-pass and per-draw overrides of a material's pipeline state.
@@ -683,6 +702,11 @@ impl RenderContext {
                 wgpu::LoadOp::Clear(0),
             ),
             Load::Keep => (wgpu::LoadOp::Load, wgpu::LoadOp::Load, wgpu::LoadOp::Load),
+            Load::ClearDepth => (
+                wgpu::LoadOp::Load,
+                wgpu::LoadOp::Clear(CLEAR_DEPTH),
+                wgpu::LoadOp::Clear(0),
+            ),
         };
 
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
