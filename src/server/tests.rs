@@ -3197,7 +3197,9 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     // and door-close-sensor Squirrel files. There is no VScript here.
     ("thinkfunction", 2),
     ("vrad_brush_cast_shadows", 2456),
-    ("vscripts", 72),
+    // +42 with `func_tracktrain`: the trains that name a script, which no
+    // class here runs.
+    ("vscripts", 114),
 ];
 
 /// Every shipped map's entity lump, spawned and then **run** for two seconds
@@ -3586,8 +3588,12 @@ fn every_shipped_map_spawns_its_entities() {
     // the 3D skybox's input: one each on the seven maps that have one, all at
     // `scale 16`, and never two in a map. It spawns, because it removes
     // nothing — `portdocs/ENGINE_WORLD_SKY.md`.
-    assert_eq!(total.matched, 35_337);
-    assert_eq!(total.spawned, 28_465);
+    //
+    // **+1,697 for the trains**: 233 `func_tracktrain`s and the 1,464
+    // `path_track`s they run on. Every one spawns, so `spawned` rises by the
+    // same amount.
+    assert_eq!(total.matched, 37_034);
+    assert_eq!(total.spawned, 30_162);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3605,7 +3611,10 @@ fn every_shipped_map_spawns_its_entities() {
     // `OnPhysGunDrop`. Four of those names are pickup outputs the port cannot
     // fire; they are declared so the connection parses as an output rather
     // than as an unknown key. See `WEIGHTED_CUBE_OUTPUTS`.
-    assert_eq!(total.outputs, 54_631);
+    // **+1,093 for the trains**: 786 `OnPass` on the nodes, and on the trains
+    // 307 — `OnArrivedAtDestinationNode` (117) and `OnUser1`-`OnUser4` (190).
+    // **No shipped map connects `OnStart` or `OnNextPoint`.**
+    assert_eq!(total.outputs, 55_724);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
     // **-2 and -409 again** for the two areaportal classnames, both of which
@@ -3613,8 +3622,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-1 classname and -98 occurrences** for `prop_weighted_cube`, which
     // every map that has cubes places.
     // **-1 and -7** for `sky_camera`: seven maps, one each.
-    assert_eq!(total.unknown.len(), 155);
-    assert_eq!(total.unknown.values().sum::<usize>(), 25_588);
+    // **-2 and -1,697** for `func_tracktrain` and `path_track`.
+    assert_eq!(total.unknown.len(), 153);
+    assert_eq!(total.unknown.values().sum::<usize>(), 23_891);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3695,6 +3705,9 @@ fn every_shipped_map_spawns_its_entities() {
     // `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` is the one that is
     // watched all the way down.
     assert_eq!(per_class.get("prop_weighted_cube"), Some(&98));
+    // The trains, on 64 maps. Nothing deletes either at run time.
+    assert_eq!(per_class.get("func_tracktrain"), Some(&233));
+    assert_eq!(per_class.get("path_track"), Some(&1_464));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -3799,7 +3812,12 @@ fn every_shipped_map_spawns_its_entities() {
     // animation wakes at 10 Hz until it has finished one. `no_target` fell by
     // more than half for the same reason: most events used to reach nothing
     // because most *targets* were props.
-    assert_eq!(io.dispatched, 5_787);
+    //
+    // **+723 with the trains** — the `InPass` a train posts to every node it
+    // passes, the `OnPass` connections that hang off those, and the
+    // `StartForward`/`MoveToPathNode` connections that used to be aimed at a
+    // classname nothing answered for.
+    assert_eq!(io.dispatched, 6_510);
     // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
     // `SetActivatedState` a map used to aim at a classname nothing answered
     // for now lands. Only two of the game's 31 are fired inside two seconds.
@@ -3828,14 +3846,22 @@ fn every_shipped_map_spawns_its_entities() {
     // `OnMapSpawn → laser_cube_wall_mixup_start_cube.EnableMotion` at a delay
     // of 0.5 s, and that cube is the game's only `SF_PHYSPROP_MOTIONDISABLED`
     // one. The map freezes it at spawn and thaws it half a second later.
-    assert_eq!(io.accepted, 5_043);
+    //
+    // **+692 with the trains**, for the same reasons, and **no train or node
+    // input is on the unhandled list below**: every one of the 22 the two
+    // classes declare is implemented.
+    assert_eq!(io.accepted, 5_735);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
     // quantised to six 64 Hz ticks. See `TestChamberDoor::animate_think` for
     // why this class deliberately does not take `DynamicProp`'s
     // cancel-when-idle divergence.
-    assert_eq!(io.thinks, 7_318);
+    //
+    // **+8,300 with the trains**, and it is Valve's shape: `Next` re-arms at
+    // `curtime` every tick for as long as a train is moving, so a train that
+    // runs for the whole two seconds is 128 thinks. About 65 do.
+    assert_eq!(io.thinks, 15_618);
     // **-86 with the two areaportal classnames, and `accepted` does not
     // move** — every one of the 86 is refused rather than accepted. They are
     // `func_areaportalwindow`'s two fade inputs, fired at the *classname*
@@ -3847,7 +3873,12 @@ fn every_shipped_map_spawns_its_entities() {
     // **-11 with `prop_weighted_cube`**: six more events than the five
     // accepted above now find a cube, and are refused by it rather than
     // finding nothing — they are on the unhandled list below.
-    assert_eq!(io.no_target, 1_025);
+    //
+    // **+48 with the trains**: what a node's `OnPass` fires at is, as often as
+    // not, a sound or a particle system, and those are not classes here. The
+    // trains make events that did not exist before, and some of them land on
+    // nothing.
+    assert_eq!(io.no_target, 1_073);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -3919,14 +3950,23 @@ fn every_shipped_map_spawns_its_entities() {
     // the furthest ride in the game's first two seconds is **539 units**, a
     // clip brush on the lift that opens a chamber. Before the pair, all 52 sat
     // where the lump put them while the thing they are bolted to drove off.
-    assert_eq!(brush_entities, 6_302);
-    assert_eq!(moved, 106, "brush entities that left their spawn placement");
-    assert_eq!(carried, 52, "…of which this many were carried by a parent");
+    //
+    // **The trains took `moved` from 106 to 326 and `carried` from 52 to
+    // 133.** Much of that is `Find`, not travel: **162 of the 230 trains that
+    // name a node are drawn more than a unit away from it**, and `Find` snaps
+    // each onto its first node on the first tick, taking everything parented
+    // to it along. That is why the furthest carried ride is now **7,837
+    // units** — `sp_a3_00`'s shaft depth signs, drawn far from the shaft they
+    // run down. 70 brush entities are still travelling at two seconds, 36
+    // more than before.
+    assert_eq!(brush_entities, 6_535);
+    assert_eq!(moved, 326, "brush entities that left their spawn placement");
+    assert_eq!(carried, 133, "…of which this many were carried by a parent");
     assert!(
-        carried_furthest > 539.0 && carried_furthest < 540.0,
+        carried_furthest > 7_837.0 && carried_furthest < 7_838.0,
         "the longest carried ride moved: {carried_furthest}"
     );
-    assert_eq!(still_moving, 34, "…and were still travelling at 2s");
+    assert_eq!(still_moving, 70, "…and were still travelling at 2s");
 
     // Stage 4's own parse-side number, and it is no longer only about brush
     // entities: how many entities are *live* triggers two ticks into the map —
@@ -5128,7 +5168,11 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // > behaviour — a chamber's exit trigger around its own button is ordinary
     // > level design — and it is counted rather than filtered out so that the
     // > number is explained rather than absorbed.
-    assert_eq!(fired, 1_889);
+    //
+    // **`func_tracktrain` and `path_track` took it to 2,117** — 228 triggers
+    // whose connections go to a train (`StartForward`, `MoveToPathNode`) or
+    // to a node, and used to reach nothing.
+    assert_eq!(fired, 2_117);
     assert_eq!(also_on_a_button, 21, "probes that also stand on a pad");
     // Three triggers in the game have no point a 32x32x72 hull fits inside.
     assert_eq!(unreachable, 3);
@@ -6926,7 +6970,13 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // **Ten props do not survive the first two seconds of their map.** `Kill`
     // (556 shipped connections) and `FadeAndKill` (51) — which is exactly why
     // `ModelEntityState` is keyed rather than positional.
-    assert_eq!(props, 8_452, "ten were removed while the map ran");
+    //
+    // **`func_tracktrain` removes 57 more, all on `mp_coop_credits`.** 31 of
+    // its trains `Kill` themselves (`OnUser2` → `!self`) when a node at the
+    // end of their path tells them to, and the 58 props riding them go with
+    // them — `removing_a_parent_removes_everything_under_it`. Before the
+    // trains existed nothing fired the `FireUser2`, so the props lived.
+    assert_eq!(props, 8_395, "67 were removed while the map ran");
 
     // **15 of the 606 models will not read, and 41 entities wear one.**
     //
@@ -6952,7 +7002,10 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // `SOLID_NONE` promoted to `SOLID_OBB` (or left alone, for an `_override`)
     // and 5,622 ask for `SOLID_VPHYSICS` and get drawn and walked through,
     // because a `.phy` is `portdocs/ENGINE_TRACE.md` stage 5's.
-    assert_eq!(solid_key, [2_830, 5_622]);
+    //
+    // The 57 `mp_coop_credits` props a dying train takes with it are all on
+    // the first side, which is why that side is 2,773 now.
+    assert_eq!(solid_key, [2_773, 5_622]);
 
     // **What `$includemodel` was worth, measured on the running maps.**
     // Before `studio::include` landed these read 2,563 / 1,666 / **897**: of
@@ -6968,9 +7021,14 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // order effect worth naming: an animation that can now *end* fires
     // `OnAnimationDone`, and the game's 5,311 `SetAnimation` connections
     // start more props animating than the map's own `DefaultAnim` keys do.
-    assert_eq!(animating, 2_738);
-    assert_eq!(resolved, 2_556);
-    assert_eq!(unresolved, 182);
+    //
+    // **The trains took each of these down a little — 20, 14 and 6 — and
+    // every one of them is a `mp_coop_credits` prop that a self-killing train
+    // took with it**: with that map left out, this port before and after the
+    // trains agree on all three to the entity.
+    assert_eq!(animating, 2_718);
+    assert_eq!(resolved, 2_542);
+    assert_eq!(unresolved, 176);
 
     // **What skinning bought**, and before it landed the measured cost of not
     // having it. `prop_dynamic` is what made it concrete: **74 of the 591
@@ -6985,9 +7043,11 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
         74,
         "models whose vertices are shared between bones"
     );
-    assert_eq!(skinned, 290, "entities that needed skinning to pose at all");
+    // 15 and 9 of these were `mp_coop_credits` props riding trains that
+    // `Kill` themselves; see `animating` above.
+    assert_eq!(skinned, 275, "entities that needed skinning to pose at all");
     assert_eq!(
-        animatable, 3_323,
+        animatable, 3_314,
         "entities whose model the renderer can pose"
     );
 }
@@ -9459,9 +9519,15 @@ fn every_shipped_mover_pushes_the_player_standing_in_front_of_it() {
     // the maps do not change, so a number that moves is a behaviour that
     // moved. **67 of the 263 engaged the pusher** — 54 shoved the player out
     // of the doorway and 13 were stopped dead by them.
+    //
+    // **`func_tracktrain` added one to `missed`**, and it is a probe artefact
+    // rather than a mover: `sp_a2_bridge_the_gap`'s
+    // `@sphere_extension_door_2` rides a train, so the "travel" pass one
+    // measures now includes the train's `Find` snapping it onto its track, and
+    // the doorway pass two probes is not where the door closes.
     assert_eq!(
         (pushed, blocked, missed, no_room, passable),
-        (54, 13, 52, 144, 163),
+        (54, 13, 53, 144, 163),
         "the pusher's census over the shipped maps has changed"
     );
     assert!(
@@ -10277,4 +10343,385 @@ fn sp_a1_intro1_exit_wall_opens_its_areaportal() {
         panic!("the exit wall's areaportal never opened ({hits} hits on the wall)")
     });
     println!("breakable_exit_wall_areaportal opened {opened_at} s into the level");
+}
+
+// ---------------------------------------------------------------------------
+// func_tracktrain and path_track
+// ---------------------------------------------------------------------------
+
+/// A `math_counter` a node's `OnPass` can count into.
+fn pass_counter(name: &str) -> bsp::Entity {
+    block(&[
+        ("classname", "math_counter"),
+        ("targetname", name),
+        ("max", "100"),
+    ])
+}
+
+/// A `path_track` whose `OnPass` adds one to `<name>_passed`.
+fn track_node(name: &str, origin: &str, target: Option<&str>, spawnflags: &str) -> bsp::Entity {
+    let pass = conn(&format!("{name}_passed"), "Add", "1", "0", "-1");
+    let mut pairs = vec![
+        ("classname", "path_track"),
+        ("targetname", name),
+        ("origin", origin),
+        ("orientationtype", "1"),
+        ("spawnflags", spawnflags),
+        ("OnPass", pass.as_str()),
+    ];
+    if let Some(target) = target {
+        pairs.push(("target", target));
+    }
+    block(&pairs)
+}
+
+/// An L-shaped track — 256 units east, then 256 north — and a train on it.
+fn l_track(train: &[(&str, &str)]) -> Vec<bsp::Entity> {
+    let mut pairs = vec![
+        ("classname", "func_tracktrain"),
+        ("targetname", "train"),
+        ("model", "*1"),
+        // Drawn somewhere other than its first node, so that `Find` is seen
+        // to move it.
+        ("origin", "-64 -64 0"),
+        ("target", "p1"),
+        ("startspeed", "128"),
+        ("speed", "0"),
+        ("wheels", "50"),
+        ("height", "0"),
+        ("spawnflags", "2"),
+        ("orientationtype", "1"),
+        ("velocitytype", "0"),
+    ];
+    for &(k, v) in train {
+        match pairs.iter_mut().find(|(key, _)| *key == k) {
+            Some(pair) => pair.1 = v,
+            None => pairs.push((k, v)),
+        }
+    }
+    vec![
+        block(&pairs),
+        track_node("p1", "0 0 0", Some("p2"), "0"),
+        track_node("p2", "256 0 0", Some("p3"), "0"),
+        track_node("p3", "256 256 0", None, "0"),
+        pass_counter("p1_passed"),
+        pass_counter("p2_passed"),
+        pass_counter("p3_passed"),
+        pass_counter("arrived"),
+    ]
+}
+
+fn train_server(map: &[bsp::Entity]) -> Server {
+    let mut server = Server::new();
+    server.level_init("test", map, &door_models());
+    server
+}
+
+fn fire(server: &mut Server, name: &str, input: &str, value: Variant) {
+    let id = find_named(server, name).id();
+    assert!(server.accept_input(id, input, value, None, None, 0), "{name} took {input}");
+}
+
+/// `CPathTrack::Link`: each node points at the next, and each is pointed back
+/// at by the one before — which only the node *before* can write.
+#[test]
+fn path_tracks_link_both_ways_at_activate() {
+    let server = train_server(&l_track(&[]));
+    let id = |name: &str| find_named(&server, name).id();
+    let node = |name: &str| {
+        find_named(&server, name)
+            .behaviour
+            .downcast_ref::<classes::PathTrack>()
+            .expect("a path_track")
+    };
+    assert_eq!(node("p1").next(), Some(id("p2")));
+    assert_eq!(node("p2").next(), Some(id("p3")));
+    assert_eq!(node("p3").next(), None);
+    assert_eq!(node("p1").previous(), None);
+    assert_eq!(node("p2").previous(), Some(id("p1")));
+    assert_eq!(node("p3").previous(), Some(id("p2")));
+}
+
+/// The whole life of a train: `Find` puts it on its first node on the first
+/// tick, `StartForward` drives it along the path turning at the corner, every
+/// node's `OnPass` goes out once, and it coasts onto the last node and stops.
+#[test]
+fn a_train_runs_its_path_passing_every_node_and_stops_at_the_end() {
+    let mut server = train_server(&l_track(&[]));
+    run(&mut server, 0.05);
+    let (origin, angles) = placement(&server, "train");
+    close(origin, Vec3::ZERO);
+    assert!(angles.y.abs() < 1e-3, "facing along the first leg: {angles}");
+    assert_eq!(counter_value(&server, "p1_passed"), 1.0, "Find arrives at p1");
+
+    fire(&mut server, "train", "StartForward", Variant::Void);
+    // Half way along the first leg after a second: 128 units a second.
+    run(&mut server, 1.0);
+    let origin = placement(&server, "train").0;
+    assert!((origin.x - 128.0).abs() < 4.0 && origin.y.abs() < 1e-3, "{origin}");
+    assert_eq!(counter_value(&server, "p2_passed"), 0.0);
+
+    // 512 units in all is four seconds; give it five.
+    run(&mut server, 4.0);
+    let train = find_named(&server, "train");
+    close(train.origin, Vec3::new(256.0, 256.0, 0.0));
+    assert_eq!(train.speed, 0.0);
+    assert_eq!(train.velocity, Vec3::ZERO);
+    assert!(
+        (train.angles.y - 90.0).abs() < 1.0,
+        "turned at the corner: {}",
+        train.angles
+    );
+    for node in ["p1", "p2", "p3"] {
+        assert_eq!(
+            counter_value(&server, &format!("{node}_passed")),
+            1.0,
+            "{node} passed exactly once"
+        );
+    }
+}
+
+/// `MoveToPathNode` drives towards the named node and stops there, firing
+/// `OnArrivedAtDestinationNode` once — and, because arrival is noticed a
+/// tenth of a second early, the last stretch is a coast.
+#[test]
+fn move_to_path_node_stops_on_the_node_it_was_sent_to() {
+    let arrived = conn("arrived", "Add", "1", "0", "-1");
+    let mut server = train_server(&l_track(&[("OnArrivedAtDestinationNode", &arrived)]));
+    run(&mut server, 0.05);
+    fire(&mut server, "train", "MoveToPathNode", Variant::String("p2".into()));
+    run(&mut server, 4.0);
+
+    let train = find_named(&server, "train");
+    assert!(
+        (train.origin - Vec3::new(256.0, 0.0, 0.0)).length() < 4.0,
+        "stopped at p2: {}",
+        train.origin
+    );
+    assert_eq!(train.speed, 0.0);
+    assert_eq!(counter_value(&server, "arrived"), 1.0);
+    assert_eq!(counter_value(&server, "p3_passed"), 0.0, "and went no further");
+}
+
+/// The reason the class was worth porting: an entity parented to a train
+/// rides it, and 1,290 shipped entities are.
+#[test]
+fn a_train_carries_what_is_parented_to_it() {
+    let mut map = l_track(&[("speed", "128")]);
+    map.push(block(&[
+        ("classname", "info_target"),
+        ("targetname", "rider"),
+        // 64 above where the train was *drawn*, which is not where `Find`
+        // puts it.
+        ("origin", "-64 -64 64"),
+        ("parentname", "train"),
+    ]));
+    let mut server = train_server(&map);
+
+    // A `speed` key starts the train by itself, a tenth of a second after
+    // `Find`.
+    run(&mut server, 1.0);
+    let train = find_named(&server, "train");
+    assert!(train.origin.x > 64.0, "moving without being told: {}", train.origin);
+    let rider = find_named(&server, "rider");
+    close(rider.origin - train.origin, Vec3::new(0.0, 0.0, 64.0));
+}
+
+/// `SF_PATH_TELEPORT`: arriving at the node *before* a teleport node jumps the
+/// train straight to it, so it covers a thousand-unit gap in no time.
+#[test]
+fn a_teleport_node_jumps_the_train_across_the_gap() {
+    let map = vec![
+        block(&[
+            ("classname", "func_tracktrain"),
+            ("targetname", "train"),
+            ("model", "*1"),
+            ("target", "p1"),
+            ("startspeed", "128"),
+            ("speed", "128"),
+            ("spawnflags", "18"),
+        ]),
+        track_node("p1", "0 0 0", Some("p2"), "0"),
+        track_node("p2", "128 0 0", Some("p3"), "0"),
+        track_node("p3", "2048 0 0", Some("p4"), "16"),
+        track_node("p4", "2176 0 0", None, "0"),
+        pass_counter("p1_passed"),
+        pass_counter("p2_passed"),
+        pass_counter("p3_passed"),
+        pass_counter("p4_passed"),
+    ];
+    let mut server = train_server(&map);
+    // 256 units of track at 128 a second, and the 1,920-unit gap is free.
+    run(&mut server, 3.0);
+    close(placement(&server, "train").0, Vec3::new(2176.0, 0.0, 0.0));
+    for node in ["p1", "p2", "p3", "p4"] {
+        assert_eq!(counter_value(&server, &format!("{node}_passed")), 1.0, "{node}");
+    }
+}
+
+/// `DisablePath` ends the path for a moving train at the disabled node — and
+/// `DeadEnd` then names the last *enabled* node the one it stopped at.
+#[test]
+fn a_disabled_node_is_a_dead_end_for_a_moving_train() {
+    let mut server = train_server(&l_track(&[]));
+    run(&mut server, 0.05);
+    fire(&mut server, "p3", "DisablePath", Variant::Void);
+    fire(&mut server, "train", "StartForward", Variant::Void);
+    run(&mut server, 4.0);
+    let train = find_named(&server, "train");
+    close(train.origin, Vec3::new(256.0, 0.0, 0.0));
+    assert_eq!(train.speed, 0.0);
+    assert_eq!(counter_value(&server, "p3_passed"), 0.0);
+    // Once, and by `DeadEnd` rather than by `ArriveAtNode`: the look-ahead
+    // runs out of enabled path a tenth of a second *before* the train reaches
+    // p2, so `Next` never sees it as a node passed. The coast lands on it and
+    // `DeadEnd` fires its `InPass`.
+    assert_eq!(counter_value(&server, "p2_passed"), 1.0);
+}
+
+/// Loads one shipped map's entities into a fresh server, for the depot tests
+/// that watch a single map run.
+fn shipped_map_server(map: &str) -> Server {
+    use crate::filesystem::Vfs;
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+    let bsp = crate::engine::world::bsp::Bsp::load(&vfs, map).expect("the map");
+    let mut server = Server::new();
+    server.level_init(map, &bsp.entities(), &bsp.models);
+    server
+}
+
+/// **Every shipped train finds its track on the first tick**: `Find` puts it
+/// on the node its `target` names, raised by its `height`, and remembers the
+/// node. Parented trains are skipped — `Find` places them with a world
+/// position computed from local coordinates, which is Valve's and is only
+/// right when the two frames agree.
+#[test]
+#[ignore = "needs the Portal 2 depot: set KISAK_GAME_DIR"]
+fn every_shipped_train_finds_its_track() {
+    use crate::engine::world::bsp::Bsp;
+    use crate::filesystem::Vfs;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let (mut trains, mut on_track, mut parented, mut lost) = (0, 0, 0, 0);
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let mut server = Server::new();
+        server.level_init(name, &bsp.entities(), &bsp.models);
+        // One tick: `Find` runs on it, and a train with a `speed` key does
+        // not start until a tenth of a second later.
+        let interval = server.time().interval;
+        server.frame(interval, &mut NoTouchQuery);
+
+        for (_, entity) in server.entities.iter() {
+            let Some(train) = entity.behaviour.downcast_ref::<classes::TrackTrain>() else {
+                continue;
+            };
+            trains += 1;
+            if entity.core.parent().is_some() {
+                parented += 1;
+                continue;
+            }
+            let Some(node) = train.path().and_then(|id| server.entities.get(id)) else {
+                lost += 1;
+                continue;
+            };
+            let expected = node.core.local_origin + Vec3::new(0.0, 0.0, train.height());
+            // A first node with a `speed` of its own starts the train inside
+            // `Find` itself (`ArriveAtNode` → `SetSpeed` → `Start`), and the
+            // pusher runs straight after the think — so such a train has
+            // already travelled one tick. It may be stopped again by then:
+            // `sp_a2_bts1`'s spherebot has `path_1 OnPass → Stop`, which the
+            // queue delivers after the push, so it has moved 3.125 units and
+            // stands still. Valve's `OnPass` is queued too, so the shipped
+            // game does the same.
+            let speed = entity.core.velocity.length().max(node.core.speed.abs());
+            let slack = speed * interval + 1e-3;
+            assert!(
+                (entity.core.origin - expected).length() < slack,
+                "{name}: {} is at {} rather than on {}",
+                entity.core.debug_name(),
+                entity.core.origin,
+                node.core.debug_name()
+            );
+            on_track += 1;
+        }
+    }
+    println!("{trains} trains: {on_track} on their track, {parented} parented, {lost} with no track");
+    // 233 placed. **Three name a `target` that no entity in their map has**,
+    // and they are Valve's map errors rather than a gap here: `Find` finds
+    // nothing and leaves each where it was drawn. One of them is
+    // `sp_a1_intro1`'s `@container_train`, whose *whole path* is missing from
+    // the shipped map — so the four relays that `MoveToPathNode` it name
+    // nodes that do not exist, and the crane never moved in the shipped game
+    // either. The other two are `sp_a1_wakeup`'s incinerator pincer and
+    // `sp_a2_bts6`'s player pod.
+    assert_eq!((trains, on_track, parented, lost), (233, 229, 1, 3));
+}
+
+/// `sp_a1_intro1`'s departure elevator runs down its shaft and loops: the
+/// last node's successor carries `SF_PATH_TELEPORT`, so arriving at the
+/// bottom jumps it back to the top, and the teleport trigger bolted to it
+/// rides along the whole way.
+///
+/// **In the game the elevator is started by VScript** (`RunScriptCode
+/// StartMoving()`), which this port does not run — so the test starts it by
+/// hand, with the `StartForward` that script ends in.
+#[test]
+#[ignore = "needs the Portal 2 depot: set KISAK_GAME_DIR"]
+fn sp_a1_intro1_departure_elevator_runs_its_shaft_and_loops() {
+    let mut server = shipped_map_server("sp_a1_intro1");
+    let interval = server.time().interval;
+    server.frame(interval, &mut NoTouchQuery);
+
+    const ELEVATOR: &str = "departure_elevator-elevator_1";
+    const TRIGGER: &str = "departure_elevator-elevator_1_player_teleport";
+    // Drawn 16 units above its first node; `Find` snaps it down.
+    let top = placement(&server, ELEVATOR).0;
+    assert!((top.z - 2573.0).abs() < 1e-3, "on path_0: {top}");
+    let offset = placement(&server, TRIGGER).0 - top;
+
+    fire(&mut server, ELEVATOR, "StartForward", Variant::Void);
+
+    // 4,269 units of shaft at 1,000 a second. Watch every tick for the jump
+    // back to the top.
+    let (mut lowest, mut jumped) = (f32::INFINITY, false);
+    let mut last = top.z;
+    for _ in 0..(6.0 / interval) as u32 {
+        server.frame(interval, &mut NoTouchQuery);
+        let z = placement(&server, ELEVATOR).0.z;
+        lowest = lowest.min(z);
+        jumped |= z - last > 3_000.0;
+        last = z;
+        // The rider never leaves its place on the car.
+        let rider = placement(&server, TRIGGER).0 - placement(&server, ELEVATOR).0;
+        assert!((rider - offset).length() < 1e-2, "the trigger slid off: {rider}");
+    }
+    // **It turns round about 97 units short of the bottom node**, at 1,000
+    // units a second: arrival at `path_2` is noticed a tenth of a second
+    // early, and that arrival is what fires the teleport to `path_0`, so the
+    // car never covers the last tenth. Valve's.
+    assert!(
+        lowest < -1_590.0 && lowest > -1_696.0,
+        "down the shaft, short of the bottom node: {lowest}"
+    );
+    assert!(jumped, "and teleported back to the top");
 }

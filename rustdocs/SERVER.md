@@ -1952,10 +1952,21 @@ impl PropPortal {
 /// `UTIL_Portal_ComputeMatrix_ForReal` — see gotcha 80 before using it.
 /// Both arguments are `(origin, angles)`.
 pub fn teleport_matrix(entrance: (Vec3, Vec3), exit: (Vec3, Vec3)) -> Mat4;
+// classes/train.rs — `func_tracktrain` and `path_track`
+pub enum TrackOrientation { Fixed, FacePath, FacePathAngles }     // a node's
+pub enum TrainVelocity { Instantaneous, LinearBlend, EaseInEaseOut }
+pub enum TrainOrientation { Fixed, AtPathTracks, LinearBlend, EaseInEaseOut }
+/// One node. `next`/`previous`/`alternate` are resolved in `Activate`; a
+/// node's `speed` is `EntityCore::speed`; its enabled and alternate switches
+/// live in `EntityCore::spawn_flags`, as Valve's do.
+pub struct PathTrack { /* private */ }
+/// The train. `m_flSpeed` is `EntityCore::speed`, signed; `startspeed` is the
+/// maximum every `StartForward` and fractional `SetSpeed` is measured against.
+pub struct TrackTrain { /* private */ }
 ```
 
-Fifty classnames, **35,337 of the shipped game's 60,925 entity blocks**.
-**Forty-five of them are among the 200 classnames the maps place**; the other
+Fifty-two classnames, **37,034 of the shipped game's 60,925 entity blocks**.
+**Forty-seven of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2008,6 +2019,8 @@ because Valve registers them:
 | `prop_portal` | `CProp_Portal` | 21, in 10 maps |
 | `player` | `CPortal_Player` | **0 placed** — `spawn_player` makes it |
 | `sky_camera` | `CSkyCamera` | 7, in 7 maps — one each |
+| `func_tracktrain` | `CFuncTrackTrain` | 233, in 64 maps |
+| `path_track` | `CPathTrack` | 1,464 |
 
 ---
 
@@ -2878,6 +2891,31 @@ the arm's origin start at 91.
     longer valid", so the two inputs are not additive and order matters.
     `Context::set_parent` passes `None` for the attachment, which is that line.
 
+95. **A train "arrives" at a node a tenth of a second before it gets there.**
+    `Next` looks 0.1 s ahead along the path and calls a node passed when that
+    point passes it, then leaves the velocity running for the 0.1 s of move
+    time it armed. So a train sent somewhere by `MoveToPathNode` *coasts* the
+    last stretch onto the node — up to a tick's travel either side — and a
+    node's `OnPass` goes out before the train is over it. It also means the
+    look-ahead can run out of path first: the last node of a path, or the
+    last one before a disabled node, is **never** arrived at through `Next`,
+    and it is `DeadEnd` that fires its `InPass`. `sp_a1_intro1`'s departure
+    elevator turns round 97 units short of its bottom node for this reason,
+    because that arrival is what fires the teleport back to the top.
+
+96. **`speed` on a node is a command, not a label, for a train without
+    controls.** `ArriveAtNode` copies a non-zero node speed onto any train with
+    `SF_TRACKTRAIN_NOCONTROL` (192 of 233), including in `Find` — so a parked
+    train whose first node has a speed starts moving on the first tick unless
+    the map stops it. `sp_a2_bts1`'s spherebot is that case: `path_1` has
+    `speed 200` and `OnPass → Stop`, so it moves one tick (3.125 units) and
+    stops. The shipped game does the same.
+
+97. **`Find` and `TeleportToPathTrack` place with `SetAbsOrigin` using a
+    node's *local* origin.** They only agree when the train and its nodes are
+    unparented; one shipped train and 19 shipped nodes are parented. Kept,
+    and it is why `every_shipped_train_finds_its_track` skips parented trains.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2893,6 +2931,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CancelEvents`' caller test | Compares the caller pointer, then re-compares its own name and classname against themselves | Compares the handle | The extra test can only ever be true. Dead code, not reproduced. |
 | A parent cycle | Recurses until the stack runs out (only self-parenting is checked) | Bounded by the entity count, reported, treated as depth 1 | No shipped map contains a cycle. |
 | `qsort` in the spawn sort | Unstable; equal-rank order is unspecified | Stable, so lump order survives within a rank | Deterministic, and it is what a level designer means by "in order". |
+| A train's `InPass` on a node | `AcceptInput( "InPass" )`, called directly | Posted with no delay | A handler cannot run another entity's code. The queue is serviced in the same tick, after the thinks (gotcha 4), so the node's `OnPass` connections are queued in the tick the train passed it. |
+| `func_tracktrain`'s first `Find` | `SetNextThink( gpGlobals->curtime )` in `Spawn` | The first tick | Spawn runs at tick zero here, where that would mean "never" (gotcha 63). "Start trains on the next frame" is the comment, and it is the tick asked for. |
+| A train `Blocked` by something standing on it | `pOther->GetGroundEntity() == this` | On the ground, feet within two units of the top of the train's box, and inside it horizontally | There is no ground entity; the same gap the pusher's `IsStandingOnPusher` rebuilds. |
+| `LookAhead` over a loop of coincident nodes | Spins for ever | Gives up after 4,096 nodes | No shipped path has one; a hand-built one should fail rather than hang. |
 | The zero-delay event chain | Unbounded; a self-triggering relay hangs the server | Bounded at 100,000 events a tick, then the queue is dropped with a warning | Four times the largest map's entire connection count. |
 | A `filter_multi` chain | Unbounded; a filter naming itself recurses until the stack runs out | Bounded at 8 deep, reported, treated as a pass | No shipped map has a chain deeper than one. |
 | Pressing a floor button | `m_pOwnerButton->TriggerStartTouch( pOther )`, a direct call | The trigger posts `PressIn` at the button | A handler cannot dispatch into another class — the dispatched entity is lifted out of the list. Same tick, one more event; gotcha 51. |
@@ -2954,7 +2996,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `func_door`'s `SetToggleState` input | Declared `FIELD_FLOAT` and read with `value.Int()` (`doors.cpp:495`), which `variant_t` answers with **zero** for a float — so in the shipped game it always means `TS_AT_TOP`. Zero shipped connections fire it. |
 | `CBaseToggle`'s `master` / `UTIL_IsMasterTriggered` | The `multisource` interlock. **No shipped Portal 2 map sets a `master` key on any of these classes.** |
 | `SF_DOOR_START_OPEN_OBSOLETE` | **No shipped map sets it.** The 40 doors that spawn open use `spawnpos 1`. |
-| `func_rot_button` (2), `momentary_rot_button` (1), `func_tracktrain` (233), `func_tanktrain` (20) | The remaining movers. `CBaseButton`'s `m_fRotating` branch is `CRotButton`'s and is therefore dead here; the trains need `path_track`. |
+| `func_rot_button` (2), `momentary_rot_button` (1), `func_tanktrain` (20) | The remaining movers. `CBaseButton`'s `m_fRotating` branch is `CRotButton`'s and is therefore dead here. `func_tanktrain` is a `func_tracktrain` a player drives, and every one is on a co-op map. |
 | `CPropTestChamberDoor`'s area portal window — `AreaPortalWindow`, `UseAreaPortalFade`, `AreaPortalFadeStart`/`End`, `AreaPortalOpen`/`Close`, `CFuncAreaPortalWindow` | All the two calls do is write `m_flFadeStartDist` and `m_flFadeDist` on a `func_areaportalwindow`, which belongs to the engine's visibility system (areas and areaportals, `cmodel.cpp`) and is not ported. **84 doors name a window and 94 write the fade triple.** The four keys are consumed and printed by `ent_dump`; the two call sites are marked in `Spawn`, `OnOpen` and `OnFullyClosed`, so wiring them up later is one line each. |
 | `CPropTestChamberDoor`'s bone followers — `CreateVPhysics`, `CreateBoneFollowers`, `TestCollision`, `UpdateOnRemove` | The same `vphysics` gap `prop_dynamic`'s row above records, and here it is the door's *whole* collision: the model's `bone_followers` block becomes one physics entity per moving bone and the door itself goes `FSOLID_NOT_SOLID`. So a chamber door is **drawn and walked through**. In the shipped map the doorway also carries a `func_clip_vphysics`, which is not ported either. |
 | `CPropTestChamberDoor`'s sounds — `prop_portal_door.open`, `prop_portal_door.close` | There is no sound system. They are the only two things `Precache` asks for beyond the model. |
@@ -2971,7 +3013,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
 | ~~`$includemodel`~~ | **Landed** in `src/studio/include.rs`, and it was measured here first: 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**. Of the 2,738 props playing a sequence two seconds into their map, the labels that resolve went from 1,666 to **2,556** and the ones that do not from 897 to **182** — and that remainder is Valve's own map errors, 183 `DefaultAnim` keys naming a sequence in no model at all. `animating` rose with it, because an animation that can now *end* fires `OnAnimationDone` into the game's 5,311 `SetAnimation` connections. |
 | `prop_dynamic_ornament` (`COrnamentProp`) | A prop that `FollowEntity`s another, which needs the same local/abs transform pair the `SetParent` family does. **Zero placed by any shipped map.** |
-| `prop_floor_cube_button` (13), `prop_floor_ball_button` (10), `prop_under_floor_button` (13), `prop_button` (64) | The first two accept **only** cubes and balls. A cube falls now, but **what it falls through is not what a trigger tests**: the cube is in the physics world and the trigger sweep is in `trace/`'s, so a cube resting on a button does not press it. **The blocker moved again, from `MOVETYPE_VPHYSICS` to the shadow controller** — `rustdocs/VPHYSICS.md` §7. The other two are ordinary follow-on work: `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names, and `prop_button` is a separate class in `prop_button.cpp` with a timer. |
+| `prop_floor_cube_button` (9), `prop_floor_ball_button` (7), `prop_under_floor_button` (13), `prop_button` (56) | Ordinary follow-on work, no longer blocked: a cube now presses a `prop_floor_button` through `CPortalButtonTrigger`'s cube arm. The first two accept **only** cubes and balls and are **co-op only**. `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names. `prop_button` is a separate class in `prop_button.cpp`, with a timer. The counts are over `portal2/maps` only; an earlier version of this row counted the DLC maps too. See [the census](#what-the-maps-place-that-is-not-here--the-unported-classnames). |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
 | **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
@@ -2986,6 +3028,359 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Save/restore, `FTYPEDESC_SAVE` | Deferred; `serde` over entity state when it comes back, not `ISave`. |
 | `ent_pause`/`ent_step` (`Debug_ShouldStep`) | 20 lines and genuinely useful; reconsider when entities do more. |
 | VScript | `portdocs/SERVER.md` §9. One `RunScriptCode` reaches an implemented class. |
+
+---
+
+## What the maps place that is not here — the unported classnames
+
+**153 of the 200 classnames the shipped maps place have no class here: 23,891 of
+the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
+`func_tracktrain` and `path_track` have landed since.) Every one is listed below, grouped by what it would
+take, and measured the same way as the rest of this file: the entity lump
+(lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
+co-op, not the DLC directories. "I/O in" is the number of shipped connections
+whose target resolves, in the same map, to an entity of that class. "Out" is
+the number of connections written *on* entities of that class, which is what
+the rest of the map is waiting to receive from it. "C++" is the
+`LINK_ENTITY_TO_CLASS` site under `legacy/game/`. **none** means that no
+factory exists anywhere in the tree: 41 classnames and 5,583 entities.
+`portdocs/SERVER.md` §1.3 explains that these are reconstruction jobs, from the
+FGD, the surviving shared code and the maps' own I/O.
+
+This is a snapshot. `LevelStats::unknown` is the live version: it is printed
+per map at load, and `every_shipped_map_spawns_its_entities` asserts the
+totals. When a class lands, delete its row here and add it to the table under
+[`classes`](#classes-classes).
+
+### What the census found
+
+1. **A missing classname breaks entities that are implemented.**
+   `Server::level_init` skips a block whose classname has no class, so nothing
+   that names that block can find it. **218 keys on implemented entities
+   name an entity this port does not spawn.** 114 of them are `parentname`,
+   and those children stay where the map put them and ride nothing.
+   - **It was 1,508, and `func_tracktrain` was 1,290 of them**: the parent of
+     1,138 `prop_dynamic`s and of the triggers, teleports, doors and brushes
+     that travel with them. That was the reason it went first; see "Trains"
+     under "What has landed". Of what is left, `func_physbox` carries 62
+     children and `func_tanktrain` 20.
+   - **`info_teleport_destination` is named by 41 `target`/`landmark` keys on
+     `trigger_teleport`s.** It is a bare `CPointEntity`, a position and
+     nothing else. Every one of those teleports currently finds no
+     destination and warns instead. This is the cheapest fix in the census.
+   - The rest are filters and `point_teleport`s naming a prop or NPC class
+     that is not here (`prop_physics_override`, `npc_personality_core`,
+     `npc_portal_turret_floor`), and 25 `func_areaportalwindow`s naming the
+     `func_illusionary` they draw when faded.
+
+   A missing *brush* entity is not missing from the picture, only from the
+   game: `rustdocs/ENGINE.md` leaves it drawn where the lump placed it. So a
+   `trigger_portal_cleanser` shows its grill whether or not the map has
+   `Disable`d it.
+
+2. **`sp_a1_intro1` alone places 51 of the missing classnames** (53 before the
+   trains). Five groups decide what the map does:
+   - **The story:** 17 `logic_choreographed_scene`s, 2 `logic_script`s, a
+     `generic_actor` and 3 `ai_script_conditions`. A scene's `OnCompletion`
+     is what releases the container ride. That is why
+     `sp_a1_intro1_exit_wall_opens_its_areaportal` has to trigger
+     `@rl_container_ride_second_section` by hand.
+   - **The way out:** the departure elevator is a `func_tracktrain` now, but
+     VScript starts it (`RunScriptCode StartMoving()`), and its
+     `trigger_teleport` has an
+     `info_teleport_destination` as its landmark, and beyond it are a
+     `point_changelevel`, a `trigger_transition` and an `info_landmark_exit`.
+   - **What is drawn:** 3 `env_fog_controller`s, 26 `move_rope`s and 25
+     `keyframe_rope`s (the cables), 4 `env_projectedtexture`s and 6
+     `info_particle_system`s.
+   - **What collides:** 8 `func_clip_vphysics`, and 3
+     `prop_physics_override`s (the radio, a clipboard and a collapsing room
+     body).
+   - **What is heard:** 36 `ambient_generic`s and 19 `env_soundscape`s.
+
+3. **Fourteen classnames, 1,259 entities, are co-op only**: no
+   single-player map places one. They are listed in the last table, and
+   they cost single-player Portal 2 nothing.
+
+4. **The commonest missing classnames are not the most needed ones.**
+   - `vgui_movie_display` (2,556) needs a video player first, and
+     `func_portal_bumper` (2,383) needs portal placement rules.
+   - `ambient_generic` (1,910) needs a sound system, and
+     `env_sprite_clientside` (1,330) is spawned by the client, not the
+     server.
+   - What a map is actually *waiting on* is better measured by the "out"
+     column. `trigger_playerteam` (1,999) and `logic_coop_manager` (1,469)
+     lead it, and both are co-op. Next come `trigger_catapult` (242),
+     `trigger_portal_cleanser` (216), `prop_button` (191) and
+     `prop_laser_catcher` (172). (`path_track`'s 786 and `func_tracktrain`'s
+     307 headed that list until they landed.)
+
+### Suggested order, for single player
+
+This is a ranking of what unblocks the most, not a plan.
+
+1. **`info_teleport_destination`.** A position with no behaviour. It
+   un-breaks 41 teleports, `sp_a1_intro1`'s elevator exit among them.
+2. ~~**`func_tracktrain` with `path_track`**~~ — **landed**. `path_corner`
+   (26) is not a train's node and stays below, with the NPCs that walk it.
+3. **`point_template` and `env_entity_maker`.** These are how a dropper makes
+   a new cube. They need entities created after load, with their names fixed
+   up, which `trigger_portal_button` already exercises in a small way.
+4. **The test elements with source or a small surface:**
+   - `prop_button`, `prop_under_button` and `prop_under_floor_button`, which
+     are in `game/server/portal2/`;
+   - `prop_indicator_panel`;
+   - `trigger_catapult`, which is `trigger_push` plus a ballistic solve;
+   - `trigger_portal_cleanser`, whose `OnDissolve` lands on
+     `WeightedCube`'s existing `SilentDissolve`.
+5. **`prop_physics`/`prop_physics_override`, `func_physbox` and
+   `func_clip_vphysics`.** The simulation and `CPhysicsProp`'s base are both
+   here already.
+6. **The portal gun and its placement rules:**
+   - `weapon_portalgun`;
+   - `func_portal_bumper`, `func_noportal_volume` and
+     `info_placement_helper`;
+   - `func_portal_detector`.
+7. **Everything gated on a subsystem:**
+   - VScript and choreography, which are the whole story layer;
+   - fog (`env_fog_controller`), sound, particles, ropes, sprites, projected
+     textures and video;
+   - lasers, bridges, funnels and gel, which are the reconstruction-heavy
+     half of the test elements;
+   - the AI (turrets, cameras, cores).
+
+### Every unported classname, by family
+
+#### The portal gun's world — 7 classnames, 3,644 entities
+
+What a portal gun places portals *against* and what a portal does to things. Mostly without source here (`portdocs/SERVER.md` §1.3).
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `func_portal_bumper` | **none** | 2,383 | 1,239 / 1,144 | 59 | 2 | 1 / 2 | Nudges a portal off an edge during placement. Inert until the portal gun places portals by rule — the `portal` command skips every rule. |
+| `func_noportal_volume` | **none** | 458 | 448 / 10 | 36 |  | 29 / 0 | Refuses portal placement inside it. Same gate as the bumper. |
+| `info_placement_helper` | **none** | 392 | 163 / 229 | 43 |  | 8 / 0 | Snaps a portal onto a fixed spot. Same gate; `baseprojectedentity_shared.cpp` names it. |
+| `trigger_portal_cleanser` | **none** | 371 | 116 / 255 | 55 | 1 | 205 / 216 | The emancipation grill. Fizzles portals and dissolves props; its `OnDissolve` needs `WeightedCube`'s `SilentDissolve`. Its brush is left drawn in place, so a `Disable`d grill still shows. |
+| `func_portal_detector` | **none** | 31 | 31 / 0 | 17 |  | 16 / 68 | Fires when a portal lands inside it. Needs portal placement. |
+| `linked_portal_door` | `CLinkedPortalDoor` (`server/portal2/prop_linked_portal_door.cpp:126`) | 6 | 6 / 0 | 2 |  | 8 / 0 | A scripted pair of portals with no gun (`prop_linked_portal_door.cpp` survives). Two maps. |
+| `weapon_portalgun` | **none** | 3 | 1 / 2 | 1 |  | 4 / 34 | The gun. Also what `OnPlayerPickup` (34) fires from, on the maps where it is picked up. |
+
+#### Test elements — 27 classnames, 1,017 entities
+
+The pieces a chamber is built from. Most have no source here; the button family survives in `game/server/portal2/`.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `trigger_catapult` | **none** | 185 | 116 / 69 | 35 |  | 74 / 242 | The aerial faith plate. 241 `OnCatapulted` connections. |
+| `info_paint_sprayer` | **none** | 158 | 131 / 27 | 12 |  | 182 / 0 | Paint dispensers — the gel. `paint_blobs_shared.cpp` and `paint_power_info.cpp` survive; the server half does not. |
+| `npc_portal_turret_floor` | **none** | 128 | 77 / 51 | 16 |  | 61 / 92 | The turret. Wants lasers, tipping on vphysics, and an AI sense of the player. |
+| `npc_security_camera` | **none** | 84 | 38 / 46 | 26 |  | 111 / 9 | The wall camera that tracks the player; knocked off with a portal. |
+| `paint_sphere` | **none** | 62 | 49 / 13 | 1 |  | 65 / 0 | Paints brush surfaces inside a radius. Two maps (49 on one of them). |
+| `prop_button` | `CPropButton` (`server/portal2/prop_button.cpp:93`) | 56 | 28 / 28 | 22 |  | 32 / 191 | The pedestal button. Survives in `portal2/prop_button.cpp`; a timer and `+use`. |
+| `prop_indicator_panel` | **none** | 49 | 28 / 21 | 20 |  | 105 / 0 | The checkmark and countdown panel beside a button. 105 `Check`/`Uncheck`/`Start`/`Stop` connections. |
+| `env_portal_laser` | **none** | 34 | 20 / 14 | 17 |  | 16 / 0 | The Thermal Discouragement Beam. |
+| `prop_laser_catcher` | **none** | 34 | 22 / 12 | 15 |  | 1 / 172 | Laser receptacle; 171 `OnPowered`/`OnUnpowered` connections. |
+| `prop_wall_projector` | **none** | 31 | 9 / 22 | 7 |  | 16 / 0 | The hard light bridge. A projected entity — `baseprojectedentity_shared.cpp` survives. |
+| `prop_under_button` | `CPropUnderButton` (`server/portal2/prop_button.cpp:507`) | 27 | 7 / 20 | 4 |  | 8 / 72 | The Wheatley-era pedestal button, same file. |
+| `prop_tractor_beam` | **none** | 25 | 13 / 12 | 12 |  | 22 / 0 | The excursion funnel. Also a projected entity. |
+| `prop_monster_box` | **none** | 22 | 22 / 0 | 11 |  | 27 / 20 | The Frankenturret: a cube that walks. `CPortalButtonTrigger` already asks for it by name. |
+| `npc_personality_core` | **none** | 21 | 21 / 0 | 19 | 1 | 164 / 45 | Wheatley and the cores, carried. 45 `OnPlayerPickup`; the grab controller's `UpdateVMGrab` names it. |
+| `prop_laser_relay` | **none** | 15 | 9 / 6 | 3 |  | 0 / 72 | Laser relay column. |
+| `npc_wheatley_boss` | **none** | 15 | 15 / 0 | 15 |  | 5 / 0 | The finale boss. One per map on 15 maps. |
+| `prop_under_floor_button` | `CPropUnderFloorButton` (`server/portal2/prop_floor_button.cpp:765`) | 13 | 6 / 7 | 4 |  | 0 / 62 | `prop_floor_button` with a bigger box and other sequence names. |
+| `prop_floor_cube_button` | `CPropFloorCubeButton` (`server/portal2/prop_floor_button.cpp:626`) | 9 | 0 / 9 | 0 |  | 2 / 26 | Accepts only cubes. Co-op only. |
+| `trigger_paint_cleanser` | **none** | 9 | 7 / 2 | 6 |  | 3 / 0 | Strips paint from what crosses it. |
+| `prop_paint_bomb` | **none** | 8 | 8 / 0 | 5 |  | 1 / 4 | A paint-filled physics ball. |
+| `vgui_neurotoxin_countdown` | **none** | 8 | 8 / 0 | 2 |  | 9 / 0 | The finale's neurotoxin timer screen. |
+| `prop_floor_ball_button` | `CPropFloorBallButton` (`server/portal2/prop_floor_button.cpp:712`) | 7 | 0 / 7 | 0 |  | 0 / 14 | Accepts only the sphere. Co-op only. |
+| `prop_exploding_futbol` | **none** | 7 | 7 / 0 | 2 |  | 5 / 0 | The Wheatley-era bomb. Filters name it. |
+| `point_survey` | **none** | 5 | 5 / 0 | 5 |  | 0 / 5 | "Displays a survey to the player". Five `OnSurveyComplete`. |
+| `env_portal_credits` | **none** | 2 | 2 / 0 | 2 |  | 2 / 0 | The rolling credits. |
+| `logic_timescale` | **none** | 2 | 2 / 0 | 1 |  | 4 / 0 | Changes the server's timescale. One map. |
+| `point_futbol_shooter` | **none** | 1 | 1 / 0 | 1 |  | 17 / 0 | Throws `prop_exploding_futbol`s. |
+
+#### Scripts and scenes — 5 classnames, 629 entities
+
+VScript and choreography. **These are what start `sp_a1_intro1`'s story beats**, including the container ride.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `logic_script` | `CLogicScript` (`server/logicentities.cpp:118`) | 384 | 202 / 182 | 63 | 2 | 769 / 0 | VScript. 769 `RunScriptCode` connections, and Portal 2's own map logic (`transitions/sp_transition_list.nut`, the elevator videos, the coop scoring) lives in the `.nut` files it runs. See `portdocs/SERVER.md` §9. |
+| `generic_actor` | `CGenericActor` (`server/genericactor.cpp:55`) | 160 | 75 / 85 | 61 | 1 | 862 / 0 | A VScript-driven model, mostly the characters' voice targets: 860 of its 862 connections are `RunScriptCode`. |
+| `logic_choreographed_scene` | `CSceneEntity` (`server/sceneentity.cpp:659`) | 35 | 33 / 2 | 10 | 17 | 23 / 56 | A `.vcd` — GLaDOS's and Wheatley's lines and the sequences timed to them. `OnCompletion` (42) is how a scene hands control back to the map. **17 on `sp_a1_intro1`**, one of which releases the container ride. |
+| `scripted_sequence` | `CAI_ScriptedSequence` (`server/scripted.cpp:121`) | 32 | 32 / 0 | 16 |  | 27 / 2 | Plays an NPC animation. Needs the AI. |
+| `ai_script_conditions` | `CAI_ScriptConditions` (`server/ai_scriptconditions.cpp:41`) | 18 | 18 / 0 | 9 | 3 | 20 / 48 | Fires when an NPC's conditions hold. 45 `OnConditionsSatisfied`; on `sp_a1_intro1`. |
+
+#### Logic and spawning — 13 classnames, 971 entities
+
+Ordinary map logic, the kind stage 2 ported. `point_template` is the one with teeth.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `point_template` | `CPointTemplate` (`server/point_template.cpp:160`) | 302 | 149 / 153 | 44 | 2 | 228 / 142 | Spawns copies of other entities on `ForceSpawn` (207 connections) — the cube and ball droppers' way of making a new cube. Needs entities created after load and a fixup of their names. |
+| `env_global` | `CEnvGlobal` (`server/logicentities.cpp:1323`) | 178 | 8 / 170 | 8 |  | 514 / 0 | Sets a global state that `logic_auto`'s `globalstate` reads. 8 on SP maps; `Auto::global_state` already parses the reader side. |
+| `point_clientcommand` | `CPointClientCommand` (`server/client.cpp:649`) | 175 | 130 / 45 | 63 | 1 | 136 / 0 | Runs a console command on the client. 118 of its 136 connections set `r_flashlightbrightness`. |
+| `point_servercommand` | `CPointServerCommand` (`server/client.cpp:702`) | 115 | 67 / 48 | 62 |  | 10 / 1 | Runs a server console command. |
+| `env_entity_maker` | `CEnvEntityMaker` (`server/env_entity_maker.cpp:106`) | 94 | 62 / 32 | 33 | 1 | 160 / 16 | Spawns a `point_template`'s contents at its own position. |
+| `logic_achievement` | `CLogicAchievement` (`server/logic_achievement.cpp:41`) | 52 | 49 / 3 | 31 | 2 | 50 / 0 | Unlocks an achievement. Steam. |
+| `logic_compare` | `CLogicCompare` (`server/logicentities.cpp:2440`) | 20 | 0 / 20 | 0 |  | 17 / 59 | Compares a value. Co-op only. |
+| `info_game_event_proxy` | `CInfoGameEventProxy` (`server/world.cpp:163`) | 17 | 5 / 12 | 4 | 2 | 12 / 0 | Raises a game event — for the instructor hints and achievements. |
+| `logic_register_activator` | `CLogicRegisterActivator` (`server/logicentities.cpp:430`) | 7 | 7 / 0 | 2 |  | 20 / 20 | Remembers an activator to fire at later. Two maps. |
+| `logic_eventlistener` | `CLogicEventListener` (`server/logic_eventlistener.cpp:15`) | 6 | 0 / 6 | 0 |  | 4 / 8 | Fires on a game event. Co-op only. |
+| `logic_random_outputs` | `CLogicRandomOutputs` (`server/logic_random_outputs.cpp:21`) | 2 | 1 / 1 | 1 |  | 3 / 10 | Fires a random subset of its outputs. |
+| `logic_collision_pair` | `CLogicCollisionPair` (`server/logicentities.cpp:3019`) | 2 | 2 / 0 | 1 |  | 0 / 0 | Disables collision between two physics objects. |
+| `math_remap` | `CMathRemap` (`server/logicentities.cpp:1036`) | 1 | 1 / 0 | 1 |  | 0 / 0 | Linear remap of a value. One entity. |
+
+#### Level flow — 11 classnames, 529 entities
+
+Leaving one map for the next, and saving on the way.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `logic_autosave` | `CLogicAutosave` (`server/logicentities.cpp:2778`) | 85 | 81 / 4 | 61 |  | 57 / 0 | Saves on an input. No save system. |
+| `point_changelevel` | **none** | 62 | 62 / 0 | 62 | 1 | 0 / 0 | Portal 2's level transition, reconstructed rather than `trigger_changelevel`. One per SP map, and with it the elevator ride out. |
+| `trigger_transition` | `CTriggerVolume` (`server/triggers.cpp:1296`) | 62 | 62 / 0 | 62 | 1 | 0 / 0 | Marks what carries across a level change. |
+| `info_landmark_entry` | **none** | 62 | 62 / 0 | 61 |  | 0 / 0 | Where the player arrives from the previous map. |
+| `info_landmark_exit` | **none** | 62 | 62 / 0 | 61 | 1 | 0 / 0 | Where the player leaves for the next one. |
+| `trigger_autosave` | `CTriggerSave` (`server/triggers.cpp:2987`) | 57 | 57 / 0 | 31 | 1 | 0 / 0 | Saves on touch. No save system. |
+| `logic_playmovie` | `CLogicPlayMovie` (`server/logic_playmovie.cpp:40`) | 53 | 3 / 50 | 3 | 1 | 50 / 8 | Plays a Bink movie — the level-transition movies. No video. |
+| `game_end` | `CGameEnd` (`server/maprules.cpp:425`) | 42 | 0 / 42 | 0 |  | 0 / 0 | Ends a co-op game. Co-op only. |
+| `info_teleport_destination` | `CPointEntity` (`server/triggers.cpp:2889`) | 41 | 41 / 0 | 40 | 1 | 0 / 0 | A bare position (`CPointEntity`) — but **41 `target`/`landmark` keys on `trigger_teleport`s name one**, `sp_a1_intro1`'s departure elevator among them. An unknown classname is not spawned, so each of those teleports finds no destination and prints a warning. The cheapest fix in this table. |
+| `info_landmark` | `CPointEntity` (`server/subs.cpp:65`) | 2 | 2 / 0 | 2 |  | 0 / 0 | The HL2-style landmark. Two maps, both `trigger_teleport` landmarks. |
+| `trigger_changelevel` | `CChangeLevel` (`server/triggers.cpp:1394`) | 1 | 1 / 0 | 1 |  | 0 / 0 | `CChangeLevel`. One entity. |
+
+#### Rendering — 28 classnames, 10,433 entities
+
+Each wants a renderer feature first — fog, sprites, particles, ropes, video — and the class is the small half.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `vgui_movie_display` | `CMovieDisplay` (`server/movie_display.cpp:99`) | 2,556 | 2,539 / 17 | 62 | 2 | 26 / 0 | The Aperture TV screens, playing Bink movies. The commonest classname missing, at 2,556 — but a video player is needed first. |
+| `env_fog_controller` | `CFogController` (`server/fogcontroller.cpp:31`) | 1,685 | 1,148 / 537 | 63 | 3 | 52 / 0 | The fog. 105 of the 106 maps place one; `CLAUDE.md`'s next-steps list already ranks fog. `SetFogController` at `!player` is 97 connections. |
+| `env_sprite_clientside` | `CSprite` (`shared/Sprite.cpp:30`) | 1,330 | 446 / 884 | 8 |  | 0 / 0 | A sprite the client spawns for itself from the entity lump; the server never sees one in the shipped game. |
+| `info_overlay_accessor` | `CInfoOverlayAccessor` (`server/info_overlay_accessor.cpp:40`) | 1,106 | 663 / 443 | 45 | 3 | 2 / 0 | Makes an `info_overlay` addressable so `env_texturetoggle` can switch its frame. |
+| `move_rope` | `CRopeKeyframe` (`server/rope.cpp:27`) | 640 | 587 / 53 | 47 | 26 | 26 / 0 | The start of a rope. 26 on `sp_a1_intro1` — the cables. |
+| `info_particle_system` | `CParticleSystem` (`server/particle_system.cpp:134`) | 602 | 450 / 152 | 37 | 6 | 711 / 0 | A particle effect. There is no particle system; 711 connections. |
+| `env_sprite` | `CSprite` (`shared/Sprite.cpp:157`) | 601 | 344 / 257 | 20 | 2 | 509 / 0 | A camera-facing sprite. 509 connections. |
+| `keyframe_rope` | `CRopeKeyframe` (`server/rope.cpp:28`) | 564 | 509 / 55 | 44 | 25 | 21 / 0 | A rope segment. 25 on `sp_a1_intro1`. |
+| `env_projectedtexture` | `CEnvProjectedTexture` (`server/env_projectedtexture.cpp:15`) | 316 | 216 / 100 | 58 | 4 | 491 / 0 | A flashlight-style projected shadowed light. 491 connections, mostly `TurnOn`. |
+| `beam_spotlight` | `CBeamSpotlight` (`server/beamspotlight.cpp:74`) | 303 | 212 / 91 | 12 |  | 13 / 0 | A volumetric beam light. |
+| `env_texturetoggle` | `CTextureToggle` (`server/env_texturetoggle.cpp:25`) | 262 | 105 / 157 | 45 | 1 | 519 / 0 | Switches a brush or overlay's `$frame`. 513 `SetTextureIndex` — the signs and the chamber-number displays. |
+| `shadow_control` | `CShadowControl` (`server/shadowcontrol.cpp:46`) | 108 | 63 / 45 | 62 | 1 | 0 / 0 | The map's shadow direction and colour. One per map; it only reaches the client. |
+| `func_illusionary` | `CFuncIllusionary` (`server/bmodels.cpp:376`) | 106 | 92 / 14 | 21 | 1 | 0 / 0 | A drawn, non-solid brush. Its brush is left drawn in place, which is its whole behaviour; 25 `func_areaportalwindow`s name one as the brush to draw when faded. |
+| `vgui_screen` | `CVGuiScreen` (`server/vguiscreen.cpp:30`) | 96 | 44 / 52 | 42 | 1 | 290 / 0 | An in-world VGUI panel — the elevator-shaft screens. |
+| `water_lod_control` | `CWaterLODControl` (`server/WaterLODControl.cpp:44`) | 44 | 20 / 24 | 20 |  | 0 / 0 | Water LOD distances. Client-only data. |
+| `point_spotlight` | `CPointSpotlight` (`server/point_spotlight.cpp:110`) | 40 | 30 / 10 | 11 |  | 14 / 0 | A spotlight with a visible cone. |
+| `func_monitor` | `CFuncMonitor` (`server/hl2/Func_Monitor.cpp:44`) | 24 | 24 / 0 | 13 |  | 38 / 0 | A screen showing a `point_camera`'s view. |
+| `point_camera` | `CPointCamera` (`server/point_camera.cpp:37`) | 14 | 14 / 0 | 14 |  | 28 / 0 | The camera a `func_monitor` shows. |
+| `color_correction` | `CColorCorrection` (`server/colorcorrection.cpp:19`) | 9 | 6 / 3 | 4 |  | 9 / 0 | A colour-correction lookup. |
+| `env_lightglow` | `CLightGlow` (`server/lightglow.cpp:65`) | 6 | 6 / 0 | 5 |  | 0 / 0 | A light halo. |
+| `postprocess_controller` | `CPostProcessController` (`server/postprocesscontroller.cpp:31`) | 5 | 4 / 1 | 3 |  | 0 / 0 | Post-processing parameters. |
+| `func_wall` | `CFuncWall` (`server/bmodels.cpp:36`) | 5 | 5 / 0 | 2 | 1 | 3 / 0 | A drawn, solid brush. Left in place. One on `sp_a1_intro1` — `glass_floor_brush`. |
+| `light_dynamic` | `CDynamicLight` (`server/dynamiclight.cpp:49`) | 3 | 3 / 0 | 1 |  | 11 / 0 | A dynamic light. One map. |
+| `material_modify_control` | `CMaterialModifyControl` (`server/MaterialModifyControl.cpp:68`) | 2 | 2 / 0 | 2 |  | 1 / 0 | Animates a material parameter. |
+| `infodecal` | `CDecal` (`server/world.cpp:219`) | 2 | 2 / 0 | 1 |  | 0 / 0 | A decal placed at load. Two entities. |
+| `info_lighting_relative` | `CInfoLightingRelative` (`server/baseanimating.cpp:86`) | 2 | 2 / 0 | 1 |  | 1 / 0 | Lights a model as though it stood at another entity's position. Two, on one map. |
+| `fog_volume` | `CFogVolume` (`server/fogvolume.cpp:17`) | 1 | 1 / 0 | 1 |  | 0 / 0 | A brush that switches fog controllers. One entity. |
+| `color_correction_volume` | `CColorCorrectionVolume` (`server/colorcorrectionvolume.cpp:67`) | 1 | 1 / 0 | 1 |  | 0 / 0 | The brush that switches one. |
+
+#### Sound, HUD, camera and effects — 28 classnames, 4,216 entities
+
+Mostly waiting on a subsystem this port has not got: sound, a HUD, particles.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `ambient_generic` | `CAmbientGeneric` (`server/ambientgeneric.cpp:88`) | 1,910 | 1,081 / 829 | 64 | 36 | 2,145 / 0 | A sound. 1,881 `PlaySound` connections. No sound system. |
+| `env_soundscape` | `CEnvSoundscape` (`server/soundscape.cpp:71`) | 1,102 | 800 / 302 | 63 | 19 | 60 / 0 | The ambient soundscape for a region. No sound system. |
+| `env_fade` | `CEnvFade` (`server/EnvFade.cpp:53`) | 327 | 124 / 203 | 63 | 5 | 331 / 0 | Fades the screen. 326 `Fade` connections. |
+| `game_text` | `CGameText` (`server/maprules.cpp:553`) | 244 | 202 / 42 | 62 | 3 | 6 / 0 | Text on screen. No HUD. |
+| `env_spark` | `CEnvSpark` (`server/EnvSpark.cpp:83`) | 162 | 135 / 27 | 32 | 2 | 140 / 0 | Sparks. Particles and sound. |
+| `env_shake` | `CEnvShake` (`server/EnvShake.cpp:91`) | 148 | 127 / 21 | 40 | 5 | 204 / 1 | Screen shake. 190 `StartShake`. |
+| `point_viewcontrol_multiplayer` | `CTriggerCameraMultiplayer` (`server/triggers.cpp:4302`) | 68 | 0 / 68 | 0 |  | 196 / 0 | The co-op camera. Co-op only. |
+| `env_splash` | `CEnvSplash` (`server/effects.cpp:2045`) | 57 | 31 / 26 | 2 |  | 23 / 0 | Water splashes. |
+| `env_shooter` | `CEnvShooter` (`server/effects.cpp:683`) | 50 | 50 / 0 | 9 |  | 21 / 0 | Throws gibs. |
+| `trigger_look` | `CTriggerLook` (`server/triggers.cpp:1063`) | 41 | 40 / 1 | 20 | 2 | 15 / 88 | Fires when the player looks at a target for a time. 69 `OnTrigger`, two on `sp_a1_intro1`. Needs only the player's eye and view angles, which the server already has. |
+| `env_instructor_hint` | `CEnvInstructorHint` (`server/env_instructor_hint.cpp:56`) | 25 | 16 / 9 | 11 | 5 | 48 / 0 | A game-instructor hint ("press E to pick up"). No HUD. |
+| `env_fire` | `CFire` (`server/fire.cpp:574`) | 19 | 19 / 0 | 2 |  | 0 / 0 | Fire. Two maps. |
+| `env_wind` | `CEnvWind` (`server/effects.cpp:1644`) | 13 | 13 / 0 | 11 | 1 | 0 / 0 | Wind, for ropes and particles. |
+| `point_viewcontrol` | `CTriggerCamera` (`server/triggers.cpp:3259`) | 8 | 6 / 2 | 5 | 2 | 27 / 0 | Takes the player's camera. Two on `sp_a1_intro1`. |
+| `env_hudhint` | `CEnvHudHint` (`server/EnvHudHint.cpp:36`) | 6 | 6 / 0 | 2 | 4 | 7 / 0 | A hint on the HUD. No HUD. |
+| `env_viewpunch` | `CEnvViewPunch` (`server/effects.cpp:2889`) | 5 | 5 / 0 | 1 |  | 3 / 0 | Kicks the view. One map. |
+| `env_ar2explosion` | **none** | 5 | 5 / 0 | 3 | 3 | 3 / 0 | An AR2 explosion cloud, visual only. No source here; on `sp_a1_intro1`. |
+| `point_viewproxy` | `CTriggerViewProxy` (`server/triggers.cpp:4490`) | 5 | 5 / 0 | 4 | 2 | 8 / 0 | Draws the player's view from somewhere else while moving the player with it. Two on `sp_a1_intro1`. |
+| `env_microphone` | `CEnvMicrophone` (`server/envmicrophone.cpp:34`) | 4 | 4 / 0 | 3 |  | 1 / 0 | Relays sounds. No sound system. |
+| `player_speedmod` | `CMovementSpeedMod` (`server/player.cpp:8085`) | 4 | 4 / 0 | 3 |  | 6 / 0 | Scales the player's movement. See the table above. |
+| `env_explosion` | `CEnvExplosion` (`server/explode.cpp:132`) | 3 | 3 / 0 | 3 |  | 3 / 0 | An explosion: damage and a push. |
+| `player_weaponstrip` | `CStripWeapons` (`server/player.cpp:7916`) | 2 | 2 / 0 | 2 |  | 2 / 0 | Takes the player's weapons. |
+| `trigger_weapon_strip` | **none** | 2 | 2 / 0 | 2 |  | 1 / 0 | Takes the player's weapons on touch. |
+| `point_anglesensor` | `CPointAngleSensor` (`server/pointanglesensor.cpp:70`) | 2 | 1 / 1 | 1 |  | 1 / 5 | Fires when an entity faces a target. |
+| `env_soundscape_proxy` | `CEnvSoundscapeProxy` (`server/soundscape.cpp:24`) | 1 | 1 / 0 | 1 |  | 0 / 0 | Another soundscape's region. One entity. |
+| `info_target_instructor_hint` | `CInfoInstructorHintTarget` (`server/env_instructor_hint.cpp:216`) | 1 | 1 / 0 | 1 |  | 0 / 0 | The target an instructor hint points at. |
+| `func_smokevolume` | `CFuncSmokeVolume` (`server/func_smokevolume.cpp:81`) | 1 | 0 / 1 | 0 |  | 0 / 0 | A brush filled with smoke particles. Co-op only. |
+| `trigger_gravity` | `CTriggerGravity` (`server/triggers.cpp:3065`) | 1 | 0 / 1 | 0 |  | 0 / 0 | Scales gravity inside it. Co-op only. |
+
+#### Physics — 18 classnames, 1,110 entities
+
+`CPhysicsProp` exists (it is `prop_weighted_cube`'s base); constraints do not.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `func_clip_vphysics` | `CFuncVPhysicsClip` (`server/bmodels.cpp:1439`) | 505 | 376 / 129 | 53 | 8 | 286 / 3 | A brush only physics objects collide with — the one in each chamber doorway. 276 `Enable`/`Disable`. |
+| `prop_physics_override` | `CPhysicsProp` (`server/props.cpp:2685`) | 138 | 130 / 8 | 14 | 3 | 16 / 23 | The same, allowed to override the model's `prop_data`. Three on `sp_a1_intro1` (the radio and the clipboard). |
+| `prop_physics` | `CPhysicsProp` (`server/props.cpp:2684`) | 132 | 128 / 4 | 18 |  | 10 / 0 | A physics prop — `CPhysicsProp`, which `prop_weighted_cube` already is. The simulation is there; the class is not. |
+| `func_physbox` | `CPhysBox` (`server/physobj.cpp:375`) | 89 | 87 / 2 | 17 |  | 94 / 71 | A brush that simulates. 62 implemented entities are parented to one. |
+| `env_physexplosion` | `CPhysExplosion` (`server/physobj.cpp:893`) | 65 | 64 / 1 | 11 |  | 65 / 0 | A push on nearby physics objects. |
+| `func_breakable` | `CBreakable` (`server/func_break.cpp:102`) | 42 | 42 / 0 | 11 |  | 18 / 72 | A breakable brush. 70 `OnBreak`. |
+| `phys_hinge` | `CPhysHinge` (`server/physconstraint.cpp:968`) | 37 | 37 / 0 | 7 | 1 | 36 / 0 | A hinge constraint. No constraints. |
+| `phys_ballsocket` | `CPhysBallSocket` (`server/physconstraint.cpp:1116`) | 31 | 31 / 0 | 5 |  | 19 / 0 | A ball-and-socket constraint. |
+| `phys_constraint` | `CPhysFixed` (`server/physconstraint.cpp:1409`) | 29 | 27 / 2 | 6 |  | 29 / 1 | A fixed constraint. |
+| `env_physimpact` | `CPhysImpact` (`server/physobj.cpp:1155`) | 17 | 17 / 0 | 5 |  | 31 / 0 | A single impulse. |
+| `phys_ragdollconstraint` | `CRagdollConstraint` (`server/physconstraint.cpp:1679`) | 9 | 9 / 0 | 3 |  | 2 / 0 | A ragdoll constraint. |
+| `point_push` | **none** | 5 | 4 / 1 | 1 |  | 9 / 0 | Pushes physics objects in a radius. No source here. |
+| `phys_lengthconstraint` | `CPhysLength` (`server/physconstraint.cpp:1598`) | 4 | 4 / 0 | 4 |  | 1 / 0 | A length constraint. |
+| `phys_constraintsystem` | `CPhysConstraintSystem` (`server/physconstraint.cpp:170`) | 2 | 2 / 0 | 2 |  | 0 / 0 | Groups constraints for the solver. |
+| `phys_spring` | `CPhysicsSpring` (`server/physobj.cpp:92`) | 2 | 2 / 0 | 1 | 2 | 2 / 0 | A spring between two bodies. Two on `sp_a1_intro1`. |
+| `prop_ragdoll` | `CRagdollProp` (`server/physics_prop_ragdoll.cpp:56`) | 1 | 1 / 0 | 1 |  | 3 / 0 | A ragdoll. No ragdolls. |
+| `phys_motor` | `CPhysMotor` (`server/phys_controller.cpp:651`) | 1 | 1 / 0 | 1 |  | 2 / 0 | Drives a body round an axis. |
+| `game_gib_manager` | `CGameGibManager` (`shared/props_shared.cpp:835`) | 1 | 1 / 0 | 1 |  | 0 / 0 | Caps the number of gibs. |
+
+#### Trains and other movers — 6 classnames, 91 entities
+
+The last of the movers. `func_tracktrain` and `path_track` (1,697 entities) were
+the head of this table and the biggest silent breakage in it; they have landed.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `func_tank` | `CFuncTankGun` (`server/func_tank.cpp:2273`) | 37 | 35 / 2 | 18 | 2 | 137 / 0 | A mounted gun — the finale's turrets. 122 `SetTargetEntity`. |
+| `path_corner` | `CPathCorner` (`server/pathcorner.cpp:36`) | 26 | 23 / 3 | 11 | 3 | 0 / 0 | A node on an NPC's or a platform's path. |
+| `func_tanktrain` | `CFuncTankTrain` (`server/tanktrain.cpp:57`) | 20 | 0 / 20 | 0 |  | 58 / 40 | A drivable tank train. Co-op only. |
+| `prop_vehicle_choreo_generic` | `CPropVehicleChoreoGeneric` (`server/vehicle_choreo_generic.cpp:262`) | 5 | 5 / 0 | 2 |  | 40 / 0 | A vehicle the player is locked into for a scene — the Wheatley rides. |
+| `func_rot_button` | `CRotButton` (`server/buttons.cpp:856`) | 2 | 2 / 0 | 2 |  | 2 / 20 | A rotating button. `CBaseButton`'s `m_fRotating` branch is its. |
+| `momentary_rot_button` | `CMomentaryRotButton` (`server/buttons.cpp:987`) | 1 | 1 / 0 | 1 |  | 0 / 0 | A wheel the player turns. |
+
+#### AI — 5 classnames, 166 entities
+
+`portdocs/SERVER.md` §1.5: 122,298 lines for 293 entities.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `info_node` | `CNodeEnt` (`server/ai_initutils.cpp:30`) | 113 | 69 / 44 | 61 | 1 | 0 / 0 | An AI navigation node. Removes itself in `Spawn` once the node graph has it. |
+| `npc_bullseye` | **none** | 44 | 44 / 0 | 13 |  | 3 / 1 | An invisible AI target, for the turrets. No source here. |
+| `ai_relationship` | `CAI_Relationship` (`server/ai_relationship.cpp:79`) | 5 | 5 / 0 | 3 |  | 1 / 0 | Sets how NPCs feel about each other. |
+| `ai_addon_builder` | **none** | 3 | 3 / 0 | 2 |  | 0 / 0 | No source here, and absent from the four shipped `.fgd` files as well. |
+| `npc_enemyfinder` | **none** | 1 | 1 / 0 | 1 |  | 3 / 0 | An AI helper that finds enemies. No source here. |
+
+#### Co-op — 5 classnames, 1,085 entities
+
+Co-op's own mechanics. Fourteen classnames in this census have no single-player placement at all — these five, plus `logic_compare`, `logic_eventlistener`, `game_end`, `func_tanktrain`, `prop_floor_cube_button`, `prop_floor_ball_button`, `func_smokevolume`, `trigger_gravity` and `point_viewcontrol_multiplayer`.
+
+| classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `trigger_playerteam` | **none** | 645 | 0 / 645 | 0 |  | 598 / 1,999 | A trigger with a different output per co-op player. 1,999 outgoing connections. |
+| `logic_coop_manager` | `CLogicCoopManager` (`server/logicentities.cpp:286`) | 291 | 0 / 291 | 0 |  | 916 / 1,469 | Two-state AND/OR logic for the two co-op players. 1,469 outgoing connections. |
+| `info_coop_spawn` | **none** | 127 | 0 / 127 | 0 |  | 350 / 0 | A co-op spawn point. |
+| `trigger_ping_detector` | **none** | 20 | 0 / 20 | 0 |  | 0 / 20 | Fires when a co-op player pings inside it. |
+| `info_player_ping_detector` | **none** | 2 | 0 / 2 | 0 |  | 4 / 2 | Fires when a co-op player pings it. |
 
 ---
 
@@ -3076,6 +3471,14 @@ case values.
 | `tests::a_mover_carries_what_is_parented_to_it` | the whole point: a rider ends up where its platform put it |
 | `tests::set_parent_and_clear_parent_leave_the_entity_where_it_is` | both inputs |
 | `tests::removing_a_parent_removes_everything_under_it` | `UpdateOnRemove`'s orphan sweep |
+| `tests::path_tracks_link_both_ways_at_activate` | `CPathTrack::Link` and `SetPrevious` |
+| `tests::a_train_runs_its_path_passing_every_node_and_stops_at_the_end` | `Find`, `Next`, the turn at a corner, `OnPass` once per node, `DeadEnd` |
+| `tests::move_to_path_node_stops_on_the_node_it_was_sent_to` | `MoveToPathNode`, `OnArrivedAtDestinationNode`, gotcha 95's coast |
+| `tests::a_train_carries_what_is_parented_to_it` | a `speed` key starts a train by itself; a rider keeps its offset |
+| `tests::a_teleport_node_jumps_the_train_across_the_gap` | `SF_PATH_TELEPORT` |
+| `tests::a_disabled_node_is_a_dead_end_for_a_moving_train` | `DisablePath`, `ValidPath`, and `DeadEnd` firing the last `InPass` |
+| `tests::every_shipped_train_finds_its_track` (depot) | 229 of 233 trains on their first node after one tick; gotchas 96 and 97 |
+| `tests::sp_a1_intro1_departure_elevator_runs_its_shaft_and_loops` (depot) | a real looped path, the teleport back to the top, and a rider that never slides off |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
 | `entity::a_handle_to_a_removed_entity_stops_resolving` | gotcha 10 |
@@ -3281,10 +3684,10 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 35,337 matched, 65
-created, 28,465 spawned, 6,937 lights deleted, 213 kept, 54,631 connections,
-155 unimplemented classnames, the full 49-name unhandled-key table, 5,787
-events dispatched, 5,043 inputs accepted, 7,318 thinks, 1,025 events that found
+server time**, and asserts exact totals: 60,925 blocks, 37,034 matched, 65
+created, 30,162 spawned, 6,937 lights deleted, 213 kept, 55,724 connections,
+153 unimplemented classnames, the full 49-name unhandled-key table, 6,510
+events dispatched, 5,735 inputs accepted, 15,618 thinks, 1,073 events that found
 no target, zero bad conversions, the **six**-name unhandled-input table, a peak
 of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
@@ -4688,3 +5091,55 @@ it. `PlayerState` grew `wish_velocity` to carry the one number the shove is
 allowed to use. What is still missing is `CGrabController`: you cannot pick a
 cube up, which is the other half of every cube puzzle in the game.
 `rustdocs/VPHYSICS.md` §7 is the list it now heads.
+
+### Trains — `func_tracktrain` and `path_track`
+
+`src/server/classes/train.rs`: `CFuncTrackTrain` (`trains.cpp:1078-2823`) and
+`CPathTrack` (all of `pathtrack.cpp`). **233 trains on 1,464 nodes across 64
+maps**, and the class the census of unported classnames put second, for a
+reason that had nothing to do with trains: **1,290 implemented entities named a
+`func_tracktrain` as their `parentname`** — 1,138 of them props — and an
+unknown classname is not spawned, so every one of them rode nothing. The
+transform pair and the pusher were already there, so a train is a velocity and
+an angular velocity recomputed once a tick; everything that rides it follows
+through `hierarchy`, and whatever it shoves goes through `push`.
+
+What it changed in the depot census (`every_shipped_map_spawns_its_entities`):
+brush entities that end up away from their spawn placement went from 106 to
+**326**, the ones carried by a parent from 52 to **133**, and the longest
+carried ride from 539 units to **7,837** — `sp_a3_00`'s shaft depth signs,
+which `Find` snaps from where they were drawn onto their track. **162 of the
+230 trains that name a node are drawn more than a unit away from it**, so most
+of the new movement in the first two seconds is that snap rather than travel.
+2,117 triggers now dispatch something, up from 1,889: their connections go to
+trains and nodes.
+
+Four findings, all written down as gotchas 95-97 or as divergences:
+
+- **The train steers by a point a tenth of a second ahead** and arrives early
+  (gotcha 95). It is why a stopping train coasts, why the last node on a path
+  is passed by `DeadEnd` rather than by `Next`, and why a looped elevator
+  turns round short of its bottom node.
+- **A node's `speed` starts a train that has no controls**, even in `Find`
+  (gotcha 96). One shipped map guards against it with an `OnPass → Stop` on
+  the first node.
+- **Three shipped trains name a `target` that no entity has**, and one of them
+  is on the default map: `sp_a1_intro1`'s `@container_train` has *no nodes at
+  all* in the shipped `.bsp`, so the four relays that `MoveToPathNode` it name
+  nodes that do not exist. The crane it would drive never moved in the shipped
+  game either. The census of unported classnames had listed it as something the
+  port was missing; it was Valve's content that was.
+- **`mp_coop_credits` loses 57 props in its first two seconds**, and that is
+  correct: 31 of its trains `Kill` themselves when their last node fires
+  `FireUser2` at them, and the props riding them go too. The prop census's
+  animation and skinning totals fell by exactly those props, which was checked
+  by rerunning it with that one map left out, before and after.
+
+What is not here is listed at the top of `train.rs`: sound, player controls
+(`func_traincontrols`, placed by no shipped map), the `vphysics` friction
+snapshot an unblockable train uses to find a physics blocker, `NearestPath`
+(restore only), `ScriptGetFuturePosition` (VScript) and the alternate-ticks
+velocity doubling. **Most shipped trains are started by VScript or by a
+choreographed scene**, neither of which exists — `sp_a1_intro1`'s departure
+elevator is `RunScriptCode StartMoving()` — so a train that works here can
+still sit still in the running game until those do.

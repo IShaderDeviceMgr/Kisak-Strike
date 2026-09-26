@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty classnames, 35,337 of the shipped game's 60,925 entity blocks.**
-//! Five of the 50 are placed by no map: `player` (the engine makes it when a
+//! **Fifty-two classnames, 37,034 of the shipped game's 60,925 entity blocks.**
+//! Five of the 52 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **45 of
+//! `light_glspot`, each registered because Valve registers it — so **47 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -38,7 +38,9 @@
 //! the rarest** — 7 in the whole game, one each on the seven maps with a 3D
 //! skybox — and it is here for the reason `logic_playerproxy` is: it is the
 //! *whole* of a feature's input, and one of the seven is on `sp_a1_intro1`.
-//! See `portdocs/ENGINE_WORLD_SKY.md`.
+//! See `portdocs/ENGINE_WORLD_SKY.md`. **`func_tracktrain` and `path_track`**
+//! (233 and 1,464) came after it, for what they carry rather than for
+//! themselves: 1,290 implemented entities name a train as their parent.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -64,6 +66,7 @@ pub mod point;
 pub mod portal;
 pub mod prop;
 pub mod sky;
+pub mod train;
 pub mod trigger;
 pub mod world;
 
@@ -83,6 +86,7 @@ pub use player::{
 pub use point::PointTeleport;
 pub use portal::PropPortal;
 pub use sky::SkyCamera;
+pub use train::{PathTrack, TrackTrain};
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
 pub use world::World;
@@ -242,6 +246,23 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: BUTTON_INPUTS,
         outputs: brush::BUTTON_OUTPUTS,
         create: Button::create,
+    },
+    // `CFuncTrackTrain` (`trains.cpp:1148`) and the `CPathTrack` chain it
+    // follows (`pathtrack.cpp:45`) — 233 trains on 1,464 nodes, and the
+    // `parentname` of 1,290 other entities. See `train.rs`.
+    ClassDef {
+        name: "func_tracktrain",
+        keys: train::TRACK_TRAIN_KEYS,
+        inputs: train::TRACK_TRAIN_INPUTS,
+        outputs: train::TRACK_TRAIN_OUTPUTS,
+        create: TrackTrain::create,
+    },
+    ClassDef {
+        name: "path_track",
+        keys: train::PATH_TRACK_KEYS,
+        inputs: train::PATH_TRACK_INPUTS,
+        outputs: train::PATH_TRACK_OUTPUTS,
+        create: PathTrack::create,
     },
     ClassDef {
         name: "func_rotating",

@@ -145,8 +145,60 @@ pub fn vector_angles(forward: Vec3, pseudo_up: Vec3) -> Vec3 {
     }
 }
 
+/// `VectorAngles( forward, angles )` (`mathlib/mathlib_base.cpp:1110`) — the
+/// one-argument form: a direction's pitch and yaw, with no roll.
+///
+/// It is not [`vector_angles`] with a default up, and two differences are
+/// visible to a caller:
+///
+/// - **Both angles come back in `[0, 360)`, not `(-180, 180]`.** A direction
+///   10° below the horizon is pitch `10`, and 10° above it is `350`. Any
+///   caller that subtracts two of these has to go through an angle-distance
+///   function, which is why `func_tracktrain` runs every one through
+///   `FixupAngles` before comparing it with anything.
+/// - **Straight up is pitch `270` and straight down is `90`**, with yaw `0`:
+///   the vertical case is a special case, not a limit.
+pub fn vector_angles_forward(forward: Vec3) -> Vec3 {
+    if forward.y == 0.0 && forward.x == 0.0 {
+        let pitch = match forward.z > 0.0 {
+            true => 270.0,
+            false => 90.0,
+        };
+        return Vec3::new(pitch, 0.0, 0.0);
+    }
+    let mut yaw = forward.y.atan2(forward.x).to_degrees();
+    if yaw < 0.0 {
+        yaw += 360.0;
+    }
+    let xy = (forward.x * forward.x + forward.y * forward.y).sqrt();
+    let mut pitch = (-forward.z).atan2(xy).to_degrees();
+    if pitch < 0.0 {
+        pitch += 360.0;
+    }
+    Vec3::new(pitch, yaw, 0.0)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The one-argument `VectorAngles` keeps both angles in `[0, 360)`, and
+    /// what it returns still points the way it was asked to.
+    #[test]
+    fn vector_angles_forward_is_positive_and_inverts_angle_vectors() {
+        assert_eq!(vector_angles_forward(Vec3::Z), Vec3::new(270.0, 0.0, 0.0));
+        assert_eq!(vector_angles_forward(-Vec3::Z), Vec3::new(90.0, 0.0, 0.0));
+        let down_left = vector_angles_forward(Vec3::new(0.0, -1.0, -1.0));
+        assert!((down_left - Vec3::new(45.0, 270.0, 0.0)).length() < 1e-4);
+        for dir in [
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(-4.0, 0.5, -1.0),
+            Vec3::new(0.0, -1.0, 0.2),
+        ] {
+            let angles = vector_angles_forward(dir);
+            assert!((0.0..360.0).contains(&angles.x) && (0.0..360.0).contains(&angles.y));
+            let (forward, _, _) = angle_vectors(angles);
+            assert!((forward - dir.normalize()).length() < 1e-5, "{dir}: {forward}");
+        }
+    }
 
     /// [`angle_vectors`] must agree with the client's own spelled-out
     /// `AngleVectors`, or the carry direction and the view would disagree.
