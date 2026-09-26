@@ -180,7 +180,13 @@ pub struct Sequence {
     pub label: String, pub flags: u32, pub anim: usize,
     pub fade_out_time: f32,     // mstudioseqdesc_t::fadeouttime, in SECONDS
     pub bounds: (Vec3, Vec3),   // mstudioseqdesc_t::bbmin/bbmax, model space
+    pub events: Vec<Event>,     // numevents/eventindex, in file order
 }
+pub struct Event {              // mstudioevent_t
+    pub cycle: f32, pub event: i32, pub kind: u32,   // kind = AE_TYPE_* bits
+    pub options: String, pub name: String,           // name only for new-style events
+}
+impl Event { pub fn is_new_style(&self) -> bool; pub fn is_for_server(&self) -> bool; }
 pub struct BoneTrack { pub bone: usize, pub pos: Vec<Vec3>, pub rot: Vec<Quat> }
 pub struct Animation {
     pub name: String, pub fps: f32, pub flags: u32,

@@ -40,7 +40,7 @@ use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
 use super::movement::{MoveType, EF_NODRAW};
 use super::name;
 use super::random::RandomStream;
-use super::sequences::{Lookup, SequenceTable};
+use super::sequences::{AnimEvent, Lookup, SequenceTable};
 use super::think::{Time, TICK_NEVER_THINK};
 
 /// One input a class accepts. `DEFINE_INPUTFUNC( fieldType, "Name", handler )`.
@@ -501,6 +501,13 @@ impl<'a> Context<'a> {
     /// that name them exist.
     pub fn sequence(&self, model: &str, label: &str) -> Lookup {
         self.sequences.lookup(model, label)
+    }
+
+    /// The server's animation events on one sequence — what
+    /// `GetAnimationEvent` walks. Borrowed from the level's table rather than
+    /// from this context, so a caller can hold it across a `&mut` call.
+    pub fn sequence_events(&self, model: &str, label: &str) -> &'a [AnimEvent] {
+        self.sequences.events(model, label)
     }
 
     /// `CreateEntityByName` (`game/server/entitylist.cpp:206`) — a new entity,

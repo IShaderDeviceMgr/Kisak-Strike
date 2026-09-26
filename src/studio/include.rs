@@ -308,6 +308,7 @@ mod tests {
             fade_out_time: 0.2,
             bounds: (Vec3::ZERO, Vec3::ZERO),
             anim,
+            events: Vec::new(),
         }
     }
 

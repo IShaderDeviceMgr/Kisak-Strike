@@ -101,6 +101,26 @@ impl SequenceInfo {
     }
 }
 
+/// `SCRIPT_EVENT_FIRE_INPUT` (`scriptevent.h:28`) — "fires named input on the
+/// event handler". [`AnimEvent::options`] is the input's name.
+pub const SCRIPT_EVENT_FIRE_INPUT: i32 = 1100;
+
+/// One animation event the server is meant to see — `mstudioevent_t` after
+/// `GetAnimationEvent`'s client filter, reduced to what a handler reads.
+///
+/// Kept **beside** [`SequenceInfo`] rather than in it, so that the info stays
+/// `Copy`: nearly every sequence has no events, and the ones that do are read
+/// by one think.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimEvent {
+    /// Where along the sequence it fires, `0..=1`.
+    pub cycle: f32,
+    /// The old-style event number; see [`SCRIPT_EVENT_FIRE_INPUT`].
+    pub event: i32,
+    /// `pszOptions()`.
+    pub options: String,
+}
+
 /// What [`SequenceTable::lookup`] found. See the module docs for why there are
 /// three answers.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,6 +144,9 @@ pub enum Lookup {
 #[derive(Debug, Clone, Default)]
 pub struct SequenceTable {
     models: HashMap<String, HashMap<String, SequenceInfo>>,
+    /// The server's events, for the few sequences that have any — by the
+    /// same two folded keys.
+    events: HashMap<String, HashMap<String, Vec<AnimEvent>>>,
 }
 
 impl SequenceTable {
@@ -154,6 +177,27 @@ impl SequenceTable {
             Some(info) => Lookup::Found(*info),
             None => Lookup::Missing,
         }
+    }
+
+    /// Records one sequence's server events, in file order. An empty list is
+    /// not filed.
+    pub fn insert_events(&mut self, model: &str, label: &str, events: Vec<AnimEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.events
+            .entry(fold(model))
+            .or_default()
+            .insert(fold(label), events);
+    }
+
+    /// The server events of one sequence — empty for a sequence that has none,
+    /// and for one the table has never heard of.
+    pub fn events(&self, model: &str, label: &str) -> &[AnimEvent] {
+        self.events
+            .get(&fold(model))
+            .and_then(|labels| labels.get(&fold(label)))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// How many models the table describes. For the startup log.
@@ -236,6 +280,20 @@ mod tests {
             t.lookup("MODELS\\Props\\Portal_Button.mdl", "DOWN"),
             Lookup::Found(_)
         ));
+    }
+
+    #[test]
+    fn events_are_filed_beside_the_sequence_and_absent_elsewhere() {
+        let mut t = table();
+        let fire = AnimEvent {
+            cycle: 0.7,
+            event: SCRIPT_EVENT_FIRE_INPUT,
+            options: "fireuser4".to_owned(),
+        };
+        t.insert_events("models/props/portal_button.mdl", "down", vec![fire.clone()]);
+        assert_eq!(t.events("MODELS\\props\\portal_button.mdl", "Down"), &[fire]);
+        assert!(t.events("models/props/portal_button.mdl", "spin").is_empty());
+        assert!(t.events("models/props/never_loaded.mdl", "down").is_empty());
     }
 
     #[test]

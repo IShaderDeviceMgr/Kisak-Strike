@@ -56,6 +56,9 @@ pub(super) const BONE_STRIDE: usize = 216;
 pub(super) const SEQUENCE_STRIDE: usize = 212;
 /// `sizeof(mstudioanimdesc_t)` (`studio.h:1040`).
 pub(super) const ANIM_DESC_STRIDE: usize = 100;
+/// `sizeof(mstudioevent_t)` (`studio.h:690`) — `cycle`, `event`, `type`,
+/// `options[64]` and `szeventindex`.
+pub(super) const EVENT_STRIDE: usize = 80;
 /// `sizeof(mstudioattachment_t)` (`studio.h:706`) — three ints, a
 /// `matrix3x4_t` and `unused[8]`.
 pub(super) const ATTACHMENT_STRIDE: usize = 92;
@@ -185,6 +188,57 @@ pub struct Sequence {
     /// this port loads has a 1x1 table**, so only entry zero is read and the
     /// pose-parameter machinery that would pick another is not written.
     pub anim: usize,
+    /// `numevents` / `eventindex` — what the sequence asks to have happen at
+    /// points along it, in file order.
+    pub events: Vec<Event>,
+}
+
+/// One animation event. `mstudioevent_t` (`studio.h:690`).
+///
+/// Most of the game's are the client's — 8,229 `AE_CL_PLAYSOUND` and 407
+/// particle effects — and nothing here plays either. **The ones that matter
+/// are the 190 `SCRIPT_EVENT_FIRE_INPUT`s**, every one a `FireUser1`-`4`,
+/// because those are how an animation reaches the map's I/O: the
+/// `sp_a1_intro1` container hitting the wall is three of them, and the third
+/// opens the areaportal behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// Where along the sequence it fires, `0..=1`.
+    pub cycle: f32,
+    /// The old-style event number — `SCRIPT_EVENT_FIRE_INPUT` is 1100. A
+    /// new-style event ([`is_new_style`](Event::is_new_style)) is named by
+    /// [`name`](Event::name) instead and this is 0.
+    pub event: i32,
+    /// `type` — the `AE_TYPE_*` bits (`eventlist.h:14`).
+    pub kind: u32,
+    /// `options[64]` — for a fire-input event, the input's name.
+    pub options: String,
+    /// `szeventindex` — the new-style event's name, `""` for an old one.
+    pub name: String,
+}
+
+/// `AE_TYPE_SERVER` (`eventlist.h:14`).
+const AE_TYPE_SERVER: u32 = 1 << 0;
+/// `AE_TYPE_NEWEVENTSYSTEM` (`eventlist.h:21`).
+const AE_TYPE_NEWEVENTSYSTEM: u32 = 1 << 10;
+/// `EVENT_CLIENT` (`npcevent.h:73`) — old-style numbers at or above this are
+/// the client's.
+const EVENT_CLIENT: i32 = 5000;
+
+impl Event {
+    pub fn is_new_style(&self) -> bool {
+        self.kind & AE_TYPE_NEWEVENTSYSTEM != 0
+    }
+
+    /// Whether the server is meant to see it — `GetAnimationEvent`'s filter
+    /// (`animation.cpp:911`): a new-style event only with `AE_TYPE_SERVER`,
+    /// an old-style one only below [`EVENT_CLIENT`].
+    pub fn is_for_server(&self) -> bool {
+        match self.is_new_style() {
+            true => self.kind & AE_TYPE_SERVER != 0,
+            false => self.event < EVENT_CLIENT,
+        }
+    }
 }
 
 /// One bone's channel within an animation, expanded to one value per frame.
@@ -376,9 +430,36 @@ pub(super) fn parse_sequences(
             fade_out_time: r.f32(at + 108)?,
             bounds,
             anim,
+            events: parse_events(r, at)?,
         });
     }
     Ok(sequences)
+}
+
+/// One sequence's events — `numevents` / `eventindex` at 24 / 28 of its
+/// `mstudioseqdesc_t`, the index relative to the descriptor.
+fn parse_events(r: &Reader, seq_at: usize) -> Result<Vec<Event>, StudioError> {
+    let count = r.count(seq_at + 24, "mstudioseqdesc_t::numevents")?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let base = r.relative_offset(seq_at + 28, seq_at, "mstudioseqdesc_t::eventindex")?;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = base + i * EVENT_STRIDE;
+        let name = match r.i32(at + 76)? {
+            0 => String::new(),
+            _ => r.c_string(r.relative_offset(at + 76, at, "mstudioevent_t::szeventindex")?)?,
+        };
+        events.push(Event {
+            cycle: r.f32(at)?,
+            event: r.i32(at + 4)?,
+            kind: r.u32(at + 8)?,
+            options: r.fixed_string(at + 12, 64),
+            name,
+        });
+    }
+    Ok(events)
 }
 
 /// Reads and expands the animations. `numlocalanim` / `localanimindex` at

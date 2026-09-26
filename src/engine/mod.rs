@@ -1357,27 +1357,42 @@ fn portals(server: &Server, curtime: f32) -> Vec<world::portals::Portal> {
 /// translation, which is the only line in the port that names both types.
 fn group_sequences<'a>(
     rows: impl Iterator<Item = world::entities::SequenceRow<'a>>,
-) -> Vec<(
-    String,
-    Vec<(String, crate::server::sequences::SequenceInfo)>,
-)> {
-    let mut out: Vec<(
-        String,
-        Vec<(String, crate::server::sequences::SequenceInfo)>,
-    )> = Vec::new();
+) -> Vec<(String, Vec<GroupedSequence>)> {
+    let mut out: Vec<(String, Vec<GroupedSequence>)> = Vec::new();
     for row in rows {
         let info = crate::server::sequences::SequenceInfo {
             duration: row.duration,
             loops: row.loops,
             fade_out_time: row.fade_out_time,
         };
+        // `GetAnimationEvent`'s filter, applied once here instead of on every
+        // think: the client's events never reach the server's table.
+        let events = row
+            .events
+            .iter()
+            .filter(|event| event.is_for_server())
+            .map(|event| crate::server::sequences::AnimEvent {
+                cycle: event.cycle,
+                event: event.event,
+                options: event.options.clone(),
+            })
+            .collect();
+        let entry = (row.label.to_owned(), info, events);
         match out.iter_mut().find(|(name, _)| name == row.model) {
-            Some((_, labels)) => labels.push((row.label.to_owned(), info)),
-            None => out.push((row.model.to_owned(), vec![(row.label.to_owned(), info)])),
+            Some((_, labels)) => labels.push(entry),
+            None => out.push((row.model.to_owned(), vec![entry])),
         }
     }
     out
 }
+
+/// One sequence as [`group_sequences`] hands it over: label, info, and the
+/// server's events.
+type GroupedSequence = (
+    String,
+    crate::server::sequences::SequenceInfo,
+    Vec<crate::server::sequences::AnimEvent>,
+);
 
 /// The server's physics props, as something a [`trace::Tracer`] can sweep against —
 /// `CEngineTrace::ClipRayToVPhysics`, and the only implementation of
@@ -1842,7 +1857,12 @@ impl Level for Scene<'_> {
         // the game therefore has to cope with.
         let mut sequences = crate::server::sequences::SequenceTable::new();
         for (model, labels) in group_sequences(world.entity_models.sequences()) {
-            sequences.insert_model(&model, labels);
+            let mut infos = Vec::with_capacity(labels.len());
+            for (label, info, events) in labels {
+                sequences.insert_events(&model, &label, events);
+                infos.push((label, info));
+            }
+            sequences.insert_model(&model, infos);
         }
         if !sequences.is_empty() {
             eprintln!(

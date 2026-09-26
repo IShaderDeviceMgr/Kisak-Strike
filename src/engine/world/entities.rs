@@ -134,6 +134,9 @@ pub struct SequenceRow<'a> {
     pub duration: f32,
     pub loops: bool,
     pub fade_out_time: f32,
+    /// Every event the sequence carries, the client's included — which of
+    /// them the server sees is [`Event::is_for_server`](crate::studio::anim::Event::is_for_server).
+    pub events: &'a [crate::studio::anim::Event],
 }
 
 /// Whether a world-space box is drawn this frame.
@@ -638,6 +641,7 @@ impl EntityModels {
                     .unwrap_or(0.0),
                 loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
                 fade_out_time: sequence.fade_out_time,
+                events: &sequence.events,
             })
         })
     }

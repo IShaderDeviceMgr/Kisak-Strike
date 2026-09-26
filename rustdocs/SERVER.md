@@ -1028,12 +1028,17 @@ impl SequenceInfo {
 }
 pub enum Lookup { Unknown, Missing, Found(SequenceInfo) }
 
+pub const SCRIPT_EVENT_FIRE_INPUT: i32 = 1100;
+pub struct AnimEvent { pub cycle: f32, pub event: i32, pub options: String }
+
 pub struct SequenceTable { /* private */ }
 impl SequenceTable {
     pub fn new() -> SequenceTable;
     pub fn insert_model(&mut self, model: &str,
                         sequences: impl IntoIterator<Item = (String, SequenceInfo)>);
+    pub fn insert_events(&mut self, model: &str, label: &str, events: Vec<AnimEvent>);
     pub fn lookup(&self, model: &str, label: &str) -> Lookup;
+    pub fn events(&self, model: &str, label: &str) -> &[AnimEvent];   // empty if none
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
 }
@@ -1041,8 +1046,36 @@ impl SequenceTable {
 // Filled in once by the engine, after level_init:
 impl Server { pub fn set_sequences(&mut self, sequences: SequenceTable); }
 // Read by a class during a dispatch:
-impl Context<'_> { pub fn sequence(&self, model: &str, label: &str) -> Lookup; }
+impl<'a> Context<'a> {
+    pub fn sequence(&self, model: &str, label: &str) -> Lookup;
+    pub fn sequence_events(&self, model: &str, label: &str) -> &'a [AnimEvent];
+}
 ```
+
+**Animation events ride beside the info, not in it**, so `SequenceInfo` stays
+`Copy`. The table holds only the events the *server* is meant to see —
+`GetAnimationEvent`'s filter is applied once, by `engine::group_sequences`, via
+`studio::anim::Event::is_for_server`. In the shipped content that leaves the
+**190 `SCRIPT_EVENT_FIRE_INPUT`s, every one a `FireUser1`-`4`** (the other
+~8,600 events in the game are client sounds and particles).
+`DynamicProp::dispatch_anim_events` is the one reader. It is
+`DispatchAnimEvents` plus `CDynamicProp::HandleAnimEvent`: a half-open window
+from `m_flLastEventCheck` to the current cycle, wrapping on a loop, extended to
+1.01 once a non-looping sequence is finished, and **dispatched before
+`AnimThink` decides whether the sequence has ended**, because Valve's think
+dispatches after `StudioFrameAdvance` and this port's cycle is already the
+advanced one. The input is **posted** to the prop at zero delay rather than
+called, so it arrives at the queue's next service.
+
+This is load-bearing for **visibility**. `sp_a1_intro1`'s
+`breakable_exit_wall_areaportal` starts closed and is opened only by
+`Actor_container_master`'s `OnUser4` → `@exit_wall_hit_counter` →
+`exit_wall_break_case`. Without event dispatch the window never opened, and
+the room past the wall could only be seen once you had walked through it, when
+the room behind you disappeared instead. `sp_a1_intro1_exit_wall_opens_its_areaportal`
+guards it. **In the running game the ride itself still does not start**,
+because it is released by a `logic_choreographed_scene` and by VScript;
+`ent_fire @rl_container_ride_second_section trigger` starts it by hand.
 
 **`LookupSequence` + `SequenceDuration` + `SequenceLoops`, answered in
 advance.** `server/` names no `studio` type, so what a `.mdl` says about its
@@ -2932,7 +2965,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CDynamicProp`'s `VPhysicsInitStatic` | A prop's collision is its `.phy` (`ENGINE_TRACE.md` stage 5), and `World::clip_models` only ever sees `"*N"` brush models. So **5,629 props that write `solid 6` are drawn and walked through**. |
 | `CDynamicProp`'s glow block — `m_bShouldGlow`, `m_clrGlow`, `m_nGlowStyle`, `SetGlowEnabled`/`SetGlowDisabled`/`SetGlowColor`/`GlowColor{Red,Green,Blue}Value`, `ShouldTransmit` | CS:GO's wall-hack glow; it reaches the client as a `CCSUsrMsg_GlowPropTurnOff` user message. **No shipped Portal 2 map writes `glowenabled`, `glowcolor`, `glowdist` or `glowstyle`, and no connection fires one of the six inputs**, so the class declares none of them. |
 | `m_bRandomAnimator` and `SelectWeightedSequence( ACT_IDLE )` | Parsed and dead: **all 5,117 props that write `RandomAnimation` write `0`**, and `MinAnimTime`/`MaxAnimTime` are Hammer's defaults of 5 and 10 on every one of the 8,462. It is the one branch of `AnimThink` that needs the activity table. |
-| `HandleAnimEvent`, `DispatchAnimEvents`, `SuppressAnimSounds`, `m_bUseHitboxesForRenderBox`, `AnimateEveryFrame`, `CalculateBlockLOS`, `BecomeRagdollOnClient` | Each parsed where it is a key, each with nothing here to drive it: anim events want sounds, the render box wants hitboxes, `AnimateEveryFrame` asks the *server* to advance the cycle more often and the server does not advance it at all, LOS wants an AI, and there are no ragdolls. `BecomeRagdoll` is declared and no shipped connection fires it. |
+| ~~`HandleAnimEvent`, `DispatchAnimEvents`~~ | **Landed** for `SCRIPT_EVENT_FIRE_INPUT`, the only server event the content uses — see `sequences` above. `SCRIPT_EVENT_SOUND` has no sound system to go to. |
+| `SuppressAnimSounds`, `m_bUseHitboxesForRenderBox`, `AnimateEveryFrame`, `CalculateBlockLOS`, `BecomeRagdollOnClient` | Each parsed where it is a key, each with nothing here to drive it: anim sounds want a sound system, the render box wants hitboxes, `AnimateEveryFrame` asks the *server* to advance the cycle more often and the server does not advance it at all, LOS wants an AI, and there are no ragdolls. `BecomeRagdoll` is declared and no shipped connection fires it. |
 | `m_nSkin` and `m_nBody` | Parsed, carried across the seam and printed by `ent_dump`; not drawn. Skin families and bodygroups are `portdocs/STUDIO.md` stage 6's. **1,437 shipped connections fire `Skin` at a prop**, so this is the most-fired input in the game that lands on a field nothing reads. |
 | Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
 | ~~`$includemodel`~~ | **Landed** in `src/studio/include.rs`, and it was measured here first: 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**. Of the 2,738 props playing a sequence two seconds into their map, the labels that resolve went from 1,666 to **2,556** and the ones that do not from 897 to **182** — and that remainder is Valve's own map errors, 183 `DefaultAnim` keys naming a sequence in no model at all. `animating` rose with it, because an animation that can now *end* fires `OnAnimationDone` into the game's 5,311 `SetAnimation` connections. |

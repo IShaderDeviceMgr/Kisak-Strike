@@ -10072,3 +10072,209 @@ fn a_held_cube_does_not_stop_the_player_who_holds_it() {
     );
     let _ = body;
 }
+
+// ---------------------------------------------------------------------------
+// animation events
+// ---------------------------------------------------------------------------
+
+/// A `SCRIPT_EVENT_FIRE_INPUT` on a sequence fires its input when the cycle
+/// passes it, once, and not before.
+#[test]
+fn a_fire_input_event_fires_once_when_the_cycle_passes_it() {
+    let mut server = Server::new();
+    server.level_init(
+        "test",
+        &[
+            block(&[
+                ("classname", "prop_dynamic"),
+                ("targetname", "arm"),
+                ("model", "models/test/arm.mdl"),
+                ("OnUser4", &conn("hits", "Add", "1", "0", "-1")),
+            ]),
+            block(&[
+                ("classname", "math_counter"),
+                ("targetname", "hits"),
+                ("max", "10"),
+            ]),
+        ],
+        &[],
+    );
+    let mut table = sequences::SequenceTable::new();
+    table.insert_model(
+        "models/test/arm.mdl",
+        [(
+            "swing".to_owned(),
+            sequences::SequenceInfo {
+                duration: 2.0,
+                loops: false,
+                fade_out_time: 0.2,
+            },
+        )],
+    );
+    let fire = |cycle: f32| sequences::AnimEvent {
+        cycle,
+        event: sequences::SCRIPT_EVENT_FIRE_INPUT,
+        options: "fireuser4".to_owned(),
+    };
+    // One halfway, one right at the end — past the last visible cycle, so it
+    // is the 1.01 window that has to catch it.
+    table.insert_events("models/test/arm.mdl", "swing", vec![fire(0.5), fire(0.97)]);
+    server.set_sequences(table);
+
+    let arm = find_named(&server, "arm").id();
+    server.accept_input(
+        arm,
+        "SetAnimation",
+        Variant::String("swing".to_owned()),
+        None,
+        None,
+        0,
+    );
+    run(&mut server, 0.9);
+    assert_eq!(counter_value(&server, "hits"), 0.0, "nothing before cycle 0.5");
+    run(&mut server, 0.3);
+    assert_eq!(counter_value(&server, "hits"), 1.0, "the halfway event, once");
+    run(&mut server, 2.0);
+    assert_eq!(
+        counter_value(&server, "hits"),
+        2.0,
+        "the end event fires as the sequence finishes, and neither fires twice"
+    );
+}
+
+/// **`sp_a1_intro1`'s exit wall opens its areaportal**, which is what it takes
+/// to see out of the container into the room past the wall.
+///
+/// `breakable_exit_wall_areaportal` starts closed and the only thing that
+/// opens it is a chain that begins in an animation: the container's `anim2`
+/// carries three `FireUser4` events, one per blow on the wall, and
+/// `Actor_container_master`'s `OnUser4` counts them into
+/// `@exit_wall_hit_counter` → `exit_wall_break_case` → `Case01` → `Open`.
+/// Before the port dispatched animation events the counter never moved, the
+/// window stayed shut, and the far room was invisible until the player
+/// walked through the hole — at which point the room behind them vanished
+/// instead.
+///
+/// See the note on the trigger below for why the run starts part way into
+/// the ride rather than at the beginning of the level.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release exit_wall -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn sp_a1_intro1_exit_wall_opens_its_areaportal() {
+    use crate::filesystem::Vfs;
+    use crate::studio::StudioModel;
+    use std::collections::BTreeSet;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+    let bsp = crate::engine::world::bsp::Bsp::load(&vfs, "sp_a1_intro1").expect("the map");
+
+    let mut server = Server::new();
+    server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
+
+    let models: BTreeSet<String> = server
+        .entities
+        .iter()
+        .filter_map(|(_, entity)| entity.core.model.clone())
+        .filter(|model| !model.starts_with('*') && !model.is_empty())
+        .collect();
+    let mut table = sequences::SequenceTable::new();
+    for model in &models {
+        let Ok(loaded) = StudioModel::load(&vfs, model) else { continue };
+        for sequence in &loaded.sequences {
+            table.insert_events(
+                model,
+                &sequence.label,
+                sequence
+                    .events
+                    .iter()
+                    .filter(|e| e.is_for_server())
+                    .map(|e| sequences::AnimEvent {
+                        cycle: e.cycle,
+                        event: e.event,
+                        options: e.options.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        table.insert_model(
+            model,
+            loaded
+                .sequences
+                .iter()
+                .enumerate()
+                .map(|(i, sequence)| {
+                    (
+                        sequence.label.clone(),
+                        sequences::SequenceInfo {
+                            duration: loaded.animation(i).map_or(0.0, |a| a.duration()),
+                            loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                            fade_out_time: sequence.fade_out_time,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    let sequences::Lookup::Found(_) = table.lookup("models/container_ride/mastertransform.mdl", "anim2")
+    else {
+        panic!("the container's model has no anim2");
+    };
+    assert_eq!(
+        table
+            .events("models/container_ride/mastertransform.mdl", "anim2")
+            .iter()
+            .filter(|e| e.options.eq_ignore_ascii_case("fireuser4"))
+            .count(),
+        3,
+        "anim2 carries one FireUser4 per blow on the wall"
+    );
+    server.set_sequences(table);
+
+    let key = |server: &Server| {
+        server
+            .area_portals()
+            .into_iter()
+            .find(|&(key, _)| key == 1)
+            .map(|(_, open)| open)
+    };
+    assert_eq!(key(&server), Some(false), "the exit wall's areaportal starts closed");
+
+    // **Started by hand, one relay down from where the game starts it.** In
+    // the shipped game the ride is released by `that_is_close_enough_vcd`, a
+    // `logic_choreographed_scene`, and by relays VScript fires — neither of
+    // which this port has — so left alone the container never moves. This is
+    // the relay the ride itself triggers: it puts `anim2` on
+    // `Actor_container_master`, and everything after it is entity I/O and
+    // animation events.
+    run(&mut server, 0.5);
+    let ride = find_named(&server, "@rl_container_ride_second_section").id();
+    server.accept_input(ride, "Trigger", Variant::Void, None, None, 0);
+
+    let mut opened_at = None;
+    let mut seconds = 0.0;
+    while seconds < 600.0 {
+        run(&mut server, 1.0);
+        seconds += 1.0;
+        if key(&server) == Some(true) {
+            opened_at = Some(seconds);
+            break;
+        }
+    }
+    let hits = counter_value(&server, "@exit_wall_hit_counter");
+    let container = find_named(&server, "Actor_container_master")
+        .behaviour
+        .describe();
+    println!("after {seconds} s: {hits} hits, container {container:?}");
+    let opened_at = opened_at.unwrap_or_else(|| {
+        panic!("the exit wall's areaportal never opened ({hits} hits on the wall)")
+    });
+    println!("breakable_exit_wall_areaportal opened {opened_at} s into the level");
+}

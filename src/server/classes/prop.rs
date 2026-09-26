@@ -122,7 +122,7 @@ use crate::server::keyvalue::{atof, atoi, effects};
 use crate::server::movement::{
     ModelBounds, MoveType, Solid, EF_NODRAW, FL_CLIENT, FSOLID_NOT_SOLID, FSOLID_TRIGGER,
 };
-use crate::server::sequences::{Lookup, SequenceInfo};
+use crate::server::sequences::{AnimEvent, Lookup, SequenceInfo, SCRIPT_EVENT_FIRE_INPUT};
 
 // ---------------------------------------------------------------------------
 // CPropFloorButton
@@ -724,7 +724,7 @@ const FADE_ALPHA_PER_SECOND: f32 = 256.0;
 ///   defaults of 5 and 10 on every one of the 8,462. It is the one branch of
 ///   `AnimThink` that needs `SelectWeightedSequence( ACT_IDLE )`, which needs
 ///   the activity table, which nothing else here wants.
-/// - **`HandleAnimEvent`**, **`m_bUseHitboxesForRenderBox`**, **`BlockLOS`**,
+/// - **`m_bUseHitboxesForRenderBox`**, **`BlockLOS`**,
 ///   **`SuppressAnimSounds`**, **`AnimateEveryFrame`** — each parsed where it
 ///   is a key and each with nothing in this port to drive it. The last two are
 ///   both about *how often the server advances the cycle*, which here it never
@@ -739,6 +739,9 @@ pub struct DynamicProp {
     cycle: f32,
     /// `m_flAnimTime`.
     anim_time: f32,
+    /// `m_flLastEventCheck` — the cycle up to which this sequence's events
+    /// have been dispatched. See [`dispatch_anim_events`](DynamicProp::dispatch_anim_events).
+    last_event_check: f32,
     /// `m_flPlaybackRate`. **Zero until a sequence is set**, which is
     /// `CBaseProp::Spawn`'s doing and is why 6,046 of the game's props stand
     /// perfectly still.
@@ -836,6 +839,7 @@ impl DynamicProp {
             sequence: String::new(),
             cycle: 0.0,
             anim_time: 0.0,
+            last_event_check: 0.0,
             playback_rate: 0.0,
             animation_done: false,
             hold_animation: false,
@@ -969,6 +973,7 @@ impl DynamicProp {
         self.cycle = 0.0;
         self.anim_time = cx.curtime();
         self.playback_rate = 1.0;
+        self.last_event_check = 0.0;
         self.fading = false;
 
         // `SetThink( &CDynamicProp::AnimThink ); if ( GetNextThink() <= curtime )`
@@ -999,7 +1004,19 @@ impl DynamicProp {
     /// > rest of the level. Nothing observable changes: `SetAnimation`,
     /// > `SetPlaybackRate` and `Spawn` all re-arm the think themselves, so a
     /// > prop that is given something new to do wakes up for it.
+    ///
+    /// # Events are dispatched before the ending is noticed
+    ///
+    /// Valve's think tests `GetCycle()` *before* `StudioFrameAdvance` and
+    /// dispatches events *after* it, so the tick on which a sequence reaches
+    /// its end dispatches everything up to the end and the *next* think is
+    /// the one that fires `OnAnimationDone`. Here the cycle is already the
+    /// advanced one, so the same order is dispatch first, then decide.
     fn anim_think(&mut self, entity: &mut EntityCore, cx: &mut Context<'_>) {
+        let events = match entity.model.as_deref() {
+            Some(model) => cx.sequence_events(model, &self.sequence),
+            None => &[],
+        };
         let Lookup::Found(info) = self.current_sequence(entity, cx) else {
             // No model, or no such sequence: nothing can finish. This is
             // Valve's `else` branch run once instead of for ever — and the
@@ -1009,12 +1026,20 @@ impl DynamicProp {
             self.animation_done = false;
             return;
         };
+        let cycle = self.cycle_now(cx.curtime(), info);
+        self.dispatch_anim_events(entity, info, events, cycle, cx);
+
         if info.loops || info.duration <= 0.0 {
             self.animation_done = false;
+            // A looping sequence never ends, so the think only has a reason
+            // to come back if there is an event on the loop to dispatch —
+            // which is the one case where Valve's for-ever think is kept.
+            if info.loops && !events.is_empty() && self.playback_rate != 0.0 {
+                entity.set_next_think(cx.curtime() + ANIM_THINK_INTERVAL, cx);
+            }
             return;
         }
 
-        let cycle = self.cycle_now(cx.curtime(), info);
         // `bPropFinished`. The 0.999 is Valve's, and it is what makes an
         // animation that has arrived stay arrived: the derived cycle clamps at
         // 1 and never leaves.
@@ -1043,6 +1068,69 @@ impl DynamicProp {
         // `m_bHoldAnimation`'s `SetNextThink( curtime + 0.1 )` is not
         // reproduced: it is Valve waiting for "an animation change to come
         // in", and an animation change here arms the think itself.
+    }
+
+    /// `CBaseAnimating::DispatchAnimEvents` (`baseanimating.cpp:1124`) and
+    /// `CDynamicProp::HandleAnimEvent` (`props.cpp:2245`): every event between
+    /// the last check and `cycle`, in file order.
+    ///
+    /// The window is `GetAnimationEvent`'s, half-open at the top, and it wraps
+    /// for a looping sequence whose cycle has come round. A finished
+    /// non-looping sequence checks up to 1.01 so that an event at exactly 1
+    /// still fires. Played backwards nothing fires, which is Valve's own
+    /// `FIXME: does not handle negative framerates!`.
+    ///
+    /// # What a handler does with one
+    ///
+    /// **Only `SCRIPT_EVENT_FIRE_INPUT` does anything**, and it is the only
+    /// server event the game's content uses: 190 of them, every one a
+    /// `FireUser1`-`4`. They are how an animation reaches the map's I/O —
+    /// `sp_a1_intro1`'s container fires `FireUser4` at three points of
+    /// `anim2`, one per blow against the exit wall, and a counter of those
+    /// breaks the wall and opens `breakable_exit_wall_areaportal`. Without
+    /// them that areaportal never opens and the room past the wall cannot be
+    /// seen from the container.
+    ///
+    /// `SCRIPT_EVENT_SOUND` has no sound system to go to.
+    ///
+    /// > **The input is posted, not called.** Valve's handler calls
+    /// > `AcceptInput` directly; here it goes onto the event queue at zero
+    /// > delay with this prop as activator and caller, so it takes the same
+    /// > path, type checks and counters as any other input and arrives at the
+    /// > queue's next service rather than inside this think.
+    fn dispatch_anim_events(
+        &mut self,
+        entity: &mut EntityCore,
+        info: SequenceInfo,
+        events: &[AnimEvent],
+        cycle: f32,
+        cx: &mut Context<'_>,
+    ) {
+        if self.playback_rate == 0.0 || events.is_empty() {
+            return;
+        }
+        // `m_bSequenceFinished`, as `StudioFrameAdvanceInternal` would have
+        // left it: forwards, past the last visible cycle; backwards, run off
+        // the bottom.
+        let finished = !info.loops
+            && match self.playback_rate > 0.0 {
+                true => cycle >= info.last_visible_cycle(self.playback_rate),
+                false => cycle <= 0.0,
+            };
+        let start = self.last_event_check;
+        let end = match finished {
+            true => 1.01,
+            false => cycle,
+        };
+        self.last_event_check = end;
+
+        for event in events {
+            let inside = (event.cycle >= start && event.cycle < end)
+                || (info.loops && end < start && (event.cycle >= start || event.cycle < end));
+            if inside && event.event == SCRIPT_EVENT_FIRE_INPUT {
+                entity.post_to_self(&event.options, 0.0, cx);
+            }
+        }
     }
 
     /// `SUB_FadeOut` (`baseentity.cpp:8466`) — the think `FadeAndKill` leaves
