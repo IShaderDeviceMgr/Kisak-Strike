@@ -3153,11 +3153,18 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("_quadratic_attn", 7121),
     ("_zero_percent_distance", 4292),
     ("addonpoints", 1),
+    // Three invisible timer `prop_button`s on `mp_coop_fling_crushers`
+    // carry `alpha 0` and `color "0 0 0"` beside a `rendermode 10`. Neither
+    // key is read by `CPropButton`, `CBaseAnimating` or `CBaseEntity` — the
+    // render keys are `renderamt` and `rendercolor` — so these are Hammer
+    // leftovers, visible now that the class that carries them is here.
+    ("alpha", 3),
     ("ambient", 2),
     // Written onto 599 `prop_dynamic`s by Hammer and declared by no `.fgd` in
     // the depot; nothing in `legacy/` reads either name. Mapper leftovers, the
     // same category as `inputfilter`.
     ("canbecaptured", 599),
+    ("color", 3),
     ("detailvbsp", 106),
     // `disableX360` **is** in `base.fgd`'s `SystemLevelChoice`, beside the four
     // CPU/GPU-level keys the port now consumes — and unlike those four it is
@@ -3592,8 +3599,11 @@ fn every_shipped_map_spawns_its_entities() {
     // **+1,697 for the trains**: 233 `func_tracktrain`s and the 1,464
     // `path_track`s they run on. Every one spawns, so `spawned` rises by the
     // same amount.
-    assert_eq!(total.matched, 37_034);
-    assert_eq!(total.spawned, 30_162);
+    //
+    // **+83 for the pedestal buttons**: 56 `prop_button`s and 27
+    // `prop_under_button`s. All spawn.
+    assert_eq!(total.matched, 37_117);
+    assert_eq!(total.spawned, 30_245);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3614,7 +3624,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **+1,093 for the trains**: 786 `OnPass` on the nodes, and on the trains
     // 307 — `OnArrivedAtDestinationNode` (117) and `OnUser1`-`OnUser4` (190).
     // **No shipped map connects `OnStart` or `OnNextPoint`.**
-    assert_eq!(total.outputs, 55_724);
+    // **+263 for the pedestal buttons**: `OnPressed` (154 + 66),
+    // `OnButtonReset` (35 + 6), and one each of the co-op team outputs.
+    assert_eq!(total.outputs, 55_987);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
     // **-2 and -409 again** for the two areaportal classnames, both of which
@@ -3623,8 +3635,9 @@ fn every_shipped_map_spawns_its_entities() {
     // every map that has cubes places.
     // **-1 and -7** for `sky_camera`: seven maps, one each.
     // **-2 and -1,697** for `func_tracktrain` and `path_track`.
-    assert_eq!(total.unknown.len(), 153);
-    assert_eq!(total.unknown.values().sum::<usize>(), 23_891);
+    // **-2 and -83** for `prop_button` and `prop_under_button`.
+    assert_eq!(total.unknown.len(), 151);
+    assert_eq!(total.unknown.values().sum::<usize>(), 23_808);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3708,6 +3721,9 @@ fn every_shipped_map_spawns_its_entities() {
     // The trains, on 64 maps. Nothing deletes either at run time.
     assert_eq!(per_class.get("func_tracktrain"), Some(&233));
     assert_eq!(per_class.get("path_track"), Some(&1_464));
+    // The pedestal buttons, on 38 and 12 maps. Nothing deletes either.
+    assert_eq!(per_class.get("prop_button"), Some(&56));
+    assert_eq!(per_class.get("prop_under_button"), Some(&27));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -3718,14 +3734,16 @@ fn every_shipped_map_spawns_its_entities() {
     }
     // The entity half of the skin-family measurement. Fewer than the 771
     // non-zero `skin` keys the entity lump carries, because a key on a class
-    // this port has no model path for never reaches the draw — 663 is the
-    // number that does.
-    assert_eq!(entity_skins, 663, "model entities on a non-zero skin family");
+    // this port has no model path for never reaches the draw — 674 is the
+    // number that does. +11 with the pedestal buttons: the eleven
+    // `prop_button`s that write `skin 1`, all of which remap — `switch001`
+    // has a second family, and `sp_a1_intro2`'s three buttons are drawn in it.
+    assert_eq!(entity_skins, 674, "model entities on a non-zero skin family");
     assert_eq!(
-        entity_skins_remapped, 659,
+        entity_skins_remapped, 670,
         "…of which draw a different material for it"
     );
-    // **Every one of the 663 names a model that loads**, so the four that do
+    // **Every one of the 674 names a model that loads**, so the four that do
     // not remap are four maps asking for a family their model has not got and
     // getting family 0 from `studio::family` — not four models this port
     // failed to read. The distinction is invisible in the count and is the
@@ -3861,7 +3879,13 @@ fn every_shipped_map_spawns_its_entities() {
     // **+8,300 with the trains**, and it is Valve's shape: `Next` re-arms at
     // `curtime` every tick for as long as a train is moving, so a train that
     // runs for the whole two seconds is 128 thinks. About 65 do.
-    assert_eq!(io.thinks, 15_618);
+    //
+    // **+1,743 with the pedestal buttons, which is 83 × 21**: `AnimateThink`
+    // re-arms unconditionally, like the door's, so every button wakes at
+    // 10 Hz — six 64 Hz ticks — for the whole level whether anyone presses it
+    // or not. Nothing a map fires at one lands inside two seconds, so
+    // `dispatched` and `accepted` do not move.
+    assert_eq!(io.thinks, 17_361);
     // **-86 with the two areaportal classnames, and `accepted` does not
     // move** — every one of the 86 is refused rather than accepted. They are
     // `func_areaportalwindow`'s two fade inputs, fired at the *classname*
@@ -4007,7 +4031,10 @@ fn every_shipped_map_spawns_its_entities() {
     // is looping or holding is **not** in here — and 215 against 27,930 live
     // entities is still under one per cent. The 215th is a chamber door,
     // which never leaves the list at all.
-    assert_eq!(peak_thinks, 215);
+    //
+    // **+4 with the pedestal buttons**, which never leave it either: the peak
+    // map is `mp_coop_start`, and it places four.
+    assert_eq!(peak_thinks, 219);
 
     // The one map this port looks at most, and the headline of the whole
     // stage: `sp_a1_intro1` asks for a ceiling of 1.5 against the cvar default
@@ -10724,4 +10751,223 @@ fn sp_a1_intro1_departure_elevator_runs_its_shaft_and_loops() {
         "down the shaft, short of the bottom node: {lowest}"
     );
     assert!(jumped, "and teleported back to the top");
+}
+
+// ---------------------------------------------------------------------------
+// prop_button and prop_under_button
+// ---------------------------------------------------------------------------
+
+/// The two pedestal models' sequences, as the shipped files have them: none
+/// loops, the idles are one frame (zero seconds), and every one carries
+/// `studiomdl`'s 0.2-second fade.
+///
+/// `switch001`'s `down` and `up` are 5 frames at 30 fps; the underground
+/// button's `press` is 22 frames and `release` 32, both at 24.
+fn pedestal_sequences() -> sequences::SequenceTable {
+    let info = |frames: f32, fps: f32| sequences::SequenceInfo {
+        duration: (frames - 1.0) / fps,
+        loops: false,
+        fade_out_time: 0.2,
+    };
+    let mut table = sequences::SequenceTable::new();
+    table.insert_model(
+        "models/props/switch001.mdl",
+        [
+            ("idle".to_owned(), info(1.0, 30.0)),
+            ("down".to_owned(), info(5.0, 30.0)),
+            ("up".to_owned(), info(5.0, 30.0)),
+            ("idle_down".to_owned(), info(1.0, 30.0)),
+        ],
+    );
+    table.insert_model(
+        "models/props_underground/underground_testchamber_button.mdl",
+        [
+            ("release".to_owned(), info(32.0, 24.0)),
+            ("release_idle".to_owned(), info(1.0, 24.0)),
+            ("press_idle".to_owned(), info(1.0, 24.0)),
+            ("press".to_owned(), info(22.0, 24.0)),
+        ],
+    );
+    table
+}
+
+/// One pedestal button named `button`, counting its `OnPressed` and
+/// `OnButtonReset` into `pressed` and `reset`.
+fn pedestal_server(classname: &str, keys: &[(&str, &str)]) -> Server {
+    let pressed = conn("pressed", "Add", "1", "0", "-1");
+    let reset = conn("reset", "Add", "1", "0", "-1");
+    let mut button = vec![
+        ("classname", classname),
+        ("targetname", "button"),
+        ("origin", "0 0 0"),
+        ("OnPressed", pressed.as_str()),
+        ("OnButtonReset", reset.as_str()),
+    ];
+    button.extend_from_slice(keys);
+    let map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&button),
+        pass_counter("pressed"),
+        pass_counter("reset"),
+    ];
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    server.set_sequences(pedestal_sequences());
+    // Past the first `AnimateThink`, so the idle has finished.
+    run(&mut server, 0.5);
+    server
+}
+
+fn pedestal(server: &Server) -> &classes::PedestalButton {
+    find_named(server, "button")
+        .behaviour
+        .downcast_ref::<classes::PedestalButton>()
+        .expect("a PedestalButton")
+}
+
+/// Ticks until `counter` reaches `value`, returning how long that took — or
+/// `None` if it did not within `limit` seconds.
+fn seconds_until(server: &mut Server, counter: &str, value: f32, limit: f32) -> Option<f32> {
+    let interval = server.time().interval;
+    let mut elapsed = 0.0;
+    while elapsed < limit {
+        if counter_value(server, counter) >= value {
+            return Some(elapsed);
+        }
+        server.frame(interval, &mut NoTouchQuery);
+        elapsed += interval;
+    }
+    (counter_value(server, counter) >= value).then_some(elapsed)
+}
+
+/// **`OnPressed` is the end of the `down` animation, not the press**, and on
+/// `switch001` that end is the first think after it: five frames is 0.133
+/// seconds, the fade-out is 0.2, and so the "last visible" cycle is below
+/// zero. Then the button waits out its `Delay` in `idle_down`, plays `up`,
+/// and fires `OnButtonReset` when that finishes.
+#[test]
+fn a_pedestal_button_fires_on_pressed_on_the_next_think_and_resets_after_its_delay() {
+    let mut server = pedestal_server("prop_button", &[("Delay", "1")]);
+    assert_eq!(pedestal(&server).sequence(), "idle");
+
+    fire(&mut server, "button", "Press", Variant::Void);
+    assert_eq!(pedestal(&server).sequence(), "down", "the press starts the animation");
+    assert_eq!(counter_value(&server, "pressed"), 0.0, "…and not the output");
+
+    let pressed = seconds_until(&mut server, "pressed", 1.0, 1.0).expect("OnPressed");
+    assert!(pressed <= 0.1 + 1e-3, "on the next 10 Hz think: {pressed}");
+    assert_eq!(pedestal(&server).sequence(), "idle_down");
+
+    // A second press while it is down changes nothing.
+    fire(&mut server, "button", "Press", Variant::Void);
+    let reset = seconds_until(&mut server, "reset", 1.0, 2.0).expect("OnButtonReset");
+    assert!(
+        (1.0..=1.25).contains(&reset),
+        "the delay, then one think to start `up` and one to finish it: {reset}"
+    );
+    assert_eq!(counter_value(&server, "pressed"), 1.0, "the second press did nothing");
+    assert_eq!(pedestal(&server).sequence(), "idle");
+
+    // And it can be pressed again.
+    fire(&mut server, "button", "Press", Variant::Void);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "pressed"), 2.0);
+}
+
+/// `Lock` makes a press do nothing at all — not even remember the activator —
+/// and `Unlock` (spelled `UnLock` by 8 of the 9 shipped connections) undoes
+/// it. This is how `sp_a1_intro2` keeps the carousel's current button from
+/// being pressed twice.
+#[test]
+fn a_locked_pedestal_button_ignores_a_press() {
+    let mut server = pedestal_server("prop_button", &[("Delay", "1")]);
+    fire(&mut server, "button", "Lock", Variant::Void);
+    fire(&mut server, "button", "Press", Variant::Void);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "pressed"), 0.0);
+    assert_eq!(pedestal(&server).sequence(), "idle");
+
+    fire(&mut server, "button", "UnLock", Variant::Void);
+    fire(&mut server, "button", "Press", Variant::Void);
+    run(&mut server, 0.2);
+    assert_eq!(counter_value(&server, "pressed"), 1.0);
+}
+
+/// **A timer button springs straight back up and resets on the clock**: the
+/// animation's `OnButtonReset` is suppressed, and the timer's own think —
+/// once a second from the moment the button went down — fires it once the
+/// delay has passed.
+#[test]
+fn a_timer_button_pops_up_at_once_and_resets_when_its_timer_runs_out() {
+    let mut server = pedestal_server("prop_button", &[("Delay", "3"), ("IsTimer", "1")]);
+    fire(&mut server, "button", "Press", Variant::Void);
+    seconds_until(&mut server, "pressed", 1.0, 1.0).expect("OnPressed");
+
+    run(&mut server, 0.5);
+    assert_eq!(pedestal(&server).sequence(), "idle", "back up already");
+    assert_eq!(counter_value(&server, "reset"), 0.0, "but not reset yet");
+
+    let reset = seconds_until(&mut server, "reset", 1.0, 5.0).expect("OnButtonReset");
+    // The timer is armed on the think that fired `OnPressed` and runs a whole
+    // second apart from there: +1 and +2 tick, and +3 — the goal, to the
+    // tick — finds `m_flGoalTime > curtime` false and resets.
+    let since_pressed = reset + 0.5;
+    assert!(
+        (since_pressed - 3.0).abs() < 0.02,
+        "three whole seconds after OnPressed: {since_pressed}"
+    );
+    run(&mut server, 3.0);
+    assert_eq!(counter_value(&server, "reset"), 1.0, "and once");
+}
+
+/// `CancelPress` expires the timer early and swallows the reset it would have
+/// fired — 8 shipped connections use it to stop a countdown the puzzle has
+/// made moot.
+#[test]
+fn cancel_press_stops_a_timer_without_a_reset() {
+    let mut server = pedestal_server("prop_button", &[("Delay", "3"), ("IsTimer", "1")]);
+    fire(&mut server, "button", "Press", Variant::Void);
+    run(&mut server, 1.5);
+    assert_eq!(counter_value(&server, "pressed"), 1.0);
+    fire(&mut server, "button", "CancelPress", Variant::Void);
+    run(&mut server, 5.0);
+    assert_eq!(counter_value(&server, "reset"), 0.0);
+}
+
+/// **Only a player can `Use` one.** An I/O `Use` carries no player as its
+/// activator, and `CPropButton::Use` ignores it — which is why the maps fire
+/// `Press` at a button instead.
+#[test]
+fn a_pedestal_button_ignores_a_use_that_no_player_sent() {
+    let mut server = pedestal_server("prop_button", &[("Delay", "1")]);
+    fire(&mut server, "button", "Use", Variant::Void);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "pressed"), 0.0);
+    assert_eq!(pedestal(&server).sequence(), "idle");
+}
+
+/// `prop_under_button` is the same class on another model with other
+/// sequence names — and a much longer press: 0.875 seconds, "finished" 0.2
+/// early, so `OnPressed` arrives about 0.7 seconds in rather than on the next
+/// think. The model is hard-coded, whatever the map's key says.
+#[test]
+fn an_under_button_fires_when_its_longer_press_animation_finishes() {
+    let mut server = pedestal_server(
+        "prop_under_button",
+        &[("Delay", "1"), ("model", "models/props/switch001.mdl")],
+    );
+    assert_eq!(
+        find_named(&server, "button").core.model.as_deref(),
+        Some("models/props_underground/underground_testchamber_button.mdl")
+    );
+    assert_eq!(pedestal(&server).sequence(), "release_idle");
+
+    fire(&mut server, "button", "Press", Variant::Void);
+    assert_eq!(pedestal(&server).sequence(), "press");
+    let pressed = seconds_until(&mut server, "pressed", 1.0, 2.0).expect("OnPressed");
+    assert!(
+        (0.55..=0.8).contains(&pressed),
+        "0.675 seconds of `press`, on a 0.1-second grid: {pressed}"
+    );
+    assert_eq!(pedestal(&server).sequence(), "press_idle");
 }

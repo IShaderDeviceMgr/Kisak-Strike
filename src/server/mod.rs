@@ -2245,7 +2245,21 @@ impl Server {
         let Some(target) = self.find_use_entity(query) else {
             return;
         };
-        self.pick_up(target);
+        // `UseFoundEntity` (`portal_player.cpp:2691`) sends every usable
+        // entity the same `Use` input, with `USE_TOGGLE` in the slot that is
+        // the output ID, and it is `CPhysicsProp::Use` that turns one into a
+        // pickup. The pickup lives here rather than on the prop because the
+        // carry is the server's state, not the cube's — so a physics prop is
+        // picked up directly and everything else gets its input.
+        let physics_prop = self
+            .physics
+            .as_ref()
+            .is_some_and(|physics| physics.is_physics_prop(&self.entities, target));
+        if physics_prop {
+            self.pick_up(target);
+        } else {
+            self.accept_input(target, "Use", Variant::Void, Some(player), Some(player), class::USE_TOGGLE);
+        }
     }
 
     /// `CPortal_Player::FindUseEntity`
@@ -2257,10 +2271,17 @@ impl Server {
     /// than whatever brush geometry the same ray hit — otherwise a cube
     /// through a wall would be pickable.
     ///
+    /// **Only a usable entity stops the search** — `IsUseableEntity`, which is
+    /// [`Behaviour::object_caps`]. A ray that finds a wall panel or a
+    /// `prop_dynamic` first goes on to the next one, which is Valve's
+    /// `while ( !IsUseableEntity( pObject, 0 ) … )`. The rays see every body
+    /// an entity owns ([`Physics::sweep_use`]), so a `prop_button`'s static
+    /// body is found as well as a cube's dynamic one.
+    ///
     /// The radius search `FindUseEntity` falls back to a third time is not
-    /// here: it exists for `FCAP_USE_IN_RADIUS` entities — buttons and levers
-    /// made of clip brushes — and every class in this port that can be
-    /// *carried* is a physics prop that the rays already reach.
+    /// here: it exists for `FCAP_USE_IN_RADIUS` entities — `prop_door_rotating`
+    /// and a bounce-painted cube — and neither a pedestal button nor an
+    /// unpainted cube sets the bit.
     fn find_use_entity(&mut self, query: &mut dyn TouchQuery) -> Option<EntityId> {
         let player = self.player?;
         let (origin, angles) = {
@@ -2272,7 +2293,7 @@ impl Server {
             let extent = Vec3::splat(half);
             let brush = query.solid_trace(start, end, -extent, extent);
             let Some(physics) = &self.physics else { continue };
-            let Some(sweep) = physics.sweep_box(extent, start, end) else {
+            let Some(sweep) = physics.sweep_use(extent, start, end) else {
                 continue;
             };
             // The brush trace and the prop sweep both report a fraction of the
@@ -2284,7 +2305,14 @@ impl Server {
             if !grab::within_use_radius(eye, hit) {
                 continue;
             }
-            if let Some(id) = physics.owner(sweep.body) {
+            let Some(id) = physics.owner(sweep.body) else {
+                continue;
+            };
+            if self
+                .entities
+                .get(id)
+                .is_some_and(|entity| class::is_useable(entity.behaviour.object_caps()))
+            {
                 return Some(id);
             }
         }

@@ -4751,7 +4751,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-382 tests under `engine::`, 21 of them depot-gated; 1,210 in the crate. (Treat both as a scale rather than a
+382 tests under `engine::`, 21 of them depot-gated; 1,216 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

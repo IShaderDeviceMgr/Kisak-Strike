@@ -343,6 +343,25 @@ pub fn base_accept_input(
     false
 }
 
+/// `FCAP_IMPULSE_USE` (`baseentity_shared.h:27`) — the player can use this
+/// once per press. The one bit the classes here answer with:
+/// `CPropButton` and `CPropWeightedCube` both OR it in.
+pub const FCAP_IMPULSE_USE: u32 = 0x01;
+/// `FCAP_CONTINUOUS_USE` — used every tick the key is held. No class here.
+pub const FCAP_CONTINUOUS_USE: u32 = 0x02;
+/// `FCAP_ONOFF_USE` — used on press and on release. No class here.
+pub const FCAP_ONOFF_USE: u32 = 0x04;
+/// `FCAP_DIRECTIONAL_USE` — "currently only tracktrains", whose player
+/// controls are not ported.
+pub const FCAP_DIRECTIONAL_USE: u32 = 0x08;
+
+/// `CBasePlayer::IsUseableEntity( pEntity, 0 )` (`player.cpp:3107`), minus
+/// its `requiredCaps` argument, which only the radius search passes and which
+/// is not ported.
+pub fn is_useable(caps: u32) -> bool {
+    caps & (FCAP_IMPULSE_USE | FCAP_CONTINUOUS_USE | FCAP_ONOFF_USE | FCAP_DIRECTIONAL_USE) != 0
+}
+
 /// `USE_TYPE` (`game/shared/shareddefs.h:581`) — what a `Use` means.
 ///
 /// # It is the connection's serial number, cast
@@ -371,6 +390,11 @@ pub enum UseType {
     /// four, which is what this variant reproduces.
     Other,
 }
+
+/// `USE_TOGGLE`, as the output ID a `Use` input carries — what
+/// `UseFoundEntity` passes when the *player* uses something, and so what
+/// [`UseType::from_output_id`] turns back into [`UseType::Toggle`].
+pub const USE_TOGGLE: u32 = 3;
 
 impl UseType {
     /// The cast `InputUse` performs.
@@ -1234,6 +1258,17 @@ pub trait Behaviour: Any {
         _input: &Input<'_>,
         _cx: &mut Context<'_>,
     ) {
+    }
+
+    /// `ObjectCaps()` — the `FCAP_*` bits, of which the player's `+use` reads
+    /// the three that make an entity usable (`IsUseableEntity`).
+    ///
+    /// Zero by default, which is `CBaseEntity::ObjectCaps` for everything
+    /// this port asks about: the transition bits it also carries are for a
+    /// level change that does not exist here. A class answers only when a
+    /// player can use it — see [`FCAP_IMPULSE_USE`].
+    fn object_caps(&self) -> u32 {
+        0
     }
 
     /// `StartTouch( pOther )` — something has begun touching this entity.

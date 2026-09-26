@@ -1963,10 +1963,26 @@ pub struct PathTrack { /* private */ }
 /// The train. `m_flSpeed` is `EntityCore::speed`, signed; `startspeed` is the
 /// maximum every `StartForward` and fractional `SetSpeed` is measured against.
 pub struct TrackTrain { /* private */ }
+
+// classes/pedestal.rs — `prop_button` and `prop_under_button`
+pub enum PedestalKind { Standard, Underground }   // the model and four labels
+/// The pedestal button. `OnPressed` is the end of the `down` animation, not
+/// the press; `sequence()` is the label it is in now.
+pub struct PedestalButton { /* private */ }
+impl PedestalButton {
+    pub fn is_locked(&self) -> bool;
+    pub fn sequence(&self) -> &'static str;
+}
+
+// class.rs — what makes an entity usable with `+use`
+pub trait Behaviour { /* … */ fn object_caps(&self) -> u32 { 0 } }
+pub const FCAP_IMPULSE_USE: u32;       // and CONTINUOUS, ONOFF, DIRECTIONAL
+pub fn is_useable(caps: u32) -> bool;  // `IsUseableEntity( e, 0 )`
+pub const USE_TOGGLE: u32;             // the output ID a player's `Use` carries
 ```
 
-Fifty-two classnames, **37,034 of the shipped game's 60,925 entity blocks**.
-**Forty-seven of them are among the 200 classnames the maps place**; the other
+Fifty-four classnames, **37,117 of the shipped game's 60,925 entity blocks**.
+**Forty-nine of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2021,6 +2037,8 @@ because Valve registers them:
 | `sky_camera` | `CSkyCamera` | 7, in 7 maps — one each |
 | `func_tracktrain` | `CFuncTrackTrain` | 233, in 64 maps |
 | `path_track` | `CPathTrack` | 1,464 |
+| `prop_button` | `CPropButton` | 56, in 38 maps |
+| `prop_under_button` | `CPropUnderButton` | 27, in 12 maps |
 
 ---
 
@@ -2916,6 +2934,27 @@ the arm's origin start at 91.
     unparented; one shipped train and 19 shipped nodes are parented. Kept,
     and it is why `every_shipped_train_finds_its_track` skips parented trains.
 
+98. **`+use` finds only what says it can be used.** `find_use_entity` casts
+    its rays against every body an *entity* owns (`Physics::sweep_use`) —
+    static and kinematic ones included, which is how a `prop_button`'s
+    `VPhysicsInitStatic` body is found — and takes the first hit only if
+    `Behaviour::object_caps` passes `class::is_useable`. Anything else goes on
+    to the next ray. A new class the player should be able to use needs an
+    `object_caps`, or the rays will look straight past it; `WeightedCube`
+    needed one the moment the filter existed. `Physics::sweep_box`, the
+    *movement's* sweep, still sees only dynamic bodies, and must: the world,
+    the brush entities and the static props are in `trace/` already.
+
+99. **A pedestal button's `OnPressed` is the end of an animation.** `Press`
+    only starts `down`; the 10 Hz `AnimateThink` fires `OnPressed` when
+    `m_bSequenceFinished` goes true, then waits `Delay` in `idle_down`, plays
+    `up`, and fires `OnButtonReset` when that finishes. `switch001`'s `down` is
+    finished on the first think after the press (5 frames at 30 fps is shorter
+    than the 0.2 s fade, so the last visible cycle is negative); the
+    underground button's `press` takes about 0.7 s. **A button whose model is
+    not in the sequence table never fires `OnPressed`** — Valve's
+    `!pStudioHdr` return — so a synthetic test must `set_sequences` first.
+
 ---
 
 ## Deliberate divergences from Valve
@@ -2932,6 +2971,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | A parent cycle | Recurses until the stack runs out (only self-parenting is checked) | Bounded by the entity count, reported, treated as depth 1 | No shipped map contains a cycle. |
 | `qsort` in the spawn sort | Unstable; equal-rank order is unspecified | Stable, so lump order survives within a rank | Deterministic, and it is what a level designer means by "in order". |
 | A train's `InPass` on a node | `AcceptInput( "InPass" )`, called directly | Posted with no delay | A handler cannot run another entity's code. The queue is serviced in the same tick, after the thinks (gotcha 4), so the node's `OnPass` connections are queued in the tick the train passed it. |
+| A player's `+use` on a physics prop | `AcceptInput( "Use" )`, and `CPhysicsProp::Use` starts the pickup | `player_use` picks it up directly; everything else gets the `Use` input | The carry is the server's state, not the prop's, and a handler cannot reach it. Nothing observable differs: no class here fires an output from `CPhysicsProp::Use`. |
+| `CPropButton`'s `TimerThinkContext` | A second think context beside `AnimateThink` | Two due ticks on the class; the entity's one think is armed at the sooner | `EntityCore` has one schedule. Each keeps its own grid — 0.1 s for the animation, whole seconds from the press for the timer — which is what the contexts would have given. |
 | `func_tracktrain`'s first `Find` | `SetNextThink( gpGlobals->curtime )` in `Spawn` | The first tick | Spawn runs at tick zero here, where that would mean "never" (gotcha 63). "Start trains on the next frame" is the comment, and it is the tick asked for. |
 | A train `Blocked` by something standing on it | `pOther->GetGroundEntity() == this` | On the ground, feet within two units of the top of the train's box, and inside it horizontally | There is no ground entity; the same gap the pusher's `IsStandingOnPusher` rebuilds. |
 | `LookAhead` over a loop of coincident nodes | Spins for ever | Gives up after 4,096 nodes | No shipped path has one; a hand-built one should fail rather than hang. |
@@ -3013,7 +3054,7 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | Flex deltas (`studio/`'s) | Also not this module's, and also measured here. The 16 models `StudioModel::load` refuses are `models/props_destruction/toxin*`; **15 of them are placed as `prop_dynamic`s, by 41 entities**, and those 41 draw nothing. `portdocs/STUDIO.md` records flex deltas as "absent from the data" because no *static prop* has any — still true, and `prop_dynamic` is the first thing in the port that places a model that is not a static prop. |
 | ~~`$includemodel`~~ | **Landed** in `src/studio/include.rs`, and it was measured here first: 9 of the 606 models the game's props name keep their sequences in a companion `*_animation.mdl`, and those 9 are worn by **926 entities**. Of the 2,738 props playing a sequence two seconds into their map, the labels that resolve went from 1,666 to **2,556** and the ones that do not from 897 to **182** — and that remainder is Valve's own map errors, 183 `DefaultAnim` keys naming a sequence in no model at all. `animating` rose with it, because an animation that can now *end* fires `OnAnimationDone` into the game's 5,311 `SetAnimation` connections. |
 | `prop_dynamic_ornament` (`COrnamentProp`) | A prop that `FollowEntity`s another, which needs the same local/abs transform pair the `SetParent` family does. **Zero placed by any shipped map.** |
-| `prop_floor_cube_button` (9), `prop_floor_ball_button` (7), `prop_under_floor_button` (13), `prop_button` (56) | Ordinary follow-on work, no longer blocked: a cube now presses a `prop_floor_button` through `CPortalButtonTrigger`'s cube arm. The first two accept **only** cubes and balls and are **co-op only**. `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names. `prop_button` is a separate class in `prop_button.cpp`, with a timer. The counts are over `portal2/maps` only; an earlier version of this row counted the DLC maps too. See [the census](#what-the-maps-place-that-is-not-here--the-unported-classnames). |
+| `prop_floor_cube_button` (9), `prop_floor_ball_button` (7), `prop_under_floor_button` (13) | Ordinary follow-on work, no longer blocked: a cube now presses a `prop_floor_button` through `CPortalButtonTrigger`'s cube arm. The first two accept **only** cubes and balls and are **co-op only**. `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names. (`prop_button` was on this row too; it has landed — "Pedestal buttons".) The counts are over `portal2/maps` only; an earlier version of this row counted the DLC maps too. See [the census](#what-the-maps-place-that-is-not-here--the-unported-classnames). |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
 | **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
@@ -3033,9 +3074,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 ## What the maps place that is not here — the unported classnames
 
-**153 of the 200 classnames the shipped maps place have no class here: 23,891 of
+**151 of the 200 classnames the shipped maps place have no class here: 23,808 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
-`func_tracktrain` and `path_track` have landed since.) Every one is listed below, grouped by what it would
+`func_tracktrain`, `path_track`, `prop_button` and `prop_under_button` have
+landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3111,9 +3153,9 @@ totals. When a class lands, delete its row here and add it to the table under
    - What a map is actually *waiting on* is better measured by the "out"
      column. `trigger_playerteam` (1,999) and `logic_coop_manager` (1,469)
      lead it, and both are co-op. Next come `trigger_catapult` (242),
-     `trigger_portal_cleanser` (216), `prop_button` (191) and
-     `prop_laser_catcher` (172). (`path_track`'s 786 and `func_tracktrain`'s
-     307 headed that list until they landed.)
+     `trigger_portal_cleanser` (216) and `prop_laser_catcher` (172).
+     (`path_track`'s 786, `func_tracktrain`'s 307 and `prop_button`'s 191
+     headed that list until they landed.)
 
 ### Suggested order, for single player
 
@@ -3127,8 +3169,9 @@ This is a ranking of what unblocks the most, not a plan.
    a new cube. They need entities created after load, with their names fixed
    up, which `trigger_portal_button` already exercises in a small way.
 4. **The test elements with source or a small surface:**
-   - `prop_button`, `prop_under_button` and `prop_under_floor_button`, which
-     are in `game/server/portal2/`;
+   - ~~`prop_button` and `prop_under_button`~~ — **landed**; see "Pedestal
+     buttons". `prop_under_floor_button` is still here, and is
+     `prop_floor_button` with a bigger box and other sequence names;
    - `prop_indicator_panel`;
    - `trigger_catapult`, which is `trigger_push` plus a ballistic solve;
    - `trigger_portal_cleanser`, whose `OnDissolve` lands on
@@ -3165,7 +3208,7 @@ What a portal gun places portals *against* and what a portal does to things. Mos
 | `linked_portal_door` | `CLinkedPortalDoor` (`server/portal2/prop_linked_portal_door.cpp:126`) | 6 | 6 / 0 | 2 |  | 8 / 0 | A scripted pair of portals with no gun (`prop_linked_portal_door.cpp` survives). Two maps. |
 | `weapon_portalgun` | **none** | 3 | 1 / 2 | 1 |  | 4 / 34 | The gun. Also what `OnPlayerPickup` (34) fires from, on the maps where it is picked up. |
 
-#### Test elements — 27 classnames, 1,017 entities
+#### Test elements — 25 classnames, 934 entities
 
 The pieces a chamber is built from. Most have no source here; the button family survives in `game/server/portal2/`.
 
@@ -3176,12 +3219,10 @@ The pieces a chamber is built from. Most have no source here; the button family 
 | `npc_portal_turret_floor` | **none** | 128 | 77 / 51 | 16 |  | 61 / 92 | The turret. Wants lasers, tipping on vphysics, and an AI sense of the player. |
 | `npc_security_camera` | **none** | 84 | 38 / 46 | 26 |  | 111 / 9 | The wall camera that tracks the player; knocked off with a portal. |
 | `paint_sphere` | **none** | 62 | 49 / 13 | 1 |  | 65 / 0 | Paints brush surfaces inside a radius. Two maps (49 on one of them). |
-| `prop_button` | `CPropButton` (`server/portal2/prop_button.cpp:93`) | 56 | 28 / 28 | 22 |  | 32 / 191 | The pedestal button. Survives in `portal2/prop_button.cpp`; a timer and `+use`. |
 | `prop_indicator_panel` | **none** | 49 | 28 / 21 | 20 |  | 105 / 0 | The checkmark and countdown panel beside a button. 105 `Check`/`Uncheck`/`Start`/`Stop` connections. |
 | `env_portal_laser` | **none** | 34 | 20 / 14 | 17 |  | 16 / 0 | The Thermal Discouragement Beam. |
 | `prop_laser_catcher` | **none** | 34 | 22 / 12 | 15 |  | 1 / 172 | Laser receptacle; 171 `OnPowered`/`OnUnpowered` connections. |
 | `prop_wall_projector` | **none** | 31 | 9 / 22 | 7 |  | 16 / 0 | The hard light bridge. A projected entity — `baseprojectedentity_shared.cpp` survives. |
-| `prop_under_button` | `CPropUnderButton` (`server/portal2/prop_button.cpp:507`) | 27 | 7 / 20 | 4 |  | 8 / 72 | The Wheatley-era pedestal button, same file. |
 | `prop_tractor_beam` | **none** | 25 | 13 / 12 | 12 |  | 22 / 0 | The excursion funnel. Also a projected entity. |
 | `prop_monster_box` | **none** | 22 | 22 / 0 | 11 |  | 27 / 20 | The Frankenturret: a cube that walks. `CPortalButtonTrigger` already asks for it by name. |
 | `npc_personality_core` | **none** | 21 | 21 / 0 | 19 | 1 | 164 / 45 | Wheatley and the cores, carried. 45 `OnPlayerPickup`; the grab controller's `UpdateVMGrab` names it. |
@@ -3479,6 +3520,13 @@ case values.
 | `tests::a_disabled_node_is_a_dead_end_for_a_moving_train` | `DisablePath`, `ValidPath`, and `DeadEnd` firing the last `InPass` |
 | `tests::every_shipped_train_finds_its_track` (depot) | 229 of 233 trains on their first node after one tick; gotchas 96 and 97 |
 | `tests::sp_a1_intro1_departure_elevator_runs_its_shaft_and_loops` (depot) | a real looped path, the teleport back to the top, and a rider that never slides off |
+| `tests::a_pedestal_button_fires_on_pressed_on_the_next_think_and_resets_after_its_delay` | gotcha 99, `Delay`, a press while down doing nothing |
+| `tests::a_locked_pedestal_button_ignores_a_press` | `Lock`, `UnLock` |
+| `tests::a_timer_button_pops_up_at_once_and_resets_when_its_timer_runs_out` | `IsTimer` and the second schedule |
+| `tests::cancel_press_stops_a_timer_without_a_reset` | `CancelPress` |
+| `tests::a_pedestal_button_ignores_a_use_that_no_player_sent` | `CPropButton::Use`'s player test |
+| `tests::an_under_button_fires_when_its_longer_press_animation_finishes` | `CPropUnderButton`'s model and labels |
+| `physics::depot::the_player_turns_the_portal_carousel_on_sp_a1_intro2` (depot) | gotcha 98 end to end: `+use` on a static body, `OnPressed`, and the blue portal it opens |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
 | `entity::a_handle_to_a_removed_entity_stops_resolving` | gotcha 10 |
@@ -3684,12 +3732,12 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 37,034 matched, 65
-created, 30,162 spawned, 6,937 lights deleted, 213 kept, 55,724 connections,
-153 unimplemented classnames, the full 49-name unhandled-key table, 6,510
-events dispatched, 5,735 inputs accepted, 15,618 thinks, 1,073 events that found
+server time**, and asserts exact totals: 60,925 blocks, 37,117 matched, 65
+created, 30,245 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
+151 unimplemented classnames, the full 51-name unhandled-key table, 6,510
+events dispatched, 5,735 inputs accepted, 17,361 thinks, 1,073 events that found
 no target, zero bad conversions, the **six**-name unhandled-input table, a peak
-of 215 entities in the simulation list at once, 2,341 live triggers, 105 maps
+of 219 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
 
@@ -5143,3 +5191,51 @@ velocity doubling. **Most shipped trains are started by VScript or by a
 choreographed scene**, neither of which exists — `sp_a1_intro1`'s departure
 elevator is `RunScriptCode StartMoving()` — so a train that works here can
 still sit still in the running game until those do.
+
+### Pedestal buttons — `prop_button` and `prop_under_button`
+
+`src/server/classes/pedestal.rs`: `CPropButton` and `CPropUnderButton`, all of
+`game/server/portal2/prop_button.cpp`. **56 and 27 buttons across 38 and 12
+maps**, carrying 220 `OnPressed` and 41 `OnButtonReset` connections. They were
+ported because of one map. **`sp_a1_intro2`'s portal carousel opens its three
+blue portals from three `prop_button`s and from nothing else.** The map also
+contains the timer-driven version of the carousel
+(`portal_cycle_timer → count_portal_chambers → case_spawn_portals`), but Valve
+switched it off before shipping by writing its targets as
+`//count_portal_chambers` and `//case_spawn_portals`, names that resolve to
+nothing. Until this class existed, no blue portal on that map could open.
+
+The class needed two things from outside itself, both on the `+use` path:
+
+- **The use rays had to see a static body.** `find_use_entity` swept only
+  *dynamic* bodies, because the only thing it had ever picked up was a cube.
+  `Physics::sweep_use` sweeps every body an entity owns (`owners`), so the
+  `VPhysicsInitStatic` body `add_studio_entities` already gives a solid
+  button is found. The world's bodies stay out, because `trace/` answers for
+  them and wins ties.
+- **An object-caps check had to decide what a hit means.** With the rays
+  finding panels, props and brush entities too, the first hit is kept only if
+  `object_caps` says it is usable (gotcha 98). A physics prop is then picked
+  up as before, and anything else gets `Use` with `USE_TOGGLE` as the output
+  ID, which is `UseFoundEntity`'s call.
+
+Two findings, both in the module docs:
+
+- **When `OnPressed` fires is decided by the model, not by the class.**
+  `switch001`'s `down` is shorter than studiomdl's fade-out, so it counts as
+  finished on the first think after the press. The underground button's
+  `press` counts as finished about 0.7 seconds in. Because both follow from
+  `m_bSequenceFinished`, the button accumulates its cycle the way
+  `StudioFrameAdvance` does, including the interval measured from the last
+  think rather than from the press. The door and `prop_dynamic` derive their
+  cycles instead.
+- **The timer is a second think schedule**, the first class here to need one.
+  It is two due ticks on the class rather than think contexts on
+  `EntityCore`; see the divergence row.
+
+What is not here: every sound (`button_down`, `button_up`, `button_locked` and
+the timer's tick-tock), the co-op team outputs, the instructor hint's
+visibility monitor, `FL_UNPAINTABLE` and the fade-distance override. The
+depot test `the_player_turns_the_portal_carousel_on_sp_a1_intro2` drives the
+real movement code up to each button, presses `+use`, and checks that exactly
+the matching blue portal is open 1.5 seconds later.

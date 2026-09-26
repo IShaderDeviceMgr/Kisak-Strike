@@ -113,7 +113,9 @@
 
 use glam::Vec3;
 
-use crate::server::class::{Behaviour, Context, InputDef, InputDefs, ModelState, SpawnResult};
+use crate::server::class::{
+    Behaviour, Context, InputDef, InputDefs, ModelState, SpawnResult, FCAP_IMPULSE_USE,
+};
 use crate::server::classes::trigger::BaseTrigger;
 use crate::server::damage::DamageMode;
 use crate::server::entity::{EntityCore, EntityId};
@@ -2654,6 +2656,16 @@ impl Behaviour for WeightedCube {
             playback_rate: 0.0,
             skin: self.skin,
         })
+    }
+
+    /// `CPropWeightedCube::ObjectCaps` (`prop_weightedcube.cpp:486`) —
+    /// `FCAP_IMPULSE_USE`, which is what lets `+use` find a cube at all.
+    ///
+    /// Its `FCAP_USE_IN_RADIUS` arm, for a cube painted with bounce gel, is
+    /// not here: nothing reads the radius bit, because the radius search it
+    /// feeds is not ported.
+    fn object_caps(&self) -> u32 {
+        FCAP_IMPULSE_USE
     }
 
     fn describe(&self) -> Vec<(&'static str, String)> {

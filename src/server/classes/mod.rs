@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty-two classnames, 37,034 of the shipped game's 60,925 entity blocks.**
-//! Five of the 52 are placed by no map: `player` (the engine makes it when a
+//! **Fifty-four classnames, 37,117 of the shipped game's 60,925 entity blocks.**
+//! Five of the 54 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **47 of
+//! `light_glspot`, each registered because Valve registers it — so **49 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -41,6 +41,9 @@
 //! See `portdocs/ENGINE_WORLD_SKY.md`. **`func_tracktrain` and `path_track`**
 //! (233 and 1,464) came after it, for what they carry rather than for
 //! themselves: 1,290 implemented entities name a train as their parent.
+//! **`prop_button` and `prop_under_button`** (56 and 27) came next, because
+//! `sp_a1_intro2`'s portal carousel opens its blue portals from them and
+//! from nothing else.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -61,6 +64,7 @@ pub mod env;
 pub mod filter;
 pub mod light;
 pub mod logic;
+pub mod pedestal;
 pub mod player;
 pub mod point;
 pub mod portal;
@@ -80,6 +84,7 @@ pub use filter::{
 };
 pub use light::{EnvLight, Light};
 pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Relay, Timer};
+pub use pedestal::PedestalButton;
 pub use player::{
     LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP, IN_USE,
 };
@@ -476,6 +481,22 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: FLOOR_BUTTON_INPUTS,
         outputs: prop::FLOOR_BUTTON_OUTPUTS,
         create: FloorButton::create,
+    },
+    // The pedestal buttons, `prop_button.cpp` — 56 and 27, across 38 and 12
+    // maps. `sp_a1_intro2`'s three are the only way its blue portals open.
+    ClassDef {
+        name: "prop_button",
+        keys: pedestal::PEDESTAL_BUTTON_KEYS,
+        inputs: pedestal::PEDESTAL_BUTTON_INPUTS,
+        outputs: pedestal::PEDESTAL_BUTTON_OUTPUTS,
+        create: PedestalButton::create,
+    },
+    ClassDef {
+        name: "prop_under_button",
+        keys: pedestal::PEDESTAL_BUTTON_KEYS,
+        inputs: pedestal::PEDESTAL_BUTTON_INPUTS,
+        outputs: pedestal::PEDESTAL_BUTTON_OUTPUTS,
+        create: PedestalButton::create_under,
     },
     // …and the second, out of order so that the two sit together. 138 across
     // 71 maps, **two of them on `sp_a1_intro1`** — and despite the classname

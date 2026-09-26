@@ -121,6 +121,8 @@ not centred on its entity's origin (the player's is not) carries its own shift.
 
 ```rust,ignore
 Environment::sweep_box(half, start, end) -> Option<Sweep>   // ClipRayToVPhysics
+Environment::sweep_box_among(half, start, end, accept)      // …over any body `accept` admits
+Environment::is_dynamic(BodyId) -> bool                     // created Motion::Dynamic?
 Environment::contacts(BodyId) -> Vec<Contact>               // IPhysicsFrictionSnapshot
 Environment::velocity(BodyId) -> Vec3
 Environment::set_velocity(BodyId, Vec3)
@@ -135,6 +137,12 @@ of, and not the player's own shadow. The filter reads the environment's record
 of how each body was *created*, because `EnableMotion( false )` makes a prop a
 fixed body and filtering on the Rapier body type would let the player walk
 through every cube a map spawns frozen.
+
+**`sweep_box_among` is the `+use` trace's version**, and it is the only query
+here that can return a static or kinematic body. `Physics::sweep_use` passes
+it "any body an entity owns", so a `prop_button`'s static body can be found by
+a use ray and still never stops a movement sweep. A held body is excluded
+from both.
 
 **A sweep that starts inside a prop can leave it.** `stop_at_penetration` is
 `false`, so a time-zero impact whose relative velocity is *separating* is

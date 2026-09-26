@@ -884,6 +884,12 @@ impl Environment {
         body.set_body_type(kind, enable);
     }
 
+    /// Whether this body was created [`Motion::Dynamic`] — a physics prop,
+    /// frozen or not, as opposed to a wall, a static prop or a mover.
+    pub fn is_dynamic(&self, id: BodyId) -> bool {
+        self.slot(id).is_some_and(|body| body.dynamic)
+    }
+
     /// Whether the solver is still integrating this body — `IsAsleep`,
     /// negated. Like [`pose`](Environment::pose), for asking about one body.
     #[allow(dead_code)]
@@ -964,6 +970,35 @@ impl Environment {
     /// > would make a frozen cube stop stopping the player — and every cube in
     /// > the game spawns frozen if its map says so.
     pub fn sweep_box(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
+        self.sweep_box_where(half, start, end, |_, body| body.dynamic)
+    }
+
+    /// [`sweep_box`](Environment::sweep_box) against **any** body `accept`
+    /// admits, static and kinematic ones included — still never a held one.
+    ///
+    /// This is the `+use` trace's question rather than the movement's.
+    /// `FindUseEntity` traces `MASK_SOLID` and takes whatever entity it hits
+    /// first, and a `prop_button` is a `VPhysicsInitStatic` body that the
+    /// movement sweep deliberately does not see. The caller admits only the
+    /// bodies an entity owns, which leaves the world's to `trace/` exactly as
+    /// `sweep_box` does.
+    pub fn sweep_box_among(
+        &self,
+        half: Vec3,
+        start: Vec3,
+        end: Vec3,
+        accept: impl Fn(BodyId) -> bool,
+    ) -> Option<Sweep> {
+        self.sweep_box_where(half, start, end, |id, _| accept(id))
+    }
+
+    fn sweep_box_where(
+        &self,
+        half: Vec3,
+        start: Vec3,
+        end: Vec3,
+        accept: impl Fn(BodyId, &Body) -> bool,
+    ) -> Option<Sweep> {
         if half.min_element() < 0.0 {
             return None;
         }
@@ -997,8 +1032,10 @@ impl Environment {
             compute_impact_geometry_on_penetration: true,
         };
         let is_prop = |_: ColliderHandle, collider: &Collider| -> bool {
-            self.body_of(collider)
-                .is_some_and(|body| body.dynamic && !body.held)
+            let Some(id) = self.id_of(collider) else {
+                return false;
+            };
+            self.slot(id).is_some_and(|body| !body.held && accept(id, body))
         };
         let filter = QueryFilter::default()
             .exclude_sensors()
@@ -1055,12 +1092,6 @@ impl Environment {
         let handle = collider.parent()?;
         let id = BodyId::from_user_data(self.world.bodies.get(handle)?.user_data);
         self.slot(id).map(|_| id)
-    }
-
-    fn body_of(&self, collider: &Collider) -> Option<&Body> {
-        let handle = collider.parent()?;
-        let id = BodyId::from_user_data(self.world.bodies.get(handle)?.user_data);
-        self.slot(id)
     }
 
     /// The live record for a handle — `None` once the body has been removed,

@@ -481,6 +481,31 @@ impl Physics {
         self.env.sweep_box(half, start, end)
     }
 
+    /// The `+use` trace's half against the environment — every body an
+    /// **entity** owns, static and kinematic included, and none of the
+    /// world's.
+    ///
+    /// [`sweep_box`](Physics::sweep_box) sees only physics props, because the
+    /// movement trace already has everything else from `trace/`. The use trace
+    /// needs more: `FindUseEntity` takes the first *entity* its ray hits, and
+    /// a `prop_button` is a `VPhysicsInitStatic` body with nothing in `trace/`
+    /// to find it by. The world's own bodies are left out for the same reason
+    /// `sweep_box` leaves them out — `trace/` has them, and the caller has
+    /// already asked it.
+    pub fn sweep_use(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
+        self.env
+            .sweep_box_among(half, start, end, |body| self.owners.contains_key(&body))
+    }
+
+    /// Whether `id` has a body created dynamic — whether a `Use` on it is
+    /// `CPhysicsProp::Use`'s pickup rather than the entity's own.
+    pub fn is_physics_prop(&self, entities: &EntityList, id: EntityId) -> bool {
+        entities
+            .get(id)
+            .and_then(|entity| entity.core.physics)
+            .is_some_and(|body| self.env.is_dynamic(body))
+    }
+
     /// `CBasePlayer::SetupVPhysicsShadow` on the first tick there is a player,
     /// then `UpdateVPhysicsPosition` on every tick after it.
     ///
@@ -1826,4 +1851,221 @@ mod depot {
         println!("the floor button is held down by the cube, with nobody standing on it");
     }
 
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release carousel -- --ignored --nocapture
+    /// ```
+    ///
+    /// **`sp_a1_intro2`'s portal carousel, pressed by the player.** The map's
+    /// three blue portals are opened by three `prop_button`s and by nothing
+    /// else — the timer that once cycled them targets names that resolve to
+    /// nothing — so this is the whole chain: the `+use` rays find the button's
+    /// *static* body, `Use` presses it, the `down` animation finishes and fires
+    /// `OnPressed`, and `logic_make_blue_N` turns that portal on 0.8 seconds
+    /// later and the other two off.
+    #[test]
+    #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+    fn the_player_turns_the_portal_carousel_on_sp_a1_intro2() {
+        use crate::client::movement::{
+            player_maxs, player_mins, player_move, MoveData, MoveVars,
+        };
+        use crate::engine::trace::{CollisionBsp, Contents, Ray};
+        use crate::server::classes::{PedestalButton, PropPortal};
+        use crate::server::sequences::{SequenceInfo, SequenceTable};
+        use crate::studio::StudioModel;
+
+        const MAP: &str = "sp_a1_intro2";
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+
+        let bsp = Bsp::load(&vfs, MAP).expect("load the map");
+        let collision = CollisionBsp::build(&bsp);
+        let props = Props::load(MAP, &bsp).expect("the prop lump");
+        let mut built = world_physics::build(
+            MAP,
+            &bsp,
+            &props,
+            &vfs,
+            world_physics::surface_properties(&vfs),
+        );
+        let mut server = Server::new();
+        server.level_init(MAP, &bsp.entities(), &bsp.models);
+        let names: Vec<String> = server
+            .model_entities()
+            .into_iter()
+            .map(|e| e.model)
+            .collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+
+        // The engine's half of `Engine::load_level`: what each button's model
+        // says about its sequences, which is what decides when `OnPressed`
+        // fires.
+        let mut table = SequenceTable::new();
+        let buttons: Vec<(String, EntityId, Vec3)> = ["1", "2", "3"]
+            .iter()
+            .map(|n| {
+                let name = format!("blue_{n}_portal_button");
+                let id = name::find_by_name(&server.entities, &name)
+                    .next()
+                    .unwrap_or_else(|| panic!("{name}"));
+                (name, id, server.entities.get(id).expect("it").core.origin)
+            })
+            .collect();
+        let model = server
+            .entities
+            .get(buttons[0].1)
+            .and_then(|e| e.core.model.clone())
+            .expect("a model");
+        let studio = StudioModel::load(&vfs, &model).expect("switch001");
+        table.insert_model(
+            &model,
+            studio.sequences.iter().enumerate().map(|(i, sequence)| {
+                (
+                    sequence.label.clone(),
+                    SequenceInfo {
+                        duration: studio.animation(i).map(|a| a.duration()).unwrap_or(0.0),
+                        loops: sequence.flags & crate::studio::anim::STUDIO_LOOPING != 0,
+                        fade_out_time: sequence.fade_out_time,
+                    },
+                )
+            }),
+        );
+        server.set_sequences(table);
+        let stats = server.physics_stats().expect("an environment").clone();
+        println!("{stats:?}");
+        for (name, id, at) in &buttons {
+            assert!(
+                server.entities.get(*id).and_then(|e| e.core.physics).is_some(),
+                "{name} at {at} should have a static body for `+use` to find"
+            );
+        }
+
+        let portal_on = |server: &Server, n: &str| {
+            let id = name::find_by_name(&server.entities, &format!("portal_blue_{n}"))
+                .next()
+                .expect("the portal");
+            server
+                .entities
+                .get(id)
+                .and_then(|e| e.behaviour.downcast_ref::<PropPortal>())
+                .map(|p| p.activated)
+                .expect("a prop_portal")
+        };
+        let sequence = |server: &Server, id: EntityId| {
+            server
+                .entities
+                .get(id)
+                .and_then(|e| e.behaviour.downcast_ref::<PedestalButton>())
+                .map(|b| b.sequence())
+                .expect("a PedestalButton")
+        };
+
+        let step = |server: &mut Server, mv: &mut MoveData, use_key: bool| {
+            let physics = server.physics().map(PhysicsPropsForTest);
+            {
+                let mut plain = collision.tracer();
+                let mut with = physics.as_ref().map(|p| collision.tracer().with_props(p));
+                let tracer: &mut crate::engine::trace::Tracer<'_> =
+                    with.as_mut().unwrap_or(&mut plain);
+                mv.forwardmove = 0.0;
+                let angles = mv.angles;
+                player_move(mv, Some(tracer), None, &MoveVars::PORTAL2, 1.0 / 64.0, angles);
+            }
+            let state = crate::server::PlayerState {
+                origin: mv.origin,
+                angles: Vec3::new(mv.angles.pitch, mv.angles.yaw, 0.0),
+                velocity: mv.velocity,
+                base_velocity: mv.base_velocity,
+                on_ground: mv.ground.is_some(),
+                move_type: MoveType::Walk,
+                mins: player_mins(mv.ducked),
+                maxs: player_maxs(mv.ducked),
+                health: 100,
+                life_state: Default::default(),
+                flags: 0,
+                buttons: match use_key {
+                    true => crate::server::classes::IN_USE,
+                    false => 0,
+                },
+                wish_velocity: Vec3::ZERO,
+                vphysics_position: mv.origin,
+                view_offset: crate::client::player::VEC_VIEW,
+            };
+            match server.player() {
+                Some(_) => server.set_player_state(state),
+                None => {
+                    server.spawn_player(state);
+                }
+            }
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        };
+
+        // Let `logic_auto` and the first thinks run.
+        for _ in 0..64 {
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        }
+        assert!(
+            ["1", "2", "3"].iter().all(|n| !portal_on(&server, n)),
+            "no blue portal is open until a button is pressed"
+        );
+
+        let (mins, maxs) = (player_mins(false), player_maxs(false));
+        let order = [0usize, 1, 2, 0];
+        for &which in &order {
+            let (name, id, at) = &buttons[which];
+            // Somewhere to stand within reach, found the way the cube test
+            // finds one: every spot on a few rings, and the press is the test.
+            let mut pressed_from = None;
+            'rings: for radius in [36.0f32, 44.0, 52.0, 60.0] {
+                for i in 0..16 {
+                    let a = std::f32::consts::TAU * i as f32 / 16.0;
+                    let above = *at + Vec3::new(a.cos(), a.sin(), 0.0) * radius + Vec3::Z * 16.0;
+                    let down = Ray::hull(above, above - Vec3::Z * 96.0, mins, maxs);
+                    let ground = collision.tracer().trace(&down, Contents::MASK_PLAYERSOLID);
+                    if !ground.did_hit() || ground.start_solid {
+                        continue;
+                    }
+                    let mut mv = MoveData::standing_at(ground.end + Vec3::Z);
+                    for _ in 0..4 {
+                        step(&mut server, &mut mv, false);
+                    }
+                    for height in [40.0f32, 32.0, 24.0] {
+                        let eye = mv.origin + crate::client::player::VEC_VIEW;
+                        let look = (*at + Vec3::Z * height - eye).normalize_or_zero();
+                        mv.angles = crate::client::view::ViewAngles::new(
+                            -look.z.asin().to_degrees(),
+                            look.y.atan2(look.x).to_degrees(),
+                        );
+                        step(&mut server, &mut mv, true);
+                        step(&mut server, &mut mv, false);
+                        if sequence(&server, *id) != "idle" {
+                            pressed_from = Some((mv.origin, height));
+                            break 'rings;
+                        }
+                    }
+                }
+            }
+            let (from, height) =
+                pressed_from.unwrap_or_else(|| panic!("`+use` should press {name} from beside it"));
+            println!("pressed {name} from {from}, aiming {height} units up it");
+
+            // The animation, `OnPressed`, the relay and its 0.8-second delay.
+            for _ in 0..(64 * 3 / 2) {
+                server.frame(1.0 / 64.0, &mut NoTouchQuery);
+            }
+            let n = (which + 1).to_string();
+            for other in ["1", "2", "3"] {
+                assert_eq!(
+                    portal_on(&server, other),
+                    other == n,
+                    "after pressing {name}, portal_blue_{other}"
+                );
+            }
+            println!("  portal_blue_{n} is open, the other two are shut");
+        }
+    }
 }
