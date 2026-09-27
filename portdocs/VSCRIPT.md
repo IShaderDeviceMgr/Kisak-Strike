@@ -130,9 +130,10 @@ Measured by `server::tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts`
 `OnPostTransition()` teleports the player into the arrival car, the train descends,
 `StartMoving()` sends the exit car down at the 200 units/s the motif table gives this
 map with the player riding its floor for 4,250 units, `FailSafeTransition()` fires at
-the bottom, and `TransitionFromMap()` asks for `map sp_a1_intro3`.
+the bottom, and `TransitionFromMap()` fires `Changelevel` at `@changelevel`, whose
+`point_changelevel` asks the engine for `changelevel sp_a1_intro3`.
 
-That last step takes the script's **own fallback**: `point_changelevel` is not ported,
-so `Entities.FindByName( null, "@changelevel" )` is null and the script sends
-`map <next>` to the console instead of firing `Changelevel` — and the engine runs it.
-Porting `point_changelevel` is what puts the designed path back.
+When VScript first landed that last step took the script's **own fallback** —
+`@changelevel` did not exist, so the script sent `map <next>` to the console. Porting
+`point_changelevel` (`rustdocs/SERVER.md`, "`point_changelevel` — leaving a map") put
+the designed path back, and the depot test now asserts the fallback is not taken.

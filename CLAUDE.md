@@ -65,7 +65,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,264 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,266 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -160,7 +160,7 @@ before calling into a module.** This table is the index.
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**, the **sky**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No fog, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning** and **skin families**. No LOD selection, no body groups, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) — **55 classnames, 37,501 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** — **56 classnames, 37,563 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
 | `src/vscript/` | **Squirrel 2.2.3, written** — the language rule for rule on a tree walker (32-bit numbers, byte strings, Lua 4.0's hash table replicated because its layout is `foreach`'s order), the standard libraries Valve registers, `Vector`, `init.nut`. **All 92 shipped scripts compile; 104 of the 106 maps run five seconds of theirs without an error.** No generators or threads, which no shipped script uses; natives whose systems are absent (`CreateSceneEntity` first) are not registered | `rustdocs/VSCRIPT.md`, `portdocs/VSCRIPT.md` |
 | `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it**. No constraints, collision events, ragdolls or vehicles, and a held object cannot cross a portal | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
@@ -614,8 +614,8 @@ for as long as a cube could not reach a button.
 pad goes down. Shoving moved it 18.8 units.
 
 - **The unported entity classes.** `rustdocs/SERVER.md`, "What the maps place that is
-  not here", lists all 150 classnames the shipped maps place that have no class here.
-  That is 23,424 of the 60,925 blocks. Each classname has its C++ source (or "none"),
+  not here", lists all 149 classnames the shipped maps place that have no class here.
+  That is 23,362 of the 60,925 blocks. Each classname has its C++ source (or "none"),
   its single-player and co-op counts, its I/O and a suggested order. The headline: an
   unknown classname is not spawned, which silently breaks implemented entities that
   name it. `func_tracktrain` was the `parentname` of 1,290 of them and **has landed**
@@ -624,14 +624,15 @@ pad goes down. Shoving moved it 18.8 units.
   carousel work, and they taught `+use` to find entities that are not physics props
   (`rustdocs/SERVER.md`, "Pedestal buttons", and gotcha 98). **`info_teleport_destination`
   is still the destination of 41 `trigger_teleport`s**, and is the cheapest fix left.
-- **The elevators' last two steps.** VScript has landed (`rustdocs/VSCRIPT.md`), and with
-  it `sp_a1_intro2` is entered and left by its elevators on its own scripts, the player
-  riding the exit car 4,250 units down (`rustdocs/SERVER.md`, "VScript"). What is left is
-  **`point_changelevel`** — the map is currently left by the transition script's own
-  fallback, `SendToConsole( "map " + next )`, because `@changelevel` does not exist — and
-  **`env_fade`**, so that the teleport into `transition_trigger` is not a hard cut. After
-  those, VScript's largest absence is the scene system: `CreateSceneEntity` is 4,647 of
-  the shipped scripts' calls, and the only one that still stops a file loading.
+- **The elevators' last step.** VScript has landed (`rustdocs/VSCRIPT.md`), and with
+  it `sp_a1_intro2` is entered and left by its elevators on its own scripts: the player
+  walks into the exit car, rides it 4,250 units down, and **`point_changelevel`** asks
+  the engine for `changelevel sp_a1_intro3` (`rustdocs/SERVER.md`, "VScript" and
+  "`point_changelevel` — leaving a map"). Its source is not in this tree, so it is
+  built from the FGD and `engine->ChangeLevel`. What is left is **`env_fade`**, so that
+  the teleport into `transition_trigger` is not a hard cut. After that, VScript's
+  largest absence is the scene system: `CreateSceneEntity` is 4,647 of the shipped
+  scripts' calls, and the only one that still stops a file loading.
 - **External `.ani` animation blocks** (`animblock != 0`), which skinning just promoted
   to the largest gap in the model path. Until skinning landed, every `$includemodel` host
   but the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss

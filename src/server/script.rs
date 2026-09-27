@@ -177,8 +177,9 @@ impl Server {
         self.script.output.borrow().clone()
     }
 
-    /// Console commands scripts asked for — `SendToConsole` and
-    /// `SendToConsoleServer` — for the engine to run.
+    /// Console commands scripts asked for with `SendToConsole`, for the
+    /// engine to run as the player's. `SendToConsoleServer` is the server's
+    /// own and goes to [`Server::take_server_commands`].
     pub fn take_console_commands(&mut self) -> Vec<String> {
         std::mem::take(&mut self.console_commands)
     }
@@ -822,8 +823,9 @@ fn register_globals(vm: &mut Vm) {
         server(host).console_commands.push(string_arg(a, 1));
         Ok(Value::Null)
     });
+    // `engine->ServerCommand` — the server's own buffer, not the player's.
     vm.register_native(&root, "SendToConsoleServer", 2, ".s", |_, host, a| {
-        server(host).console_commands.push(string_arg(a, 1));
+        server(host).server_commands.push(string_arg(a, 1));
         Ok(Value::Null)
     });
     vm.register_native(&root, "GetMapName", 1, ".", |_, host, _| {

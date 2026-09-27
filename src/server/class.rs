@@ -488,6 +488,8 @@ pub struct Context<'a> {
     physics: Vec<super::physics::Pending>,
     /// Whether [`reload_level`](Context::reload_level) was called.
     reload_level: bool,
+    /// The map [`change_level`](Context::change_level) asked for.
+    change_level: Option<String>,
     /// Whether this handler parented anything to an attachment point — the
     /// one bit `Server::refresh_attachment_children` needs to know.
     attachments_used: bool,
@@ -524,6 +526,7 @@ impl<'a> Context<'a> {
             activated_skybox: None,
             physics: Vec::new(),
             reload_level: false,
+            change_level: None,
             attachments_used: false,
             sequences,
             attachments,
@@ -1023,6 +1026,21 @@ impl<'a> Context<'a> {
     /// Whether [`reload_level`](Context::reload_level) was called.
     pub(super) fn take_reload_level(&mut self) -> bool {
         std::mem::take(&mut self.reload_level)
+    }
+
+    /// `engine->ChangeLevel( map, NULL )` — go on to another map.
+    ///
+    /// Harvested by `Server::dispatch` into `changelevel <map>` for the
+    /// engine's command buffer, and answered by
+    /// `Server::take_server_commands`, as [`reload_level`](Context::reload_level)
+    /// is.
+    pub fn change_level(&mut self, map: &str) {
+        self.change_level = Some(map.to_owned());
+    }
+
+    /// What [`change_level`](Context::change_level) asked for.
+    pub(super) fn take_change_level(&mut self) -> Option<String> {
+        self.change_level.take()
     }
 
     /// Whether this handler parented anything to an attachment point.

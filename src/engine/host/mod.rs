@@ -286,8 +286,7 @@ impl Host {
         self.current
     }
 
-    /// Whether a level is loaded.
-    #[allow(dead_code)] // used by the tests; `sv.IsActive()`'s replacement
+    /// Whether a level is loaded — `sv.IsActive()`'s replacement.
     pub fn has_level(&self) -> bool {
         self.active_game
     }

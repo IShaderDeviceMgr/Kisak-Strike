@@ -2369,12 +2369,23 @@ pub(crate) fn brush_models_touching(
     }
 }
 
-fn sync_placements(
+pub(crate) fn sync_placements(
     models: &mut [PlacedBrushModel],
     placement: impl Fn(usize) -> Option<Placement>,
 ) {
     for placed in models {
         let Some(p) = placement(placed.index) else {
+            // An entity the game answered for and no longer does has been
+            // removed — `Kill`, or its parent's — and a removed entity is
+            // neither drawn nor collided with. Left as it was, a killed
+            // `func_brush` player clip stayed a wall for the rest of the level:
+            // `sp_a1_intro2`'s exit elevator is filled by one until
+            // `elevator_arrive` kills it. A model nobody ever answered for is
+            // still left alone; see [`PlacedBrushModel::owned`].
+            if placed.owned {
+                placed.visible = false;
+                placed.solid = false;
+            }
             continue;
         };
         placed.model.set_placement(p.origin, p.angles);
@@ -2961,6 +2972,35 @@ mod tests {
         });
         assert!((at(&placed[0]) - Vec3::new(0.0, 0.0, 99.0)).length() < 1e-4);
         assert!(!placed[0].visible && !placed[0].solid);
+    }
+
+    /// **A model the game answered for and then stops answering for has been
+    /// removed**, and goes out of the picture and the clip chain — where one
+    /// nobody ever owned is left alone. `sp_a1_intro2`'s exit elevator is
+    /// filled by a `func_brush` clip until a relay kills it, and before this
+    /// the clip stayed a wall.
+    #[test]
+    fn a_killed_brush_entity_is_neither_drawn_nor_solid() {
+        let bsp = with_brush_model(1, "\"origin\" \"10 0 0\"\n");
+        let collision = CollisionBsp::build(&bsp);
+        let mut placed = find_brush_models(&bsp.entities(), &collision);
+        let alive = |_| {
+            Some(Placement {
+                origin: Vec3::ZERO,
+                angles: Vec3::ZERO,
+                visible: true,
+                solid: true,
+            })
+        };
+        sync_placements(&mut placed, alive);
+        let mut clip = Vec::new();
+        rebuild_clip_models(&placed, &mut clip);
+        assert_eq!(clip.len(), 1);
+
+        sync_placements(&mut placed, |_| None);
+        rebuild_clip_models(&placed, &mut clip);
+        assert!(clip.is_empty(), "a killed clip brush is still a wall");
+        assert!(!placed[0].visible, "a killed brush entity is still drawn");
     }
 
     /// **The clip chain is opt-in, and that is what stops 5,333 brush entities

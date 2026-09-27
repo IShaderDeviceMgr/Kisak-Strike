@@ -8,7 +8,7 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair, the pusher, attachment parenting, the trains, the pedestal buttons and VScript.** **The maps' own Squirrel runs** — `logic_script`s, `vscripts`, `thinkfunction`, `RunScriptCode` — and it is what enters and leaves `sp_a1_intro2` by its elevators. Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it** — down to a named point on one of its bones — and **a door closing on you shoves you out of the way, or is stopped by you**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair, the pusher, attachment parenting, the trains, the pedestal buttons and VScript.** **The maps' own Squirrel runs** — `logic_script`s, `vscripts`, `thinkfunction`, `RunScriptCode` — and it is what enters and leaves `sp_a1_intro2` by its elevators, with **`point_changelevel`** asking the engine for the next map at the bottom. Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it** — down to a named point on one of its bones — and **a door closing on you shoves you out of the way, or is stopped by you**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
 | Tests | 222 unit tests + twelve depot tests over all 106 shipped maps |
@@ -226,6 +226,7 @@ impl Server {
     pub fn kill_player(&mut self) -> bool;             // the `kill` command
     pub fn hurt_player(&mut self, amount: f32, damage_type: i32) -> bool;
     pub fn take_level_restart(&mut self) -> Option<String>;
+    pub fn take_server_commands(&mut self) -> Vec<String>; // ServerCommand / ChangeLevel
 
     pub fn report_entities(&self, cx: &mut ExecContext<'_>);
     pub fn ent_dump(&self, cmd: &Command, cx: &mut ExecContext<'_>);
@@ -823,6 +824,7 @@ impl Context<'_> {
     pub fn player(&self) -> Option<EntityId>;            // UTIL_GetLocalPlayer
     pub fn take_damage(&mut self, target: EntityId, info: DamageInfo) -> bool;
     pub fn reload_level(&mut self);                      // ServerCommand("reload")
+    pub fn change_level(&mut self, map: &str);           // engine->ChangeLevel(map, NULL)
 
     // prop_dynamic — LookupSequence/SequenceDuration/SequenceLoops in one call
     pub fn sequence(&self, model: &str, label: &str) -> Lookup;
@@ -2004,8 +2006,8 @@ pub vscripts: Option<String>,
 pub script_think_function: Option<String>,
 ```
 
-Fifty-five classnames, **37,501 of the shipped game's 60,925 entity blocks**.
-**Fifty of them are among the 200 classnames the maps place**; the other
+Fifty-six classnames, **37,563 of the shipped game's 60,925 entity blocks**.
+**Fifty-one of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2027,6 +2029,7 @@ because Valve registers them:
 | `worldspawn` | `CWorld` | 106 |
 | `math_counter` | `CMathCounter` | 102 |
 | `logic_case` | `CLogicCase` | 84 |
+| `point_changelevel` | `CPointChangelevel` (source not in the tree) | 62 |
 | `light_environment` | `CEnvLight` | 25 |
 | `func_brush` | `CFuncBrush` | 2,502 |
 | `func_door_rotating` | `CRotDoor` | 346 |
@@ -3001,6 +3004,11 @@ the arm's origin start at 91.
     `GenerateUniqueKey`'s `RandomInt( 0, 0xfff )` does. Adding a scripted entity
     to a test therefore changes which way a `logic_case` goes; three depot totals
     moved by single digits for exactly this reason when VScript landed.
+105. **A level asks the engine to change level at most once.**
+    `CVEngineServer::ChangeLevel`'s `last_spawncount` guard is
+    `Server::change_level_issued`, reset by `level_shutdown`; a second
+    `ChangeLevel` in the same level still fires `OnChangeLevel` and asks for
+    nothing.
 
 ---
 
@@ -3119,16 +3127,15 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `SendTable`/`DT_`/`edict_t` | One process. Deleted, not deferred. |
 | Save/restore, `FTYPEDESC_SAVE` | Deferred; `serde` over entity state when it comes back, not `ISave`. |
 | `ent_pause`/`ent_step` (`Debug_ShouldStep`) | 20 lines and genuinely useful; reconsider when entities do more. |
-| VScript | `portdocs/SERVER.md` §9. One `RunScriptCode` reaches an implemented class. |
 
 ---
 
 ## What the maps place that is not here — the unported classnames
 
-**150 of the 200 classnames the shipped maps place have no class here: 23,424 of
+**149 of the 200 classnames the shipped maps place have no class here: 23,362 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
-`func_tracktrain`, `path_track`, `prop_button`, `prop_under_button` and
-`logic_script` have landed since.) Every one is listed below, grouped by what it would
+`func_tracktrain`, `path_track`, `prop_button`, `prop_under_button`,
+`logic_script` and `point_changelevel` have landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3136,7 +3143,7 @@ whose target resolves, in the same map, to an entity of that class. "Out" is
 the number of connections written *on* entities of that class, which is what
 the rest of the map is waiting to receive from it. "C++" is the
 `LINK_ENTITY_TO_CLASS` site under `legacy/game/`. **none** means that no
-factory exists anywhere in the tree: 41 classnames and 5,583 entities.
+factory exists anywhere in the tree: 40 classnames and 5,521 entities.
 `portdocs/SERVER.md` §1.3 explains that these are reconstruction jobs, from the
 FGD, the surviving shared code and the maps' own I/O.
 
@@ -3171,8 +3178,8 @@ totals. When a class lands, delete its row here and add it to the table under
    `trigger_portal_cleanser` shows its grill whether or not the map has
    `Disable`d it.
 
-2. **`sp_a1_intro1` alone places 50 of the missing classnames** (53 before the
-   trains and `logic_script`). Five groups decide what the map does:
+2. **`sp_a1_intro1` alone places 49 of the missing classnames** (53 before the
+   trains, `logic_script` and `point_changelevel`). Five groups decide what the map does:
    - **The story:** 17 `logic_choreographed_scene`s, a `generic_actor` and 3
      `ai_script_conditions` — its two `logic_script`s run now. A scene's `OnCompletion`
      is what releases the container ride. That is why
@@ -3182,7 +3189,8 @@ totals. When a class lands, delete its row here and add it to the table under
      VScript starts it (`RunScriptCode StartMoving()`) — but its
      `trigger_teleport` has an
      `info_teleport_destination` as its landmark, and beyond it are a
-     `point_changelevel`, a `trigger_transition` and an `info_landmark_exit`.
+     `trigger_transition` and an `info_landmark_exit`. Its `point_changelevel`
+     has landed.
    - **What is drawn:** 3 `env_fog_controller`s, 26 `move_rope`s and 25
      `keyframe_rope`s (the cables), 4 `env_projectedtexture`s and 6
      `info_particle_system`s.
@@ -3324,14 +3332,15 @@ Ordinary map logic, the kind stage 2 ported. `point_template` is the one with te
 | `logic_collision_pair` | `CLogicCollisionPair` (`server/logicentities.cpp:3019`) | 2 | 2 / 0 | 1 |  | 0 / 0 | Disables collision between two physics objects. |
 | `math_remap` | `CMathRemap` (`server/logicentities.cpp:1036`) | 1 | 1 / 0 | 1 |  | 0 / 0 | Linear remap of a value. One entity. |
 
-#### Level flow — 11 classnames, 529 entities
+#### Level flow — 10 classnames, 467 entities
 
-Leaving one map for the next, and saving on the way.
+Leaving one map for the next, and saving on the way. `point_changelevel` (62)
+left this table; see "`point_changelevel` — leaving a map" under "What has
+landed".
 
 | classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
 |---|---|---:|---:|---:|---:|---:|---|
 | `logic_autosave` | `CLogicAutosave` (`server/logicentities.cpp:2778`) | 85 | 81 / 4 | 61 |  | 57 / 0 | Saves on an input. No save system. |
-| `point_changelevel` | **none** | 62 | 62 / 0 | 62 | 1 | 0 / 0 | Portal 2's level transition, reconstructed rather than `trigger_changelevel`. One per SP map, and with it the elevator ride out. |
 | `trigger_transition` | `CTriggerVolume` (`server/triggers.cpp:1296`) | 62 | 62 / 0 | 62 | 1 | 0 / 0 | Marks what carries across a level change. |
 | `info_landmark_entry` | **none** | 62 | 62 / 0 | 61 |  | 0 / 0 | Where the player arrives from the previous map. |
 | `info_landmark_exit` | **none** | 62 | 62 / 0 | 61 | 1 | 0 / 0 | Where the player leaves for the next one. |
@@ -3589,7 +3598,8 @@ case values.
 | `tests::entities_finds_by_name_and_classname` | `CEntities`' iteration |
 | `tests::a_script_error_is_printed_and_the_level_carries_on` | The error handler's output |
 | `tests::a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root` | `RemoveInstance`, `IsValid` |
-| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts, with the player riding the exit car |
+| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code, rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` |
+| `tests::point_changelevel_asks_the_engine_for_one_changelevel` | `OnChangeLevel`, and one `changelevel` per level (gotcha 105) |
 | `tests::every_shipped_maps_scripts_run` (depot) | 104 of 106 maps run five seconds of their scripts without an error |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
@@ -3796,9 +3806,9 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 37,501 matched, 65
-created, 30,629 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
-150 unimplemented classnames, the full 49-name unhandled-key table, 7,005
+server time**, and asserts exact totals: 60,925 blocks, 37,563 matched, 65
+created, 30,691 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
+149 unimplemented classnames, the full 49-name unhandled-key table, 7,005
 events dispatched, 6,272 inputs accepted, 17,357 thinks, 1,032 events that found
 no target, zero bad conversions, the **seven**-name unhandled-input table, a peak
 of 219 entities in the simulation list at once, 2,341 live triggers, 105 maps
@@ -5333,10 +5343,13 @@ every global a script made. In between:
 - **The player's instance is the root table's `player`** from the moment the player
   spawns, as `CBasePlayer::Spawn` sets it in single player.
 
-**What reaches the engine**: `SendToConsole` queues a console command, which the
-engine runs after the frame — and that is how a map is left, for now:
-`TransitionFromMap()` finds no `@changelevel` entity (`point_changelevel` is not
-ported) and takes the script's own fallback, `SendToConsole( "map " + next )`.
+**What reaches the engine**: `SendToConsole` queues a console command as the
+player's (`Server::take_console_commands`), and `SendToConsoleServer` one as the
+server's own (`Server::take_server_commands`), which the engine runs after the
+frame. A map is **not** left through either: `TransitionFromMap()` finds
+`@changelevel` and fires `Changelevel` at it (see "`point_changelevel`" below).
+The script's `SendToConsole( "map " + next )` is only its fallback for a map
+without one.
 Scripts are read through `ScriptFiles`, which the engine implements over the
 `Vfs`'s `GAME` path and a test implements over a table.
 
@@ -5363,5 +5376,41 @@ At the exit, the approach trigger summons the car and kills the clip that fills 
 elevator departure_elevator-elevator_1 with speed 200" and sets that speed; **the
 player rides the car's floor 4,250 units down**, 23.1 units below its origin the
 whole way; `FailSafeTransition()` fires at the bottom node, the relay teleports the
-player into `transition_trigger`, and `TransitionFromMap()` sends
-`map sp_a1_intro3` 22.6 s after the car started.
+player into `transition_trigger`, and `TransitionFromMap()` fires `@changelevel`,
+which asks the engine for `changelevel sp_a1_intro3` 22.4 s after the car started.
+The player gets into the car by **walking** there from the approach trigger, through
+`player_move` and the clip chain the engine syncs — which is what caught the dead
+clip (below).
+
+### `point_changelevel` — leaving a map
+
+`classes/point.rs`, `PointChangelevel`. **Its source is not in this tree**:
+`server_portal2.vpc` lists `portal2\point_changelevel.cpp` and the file was not
+shipped with it. So it is built from what is fixed from outside — the FGD
+(`bin/portal2.fgd:614`: input `ChangeLevel(string)`, output `OnChangeLevel`) and
+the one call a server has for the job, `engine->ChangeLevel( map, NULL )`
+(`vengineserver_impl.cpp:310`) — and from what the maps do with it: **62 maps
+place exactly one, every one named `@changelevel` with no other key, no map wires
+an output to it or an input at it, and the only caller is `TransitionFromMap()`**.
+
+`ChangeLevel` fires `OnChangeLevel` and calls `Context::change_level`, which
+`Server::dispatch` turns into `changelevel <map>` in the server's command queue —
+**once per level** (gotcha 105). The engine drains that as its own command text
+and runs `Host_Changelevel_f`'s checks: a level must be running and
+`maps/<name>.bsp` must exist, else it prints Valve's refusal. It then loads the map
+as `map` does, because `HostState_ChangeLevelMP`'s difference — keeping the
+clients connected — has no meaning with the client in this process.
+
+What `@changelevel` does **not** do is fade the screen out: in the shipped game the
+transition's `env_fade` has already run by the time it fires. That is the next step.
+
+**The clip that stayed.** Playing it showed the exit car could not be entered
+without `noclip`. `departure_elevator-elevator_playerclip` fills the car until
+`elevator_arrive` kills it, and the server did kill it — but `world::sync_placements`
+skipped a model whose entity no longer answered, so the engine kept the dead clip
+**solid and drawn** for the rest of the level. A model the game answered for and
+then stops answering for is now taken out of the picture and the clip chain; one
+it never answered for is left alone, as before. The depot test did not see it
+because its copy of the sync dropped dead entities where the engine's kept them,
+and because it placed the player in the car by hand. It now uses the engine's
+own `sync_placements` and `engine::brush_placement`, and walks.

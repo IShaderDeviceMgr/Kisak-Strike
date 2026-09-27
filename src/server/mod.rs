@@ -297,6 +297,12 @@ pub struct Server {
     /// What `SendToConsole` asked for, for the engine to run — see
     /// [`Server::take_console_commands`].
     console_commands: Vec<String>,
+    /// `engine->ServerCommand`/`engine->ChangeLevel` text, for the engine's
+    /// own command buffer — see [`Server::take_server_commands`].
+    server_commands: Vec<String>,
+    /// `CVEngineServer::ChangeLevel`'s `last_spawncount` guard: one
+    /// `changelevel` per level, however many times it is asked.
+    change_level_issued: bool,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -894,6 +900,8 @@ impl Server {
             script: script::ScriptState::default(),
             script_files: None,
             console_commands: Vec::new(),
+            server_commands: Vec::new(),
+            change_level_issued: false,
         }
     }
 
@@ -1226,6 +1234,9 @@ impl Server {
         // `LevelShutdownPostEntity`'s `VScriptServerTerm`.
         self.script_shutdown();
         self.console_commands.clear();
+        self.server_commands.clear();
+        // A new level is a new `sv.GetSpawnCount()`.
+        self.change_level_issued = false;
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -2068,6 +2079,7 @@ impl Server {
         let activated_skybox = cx.take_activated_skybox();
         let queued_physics = cx.take_physics_queue();
         let reload = cx.take_reload_level();
+        let change_level = cx.take_change_level();
         // Once a level has any attachment parenting, every tick re-derives
         // what rides one — see `Server::refresh_attachment_children`.
         self.attachments_in_use |= cx.took_attachment();
@@ -2148,6 +2160,14 @@ impl Server {
 
         if reload {
             self.level_restart = self.map.clone();
+        }
+        // `CVEngineServer::ChangeLevel` (`vengineserver_impl.cpp:310`): *"make
+        // sure we don't issue two changelevels"* — once per level — then
+        // `Cbuf_AddText( CBUF_SERVER, "changelevel %s\n" )`.
+        if let Some(map) = change_level {
+            if !std::mem::replace(&mut self.change_level_issued, true) {
+                self.server_commands.push(format!("changelevel {map}"));
+            }
         }
 
         Some(result)
@@ -3124,6 +3144,16 @@ impl Server {
     /// host state machine, the same way nothing in it names `wgpu`.
     pub fn take_level_restart(&mut self) -> Option<String> {
         self.level_restart.take()
+    }
+
+    /// Command text the game asked the engine to run as its own —
+    /// `engine->ServerCommand` and `engine->ChangeLevel`, which are
+    /// `Cbuf_AddText( CBUF_SERVER, … )` — taken once.
+    ///
+    /// Distinct from [`take_console_commands`](Server::take_console_commands),
+    /// which is `SendToConsole`: that is a *client* command, from the player.
+    pub fn take_server_commands(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.server_commands)
     }
 
     /// How many brush entities this map placed that the port has a class for.

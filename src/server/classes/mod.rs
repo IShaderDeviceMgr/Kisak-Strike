@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty-five classnames, 37,501 of the shipped game's 60,925 entity blocks.**
-//! Five of the 55 are placed by no map: `player` (the engine makes it when a
+//! **Fifty-six classnames, 37,563 of the shipped game's 60,925 entity blocks.**
+//! Five of the 56 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **50 of
+//! `light_glspot`, each registered because Valve registers it — so **51 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -47,6 +47,8 @@
 //! VScript: it has no behaviour of its own beyond `EntityGroup`, and is here
 //! because it is where most of the game's scripts are attached — the
 //! elevators' transition scripts among them. See `portdocs/VSCRIPT.md`.
+//! **`point_changelevel`** (62, one per single-player map) came straight
+//! after, because those scripts end by firing it: it is how a map is left.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -93,7 +95,7 @@ pub use pedestal::PedestalButton;
 pub use player::{
     LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP, IN_USE,
 };
-pub use point::PointTeleport;
+pub use point::{PointChangelevel, PointTeleport};
 pub use portal::PropPortal;
 pub use sky::SkyCamera;
 pub use train::{PathTrack, TrackTrain};
@@ -448,6 +450,15 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: POINT_TELEPORT_INPUTS,
         outputs: &[],
         create: PointTeleport::create,
+    },
+    // `CPointChangelevel` — `portal2/point_changelevel.cpp`, which this tree
+    // does not ship; see [`PointChangelevel`] for what it is built from.
+    ClassDef {
+        name: "point_changelevel",
+        keys: &[],
+        inputs: point::POINT_CHANGELEVEL_INPUTS,
+        outputs: &["OnChangeLevel"],
+        create: PointChangelevel::create,
     },
     // `LINK_ENTITY_TO_CLASS( player, CPortal_Player )`. **No shipped map
     // places one** — the player is created when a client connects, which here

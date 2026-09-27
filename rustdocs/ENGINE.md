@@ -577,6 +577,15 @@ So `clip_models` is `owned && solid`: **collide with what the game has told us
 about**, rather than assume everything is a wall. The alternative fills every
 Portal 2 chamber with invisible walls, and would do it silently.
 
+**A model the game answered for and then stops answering for has been removed**,
+and `sync_placements` makes it invisible and non-solid. Before that rule it was
+skipped like a model nobody owns, which left a `Kill`ed brush entity drawn and
+solid for the rest of the level — `sp_a1_intro2`'s exit car stayed full of its
+player clip and could only be entered with `noclip`. Guarded by
+`a_killed_brush_entity_is_neither_drawn_nor_solid`. The depot tests sync through the
+same `sync_placements` and `engine::brush_placement` the frame does, so they cannot
+disagree with it.
+
 `brush_models_touching` is the other direction — the engine's half of the
 server's touch test (`engine->SolidMoved`, `engine/world.cpp`'s `CTouchLinks`).
 Two things it is *not*: not a bounding-box overlap (Valve's enumerator ends in
@@ -4638,13 +4647,19 @@ disjoint from the rest).
 **Scripts reach the console too.** A VScript `SendToConsole` queues its text on the
 server, and `Engine::frame` drains it after the ticks — `Server::take_console_commands`,
 enqueued as `Source::ClientCmd`, which is what `engine->ClientCommand` to the listen
-server's own player is. That is how a map is left at the moment: `TransitionFromMap()`
-finds no `point_changelevel` and sends `map <next>`, which lands here. The scripts
+server's own player is. `Server::take_server_commands` is the server's *own* text —
+`engine->ServerCommand` and `engine->ChangeLevel`, `Cbuf_AddText( CBUF_SERVER, … )` —
+and is enqueued as `Source::Code`. That is how a map is left: `point_changelevel`
+asks for `changelevel <next>`, and `changelevel` (`Host_Changelevel_f`) refuses
+without a running level or a `maps/<next>.bsp`, then loads it as `map` does —
+`HostState_ChangeLevelMP` keeps clients connected, and with the client in this
+process there is no connection to keep. `EngineCommands` holds the `Vfs` for that
+check. The scripts
 themselves are read through `Engine::share_filesystem`, which hands the server an
 `Arc<Vfs>` behind `server::script::ScriptFiles` (`VfsScripts`, the `GAME` path) — the
 launcher holds the `Vfs` in an `Arc` for exactly this.
 
-It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
+It owns `map`/`changelevel`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
 `trace`, `tonemap`, `portal`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
 
@@ -4760,7 +4775,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-382 tests under `engine::`, 21 of them depot-gated; 1,264 in the crate. (Treat both as a scale rather than a
+383 tests under `engine::`, 21 of them depot-gated; 1,266 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

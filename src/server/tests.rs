@@ -3600,8 +3600,11 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **+384 for `logic_script`**, which is nothing but a place to hang a
     // script. All spawn.
-    assert_eq!(total.matched, 37_501);
-    assert_eq!(total.spawned, 30_629);
+    //
+    // **+62 for `point_changelevel`**, one each on 62 maps and every one
+    // named `@changelevel`. All spawn.
+    assert_eq!(total.matched, 37_563);
+    assert_eq!(total.spawned, 30_691);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3635,8 +3638,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-2 and -1,697** for `func_tracktrain` and `path_track`.
     // **-2 and -83** for `prop_button` and `prop_under_button`.
     // **-1 and -384** for `logic_script`.
-    assert_eq!(total.unknown.len(), 150);
-    assert_eq!(total.unknown.values().sum::<usize>(), 23_424);
+    // **-1 and -62** for `point_changelevel`.
+    assert_eq!(total.unknown.len(), 149);
+    assert_eq!(total.unknown.values().sum::<usize>(), 23_362);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3728,6 +3732,9 @@ fn every_shipped_map_spawns_its_entities() {
     // is what measures the *entity* side of scripting without the scripts'
     // own behaviour; `every_shipped_maps_scripts_run` is the other half.
     assert_eq!(per_class.get("logic_script"), Some(&384));
+    // One per map on 62 maps, all `@changelevel`; no map connects an output
+    // to one, and only `TransitionFromMap()` fires at one.
+    assert_eq!(per_class.get("point_changelevel"), Some(&62));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -11271,6 +11278,45 @@ fn a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root() {
     assert_eq!(counter_value(&server, "counter"), 100.0);
 }
 
+/// **`point_changelevel` is how a map is left**: `ChangeLevel` fires
+/// `OnChangeLevel` and asks the engine for `changelevel <map>` — once per
+/// level, however many times it is fired, which is
+/// `CVEngineServer::ChangeLevel`'s `last_spawncount` guard. The input is
+/// fired the way `TransitionFromMap()` fires it, spelt `Changelevel`, through
+/// `EntFire`.
+#[test]
+fn point_changelevel_asks_the_engine_for_one_changelevel() {
+    let files = vec![(
+        "test/leave.nut",
+        "function Leave() { EntFire(\"@changelevel\", \"Changelevel\", \"sp_next\", 0.0) }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[
+            ("classname", "point_changelevel"),
+            ("targetname", "@changelevel"),
+            ("OnChangeLevel", &conn("counter", "Add", "1", "0", "-1")),
+        ]),
+        block(&[("classname", "logic_script"), ("targetname", "leaver"), ("vscripts", "test/leave.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("leaver", "CallScriptFunction", "Leave", "0", "-1")),
+            ("OnMapSpawn", &conn("@changelevel", "ChangeLevel", "sp_other", "0.5", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 2.0, "OnChangeLevel fires each time");
+    assert_eq!(server.take_server_commands(), ["changelevel sp_next"]);
+    assert!(server.take_console_commands().is_empty(), "not the script's `map` fallback");
+    assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
+
+    // A new level may change level again.
+    server.level_shutdown();
+    server.level_init("sp_script_test", &blocks, &[]);
+    run(&mut server, 1.0);
+    assert_eq!(server.take_server_commands(), ["changelevel sp_next"]);
+}
+
 /// `scripts/vscripts/` read from a mounted game, for the depot tests.
 struct DepotScripts(Rc<crate::filesystem::Vfs>);
 
@@ -11300,9 +11346,14 @@ impl script::ScriptFiles for DepotScripts {
 ///   fires `SetSpeedReal 200`; the path's `OnPass` calls
 ///   `FailSafeTransition()`, the relay teleports the player into
 ///   `transition_trigger`, and `TransitionFromMap()` looks up the next map in
-///   `MapPlayOrder`. There is no `point_changelevel` yet, so the script takes
-///   its own fallback — `SendToConsole( "map " + next_map )` — and that is
-///   the command this test waits for.
+///   `MapPlayOrder` and fires `Changelevel` at `@changelevel`, whose
+///   `point_changelevel` asks the engine for `changelevel sp_a1_intro3` —
+///   the command this test waits for. The script's own fallback,
+///   `SendToConsole( "map " + next_map )`, must not be taken.
+/// - **Walking in.** The player walks from the exit's approach trigger into
+///   the car through the movement code, against the clip chain the engine
+///   syncs, so a clip the map killed and the port kept would stop them at the
+///   door.
 ///
 /// ```text
 /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release sp_a1_intro2s_elevators -- --ignored --nocapture
@@ -11310,8 +11361,9 @@ impl script::ScriptFiles for DepotScripts {
 #[test]
 #[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
 fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
-    use crate::engine::trace::CollisionBsp;
-    use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
+    use crate::client::movement::{player_maxs, player_mins, player_move, MoveData, MoveVars, SV_SPEED_NORMAL};
+    use crate::engine::trace::{BrushModel, CollisionBsp};
+    use crate::engine::world::{bsp::Bsp, find_brush_models, sync_placements};
 
     const MAP: &str = "sp_a1_intro2";
     let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
@@ -11336,30 +11388,26 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         "mapspawn.nut runs at level start"
     );
 
-    // The placements are taken from the server once a tick, as
-    // `sync_brush_models` does in the running engine.
-    let place = |server: &Server| -> Vec<PlacedBrushModel> {
-        placed
-            .iter()
-            .filter_map(|p| {
-                let e = server.brush_entity(p.index)?;
-                let mut p = p.clone();
-                p.owned = true;
-                p.model.set_placement(e.origin, e.angles);
-                p.solid = e.is_solid() && e.collides_with_player();
-                Some(p)
-            })
-            .collect()
-    };
+    // The placements are synced from the server once a tick through the
+    // engine's own `sync_placements` and `brush_placement`, exactly as
+    // `sync_brush_models` does in the running game — **not** a copy of them.
+    // A copy that dropped a killed entity where the engine kept it solid is
+    // how the exit car's dead clip passed this test and stopped the player.
+    let models = std::cell::RefCell::new(placed.clone());
     let tick = |server: &mut Server| {
-        let owned = place(server);
+        let mut models = models.borrow_mut();
+        sync_placements(&mut models, |index| crate::engine::brush_placement(server, index));
         let mut query = Placed {
             collision: &collision,
-            models: &owned,
+            models: &models,
             chain: Vec::new(),
         };
         let interval = server.time().interval;
         server.frame(interval, &mut query);
+    };
+    // The player's clip chain, as `World::clip_models` builds it.
+    let clip_chain = || -> Vec<BrushModel> {
+        models.borrow().iter().filter(|p| p.owned && p.solid).map(|p| p.model).collect()
     };
     let origin_of = |server: &Server, name: &str| {
         let id = name::find_by_name(&server.entities, name)
@@ -11449,39 +11497,76 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         .expect("the departure elevator's trigger");
     let trigger = server.brush_entity(start_moving).expect("it spawned");
     let (mins, maxs) = (trigger.origin + trigger.model_bounds.mins, trigger.origin + trigger.model_bounds.maxs);
-    let probe = probe_inside(&collision, &placed, start_moving, mins, maxs).expect("a point inside it");
-    // Stand the player **on the elevator's floor**, as a player walking in
-    // would be: a hull dropped from the top of the trigger onto whatever is
-    // solid below it — the train's own brushes included. A player left
-    // overlapping those is a blocker, and the pusher stops the train for one.
-    let floor = {
+    let inside = |p: Vec3| p.x > mins.x && p.x < maxs.x && p.y > mins.y && p.y < maxs.y;
+    let goal = (mins + maxs) * 0.5;
+
+    // **Walk in**, through the movement code and the clip chain the engine
+    // builds — from the approach trigger, where the doors were opened, to the
+    // middle of the car's floor. The origin is the movement code's answer and
+    // not the test's: a clip left standing in the doorway stops the walk.
+    // Stood on the floor under the approach trigger first: the probe is only
+    // a point inside the trigger's brush, and a hull there can be in a wall.
+    let floor_under = |at: Vec3, top: f32, bottom: f32| -> Option<Vec3> {
         use crate::engine::trace::{Contents, Ray};
-        let owned = place(&server);
-        let solid: Vec<crate::engine::trace::BrushModel> =
-            owned.iter().filter(|p| p.solid).map(|p| p.model).collect();
-        let (hull_min, hull_max) = (Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 72.0));
-        // From the highest clear spot in the trigger's column, straight down.
-        let mut z = maxs.z;
-        let found = loop {
-            if z < mins.z - 72.0 {
-                break None;
-            }
-            let at = Vec3::new(probe.x, probe.y, z);
-            let clear = Ray::hull(at, at, hull_min, hull_max);
-            let mut tracer = collision.tracer().with_entities(&solid);
-            if !tracer.trace(&clear, Contents::MASK_PLAYERSOLID).start_solid {
-                let down = Ray::hull(at, at - Vec3::Z * 256.0, hull_min, hull_max);
-                let trace = collision.tracer().with_entities(&solid).trace(&down, Contents::MASK_PLAYERSOLID);
+        let chain = clip_chain();
+        let (hull_min, hull_max) = (player_mins(false), player_maxs(false));
+        let mut z = top;
+        while z >= bottom {
+            let from = Vec3::new(at.x, at.y, z);
+            let clear = Ray::hull(from, from, hull_min, hull_max);
+            if !collision.tracer().with_entities(&chain).trace(&clear, Contents::MASK_PLAYERSOLID).start_solid {
+                let down = Ray::hull(from, from - Vec3::Z * 256.0, hull_min, hull_max);
+                let trace = collision.tracer().with_entities(&chain).trace(&down, Contents::MASK_PLAYERSOLID);
                 if trace.did_hit() {
-                    break Some(trace.end);
+                    return Some(trace.end);
                 }
             }
             z -= 8.0;
-        };
-        found.expect("the elevator has a floor under its trigger")
+        }
+        None
     };
+    let at = server.player_state().expect("a player").origin;
+    let start = floor_under(at, at.z + 128.0, at.z - 256.0).expect("a floor under the approach trigger");
+    let mut mv = MoveData::standing_at(start);
+    let mut walked_in = None;
+    for t in 0..(64 * 15) {
+        let toward = (goal - mv.origin).truncate();
+        let there = toward.length() < 12.0;
+        if there && mv.velocity.truncate().length() < 1.0 {
+            walked_in = Some(t);
+            break;
+        }
+        mv.angles = crate::client::view::ViewAngles::new(0.0, toward.y.atan2(toward.x).to_degrees());
+        mv.forwardmove = if there { 0.0 } else { SV_SPEED_NORMAL.min(toward.length() * 16.0) };
+        {
+            let chain = clip_chain();
+            let mut tracer = collision.tracer().with_entities(&chain);
+            let angles = mv.angles;
+            player_move(&mut mv, Some(&mut tracer), None, &MoveVars::PORTAL2, 1.0 / 64.0, angles);
+        }
+        let mut state = server.player_state().expect("a player");
+        state.origin = mv.origin;
+        state.velocity = mv.velocity;
+        state.on_ground = mv.ground.is_some();
+        state.mins = player_mins(mv.ducked);
+        state.maxs = player_maxs(mv.ducked);
+        server.set_player_state(state);
+        tick(&mut server);
+        if t % 64 == 0 {
+            println!("departure: walking in, {:.0}s: {:.1} ({:.0} units to go)", t as f32 / 64.0, mv.origin, toward.length());
+        }
+    }
+    let walked_in = walked_in.unwrap_or_else(|| {
+        panic!(
+            "the player walks into the exit car: stopped at {} with {:.0} units to go",
+            mv.origin,
+            (goal - mv.origin).truncate().length()
+        )
+    });
+    assert!(inside(mv.origin), "the player stands inside the car's trigger");
+    println!("departure: walked into the car in {:.1}s, standing at {:.1}", walked_in as f32 / 64.0, mv.origin);
     let mut state = server.player_state().expect("a player");
-    state.origin = floor;
+    state.velocity = Vec3::ZERO;
     server.set_player_state(state);
 
     let train = name::find_by_name(&server.entities, "departure_elevator-elevator_1")
@@ -11499,7 +11584,15 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         if moving_at.is_none() && server.entities.get(train).is_some_and(|e| e.core.speed > 0.0) {
             moving_at = Some(t);
         }
-        if let Some(c) = server.take_console_commands().into_iter().find(|c| c.starts_with("map ")) {
+        let console = server.take_console_commands();
+        assert!(
+            !console.iter().any(|c| c.starts_with("map ")),
+            "the script's `map` fallback is not taken: @changelevel exists ({console:?})"
+        );
+        for c in console {
+            println!("departure: a script sent `{c}` to the console after {:.1}s", t as f32 / 64.0);
+        }
+        if let Some(c) = server.take_server_commands().into_iter().find(|c| c.starts_with("changelevel ")) {
             map_command = Some((t, c));
             break;
         }
@@ -11536,8 +11629,8 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
     assert!(top - ride_bottom > 3000.0, "the car carries the player most of the way down");
     assert!(hi - lo < 2.0, "the player stays on the car's floor all the way down");
     let (at, command) = map_command.expect("TransitionFromMap() asks for the next map");
-    println!("departure: TransitionFromMap() sent `{command}` after {:.1}s", at as f32 / 64.0);
-    assert_eq!(command, "map sp_a1_intro3");
+    println!("departure: @changelevel sent `{command}` after {:.1}s", at as f32 / 64.0);
+    assert_eq!(command, "changelevel sp_a1_intro3");
     assert!((speed - 200.0).abs() < 1e-3, "sp_elevator_motifs.nut's speed for this map");
     assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
 }

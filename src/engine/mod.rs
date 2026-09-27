@@ -295,6 +295,8 @@ impl<'a> Engine<'a> {
                 dir: "maps",
                 ext: "bsp",
             }),
+            CommandSpec::new("changelevel", "Change server to the specified map")
+                .with_completion(console::Completion::Files { dir: "maps", ext: "bsp" }),
             CommandSpec::new("quit", "Exit the engine."),
             CommandSpec::new("restart", "Restart the engine."),
             CommandSpec::new("bind", "Bind a key."),
@@ -682,6 +684,7 @@ impl<'a> Engine<'a> {
             world: scene.world.as_ref(),
             server: &mut scene.server,
             client: &mut scene.client,
+            vfs: scene.vfs,
         });
 
         // What `fps_max_callback` did. A poll rather than a callback, because a
@@ -782,6 +785,11 @@ impl<'a> Engine<'a> {
         // tick that asked.
         for command in self.scene.server.take_console_commands() {
             self.console.enqueue(&format!("{command}\n"), console::Source::ClientCmd);
+        }
+        // …and `engine->ServerCommand`/`engine->ChangeLevel`, which are the
+        // engine's own `Cbuf_AddText( CBUF_SERVER, … )`.
+        for command in self.scene.server.take_server_commands() {
+            self.console.enqueue(&format!("{command}\n"), console::Source::Code);
         }
 
         // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
@@ -1282,31 +1290,36 @@ impl<'a> Engine<'a> {
 /// entity the port has a class for, so this is a few dozen lookups a frame on
 /// a real map: 26 on `sp_a1_intro1`.
 fn sync_brush_models(world: &mut World, server: &Server) {
+    world.sync_brush_models(|index| brush_placement(server, index));
+}
+
+/// What the server says about brush model `*index`, or `None` if no live
+/// entity answers for it. Shared with the depot tests, which have no GPU and
+/// so no [`World`], so that they sync placements through the same rule.
+pub(crate) fn brush_placement(server: &Server, index: usize) -> Option<world::Placement> {
     use crate::server::movement::EF_NODRAW;
 
-    world.sync_brush_models(|index| {
-        let entity = server.brush_entity(index)?;
-        Some(world::Placement {
-            origin: entity.origin,
-            angles: entity.angles,
-            visible: entity.effects & EF_NODRAW == 0,
-            // `IsSolid()` rather than the `FSOLID_NOT_SOLID` bit alone, which
-            // is what stage 4 changed: a trigger is `SOLID_BSP` *and* not
-            // solid, and a `func_button` with `SF_BUTTON_NOTSOLID` is
-            // `SOLID_NONE`. Reading only the bit would have put every trigger
-            // in the game into the player's clip chain as a wall.
-            //
-            // …and `collides_with_player()`, which is the pusher's rule read
-            // from the other side. **The clip chain has exactly one consumer**
-            // — the player's own move, `Engine::update_client` — so "solid"
-            // here means "solid to the player", and the 141 doors that set
-            // `SF_DOOR_NONSOLID_TO_PLAYER` are ones the shipped game lets you
-            // walk straight through. Leaving them in would make a door the
-            // player cannot pass *and* cannot block, which is the worst of
-            // both readings.
-            solid: entity.is_solid() && entity.collides_with_player(),
-        })
-    });
+    let entity = server.brush_entity(index)?;
+    Some(world::Placement {
+        origin: entity.origin,
+        angles: entity.angles,
+        visible: entity.effects & EF_NODRAW == 0,
+        // `IsSolid()` rather than the `FSOLID_NOT_SOLID` bit alone, which
+        // is what stage 4 changed: a trigger is `SOLID_BSP` *and* not
+        // solid, and a `func_button` with `SF_BUTTON_NOTSOLID` is
+        // `SOLID_NONE`. Reading only the bit would have put every trigger
+        // in the game into the player's clip chain as a wall.
+        //
+        // …and `collides_with_player()`, which is the pusher's rule read
+        // from the other side. **The clip chain has exactly one consumer**
+        // — the player's own move, `Engine::update_client` — so "solid"
+        // here means "solid to the player", and the 141 doors that set
+        // `SF_DOOR_NONSOLID_TO_PLAYER` are ones the shipped game lets you
+        // walk straight through. Leaving them in would make a door the
+        // player cannot pass *and* cannot block, which is the worst of
+        // both readings.
+        solid: entity.is_solid() && entity.collides_with_player(),
+    })
 }
 
 /// Every model an entity places, as `world/` wants it.
@@ -2003,6 +2016,8 @@ struct EngineCommands<'e> {
     /// The entity list, for `report_entities` and `ent_dump`. Shared, like
     /// [`world`](EngineCommands::world): neither command changes anything.
     server: &'e mut Server,
+    /// The mounted game, for `changelevel`'s `Map_IsValid`.
+    vfs: Option<&'e Vfs>,
 }
 
 /// `input/` defines [`CommandSink`] and `console/` provides the buffer, and
@@ -2641,6 +2656,25 @@ impl CommandTarget for EngineCommands<'_> {
                 Some(name) => self.host.request_new_game(name),
                 None => cx.print("map <mapname> : load a map"),
             },
+            // `Host_Changelevel_f` (`engine/host_cmd.cpp:1524`): "continue
+            // game on a new level" — what `engine->ChangeLevel` puts in the
+            // buffer, and so what `point_changelevel` ends in. It refuses
+            // without a running level or a map that exists, where `map` loads
+            // blindly. `HostState_ChangeLevelMP` then keeps the clients
+            // connected across the load; with the client in this process
+            // there is no connection to keep, so it is the same new game.
+            // `Host_Map_Helper_FuzzyName` is not ported.
+            "changelevel" => match cmd.arg(1) {
+                None => cx.print("changelevel <levelname> : continue game on a new level"),
+                Some(_) if !self.host.has_level() => cx.print("Can't changelevel, not running server"),
+                Some(name) => {
+                    let map = name.strip_suffix(".bsp").unwrap_or(name);
+                    match self.vfs.is_some_and(|vfs| vfs.exists(&format!("maps/{map}.bsp"))) {
+                        true => self.host.request_new_game(map),
+                        false => cx.print(&format!("changelevel failed: {map} not found")),
+                    }
+                }
+            },
             // `CON_COMMAND_F( quit, "Exit the engine.", FCVAR_NONE )`
             // (`engine/host_cmd.cpp:2750`).
             // `CON_COMMAND_F( noclip, ..., FCVAR_CHEAT )` — **a server command
@@ -2994,6 +3028,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
 
@@ -3013,6 +3048,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert!(
             client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove > 0.0,
@@ -3030,6 +3066,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert_eq!(client.create_move(1.0 / 60.0, (0.0, 0.0)).forwardmove, 0.0);
     }
@@ -3063,6 +3100,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert!(!ui.is_open());
 
@@ -3077,6 +3115,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert!(ui.is_open(), "the console key opened the console");
 
@@ -3093,6 +3132,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert!(!ui.is_open());
     }
@@ -3141,6 +3181,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), None);
@@ -3231,6 +3272,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         sensitivity.set_string("6");
         console.enqueue("host_writeconfig", Source::Code);
@@ -3241,6 +3283,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
 
         let written = store
@@ -3268,6 +3311,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
 
         assert_eq!(input.bindings().get(Button::Key(Key::W)), Some("+forward"));
@@ -3307,6 +3351,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
 
         assert!(
@@ -3335,6 +3380,7 @@ mod tests {
             world: None,
             server: &mut Server::new(),
             client: &mut client,
+            vfs: None,
         });
         assert!(store.files.lock().expect("not poisoned").is_empty());
     }

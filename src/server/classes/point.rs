@@ -1,4 +1,5 @@
-//! Point entities that act on somebody else: `point_teleport`.
+//! Point entities that act on somebody else: `point_teleport`, and
+//! `point_changelevel`, which acts on the whole game.
 //!
 //! `game/server/pointteleport.cpp` (`CPointTeleport`, 213 lines) — **128
 //! entities across the shipped maps**, and the class that makes stage 4's
@@ -13,7 +14,7 @@
 
 use crate::server::class::{Behaviour, Context, InputDef, InputDefs};
 use crate::server::entity::EntityCore;
-use crate::server::io::{FieldType, Input};
+use crate::server::io::{FieldType, Input, Variant};
 use crate::server::touch::{self, Teleport};
 use glam::Vec3;
 
@@ -170,5 +171,54 @@ impl Behaviour for PointTeleport {
             ("save_origin", format!("{:?}", self.save_origin)),
             ("save_angles", format!("{:?}", self.save_angles)),
         ]
+    }
+}
+
+/// `CPointChangelevel` — `LINK_ENTITY_TO_CLASS( point_changelevel, … )`.
+///
+/// **Its source is not in this tree.** `server_portal2.vpc` lists
+/// `portal2\point_changelevel.cpp` and the file was never shipped with it, so
+/// this is built from the two things that are fixed from outside: the FGD
+/// (`bin/portal2.fgd:614` — one input, `ChangeLevel(string)`, and one output,
+/// `OnChangeLevel`) and the engine call a server makes to change level,
+/// `engine->ChangeLevel( map, NULL )` (`vengineserver_impl.cpp:310`), which is
+/// the one way `server.dll` has to ask for it.
+///
+/// What the shipped maps do with it pins the rest. **62 of the 106 maps place
+/// exactly one**, every one named `@changelevel` and carrying no key but its
+/// name; **no map connects an output to it or fires an input at it**. The only
+/// caller in the game is `transitions/sp_transition_list.nut`'s
+/// `TransitionFromMap()`, which fires `Changelevel` with the next map's name —
+/// and, where the map has no `@changelevel`, sends `map <next>` to the console
+/// instead. That fallback is how the level was left before this class
+/// existed.
+pub struct PointChangelevel;
+
+pub static POINT_CHANGELEVEL_INPUTS: InputDefs = &[InputDef::new("ChangeLevel", FieldType::String)];
+
+impl PointChangelevel {
+    pub fn create() -> Box<dyn Behaviour> {
+        Box::new(PointChangelevel)
+    }
+}
+
+impl Behaviour for PointChangelevel {
+    fn accept_input(
+        &mut self,
+        entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        if !input.name.eq_ignore_ascii_case("ChangeLevel") {
+            return false;
+        }
+        let me = entity.id();
+        entity.fire_output("OnChangeLevel", Variant::Void, input.activator, Some(me), 0.0, cx);
+        // `engine->ChangeLevel( s1, NULL )`: no landmark, so a plain
+        // `changelevel` — Portal 2's single-player transitions carry nothing
+        // across, and the next map's arrival elevator is its own
+        // `OnPostTransition()`.
+        cx.change_level(&input.value.to_string());
+        true
     }
 }
