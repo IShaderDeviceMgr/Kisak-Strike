@@ -83,6 +83,20 @@ pub enum VertexLayout {
     /// `numTexCoords` is 2 or, when the material has a `$bumpmap`, 3.
     World,
 
+    /// World brush geometry with a surface frame and no lightmap: position,
+    /// one texture coordinate, colour, the normal and the two tangents.
+    /// [`WorldTangentVertex`].
+    ///
+    /// `SolidEnergy`'s brush form — `VERTEX_POSITION | VERTEX_NORMAL |
+    /// VERTEX_TANGENT_S | VERTEX_TANGENT_T` with one texture coordinate
+    /// (`solidenergy_dx9_helper.cpp:139`) — which is what a fizzler's field is
+    /// drawn from. It is the *unbumped* `LightmappedGeneric` format's normal and
+    /// tangents without its lightmap coordinates, and it is a layout of its
+    /// own rather than three more fields on [`WorldVertex`] because nothing
+    /// else a map draws reads them: 1,186 of the game's brush faces name this
+    /// shader, and adding 36 bytes to every other one would pay for them.
+    WorldTangent,
+
     /// Model geometry: position, normal, one texture coordinate, a tangent,
     /// and the baked static-lighting colour. [`ModelVertex`].
     ///
@@ -117,6 +131,7 @@ impl VertexLayout {
         match self {
             VertexLayout::Simple => &[SimpleVertex::LAYOUT],
             VertexLayout::World => &[WorldVertex::LAYOUT],
+            VertexLayout::WorldTangent => &[WorldTangentVertex::LAYOUT],
             VertexLayout::Model => &[ModelVertex::LAYOUT, StaticLightVertex::LAYOUT],
             VertexLayout::StaticLight => &[StaticLightVertex::LAYOUT],
         }
@@ -132,6 +147,7 @@ impl VertexLayout {
         match self {
             VertexLayout::Simple => size_of::<SimpleVertex>() as u64,
             VertexLayout::World => size_of::<WorldVertex>() as u64,
+            VertexLayout::WorldTangent => size_of::<WorldTangentVertex>() as u64,
             VertexLayout::Model => size_of::<ModelVertex>() as u64,
             VertexLayout::StaticLight => size_of::<StaticLightVertex>() as u64,
         }
@@ -275,6 +291,53 @@ impl WorldVertex {
 
 impl Vertex for WorldVertex {
     const LAYOUT: VertexLayout = VertexLayout::World;
+}
+
+/// Position, texture coordinate, colour, normal and the two tangents.
+/// [`VertexLayout::WorldTangent`].
+///
+/// What `BuildMSurfaceVertexArrays` writes for a surface with
+/// `SURFDRAW_TANGENTSPACE` (`engine/matsys_interface.cpp:1506`), minus the
+/// lightmap coordinates its shader never reads. The normal and the tangents
+/// are constant across a flat face: `TangentSpaceSurfaceSetup` and
+/// `TangentSpaceComputeBasis` (`:1402`) build them once from the texinfo's
+/// texture axes, and the world builder does the same — see
+/// `engine::world::FaceBasis`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct WorldTangentVertex {
+    pub position: [f32; 3],
+    /// `TEXCOORD0`, already divided by the texture's mapping size.
+    pub texcoord: [f32; 2],
+    /// `COLOR0`, read when `$vertexcolor` is set.
+    pub color: [f32; 4],
+    /// `NORMAL`.
+    pub normal: [f32; 3],
+    /// `TANGENT` — the direction `u` increases in, on the surface.
+    pub tangent_s: [f32; 3],
+    /// `BINORMAL` — the direction `v` increases in.
+    pub tangent_t: [f32; 3],
+}
+
+impl WorldTangentVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x2,
+        2 => Float32x4,
+        3 => Float32x3,
+        4 => Float32x3,
+        5 => Float32x3,
+    ];
+
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: size_of::<WorldTangentVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &WorldTangentVertex::ATTRIBUTES,
+    };
+}
+
+impl Vertex for WorldTangentVertex {
+    const LAYOUT: VertexLayout = VertexLayout::WorldTangent;
 }
 
 /// Position, normal, texture coordinate, tangent, baked static light.

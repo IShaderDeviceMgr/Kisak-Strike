@@ -45,6 +45,50 @@ use super::pipeline::TargetFormat;
 use super::renderer::Frame;
 use super::target::RenderTarget;
 
+/// What the presenting pass does to the picture on its way out: the screen
+/// fade.
+///
+/// `SetViewFadeParams` (`viewpostprocess.cpp:1556`) and `engine_post`'s
+/// `FADE_TYPE` (`engine_post_ps2x.fxc:437`). **Valve does not draw a fade as a
+/// quad over the scene**; it hands the colour to the last full-screen pass,
+/// which lerps each pixel towards it — so that is where it is here too, and it
+/// costs nothing on a frame with no fade.
+///
+/// **The lerp is in gamma space**, because `engine_post` reads and writes the
+/// frame buffer with sRGB conversion *off* on the PC
+/// (`bForceSRGBReadsAndWrites`, `engine_post_dx9.cpp:330`). A fade to black at
+/// half alpha is therefore half the *encoded* value — about a fifth of the
+/// light — not half the light. The blit decodes the scene on the fetch and
+/// encodes it on the write, so it converts both ways around the lerp to land
+/// where Valve's did.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ViewFade {
+    /// The colour, 0-1 from the fade's bytes, and in `w` how far towards it.
+    pub color: [f32; 4],
+    /// `FFADE_MODULATE`: multiply by the colour rather than blending to it.
+    pub modulate: bool,
+}
+
+impl ViewFade {
+    /// From the bytes and the flag `CViewEffects::GetFadeParams` answers.
+    pub fn from_bytes(color: [u8; 4], modulate: bool) -> ViewFade {
+        ViewFade {
+            color: color.map(|c| f32::from(c) / 255.0),
+            modulate,
+        }
+    }
+
+    /// `nFadeType` (`viewpostprocess.cpp:1886`): 0 for none — any fade with no
+    /// alpha — then 1 to blend and 2 to modulate.
+    fn kind(&self) -> u32 {
+        match (self.color[3] > 0.0, self.modulate) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+        }
+    }
+}
+
 /// The scene target, the thing that measures it, and the pass that presents it.
 pub struct PostProcess {
     device: wgpu::Device,
@@ -70,7 +114,7 @@ impl PostProcess {
         bounds: &[f32],
     ) -> PostProcess {
         PostProcess {
-            blit: Blit::new(device, format.color),
+            blit: Blit::new(device, queue, format.color),
             histogram: Histogram::new(device, queue, bounds),
             format,
             scene: None,
@@ -174,6 +218,12 @@ impl PostProcess {
         self.blit.record(encoder, destination);
     }
 
+    /// Sets the screen fade the next [`resolve`](PostProcess::resolve)
+    /// applies. [`ViewFade::default`] is none.
+    pub fn set_fade(&mut self, fade: ViewFade) {
+        self.blit.fade = fade;
+    }
+
     /// How many buckets a [`measurement`](PostProcess::measurement) comes back
     /// with. The tone mapper's own bucket count, round-tripped.
     #[allow(dead_code)]
@@ -194,10 +244,28 @@ struct Blit {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     bind_group: Option<wgpu::BindGroup>,
+    queue: wgpu::Queue,
+    /// `FadeUniforms`, rewritten every [`record`](Blit::record).
+    uniforms: wgpu::Buffer,
+    /// Whether the destination encodes on write — and so whether the shader
+    /// has to convert to gamma space around the fade itself.
+    srgb: bool,
+    fade: ViewFade,
+}
+
+/// `shaders/blit.wgsl`'s `FadeUniforms`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FadeUniforms {
+    color: [f32; 4],
+    /// [`ViewFade::kind`].
+    kind: u32,
+    srgb: u32,
+    _padding: [u32; 2],
 }
 
 impl Blit {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Blit {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Blit {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
             entries: &[
@@ -215,6 +283,16 @@ impl Blit {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -277,6 +355,15 @@ impl Blit {
             }),
             layout,
             bind_group: None,
+            queue: queue.clone(),
+            uniforms: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blit fade"),
+                size: size_of::<FadeUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            srgb: format.is_srgb(),
+            fade: ViewFade::default(),
         }
     }
 
@@ -296,6 +383,10 @@ impl Blit {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniforms.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -304,6 +395,16 @@ impl Blit {
         let Some(bind_group) = &self.bind_group else {
             return;
         };
+        // One blit a frame, so one small write rather than an arena: the write
+        // lands before this frame's submission reads it.
+        let uniforms = FadeUniforms {
+            color: self.fade.color,
+            kind: self.fade.kind(),
+            srgb: u32::from(self.srgb),
+            _padding: [0; 2],
+        };
+        self.queue
+            .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("blit"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -466,6 +567,55 @@ mod tests {
             readback(&device, &queue, post.scene((SIZE * 2, SIZE)))[0],
             0
         );
+    }
+
+    /// The screen fade lerps the *encoded* bytes, as `engine_post` did with
+    /// sRGB conversion off: half way to black is half the byte, not half the
+    /// light. And a modulating fade multiplies the bytes.
+    #[test]
+    fn a_screen_fade_lerps_in_gamma_space() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let mut post = PostProcess::new(&device, &queue, target_format(), &bounds());
+        let back = RenderTarget::new(&device, "back buffer", SIZE, SIZE, FORMAT, false);
+        let color = wgpu::Color {
+            r: 0.1,
+            g: 0.4,
+            b: 0.8,
+            a: 1.0,
+        };
+        let present = |post: &mut PostProcess, fade: ViewFade| {
+            post.set_fade(fade);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            clear(&mut encoder, post.scene((SIZE, SIZE)), color);
+            post.record(&mut encoder, back.view(), None);
+            queue.submit([encoder.finish()]);
+            let scene = readback(&device, &queue, post.scene((SIZE, SIZE)));
+            (scene[..4].to_vec(), readback(&device, &queue, &back)[..4].to_vec())
+        };
+
+        let (scene, half_black) = present(&mut post, ViewFade::from_bytes([0, 0, 0, 128], false));
+        for channel in 0..3 {
+            let want = f32::from(scene[channel]) * (1.0 - 128.0 / 255.0);
+            assert!(
+                (f32::from(half_black[channel]) - want).abs() <= 1.0,
+                "channel {channel}: {} -> {}, expected {want}",
+                scene[channel],
+                half_black[channel]
+            );
+        }
+
+        let (scene, modulated) = present(&mut post, ViewFade::from_bytes([128, 255, 255, 255], true));
+        let want = f32::from(scene[0]) * 128.0 / 255.0;
+        assert!((f32::from(modulated[0]) - want).abs() <= 1.0, "{modulated:?} {want}");
+        assert!(modulated[1].abs_diff(scene[1]) <= 1 && modulated[2].abs_diff(scene[2]) <= 1);
+
+        // No alpha, no fade — whatever the colour says.
+        let (scene, untouched) = present(&mut post, ViewFade::from_bytes([255, 0, 0, 0], false));
+        for channel in 0..3 {
+            assert!(untouched[channel].abs_diff(scene[channel]) <= 1);
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ use std::any::Any;
 use glam::Vec3;
 
 use super::attachment::{Attachments, Posed, Poser};
+use crate::client::fade::ScreenFade;
 use super::damage::{self, DamageInfo, DamageMode, Damaged, LifeState};
 use super::entity::{Entity, EntityCore, EntityId, EntityList};
 use super::io::{Event, EventQueue, FieldType, Input, Target, Variant};
@@ -490,6 +491,8 @@ pub struct Context<'a> {
     reload_level: bool,
     /// The map [`change_level`](Context::change_level) asked for.
     change_level: Option<String>,
+    /// What [`screen_fade`](Context::screen_fade) sent.
+    screen_fades: Vec<ScreenFade>,
     /// Whether this handler parented anything to an attachment point — the
     /// one bit `Server::refresh_attachment_children` needs to know.
     attachments_used: bool,
@@ -527,6 +530,7 @@ impl<'a> Context<'a> {
             physics: Vec::new(),
             reload_level: false,
             change_level: None,
+            screen_fades: Vec::new(),
             attachments_used: false,
             sequences,
             attachments,
@@ -1041,6 +1045,30 @@ impl<'a> Context<'a> {
     /// What [`change_level`](Context::change_level) asked for.
     pub(super) fn take_change_level(&mut self) -> Option<String> {
         self.change_level.take()
+    }
+
+    /// `UTIL_ScreenFadeAll` / `UTIL_ScreenFade` — the `Fade` user message, to
+    /// the one client there is.
+    ///
+    /// **Only when there is a player to send it to**: `UTIL_ScreenFadeWrite`
+    /// returns early for a recipient that `!IsNetClient()`, so a fade fired
+    /// on a server with nobody connected goes nowhere rather than waiting.
+    /// `ShouldThrottleUserMessage( "Fade" )` — a per-player rate limit on the
+    /// same message — is not reproduced: nothing in single player comes near
+    /// it.
+    ///
+    /// Harvested by `Server::dispatch` and answered by
+    /// `Server::take_screen_fades`, as [`change_level`](Context::change_level)
+    /// is.
+    pub fn screen_fade(&mut self, fade: ScreenFade) {
+        if self.player.is_some() {
+            self.screen_fades.push(fade);
+        }
+    }
+
+    /// What [`screen_fade`](Context::screen_fade) sent.
+    pub(super) fn take_screen_fades(&mut self) -> Vec<ScreenFade> {
+        std::mem::take(&mut self.screen_fades)
     }
 
     /// Whether this handler parented anything to an attachment point.

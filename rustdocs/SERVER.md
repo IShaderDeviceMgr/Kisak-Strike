@@ -2007,8 +2007,8 @@ pub vscripts: Option<String>,
 pub script_think_function: Option<String>,
 ```
 
-Fifty-six classnames, **37,563 of the shipped game's 60,925 entity blocks**.
-**Fifty-one of them are among the 200 classnames the maps place**; the other
+Fifty-seven classnames, **37,890 of the shipped game's 60,925 entity blocks**.
+**Fifty-two of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2026,6 +2026,7 @@ because Valve registers them:
 | `info_target` | `CInfoTarget` | 431 |
 | `logic_timer` | `CTimerEntity` | 151 |
 | `info_player_start` | `CPointEntity` | 116 |
+| `env_fade` | `CEnvFade` | 327 |
 | `env_tonemap_controller` | `CEnvTonemapController` | 110 |
 | `worldspawn` | `CWorld` | 106 |
 | `math_counter` | `CMathCounter` | 102 |
@@ -3027,6 +3028,11 @@ the arm's origin start at 91.
     takes a `prop_dynamic` out of the player's way on the next tick, and
     `EnableCollision` (8) puts it back. A parented `prop_dynamic` is kinematic
     and never swept; see `rustdocs/VPHYSICS.md` §4b.
+107. **A screen fade needs a player to go to.** `Context::screen_fade` drops a
+    fade when the server has no player, as `UTIL_ScreenFadeWrite` drops one for
+    a recipient that is not a net client — so a test that fires `Fade` before
+    `spawn_player` sees `OnBeginFade` fire and `take_screen_fades` come back
+    empty. Fades are taken once, like server commands.
 
 ---
 
@@ -3150,10 +3156,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 ## What the maps place that is not here — the unported classnames
 
-**149 of the 200 classnames the shipped maps place have no class here: 23,362 of
+**148 of the 200 classnames the shipped maps place have no class here: 23,035 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
 `func_tracktrain`, `path_track`, `prop_button`, `prop_under_button`,
-`logic_script` and `point_changelevel` have landed since.) Every one is listed below, grouped by what it would
+`logic_script`, `point_changelevel` and `env_fade` have landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3404,7 +3410,7 @@ Each wants a renderer feature first — fog, sprites, particles, ropes, video �
 | `fog_volume` | `CFogVolume` (`server/fogvolume.cpp:17`) | 1 | 1 / 0 | 1 |  | 0 / 0 | A brush that switches fog controllers. One entity. |
 | `color_correction_volume` | `CColorCorrectionVolume` (`server/colorcorrectionvolume.cpp:67`) | 1 | 1 / 0 | 1 |  | 0 / 0 | The brush that switches one. |
 
-#### Sound, HUD, camera and effects — 28 classnames, 4,216 entities
+#### Sound, HUD, camera and effects — 27 classnames, 3,889 entities
 
 Mostly waiting on a subsystem this port has not got: sound, a HUD, particles.
 
@@ -3412,7 +3418,6 @@ Mostly waiting on a subsystem this port has not got: sound, a HUD, particles.
 |---|---|---:|---:|---:|---:|---:|---|
 | `ambient_generic` | `CAmbientGeneric` (`server/ambientgeneric.cpp:88`) | 1,910 | 1,081 / 829 | 64 | 36 | 2,145 / 0 | A sound. 1,881 `PlaySound` connections. No sound system. |
 | `env_soundscape` | `CEnvSoundscape` (`server/soundscape.cpp:71`) | 1,102 | 800 / 302 | 63 | 19 | 60 / 0 | The ambient soundscape for a region. No sound system. |
-| `env_fade` | `CEnvFade` (`server/EnvFade.cpp:53`) | 327 | 124 / 203 | 63 | 5 | 331 / 0 | Fades the screen. 326 `Fade` connections. |
 | `game_text` | `CGameText` (`server/maprules.cpp:553`) | 244 | 202 / 42 | 62 | 3 | 6 / 0 | Text on screen. No HUD. |
 | `env_spark` | `CEnvSpark` (`server/EnvSpark.cpp:83`) | 162 | 135 / 27 | 32 | 2 | 140 / 0 | Sparks. Particles and sound. |
 | `env_shake` | `CEnvShake` (`server/EnvShake.cpp:91`) | 148 | 127 / 21 | 40 | 5 | 204 / 1 | Screen shake. 190 `StartShake`. |
@@ -3616,11 +3621,12 @@ case values.
 | `tests::entities_finds_by_name_and_classname` | `CEntities`' iteration |
 | `tests::a_script_error_is_printed_and_the_level_carries_on` | The error handler's output |
 | `tests::a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root` | `RemoveInstance`, `IsValid` |
-| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code — **down the static-prop stairs, not through them** — rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` |
+| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code — **down the static-prop stairs, not through them** — rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` — **after** `exit_fade` has sent the screen to black |
 | `physics::tests::a_still_prop_dynamic_stops_the_player_until_its_collision_is_disabled` | gotcha 106 |
 | `tests::a_teleport_does_not_touch_the_triggers_it_jumps_over` | gotcha 45: `point_teleport` and a portal crossing are box tests at the destination; a walk still sweeps |
 | `tests::no_shipped_map_leaves_itself_on_arrival` (depot) | gotcha 45 on every map: ten seconds of arrival, with scripts and real triggers, asks for no `changelevel` or `map` |
 | `tests::point_changelevel_asks_the_engine_for_one_changelevel` | `OnChangeLevel`, and one `changelevel` per level (gotcha 105) |
+| `tests::env_fade_fades_the_players_screen_and_reverses_from_where_it_got_to` | `Fade`'s flags and 7.9 fixed-point duration, `FadeReverse` starting from the forward fade's alpha, `OnBeginFade`, and no fade without a player (gotcha 107) |
 | `tests::every_shipped_maps_scripts_run` (depot) | 104 of 106 maps run five seconds of their scripts without an error |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
@@ -3827,10 +3833,10 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 37,563 matched, 65
-created, 30,691 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
-149 unimplemented classnames, the full 49-name unhandled-key table, 7,005
-events dispatched, 6,272 inputs accepted, 17,357 thinks, 1,032 events that found
+server time**, and asserts exact totals: 60,925 blocks, 37,890 matched, 65
+created, 31,018 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
+148 unimplemented classnames, the full 49-name unhandled-key table, 7,005
+events dispatched, 6,277 inputs accepted, 17,357 thinks, 1,027 events that found
 no target, zero bad conversions, the **seven**-name unhandled-input table, a peak
 of 219 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
@@ -5423,7 +5429,8 @@ as `map` does, because `HostState_ChangeLevelMP`'s difference — keeping the
 clients connected — has no meaning with the client in this process.
 
 What `@changelevel` does **not** do is fade the screen out: in the shipped game the
-transition's `env_fade` has already run by the time it fires. That is the next step.
+transition's `env_fade` has already run by the time it fires — see the next
+section.
 
 **The clip that stayed.** Playing it showed the exit car could not be entered
 without `noclip`. `departure_elevator-elevator_playerclip` fills the car until
@@ -5435,3 +5442,55 @@ it never answered for is left alone, as before. The depot test did not see it
 because its copy of the sync dropped dead entities where the engine's kept them,
 and because it placed the player in the car by hand. It now uses the engine's
 own `sync_placements` and `engine::brush_placement`, and walks.
+
+### `env_fade` — going to black
+
+`classes/env.rs`, `EnvFade`; the message and the client's list are
+`client/fade.rs`; the picture is `materials::post::ViewFade`. **327 across 105
+maps**, and every transition in the game goes through one:
+`@transition_from_map` fires `exit_fade` — 0.3 s to black with `SF_FADE_STAYOUT` —
+on the same trigger as the script that fires `@changelevel`. On `sp_a1_intro2`
+the fade goes out 22.0 s after the car starts and the `changelevel` at 22.4 s, so
+the car is fully black a tenth of a second before the level changes; the depot
+test asserts the order.
+
+```rust
+// client/fade.rs
+pub struct ScreenFade { pub duration: u16, pub hold_time: u16, pub flags: u16, pub color: [u8; 4] }
+impl ScreenFade { pub fn new(color: [u8; 4], fade_time: f32, hold_time: f32, flags: u16) -> ScreenFade }
+pub struct ViewFades;   // fade(&ScreenFade, now), calculate(now) -> FadeParams, clear()
+pub struct FadeParams { pub color: [u8; 4], pub modulate: bool }
+// class.rs
+impl Context<'_> { pub fn screen_fade(&mut self, fade: ScreenFade) }
+// mod.rs
+impl Server {
+    pub fn take_screen_fades(&mut self) -> Vec<ScreenFade>;
+    pub fn screen_fade(&mut self, fade: ScreenFade); // the `fadein`/`fadeout` commands
+}
+```
+
+The path is Valve's, with the network taken out. `Fade` and `FadeReverse` build a
+`ScreenFade_t` — **the times in 7.9 fixed point**, so 0.3 s is 153/512 — and send
+it through `Context::screen_fade`, which is `UTIL_ScreenFadeAll`; the engine drains
+`Server::take_screen_fades` once a tick into the client's `ViewFades`
+(`CViewEffects`' fade list), timed by the client's clock when it arrives. Once a
+frame the engine asks `ViewFades::calculate` for the combined colour — averaged in
+integers, highest alpha — and hands it to `PostProcess::set_fade`. **The fade is
+not a quad drawn over the scene**: Valve applies it in `engine_post`, the last
+full-screen pass, as `lerp( scene, colour, alpha )`, with sRGB conversion off —
+so the lerp is on the encoded bytes and half way to black is about a fifth of the
+light. The blit does the same, converting around the lerp
+(`a_screen_fade_lerps_in_gamma_space`). `Client::spawn` clears the list, which is
+`CViewEffects::LevelInit`: the black a stay-out exit fade leaves is lifted when the
+next level starts.
+
+`FadeReverse` goes the other way over `ReverseFadeDuration`, starting from how far
+the forward fade had got (`m_clrRender.a * elapsed / duration`), which is the one
+place the class keeps state. **No shipped map connects `OnBeginFade`.**
+`SF_FADE_ONLYONE` fades only an activator that is the player. The console commands
+`fadeout`/`fadein` `{time r g b}` are here too, with `GetFadeParms`' off-by-one
+kept: exactly five arguments read the alpha from past the end, as 0.
+
+**Not reproduced:** `ShouldThrottleUserMessage( "Fade" )`, a per-player rate limit
+nothing in single player approaches, and `g_pIntroData`'s override of the fade,
+which is the co-op intro camera.

@@ -1,12 +1,16 @@
 //! `env_*`: the entities that tell the renderer how to look at the map.
 //!
-//! One so far, and it is the one `portdocs/CLIENT_TONEMAP.md` named as the
-//! single measured gap in an otherwise complete tone mapper.
+//! Two so far. `env_tonemap_controller` is the one
+//! `portdocs/CLIENT_TONEMAP.md` named as the single measured gap in an
+//! otherwise complete tone mapper; `env_fade` is how every transition in the
+//! game goes to black.
 
+use crate::client::fade::{ScreenFade, FFADE_IN, FFADE_MODULATE, FFADE_OUT, FFADE_PURGE, FFADE_STAYOUT};
 use crate::client::tonemap::TonemapSettings;
 use crate::server::class::{Behaviour, Context, InputDef, InputDefs};
 use crate::server::entity::EntityCore;
-use crate::server::io::{FieldType, Input};
+use crate::server::io::{FieldType, Input, Variant};
+use crate::server::keyvalue::atof;
 
 /// `SF_TONEMAP_MASTER` (`env_tonemap_controller.cpp:18`).
 ///
@@ -180,3 +184,153 @@ pub(super) static TONEMAP_INPUTS: InputDefs = &[
     InputDef::new("SetTonemapPercentBrightPixels", FieldType::Float),
     InputDef::new("SetTonemapMinAvgLum", FieldType::Float),
 ];
+
+/// `SF_FADE_IN` (`EnvFade.cpp:67`) — fade from the colour rather than to it.
+pub const SF_FADE_IN: u32 = 0x0001;
+/// `SF_FADE_MODULATE` — multiply rather than blend.
+pub const SF_FADE_MODULATE: u32 = 0x0002;
+/// `SF_FADE_ONLYONE` — fade the activator's screen only, if it is a player.
+pub const SF_FADE_ONLYONE: u32 = 0x0004;
+/// `SF_FADE_STAYOUT` — stay faded until something replaces it.
+pub const SF_FADE_STAYOUT: u32 = 0x0008;
+
+pub static FADE_KEYS: &[&str] = &["duration", "holdtime", "ReverseFadeDuration"];
+
+pub static FADE_INPUTS: InputDefs = &[
+    InputDef::new("Fade", FieldType::Void),
+    InputDef::new("FadeReverse", FieldType::Void),
+];
+
+/// `CEnvFade` (`game/server/EnvFade.cpp`) — fades every player's screen to,
+/// or from, its render colour.
+///
+/// **327 of them, on 105 of the 106 maps**, and every transition in the game
+/// goes through one: `@transition_from_map` fires `exit_fade` — 0.3 s to
+/// black, `SF_FADE_STAYOUT` — in the same breath as the script that fires
+/// `@changelevel`, so the level is left in the dark and the next one's
+/// `LevelInit` lifts it. 326 of the game's connections to one fire `Fade`
+/// and 5 fire `FadeReverse`; 324 are black and two fade to white.
+///
+/// The colour is `m_clrRender` — `rendercolor` and `renderamt`, which every
+/// entity parses — so there is nothing to read here but the two times and
+/// the reverse duration.
+pub struct EnvFade {
+    duration: f32,
+    hold_time: f32,
+    reverse_duration: f32,
+    /// `m_flFadeStartTime`, which `FadeReverse` reads to start where `Fade`
+    /// has got to. Zero until the first `Fade`.
+    ///
+    /// Its mirror, `m_flReverseFadeStartTime`, is not kept: `FadeReverse`
+    /// writes it and the only reader is `InputFade`'s commented-out version of
+    /// the same anti-pop, so in the shipped game it is never read.
+    fade_start: f32,
+}
+
+impl EnvFade {
+    pub(super) fn create() -> Box<dyn Behaviour> {
+        Box::new(EnvFade {
+            duration: 0.0,
+            hold_time: 0.0,
+            reverse_duration: 0.0,
+            fade_start: 0.0,
+        })
+    }
+
+    /// The flags both inputs build: the direction `SF_FADE_IN` asks for when
+    /// `forward` — `Fade` — and the other one for `FadeReverse`, then
+    /// modulate and stay-out as the spawnflags say.
+    fn flags(entity: &EntityCore, forward: bool) -> u16 {
+        let fading_in = entity.has_spawn_flags(SF_FADE_IN) == forward;
+        let mut flags = if fading_in { FFADE_IN } else { FFADE_OUT };
+        if entity.has_spawn_flags(SF_FADE_MODULATE) {
+            flags |= FFADE_MODULATE;
+        }
+        if entity.has_spawn_flags(SF_FADE_STAYOUT) {
+            flags |= FFADE_STAYOUT;
+        }
+        flags
+    }
+
+    /// `UTIL_ScreenFade` to the activator for `SF_FADE_ONLYONE`, else
+    /// `UTIL_ScreenFadeAll` with `FFADE_PURGE` added.
+    fn send(
+        entity: &EntityCore,
+        input: &Input<'_>,
+        color: [u8; 4],
+        duration: f32,
+        hold: f32,
+        flags: u16,
+        cx: &mut Context<'_>,
+    ) {
+        if entity.has_spawn_flags(SF_FADE_ONLYONE) {
+            // `pActivator->IsNetClient()`: only a player's own screen, and
+            // only if a player is what fired it.
+            if input.activator.is_some() && input.activator == cx.player() {
+                cx.screen_fade(ScreenFade::new(color, duration, hold, flags));
+            }
+        } else {
+            cx.screen_fade(ScreenFade::new(color, duration, hold, flags | FFADE_PURGE));
+        }
+    }
+}
+
+impl Behaviour for EnvFade {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        let is = |name: &str| key.eq_ignore_ascii_case(name);
+        if is("duration") {
+            self.duration = atof(value);
+        } else if is("holdtime") {
+            self.hold_time = atof(value);
+        } else if is("ReverseFadeDuration") {
+            self.reverse_duration = atof(value);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn accept_input(
+        &mut self,
+        entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        let me = entity.id();
+        if input.name.eq_ignore_ascii_case("Fade") {
+            let flags = EnvFade::flags(entity, true);
+            let color = entity.render_color;
+            EnvFade::send(entity, input, color, self.duration, self.hold_time, flags, cx);
+            self.fade_start = cx.curtime();
+            entity.fire_output("OnBeginFade", Variant::Void, input.activator, Some(me), 0.0, cx);
+            return true;
+        }
+        if input.name.eq_ignore_ascii_case("FadeReverse") {
+            // The other direction, at the reverse duration.
+            let flags = EnvFade::flags(entity, false);
+            let mut color = entity.render_color;
+            // "Change the fade alpha to match the alpha of the current fade to
+            // prevent a pop" — a reverse part way through a forward fade
+            // starts from where that fade had got to. The `u8` truncation is
+            // `color32::a`'s.
+            if self.fade_start != 0.0 {
+                let elapsed = cx.curtime() - self.fade_start;
+                if elapsed < self.duration {
+                    color[3] = (f32::from(color[3]) * elapsed / self.duration) as u8;
+                }
+            }
+            EnvFade::send(entity, input, color, self.reverse_duration, self.hold_time, flags, cx);
+            entity.fire_output("OnBeginFade", Variant::Void, input.activator, Some(me), 0.0, cx);
+            return true;
+        }
+        false
+    }
+
+    fn describe(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("duration", self.duration.to_string()),
+            ("holdtime", self.hold_time.to_string()),
+            ("ReverseFadeDuration", self.reverse_duration.to_string()),
+        ]
+    }
+}

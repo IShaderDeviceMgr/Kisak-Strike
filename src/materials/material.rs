@@ -264,6 +264,10 @@ impl Material {
             // Built rather than skipped because a bind group must supply every
             // entry its layout declares, and every layout here declares a
             // block at `BINDING_MATERIAL_UNIFORMS`.
+            ShaderKind::SolidEnergy => {
+                let block = shader::solid_energy_uniforms(vmt);
+                create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
+            }
             ShaderKind::BufferClearObeyStencil => {
                 let block = shader::buffer_clear_uniforms(vmt);
                 create_uniform_buffer(device, queue, name, bytemuck::bytes_of(&block))
@@ -758,7 +762,7 @@ mod tests {
     /// pipeline is the half of this that has teeth:
     ///
     /// ```text
-    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_materials -- --ignored --nocapture
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_material -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
@@ -964,5 +968,8 @@ mod tests {
         at_least("UnlitGeneric", 928);
         at_least("WorldVertexTransition", 18);
         at_least("Refract", 37);
+        // All 14: the fizzlers, the laser plane, the tractor beams and the
+        // light bridge — including the three no map can reach yet.
+        at_least("SolidEnergy", 14);
     }
 }

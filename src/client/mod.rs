@@ -37,6 +37,7 @@
 //! wraps `run_move` without touching it (`portdocs/CLIENT.md` §4.8).
 
 pub mod button;
+pub mod fade;
 pub mod movement;
 pub mod player;
 pub mod tonemap;
@@ -152,6 +153,9 @@ pub struct Client {
     /// exposure controller is game code, and only the *measurement* of the
     /// frame it exposes belongs to the material system.
     tonemap: ToneMap,
+    /// The screen fades in progress — `CViewEffects`' fade list. See
+    /// [`fade`].
+    fades: fade::ViewFades,
     /// `mv->m_vecOldAngles` — where the view pointed on the *previous*
     /// command, captured at the top of [`create_move`](Client::create_move)
     /// because that is the last moment it is still the view.
@@ -415,6 +419,7 @@ impl Client {
             impulse: 0,
             keyboard_sample_time: 0.0,
             tonemap: ToneMap::new(console),
+            fades: fade::ViewFades::default(),
             old_view_angles: ViewAngles::new(0.0, 0.0),
             last_buttons: ButtonBits::NONE,
         }
@@ -430,6 +435,12 @@ impl Client {
     /// engine, once a frame, from [`Engine::render`](crate::engine::Engine::render).
     pub fn tonemap_mut(&mut self) -> &mut ToneMap {
         &mut self.tonemap
+    }
+
+    /// The screen fades: what `env_fade` sends, and what the presenting pass
+    /// reads once a frame.
+    pub fn fades_mut(&mut self) -> &mut fade::ViewFades {
+        &mut self.fades
     }
 
     /// What a `+command`/`-command` reaches.
@@ -485,6 +496,10 @@ impl Client {
         // first thing the player is shown — the same argument as dropping the
         // velocity above, for the same reason.
         self.tonemap.reset(1.0);
+        // `CViewEffects::LevelInit`'s `ClearAllFades`, at the same moment —
+        // which is what lifts the black a transition's `FFADE_STAYOUT` exit
+        // fade left behind, before the next map's own fade in.
+        self.fades.clear();
     }
 
     /// `m_nButtons` as the last command carried it, for the server's copy of

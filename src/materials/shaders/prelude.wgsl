@@ -53,6 +53,8 @@ struct FrameUniforms {
     light_scale: vec4<f32>,
     // cScreenSize, PS c32: (w, h, 1/w, 1/h)
     screen_size: vec4<f32>,
+    // x = `IShaderDynamicAPI::CurrentTime()`, in seconds. yzw unused.
+    time: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -106,6 +108,19 @@ struct WorldVertexInput {
     @location(2) lightmap_texcoord: vec2<f32>,
     @location(3) lightmap_offset: f32,
     @location(4) color: vec4<f32>,
+}
+
+// `mesh::WorldTangentVertex` / `VertexLayout::WorldTangent`: a brush surface
+// with the frame `TangentSpaceComputeBasis` builds and no lightmap. Only
+// `SolidEnergy` reads it.
+
+struct WorldTangentVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) texcoord: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+    @location(4) tangent_s: vec3<f32>,
+    @location(5) tangent_t: vec3<f32>,
 }
 
 // ---------------------------------------------------------------------------

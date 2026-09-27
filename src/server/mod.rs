@@ -303,6 +303,9 @@ pub struct Server {
     /// `CVEngineServer::ChangeLevel`'s `last_spawncount` guard: one
     /// `changelevel` per level, however many times it is asked.
     change_level_issued: bool,
+    /// `Fade` user messages on their way to the client — see
+    /// [`Server::take_screen_fades`].
+    screen_fades: Vec<crate::client::fade::ScreenFade>,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -907,6 +910,7 @@ impl Server {
             console_commands: Vec::new(),
             server_commands: Vec::new(),
             change_level_issued: false,
+            screen_fades: Vec::new(),
         }
     }
 
@@ -1242,6 +1246,7 @@ impl Server {
         self.server_commands.clear();
         // A new level is a new `sv.GetSpawnCount()`.
         self.change_level_issued = false;
+        self.screen_fades.clear();
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -2101,6 +2106,7 @@ impl Server {
         let queued_physics = cx.take_physics_queue();
         let reload = cx.take_reload_level();
         let change_level = cx.take_change_level();
+        self.screen_fades.extend(cx.take_screen_fades());
         // Once a level has any attachment parenting, every tick re-derives
         // what rides one — see `Server::refresh_attachment_children`.
         self.attachments_in_use |= cx.took_attachment();
@@ -3178,6 +3184,26 @@ impl Server {
     /// which is `SendToConsole`: that is a *client* command, from the player.
     pub fn take_server_commands(&mut self) -> Vec<String> {
         std::mem::take(&mut self.server_commands)
+    }
+
+    /// `UTIL_ScreenFade` to the player, from outside an entity handler —
+    /// the `fadein`/`fadeout` commands' way in. Dropped with no player, as
+    /// [`Context::screen_fade`](class::Context::screen_fade) drops it.
+    pub fn screen_fade(&mut self, fade: crate::client::fade::ScreenFade) {
+        if self.player.is_some() {
+            self.screen_fades.push(fade);
+        }
+    }
+
+    /// The `Fade` user messages the game sent the client — `env_fade`'s — in
+    /// the order they were sent, taken once.
+    ///
+    /// **Read once per tick by the engine**, which hands them to the client's
+    /// [`ViewFades`](crate::client::fade::ViewFades) at its own clock: a fade
+    /// is timed from when the *client* receives it, as `CViewEffects::Fade`
+    /// reads the client's `gpGlobals->curtime`.
+    pub fn take_screen_fades(&mut self) -> Vec<crate::client::fade::ScreenFade> {
+        std::mem::take(&mut self.screen_fades)
     }
 
     /// How many brush entities this map placed that the port has a class for.

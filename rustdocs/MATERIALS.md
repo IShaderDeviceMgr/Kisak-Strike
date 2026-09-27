@@ -17,7 +17,7 @@ one (`src/materials/`). Same subject, two names, on purpose.
 | Lines | ~20,600 Rust including tests, plus ~2,600 of WGSL |
 | Tests | 231 (`cargo test materials`) — 52 of them run on a real GPU, one of which builds a pipeline for every shader; plus one depot-gated census over the whole game |
 | Dependencies | `wgpu` 30, `glam`, `bytemuck`, `pollster`, `thiserror`, and `egui`/`egui-wgpu` in [`ui`](#uirenderer) alone |
-| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question and the stencil the recursive view needed.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
+| Status | **Stages 1-6 of 8, plus the exposure half of §10's HDR question and the stencil the recursive view needed.** GPU bring-up, `.vtf` -> `wgpu::Texture`, `.vmt` -> `Material`, meshes, the render context, a depth buffer, lightmaps, `VertexLitGeneric`, `Refract`, `Phong`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil`, `SolidEnergy`, and the scene target + luminance histogram the tone mapper measures. The rest of stage 6's shader set and stages 7-8 not started |
 
 ```
 src/materials/
@@ -46,6 +46,7 @@ src/materials/
   shaders/portalrefract.wgsl       the coloured oval a portal wears — PortalRefract's $Stage 2
   shaders/portalhole.wgsl          the recursive view's stencil punch — PortalRefract's $Stage 1
   shaders/bufferclear.wgsl         a partial depth clear, written as a full-screen draw
+  shaders/solidenergy.wgsl         fizzler fields and laser planes: detail layers and a flow field
   shaders/vertexlitgeneric.wgsl    models: ambient cube, local lights, baked vertex light
   shaders/phong.wgsl               models with a specular highlight, a rim light and an envmap
   shaders/refract.wgsl             glass: a screen-space warp of a copy of the scene
@@ -721,6 +722,7 @@ pub enum ShaderKind {
     PortalRefract,           // `$Stage 2` — the coloured oval
     PortalRefractHole,       // `$Stage 1` — the recursive view's stencil punch
     BufferClearObeyStencil,  // no .vmt in the game names this one either
+    SolidEnergy,             // fizzlers and the laser plane
 }
 
 pub fn resolve(vmt: &Vmt) -> Option<ShaderKind>;   // what will draw it
@@ -733,7 +735,7 @@ pub fn param(self, name: &str) -> Option<&'static ShaderParam>;
 pub fn wgsl(self) -> String;                  // prelude + body
 ```
 
-Nine variants, eight implementations, **seven names**. `UnlitGeneric` is sprites, tool
+Ten variants, nine implementations, **eight names**. `UnlitGeneric` is sprites, tool
 textures and anything whose colour is entirely in its texture; `LightmappedGeneric` is
 world brush surfaces — 62 of `sp_a1_intro1`'s 66 world materials — and multiplies a base
 texture by a baked lightmap, flat or radiosity-normal-mapped; `VertexLitGeneric` is
@@ -742,8 +744,10 @@ game's 3,555 materials write it, including 1,012 of the 1,096 under `materials/m
 `Phong` is the 317 of those that ask for a specular highlight; `Refract` is glass, 37
 materials, 29 of them on models; `PortalRefract` is the coloured oval a portal wears, 7
 materials of which 6 resolve; `PortalRefractHole` is the sixth of those, the stencil punch
-the recursive view marks its opening with; and `BufferClearObeyStencil` is a partial depth
-clear written as a draw, which is the only way to clear part of an attachment.
+the recursive view marks its opening with; `BufferClearObeyStencil` is a partial depth
+clear written as a draw, which is the only way to clear part of an attachment; and
+`SolidEnergy` is the fizzler field and the laser plane — 14 materials, 11 of which reach a
+map (see [its section](#the-solidenergy-shader)).
 
 **Call `resolve`, not `from_name`.** `from_name` answers "what did the `.vmt` say", which
 is what a diagnostic wants. `resolve` answers "what will draw it", which is what
@@ -959,6 +963,42 @@ material. 78 of Portal 2's non-phong `VertexLitGeneric` materials say it, and **
 branch off; when the `.bsp`'s embedded cubemaps become readable this becomes
 render-context state alongside the lightmap page, and *that* is the trigger to revisit it.
 
+<a id="the-solidenergy-shader"></a>
+
+### The SolidEnergy shader
+
+`shaders/solidenergy.wgsl`, `SolidEnergyUniforms`, `SolidEnergyFlags`,
+`solid_energy_uniforms`, and a group-1 layout of six textures: `$basetexture`,
+`$detail1` (at `BINDING_DETAIL_TEXTURE`), `$detail2`, `$flowmap`,
+`$flow_noise_texture` and `$flowbounds`. `solidenergy_dx9_helper.cpp`,
+`solidenergy_vs20.fxc` and `solidenergy_ps20b.fxc`.
+
+**14 shipped materials, and only 11 reach a map**: the ten `effects/fizzler*` are
+1,174 brush faces across 59 maps and `effects/laserplane` is 12 on one. The two
+tractor beams and `effects/projected_wall` (the light bridge) are drawn on meshes
+their client classes build at run time, and neither class is ported — so the
+shader's `$model` form has no content and **only the brush form is compiled**, on
+`VertexLayout::WorldTangent`. Four things to know:
+
+- **The flow is in world units along the texture's axes**: the vertex shader takes
+  `dot( worldPos, tangentS )` and `dot( worldPos, tangentT )` — which is why the
+  brush form needs the surface frame the world vertex does not carry, and why the
+  field is one continuous sheet across a fizzler's faces.
+- **Every combo, static and dynamic, is a flag bit** (`SolidEnergyFlags`), and the
+  dynamic four — `ACTIVE`, `POWERUP`, `VORTEX1`, `VORTEX2` — are decided once at
+  load, because what drives them in the shipped game is material proxies:
+  `FizzlerVortex` on all ten fizzlers, whose source is not in this tree, and a
+  `Sine` flicker on six. So no field swirls round a cube and none animates
+  switching on.
+- **It reads the clock from group 0.** `FrameUniforms::time` is
+  `IShaderDynamicAPI::CurrentTime()`, which the engine sets once a frame with
+  `RenderContext::set_time`; before it, no shader here animated itself on the GPU.
+- **Blending is `$translucent` and `$additive` and nothing else** — no base-texture
+  alpha, no `$alpha`, no alpha modulation — and an additive surface fades out over
+  the 40 units in front of the near plane (`ComputeCameraFade`). The final colour,
+  alpha included, is scaled by `$outputintensity` (2.3 on a fizzler, from its
+  `srgb_pc?` key), and the 8-bit target clamps the blend factor to 1.
+
 <a id="the-phong-shader"></a>
 
 ### The Phong shader
@@ -1134,6 +1174,7 @@ pub struct FrameUniforms {
     pub fog_color: [f32; 4],                // g_LinearFogColor
     pub light_scale: [f32; 4],              // cLightScale
     pub screen_size: [f32; 4],              // cScreenSize
+    pub time: [f32; 4],                     // x = CurrentTime(); not one of Valve's registers
 }
 pub struct DrawUniforms {
     pub model: ColumnMajor,
@@ -1329,7 +1370,7 @@ struct, its GPU layout is derived from the struct, and filling a buffer is
 ### Vertices and layouts
 
 ```rust
-pub enum VertexLayout { Simple, World, Model, StaticLight }
+pub enum VertexLayout { Simple, World, WorldTangent, Model, StaticLight }
 impl VertexLayout {
     /// Every buffer a pipeline in this layout binds, in slot order.
     pub fn buffer_layouts(self) -> &'static [wgpu::VertexBufferLayout<'static>];
@@ -1352,6 +1393,17 @@ pub struct WorldVertex {
     pub color: [f32; 4],
 }
 impl WorldVertex { pub const fn new(position: [f32; 3], texcoord: [f32; 2]) -> WorldVertex; }
+
+/// A brush face with its surface frame and no lightmap — SolidEnergy's.
+#[repr(C)]
+pub struct WorldTangentVertex {
+    pub position: [f32; 3],
+    pub texcoord: [f32; 2],
+    pub color: [f32; 4],
+    pub normal: [f32; 3],
+    pub tangent_s: [f32; 3],          // TangentSpaceComputeBasis, constant per face
+    pub tangent_t: [f32; 3],
+}
 
 #[repr(C)]
 pub struct ModelVertex {                       // 64 bytes
@@ -2118,9 +2170,20 @@ impl PostProcess {
     pub fn resolve(&mut self, frame: &mut Frame<'_>, measure: Option<(f32, f32)>);
     pub fn record(&mut self, encoder: &mut wgpu::CommandEncoder,
                   destination: &wgpu::TextureView, measure: Option<(f32, f32)>);
+    pub fn set_fade(&mut self, fade: ViewFade);   // the screen fade the next resolve applies
     pub fn buckets(&self) -> usize;
 }
+
+pub struct ViewFade { pub color: [f32; 4], pub modulate: bool }
+impl ViewFade { pub fn from_bytes(color: [u8; 4], modulate: bool) -> ViewFade; }
 ```
+
+**The screen fade is applied by the presenting pass**, not drawn as a quad: Valve
+hands it to `engine_post` (`SetViewFadeParams`, `FADE_TYPE`), which lerps each pixel
+towards the colour — or towards the colour times the pixel, for `FFADE_MODULATE` —
+with sRGB conversion off, so **the lerp is on encoded values**. The blit converts to
+gamma space around it to land in the same place. A fade with no alpha is no fade.
+`env_fade` and the client's fade list are `rustdocs/SERVER.md`, "`env_fade`".
 
 A frame that draws the world looks like this, and `Engine::render` is the one caller:
 
@@ -2953,6 +3016,10 @@ machine with no usable adapter:
 | `black_lands_in_the_first_bucket_and_nothing_is_lost` | the widened first bucket, which is Valve's `-1e20` |
 | `a_measurement_does_not_accumulate_across_frames` | the `clear_buffer` before the dispatch: without it the histogram only ever grows |
 | `the_scene_reaches_the_back_buffer_unchanged` | the presenting pass, byte for byte against the scene target — a blit that dropped or re-encoded a channel |
+| `a_screen_fade_lerps_in_gamma_space` | `engine_post`'s fade: half way to black is half the *byte*; a modulating fade multiplies the bytes; no alpha is no fade |
+| `solid_energy_multiplies_its_detail_in_at_twice_and_writes_base_alpha` | `DETAIL1BLENDMODE` 0 and the alpha rule that takes the base texture's alpha when nothing else sets it |
+| `solid_energy_flow_is_two_cross_faded_samples_lit_by_the_bounds` | **the whole flow path against arithmetic done by hand**: the group-0 clock, the noise phase, `$flow_lerpexp`'s weights, `bounds.g` added to alpha before the colour is taken from it, `bounds.b` and the intensity |
+| `an_additive_energy_surface_fades_out_in_front_of_the_camera` | `ComputeCameraFade` at two distances, the `(1 + alpha)` doubling, `BlendAdd` and no depth or alpha writes |
 | `the_measurement_is_of_the_scene_and_not_of_the_back_buffer` | the whole chain end to end, with a known linear grey landing in the bucket the tone mapper's boundaries put it in |
 | `the_scene_target_matches_the_back_buffer_and_is_reused_until_the_size_changes` | a reallocation every frame (a screen-sized texture per frame), and a format that would double the pipeline count |
 

@@ -636,6 +636,19 @@ copy of its indices and a span per `.bsp` face; a **brush model's** batches keep
 because a brush entity is not in the world's tree and is culled whole. See
 [`world::vis`](#worldvis--what-a-frame-actually-draws).
 
+**A batch's vertices are in whatever layout its shader declared**, and a brush face can
+fill three: `Simple` (`UnlitGeneric`), `World` (`LightmappedGeneric`) and `WorldTangent`
+(`SolidEnergy` — the fizzlers). The third carries the face's normal and texture-space
+tangents, built once per face by `FaceBasis` from the texinfo's two texture axes the way
+`TangentSpaceSurfaceSetup` and `TangentSpaceComputeBasis` build them
+(`matsys_interface.cpp:1402`). **The tangents do not depend on which way the face points** —
+flipping the normal flips both the cross product and the "backwards" test, and they cancel
+— so only the normal reads `Face::side`; Valve reads it from `LUMP_VERTNORMALS`, which is
+not loaded, and for a flat face the two agree.
+`a_face_basis_follows_the_texture_axes_whichever_way_the_face_points` pins all three
+cases. A model shader on a brush face (`VertexLayout::Model`) still gets the error
+material: there is no honest per-vertex data to give it.
+
 ### `Spawn` and `WorldStats`
 
 ```rust
@@ -4775,7 +4788,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-383 tests under `engine::`, 21 of them depot-gated; 1,269 in the crate. (Treat both as a scale rather than a
+384 tests under `engine::`, 21 of them depot-gated; 1,280 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

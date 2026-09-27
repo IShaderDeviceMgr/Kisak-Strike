@@ -253,6 +253,23 @@ pub enum ShaderKind {
     /// vertices it takes are **already in clip space**;
     /// `portdocs/PORTAL_RENDER.md` §6.2.
     BufferClearObeyStencil,
+
+    /// Fizzler fields, laser planes, light bridges and tractor beams: an unlit
+    /// surface whose colour is a base texture, up to two detail layers and,
+    /// for a fizzler, a flow field scrolled by the clock.
+    ///
+    /// `stdshaders/solidenergy_dx9.cpp` through `solidenergy_dx9_helper.cpp`,
+    /// `solidenergy_vs20.fxc` and `solidenergy_ps20b.fxc`.
+    ///
+    /// Measured over the mounted game: **14 materials name it** — ten
+    /// `effects/fizzler*`, `effects/laserplane`, the two tractor beams and
+    /// `effects/projected_wall`. **Only the first eleven reach a map**: 1,174
+    /// brush faces across 59 maps wear a fizzler and 12 on one map wear the
+    /// laser plane. The tractor beam and the light bridge are meshes their
+    /// client classes build at run time, and neither class is ported — so the
+    /// shader's *model* form has no content here, and this variant draws brush
+    /// faces only ([`VertexLayout::WorldTangent`]).
+    SolidEnergy,
 }
 
 /// What a shader binds in group 3, if anything.
@@ -339,6 +356,7 @@ impl ShaderKind {
             n if n.eq_ignore_ascii_case("BufferClearObeyStencil") => {
                 Some(ShaderKind::BufferClearObeyStencil)
             }
+            n if n.eq_ignore_ascii_case("SolidEnergy") => Some(ShaderKind::SolidEnergy),
             _ => None,
         }
     }
@@ -402,6 +420,7 @@ impl ShaderKind {
             // round, two names sharing one module.
             ShaderKind::PortalRefract | ShaderKind::PortalRefractHole => "PortalRefract",
             ShaderKind::BufferClearObeyStencil => "BufferClearObeyStencil",
+            ShaderKind::SolidEnergy => "SolidEnergy",
         }
     }
 
@@ -494,6 +513,16 @@ impl ShaderKind {
             // space rather than model space, which is the shader's business
             // and not the layout's.
             ShaderKind::BufferClearObeyStencil => VertexLayout::Simple,
+            // Two formats, and the axis is `$model`
+            // (`solidenergy_dx9_helper.cpp:139`): a brush surface takes its
+            // frame as `VERTEX_TANGENT_S | VERTEX_TANGENT_T | VERTEX_NORMAL`,
+            // a model decompresses it from its normal and four floats of user
+            // data. **Pinned to the brush form on a measurement**: every shipped
+            // material that reaches a map is on a brush face, and the model
+            // form's two materials are the tractor beam and the light bridge,
+            // whose meshes are built by client classes this port does not
+            // have. When those land, this is where the second layout arrives.
+            ShaderKind::SolidEnergy => VertexLayout::WorldTangent,
         }
     }
 
@@ -530,6 +559,7 @@ impl ShaderKind {
             // rather than four `.vmt` keys nobody can write. So the table is
             // the standard one alone — see [`BUFFER_CLEAR_PARAMS`].
             ShaderKind::BufferClearObeyStencil => (BUFFER_CLEAR_PARAMS, &[]),
+            ShaderKind::SolidEnergy => (SOLID_ENERGY_PARAMS, &[]),
         };
         STANDARD_PARAMS.iter().chain(own).chain(extra)
     }
@@ -567,6 +597,9 @@ impl ShaderKind {
             // already in clip space and its output is thrown away by the
             // colour write mask.
             ShaderKind::BufferClearObeyStencil => None,
+            // Unlit, and everything else it reads — the clock, the eye — is
+            // group 0's.
+            ShaderKind::SolidEnergy => None,
         }
     }
 
@@ -594,6 +627,7 @@ impl ShaderKind {
             ShaderKind::PortalRefract => include_str!("shaders/portalrefract.wgsl"),
             ShaderKind::PortalRefractHole => include_str!("shaders/portalhole.wgsl"),
             ShaderKind::BufferClearObeyStencil => include_str!("shaders/bufferclear.wgsl"),
+            ShaderKind::SolidEnergy => include_str!("shaders/solidenergy.wgsl"),
         };
         // A second shared fragment, narrower than the prelude: group 3's
         // *layout* is per shader, so a `@group(3)` declaration cannot live in
@@ -1609,6 +1643,22 @@ pub const BINDING_PORTAL_MASK_SAMPLER: u32 = 28;
 pub const BINDING_PORTAL_COLOR_TEXTURE: u32 = 29;
 pub const BINDING_PORTAL_COLOR_SAMPLER: u32 = 30;
 
+/// `SolidEnergy`'s. `$detail1` shares [`BINDING_DETAIL_TEXTURE`] with the
+/// model shaders' `$detail`; `$detail2` is `SHADER_SAMPLER4`.
+pub const BINDING_DETAIL2_TEXTURE: u32 = 31;
+pub const BINDING_DETAIL2_SAMPLER: u32 = 32;
+/// `$flowmap`, `SHADER_SAMPLER5`: a two-channel vector field, `rg * 2 - 1`.
+pub const BINDING_FLOW_MAP_TEXTURE: u32 = 33;
+pub const BINDING_FLOW_MAP_SAMPLER: u32 = 34;
+/// `$flow_noise_texture`, `SHADER_SAMPLER6`: its `g` staggers each texel's
+/// phase so the field does not pulse in unison.
+pub const BINDING_FLOW_NOISE_TEXTURE: u32 = 35;
+pub const BINDING_FLOW_NOISE_SAMPLER: u32 = 36;
+/// `$flowbounds`, `SHADER_SAMPLER7`, sampled at the *base* coordinate: `r`
+/// slows the flow, `g` is the glow at the field's edge, `b` masks the whole.
+pub const BINDING_FLOW_BOUNDS_TEXTURE: u32 = 37;
+pub const BINDING_FLOW_BOUNDS_SAMPLER: u32 = 38;
+
 /// Where the lightmap page is bound, in group **3**.
 ///
 /// Not in the material's group, and that is structural rather than a
@@ -2036,6 +2086,53 @@ pub fn texture_requests(kind: ShaderKind, vmt: &Vmt) -> Vec<TextureRequest> {
         // Four samplers in the original, all of them for the colour path this
         // port's one caller has turned off.
         ShaderKind::BufferClearObeyStencil => Vec::new(),
+        // `InitSolidEnergy` (`solidenergy_dx9_helper.cpp:58`): the base and
+        // both details are `TEXTUREFLAGS_SRGB`, the three flow textures are
+        // not — they are vectors, a noise field and a mask, and the shadow
+        // phase agrees (`EnableSRGBRead( SHADER_SAMPLER5..7, false )`).
+        //
+        // All six are requested whatever the material says, and the ones it
+        // leaves out bind white: a bind group must supply every entry its
+        // layout declares, and which of them are *read* is
+        // [`SolidEnergyFlags`]' decision, as it was the combos'.
+        ShaderKind::SolidEnergy => vec![
+            TextureRequest {
+                param: "$basetexture",
+                binding: BINDING_BASE_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$detail1",
+                binding: BINDING_DETAIL_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$detail2",
+                binding: BINDING_DETAIL2_TEXTURE,
+                color_space: ColorSpace::Srgb,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$flowmap",
+                binding: BINDING_FLOW_MAP_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$flow_noise_texture",
+                binding: BINDING_FLOW_NOISE_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+            TextureRequest {
+                param: "$flowbounds",
+                binding: BINDING_FLOW_BOUNDS_TEXTURE,
+                color_space: ColorSpace::Linear,
+                dimension: TextureDimension::D2,
+            },
+        ],
     }
 }
 
@@ -2293,7 +2390,11 @@ pub fn lighting(kind: ShaderKind, vmt: &Vmt) -> Lighting {
         // around it.
         | ShaderKind::PortalRefract
         | ShaderKind::PortalRefractHole
-        | ShaderKind::BufferClearObeyStencil => Lighting::None,
+        | ShaderKind::BufferClearObeyStencil
+        // Nor `SolidEnergy`: a fizzler is light, not lit. Its brush faces
+        // still get a lightmap allocation from `vbsp` — `SURF_NOLIGHT` is not
+        // set on them — and draw without reading it.
+        | ShaderKind::SolidEnergy => Lighting::None,
         ShaderKind::LightmappedGeneric | ShaderKind::WorldVertexTransition => {
             let has_bump = vmt
                 .var("$bumpmap")
@@ -3855,6 +3956,12 @@ fn render_state_with_modulation(
     if kind == ShaderKind::BufferClearObeyStencil {
         return buffer_clear_render_state(state);
     }
+    // `SolidEnergy` never calls `EvaluateBlendRequirements`: `$translucent`
+    // alone decides, and alpha modulation cannot. See
+    // [`solid_energy_render_state`].
+    if kind == ShaderKind::SolidEnergy {
+        return solid_energy_render_state(vmt, state);
+    }
 
     // --- EvaluateBlendRequirements ---------------------------------------
     let alpha_test = flags.contains(MaterialFlags::ALPHATEST);
@@ -4127,6 +4234,604 @@ fn buffer_clear_render_state(mut state: RenderState) -> RenderState {
     // useful answer, and a back-facing full-screen clear is a portal that
     // draws the wall. Turning culling off costs nothing: it is two triangles.
     state.cull = false;
+    state
+}
+
+/// `SolidEnergy`'s own parameters (`stdshaders/solidenergy_dx9.cpp:17`), all
+/// 44 of them, in declaration order.
+///
+/// **`$flowmapscrollrate`'s declared default is `"[0 0"`** — the closing
+/// bracket is missing in the original, and it is documentation only (see
+/// [`ShaderParam`]), so it is kept as written.
+const SOLID_ENERGY_PARAMS: &[ShaderParam] = &[
+    ShaderParam {
+        name: "$detail1",
+        kind: ParamKind::Texture,
+        declared_default: "shader/BaseTexture",
+        help: "detail map 1",
+    },
+    ShaderParam {
+        name: "$detail1scale",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "scale detail1 as multiplier of base UVs",
+    },
+    ShaderParam {
+        name: "$detail1frame",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for detail1",
+    },
+    ShaderParam {
+        name: "$detail1blendmode",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "detail 1 blend mode: 0=add, 1=mod2x, 2=mul, 3=alphamul (mul masked by base alpha)",
+    },
+    ShaderParam {
+        name: "$detail1blendfactor",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "detail 1 blend factor",
+    },
+    ShaderParam {
+        name: "$detail1texturetransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "detail1 texcoord transform",
+    },
+    ShaderParam {
+        name: "$detail2",
+        kind: ParamKind::Texture,
+        declared_default: "shader/BaseTexture",
+        help: "detail map 2",
+    },
+    ShaderParam {
+        name: "$detail2scale",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "scale detail1 as multiplier of base UVs",
+    },
+    ShaderParam {
+        name: "$detail2frame",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for detail1",
+    },
+    ShaderParam {
+        name: "$detail2blendmode",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "detail 1 blend mode: 0=add, 1=mod2x, 2=mul, 3=detailmul (mul with detail1)",
+    },
+    ShaderParam {
+        name: "$detail2blendfactor",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "detail 1 blend factor",
+    },
+    ShaderParam {
+        name: "$detail2texturetransform",
+        kind: ParamKind::Matrix,
+        declared_default: "center .5 .5 scale 1 1 rotate 0 translate 0 0",
+        help: "detail1 texcoord transform",
+    },
+    ShaderParam {
+        name: "$tangenttopacityranges",
+        kind: ParamKind::Vec4,
+        declared_default: "[1 0.9 0 0.6]",
+        help: "enables view-based opacity falloff based on tangent t direction, great for cylinders, includes last term for scaling backface opacity",
+    },
+    ShaderParam {
+        name: "$tangentsopacityranges",
+        kind: ParamKind::Vec4,
+        declared_default: "[1 0.9 0 0.6]",
+        help: "enables view-based opacity falloff based on tangent s direction, great for cylinders, includes last term for scaling backface opacity",
+    },
+    ShaderParam {
+        name: "$fresnelopacityranges",
+        kind: ParamKind::Vec4,
+        declared_default: "[1 0.9 0 0.6]",
+        help: "enables fresnel-based opacity falloff, includes last term for scaling backface opacity",
+    },
+    ShaderParam {
+        name: "$needstangentt",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "don't need to set this explicitly, it gets set when tangenttopacityranges is defined",
+    },
+    ShaderParam {
+        name: "$needstangents",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "don't need to set this explicitly, it gets set when tangentSopacityranges is defined",
+    },
+    ShaderParam {
+        name: "$needsnormals",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "don't need to set this explicitly, it gets set when fresnelopacityranges is defined",
+    },
+    ShaderParam {
+        name: "$depthblend",
+        kind: ParamKind::Bool,
+        declared_default: "0",
+        help: "enables depth-feathering",
+    },
+    ShaderParam {
+        name: "$depthblendscale",
+        kind: ParamKind::Float,
+        declared_default: "50.0",
+        help: "Amplify or reduce DEPTHBLEND fading. Lower values make harder edges.",
+    },
+    ShaderParam {
+        name: "$flowmap",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "flowmap",
+    },
+    ShaderParam {
+        name: "$flowmapframe",
+        kind: ParamKind::Integer,
+        declared_default: "0",
+        help: "frame number for $flowmap",
+    },
+    ShaderParam {
+        name: "$flowmapscrollrate",
+        kind: ParamKind::Vec2,
+        declared_default: "[0 0",
+        help: "2D rate to scroll $flowmap",
+    },
+    ShaderParam {
+        name: "$flow_noise_texture",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "flow noise texture",
+    },
+    ShaderParam {
+        name: "$time",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_worlduvscale",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_normaluvscale",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_timeintervalinseconds",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_uvscrolldistance",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_noise_scale",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_lerpexp",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flowbounds",
+        kind: ParamKind::Texture,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$powerup",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_color_intensity",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_color",
+        kind: ParamKind::Vec3,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex_color",
+        kind: ParamKind::Vec3,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex_size",
+        kind: ParamKind::Float,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex1",
+        kind: ParamKind::Bool,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex_pos1",
+        kind: ParamKind::Vec3,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex2",
+        kind: ParamKind::Bool,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_vortex_pos2",
+        kind: ParamKind::Vec3,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$flow_cheap",
+        kind: ParamKind::Bool,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$modelformat",
+        kind: ParamKind::Bool,
+        declared_default: "",
+        help: "",
+    },
+    ShaderParam {
+        name: "$outputintensity",
+        kind: ParamKind::Float,
+        declared_default: "1.0",
+        help: "",
+    },
+];
+
+/// Flags in [`SolidEnergyUniforms::flags`] — every combo of
+/// `solidenergy_vs20.fxc` and `solidenergy_ps20b.fxc` that survives, each a
+/// uniform branch.
+#[allow(dead_code)]
+pub struct SolidEnergyFlags;
+
+impl SolidEnergyFlags {
+    /// `DETAIL1`: `$detail1` is a texture.
+    pub const DETAIL1: u32 = 1 << 0;
+    /// `DETAIL2`: `$detail2` is a texture **and so is `$detail1`**.
+    pub const DETAIL2: u32 = 1 << 1;
+    /// `DETAIL1BLENDMODE` 1 rather than 0 — clamped to that range.
+    pub const DETAIL1_BLEND_MODE: u32 = 1 << 2;
+    pub const DETAIL2_BLEND_MODE: u32 = 1 << 3;
+    /// `TANGENTTOPACITY`, from `$tangenttopacityranges` being defined.
+    pub const TANGENT_T_OPACITY: u32 = 1 << 4;
+    /// `TANGENTSOPACITY` — never with `TANGENT_T_OPACITY`, which wins.
+    pub const TANGENT_S_OPACITY: u32 = 1 << 5;
+    /// `FRESNELOPACITY` — only with neither tangent opacity.
+    pub const FRESNEL_OPACITY: u32 = 1 << 6;
+    /// `VERTEXCOLOR`, from `$vertexcolor` or `$vertexalpha`.
+    pub const VERTEX_COLOR: u32 = 1 << 7;
+    /// `FLOWMAP`: `$flowmap` is a texture and `$detail1` is not.
+    pub const FLOWMAP: u32 = 1 << 8;
+    /// `FLOW_CHEAP`: `$flow_cheap`, which `gpu_level < 2` would default on.
+    pub const FLOW_CHEAP: u32 = 1 << 9;
+    /// `ADDITIVE`: `$additive`.
+    pub const ADDITIVE: u32 = 1 << 10;
+    /// `ACTIVE`, a dynamic combo: the field is drawn at all.
+    pub const ACTIVE: u32 = 1 << 11;
+    /// `POWERUP`, dynamic: a flow field part way through switching on.
+    pub const POWERUP: u32 = 1 << 12;
+    /// `VORTEX1`/`VORTEX2`, dynamic: an object near the field.
+    pub const VORTEX1: u32 = 1 << 13;
+    pub const VORTEX2: u32 = 1 << 14;
+}
+
+/// `SolidEnergy`'s material block — group 1, binding 0. Every field names
+/// the register the helper wrote it to.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct SolidEnergyUniforms {
+    /// `$basetexturetransform`, VS `SHADER_SPECIFIC_CONST_0`, as two rows.
+    pub base_texture_transform: [[f32; 4]; 2],
+    /// `$detail1texturetransform` scaled by `$detail1scale`, `CONST_2`.
+    pub detail1_transform: [[f32; 4]; 2],
+    /// `$detail2texturetransform` scaled by `$detail2scale`, `CONST_6`.
+    pub detail2_transform: [[f32; 4]; 2],
+    /// PS `c0`: `$tangenttopacityranges` — `(facing-on, edge-on, exponent,
+    /// back face)`.
+    pub tangent_t_opacity: [f32; 4],
+    /// PS `c1`: `$tangentsopacityranges`.
+    pub tangent_s_opacity: [f32; 4],
+    /// PS `c2`: `$fresnelopacityranges`.
+    pub fresnel_opacity: [f32; 4],
+    /// PS `c6`: `$flow_worlduvscale`, two empties, `$outputintensity`.
+    pub flow_params1: [f32; 4],
+    /// PS `c7`: `$flow_timeintervalinseconds`, `$flow_uvscrolldistance`, an
+    /// empty, `$flow_lerpexp`.
+    pub flow_params2: [f32; 4],
+    /// PS `c8`: `$flow_color`.
+    pub flow_color: [f32; 4],
+    /// PS `c9`: `$flow_vortex_color`, then `$flow_vortex_size`.
+    pub vortex_params: [f32; 4],
+    /// VS `CONST_9`: `$flow_vortex_pos1`, then `$flow_noise_scale`.
+    pub vortex_pos1_noise_scale: [f32; 4],
+    /// VS `CONST_10`: `$flow_vortex_pos2`, then `$flow_normaluvscale`.
+    pub vortex_pos2_normal_uv_scale: [f32; 4],
+    /// PS `c3.z` and `c3.w`: `$powerup` and `$flow_color_intensity`. The
+    /// register's other two are the depth-to-alpha switch, which is not
+    /// ported, and the time, which is group 0's.
+    pub power: [f32; 4],
+    /// [`SolidEnergyFlags`].
+    pub flags: u32,
+    pub _padding: [u32; 3],
+}
+
+/// `kDefaultFalloffRanges` (`solidenergy_dx9_helper.h:78`) — and **not** the
+/// `[1 0.9 0 0.6]` the parameter declarations advertise, which is
+/// documentation. The two disagree in `w`.
+const SOLID_ENERGY_DEFAULT_FALLOFF: [f32; 4] = [1.0, 0.9, 0.0, 0.7];
+
+/// Whether a texture parameter names something — `IsTexture()` once the
+/// material has loaded, which is true of a name that failed to load as well:
+/// it becomes the error texture, not nothing.
+fn names_texture(vmt: &Vmt, name: &str) -> bool {
+    vmt.var(name)
+        .and_then(|var| var.as_str())
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// `SetVertexShaderTextureScaledTransform` (`BaseVSShader.cpp:292`): a
+/// transform's first two rows with the 2x2 part scaled per column.
+///
+/// The scale is a vector if the var is one and a scalar otherwise — so
+/// `$detail1scale 2` and `$detail1scale "[2 2]"` agree.
+fn scaled_transform(vmt: &Vmt, transform: &str, scale: &str) -> [[f32; 4]; 2] {
+    let kind = ShaderKind::SolidEnergy;
+    let matrix = param_value(kind, vmt, transform)
+        .map(|var| var.as_matrix())
+        .unwrap_or(super::var::IDENTITY);
+    // `SET_PARAM_FLOAT_IF_NOT_DEFINED( m_nDetail1Scale, kDefaultDetailScale )`.
+    let scale = match vmt.var(scale) {
+        Some(MaterialVar::Vec(value, _)) => [value[0], value[1]],
+        Some(var) => [var.as_f32(); 2],
+        None => [1.0; 2],
+    };
+    let mut rows = [matrix[0], matrix[1]];
+    rows[0][0] *= scale[0];
+    rows[0][1] *= scale[1];
+    rows[1][0] *= scale[0];
+    rows[1][1] *= scale[1];
+    rows
+}
+
+/// Builds the material block for a `SolidEnergy` `.vmt`.
+///
+/// # The combo bucketing
+///
+/// **Bucket 1 — pinned, axis deleted.** `MODELFORMAT`, pinned to the brush
+/// form (see [`ShaderKind::vertex_layout`]); `COMPRESSED_VERTS` and
+/// `SKINNING`, which the brush form never has; `DEPTHBLEND`, `[CONSOLE]` only
+/// — `"0..0" [PC]` in the `.fxc`, so `$depthblend` does nothing on the PC
+/// and nothing here.
+///
+/// **Bucket 2 — a uniform branch.** Everything else, static and dynamic
+/// alike: the detail layers and their blend modes, the three opacity
+/// falloffs, the vertex colour, the flow map and its cheap form, `$additive`,
+/// and the four dynamic combos `ACTIVE`, `POWERUP`, `VORTEX1` and `VORTEX2`.
+///
+/// **Bucket 3 — a real pipeline variant.** [`RenderState`]; see
+/// [`solid_energy_render_state`].
+///
+/// # The dynamic combos are decided here, once
+///
+/// `ACTIVE`, `POWERUP` and the vortices are dynamic in the original because
+/// proxies rewrite what they read — `$flow_color_intensity`, `$powerup`,
+/// `$flow_vortex1` — between draws. The proxy system is not ported, so those
+/// vars are what the `.vmt` said and the combos are constant per material.
+/// What that costs is measurable: **every shipped fizzler names the
+/// `FizzlerVortex` proxy, and `C_FizzlerVortexProxy` is not in this tree** —
+/// so no field swirls round a cube pushed into it and none animates switching
+/// on. Six of them also run a `Sine` proxy on the intensity, a flicker
+/// between 0.875 and 1 every tenth of a second, which is missing too.
+pub fn solid_energy_uniforms(vmt: &Vmt) -> SolidEnergyUniforms {
+    let kind = ShaderKind::SolidEnergy;
+    let flags = vmt.flags;
+    let float = |name: &str, default: f32| init_float(vmt, name, default);
+    let vec = |name: &str, default: [f32; 4]| init_vec(vmt, name, default);
+
+    let detail1 = names_texture(vmt, "$detail1");
+    let detail2 = detail1 && names_texture(vmt, "$detail2");
+    let flowmap = !detail1 && names_texture(vmt, "$flowmap");
+
+    // `SET_PARAM_INT_IF_NOT_DEFINED( m_nNeedsTangentT,
+    // IS_PARAM_DEFINED( m_nTangentTOpacityRanges ) && nGPULevel > 1 )`. The
+    // GPU level is this port's fixed tier, which is above 1.
+    let defined = |name: &str| vmt.var(name).is_some();
+    let needs = |flag: &str, ranges: &str| match vmt.var(flag) {
+        Some(var) => var.as_bool(),
+        None => defined(ranges),
+    };
+    let tangent_t = needs("$needstangentt", "$tangenttopacityranges");
+    let mut tangent_s = needs("$needstangents", "$tangentsopacityranges");
+    if tangent_s && tangent_t {
+        // "If both on, T wins".
+        tangent_s = false;
+    }
+    let fresnel = !tangent_s && !tangent_t && needs("$needsnormals", "$fresnelopacityranges");
+
+    // `clamp( mode, 0, kMaxDetailBlendMode )` where the maximum is 1, and 0
+    // when there is no detail texture at all. The parameter's help text
+    // advertises four modes; the shader has two.
+    let blend_mode = |name: &str, present: bool| {
+        present
+            && param_value(kind, vmt, name)
+                .map(|var| var.as_i32())
+                .unwrap_or(0)
+                .clamp(0, 1)
+                == 1
+    };
+
+    let power_up = float("$powerup", 1.0);
+    let intensity = float("$flow_color_intensity", 1.0);
+    // `bActive = flIntensity > 0`, and a flow field with no power is off too.
+    let active = intensity > 0.0 && !(flowmap && power_up <= 0.0);
+    let vortex = |name: &str| {
+        active && flowmap && param_value(kind, vmt, name).is_some_and(|var| var.as_bool())
+    };
+
+    let mut bits = 0;
+    let mut set = |on: bool, bit: u32| {
+        if on {
+            bits |= bit;
+        }
+    };
+    set(detail1, SolidEnergyFlags::DETAIL1);
+    set(detail2, SolidEnergyFlags::DETAIL2);
+    set(blend_mode("$detail1blendmode", detail1), SolidEnergyFlags::DETAIL1_BLEND_MODE);
+    set(blend_mode("$detail2blendmode", detail2), SolidEnergyFlags::DETAIL2_BLEND_MODE);
+    set(tangent_t, SolidEnergyFlags::TANGENT_T_OPACITY);
+    set(tangent_s, SolidEnergyFlags::TANGENT_S_OPACITY);
+    set(fresnel, SolidEnergyFlags::FRESNEL_OPACITY);
+    set(
+        flags.contains(MaterialFlags::VERTEXCOLOR) || flags.contains(MaterialFlags::VERTEXALPHA),
+        SolidEnergyFlags::VERTEX_COLOR,
+    );
+    set(flowmap, SolidEnergyFlags::FLOWMAP);
+    // `SET_PARAM_INT_IF_NOT_DEFINED( m_nFlowCheap, nGPULevel < 2 )` — off.
+    set(
+        flowmap && param_value(kind, vmt, "$flow_cheap").is_some_and(|var| var.as_bool()),
+        SolidEnergyFlags::FLOW_CHEAP,
+    );
+    set(flags.contains(MaterialFlags::ADDITIVE), SolidEnergyFlags::ADDITIVE);
+    set(active, SolidEnergyFlags::ACTIVE);
+    set(
+        active && flowmap && power_up > 0.0 && power_up < 1.0,
+        SolidEnergyFlags::POWERUP,
+    );
+    set(vortex("$flow_vortex1"), SolidEnergyFlags::VORTEX1);
+    set(vortex("$flow_vortex2"), SolidEnergyFlags::VORTEX2);
+
+    let base = param_value(kind, vmt, "$basetexturetransform")
+        .map(|var| var.as_matrix())
+        .unwrap_or(super::var::IDENTITY);
+    let ranges = |name: &str| {
+        vmt.var(name)
+            .map(|var| var.as_vec4())
+            .unwrap_or(SOLID_ENERGY_DEFAULT_FALLOFF)
+    };
+    let rgb = |name: &str, default: [f32; 3]| {
+        let v = vec(name, [default[0], default[1], default[2], 0.0]);
+        [v[0], v[1], v[2]]
+    };
+    let flow_color = rgb("$flow_color", [0.1, 0.2, 0.4]);
+    let vortex_color = rgb("$flow_vortex_color", [1.2, 0.4, 0.0]);
+    let position = |name: &str| {
+        let v = param_value(kind, vmt, name)
+            .map(|var| var.as_vec4())
+            .unwrap_or([0.0; 4]);
+        [v[0], v[1], v[2]]
+    };
+    let pos1 = position("$flow_vortex_pos1");
+    let pos2 = position("$flow_vortex_pos2");
+
+    SolidEnergyUniforms {
+        base_texture_transform: [base[0], base[1]],
+        detail1_transform: scaled_transform(vmt, "$detail1texturetransform", "$detail1scale"),
+        detail2_transform: scaled_transform(vmt, "$detail2texturetransform", "$detail2scale"),
+        tangent_t_opacity: ranges("$tangenttopacityranges"),
+        tangent_s_opacity: ranges("$tangentsopacityranges"),
+        fresnel_opacity: ranges("$fresnelopacityranges"),
+        flow_params1: [
+            float("$flow_worlduvscale", 1.0),
+            0.0,
+            0.0,
+            float("$outputintensity", 1.0),
+        ],
+        flow_params2: [
+            float("$flow_timeintervalinseconds", 0.4),
+            float("$flow_uvscrolldistance", 0.2),
+            0.0,
+            // No `SET_PARAM_*_IF_NOT_DEFINED` for this one, so it is the
+            // type default: 0, and `pow( w, 0 )` is 1 — an even cross-fade
+            // becomes no fade at all. Every shipped flow material sets it.
+            param_value(kind, vmt, "$flow_lerpexp")
+                .map(|var| var.as_f32())
+                .unwrap_or(0.0),
+        ],
+        flow_color: [flow_color[0], flow_color[1], flow_color[2], 0.0],
+        vortex_params: [
+            vortex_color[0],
+            vortex_color[1],
+            vortex_color[2],
+            float("$flow_vortex_size", 30.0),
+        ],
+        vortex_pos1_noise_scale: [pos1[0], pos1[1], pos1[2], float("$flow_noise_scale", 0.0002)],
+        vortex_pos2_normal_uv_scale: [
+            pos2[0],
+            pos2[1],
+            pos2[2],
+            float("$flow_normaluvscale", 1.0),
+        ],
+        power: [power_up, intensity, 0.0, 0.0],
+        flags: bits,
+        _padding: [0; 3],
+    }
+}
+
+/// `SolidEnergy`'s shadow phase, after `SetInitialShadowState` has run.
+///
+/// `DrawSolidEnergy`'s `SHADOW_STATE` block (`solidenergy_dx9_helper.cpp:268`),
+/// which is simpler than any shader's here: `$translucent` decides whether
+/// it blends, `$additive` decides how, and **nothing else is consulted** — not
+/// the base texture's alpha, not `$alpha`, not alpha modulation. So a
+/// `SolidEnergy` material draws the same whether or not its draw is
+/// modulated, and both of [`Material`](super::material::Material)'s snapshots
+/// are this one.
+///
+/// Depth writes go off with blending only when the blend is *not* additive
+/// or feathered — `EnableDepthWrites( !bDepthBlend && !bAdditiveBlend )` —
+/// so a translucent, non-additive energy surface writes depth. No shipped
+/// material is one.
+fn solid_energy_render_state(vmt: &Vmt, mut state: RenderState) -> RenderState {
+    let flags = vmt.flags;
+    let additive = flags.contains(MaterialFlags::ADDITIVE);
+    if flags.contains(MaterialFlags::TRANSLUCENT) {
+        // `SHADER_BLEND_SRC_ALPHA, SHADER_BLEND_ONE` is `BlendAdd`;
+        // `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` is `Blend`.
+        state.blend = if additive {
+            BlendMode::BlendAdd
+        } else {
+            BlendMode::Blend
+        };
+        state.write_alpha = false;
+        // `bDepthBlend` is off on the PC — see [`solid_energy_uniforms`].
+        state.depth_write = !additive;
+    } else {
+        state.blend = BlendMode::None;
+        state.write_alpha = true;
+        state.depth_write = true;
+    }
     state
 }
 

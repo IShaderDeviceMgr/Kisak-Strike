@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty-six classnames, 37,563 of the shipped game's 60,925 entity blocks.**
-//! Five of the 56 are placed by no map: `player` (the engine makes it when a
+//! **Fifty-seven classnames, 37,890 of the shipped game's 60,925 entity blocks.**
+//! Five of the 57 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **51 of
+//! `light_glspot`, each registered because Valve registers it — so **52 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -49,6 +49,8 @@
 //! elevators' transition scripts among them. See `portdocs/VSCRIPT.md`.
 //! **`point_changelevel`** (62, one per single-player map) came straight
 //! after, because those scripts end by firing it: it is how a map is left.
+//! **`env_fade`** (327, on 105 maps) came last, because the same relay that
+//! fires the scripts fades the screen to black first.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -83,7 +85,7 @@ use crate::server::class::{ClassDef, InputDef, InputDefs, PointEntity};
 use crate::server::io::FieldType;
 
 pub use brush::{AreaPortal, Brush, Button, Door, MoveLinear, Rotating};
-pub use env::TonemapController;
+pub use env::{EnvFade, TonemapController};
 pub use filter::{
     FilterClass, FilterDamageType, FilterModel, FilterMulti, FilterName, FilterPlayerHeld,
 };
@@ -450,6 +452,15 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: POINT_TELEPORT_INPUTS,
         outputs: &[],
         create: PointTeleport::create,
+    },
+    // `CEnvFade` (`EnvFade.cpp`): how a transition goes to black. 327 across
+    // 105 maps.
+    ClassDef {
+        name: "env_fade",
+        keys: env::FADE_KEYS,
+        inputs: env::FADE_INPUTS,
+        outputs: &["OnBeginFade"],
+        create: EnvFade::create,
     },
     // `CPointChangelevel` — `portal2/point_changelevel.cpp`, which this tree
     // does not ship; see [`PointChangelevel`] for what it is built from.

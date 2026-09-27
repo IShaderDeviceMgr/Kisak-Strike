@@ -330,6 +330,10 @@ pub struct RenderContext {
     /// portal view or a water reflection must be exposed the same way the scene
     /// around it is, or the seam is visible.
     exposure: f32,
+    /// `IShaderDynamicAPI::CurrentTime()`, which `CShaderAPIDx8` reads off
+    /// the material system's clock once a frame. Set by
+    /// [`set_time`](RenderContext::set_time).
+    time: f32,
     /// Group 3 for a pass that has not bound a real lightmap page.
     ///
     /// `MATERIAL_SYSTEM_LIGHTMAP_PAGE_WHITE`, which `AllocateWhiteLightmap`
@@ -426,6 +430,7 @@ impl RenderContext {
             // context with no tone mapper keeps for ever: as bright as `vrad`
             // left it.
             exposure: 1.0,
+            time: 0.0,
             device: device.clone(),
             queue: queue.clone(),
         }
@@ -447,6 +452,15 @@ impl RenderContext {
     /// than the ones after it — `rustdocs/MATERIALS.md` gotcha #5.
     pub fn set_exposure(&mut self, exposure: f32) {
         self.exposure = exposure;
+    }
+
+    /// Sets the clock every shader that animates itself reads —
+    /// [`FrameUniforms::time`](super::uniforms::FrameUniforms::time).
+    ///
+    /// Takes effect on the next pass opened, like
+    /// [`set_exposure`](RenderContext::set_exposure), and for the same reason.
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
     }
 
     /// What [`set_exposure`](RenderContext::set_exposure) was last given.
@@ -649,6 +663,7 @@ impl RenderContext {
             camera.eye.to_array(),
             size,
             self.exposure,
+            self.time,
         );
         let frame_offset = self.frames.push(
             &self.device,
@@ -756,6 +771,7 @@ impl RenderContext {
             frames: &mut self.frames,
             size,
             exposure: self.exposure,
+            time: self.time,
             draws: &mut self.draws,
             lights: &mut self.lights,
             lighting_offset,
@@ -900,6 +916,8 @@ pub struct Pass<'a> {
     /// parameter of `set_camera`: a portal view must be exposed exactly the
     /// way the scene around it is, or the seam shows.
     exposure: f32,
+    /// The frame's clock, likewise: a portal view happens at the same moment.
+    time: f32,
     draws: &'a mut UniformArena,
     /// The model-lighting arena, group 3 for the shaders that read one.
     lights: &'a mut UniformArena,
@@ -1209,6 +1227,7 @@ impl Pass<'_> {
             camera.eye.to_array(),
             self.size,
             self.exposure,
+            self.time,
         );
         self.frame_offset = self
             .frames

@@ -13,6 +13,34 @@
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
 
+// `post::FadeUniforms`: the screen fade, `engine_post`'s `FADE_TYPE`.
+struct FadeUniforms {
+    // The fade colour, and in `a` how far towards it.
+    color: vec4<f32>,
+    // 0: none. 1: blend to the colour. 2: modulate by it.
+    kind: u32,
+    // Whether the destination encodes on write, so the lerp has to be put in
+    // gamma space by hand.
+    srgb: u32,
+    pad0: u32,
+    pad1: u32,
+}
+@group(0) @binding(2) var<uniform> fade: FadeUniforms;
+
+// The sRGB transfer function both ways, exactly: `engine_post` lerped the
+// *encoded* bytes, and a wrong curve here would change where half way is.
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let low = c * 12.92;
+    let high = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(high, low, c <= vec3<f32>(0.0031308));
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -44,7 +72,30 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 // from where it started. That is the price of having the frame readable at all,
 // and it is the same price `UpdateScreenEffectTexture` and the `Engine_Post`
 // pass charged in the shipped game.
+//
+// The fade, when there is one, is the last thing `engine_post` did before
+// writing (`engine_post_ps2x.fxc:437`):
+//
+//     FADE_TYPE 1: outColor.rgb = lerp( outColor.rgb, g_vViewFadeColor.rgb, g_vViewFadeColor.aaa );
+//     FADE_TYPE 2: outColor.rgb = lerp( outColor.rgb, g_vViewFadeColor.rgb * outColor.rgb, g_vViewFadeColor.aaa );
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(source, source_sampler, input.uv);
+    let scene = textureSample(source, source_sampler, input.uv);
+    if fade.kind == 0u {
+        return scene;
+    }
+    var rgb = scene.rgb;
+    if fade.srgb != 0u {
+        rgb = linear_to_srgb(saturate(rgb));
+    }
+    let amount = vec3<f32>(fade.color.a);
+    if fade.kind == 1u {
+        rgb = mix(rgb, fade.color.rgb, amount);
+    } else {
+        rgb = mix(rgb, fade.color.rgb * rgb, amount);
+    }
+    if fade.srgb != 0u {
+        rgb = srgb_to_linear(rgb);
+    }
+    return vec4<f32>(rgb, scene.a);
 }

@@ -52,11 +52,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::client::player::{VEC_HULL_MAX, VEC_HULL_MIN};
+use crate::client::fade::{ScreenFade, FFADE_IN, FFADE_OUT, FFADE_PURGE, FFADE_STAYOUT};
 use crate::client::{tonemap, Client, BUTTONS};
 use crate::cmdline::CommandLine;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::{Camera, Load};
 use crate::materials::pipeline::TargetFormat;
+use crate::materials::post::ViewFade;
 use crate::materials::renderer::Frame;
 use crate::materials::{
     Material, MaterialCache, MaterialPreview, PostProcess, RenderContext, CLEAR_COLOR,
@@ -324,6 +326,15 @@ impl<'a> Engine<'a> {
             // `trigger_hurt` the only damage source in the shipped maps, the
             // alternative to this is walking into goo to test arithmetic.
             CommandSpec::new("hurtme", "Usage: hurtme [damage] — hurt the player."),
+            // `EnvFade.cpp`'s two, `FCVAR_CHEAT` there.
+            CommandSpec::new(
+                "fadeout",
+                "fadeout {time r g b}: Fades the screen to black or to the specified color over the given number of seconds.",
+            ),
+            CommandSpec::new(
+                "fadein",
+                "fadein {time r g b}: Fades the screen in from black or from the specified color over the given number of seconds.",
+            ),
             CommandSpec::new("impulse", "Issue an impulse command."),
             // **This port's, not Valve's.** The C++ has no `trace` command:
             // its equivalents are `debugrayenable` and the trace counter,
@@ -791,6 +802,13 @@ impl<'a> Engine<'a> {
         for command in self.scene.server.take_server_commands() {
             self.console.enqueue(&format!("{command}\n"), console::Source::Code);
         }
+        // …and the `Fade` user message, `env_fade`'s. `CViewEffects::Fade`
+        // times a fade from the client's clock when it arrives, which is this
+        // one.
+        let now = self.scene.curtime;
+        for fade in self.scene.server.take_screen_fades() {
+            self.scene.client.fades_mut().fade(&fade, now);
+        }
 
         // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
         // it — **after the ticks and before anything reads it**, so the player
@@ -1033,6 +1051,10 @@ impl<'a> Engine<'a> {
         // opened has its constants written.
         let tonemap = client.tonemap_mut();
         context.set_exposure(tonemap.scale());
+        // `CurrentTime()`: what a fizzler's field flows by. The scene clock,
+        // unwrapped — `SolidEnergy` takes `frac` of it itself, and wrapping
+        // here would put a visible jump in every flow at the wrap.
+        context.set_time(curtime);
         let measure = tonemap.measuring().then(|| tonemap.exposure_region());
 
         // **Visibility, once, before anything is drawn.** `Map_VisSetup` runs
@@ -1202,6 +1224,10 @@ impl<'a> Engine<'a> {
             world.draw_translucent(&mut pass, curtime, &translucent, &visible, portal_depth);
         }
 
+        // `GetFadeParams` then `SetViewFadeParams` (`viewrender.cpp:3292`):
+        // what the fades add up to now, for the presenting pass to apply.
+        let fade = client.fades_mut().calculate(curtime);
+        post.set_fade(ViewFade::from_bytes(fade.color, fade.modulate));
         post.resolve(frame, measure);
     }
 
@@ -2041,6 +2067,33 @@ impl CommandSink for Console<'_> {
 /// `CTonemapSystem::DisplayHistogram` (`viewpostprocess.cpp:1115`) without the
 /// bar chart. The three lines it prints are the three its `Con_NPrintf` calls
 /// printed, plus the buckets themselves — which Valve only ever drew.
+/// `GetFadeParms` (`EnvFade.cpp:204`): `{time r g b}`, black and two
+/// seconds by default.
+///
+/// **Its alpha test is off by one, and that is kept.** It reads
+/// `args[5]` when `ArgC() == 5` — one past the last argument, which
+/// `CCommand` answers with `""`, so `atoi` makes it 0. So `fadeout 2 255 0 0`
+/// fades to a *transparent* red and does nothing visible, while a sixth
+/// argument is never read at all and leaves the alpha at 255.
+fn fade_params(cmd: &Command) -> (f32, [u8; 4]) {
+    let arg = |i: usize| cmd.arg(i).unwrap_or("");
+    let time = match cmd.argc() > 1 {
+        true => server::keyvalue::atof(arg(1)),
+        false => 2.0,
+    };
+    let mut color = [0, 0, 0, 255];
+    if cmd.argc() > 4 {
+        // `clrFade.r = atoi( args[2] )` into a `byte`: the low eight bits.
+        color[0] = server::keyvalue::atoi(arg(2)) as u8;
+        color[1] = server::keyvalue::atoi(arg(3)) as u8;
+        color[2] = server::keyvalue::atoi(arg(4)) as u8;
+        if cmd.argc() == 5 {
+            color[3] = server::keyvalue::atoi(arg(5)) as u8;
+        }
+    }
+    (time, color)
+}
+
 fn tonemap_command(client: &Client, cx: &mut ExecContext<'_>) {
     let tonemap = client.tonemap();
     let (min, max) = tonemap.exposure_range();
@@ -2686,6 +2739,17 @@ impl CommandTarget for EngineCommands<'_> {
             // since `portdocs/SERVER.md` stage 5**, which is where the move
             // type went. `god` and `kill` are its neighbours in
             // `game/server/client.cpp` and arrived with it.
+            // `CC_FadeOut` and `CC_FadeIn` (`EnvFade.cpp:236`), to the
+            // player. See [`fade_params`] for the argument parsing, which has
+            // a slip in it that is kept.
+            "fadeout" | "fadein" => {
+                let (time, color) = fade_params(cmd);
+                let flags = match cmd.name().eq_ignore_ascii_case("fadeout") {
+                    true => FFADE_OUT | FFADE_PURGE | FFADE_STAYOUT,
+                    false => FFADE_IN | FFADE_PURGE,
+                };
+                self.server.screen_fade(ScreenFade::new(color, time, 0.0, flags));
+            }
             "noclip" => match self.server.toggle_noclip() {
                 Some(true) => cx.print("noclip ON"),
                 Some(false) => cx.print("noclip OFF"),

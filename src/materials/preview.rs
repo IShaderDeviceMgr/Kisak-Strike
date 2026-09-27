@@ -24,7 +24,9 @@ use glam::{Mat4, Vec3};
 
 use super::context::{Camera, Load, Pass, RenderContext};
 use super::material::Material;
-use super::mesh::{IndexBuffer, ModelVertex, SimpleVertex, VertexBuffer, VertexLayout};
+use super::mesh::{
+    IndexBuffer, ModelVertex, SimpleVertex, VertexBuffer, VertexLayout, WorldTangentVertex,
+};
 use super::uniforms::{Light, ModelLighting, AMBIENT_CUBE_FACES, MAX_LIGHTS};
 
 // The non-deprecated spelling of `Mat4::look_at_rh`. Right-handed, Y-up.
@@ -56,6 +58,9 @@ pub struct MaterialPreview {
     /// Which one a `-vmt` uses is decided by the `.vmt`, so the preview cannot
     /// pick at construction time and builds both — 24 vertices each.
     model_vertices: VertexBuffer,
+    /// The same cube in [`VertexLayout::WorldTangent`], for `SolidEnergy` —
+    /// the third layout a `-vmt` can ask for, for the same reason.
+    tangent_vertices: VertexBuffer,
     /// A black static-light stream, long enough for the cube and the ground.
     ///
     /// Slot 1 of [`VertexLayout::Model`] has to be bound for every model draw,
@@ -82,6 +87,7 @@ impl MaterialPreview {
                 &vec![super::mesh::StaticLightVertex::UNLIT; model_vertices.len()],
             ),
             model_vertices: VertexBuffer::new(device, "preview model cube", &model_vertices),
+            tangent_vertices: VertexBuffer::new(device, "preview tangent cube", &tangent_cube()),
             indices: IndexBuffer::new(device, "preview cube", &indices),
             ground_indices: IndexBuffer::new(device, "preview ground", &QUAD_INDICES),
         }
@@ -132,10 +138,11 @@ impl MaterialPreview {
             // ground with room to spare.
             pass.bind_static_light(&self.unlit.slice());
         }
-        let vertices = if model_layout {
-            self.model_vertices.slice()
-        } else {
-            self.vertices.slice()
+        let layout = material.shader.vertex_layout();
+        let vertices = match layout {
+            VertexLayout::Model => self.model_vertices.slice(),
+            VertexLayout::WorldTangent => self.tangent_vertices.slice(),
+            _ => self.vertices.slice(),
         };
 
         for offset in CUBE_OFFSETS {
@@ -170,6 +177,20 @@ impl MaterialPreview {
                     // same reason it is on the cube's faces.
                     vertex.tangent = [1.0, 0.0, 0.0, -1.0];
                     vertex
+                })
+                .collect();
+            pass.vertices(&vertices)
+        } else if layout == VertexLayout::WorldTangent {
+            // `u` runs along +x and `v` along +z, so those are the tangents.
+            let vertices: Vec<WorldTangentVertex> = CORNERS
+                .iter()
+                .map(|&(position, texcoord)| WorldTangentVertex {
+                    position,
+                    texcoord,
+                    color: [1.0; 4],
+                    normal: [0.0, 1.0, 0.0],
+                    tangent_s: [1.0, 0.0, 0.0],
+                    tangent_t: [0.0, 0.0, 1.0],
                 })
                 .collect();
             pass.vertices(&vertices)
@@ -274,6 +295,28 @@ fn model_cube() -> Vec<ModelVertex> {
     vertices
 }
 
+/// The same cube as [`cube`], in [`VertexLayout::WorldTangent`]: the face
+/// normal, `u`'s direction as the S tangent and `v`'s as the T tangent — which
+/// is `-v` in the face table, for the reason [`model_cube`] gives.
+fn tangent_cube() -> Vec<WorldTangentVertex> {
+    let (simple, _) = cube();
+    let mut vertices = Vec::with_capacity(simple.len());
+    for (face, chunk) in simple.chunks(4).enumerate() {
+        let (normal, u, v) = CUBE_FACES[face];
+        for vertex in chunk {
+            vertices.push(WorldTangentVertex {
+                position: vertex.position,
+                texcoord: vertex.texcoord,
+                color: vertex.color,
+                normal,
+                tangent_s: u,
+                tangent_t: [-v[0], -v[1], -v[2]],
+            });
+        }
+    }
+    vertices
+}
+
 /// The lighting a `-vmt` preview of a model material is drawn under.
 ///
 /// There is no lighting environment here to be faithful to — `-vmt` is a
@@ -330,6 +373,8 @@ impl RenderContext {
         seconds: f32,
     ) {
         let camera = preview.camera(frame.size(), seconds);
+        // The clock a self-animating shader reads — `SolidEnergy`'s flow.
+        self.set_time(seconds);
         let mut pass = self.pass(
             frame,
             pipelines,
@@ -374,7 +419,7 @@ mod tests {
     use crate::materials::context::{Load, RenderContext, StateOverride};
     use crate::materials::image_format::{ColorSpace, ImageFormat};
     use crate::materials::material::{MaterialCache, TextureFallbacks};
-    use crate::materials::mesh::StaticLightVertex;
+    use crate::materials::mesh::{StaticLightVertex, WorldTangentVertex};
     use crate::materials::pipeline::{BlendMode, PipelineCache};
     use crate::materials::shader::TextureDimension;
     use crate::materials::target::RenderTarget;
@@ -2492,5 +2537,169 @@ mod tests {
         assert_eq!(at(1)[0], 0, "second column is not red");
         assert_eq!(at(2)[0], 255, "third column is red again");
         assert_eq!(at(2)[1], 0, "third column is not green");
+    }
+
+    // --- SolidEnergy -------------------------------------------------------
+    //
+    // Every texture a test material names resolves to the one flat texture
+    // the harness is given, so each expected value below is `solidenergy_ps20b`
+    // evaluated by hand on a constant colour.
+
+    /// A `SolidEnergy` material over `base`.
+    fn energy_material(h: &Harness, body: &str, base: Arc<Texture>) -> Material {
+        shader_material(&h.device, &h.queue, &h.pipelines, "SolidEnergy", body, base)
+    }
+
+    /// A full-screen quad in [`VertexLayout::WorldTangent`] at depth `z` of
+    /// the screen camera. Culling is the material's business: every test here
+    /// sets `$nocull`.
+    fn energy_quad(corners: [[f32; 3]; 4]) -> ([WorldTangentVertex; 4], [u16; 6]) {
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let vertex = |i: usize| WorldTangentVertex {
+            position: corners[i],
+            texcoord: uv[i],
+            color: [1.0; 4],
+            normal: [0.0, 0.0, 1.0],
+            tangent_s: [1.0, 0.0, 0.0],
+            tangent_t: [0.0, 1.0, 0.0],
+        };
+        ([vertex(0), vertex(1), vertex(2), vertex(3)], [0, 1, 2, 0, 2, 3])
+    }
+
+    fn unorm(value: f32) -> f32 {
+        (value.clamp(0.0, 1.0) * 255.0).round()
+    }
+
+    fn assert_near(actual: [u8; 4], expected: [f32; 4], what: &str) {
+        for (channel, (&got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (f32::from(got) - want).abs() <= 1.0,
+                "{what}: channel {channel} is {got}, expected {want} ({actual:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn solid_energy_multiplies_its_detail_in_at_twice_and_writes_base_alpha() {
+        // `DETAIL1BLENDMODE` 0: `cBase.rgb *= 2 * cDetail1.rgb`, and with no
+        // flow and no falloff the alpha is the base texture's own.
+        let mut h = harness!(false);
+        let texel = [64u8, 128, 32, 200];
+        let material = energy_material(&h, r#""$detail1" "test" "$nocull" 1"#, h.texture(texel));
+        let (vertices, indices) = energy_quad([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let pixels = h.render(|pass| {
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        let c = texel.map(|x| f32::from(x) / 255.0);
+        assert_near(
+            centre(&pixels),
+            [
+                unorm(c[0] * 2.0 * c[0]),
+                unorm(c[1] * 2.0 * c[1]),
+                unorm(c[2] * 2.0 * c[2]),
+                unorm(c[3]),
+            ],
+            "mod2x detail",
+        );
+    }
+
+    #[test]
+    fn solid_energy_flow_is_two_cross_faded_samples_lit_by_the_bounds() {
+        // The whole flow path on a constant texture, at a time that puts the
+        // two phases at unequal weights. What it pins: the clock comes from
+        // group 0, the noise offsets it, `$flow_lerpexp` shapes the weights,
+        // `bounds.g` is added to alpha before the colour is taken from it, and
+        // `bounds.b` and the intensity scale the result.
+        let mut h = harness!(false);
+        let texel = [64u8, 128, 192, 255];
+        let body = r#""$flowmap" "test" "$flowbounds" "test" "$flow_noise_texture" "test"
+            "$flow_timeintervalinseconds" 1 "$flow_lerpexp" 2
+            "$flow_color" "[0.5 0.25 1]" "$flow_color_intensity" 0.8 "$nocull" 1"#;
+        let material = energy_material(&h, body, h.texture(texel));
+        let (vertices, indices) = energy_quad([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let time = 0.3;
+        h.context.set_time(time);
+        let pixels = h.render(|pass| {
+            let v = pass.vertices(&vertices);
+            let i = pass.indices(&indices);
+            pass.draw(&material, &v, &i, Mat4::IDENTITY);
+        });
+
+        let c = texel.map(|x| f32::from(x) / 255.0);
+        let noise = c[1];
+        let intervals = time / (1.0 * 2.0) + noise;
+        let w1 = (2.0 * (intervals + 0.5).fract() - 1.0).abs().powf(2.0);
+        let w2 = (2.0 * intervals.fract() - 1.0).abs().powf(2.0);
+        let alpha = c[3] * (w1 + w2) + c[1];
+        let scale = c[2] * 0.8;
+        assert_near(
+            centre(&pixels),
+            [
+                unorm(alpha * 0.5 * scale),
+                unorm(alpha * 0.25 * scale),
+                unorm(alpha * scale),
+                // A flow field's alpha is 1: it is not multiplied by the base.
+                255.0,
+            ],
+            "flow field",
+        );
+    }
+
+    #[test]
+    fn an_additive_energy_surface_fades_out_in_front_of_the_camera() {
+        // `ComputeCameraFade`: `smoothstep( 0, 1, saturate( z * 0.025 ) )` of
+        // the clip-space depth, then `rgb *= ( 1 + alpha ) * fade`. Far away
+        // the fade is 1 and the colour doubles; twenty units out it is half.
+        let mut h = harness!(false);
+        let texel = [64u8, 64, 64, 255];
+        let body = r#""$translucent" 1 "$additive" 1 "$nocull" 1"#;
+        let material = energy_material(&h, body, h.texture(texel));
+        assert_eq!(material.state.blend, BlendMode::BlendAdd);
+        assert!(!material.state.depth_write);
+
+        let (near, far) = (1.0, 10_000.0);
+        let camera = Camera::perspective(Vec3::ZERO, Mat4::IDENTITY, 90.0, 1.0, near, far);
+        let draw_at = |h: &mut Harness, distance: f32| {
+            let d = distance;
+            let (vertices, indices) = energy_quad([
+                [-2.0 * d, -2.0 * d, -d],
+                [2.0 * d, -2.0 * d, -d],
+                [2.0 * d, 2.0 * d, -d],
+                [-2.0 * d, 2.0 * d, -d],
+            ]);
+            let pixels = h.render_with(&camera, |pass| {
+                let v = pass.vertices(&vertices);
+                let i = pass.indices(&indices);
+                pass.draw(&material, &v, &i, Mat4::IDENTITY);
+            });
+            centre(&pixels)
+        };
+        let expected = |distance: f32| {
+            let z = far * (distance - near) / (far - near);
+            let x = (z * 0.025).clamp(0.0, 1.0);
+            let fade = x * x * (3.0 - 2.0 * x);
+            unorm(f32::from(texel[0]) / 255.0 * 2.0 * fade)
+        };
+
+        // Alpha stays the clear's 0: a blended `SolidEnergy` surface turns
+        // alpha writes off (`EnableAlphaWrites( false )`).
+        let far_away = draw_at(&mut h, 200.0);
+        assert_near(far_away, [expected(200.0), expected(200.0), expected(200.0), 0.0], "far");
+        let close = draw_at(&mut h, 21.0);
+        assert_near(close, [expected(21.0), expected(21.0), expected(21.0), 0.0], "close");
+        assert!(close[0] < far_away[0], "nearer is dimmer");
     }
 }

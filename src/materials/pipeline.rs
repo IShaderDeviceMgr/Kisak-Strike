@@ -34,7 +34,9 @@ use super::shader::{
     BINDING_PORTAL_COLOR_SAMPLER, BINDING_PORTAL_COLOR_TEXTURE, BINDING_PORTAL_MASK_SAMPLER,
     BINDING_PORTAL_MASK_TEXTURE, BINDING_REFRACT_SOURCE_SAMPLER, BINDING_REFRACT_SOURCE_TEXTURE,
     BINDING_REFRACT_TINT_SAMPLER, BINDING_REFRACT_TINT_TEXTURE, BINDING_SELFILLUM_MASK_SAMPLER,
-    BINDING_SELFILLUM_MASK_TEXTURE,
+    BINDING_SELFILLUM_MASK_TEXTURE, BINDING_DETAIL2_SAMPLER, BINDING_DETAIL2_TEXTURE,
+    BINDING_FLOW_BOUNDS_SAMPLER, BINDING_FLOW_BOUNDS_TEXTURE, BINDING_FLOW_MAP_SAMPLER,
+    BINDING_FLOW_MAP_TEXTURE, BINDING_FLOW_NOISE_SAMPLER, BINDING_FLOW_NOISE_TEXTURE,
 };
 
 /// Fixed pipeline state, as a material asks for it.
@@ -356,6 +358,7 @@ pub struct BindLayouts {
     refract_material: wgpu::BindGroupLayout,
     portal_refract_material: wgpu::BindGroupLayout,
     buffer_clear_material: wgpu::BindGroupLayout,
+    solid_energy_material: wgpu::BindGroupLayout,
     lightmap: wgpu::BindGroupLayout,
     model_lighting: wgpu::BindGroupLayout,
     frame_buffer_copy: wgpu::BindGroupLayout,
@@ -558,6 +561,40 @@ impl BindLayouts {
                     }],
                 },
             ),
+            // Six textures, the most any shader here binds that is not a
+            // model shader: a base, two details and the flow field's three.
+            // A material uses either the details or the flow — `$detail1`
+            // turns the flow map off — but a bind group must supply every
+            // entry, so the unused three bind white.
+            solid_energy_material: device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("material: SolidEnergy"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: BINDING_MATERIAL_UNIFORMS,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        texture_entry(BINDING_BASE_TEXTURE),
+                        sampler_entry(BINDING_BASE_SAMPLER),
+                        texture_entry(BINDING_DETAIL_TEXTURE),
+                        sampler_entry(BINDING_DETAIL_SAMPLER),
+                        texture_entry(BINDING_DETAIL2_TEXTURE),
+                        sampler_entry(BINDING_DETAIL2_SAMPLER),
+                        texture_entry(BINDING_FLOW_MAP_TEXTURE),
+                        sampler_entry(BINDING_FLOW_MAP_SAMPLER),
+                        texture_entry(BINDING_FLOW_NOISE_TEXTURE),
+                        sampler_entry(BINDING_FLOW_NOISE_SAMPLER),
+                        texture_entry(BINDING_FLOW_BOUNDS_TEXTURE),
+                        sampler_entry(BINDING_FLOW_BOUNDS_SAMPLER),
+                    ],
+                },
+            ),
             portal_refract_material: device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
                     label: Some("material: PortalRefract"),
@@ -632,6 +669,7 @@ impl BindLayouts {
                 &self.portal_refract_material
             }
             ShaderKind::BufferClearObeyStencil => &self.buffer_clear_material,
+            ShaderKind::SolidEnergy => &self.solid_energy_material,
         }
     }
 
@@ -1159,6 +1197,7 @@ mod tests {
             ShaderKind::Phong,
             ShaderKind::Refract,
             ShaderKind::PortalRefract,
+            ShaderKind::SolidEnergy,
         ] {
             // **Every** blend mode, not just two: the translucent pass made all
             // five reachable, and a `ColorTargetState` whose factors a backend

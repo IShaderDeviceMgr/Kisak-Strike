@@ -7,10 +7,10 @@ Porting plan and the C++ inventory: [`portdocs/CLIENT.md`](../portdocs/CLIENT.md
 
 | | |
 |---|---|
-| Module | `crate::client`, with `client::{button, movement, player, tonemap, usercmd, view}` |
-| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, `FullNoClipMove`/`FullWalkMove` from `game/shared/gamemovement.cpp` (via `portal_gamemovement.cpp`), and `CTonemapSystem` from `viewpostprocess.cpp` |
+| Module | `crate::client`, with `client::{button, fade, movement, player, tonemap, usercmd, view}` |
+| Replaces | `game/client/in_main.cpp`, `in_mouse.cpp`, `view.cpp`'s `SetUpView`/`GetZNear`/`GetZFar`, `game/shared/usercmd.h`, `in_buttons.h`, `FullNoClipMove`/`FullWalkMove` from `game/shared/gamemovement.cpp` (via `portal_gamemovement.cpp`), `CTonemapSystem` from `viewpostprocess.cpp`, and the fade half of `CViewEffects` from `view_effects.cpp` |
 | Lines | ~5,500 including tests |
-| Tests | 107 (`cargo test client::`) |
+| Tests | 122 (`cargo test client::`) |
 | Dependencies | `std`, `glam`, and `crate::engine::console` for cvar handles. **Not `winit`, not `egui`, not `wgpu`, not `crate::engine::input`** |
 | Status | **Stages 1-4 of 5 done** (`portdocs/CLIENT.md` §8), plus the tone mapper (`portdocs/CLIENT_TONEMAP.md`) and the dead player that `server/` stage 5 brought. `client/` stage 5 waits for `net/` |
 
@@ -688,6 +688,37 @@ The `tonemap` console command prints `current`, `target`, `exposure_range`, `bri
 `median_luminance` and the buckets. It is this port's own, the way `trace` is;
 `mat_show_histogram` and its 200-line bar chart are not ported.
 
+### `ViewFades` — screen fades
+
+`src/client/fade.rs`. The fade half of `CViewEffects` (`view_effects.cpp:815-1009`)
+and `shake.h`'s `ScreenFade_t`/`FFADE_*`.
+
+```rust
+pub struct ScreenFade { pub duration: u16, pub hold_time: u16, pub flags: u16, pub color: [u8; 4] }
+impl ScreenFade { pub fn new(color: [u8; 4], fade_time: f32, hold_time: f32, flags: u16) -> ScreenFade; }
+
+pub struct ViewFades;
+impl ViewFades {
+    pub fn fade(&mut self, data: &ScreenFade, now: f32);   // CViewEffects::Fade
+    pub fn calculate(&mut self, now: f32) -> FadeParams;   // FadeCalculate + GetFadeParams
+    pub fn clear(&mut self);                               // ClearAllFades
+}
+pub struct FadeParams { pub color: [u8; 4], pub modulate: bool }
+
+impl Client { pub fn fades_mut(&mut self) -> &mut ViewFades; }
+```
+
+The server's `env_fade` builds a `ScreenFade`; the engine hands it to `fade` at the
+client's clock the tick it arrives, and once a frame passes `calculate`'s answer to the
+presenting pass (`materials::post::ViewFade`). **The two times stay in 7.9 fixed point**
+because that is the wire format — 0.3 s arrives as 0.2988 s. A fade *out* runs, then
+holds; a fade *in* holds, then runs. `calculate` drops what is over, averages the live
+colours **in integers** and takes the highest alpha, and truncates the alpha arithmetic to
+`int` before adding the full alpha back, as the C does. `Client::spawn` clears the list —
+`CViewEffects::LevelInit` — which is what lifts a transition's stay-out exit fade.
+Valve's zero-duration quirk is kept: such a fade's `reset` is its hold time as an
+*absolute* time, so one sent after that time has passed is dropped at once.
+
 ## The cvars
 
 Registered by `Client::new`. Names, defaults, bounds and flags are Valve's; `FCVAR_NOTIFY`,
@@ -1107,7 +1138,7 @@ Same ordering: most likely to bite first.
 
 ## Which tests guard what
 
-`cargo test client::` — 115 tests, no window, no GPU, no game content, plus one
+`cargo test client::` — 121 tests, no window, no GPU, no game content, plus one
 depot-gated. Stage 4's build a collision model with `engine::trace::fixture::Fixture`
 rather than loading a `.bsp`: a room with a floor, a 16-unit step, a wall nothing can climb
 and a ceiling only a crouched player fits under. The teleport's use
@@ -1202,6 +1233,11 @@ Added by `server/` stage 5:
 | `movement::the_dead_view_drops_to_the_floor_and_duck_does_not_lift_it_back` | `VEC_DEAD_VIEWHEIGHT`, and the write order against `Duck()` |
 | `movement::a_dead_players_movement_basis_is_the_previous_commands` | the `m_vecOldAngles` pin, and that a live player is unaffected |
 | `server::tests::noclip_is_the_servers_and_survives_the_round_trip` | that the move type only travels one way |
+| `fade::a_fade_out_darkens_over_its_duration_and_then_holds` | `CViewEffects::Fade`'s out-then-hold timing and `FadeCalculate`'s truncating alpha arithmetic |
+| `fade::a_fade_in_holds_first_and_then_clears` | the other order, and the clamp to the fade's own alpha during the hold |
+| `fade::stayout_holds_until_something_replaces_it` | `FFADE_STAYOUT` pushing its reset out, and `FFADE_PURGE` clearing it — the transition's exit fade |
+| `fade::the_times_cross_in_seven_nine_fixed_point` | `FixedUnsigned16`: truncation and both clamps |
+| `fade::two_fades_average_their_colours_and_take_the_higher_alpha` | the integer average, the highest alpha and `FFADE_MODULATE` |
 
 **`a_player_walks_through_every_shipped_portal_pair`** is the depot-gated acceptance test
 `portdocs/PORTAL.md` §11 asks for, and it is the strongest evidence stage 4 has:

@@ -59,7 +59,9 @@ use crate::filesystem::mount::pak::PakMount;
 use crate::filesystem::{PathId, Vfs};
 use crate::materials::context::Pass;
 use crate::materials::lightmap::{Allocation, LightmapAtlas, LightmapPages, WHITE_PAGE};
-use crate::materials::mesh::{IndexBuffer, SimpleVertex, VertexBuffer, VertexLayout, WorldVertex};
+use crate::materials::mesh::{
+    IndexBuffer, SimpleVertex, VertexBuffer, VertexLayout, WorldTangentVertex, WorldVertex,
+};
 use crate::materials::shader::Lighting;
 use crate::materials::{Material, MaterialCache};
 
@@ -616,7 +618,7 @@ impl World {
             // shader, one step later: visibly wrong beats plausibly wrong.
             if !matches!(
                 material.shader.vertex_layout(),
-                VertexLayout::Simple | VertexLayout::World
+                VertexLayout::Simple | VertexLayout::World | VertexLayout::WorldTangent
             ) {
                 eprintln!(
                     "source-engine: world: {name}: {} needs model geometry, \
@@ -1568,6 +1570,67 @@ struct FaceSpan {
 enum MeshVertices {
     Simple(Vec<SimpleVertex>),
     World(Vec<WorldVertex>),
+    /// `SolidEnergy`'s: a fizzler's field wants the surface frame and no
+    /// lightmap. See [`FaceBasis`].
+    WorldTangent(Vec<WorldTangentVertex>),
+}
+
+/// A face's normal and texture-space tangents, which a flat surface has one
+/// of.
+///
+/// `TangentSpaceSurfaceSetup` then `TangentSpaceComputeBasis`
+/// (`engine/matsys_interface.cpp:1402`): `t` is the texinfo's `v` axis
+/// normalised, `s` is `normal × t` and `t` is then rebuilt as `s × normal`,
+/// and `s` is negated when the texture is mapped "backwards" — when
+/// `normalize(u) × normalize(v)` points the same way as the normal.
+///
+/// **The normal's sign does not reach the tangents.** Flipping it flips
+/// `normal × t` *and* the backwards test, and the two cancel; so `s` and `t`
+/// are the same whichever way the plane faces, and only the normal itself —
+/// which `SolidEnergy` reads for its vortices and its Fresnel falloff —
+/// depends on getting `side` right. Valve reads that normal from
+/// `LUMP_VERTNORMALS`, which this port does not load; for a flat face it is the
+/// plane's normal turned to face the way the face does, which is what is used
+/// here, displacements included.
+#[derive(Debug, Clone, Copy)]
+struct FaceBasis {
+    normal: Vec3,
+    tangent_s: Vec3,
+    tangent_t: Vec3,
+}
+
+impl FaceBasis {
+    fn of(bsp: &Bsp, face: &Face) -> FaceBasis {
+        let plane = bsp.planes.get(face.plane_num as usize);
+        let mut normal = plane.map_or(Vec3::Z, |p| Vec3::from(p.normal));
+        if face.side != 0 {
+            normal = -normal;
+        }
+        let axes = bsp
+            .texinfo
+            .get(face.tex_info.max(0) as usize)
+            .map(|info| info.texture_vecs);
+        let axis = |i: usize| axes.map_or(Vec3::ZERO, |v| Vec3::new(v[i][0], v[i][1], v[i][2]));
+        FaceBasis::from_axes(normal, axis(0), axis(1))
+    }
+
+    /// The arithmetic of [`of`](FaceBasis::of), from a normal and the
+    /// texinfo's two unnormalised texture axes.
+    fn from_axes(normal: Vec3, u: Vec3, v: Vec3) -> FaceBasis {
+        let (s_vect, t_vect) = (u.normalize_or_zero(), v.normalize_or_zero());
+        let negate = normal.dot(s_vect.cross(t_vect)) > 0.0;
+
+        let mut tangent_s = normal.cross(t_vect).normalize_or_zero();
+        let tangent_t = tangent_s.cross(normal).normalize_or_zero();
+        if negate {
+            tangent_s = -tangent_s;
+        }
+        FaceBasis {
+            normal,
+            tangent_s,
+            tangent_t,
+        }
+    }
 }
 
 impl MeshVertices {
@@ -1580,6 +1643,7 @@ impl MeshVertices {
         match layout {
             VertexLayout::Simple => MeshVertices::Simple(Vec::new()),
             VertexLayout::World => MeshVertices::World(Vec::new()),
+            VertexLayout::WorldTangent => MeshVertices::WorldTangent(Vec::new()),
             VertexLayout::Model | VertexLayout::StaticLight => {
                 unreachable!("model geometry is not built from a .bsp face")
             }
@@ -1590,6 +1654,7 @@ impl MeshVertices {
         match self {
             MeshVertices::Simple(v) => v.len(),
             MeshVertices::World(v) => v.len(),
+            MeshVertices::WorldTangent(v) => v.len(),
         }
     }
 
@@ -1598,8 +1663,9 @@ impl MeshVertices {
     }
 
     /// Appends one vertex, dropping whichever attributes this layout has no
-    /// room for.
-    fn push(&mut self, vertex: WorldVertex) {
+    /// room for and taking the surface frame from `basis` for the one layout
+    /// that has room for it.
+    fn push(&mut self, vertex: WorldVertex, basis: &FaceBasis) {
         match self {
             MeshVertices::Simple(v) => {
                 v.push(SimpleVertex {
@@ -1609,6 +1675,14 @@ impl MeshVertices {
                 });
             }
             MeshVertices::World(v) => v.push(vertex),
+            MeshVertices::WorldTangent(v) => v.push(WorldTangentVertex {
+                position: vertex.position,
+                texcoord: vertex.texcoord,
+                color: vertex.color,
+                normal: basis.normal.to_array(),
+                tangent_s: basis.tangent_s.to_array(),
+                tangent_t: basis.tangent_t.to_array(),
+            }),
         }
     }
 
@@ -1616,6 +1690,7 @@ impl MeshVertices {
         match self {
             MeshVertices::Simple(v) => MeshVertices::Simple(std::mem::take(v)),
             MeshVertices::World(v) => MeshVertices::World(std::mem::take(v)),
+            MeshVertices::WorldTangent(v) => MeshVertices::WorldTangent(std::mem::take(v)),
         }
     }
 
@@ -1624,6 +1699,7 @@ impl MeshVertices {
         let positions: &mut dyn Iterator<Item = [f32; 3]> = match self {
             MeshVertices::Simple(v) => &mut v.iter().map(|v| v.position),
             MeshVertices::World(v) => &mut v.iter().map(|v| v.position),
+            MeshVertices::WorldTangent(v) => &mut v.iter().map(|v| v.position),
         };
         positions.fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |b, p| {
             let p = Vec3::from(p);
@@ -1734,6 +1810,7 @@ fn upload_batches(
             vertices: match &mesh.vertices {
                 MeshVertices::Simple(v) => VertexBuffer::new(device, &mesh.material, v),
                 MeshVertices::World(v) => VertexBuffer::new(device, &mesh.material, v),
+                MeshVertices::WorldTangent(v) => VertexBuffer::new(device, &mesh.material, v),
             },
             indices: IndexBuffer::new(device, &mesh.material, &mesh.indices),
         })
@@ -1896,6 +1973,7 @@ fn build_page_meshes(
         let base = vertices.len() as u16;
         let first_index = indices.len() as u32;
         let lightmap_offset = lightmap_block_offset(face, info.lighting, page_size);
+        let basis = FaceBasis::of(bsp, face);
 
         // A displacement replaces the face's winding with its own grid, and
         // brings its own texture and lightmap coordinates with it — a
@@ -1922,7 +2000,7 @@ fn build_page_meshes(
                 // (`disp_mapload.cpp:330`) — the blend factor between
                 // `$basetexture` and `$basetexture2`.
                 out.color = [1.0, 1.0, 1.0, vertex.alpha];
-                vertices.push(out);
+                vertices.push(out, &basis);
             }
             // Already reversed, by `Displacement::build`, for the same
             // `front_face: Ccw` reason the fan below is reversed here.
@@ -1942,7 +2020,7 @@ fn build_page_meshes(
             vertex.lightmap_texcoord =
                 lightmap_texcoord(bsp, face, position, allocation, page_size);
             vertex.lightmap_offset = lightmap_offset;
-            vertices.push(vertex);
+            vertices.push(vertex, &basis);
         }
 
         // `BuildIndicesForSurface` (`engine/gl_rsurf.h:145`): a face is a
@@ -2443,6 +2521,29 @@ mod tests {
         Bsp::parse("test.bsp".into(), &bsp::one_face_bsp()).expect("valid")
     }
 
+    #[test]
+    fn a_face_basis_follows_the_texture_axes_whichever_way_the_face_points() {
+        // A floor mapped the ordinary way: `u` along +x at half a texel per
+        // unit, `v` along -y. The tangents are the axes' directions.
+        let (u, v) = (Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.0, -0.5, 0.0));
+        let up = FaceBasis::from_axes(Vec3::Z, u, v);
+        assert!(up.tangent_s.abs_diff_eq(Vec3::X, 1e-6), "{:?}", up.tangent_s);
+        assert!(up.tangent_t.abs_diff_eq(-Vec3::Y, 1e-6), "{:?}", up.tangent_t);
+
+        // The ceiling on the other side of the same brush: the normal flips
+        // and `TangentSpaceSurfaceSetup`'s "backwards" test flips with it, so
+        // the tangents do not move.
+        let down = FaceBasis::from_axes(-Vec3::Z, u, v);
+        assert!(down.tangent_s.abs_diff_eq(up.tangent_s, 1e-6));
+        assert!(down.tangent_t.abs_diff_eq(up.tangent_t, 1e-6));
+        assert_eq!(down.normal, -Vec3::Z);
+
+        // A mirrored mapping: `u` along -x. The S tangent follows it.
+        let mirrored = FaceBasis::from_axes(Vec3::Z, -u, v);
+        assert!(mirrored.tangent_s.abs_diff_eq(-Vec3::X, 1e-6));
+        assert!(mirrored.tangent_t.abs_diff_eq(-Vec3::Y, 1e-6));
+    }
+
     fn lit_bsp(bumped: bool) -> Bsp {
         Bsp::parse("lit.bsp".into(), &bsp::lit_face_bsp(bumped)).expect("valid")
     }
@@ -2481,7 +2582,9 @@ mod tests {
     fn world_vertices(mesh: &Mesh) -> &[WorldVertex] {
         match &mesh.vertices {
             MeshVertices::World(v) => v,
-            MeshVertices::Simple(_) => panic!("expected the World layout"),
+            MeshVertices::Simple(_) | MeshVertices::WorldTangent(_) => {
+                panic!("expected the World layout")
+            }
         }
     }
 

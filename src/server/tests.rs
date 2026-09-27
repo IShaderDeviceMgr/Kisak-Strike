@@ -3603,8 +3603,11 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **+62 for `point_changelevel`**, one each on 62 maps and every one
     // named `@changelevel`. All spawn.
-    assert_eq!(total.matched, 37_563);
-    assert_eq!(total.spawned, 30_691);
+    //
+    // **+327 for `env_fade`**, on 105 maps. All spawn. **No shipped map
+    // connects `OnBeginFade`**, so `outputs` does not move.
+    assert_eq!(total.matched, 37_890);
+    assert_eq!(total.spawned, 31_018);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3639,8 +3642,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-2 and -83** for `prop_button` and `prop_under_button`.
     // **-1 and -384** for `logic_script`.
     // **-1 and -62** for `point_changelevel`.
-    assert_eq!(total.unknown.len(), 149);
-    assert_eq!(total.unknown.values().sum::<usize>(), 23_362);
+    // **-1 and -327** for `env_fade`.
+    assert_eq!(total.unknown.len(), 148);
+    assert_eq!(total.unknown.values().sum::<usize>(), 23_035);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3895,7 +3899,10 @@ fn every_shipped_map_spawns_its_entities() {
     // inputs that were aimed at `logic_script`s and found nothing, and the one
     // `logic_relay.RunScriptCode` that was on the unhandled list — it is a
     // `CBaseEntity` input now.
-    assert_eq!(io.accepted, 6_272);
+    //
+    // **+5 with `env_fade`**: the fades a map fires in its first two seconds
+    // — arrival fade-ins, mostly.
+    assert_eq!(io.accepted, 6_277);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3934,7 +3941,9 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **-41 with VScript**: 38 script inputs that now find their
     // `logic_script`, and 3 from the random stream.
-    assert_eq!(io.no_target, 1_032);
+    //
+    // **-5 with `env_fade`**: the five accepted above.
+    assert_eq!(io.no_target, 1_027);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -11364,6 +11373,59 @@ fn point_changelevel_asks_the_engine_for_one_changelevel() {
     assert_eq!(server.take_server_commands(), ["changelevel sp_next"]);
 }
 
+/// `env_fade`: `Fade` sends the player one fade, in the direction and with
+/// the flags its spawnflags ask for, and `FadeReverse` sends the other
+/// direction starting from wherever the first had got to.
+#[test]
+fn env_fade_fades_the_players_screen_and_reverses_from_where_it_got_to() {
+    use crate::client::fade::{FFADE_IN, FFADE_OUT, FFADE_PURGE, FFADE_STAYOUT};
+    let blocks = script_counter_map(vec![
+        // `@transition_from_map`'s `exit_fade`, as `sp_a1_intro2` places it.
+        block(&[
+            ("classname", "env_fade"),
+            ("targetname", "exit_fade"),
+            ("spawnflags", "8"),
+            ("duration", "0.3"),
+            ("holdtime", "0"),
+            ("rendercolor", "0 0 0"),
+            ("renderamt", "255"),
+            ("ReverseFadeDuration", "2"),
+            ("OnBeginFade", &conn("counter", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("exit_fade", "Fade", "", "0", "-1")),
+            ("OnMapSpawn", &conn("exit_fade", "FadeReverse", "", "0.1", "-1")),
+        ]),
+    ]);
+    let mut server = Server::new();
+    server.level_init("test", &blocks, &[]);
+    server.spawn_player(player_at(Vec3::ZERO));
+    run(&mut server, 0.5);
+
+    assert_eq!(counter_value(&server, "counter"), 2.0, "OnBeginFade, twice");
+    let fades = server.take_screen_fades();
+    assert_eq!(fades.len(), 2, "{fades:?}");
+    assert_eq!(fades[0].flags, FFADE_OUT | FFADE_STAYOUT | FFADE_PURGE);
+    assert_eq!(fades[0].duration, 153, "0.3 s in 7.9 fixed point");
+    assert_eq!(fades[0].color, [0, 0, 0, 255]);
+    // The reverse fades *in*, over `ReverseFadeDuration`, from about a third
+    // of the way — 0.1 s into a 0.3 s fade, give or take a tick.
+    assert_eq!(fades[1].flags, FFADE_IN | FFADE_STAYOUT | FFADE_PURGE);
+    assert_eq!(fades[1].duration, 1024);
+    let alpha = fades[1].color[3];
+    assert!((70..=100).contains(&alpha), "reverse alpha {alpha}");
+    assert!(server.take_screen_fades().is_empty(), "taken once");
+
+    // With nobody to send it to, a fade goes nowhere — and the output still
+    // fires, because the entity did its part.
+    let mut alone = Server::new();
+    alone.level_init("test", &blocks, &[]);
+    run(&mut alone, 0.5);
+    assert_eq!(counter_value(&alone, "counter"), 2.0);
+    assert!(alone.take_screen_fades().is_empty());
+}
+
 /// The server's environment as the movement tracer's prop query — the three
 /// lines `engine/mod.rs`'s `PhysicsProps` is, which this module cannot name.
 struct PhysicsProps<'a>(&'a super::physics::Physics);
@@ -11615,7 +11677,7 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         {
             let chain = clip_chain();
             let props = server.physics().map(PhysicsProps);
-            let mut tracer = collision.tracer().with_entities(&chain);
+            let tracer = collision.tracer().with_entities(&chain);
             let mut tracer = match props.as_ref() {
                 Some(props) => tracer.with_props(props),
                 None => tracer,
@@ -11671,11 +11733,13 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
     // player aboard.
     let mut ride: Option<(f32, f32, f32)> = None;
     let mut ride_bottom = f32::INFINITY;
+    let mut fades = Vec::new();
     for t in 0..(64 * 60) {
         tick(&mut server);
         if moving_at.is_none() && server.entities.get(train).is_some_and(|e| e.core.speed > 0.0) {
             moving_at = Some(t);
         }
+        fades.extend(server.take_screen_fades().into_iter().map(|f| (t, f)));
         let console = server.take_console_commands();
         assert!(
             !console.iter().any(|c| c.starts_with("map ")),
@@ -11723,6 +11787,20 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
     let (at, command) = map_command.expect("TransitionFromMap() asks for the next map");
     println!("departure: @changelevel sent `{command}` after {:.1}s", at as f32 / 64.0);
     assert_eq!(command, "changelevel sp_a1_intro3");
+    // **And the screen goes black as it is asked**: `@transition_from_map`
+    // fires `exit_fade` — 0.3 s to black and stay there — on the same trigger
+    // as the script that fires `@changelevel`, so the level is left in the
+    // dark rather than cut away from.
+    for (t, fade) in &fades {
+        println!("departure: a {:?} fade after {:.1}s", fade, *t as f32 / 64.0);
+    }
+    use crate::client::fade::{FFADE_OUT, FFADE_STAYOUT};
+    let exit = fades
+        .iter()
+        .find(|(_, f)| f.flags & (FFADE_OUT | FFADE_STAYOUT) == FFADE_OUT | FFADE_STAYOUT)
+        .expect("the exit fade is sent");
+    assert!(exit.0 <= at, "the fade starts no later than the changelevel");
+    assert_eq!(exit.1.color, [0, 0, 0, 255], "to black");
     assert!((speed - 200.0).abs() < 1e-3, "sp_elevator_motifs.nut's speed for this map");
     assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
 }

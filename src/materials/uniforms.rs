@@ -163,6 +163,17 @@ pub struct FrameUniforms {
 
     /// `cScreenSize`, PS `c32`: `(width, height, 1/width, 1/height)`.
     pub screen_size: [f32; 4],
+
+    /// `x` is `IShaderDynamicAPI::CurrentTime()`: the clock a shader animates
+    /// itself by, in seconds. The rest is padding.
+    ///
+    /// **Not one of Valve's registers**, and that is the point of it: a shader
+    /// that wanted the time asked the API for it and wrote it into a register
+    /// of its *own* choosing — `SolidEnergy` puts it in PS `c3.y` beside three
+    /// unrelated numbers (`solidenergy_dx9_helper.cpp:517`). Every such shader
+    /// asks the same clock, so it is uploaded once a frame here rather than
+    /// once a material.
+    pub time: [f32; 4],
 }
 
 impl FrameUniforms {
@@ -178,11 +189,14 @@ impl FrameUniforms {
     /// `exposure` is what the tone mapper chose — 1.0 is "as bright as `vrad`
     /// left it". There is still no fog controller, which is the other half of
     /// what this block would carry in a finished engine.
+    ///
+    /// `time` is the clock [`time`](FrameUniforms::time) carries.
     pub fn new(
         view_proj: ColumnMajor,
         eye: [f32; 3],
         size: (u32, u32),
         exposure: f32,
+        time: f32,
     ) -> FrameUniforms {
         let (width, height) = (size.0.max(1) as f32, size.1.max(1) as f32);
         FrameUniforms {
@@ -192,6 +206,7 @@ impl FrameUniforms {
             fog_color: [0.0, 0.0, 0.0, 1.0],
             light_scale: tone_mapping_scale(exposure),
             screen_size: [width, height, 1.0 / width, 1.0 / height],
+            time: [time, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -646,7 +661,7 @@ mod tests {
         // A uniform buffer's size and every member's offset are part of the
         // ABI: WGSL rounds a struct up to a multiple of its largest member's
         // alignment, and a mismatch here binds garbage rather than failing.
-        assert_eq!(size_of::<FrameUniforms>(), 64 + 5 * 16);
+        assert_eq!(size_of::<FrameUniforms>(), 64 + 6 * 16);
         assert_eq!(size_of::<DrawUniforms>(), 64 + 16 + 16);
         assert_eq!(size_of::<FrameUniforms>() % 16, 0);
         assert_eq!(size_of::<DrawUniforms>() % 16, 0);
