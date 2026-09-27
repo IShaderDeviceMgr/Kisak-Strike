@@ -14,8 +14,12 @@ Scope of this doc: `engine/cmodel*.cpp` (the BSP brush trace), `engine/enginetra
 Read `PORTING.md` first. `portdocs/CLIENT.md` §8 stage 4 is the consumer this is being
 built for; `rustdocs/ENGINE.md` is the API doc for the module it lands beside.
 
-Status: **stages 1-4 of 5 done.** Stage 5 (vcollide, static props, `parry`) is
-all that remains.
+Status: **stages 1-4 of 5 done, and stage 5 landed somewhere else.** vcollide and
+static props reached the player's trace through `src/vphysics/`'s environment
+rather than through `trace/`: `Tracer::with_props` sweeps the bodies built from
+each model's `.phy`, and `Environment::set_traced` puts the static props and the
+still studio entities among them (`rustdocs/VPHYSICS.md` §4b). `trace/` itself
+still has no studio models.
 
 ---
 

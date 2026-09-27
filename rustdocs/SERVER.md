@@ -3020,6 +3020,13 @@ the arm's origin start at 91.
     `Server::change_level_issued`, reset by `level_shutdown`; a second
     `ChangeLevel` in the same level still fires `OnChangeLevel` and asks for
     nothing.
+106. **A still studio prop is solid to the player only while its entity is
+    solid.** `Physics::sync_traced` runs once a tick beside `follow_movers` and
+    marks each `VPhysicsInitStatic` body for the movement sweep from
+    `EntityCore::is_solid()` — so `DisableCollision` (17 shipped connections)
+    takes a `prop_dynamic` out of the player's way on the next tick, and
+    `EnableCollision` (8) puts it back. A parented `prop_dynamic` is kinematic
+    and never swept; see `rustdocs/VPHYSICS.md` §4b.
 
 ---
 
@@ -3609,7 +3616,8 @@ case values.
 | `tests::entities_finds_by_name_and_classname` | `CEntities`' iteration |
 | `tests::a_script_error_is_printed_and_the_level_carries_on` | The error handler's output |
 | `tests::a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root` | `RemoveInstance`, `IsValid` |
-| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code, rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` |
+| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code — **down the static-prop stairs, not through them** — rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` |
+| `physics::tests::a_still_prop_dynamic_stops_the_player_until_its_collision_is_disabled` | gotcha 106 |
 | `tests::a_teleport_does_not_touch_the_triggers_it_jumps_over` | gotcha 45: `point_teleport` and a portal crossing are box tests at the destination; a walk still sweeps |
 | `tests::no_shipped_map_leaves_itself_on_arrival` (depot) | gotcha 45 on every map: ten seconds of arrival, with scripts and real triggers, asks for no `changelevel` or `map` |
 | `tests::point_changelevel_asks_the_engine_for_one_changelevel` | `OnChangeLevel`, and one `changelevel` per level (gotcha 105) |

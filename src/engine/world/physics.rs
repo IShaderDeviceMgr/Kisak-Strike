@@ -247,17 +247,17 @@ pub fn build(map: &str, bsp: &Bsp, props: &Props, vfs: &Vfs, surfaces: SurfacePr
         let origin = prop.transform.w_axis.truncate();
         let angles = matrix_angles(Mat3::from_mat4(prop.transform));
         let surface = model.params.surface_prop.clone();
-        if environment
-            .add(
-                Motion::Static,
-                &model.hulls,
-                origin,
-                angles,
-                &surface,
-                None,
-            )
-            .is_some()
-        {
+        if let Some(body) = environment.add(
+            Motion::Static,
+            &model.hulls,
+            origin,
+            angles,
+            &surface,
+            None,
+        ) {
+            // `trace/` has no static props; this body is the player's only
+            // collision with one — `Environment::set_traced`.
+            environment.set_traced(body, true);
             stats.static_props += 1;
         }
     }

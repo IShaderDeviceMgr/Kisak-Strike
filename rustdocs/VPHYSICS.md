@@ -122,6 +122,7 @@ not centred on its entity's origin (the player's is not) carries its own shift.
 ```rust,ignore
 Environment::sweep_box(half, start, end) -> Option<Sweep>   // ClipRayToVPhysics
 Environment::sweep_box_among(half, start, end, accept)      // …over any body `accept` admits
+Environment::set_traced(BodyId, bool)                       // a static studio body sweep_box sees
 Environment::is_dynamic(BodyId) -> bool                     // created Motion::Dynamic?
 Environment::contacts(BodyId) -> Vec<Contact>               // IPhysicsFrictionSnapshot
 Environment::velocity(BodyId) -> Vec3
@@ -131,12 +132,28 @@ Environment::set_hulls(BodyId, &Hulls, surface)             // the duck/stand sw
 ```
 
 **`sweep_box` is how the props get into `trace/`.** It is a swept AABB against
-**only the bodies created `Motion::Dynamic`** — not the world, not the static
-props, not the brush entities, all of which `trace/` already holds its own copy
-of, and not the player's own shadow. The filter reads the environment's record
-of how each body was *created*, because `EnableMotion( false )` makes a prop a
-fixed body and filtering on the Rapier body type would let the player walk
-through every cube a map spawns frozen.
+**the bodies created `Motion::Dynamic` and the bodies marked `set_traced`** —
+not the world or the brush entities, which `trace/` holds its own copy of, and
+not the player's own shadow. The filter reads the environment's record of how
+each body was *created*, because `EnableMotion( false )` makes a prop a fixed
+body and filtering on the Rapier body type would let the player walk through
+every cube a map spawns frozen.
+
+**`set_traced` is the static props and the still studio entities**, whose
+`.phy` this environment holds the only copy of — `trace/` has no studio
+models. `world::physics::build` marks every static prop it gives a body, and
+`Physics::sync_traced` marks each still (`VPhysicsInitStatic`) studio entity
+once a tick for as long as `EntityCore::is_solid()` says so, which is how
+`DisableCollision` takes one out. **Until this, the player walked through every
+static prop in the game**, the stairs down to `sp_a1_intro2`'s exit elevator
+among them; wherever it felt solid, a clip brush under it was doing the work.
+Measured over the 106 maps: 49,296 static props are `SOLID_VPHYSICS` and
+**30,649 have a `.phy`**. The other 18,647 are not solid in the shipped game
+either — `CStaticProp::CreateVPhysics` demotes them to `SOLID_NONE` as a "Map
+Error". The **8 `SOLID_BBOX`** static props, which Valve gives a box from the
+model's bounds, have no collision here. Neither do **moving** studio bodies (a
+`prop_dynamic` parented to a train), because the pusher shoves the player out of
+brush movers only; the elevator cars are ridden on their clip brushes.
 
 **`sweep_box_among` is the `+use` trace's version**, and it is the only query
 here that can return a static or kinematic body. `Physics::sweep_use` passes
@@ -443,6 +460,9 @@ would be noticed first.
 | **The real cube on the real map** | `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` *(depot)* |
 | The sweep reports props and not the world | `a_sweep_reports_the_prop_and_not_the_world` |
 | …including a *frozen* prop, which is a fixed body | `a_frozen_prop_still_stops_a_sweep` |
+| A static body is swept only once it is marked a studio model's — a static prop | `a_static_body_stops_the_sweep_only_when_it_is_traced` |
+| `DisableCollision` takes a still `prop_dynamic` out of the sweep | `server::physics::tests::a_still_prop_dynamic_stops_the_player_until_its_collision_is_disabled` |
+| The stairs down to `sp_a1_intro2`'s exit car are walked down, not fallen through | `server::tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) |
 | …and never the player's own shadow | `the_players_shadow_is_not_swept_against` |
 | The sweep normal is Source's, not parry's | `the_sweep_normal_points_back_at_the_sweeper` |
 | A degenerate zero-extent sweep is a ray, not a NaN | `a_ray_against_a_prop_is_a_zero_extent_sweep` |

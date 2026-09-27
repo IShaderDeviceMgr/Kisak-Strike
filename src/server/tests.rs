@@ -11364,6 +11364,21 @@ fn point_changelevel_asks_the_engine_for_one_changelevel() {
     assert_eq!(server.take_server_commands(), ["changelevel sp_next"]);
 }
 
+/// The server's environment as the movement tracer's prop query — the three
+/// lines `engine/mod.rs`'s `PhysicsProps` is, which this module cannot name.
+struct PhysicsProps<'a>(&'a super::physics::Physics);
+
+impl crate::engine::trace::PropQuery for PhysicsProps<'_> {
+    fn sweep(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<crate::engine::trace::PropHit> {
+        let sweep = self.0.sweep_box(half, start, end)?;
+        Some(crate::engine::trace::PropHit {
+            fraction: sweep.fraction,
+            normal: sweep.normal,
+            start_solid: sweep.start_solid,
+        })
+    }
+}
+
 /// `scripts/vscripts/` read from a mounted game, for the depot tests.
 struct DepotScripts(Rc<crate::filesystem::Vfs>);
 
@@ -11429,6 +11444,17 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
     let mut server = Server::new();
     server.set_script_files(Rc::new(DepotScripts(vfs.clone())));
     server.level_init(MAP, &entities, &bsp.models);
+    // `Scene::load`'s order: spawn, read the `.phy` of every model the
+    // entities name, hand the environment over. The static props — the
+    // stairs down to the exit car among them — are only solid through it.
+    {
+        use crate::engine::world::physics as world_physics;
+        let props = crate::engine::world::props::Props::load(MAP, &bsp).expect("the prop lump");
+        let mut built = world_physics::build(MAP, &bsp, &props, &vfs, world_physics::surface_properties(&vfs));
+        let names: Vec<String> = server.model_entities().into_iter().map(|e| e.model).collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+    }
     assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
     assert!(
         server.script_output().iter().any(|l| l == "==== calling mapspawn.nut"),
@@ -11576,6 +11602,7 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
     let start = floor_under(at, at.z + 128.0, at.z - 256.0).expect("a floor under the approach trigger");
     let mut mv = MoveData::standing_at(start);
     let mut walked_in = None;
+    let mut on_stairs = None;
     for t in 0..(64 * 15) {
         let toward = (goal - mv.origin).truncate();
         let there = toward.length() < 12.0;
@@ -11587,9 +11614,21 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         mv.forwardmove = if there { 0.0 } else { SV_SPEED_NORMAL.min(toward.length() * 16.0) };
         {
             let chain = clip_chain();
+            let props = server.physics().map(PhysicsProps);
             let mut tracer = collision.tracer().with_entities(&chain);
+            let mut tracer = match props.as_ref() {
+                Some(props) => tracer.with_props(props),
+                None => tracer,
+            };
             let angles = mv.angles;
             player_move(&mut mv, Some(&mut tracer), None, &MoveVars::PORTAL2, 1.0 / 64.0, angles);
+        }
+        // The stairs are `models/props_bts/hanging_stair_128.mdl`, a static
+        // prop centred on y = 864 between the walkway (z = -60) and the floor
+        // under it (z = -192); the first tick past their middle is where the
+        // player's feet are on them.
+        if on_stairs.is_none() && mv.origin.y >= 864.0 {
+            on_stairs = Some(mv.origin.z);
         }
         let mut state = server.player_state().expect("a player");
         state.origin = mv.origin;
@@ -11611,6 +11650,12 @@ fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
         )
     });
     assert!(inside(mv.origin), "the player stands inside the car's trigger");
+    let on_stairs = on_stairs.expect("the walk crosses the stairs");
+    println!("departure: halfway down the stairs the player's feet are at z = {on_stairs:.1}");
+    assert!(
+        on_stairs > -150.0,
+        "the stairs are solid: the player went down them rather than through them to the floor at z = -192"
+    );
     println!("departure: walked into the car in {:.1}s, standing at {:.1}", walked_in as f32 / 64.0, mv.origin);
     let mut state = server.player_state().expect("a player");
     state.velocity = Vec3::ZERO;
@@ -11876,3 +11921,5 @@ fn no_shipped_map_leaves_itself_on_arrival() {
     println!("{} maps, {teleported} of them moved the player more than 256 units in ten seconds", names.len());
     assert!(left.is_empty(), "maps that asked to leave on arrival:\n{}", left.join("\n"));
 }
+
+

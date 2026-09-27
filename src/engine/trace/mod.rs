@@ -6,7 +6,9 @@
 //! `portdocs/ENGINE_TRACE.md`: the world's brushes ([`Tracer::trace`]), the
 //! **brush models** built out of them — doors, platforms, pistons
 //! ([`Tracer::trace_model`]) — and the **displacements**, the map's terrain.
-//! No entities, no static props.
+//! No entities and no static props of its own — a static prop's collision is
+//! its `.phy`, which `vphysics/` holds, and reaches a trace through
+//! [`Tracer::with_props`].
 //!
 //! [`carve`] is the exception to all of that, and it is `portdocs/PORTAL.md`
 //! stage 3 rather than `ENGINE_TRACE.md`: the collision near a portal, with a

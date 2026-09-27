@@ -2258,6 +2258,7 @@ impl Server {
             return;
         };
         physics.follow_movers(&self.entities);
+        physics.sync_traced(&self.entities);
         let moved = physics.step();
         if moved.is_empty() {
             return;

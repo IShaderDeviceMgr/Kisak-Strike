@@ -407,6 +407,9 @@ struct Body {
     /// The solver needs the rule as well as the trace, and that half is
     /// collider interaction groups — see [`set_held`](Environment::set_held).
     held: bool,
+    /// Whether the player's movement sweep sees this body although it is not
+    /// dynamic — [`set_traced`](Environment::set_traced).
+    traced: bool,
 }
 
 /// The environment. `physenv`.
@@ -532,6 +535,7 @@ impl Environment {
             generation: id.generation,
             dynamic: matches!(motion, Motion::Dynamic),
             held: false,
+            traced: false,
         });
         self.live += 1;
         Some(id)
@@ -955,13 +959,17 @@ impl Environment {
     /// its entity's origin — the player's is not — is the caller's to shift,
     /// exactly as `Ray_t::Init` shifts it.
     ///
-    /// > **Only bodies created [`Motion::Dynamic`], and that is correctness
-    /// > rather than thrift.** The world, its displacements, its static props
-    /// > and its brush entities are all in this environment *and* all already
-    /// > in `trace/`. A sweep that returned them would clip the same geometry
-    /// > twice, with two implementations that do not have to agree — and the
-    /// > brush entities' half would be the worse answer of the two, because
-    /// > `trace/` carves portal holes out of them and this does not.
+    /// > **Only bodies created [`Motion::Dynamic`], and those marked
+    /// > [`set_traced`](Environment::set_traced), and that is correctness
+    /// > rather than thrift.** The world, its displacements and its brush
+    /// > entities are all in this environment *and* all already in `trace/`. A
+    /// > sweep that returned them would clip the same geometry twice, with two
+    /// > implementations that do not have to agree — and the brush entities'
+    /// > half would be the worse answer of the two, because `trace/` carves
+    /// > portal holes out of them and this does not. **A static prop and a
+    /// > studio entity's static body are *not* in `trace/`** — its only copy of
+    /// > a `.phy` is this one — so they are marked, and this is where the
+    /// > player meets them.
     ///
     /// > **The test is `Body::dynamic`, not `RigidBody::body_type()`.**
     /// > `EnableMotion( false )` freezes a prop by making it a *fixed* body
@@ -970,7 +978,24 @@ impl Environment {
     /// > would make a frozen cube stop stopping the player — and every cube in
     /// > the game spawns frozen if its map says so.
     pub fn sweep_box(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
-        self.sweep_box_where(half, start, end, |_, body| body.dynamic)
+        self.sweep_box_where(half, start, end, |_, body| body.dynamic || body.traced)
+    }
+
+    /// Whether [`sweep_box`](Environment::sweep_box) sees a body that is not
+    /// dynamic — a studio model's collision that `trace/` does not have.
+    ///
+    /// `CEngineTrace` reaches a static prop through
+    /// `CStaticPropMgr`'s collideable and a `SOLID_VPHYSICS` entity through
+    /// `ClipRayToVPhysics`; both end in the model's `.phy`, and this
+    /// environment holds the only copy of it. The caller decides which bodies
+    /// those are, because only it knows a body came from a studio model and
+    /// whether its entity is solid right now.
+    pub fn set_traced(&mut self, id: BodyId, traced: bool) {
+        if let Some(body) = self.bodies.get_mut(id.slot as usize).and_then(Option::as_mut) {
+            if body.generation == id.generation {
+                body.traced = traced;
+            }
+        }
     }
 
     /// [`sweep_box`](Environment::sweep_box) against **any** body `accept`
@@ -1385,6 +1410,30 @@ mod tests {
             Vec3::new(0.0, 0.0, 0.0),
         );
         assert_eq!(hit.map(|hit| hit.body), Some(cube));
+    }
+
+    /// A static body is the world's until someone says it is a studio model's:
+    /// `trace/` already has the world and would clip it twice. A static prop
+    /// is marked [`set_traced`](Environment::set_traced), and then it stops
+    /// the sweep — until it is unmarked, which is `DisableCollision`.
+    #[test]
+    fn a_static_body_stops_the_sweep_only_when_it_is_traced() {
+        let mut env = Environment::new(SurfaceProps::default());
+        let hulls = Hulls::from_box(Vec3::splat(-16.0), Vec3::splat(16.0));
+        let stair = env
+            .add(Motion::Static, &hulls, Vec3::new(0.0, 0.0, 100.0), Vec3::ZERO, "default", None)
+            .expect("a body");
+        env.step();
+        let sweep = |env: &Environment| {
+            env.sweep_box(Vec3::splat(1.0), Vec3::new(0.0, 0.0, 300.0), Vec3::ZERO)
+                .map(|hit| hit.body)
+        };
+
+        assert_eq!(sweep(&env), None, "untraced: the world's, and trace/ has it");
+        env.set_traced(stair, true);
+        assert_eq!(sweep(&env), Some(stair));
+        env.set_traced(stair, false);
+        assert_eq!(sweep(&env), None);
     }
 
     /// The player's own shadow must not stop the player's own movement trace,

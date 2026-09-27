@@ -1425,9 +1425,11 @@ type GroupedSequence = (
     Vec<crate::server::sequences::AnimEvent>,
 );
 
-/// The server's physics props, as something a [`trace::Tracer`] can sweep against —
-/// `CEngineTrace::ClipRayToVPhysics`, and the only implementation of
-/// [`trace::PropQuery`] there is.
+/// The server's physics props — and the static props and still studio
+/// entities, whose `.phy` only the environment holds — as something a
+/// [`trace::Tracer`] can sweep against: `CEngineTrace::ClipRayToVPhysics` and
+/// the static-prop half of `ClipRayToCollideable`, and the only implementation
+/// of [`trace::PropQuery`] there is.
 ///
 /// # Why it is here and not in either module it joins
 ///

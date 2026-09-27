@@ -106,6 +106,11 @@ pub struct Physics {
     /// a write into the broad phase. Valve's equivalent is `PhysFrame`'s
     /// `if ( pPhysics && !pPhysics->IsAsleep() )`.
     movers: Vec<(EntityId, BodyId, (Vec3, Vec3))>,
+    /// The **static** bodies of studio entities — `VPhysicsInitStatic`, a
+    /// `prop_dynamic` that never moves — which the player's movement sweep
+    /// sees for as long as their entity is solid. See
+    /// [`sync_traced`](Physics::sync_traced).
+    studio_statics: Vec<(EntityId, BodyId, bool)>,
     /// The player's shadow — `CBasePlayer::m_pPhysicsController`.
     ///
     /// Created on the first tick that has a player rather than in
@@ -165,6 +170,7 @@ impl Physics {
             brush_models: brush_models.into_iter().collect(),
             owners: HashMap::new(),
             movers: Vec::new(),
+            studio_statics: Vec::new(),
             player: None,
             grab: None,
             stats: PhysicsStats {
@@ -314,9 +320,13 @@ impl Physics {
             entity.core.physics = Some(body);
             self.owners.insert(body, id);
             self.stats.studio_bodies += 1;
-            if motion == Motion::Kinematic {
-                self.movers.push((id, body, (origin, angles)));
-                self.stats.studio_movers += 1;
+            match motion {
+                Motion::Kinematic => {
+                    self.movers.push((id, body, (origin, angles)));
+                    self.stats.studio_movers += 1;
+                }
+                // `sync_traced` marks it on the first tick.
+                _ => self.studio_statics.push((id, body, false)),
             }
         }
     }
@@ -469,8 +479,38 @@ impl Physics {
         });
     }
 
-    /// One swept box against every physics prop —
-    /// [`Environment::sweep_box`], which is the whole of it.
+    /// Puts each studio entity's static body in the player's movement sweep
+    /// while the entity is solid, and takes it out when it is not.
+    ///
+    /// Valve's trace asks the *entity*: `DisableCollision` sets
+    /// `FSOLID_NOT_SOLID`, `SetSolidFlags` takes it out of the solid
+    /// partition, and no trace finds it after that, whatever its physics
+    /// object says. The body itself is untouched — 17 shipped connections
+    /// fire `DisableCollision` and 8 `EnableCollision`. Once a tick, beside
+    /// [`follow_movers`](Physics::follow_movers), and a write only when the
+    /// answer changed.
+    ///
+    /// > **Moving studio bodies are not traced.** A `prop_dynamic` parented to
+    /// > a train is a kinematic body, and the pusher that would shove the player
+    /// > out of its way handles brush movers only; a car that moved into the
+    /// > player would trap them. The map's clip brushes carry those today.
+    pub fn sync_traced(&mut self, entities: &EntityList) {
+        let env = &mut self.env;
+        self.studio_statics.retain_mut(|(id, body, traced)| {
+            let Some(entity) = entities.get(*id) else {
+                return false;
+            };
+            let solid = entity.core.is_solid() && entity.core.physics == Some(*body);
+            if solid != *traced {
+                env.set_traced(*body, solid);
+                *traced = solid;
+            }
+            entity.core.physics == Some(*body)
+        });
+    }
+
+    /// One swept box against every physics prop, static prop and solid still
+    /// studio entity — [`Environment::sweep_box`], which is the whole of it.
     ///
     /// Here rather than reached through an accessor on the environment because
     /// this is the module that owns the environment's lifetime, and because
@@ -485,9 +525,9 @@ impl Physics {
     /// **entity** owns, static and kinematic included, and none of the
     /// world's.
     ///
-    /// [`sweep_box`](Physics::sweep_box) sees only physics props, because the
-    /// movement trace already has everything else from `trace/`. The use trace
-    /// needs more: `FindUseEntity` takes the first *entity* its ray hits, and
+    /// [`sweep_box`](Physics::sweep_box) sees only what `trace/` lacks — physics
+    /// props, static props, and still studio entities while they are solid.
+    /// The use trace needs every entity-owned body: `FindUseEntity` takes the first *entity* its ray hits, and
     /// a `prop_button` is a `VPhysicsInitStatic` body with nothing in `trace/`
     /// to find it by. The world's own bodies are left out for the same reason
     /// `sweep_box` leaves them out — `trace/` has them, and the caller has
@@ -1006,6 +1046,60 @@ mod tests {
             server.entities.get(scenery).unwrap().core.physics.is_none(),
             "a `solid 0` prop is not solid and gets no body"
         );
+    }
+
+    /// **A still `prop_dynamic` is in the player's movement sweep while it is
+    /// solid** — `trace/` has no studio models, so this is the only place the
+    /// player can meet one — and `DisableCollision` takes it out, as
+    /// `SetSolidFlags( FSOLID_NOT_SOLID )` takes it out of Valve's solid
+    /// partition. A parented one is kinematic and is not swept at all.
+    #[test]
+    fn a_still_prop_dynamic_stops_the_player_until_its_collision_is_disabled() {
+        let mut server = Server::new();
+        server.level_init(
+            "test",
+            &[
+                block(&[("classname", "info_target"), ("targetname", "arm"), ("origin", "0 0 0")]),
+                block(&[
+                    ("classname", "prop_dynamic"),
+                    ("targetname", "panel"),
+                    ("model", "models/props/panel.mdl"),
+                    ("solid", "6"),
+                    ("origin", "0 0 100"),
+                ]),
+                block(&[
+                    ("classname", "prop_dynamic"),
+                    ("targetname", "rider"),
+                    ("model", "models/props/panel.mdl"),
+                    ("solid", "6"),
+                    ("parentname", "arm"),
+                    ("origin", "500 0 100"),
+                ]),
+                block(&[
+                    ("classname", "logic_auto"),
+                    ("OnMapSpawn", "panel\u{1b}DisableCollision\u{1b}\u{1b}0.5\u{1b}-1"),
+                ]),
+            ],
+            &[],
+        );
+        let (env, mut models) = environment();
+        models.insert("models/props/panel.mdl".to_owned(), model(Vec3::new(64.0, 64.0, 4.0), 0.0));
+        server.set_physics(env, models, Vec::new());
+        let down = |server: &Server, x: f32| {
+            server
+                .physics()
+                .expect("an environment")
+                .sweep_box(Vec3::splat(8.0), Vec3::new(x, 0.0, 300.0), Vec3::new(x, 0.0, 50.0))
+                .is_some()
+        };
+
+        server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        assert!(down(&server, 0.0), "a solid prop_dynamic stops the sweep");
+        assert!(!down(&server, 500.0), "a parented one is kinematic and is not swept");
+        for _ in 0..64 {
+            server.frame(1.0 / 64.0, &mut NoTouchQuery);
+        }
+        assert!(!down(&server, 0.0), "DisableCollision took it out");
     }
 
     /// A jointed model gets nothing rather than its first bone frozen in the
