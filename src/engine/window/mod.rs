@@ -307,7 +307,12 @@ pub enum RunOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Boot<'a> {
     /// The mounted game content, or `None` if it failed to mount.
-    pub vfs: Option<&'a Vfs>,
+    ///
+    /// Shared rather than borrowed, because the server keeps a handle: a
+    /// script can include another at any moment in the level, so
+    /// `scripts/vscripts/` has to be readable from inside a tick — see
+    /// [`crate::server::script::ScriptFiles`].
+    pub vfs: Option<&'a std::sync::Arc<Vfs>>,
     /// The process arguments, which the console reads twice: `stuffcmds` turns
     /// every `+`-prefixed one into a command, and cvar registration seeds a
     /// default from `+<name> <value>`. This replaced the separate `map` and
@@ -470,10 +475,13 @@ impl<'a> GameWindow<'a> {
             renderer.device(),
             renderer.queue(),
             renderer.target_format(),
-            self.boot.vfs,
+            self.boot.vfs.map(|vfs| &**vfs),
             self.boot.command_line,
             self.boot.test_material,
         );
+        if let Some(vfs) = self.boot.vfs {
+            engine.share_filesystem(vfs.clone());
+        }
 
         // `Host_Init`'s last act: queue `exec valve.rc`. Everything about how
         // the game starts — including `+map`, by way of `stuffcmds` — is in

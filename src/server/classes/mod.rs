@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty-four classnames, 37,117 of the shipped game's 60,925 entity blocks.**
-//! Five of the 54 are placed by no map: `player` (the engine makes it when a
+//! **Fifty-five classnames, 37,501 of the shipped game's 60,925 entity blocks.**
+//! Five of the 55 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **49 of
+//! `light_glspot`, each registered because Valve registers it — so **50 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -43,7 +43,10 @@
 //! themselves: 1,290 implemented entities name a train as their parent.
 //! **`prop_button` and `prop_under_button`** (56 and 27) came next, because
 //! `sp_a1_intro2`'s portal carousel opens its blue portals from them and
-//! from nothing else.
+//! from nothing else. **`logic_script`** (384) came with
+//! VScript: it has no behaviour of its own beyond `EntityGroup`, and is here
+//! because it is where most of the game's scripts are attached — the
+//! elevators' transition scripts among them. See `portdocs/VSCRIPT.md`.
 //!
 //! The additions are not chosen by instance count alone — `logic_case` is 84
 //! entities and `logic_playerproxy` is 9 — but by what a map needs in order to
@@ -83,7 +86,9 @@ pub use filter::{
     FilterClass, FilterDamageType, FilterModel, FilterMulti, FilterName, FilterPlayerHeld,
 };
 pub use light::{EnvLight, Light};
-pub use logic::{Auto, Branch, BranchList, Case, InstanceIoProxy, MathCounter, Relay, Timer};
+pub use logic::{
+    Auto, Branch, BranchList, Case, InstanceIoProxy, LogicScript, MathCounter, Relay, Timer,
+};
 pub use pedestal::PedestalButton;
 pub use player::{
     LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP, IN_USE,
@@ -220,6 +225,15 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: PROXY_INPUTS,
         outputs: logic::PROXY_RELAYS,
         create: InstanceIoProxy::create,
+    },
+    // `CLogicScript` (`logicentities.cpp:31`) — a place to hang a script.
+    // 384 entities across the game; what they do is in their `vscripts`.
+    ClassDef {
+        name: "logic_script",
+        keys: logic::SCRIPT_GROUP_KEYS,
+        inputs: &[],
+        outputs: &[],
+        create: LogicScript::create,
     },
     // `CRotDoor : public CBaseDoor` — the same struct, told at construction
     // that it turns instead of sliding. It outnumbers `func_door`, which is

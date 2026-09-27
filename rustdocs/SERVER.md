@@ -8,10 +8,18 @@ and the think schedule. Porting doc:
 
 | | |
 |---|---|
-| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair, the pusher and attachment parenting.** Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it** — down to a named point on one of its bones — and **a door closing on you shoves you out of the way, or is stopped by you**. |
+| Status | **Stages 1-5 of 5, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, the local/abs transform pair, the pusher, attachment parenting, the trains, the pedestal buttons and VScript.** **The maps' own Squirrel runs** — `logic_script`s, `vscripts`, `thinkfunction`, `RunScriptCode` — and it is what enters and leaves `sp_a1_intro2` by its elevators. Entities spawn, fire outputs at each other, think on a fixed tick, the brush ones move, the map notices the player, a pad you stand on presses, **the models the map places draw and animate**, **the chamber doors open and shut** — the player can be hurt and die, **a portal links to its partner and draws an oval**, **what is parented to a mover rides it** — down to a named point on one of its bones — and **a door closing on you shoves you out of the way, or is stopped by you**. |
 | Depends on | `engine::world::bsp::{Entity, Model}` (the parsed lumps), `engine::console` (eight commands), `client::tonemap::TonemapSettings` (what `env_tonemap_controller` produces) |
 | Names no | `wgpu`, `winit`, `egui`, `materials`, `studio`, `engine::trace`, `client::Player` — every test runs with no GPU |
 | Tests | 222 unit tests + twelve depot tests over all 106 shipped maps |
+
+**What VScript added** (the most recent thing to land): `script.rs` — the
+level's Squirrel VM (`src/vscript/`, `rustdocs/VSCRIPT.md`), entity scopes,
+`self`, `EntFire`, `Entities`, the `Input<name>` hook, script thinks — and
+`logic_script`, **384 entities**, plus the `vscripts` and `thinkfunction` keys on
+`CBaseEntity`. **104 of the 106 maps run five seconds of their own scripts
+without an error**, and `sp_a1_intro2`'s elevators run end to end on theirs. See
+[VScript](#vscript--the-servers-half).
 
 **What stage 5 added**: `damage.rs` (the `DMG_*` table, `CTakeDamageInfo`,
 `m_takedamage`, `m_lifeState` and the health arithmetic), health and death on
@@ -104,8 +112,8 @@ it and `Context` grew `punch_penetrating_players`, which queues the work the way
 read as bugs.
 
 **What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
-it needs the portal system), the armour and drowning. **43 of the 200
-classnames the shipped maps place are implemented**, out of 48 registered — the
+it needs the portal system), the armour and drowning. **50 of the 200
+classnames the shipped maps place are implemented**, out of 55 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -1979,10 +1987,25 @@ pub trait Behaviour { /* … */ fn object_caps(&self) -> u32 { 0 } }
 pub const FCAP_IMPULSE_USE: u32;       // and CONTINUOUS, ONOFF, DIRECTIONAL
 pub fn is_useable(caps: u32) -> bool;  // `IsUseableEntity( e, 0 )`
 pub const USE_TOGGLE: u32;             // the output ID a player's `Use` carries
+
+// script.rs — VScript, the server's half
+pub trait ScriptFiles { fn read_script(&self, path: &str) -> Option<Vec<u8>>; }
+impl Server {
+    pub fn set_script_files(&mut self, files: Rc<dyn ScriptFiles>);
+    pub fn take_console_commands(&mut self) -> Vec<String>; // `SendToConsole`
+    pub fn script_output(&self) -> Vec<String>;             // what scripts printed
+}
+// class.rs
+pub fn is_script_input(name: &str) -> bool;  // RunScriptFile/Code, CallScriptFunction
+// classes/logic.rs
+pub struct LogicScript { pub group: Vec<Option<String>> } // `m_iszGroupMembers`
+// entity.rs — on `EntityCore`
+pub vscripts: Option<String>,
+pub script_think_function: Option<String>,
 ```
 
-Fifty-four classnames, **37,117 of the shipped game's 60,925 entity blocks**.
-**Forty-nine of them are among the 200 classnames the maps place**; the other
+Fifty-five classnames, **37,501 of the shipped game's 60,925 entity blocks**.
+**Fifty of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -1996,6 +2019,7 @@ because Valve registers them:
 | `logic_auto` | `CLogicAuto` | 1,112 |
 | `logic_branch` | `CLogicBranch` | 601 |
 | `logic_branch_listener` | `CLogicBranchList` | 158 |
+| `logic_script` | `CLogicScript` | 384 |
 | `info_target` | `CInfoTarget` | 431 |
 | `logic_timer` | `CTimerEntity` | 151 |
 | `info_player_start` | `CPointEntity` | 116 |
@@ -2954,6 +2978,29 @@ the arm's origin start at 91.
     underground button's `press` takes about 0.7 s. **A button whose model is
     not in the sequence table never fires `OnPressed`** — Valve's
     `!pStudioHdr` return — so a synthetic test must `set_sequences` first.
+100. **The VM is lifted out of the server while a script runs** (`with_vm`),
+    and every native is handed the server as its host. A native may read and
+    write the entity list and queue events; it may not dispatch an input or run
+    a think, and nothing in Valve's binding does either synchronously —
+    `EntFire` is `AddEvent`. A second `with_vm` while one is running returns
+    `None`, which is the one re-entry refused.
+101. **`RunScriptCode`, `RunScriptFile` and `CallScriptFunction` are handled by
+    `Server::accept_input`, not by `base_accept_input`**, because they need the
+    VM. `class::is_script_input` is the test. They are still declared in
+    `BASE_INPUTS`, so the type conversion and the `Input<name>` hook see them.
+102. **An entity with a script scope asks `Input<name>` first, and a false —
+    or a missing — return swallows the input.** `activator` and `caller` are
+    set in the root table for the duration, and only when the entity already
+    had a scope *before* the input arrived.
+103. **`DispatchOnPostSpawn` is an event every scripted entity posts to itself
+    at spawn**, because `RunVScripts` builds the `OnPostSpawn` call chain in
+    every scope whether or not its file loads — so a census that counts
+    dispatched events sees one per scripted entity on the first tick. The
+    trigger depot test subtracts them.
+104. **A script id draws from the level's random stream**, as
+    `GenerateUniqueKey`'s `RandomInt( 0, 0xfff )` does. Adding a scripted entity
+    to a test therefore changes which way a `logic_case` goes; three depot totals
+    moved by single digits for exactly this reason when VScript landed.
 
 ---
 
@@ -2970,6 +3017,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CancelEvents`' caller test | Compares the caller pointer, then re-compares its own name and classname against themselves | Compares the handle | The extra test can only ever be true. Dead code, not reproduced. |
 | A parent cycle | Recurses until the stack runs out (only self-parenting is checked) | Bounded by the entity count, reported, treated as depth 1 | No shipped map contains a cycle. |
 | `qsort` in the spawn sort | Unstable; equal-rank order is unspecified | Stable, so lump order survives within a rank | Deterministic, and it is what a level designer means by "in order". |
+| A script id's `Plat_MSTime()` | The process's millisecond clock | The level clock's milliseconds | A script can see its id; reproducibility, as with the seed. |
+| The game rules scripts see | `CPortalMPGameRules` on a co-op map | `CPortalGameRules`' single-player set on every map | There is one player. The co-op progress functions answer as they do in single player (nothing, false, 0). |
+| A script think | A context think on the entity, ordered with its other contexts | Run straight after the tick's ordinary thinks, in the order the contexts were set | There are no think contexts on `EntityCore`; the ordering difference is within one tick. |
+| Script classes | One per C++ class with a script description (`CBaseAnimating`, `CBaseFlex`, `CSceneEntity`, …) | `CBaseEntity` for everything, `CBasePlayer` for the player | The other classes' members need animation and choreography from script. A call to one is an index error, not a stub. |
 | A train's `InPass` on a node | `AcceptInput( "InPass" )`, called directly | Posted with no delay | A handler cannot run another entity's code. The queue is serviced in the same tick, after the thinks (gotcha 4), so the node's `OnPass` connections are queued in the tick the train passed it. |
 | A player's `+use` on a physics prop | `AcceptInput( "Use" )`, and `CPhysicsProp::Use` starts the pickup | `player_use` picks it up directly; everything else gets the `Use` input | The carry is the server's state, not the prop's, and a handler cannot reach it. Nothing observable differs: no class here fires an output from `CPhysicsProp::Use`. |
 | `CPropButton`'s `TimerThinkContext` | A second think context beside `AnimateThink` | Two due ticks on the class; the entity's one think is armed at the sooner | `EntityCore` has one schedule. Each keeps its own grid — 0.1 s for the animation, whole seconds from the press for the timer — which is what the contexts would have given. |
@@ -3074,10 +3125,10 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 ## What the maps place that is not here — the unported classnames
 
-**151 of the 200 classnames the shipped maps place have no class here: 23,808 of
+**150 of the 200 classnames the shipped maps place have no class here: 23,424 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
-`func_tracktrain`, `path_track`, `prop_button` and `prop_under_button` have
-landed since.) Every one is listed below, grouped by what it would
+`func_tracktrain`, `path_track`, `prop_button`, `prop_under_button` and
+`logic_script` have landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3120,15 +3171,15 @@ totals. When a class lands, delete its row here and add it to the table under
    `trigger_portal_cleanser` shows its grill whether or not the map has
    `Disable`d it.
 
-2. **`sp_a1_intro1` alone places 51 of the missing classnames** (53 before the
-   trains). Five groups decide what the map does:
-   - **The story:** 17 `logic_choreographed_scene`s, 2 `logic_script`s, a
-     `generic_actor` and 3 `ai_script_conditions`. A scene's `OnCompletion`
+2. **`sp_a1_intro1` alone places 50 of the missing classnames** (53 before the
+   trains and `logic_script`). Five groups decide what the map does:
+   - **The story:** 17 `logic_choreographed_scene`s, a `generic_actor` and 3
+     `ai_script_conditions` — its two `logic_script`s run now. A scene's `OnCompletion`
      is what releases the container ride. That is why
      `sp_a1_intro1_exit_wall_opens_its_areaportal` has to trigger
      `@rl_container_ride_second_section` by hand.
-   - **The way out:** the departure elevator is a `func_tracktrain` now, but
-     VScript starts it (`RunScriptCode StartMoving()`), and its
+   - **The way out:** the departure elevator is a `func_tracktrain` now and
+     VScript starts it (`RunScriptCode StartMoving()`) — but its
      `trigger_teleport` has an
      `info_teleport_destination` as its landmark, and beyond it are a
      `point_changelevel`, a `trigger_transition` and an `info_landmark_exit`.
@@ -3185,7 +3236,9 @@ This is a ranking of what unblocks the most, not a plan.
      `info_placement_helper`;
    - `func_portal_detector`.
 7. **Everything gated on a subsystem:**
-   - VScript and choreography, which are the whole story layer;
+   - choreography, which with VScript is the whole story layer — VScript has
+     landed, and `CreateSceneEntity` is the one native the shipped scripts
+     reach for that it cannot answer;
    - fog (`env_fog_controller`), sound, particles, ropes, sprites, projected
      textures and video;
    - lasers, bridges, funnels and gel, which are the reconstruction-heavy
@@ -3240,13 +3293,12 @@ The pieces a chamber is built from. Most have no source here; the button family 
 | `logic_timescale` | **none** | 2 | 2 / 0 | 1 |  | 4 / 0 | Changes the server's timescale. One map. |
 | `point_futbol_shooter` | **none** | 1 | 1 / 0 | 1 |  | 17 / 0 | Throws `prop_exploding_futbol`s. |
 
-#### Scripts and scenes — 5 classnames, 629 entities
+#### Scripts and scenes — 4 classnames, 245 entities
 
-VScript and choreography. **These are what start `sp_a1_intro1`'s story beats**, including the container ride.
+Choreography and the scripted characters. **These are what start `sp_a1_intro1`'s story beats**, including the container ride. `logic_script` (384) left this table with VScript.
 
 | classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
 |---|---|---:|---:|---:|---:|---:|---|
-| `logic_script` | `CLogicScript` (`server/logicentities.cpp:118`) | 384 | 202 / 182 | 63 | 2 | 769 / 0 | VScript. 769 `RunScriptCode` connections, and Portal 2's own map logic (`transitions/sp_transition_list.nut`, the elevator videos, the coop scoring) lives in the `.nut` files it runs. See `portdocs/SERVER.md` §9. |
 | `generic_actor` | `CGenericActor` (`server/genericactor.cpp:55`) | 160 | 75 / 85 | 61 | 1 | 862 / 0 | A VScript-driven model, mostly the characters' voice targets: 860 of its 862 connections are `RunScriptCode`. |
 | `logic_choreographed_scene` | `CSceneEntity` (`server/sceneentity.cpp:659`) | 35 | 33 / 2 | 10 | 17 | 23 / 56 | A `.vcd` — GLaDOS's and Wheatley's lines and the sequences timed to them. `OnCompletion` (42) is how a scene hands control back to the map. **17 on `sp_a1_intro1`**, one of which releases the container ride. |
 | `scripted_sequence` | `CAI_ScriptedSequence` (`server/scripted.cpp:121`) | 32 | 32 / 0 | 16 |  | 27 / 2 | Plays an NPC animation. Needs the AI. |
@@ -3527,6 +3579,18 @@ case values.
 | `tests::a_pedestal_button_ignores_a_use_that_no_player_sent` | `CPropButton::Use`'s player test |
 | `tests::an_under_button_fires_when_its_longer_press_animation_finishes` | `CPropUnderButton`'s model and labels |
 | `physics::depot::the_player_turns_the_portal_carousel_on_sp_a1_intro2` (depot) | gotcha 98 end to end: `+use` on a static body, `OnPressed`, and the blue portal it opens |
+| `tests::mapspawn_and_valves_server_script_run_before_any_entity` | `VScriptServerInit`'s order: `vscript_server.nut`, then `mapspawn.nut`, before the entity parse |
+| `tests::run_script_code_runs_in_the_entitys_scope_and_ent_fire_reaches_the_map` | A scope per entity, `RunScriptCode`, `EntFire` into the queue |
+| `tests::call_script_function_and_self_name_the_entity` | `CallScriptFunction`, `self` |
+| `tests::on_post_spawn_runs_on_the_first_tick_after_the_scripts_ran_before_spawn` | `RunVScripts` before `Spawn`, gotcha 103 |
+| `tests::a_think_function_runs_every_tenth_of_a_second_unless_it_asks_otherwise` | `ScriptThink` and its return value |
+| `tests::an_input_function_in_the_scope_can_swallow_the_input` | gotcha 102 |
+| `tests::a_logic_script_group_is_an_array_of_entities` | `EntityGroup`, and `Group16` |
+| `tests::entities_finds_by_name_and_classname` | `CEntities`' iteration |
+| `tests::a_script_error_is_printed_and_the_level_carries_on` | The error handler's output |
+| `tests::a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root` | `RemoveInstance`, `IsValid` |
+| `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts, with the player riding the exit car |
+| `tests::every_shipped_maps_scripts_run` (depot) | 104 of 106 maps run five seconds of their scripts without an error |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |
 | `entity::an_entity_knows_its_own_handle` | the handle write-back |
 | `entity::a_handle_to_a_removed_entity_stops_resolving` | gotcha 10 |
@@ -3732,11 +3796,11 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 37,117 matched, 65
-created, 30,245 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
-151 unimplemented classnames, the full 51-name unhandled-key table, 6,510
-events dispatched, 5,735 inputs accepted, 17,361 thinks, 1,073 events that found
-no target, zero bad conversions, the **six**-name unhandled-input table, a peak
+server time**, and asserts exact totals: 60,925 blocks, 37,501 matched, 65
+created, 30,629 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
+150 unimplemented classnames, the full 49-name unhandled-key table, 7,005
+events dispatched, 6,272 inputs accepted, 17,357 thinks, 1,032 events that found
+no target, zero bad conversions, the **seven**-name unhandled-input table, a peak
 of 219 entities in the simulation list at once, 2,341 live triggers, 105 maps
 with a master tone mapper — and that `sp_a1_intro1` ends up asking for an exposure
 ceiling of **1.5**.
@@ -5239,3 +5303,65 @@ visibility monitor, `FL_UNPAINTABLE` and the fade-distance override. The
 depot test `the_player_turns_the_portal_carousel_on_sp_a1_intro2` drives the
 real movement code up to each button, presses `+use`, and checks that exactly
 the matching blue portal is open 1.5 seconds later.
+
+### VScript — the server's half
+
+`src/server/script.rs`: `vscript_server.cpp`, `vscript_shared.cpp`, the script
+half of `CBaseEntity` (`baseentity.cpp:7373-8660`), `CLogicScript` and
+`CPortalGameRules::RegisterScriptFunctions`. The language is `src/vscript/`
+(`rustdocs/VSCRIPT.md`); why it is a VM rather than a rewrite of the scripts is
+`portdocs/VSCRIPT.md`.
+
+**The lifecycle is Valve's.** `level_init` makes the VM before it parses a single
+entity (`LevelInitPreEntity`), registers the natives, the `CBaseEntity`,
+`CBasePlayer` and `CEntities` classes and the `Entities` instance, runs
+`vscript_server.nut` and then `mapspawn.nut`. `level_shutdown` drops it, and with it
+every global a script made. In between:
+
+- **`DispatchSpawn` runs an entity's `vscripts` before its `Spawn`**, in a scope
+  that is a table in the root table (keyed by a unique id, delegating to the root),
+  with `self` set to the entity's instance. The `OnPostSpawn` and `Precache` call
+  chains are built first; `DispatchPrecache` runs after; `DispatchOnPostSpawn` is
+  posted as an event (gotcha 103). A `logic_script` builds its `EntityGroup` before
+  any of that.
+- **An input goes through the scope's `Input<name>`** if the entity has a scope
+  (gotcha 102), and the three script inputs run the VM (gotcha 101).
+- **A `thinkfunction` is called every 0.1 s**, or as often as its return value
+  asks, straight after the tick's ordinary thinks.
+- **When an entity is freed** its instance goes invalid (`IsValid()` is false, a
+  method call raises "Accessed null instance") and its scope leaves the root table.
+- **The player's instance is the root table's `player`** from the moment the player
+  spawns, as `CBasePlayer::Spawn` sets it in single player.
+
+**What reaches the engine**: `SendToConsole` queues a console command, which the
+engine runs after the frame — and that is how a map is left, for now:
+`TransitionFromMap()` finds no `@changelevel` entity (`point_changelevel` is not
+ported) and takes the script's own fallback, `SendToConsole( "map " + next )`.
+Scripts are read through `ScriptFiles`, which the engine implements over the
+`Vfs`'s `GAME` path and a test implements over a table.
+
+**What it measured.** Every shipped map, with its scripts and a player, for five
+seconds (`every_shipped_maps_scripts_run`): **104 of 106 raise no script error**.
+Before `CPortalGameRules`' functions were registered it was 25 — 85
+`AddBranchLevelName` and 68 `PrecacheMovie` calls, each a no-op in the shipped
+single-player game. The two that remain are `CreateSceneEntity`, called while a
+file loads.
+
+**What it moved in the census**, all attributed in
+`every_shipped_map_spawns_its_entities`: `logic_script` is +384 matched and
+spawned; `vscripts` and `thinkfunction` left the unhandled-key table;
+`DispatchOnPostSpawn` is +498 dispatched and accepted; 38 script inputs that were
+aimed at `logic_script`s now land; and three totals moved by single digits because
+script ids draw from the random stream (gotcha 104).
+
+**`sp_a1_intro2`, end to end, on its own scripts**
+(`sp_a1_intro2s_elevators_run_on_the_maps_own_scripts`): the player touches the
+trigger at the spawn, `OnPostTransition()` prints "Teleporting to default start
+pos" and teleports them into the arrival car, which descends 723 units in 2.5 s.
+At the exit, the approach trigger summons the car and kills the clip that fills it
+3.5 s later; the car's trigger calls `StartMoving()`, which prints "Starting
+elevator departure_elevator-elevator_1 with speed 200" and sets that speed; **the
+player rides the car's floor 4,250 units down**, 23.1 units below its origin the
+whole way; `FailSafeTransition()` fires at the bottom node, the relay teleports the
+player into `transition_trigger`, and `TransitionFromMap()` sends
+`map sp_a1_intro3` 22.6 s after the car started.

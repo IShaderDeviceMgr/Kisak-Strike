@@ -197,7 +197,21 @@ pub const BASE_INPUTS: &[InputDef] = &[
     // (`baseentity.cpp:2403`).
     InputDef::new("DisableDraw", FieldType::Void),
     InputDef::new("EnableDraw", FieldType::Void),
+    // `DEFINE_INPUTFUNC( FIELD_STRING, "RunScriptFile", … )` and its two
+    // siblings (`baseentity.cpp:2419`). Handled by the server rather than
+    // here, because they run the level's VM — see `Server::accept_input`.
+    // 2,267 shipped connections fire `RunScriptCode`.
+    InputDef::new("RunScriptFile", FieldType::String),
+    InputDef::new("RunScriptCode", FieldType::String),
+    InputDef::new("CallScriptFunction", FieldType::String),
 ];
+
+/// Whether `name` is one of the three inputs that run a script.
+pub fn is_script_input(name: &str) -> bool {
+    ["RunScriptFile", "RunScriptCode", "CallScriptFunction"]
+        .iter()
+        .any(|input| input.eq_ignore_ascii_case(name))
+}
 
 /// The type [`BASE_INPUTS`] declares for `name`, if any.
 pub fn base_input(name: &str) -> Option<FieldType> {

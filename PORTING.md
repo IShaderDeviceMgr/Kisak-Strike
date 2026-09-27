@@ -312,8 +312,9 @@ Measured sizes (whole subtree; not all of it is compiled today):
 Portal-2-specific engine features already identified in the tree: `engine/paint.cpp`
 (1,656 lines — paint/gel maps) is **essential**, not vestigial as it would be for a
 CS:GO build. `vscript/` (Squirrel VM, ~55k) matters because Portal 2 puzzle logic is
-scripted — worth evaluating a Rust Squirrel binding or an alternative VM rather than
-porting the vendored one.
+scripted — and it **has been written in Rust** as `src/vscript/`: Squirrel 2.2.3's
+language rule for rule on a tree walker, not a port of the vendored bytecode VM and not a
+rewrite of the scripts (`portdocs/VSCRIPT.md`).
 
 Beware: the `cstrike15` base means some shared systems are CS:GO-shaped (e.g.
 `DEFAULT_HL2_GAMEDIR` is `"csgo"` in the launcher, game rules default to CS:GO). Those
@@ -598,6 +599,15 @@ with it and `.gitmodules` was updated to `legacy/ivp`.
   `front_face` in `PipelineCache` is arguably the better fix and is left as an open
   question**, since it fails 17 stage-4 GPU tests whose geometry is hand-wound for the
   present convention.
+- **`src/vscript/` — Squirrel 2.2.3, written.** The language rule for rule on a tree
+  walker: every compile decision of `sqcompiler.cpp` and every runtime rule of
+  `sqvm.cpp`, 32-bit numbers, byte strings, and Lua 4.0's hash table replicated because
+  its layout is `foreach`'s order. The standard libraries Valve registers, `Vector`,
+  `init.nut`; `src/server/script.rs` is the game's binding. All 92 shipped scripts
+  compile and 104 of the 106 maps run their first five seconds of script without an
+  error. Not ported: generators and threads (no shipped script uses them) and the
+  natives whose systems are absent, `CreateSceneEntity` first. `rustdocs/VSCRIPT.md`,
+  `portdocs/VSCRIPT.md`.
 - **Everything else is unported** and lives in `legacy/`.
 
 **`console/` stage 1 is done.** It landed as `src/engine/console/`, and the system turned

@@ -448,6 +448,16 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Gives the server a handle on the mounted content, so that a script can
+    /// read `scripts/vscripts/` whenever it asks — at a spawn, or in the middle
+    /// of a tick when one script includes another. `filesystem->ReadFile(
+    /// …, "GAME" )`, which is what `VScriptCompileScript` calls.
+    pub fn share_filesystem(&mut self, vfs: Arc<Vfs>) {
+        self.scene
+            .server
+            .set_script_files(std::rc::Rc::new(VfsScripts(vfs)));
+    }
+
     /// Queues the startup command line. `Host_Init`'s last act.
     ///
     /// Everything about how the engine starts is in `cfg/valve.rc`, which execs
@@ -764,6 +774,14 @@ impl<'a> Engine<'a> {
         // a respawn takes the same path as a fresh `map`.
         if let Some(map) = self.scene.server.take_level_restart() {
             self.host.request_new_game(&map);
+        }
+
+        // `SendToConsole` — `engine->ClientCommand( player, … )`, which for a
+        // listen server's own player is text for this console. Queued, so it
+        // runs with the rest of the frame's commands rather than inside the
+        // tick that asked.
+        for command in self.scene.server.take_console_commands() {
+            self.console.enqueue(&format!("{command}\n"), console::Source::ClientCmd);
         }
 
         // `R_DrawBrushModel`'s placement, refreshed from the entity that owns
@@ -2792,6 +2810,16 @@ fn build_configuration(bindings: &Bindings, cvars: &CvarRegistry) -> String {
     bindings.write(&mut out);
     console::write_archived_cvars(cvars, &mut out);
     out
+}
+
+/// The server's window onto `scripts/vscripts/` — the `"GAME"` search path,
+/// which is where `VScriptCompileScript` reads from.
+struct VfsScripts(Arc<Vfs>);
+
+impl server::script::ScriptFiles for VfsScripts {
+    fn read_script(&self, path: &str) -> Option<Vec<u8>> {
+        self.0.scoped(PathId::Game).read(path).ok()
+    }
 }
 
 /// `exec`'s window onto the mounted content.

@@ -31,6 +31,7 @@ mod math;
 mod server;
 mod studio;
 mod vphysics;
+mod vscript;
 
 fn main() -> std::process::ExitCode {
     let code = launcher::run();

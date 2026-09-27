@@ -380,6 +380,17 @@ pub fn base_key_value(entity: &mut EntityCore, key: &str, value: &str) -> bool {
         entity.damage_filter_name = Some(value.to_owned());
         return true;
     }
+    // `DEFINE_KEYFIELD( m_iszVScripts, FIELD_STRING, "vscripts" )` and
+    // `m_iszScriptThinkFunction`'s `"thinkfunction"` (`baseentity.cpp:2236`).
+    // An empty value is `NULL_STRING`, which is "no scripts".
+    if is("vscripts") {
+        entity.vscripts = (!value.is_empty()).then(|| value.to_owned());
+        return true;
+    }
+    if is("thinkfunction") {
+        entity.script_think_function = (!value.is_empty()).then(|| value.to_owned());
+        return true;
+    }
 
     // `DEFINE_KEYFIELD( m_nSolidType, FIELD_CHARACTER, "solid" )` — a field of
     // the `CCollisionProperty` that `CBaseEntity` embeds

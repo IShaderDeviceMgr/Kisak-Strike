@@ -80,11 +80,13 @@ pub mod obb;
 pub mod physics;
 pub mod push;
 pub mod random;
+pub mod script;
 pub mod sequences;
 pub mod think;
 pub mod touch;
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use glam::Vec3;
 
@@ -285,6 +287,16 @@ pub struct Server {
     /// What the `Context::vphysics_*` calls queued — see [`physics`], which is
     /// also where the deferral is justified.
     pending_physics: Vec<physics::Pending>,
+    /// The level's VScript VM and everything that points into it — see
+    /// [`script`].
+    script: script::ScriptState,
+    /// Where `scripts/vscripts/*.nut` are read from. Set once by the engine;
+    /// `None` in a test that does not hand one in, in which case every script
+    /// is "not found" and the VM runs only Valve's own two.
+    script_files: Option<Rc<dyn script::ScriptFiles>>,
+    /// What `SendToConsole` asked for, for the engine to run — see
+    /// [`Server::take_console_commands`].
+    console_commands: Vec<String>,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -879,6 +891,9 @@ impl Server {
             attachments_in_use: false,
             physics: None,
             pending_physics: Vec::new(),
+            script: script::ScriptState::default(),
+            script_files: None,
+            console_commands: Vec::new(),
         }
     }
 
@@ -904,6 +919,9 @@ impl Server {
     ) -> LevelStats {
         self.level_shutdown();
         self.map = Some(map.to_owned());
+        // `CVScriptGameSystem::LevelInitPreEntity` — the VM exists, and
+        // `mapspawn.nut` has run, before the first entity is parsed.
+        self.script_init();
 
         let mut stats = LevelStats {
             blocks: blocks.len(),
@@ -1108,6 +1126,10 @@ impl Server {
     /// `DispatchSpawn` (`mapentities.cpp:74`) — spawn one entity and mark it
     /// if it asked to go.
     fn dispatch_spawn(&mut self, id: EntityId) {
+        // `DispatchSpawn`'s `RunVScripts` and `RunPrecacheScripts`
+        // (`util.cpp:1971`) — **before** `Spawn`, so a script sees the
+        // entity's keys and not what its `Spawn` made of them.
+        self.run_vscripts(id);
         self.dispatch(id, |core, behaviour, cx| {
             match behaviour.spawn(core, cx) {
                 SpawnResult::Ok => {}
@@ -1115,6 +1137,11 @@ impl Server {
                 SpawnResult::Remove => core.remove(),
             }
         });
+        // …and `RunOnPostSpawnScripts` after it, unless the `Spawn` asked
+        // to go.
+        if self.entities.get(id).is_some_and(|e| !e.removed) {
+            self.run_on_post_spawn_scripts(id);
+        }
     }
 
     /// `ComputeSpawnHierarchyDepth_r` (`mapentities.cpp:133`), iteratively.
@@ -1196,6 +1223,9 @@ impl Server {
         // list is: every body in it belongs to something in that list.
         self.physics = None;
         self.pending_physics.clear();
+        // `LevelShutdownPostEntity`'s `VScriptServerTerm`.
+        self.script_shutdown();
+        self.console_commands.clear();
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -1336,6 +1366,9 @@ impl Server {
         self.player_use(query);
         self.player_touch_triggers(query);
         self.run_think_functions(query);
+        // `CBaseEntity::ScriptThink` — a context think in the original, run
+        // here straight after the ordinary ones.
+        self.run_script_thinks();
         // `CPhysicsHook::FrameUpdatePostEntityThink` — after every think and
         // before the touch sweep, so that a cube which moved this tick is in
         // its new place when `check_for_entity_untouch` looks.
@@ -1917,8 +1950,21 @@ impl Server {
             }
         }
 
-        let accepted = self
-            .dispatch(id, |core, behaviour, cx| {
+        // The script half of `AcceptInput` (`baseentity.cpp:4536`): an entity
+        // with a scope gets `activator`/`caller` set and its `Input<name>`
+        // asked first, and a false answer swallows the input.
+        let scoped = self.has_script_scope(id);
+        let run = !scoped || self.script_input_hook(id, input_name, activator, caller);
+        let accepted = if !run {
+            true
+        } else if !on_class && class::is_script_input(input_name) {
+            // `InputRunScriptCode` and its siblings need the VM, which is the
+            // server's — so they are handled here rather than by
+            // `base_accept_input`.
+            let text = value.to_string();
+            self.script_input(id, input_name, &text)
+        } else {
+            self.dispatch(id, |core, behaviour, cx| {
                 let input = Input {
                     name: input_name,
                     value,
@@ -1931,7 +1977,11 @@ impl Server {
                     false => base_accept_input(core, behaviour, &input, cx),
                 }
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+        };
+        if scoped {
+            self.script_input_done(id);
+        }
 
         match accepted {
             true => self.io.accepted += 1,
@@ -2700,6 +2750,10 @@ impl Server {
                 self.player = None;
             }
         }
+        // `UpdateOnRemove`'s `RemoveInstance` and the scope's release.
+        if freed > 0 {
+            self.script_forget_dead();
+        }
         // After the borrow above ends: re-resolving needs the whole list.
         if resolve_sky_camera {
             self.update_active_sky_camera();
@@ -2892,6 +2946,7 @@ impl Server {
         });
         self.set_player_state(state);
         self.player_prev_origin = state.origin;
+        self.script_player_spawned(id);
         id
     }
 

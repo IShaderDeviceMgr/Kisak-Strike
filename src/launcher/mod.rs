@@ -98,7 +98,7 @@ pub fn run() -> i32 {
             // Held for the rest of `run()`: the mounts stay alive as long as
             // the game does, and the material system reads `.vmt` and `.vtf`
             // files through it.
-            (Some(vfs), title)
+            (Some(std::sync::Arc::new(vfs)), title)
         }
         Err(err) => {
             eprintln!("source-engine: filesystem: {err}");

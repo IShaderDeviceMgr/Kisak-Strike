@@ -305,6 +305,15 @@ pub struct EntityCore {
     /// (`baseentity.cpp:2266`). 27 entities in the game carry it, all of them
     /// props this port has no class for.
     pub damage_filter_name: Option<String>,
+    /// `m_iszVScripts` — the `vscripts` key (`baseentity.cpp:2236`): a
+    /// space-separated list of files under `scripts/vscripts/`, run in the
+    /// entity's scope before its `Spawn`. 681 of the game's entities carry it,
+    /// 384 of them `logic_script`s.
+    pub vscripts: Option<String>,
+    /// `m_iszScriptThinkFunction` — the `thinkfunction` key: a function in
+    /// the entity's scope called every `sv_script_think_interval`, or as
+    /// often as it asks. 295 entities carry it.
+    pub script_think_function: Option<String>,
     /// `m_hDamageFilter`, resolved from
     /// [`damage_filter_name`](EntityCore::damage_filter_name) by
     /// `CBaseEntity::Activate` (`baseentity.cpp:1782`) and by the
@@ -1107,6 +1116,8 @@ impl Entity {
                 life_state: LifeState::Alive,
                 damage_accumulator: 0.0,
                 damage_filter_name: None,
+                vscripts: None,
+                script_think_function: None,
                 damage_filter: None,
                 solid: Solid::None,
                 solid_flags: 0,

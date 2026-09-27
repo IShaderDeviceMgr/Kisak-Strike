@@ -4635,6 +4635,15 @@ by the next frame's state machine, which is one frame of latency at startup and 
 is the `CommandTarget`: a struct of field borrows, holding `&mut Host`, `&mut Input`,
 `&mut ConsoleUi` and `&mut Client` (which is `scene.client` — a field of a field, and
 disjoint from the rest).
+**Scripts reach the console too.** A VScript `SendToConsole` queues its text on the
+server, and `Engine::frame` drains it after the ticks — `Server::take_console_commands`,
+enqueued as `Source::ClientCmd`, which is what `engine->ClientCommand` to the listen
+server's own player is. That is how a map is left at the moment: `TransitionFromMap()`
+finds no `point_changelevel` and sends `map <next>`, which lands here. The scripts
+themselves are read through `Engine::share_filesystem`, which hands the server an
+`Arc<Vfs>` behind `server::script::ScriptFiles` (`VfsScripts`, the `GAME` path) — the
+launcher holds the `Vfs` in an `Arc` for exactly this.
+
 It owns `map`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
 `trace`, `tonemap`, `portal`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
@@ -4751,7 +4760,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-382 tests under `engine::`, 21 of them depot-gated; 1,216 in the crate. (Treat both as a scale rather than a
+382 tests under `engine::`, 21 of them depot-gated; 1,264 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

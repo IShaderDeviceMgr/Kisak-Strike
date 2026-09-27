@@ -1515,3 +1515,53 @@ pub(super) static CASE_OUTPUTS: &[&str] = &[
     "OnCase16",
     "OnDefault",
 ];
+
+// ---------------------------------------------------------------------------
+// logic_script
+// ---------------------------------------------------------------------------
+
+/// `MAX_SCRIPT_GROUP` (`logicentities.cpp:40`).
+const MAX_SCRIPT_GROUP: usize = 16;
+
+/// `CLogicScript` (`logicentities.cpp:31`) — **384 of the game's 681
+/// scripted entities**, and nothing but a place to hang a script: a point
+/// entity with no inputs, no outputs and no think of its own. What it adds to
+/// `CBaseEntity` is `EntityGroup`, an array of up to sixteen named entities
+/// its script can reach, built in its `RunVScripts` before the scripts run
+/// (`Server::run_vscripts`).
+///
+/// > **The sixteenth key is `Group16`, not `Group15`** —
+/// > `DEFINE_KEYFIELD( m_iszGroupMembers[15], FIELD_STRING, "Group16")`.
+/// > A map that sets `Group15` sets nothing, and one that sets `Group16`
+/// > fills the sixteenth slot. Valve's, kept.
+pub struct LogicScript {
+    /// `m_iszGroupMembers`, `None` for `NULL_STRING`.
+    pub group: Vec<Option<String>>,
+}
+
+impl LogicScript {
+    pub(super) fn create() -> Box<dyn Behaviour> {
+        Box::new(LogicScript {
+            group: vec![None; MAX_SCRIPT_GROUP],
+        })
+    }
+}
+
+/// The keys `CLogicScript`'s datadesc names, in slot order.
+pub(super) static SCRIPT_GROUP_KEYS: &[&str] = &[
+    "Group00", "Group01", "Group02", "Group03", "Group04", "Group05", "Group06", "Group07",
+    "Group08", "Group09", "Group10", "Group11", "Group12", "Group13", "Group14", "Group16",
+];
+
+impl Behaviour for LogicScript {
+    fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
+        let Some(slot) = SCRIPT_GROUP_KEYS
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(key))
+        else {
+            return false;
+        };
+        self.group[slot] = (!value.is_empty()).then(|| value.to_owned());
+        true
+    }
+}

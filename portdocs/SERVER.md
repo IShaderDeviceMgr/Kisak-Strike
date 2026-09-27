@@ -1795,7 +1795,14 @@ Portal 2 is scripted, and the maps say how much:
 the VM is in the tree — and it is a 2005-era vendored Squirrel, which is exactly the
 kind of thing `PORTING.md` says to replace with a crate rather than port.
 
-**This is an open question, not a decision.** The options, with what would pick each:
+> **Decided: the VM was written.** Neither a crate nor FFI, and not option 4 either —
+> rewriting the scripts' functions in Rust was judged too great a divergence, since it
+> replaces Valve's *content* with the port's reading of it. `src/vscript/` is Squirrel
+> 2.2.3 rule for rule, `src/server/script.rs` is Valve's binding, and the measurement
+> option 4 asked for is `portdocs/VSCRIPT.md` §1 and §5. The options below are kept as
+> the record of what was weighed.
+
+The options, with what would pick each:
 
 1. **Defer.** `sp_a1_intro1` has 6 scripted entities out of 598. Most maps open, draw
    and are walkable with every script a no-op. This is the right answer through stage 5.

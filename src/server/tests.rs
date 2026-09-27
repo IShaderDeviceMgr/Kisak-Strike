@@ -3199,14 +3199,9 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("scalevalue", 599),
     ("skin", 1),
     ("sunspreadangle", 27),
-    // VScript's two keys, and the pair rises together: 33 chamber doors carry
-    // a `vscripts` and two a `thinkfunction`, which are the puzzle-completion
-    // and door-close-sensor Squirrel files. There is no VScript here.
-    ("thinkfunction", 2),
     ("vrad_brush_cast_shadows", 2456),
-    // +42 with `func_tracktrain`: the trains that name a script, which no
-    // class here runs.
-    ("vscripts", 114),
+    // `vscripts` (114) and `thinkfunction` (2) left this list with VScript:
+    // both are `CBaseEntity` keys now, read into `EntityCore`.
 ];
 
 /// Every shipped map's entity lump, spawned and then **run** for two seconds
@@ -3602,8 +3597,11 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **+83 for the pedestal buttons**: 56 `prop_button`s and 27
     // `prop_under_button`s. All spawn.
-    assert_eq!(total.matched, 37_117);
-    assert_eq!(total.spawned, 30_245);
+    //
+    // **+384 for `logic_script`**, which is nothing but a place to hang a
+    // script. All spawn.
+    assert_eq!(total.matched, 37_501);
+    assert_eq!(total.spawned, 30_629);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3636,8 +3634,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-1 and -7** for `sky_camera`: seven maps, one each.
     // **-2 and -1,697** for `func_tracktrain` and `path_track`.
     // **-2 and -83** for `prop_button` and `prop_under_button`.
-    assert_eq!(total.unknown.len(), 151);
-    assert_eq!(total.unknown.values().sum::<usize>(), 23_808);
+    // **-1 and -384** for `logic_script`.
+    assert_eq!(total.unknown.len(), 150);
+    assert_eq!(total.unknown.values().sum::<usize>(), 23_424);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3724,6 +3723,11 @@ fn every_shipped_map_spawns_its_entities() {
     // The pedestal buttons, on 38 and 12 maps. Nothing deletes either.
     assert_eq!(per_class.get("prop_button"), Some(&56));
     assert_eq!(per_class.get("prop_under_button"), Some(&27));
+    // Squirrel's anchor, on 105 of the 106 maps. This test hands the server no
+    // `scripts/vscripts/`, so every one of them loads an empty scope — which
+    // is what measures the *entity* side of scripting without the scripts'
+    // own behaviour; `every_shipped_maps_scripts_run` is the other half.
+    assert_eq!(per_class.get("logic_script"), Some(&384));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -3835,7 +3839,18 @@ fn every_shipped_map_spawns_its_entities() {
     // passes, the `OnPass` connections that hang off those, and the
     // `StartForward`/`MoveToPathNode` connections that used to be aimed at a
     // classname nothing answered for.
-    assert_eq!(io.dispatched, 6_510);
+    //
+    // **+495 with VScript, which is +498 and -3.** The 498 are one
+    // `CallScriptFunction DispatchOnPostSpawn` per scripted entity of a class
+    // the port has: `RunVScripts` builds the `OnPostSpawn` call chain in every
+    // scope whether or not its file is found, so every one of them posts the
+    // event (681 entities carry `vscripts`; 183 are on classes not here yet).
+    // The -3 — and the -3 in `no_target` and -4 in `thinks` below — are the
+    // level's random stream: `GenerateUniqueKey` draws a `RandomInt` for each
+    // script id, which is Valve's, and that moves which way a map's
+    // `logic_case` pickers go. Take the draw out and all three return to
+    // exactly the old numbers plus the 498.
+    assert_eq!(io.dispatched, 7_005);
     // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
     // `SetActivatedState` a map used to aim at a classname nothing answered
     // for now lands. Only two of the game's 31 are fired inside two seconds.
@@ -3868,7 +3883,12 @@ fn every_shipped_map_spawns_its_entities() {
     // **+692 with the trains**, for the same reasons, and **no train or node
     // input is on the unhandled list below**: every one of the 22 the two
     // classes declare is implemented.
-    assert_eq!(io.accepted, 5_735);
+    //
+    // **+537 with VScript**: the 498 `DispatchOnPostSpawn`s above, 38 script
+    // inputs that were aimed at `logic_script`s and found nothing, and the one
+    // `logic_relay.RunScriptCode` that was on the unhandled list — it is a
+    // `CBaseEntity` input now.
+    assert_eq!(io.accepted, 6_272);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3885,7 +3905,9 @@ fn every_shipped_map_spawns_its_entities() {
     // 10 Hz — six 64 Hz ticks — for the whole level whether anyone presses it
     // or not. Nothing a map fires at one lands inside two seconds, so
     // `dispatched` and `accepted` do not move.
-    assert_eq!(io.thinks, 17_361);
+    //
+    // **-4 with VScript**, from the random stream — see `dispatched`.
+    assert_eq!(io.thinks, 17_357);
     // **-86 with the two areaportal classnames, and `accepted` does not
     // move** — every one of the 86 is refused rather than accepted. They are
     // `func_areaportalwindow`'s two fade inputs, fired at the *classname*
@@ -3902,7 +3924,10 @@ fn every_shipped_map_spawns_its_entities() {
     // not, a sound or a particle system, and those are not classes here. The
     // trains make events that did not exist before, and some of them land on
     // nothing.
-    assert_eq!(io.no_target, 1_073);
+    //
+    // **-41 with VScript**: 38 script inputs that now find their
+    // `logic_script`, and 3 from the random stream.
+    assert_eq!(io.no_target, 1_032);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -3920,8 +3945,9 @@ fn every_shipped_map_spawns_its_entities() {
     // in hand is
     // `every_shipped_attachment_connection_puts_its_entity_on_a_bone`.
     //
-    // Three of the remaining names are the player procedurals (stage 5's), one
-    // is `RunScriptCode` (`portdocs/SERVER.md` §9), and
+    // Three of the remaining names are the player procedurals (stage 5's) —
+    // `RunScriptCode` was a fourth until VScript made it a `CBaseEntity`
+    // input — and
     // `prop_dynamic.Disabled` is eight connections misspelling `Disable`.
     //
     // **`prop_weighted_cube` added two names and six occurrences. One of them
@@ -3945,7 +3971,6 @@ fn every_shipped_map_spawns_its_entities() {
             // than too little. See `classes::AreaPortal`.
             ("func_areaportalwindow.SetFadeEndDistance", 43),
             ("func_areaportalwindow.SetFadeStartDistance", 43),
-            ("logic_relay.RunScriptCode", 1),
             ("player.SetFogController", 97),
             ("prop_dynamic.Disabled", 8),
             ("prop_weighted_cube.AddOutput", 5),
@@ -5092,6 +5117,14 @@ fn every_shipped_maps_triggers_notice_the_player() {
             };
 
             let before = server.io.dispatched;
+            // Every scripted entity posts itself a `DispatchOnPostSpawn` at
+            // spawn, and it is dispatched on the first tick whether or not
+            // anyone touches anything — so it is not the trigger's doing.
+            let posted_at_spawn = server
+                .queue
+                .iter()
+                .filter(|e| e.input == "CallScriptFunction")
+                .count();
             server.spawn_player(player_at(probe));
             let mut query = Placed {
                 collision: &collision,
@@ -5139,7 +5172,7 @@ fn every_shipped_maps_triggers_notice_the_player() {
             }) {
                 also_on_a_button += 1;
             }
-            if server.io.dispatched > before {
+            if server.io.dispatched > before + posted_at_spawn {
                 fired += 1;
             }
         }
@@ -7032,7 +7065,14 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     //
     // The 57 `mp_coop_credits` props a dying train takes with it are all on
     // the first side, which is why that side is 2,773 now.
-    assert_eq!(solid_key, [2_773, 5_622]);
+    //
+    // **One prop changed sides with VScript**, and the total did not move: a
+    // `SOLID_NONE` prop that used to survive the two seconds is removed and a
+    // `SOLID_VPHYSICS` one that used to be removed survives. It is the level's
+    // random stream — `GenerateUniqueKey` draws a `RandomInt` for every
+    // script id, as Valve's does, and that changes which way a random picker
+    // goes. With the draw taken out the old `[2_773, 5_622]` comes back.
+    assert_eq!(solid_key, [2_772, 5_623]);
 
     // **What `$includemodel` was worth, measured on the running maps.**
     // Before `studio::include` landed these read 2,563 / 1,666 / **897**: of
@@ -10970,4 +11010,646 @@ fn an_under_button_fires_when_its_longer_press_animation_finishes() {
         "0.675 seconds of `press`, on a 0.1-second grid: {pressed}"
     );
     assert_eq!(pedestal(&server).sequence(), "press_idle");
+}
+
+// ---------------------------------------------------------------------------
+// VScript — `server::script`
+// ---------------------------------------------------------------------------
+
+/// `scripts/vscripts/` as a table, for a test.
+struct ScriptTable(Vec<(&'static str, &'static str)>);
+
+impl script::ScriptFiles for ScriptTable {
+    fn read_script(&self, path: &str) -> Option<Vec<u8>> {
+        self.0
+            .iter()
+            .find(|(name, _)| format!("scripts/vscripts/{name}") == path)
+            .map(|(_, text)| text.as_bytes().to_vec())
+    }
+}
+
+/// A server whose scripts are `files`, loaded with `blocks`.
+fn script_server(files: Vec<(&'static str, &'static str)>, blocks: &[bsp::Entity]) -> Server {
+    let mut server = Server::new();
+    server.set_script_files(Rc::new(ScriptTable(files)));
+    server.level_init("sp_script_test", blocks, &[]);
+    server
+}
+
+fn script_counter_map(extra: Vec<bsp::Entity>) -> Vec<bsp::Entity> {
+    let mut blocks = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[("classname", "math_counter"), ("targetname", "counter"), ("max", "1000")]),
+    ];
+    blocks.extend(extra);
+    blocks
+}
+
+#[test]
+fn mapspawn_and_valves_server_script_run_before_any_entity() {
+    let server = script_server(
+        vec![("mapspawn.nut", "printl(\"==== calling mapspawn.nut\")\nprintl(GetMapName())")],
+        &script_counter_map(vec![]),
+    );
+    assert_eq!(
+        server.script_output(),
+        vec!["==== calling mapspawn.nut".to_owned(), "sp_script_test".to_owned()]
+    );
+    assert_eq!(server.script.errors, 0);
+}
+
+#[test]
+fn run_script_code_runs_in_the_entitys_scope_and_ent_fire_reaches_the_map() {
+    let files = vec![(
+        "test/adder.nut",
+        "amount <- 5\nfunction Go() { EntFire(\"counter\", \"Add\", amount) }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[("classname", "logic_script"), ("targetname", "adder"), ("vscripts", "test/adder.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("adder", "RunScriptCode", "Go()", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 5.0);
+    // `amount` went into the entity's scope, not the root table.
+    let root_has_amount = server
+        .with_vm(|vm, s| vm.get(s, &crate::vscript::Value::Table(vm.root()), &crate::vscript::Value::str("amount")))
+        .flatten();
+    assert!(root_has_amount.is_none());
+}
+
+#[test]
+fn call_script_function_and_self_name_the_entity() {
+    let files = vec![(
+        "test/named.nut",
+        "function Report() { printl(self.GetName() + \" \" + self.GetClassname()) }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[("classname", "logic_script"), ("targetname", "reporter"), ("vscripts", "test/named.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("reporter", "CallScriptFunction", "Report", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert!(server.script_output().contains(&"reporter logic_script".to_owned()), "{:?}", server.script_output());
+}
+
+#[test]
+fn on_post_spawn_runs_on_the_first_tick_after_the_scripts_ran_before_spawn() {
+    let files = vec![(
+        "test/spawn.nut",
+        "printl(\"loaded\")\nfunction OnPostSpawn() { printl(\"post spawn \" + Time()) }",
+    )];
+    let blocks = script_counter_map(vec![block(&[
+        ("classname", "logic_script"),
+        ("targetname", "s"),
+        ("vscripts", "test/spawn.nut"),
+    ])]);
+    let mut server = script_server(files, &blocks);
+    assert_eq!(server.script_output(), vec!["loaded".to_owned()]);
+    run(&mut server, 0.1);
+    let out = server.script_output();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(out[1].starts_with("post spawn 0.0"), "{out:?}");
+}
+
+#[test]
+fn a_think_function_runs_every_tenth_of_a_second_unless_it_asks_otherwise() {
+    let files = vec![
+        ("test/ticker.nut", "n <- 0\nfunction Tick() { n++; EntFire(\"counter\", \"Add\", 1) }"),
+        ("test/slow.nut", "function Tick() { EntFire(\"counter2\", \"Add\", 1); return 0.5 }"),
+    ];
+    let mut extra = vec![
+        block(&[
+            ("classname", "logic_script"),
+            ("targetname", "ticker"),
+            ("vscripts", "test/ticker.nut"),
+            ("thinkfunction", "Tick"),
+        ]),
+        block(&[
+            ("classname", "logic_script"),
+            ("targetname", "slow"),
+            ("vscripts", "test/slow.nut"),
+            ("thinkfunction", "Tick"),
+        ]),
+    ];
+    extra.push(block(&[("classname", "math_counter"), ("targetname", "counter2"), ("max", "1000")]));
+    let mut server = script_server(files, &script_counter_map(extra));
+    run(&mut server, 1.0);
+    // 0.1, 0.2, … 1.0 — ten runs in the first second.
+    assert_eq!(counter_value(&server, "counter"), 10.0);
+    // 0.1, 0.6 — the think's return value is the interval.
+    assert_eq!(counter_value(&server, "counter2"), 2.0);
+}
+
+#[test]
+fn an_input_function_in_the_scope_can_swallow_the_input() {
+    let files = vec![
+        ("test/block.nut", "function InputTrigger() { printl(\"blocked \" + caller.GetName()); return false }"),
+        ("test/allow.nut", "function InputTrigger() { return true }"),
+    ];
+    let blocks = script_counter_map(vec![
+        block(&[
+            ("classname", "logic_relay"),
+            ("targetname", "blocked"),
+            ("vscripts", "test/block.nut"),
+            ("OnTrigger", &conn("counter", "Add", "1", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "logic_relay"),
+            ("targetname", "allowed"),
+            ("vscripts", "test/allow.nut"),
+            ("OnTrigger", &conn("counter", "Add", "10", "0", "-1")),
+        ]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("targetname", "starter"),
+            ("OnMapSpawn", &conn("blocked", "Trigger", "", "0", "-1")),
+            ("OnMapSpawn", &conn("allowed", "Trigger", "", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 10.0);
+    assert!(server.script_output().contains(&"blocked starter".to_owned()), "{:?}", server.script_output());
+}
+
+#[test]
+fn a_logic_script_group_is_an_array_of_entities() {
+    let files = vec![(
+        "test/group.nut",
+        "function Count() { local n = 0; foreach (e in EntityGroup) { if (e != null) n++ } EntFire(\"counter\", \"Add\", n * 100 + EntityGroup.len()) }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[
+            ("classname", "logic_script"),
+            ("targetname", "grouper"),
+            ("vscripts", "test/group.nut"),
+            ("Group00", "counter"),
+            ("Group01", "nobody"),
+            // `Group15` is not a key; `Group16` is the sixteenth slot.
+            ("Group16", "counter"),
+        ]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("grouper", "CallScriptFunction", "Count", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    // Two found, sixteen slots.
+    assert_eq!(counter_value(&server, "counter"), 216.0);
+}
+
+#[test]
+fn entities_finds_by_name_and_classname() {
+    let files = vec![(
+        "test/find.nut",
+        "function Find() {
+            local n = 0
+            for (local e = Entities.FindByClassname(null, \"math_counter\"); e != null; e = Entities.FindByClassname(e, \"math_counter\")) n++
+            local c = Entities.FindByName(null, \"count*\")
+            EntFire(c.GetName(), \"Add\", n)
+        }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[("classname", "math_counter"), ("targetname", "other")]),
+        block(&[("classname", "logic_script"), ("targetname", "finder"), ("vscripts", "test/find.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("finder", "CallScriptFunction", "Find", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 2.0);
+}
+
+#[test]
+fn a_script_error_is_printed_and_the_level_carries_on() {
+    let files = vec![("test/broken.nut", "function Go() { local x = nothing_here + 1 }")];
+    let blocks = script_counter_map(vec![
+        block(&[("classname", "logic_script"), ("targetname", "broken"), ("vscripts", "test/broken.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("broken", "RunScriptCode", "Go()", "0", "-1")),
+            ("OnMapSpawn", &conn("counter", "Add", "1", "0", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 1.0);
+    let out = server.script_output().join("\n");
+    assert!(out.contains("AN ERROR HAS OCCURED [the index 'nothing_here' does not exist]"), "{out}");
+    assert!(out.contains("*FUNCTION [Go()] broken.nut line [1]"), "{out}");
+}
+
+#[test]
+fn a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root() {
+    let files = vec![(
+        "test/keeper.nut",
+        "function Keep() { ::kept <- Entities.FindByName(null, \"victim\") }
+         function Check() { EntFire(\"counter\", \"Add\", ::kept.IsValid() ? 1 : 100) }",
+    )];
+    let blocks = script_counter_map(vec![
+        block(&[("classname", "info_target"), ("targetname", "victim")]),
+        block(&[("classname", "logic_script"), ("targetname", "keeper"), ("vscripts", "test/keeper.nut")]),
+        block(&[
+            ("classname", "logic_auto"),
+            ("OnMapSpawn", &conn("keeper", "CallScriptFunction", "Keep", "0", "-1")),
+            ("OnMapSpawn", &conn("victim", "Kill", "", "0.1", "-1")),
+            ("OnMapSpawn", &conn("keeper", "CallScriptFunction", "Check", "0.5", "-1")),
+        ]),
+    ]);
+    let mut server = script_server(files, &blocks);
+    run(&mut server, 1.0);
+    assert_eq!(counter_value(&server, "counter"), 100.0);
+}
+
+/// `scripts/vscripts/` read from a mounted game, for the depot tests.
+struct DepotScripts(Rc<crate::filesystem::Vfs>);
+
+impl script::ScriptFiles for DepotScripts {
+    fn read_script(&self, path: &str) -> Option<Vec<u8>> {
+        self.0
+            .scoped(crate::filesystem::PathId::Game)
+            .read(path)
+            .ok()
+    }
+}
+
+/// **Both of `sp_a1_intro2`'s elevators, driven by the map's own scripts.**
+///
+/// Every step of an elevator is a `RunScriptCode` into
+/// `transitions/sp_transition_list.nut` or `sp_elevator_motifs.nut`, so this
+/// is the first depot test that is also a test of the Squirrel VM: it only
+/// passes if Valve's scripts compile, run in the right scopes, and reach the
+/// map through `EntFire`.
+///
+/// - **Arrival.** The player spawns in the map's box, touches the trigger
+///   that calls `OnPostTransition()`, and the script's `EntFire` at
+///   `@arrival_teleport` puts them in the elevator; the trigger there sends
+///   the train down to `@elevator_1_bottom_path_1`.
+/// - **Departure.** Standing in the exit elevator's trigger calls
+///   `StartMoving()`, which reads this map's speed out of the motif table and
+///   fires `SetSpeedReal 200`; the path's `OnPass` calls
+///   `FailSafeTransition()`, the relay teleports the player into
+///   `transition_trigger`, and `TransitionFromMap()` looks up the next map in
+///   `MapPlayOrder`. There is no `point_changelevel` yet, so the script takes
+///   its own fallback — `SendToConsole( "map " + next_map )` — and that is
+///   the command this test waits for.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release sp_a1_intro2s_elevators -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn sp_a1_intro2s_elevators_run_on_the_maps_own_scripts() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, PlacedBrushModel};
+
+    const MAP: &str = "sp_a1_intro2";
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Rc::new(
+        crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game"),
+    );
+    let bsp = Bsp::load(&vfs, MAP).expect("the map parses");
+    let collision = CollisionBsp::build(&bsp);
+    let entities = bsp.entities();
+    let placed = find_brush_models(&entities, &collision);
+
+    let mut server = Server::new();
+    server.set_script_files(Rc::new(DepotScripts(vfs.clone())));
+    server.level_init(MAP, &entities, &bsp.models);
+    assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
+    assert!(
+        server.script_output().iter().any(|l| l == "==== calling mapspawn.nut"),
+        "mapspawn.nut runs at level start"
+    );
+
+    // The placements are taken from the server once a tick, as
+    // `sync_brush_models` does in the running engine.
+    let place = |server: &Server| -> Vec<PlacedBrushModel> {
+        placed
+            .iter()
+            .filter_map(|p| {
+                let e = server.brush_entity(p.index)?;
+                let mut p = p.clone();
+                p.owned = true;
+                p.model.set_placement(e.origin, e.angles);
+                p.solid = e.is_solid() && e.collides_with_player();
+                Some(p)
+            })
+            .collect()
+    };
+    let tick = |server: &mut Server| {
+        let owned = place(server);
+        let mut query = Placed {
+            collision: &collision,
+            models: &owned,
+            chain: Vec::new(),
+        };
+        let interval = server.time().interval;
+        server.frame(interval, &mut query);
+    };
+    let origin_of = |server: &Server, name: &str| {
+        let id = name::find_by_name(&server.entities, name)
+            .next()
+            .unwrap_or_else(|| panic!("{name} is in the map"));
+        server.entities.get(id).expect("alive").core.origin
+    };
+
+    // ----- arrival -----
+    let spawn = entities
+        .iter()
+        .find(|e| e.classname() == Some("info_player_start"))
+        .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+        .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+        .expect("an info_player_start");
+    server.spawn_player(player_at(spawn));
+    let arrival = origin_of(&server, "@arrival_teleport");
+    let mut teleported_at = None;
+    for t in 0..64 {
+        tick(&mut server);
+        let player = server.player_state().expect("a player").origin;
+        if (player - arrival).length() < 1.0 {
+            teleported_at = Some(t);
+            break;
+        }
+    }
+    let teleported_at = teleported_at.expect("OnPostTransition() teleports the player into the arrival elevator");
+    println!("arrival: OnPostTransition() teleported the player to {arrival} on tick {teleported_at}");
+
+    // The interior trigger sends the train down; wait for it to arrive.
+    let bottom = origin_of(&server, "@elevator_1_bottom_path_1");
+    let train_start = origin_of(&server, "arrival_elevator-elevator_1");
+    let mut arrived = None;
+    for t in 0..(64 * 60) {
+        tick(&mut server);
+        let at = origin_of(&server, "arrival_elevator-elevator_1");
+        if (at - bottom).length() < 1.0 {
+            arrived = Some(t);
+            break;
+        }
+    }
+    let arrived = arrived.expect("the arrival train reaches @elevator_1_bottom_path_1");
+    println!(
+        "arrival: the train went from {train_start} to {bottom} in {:.1}s",
+        arrived as f32 / 64.0
+    );
+
+    // ----- departure -----
+    // Walking up to the exit is what summons the elevator: the approach
+    // trigger plays the tube's blockage animation and fires `elevator_arrive`,
+    // which opens the doors and kills the solid clip that fills the car until
+    // then. A test that skipped it would find the car full.
+    let trigger_named_to = |needle: &str| {
+        entities
+            .iter()
+            .filter(|e| e.classname() == Some("trigger_once"))
+            .find(|e| e.pairs.iter().any(|(_, v)| v.contains(needle)))
+            .and_then(|e| e.pairs.iter().find(|(k, _)| k == "model"))
+            .and_then(|(_, m)| m.strip_prefix('*')?.parse::<usize>().ok())
+    };
+    let approach = trigger_named_to("departure_elevator-blocked_elevator_tube_anim")
+        .expect("the exit's approach trigger");
+    let e = server.brush_entity(approach).expect("it spawned");
+    let (lo, hi) = (e.origin + e.model_bounds.mins, e.origin + e.model_bounds.maxs);
+    let probe = probe_inside(&collision, &placed, approach, lo, hi).expect("a point inside it");
+    let mut state = server.player_state().expect("a player");
+    state.origin = probe;
+    server.set_player_state(state);
+    let playerclip = name::find_by_name(&server.entities, "departure_elevator-elevator_playerclip")
+        .next()
+        .expect("the car's clip");
+    // `elevator_arrive` kills the clip 3.5 seconds in.
+    for _ in 0..(64 * 4) {
+        tick(&mut server);
+    }
+    assert!(
+        !server.entities.is_alive(playerclip),
+        "elevator_arrive kills the clip that fills the car"
+    );
+
+    let start_moving = entities
+        .iter()
+        .filter(|e| e.classname() == Some("trigger_once"))
+        .find(|e| e.pairs.iter().any(|(_, v)| v.contains("StartMoving()")))
+        .and_then(|e| e.pairs.iter().find(|(k, _)| k == "model"))
+        .and_then(|(_, m)| m.strip_prefix('*')?.parse::<usize>().ok())
+        .expect("the departure elevator's trigger");
+    let trigger = server.brush_entity(start_moving).expect("it spawned");
+    let (mins, maxs) = (trigger.origin + trigger.model_bounds.mins, trigger.origin + trigger.model_bounds.maxs);
+    let probe = probe_inside(&collision, &placed, start_moving, mins, maxs).expect("a point inside it");
+    // Stand the player **on the elevator's floor**, as a player walking in
+    // would be: a hull dropped from the top of the trigger onto whatever is
+    // solid below it — the train's own brushes included. A player left
+    // overlapping those is a blocker, and the pusher stops the train for one.
+    let floor = {
+        use crate::engine::trace::{Contents, Ray};
+        let owned = place(&server);
+        let solid: Vec<crate::engine::trace::BrushModel> =
+            owned.iter().filter(|p| p.solid).map(|p| p.model).collect();
+        let (hull_min, hull_max) = (Vec3::new(-16.0, -16.0, 0.0), Vec3::new(16.0, 16.0, 72.0));
+        // From the highest clear spot in the trigger's column, straight down.
+        let mut z = maxs.z;
+        let found = loop {
+            if z < mins.z - 72.0 {
+                break None;
+            }
+            let at = Vec3::new(probe.x, probe.y, z);
+            let clear = Ray::hull(at, at, hull_min, hull_max);
+            let mut tracer = collision.tracer().with_entities(&solid);
+            if !tracer.trace(&clear, Contents::MASK_PLAYERSOLID).start_solid {
+                let down = Ray::hull(at, at - Vec3::Z * 256.0, hull_min, hull_max);
+                let trace = collision.tracer().with_entities(&solid).trace(&down, Contents::MASK_PLAYERSOLID);
+                if trace.did_hit() {
+                    break Some(trace.end);
+                }
+            }
+            z -= 8.0;
+        };
+        found.expect("the elevator has a floor under its trigger")
+    };
+    let mut state = server.player_state().expect("a player");
+    state.origin = floor;
+    server.set_player_state(state);
+
+    let train = name::find_by_name(&server.entities, "departure_elevator-elevator_1")
+        .next()
+        .expect("the departure train");
+    let mut map_command = None;
+    let mut moving_at = None;
+    // The player's height above the car's origin, lowest and highest, over the
+    // ride — and where the car was when it started and when it last had the
+    // player aboard.
+    let mut ride: Option<(f32, f32, f32)> = None;
+    let mut ride_bottom = f32::INFINITY;
+    for t in 0..(64 * 60) {
+        tick(&mut server);
+        if moving_at.is_none() && server.entities.get(train).is_some_and(|e| e.core.speed > 0.0) {
+            moving_at = Some(t);
+        }
+        if let Some(c) = server.take_console_commands().into_iter().find(|c| c.starts_with("map ")) {
+            map_command = Some((t, c));
+            break;
+        }
+        // The ride: while the car is moving and before the exit teleport, the
+        // player stands on its floor and the pusher carries them down with it.
+        if let (Some(e), Some(p)) = (server.entities.get(train), server.player_state()) {
+            // Measured once the car is under way: the test drops the player on
+            // the floor clip, which sits 22 units below the car's own floor,
+            // and the car picks them up in its first tenth of a second.
+            let offset = p.origin - e.core.origin;
+            if e.core.speed > 0.0 && offset.length() < 128.0 {
+                let top = ride.map_or(e.core.origin.z, |(_, _, top)| top);
+                let (lo, hi) = match (ride, top - e.core.origin.z > 64.0) {
+                    (Some((lo, hi, _)), true) => (lo.min(offset.z), hi.max(offset.z)),
+                    (Some((lo, hi, _)), false) => (lo, hi),
+                    (None, _) => (f32::INFINITY, f32::NEG_INFINITY),
+                };
+                ride = Some((lo, hi, top));
+                ride_bottom = ride_bottom.min(e.core.origin.z);
+            }
+        }
+    }
+    let moving_at = moving_at.expect("StartMoving() sets the departure train going");
+    let speed = server.entities.get(train).map_or(0.0, |e| e.core.speed);
+    println!(
+        "departure: StartMoving() started the train {:.2}s after the trigger, at {speed} units/s",
+        moving_at as f32 / 64.0
+    );
+    let (lo, hi, top) = ride.expect("the player rides the departure car");
+    println!(
+        "departure: the player rode {:.0} units down, {lo:.1} to {hi:.1} above the car's origin",
+        top - ride_bottom
+    );
+    assert!(top - ride_bottom > 3000.0, "the car carries the player most of the way down");
+    assert!(hi - lo < 2.0, "the player stays on the car's floor all the way down");
+    let (at, command) = map_command.expect("TransitionFromMap() asks for the next map");
+    println!("departure: TransitionFromMap() sent `{command}` after {:.1}s", at as f32 / 64.0);
+    assert_eq!(command, "map sp_a1_intro3");
+    assert!((speed - 200.0).abs() < 1e-3, "sp_elevator_motifs.nut's speed for this map");
+    assert_eq!(server.script.errors, 0, "{:#?}", server.script_output());
+}
+
+/// **Every shipped map's scripts, run.** Each map is loaded with the game's
+/// `scripts/vscripts/`, given a player at its `info_player_start`, and run for
+/// five seconds of server time; every error a script raises is tallied by
+/// its message.
+///
+/// This is the measurement of what VScript still lacks. The VM is complete
+/// for the language the scripts are written in — every file compiles
+/// (`vscript::tests::every_shipped_script_compiles`) — so what fails here is
+/// a *native* the port does not register yet, or an entity a script expects
+/// that the port has no class for. Both lists are printed.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release every_shipped_maps_scripts_run -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_maps_scripts_run() {
+    use crate::engine::world::bsp::Bsp;
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Rc::new(
+        crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game"),
+    );
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let mut errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut maps_with_errors: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut warnings, mut lines, mut clean_maps) = (0usize, 0usize, 0usize);
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let entities = bsp.entities();
+        let mut server = Server::new();
+        server.set_script_files(Rc::new(DepotScripts(vfs.clone())));
+        server.level_init(name, &entities, &bsp.models);
+        let spawn = entities
+            .iter()
+            .find(|e| e.classname() == Some("info_player_start"))
+            .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+            .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+            .unwrap_or(Vec3::ZERO);
+        server.spawn_player(player_at(spawn));
+        run(&mut server, 5.0);
+
+        let out = server.script_output();
+        lines += out.len();
+        warnings += server.script.errors;
+        let mut map_errors = 0;
+        for line in &out {
+            if let Some(rest) = line.strip_prefix("AN ERROR HAS OCCURED [") {
+                let message = rest.trim_end_matches(']').to_owned();
+                *errors.entry(message).or_default() += 1;
+                map_errors += 1;
+            }
+        }
+        match map_errors {
+            0 => clean_maps += 1,
+            n => {
+                maps_with_errors.insert(name.clone(), n);
+            }
+        }
+    }
+
+    println!("\n{} maps, {} printed lines, {} host warnings", names.len(), lines, warnings);
+    println!("  {clean_maps} maps ran five seconds of their scripts without an error");
+    println!("  errors by message:");
+    let mut sorted: Vec<_> = errors.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (message, count) in &sorted {
+        println!("    {count:>6}  {message}");
+    }
+    println!("  maps with errors:");
+    for (map, count) in &maps_with_errors {
+        println!("    {count:>6}  {map}");
+    }
+    assert_eq!(names.len(), 106);
+
+    // **104 of the 106 run five seconds of their scripts without an error.**
+    // Before `CPortalGameRules`' functions were registered it was 25 — 85
+    // `AddBranchLevelName` calls on the co-op maps and 68 `PrecacheMovie`s from
+    // the elevator video scripts, all of them single-player no-ops in the
+    // shipped game too.
+    assert_eq!(clean_maps, 104);
+    // The two that are left are the same absence twice: the scene system.
+    // `choreo/turret_vo_manager.nut` (`sp_a2_bts4`) and
+    // `credits/credits_coop.nut` (`mp_coop_credits`) both build a table of
+    // `CreateSceneEntity` handles **while they load**, so the first call stops
+    // the file — which is also what the two host warnings are ("Error running
+    // script named …"). GLaDOS's own `glados.nut` makes its scenes lazily and
+    // so gets through five seconds without needing one.
+    assert_eq!(
+        errors.iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(),
+        vec![("the index 'CreateSceneEntity' does not exist", 2)],
+        "the set of script errors has changed"
+    );
+    assert_eq!(
+        maps_with_errors.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["mp_coop_credits", "sp_a2_bts4"]
+    );
+    assert_eq!(warnings, 2, "scripts that failed to run to the end");
 }
