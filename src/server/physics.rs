@@ -1267,6 +1267,7 @@ mod depot {
             wish_velocity: Vec3::new(175.0, 0.0, 0.0),
             // Rewritten every tick inside the loop below; see there.
             vphysics_position: feet,
+            teleported: false,
             view_offset: crate::client::player::VEC_VIEW,
         };
         server.spawn_player(state);
@@ -1457,6 +1458,7 @@ mod depot {
                         }
                         false => mv.origin,
                     },
+                    teleported: false,
                     view_offset: crate::client::player::VEC_VIEW,
                 };
                 match server.player() {
@@ -1689,6 +1691,7 @@ mod depot {
                     true => (mv.origin + (mv.move_start + mv.out_wish_vel / 64.0)) * 0.5,
                     false => mv.origin,
                 },
+                teleported: false,
                 view_offset: crate::client::player::VEC_VIEW,
             };
             state.vphysics_position = state.origin;
@@ -1993,6 +1996,7 @@ mod depot {
                 },
                 wish_velocity: Vec3::ZERO,
                 vphysics_position: mv.origin,
+                teleported: false,
                 view_offset: crate::client::player::VEC_VIEW,
             };
             match server.player() {

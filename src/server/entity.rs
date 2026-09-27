@@ -234,6 +234,16 @@ pub struct EntityCore {
     /// or zero. See [`ModelBounds`] — it is the one piece of entity state that
     /// comes from the `.bsp` rather than from the entity lump.
     pub model_bounds: ModelBounds,
+    /// **Teleported since its last trigger check**, by
+    /// [`touch::Teleport`](super::touch::Teleport) or, for the player, a
+    /// portal the client's move went through.
+    ///
+    /// The trigger check sweeps from where the entity was to where it is, and
+    /// a teleport is not a path: sweeping across one touches whatever lies
+    /// between. So the next check after a teleport is a box at the
+    /// destination — `PhysicsTouchTriggers()` with no previous origin, which
+    /// is what Valve's player gets on every command — and clears this.
+    pub teleported: bool,
     /// `m_MoveType` — how this entity is simulated. Set by a class's `Spawn`,
     /// never by a map key.
     pub move_type: MoveType,
@@ -1100,6 +1110,7 @@ impl Entity {
                 effects: 0,
                 entity_flags: 0,
                 model_bounds: ModelBounds::default(),
+                teleported: false,
                 move_type: MoveType::None,
                 velocity: Vec3::ZERO,
                 angular_velocity: Vec3::ZERO,

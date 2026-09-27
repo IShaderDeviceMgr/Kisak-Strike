@@ -606,6 +606,11 @@ pub struct PlayerState {
     /// the shove does not work, because a blocked player is a target the
     /// shadow catches up with.
     pub vphysics_position: Vec3,
+    /// **The client's**, in only: the player went through a portal since the
+    /// last hand-off, so the next trigger check must not sweep from the
+    /// entrance to the exit. See [`EntityCore::teleported`]. Always `false`
+    /// coming out.
+    pub teleported: bool,
 }
 
 /// One entity's studio model, as the renderer needs to see it.
@@ -1515,14 +1520,20 @@ impl Server {
         }
     }
 
-    /// `CBasePlayer::PhysicsSimulate`'s `PhysicsTouchTriggers( &vecPrevOrigin )`
-    /// (`baseentity_shared.cpp:2800`), for the one entity in this port that
-    /// moves under its own power.
+    /// The player's `PhysicsTouchTriggers` (`baseentity_shared.cpp:2800`), for
+    /// the one entity in this port that moves under its own power.
     ///
     /// The player is `IsSolid()` and is not a trigger, so it takes the
-    /// `isSolidCheckTriggers` branch: sweep its hull from where it was to
-    /// where it is, and mark everything with `FSOLID_TRIGGER` that the sweep
-    /// meets.
+    /// `isSolidCheckTriggers` branch and marks everything with
+    /// `FSOLID_TRIGGER` that its hull meets.
+    ///
+    /// > **Valve's is a box test and this is a sweep.** The shipped server
+    /// > checks after every usercmd (`CMoveHelperServer::ProcessImpacts`, with
+    /// > no previous origin), and there is one usercmd a tick. Here the client
+    /// > moves once per *rendered frame* and the server sees only where the
+    /// > last one left the player, so the sweep stands in for the frames it
+    /// > did not see. A teleport is not a path and gets Valve's box instead —
+    /// > [`EntityCore::teleported`].
     ///
     /// > **The sweep starts at the last *tick*'s origin, not the last frame's.**
     /// > `player_prev_origin` is written only here, so at 200 fps and 64 Hz it
@@ -1570,10 +1581,20 @@ impl Server {
         start: Vec3,
         query: &mut dyn TouchQuery,
     ) -> Option<Vec3> {
-        let entity = self.entities.get(id)?;
+        let entity = self.entities.get_mut(id)?;
         if !entity.core.is_solid() {
             return None;
         }
+        // A teleport since the last check: a box at the destination, not a
+        // sweep across the jump. `sp_a2_triple_laser`'s `@arrival_teleport`
+        // moves the player 2,300 units from the spawn box into the arrival
+        // elevator, and the sweep crossed `transition_trigger` on the way —
+        // which calls `TransitionFromMap()` and left the level on its first
+        // tick.
+        let start = match std::mem::take(&mut entity.core.teleported) {
+            true => entity.core.origin,
+            false => start,
+        };
         let (origin, mins, maxs) = (
             entity.core.origin,
             entity.core.model_bounds.mins,
@@ -2998,6 +3019,7 @@ impl Server {
         // form is both correct and, through
         // `CalcAbsolutePosition`'s no-move-parent branch, exact.
         core.set_abs_placement(state.origin, state.angles);
+        core.teleported |= state.teleported;
         core.velocity = state.velocity;
         core.base_velocity = state.base_velocity;
         self.player_wish_velocity = state.wish_velocity;
@@ -3060,6 +3082,7 @@ impl Server {
             wish_velocity: self.player_wish_velocity,
             view_offset: self.player_view_offset,
             vphysics_position: self.player_shadow_target.unwrap_or(core.origin),
+            teleported: false,
         })
     }
 

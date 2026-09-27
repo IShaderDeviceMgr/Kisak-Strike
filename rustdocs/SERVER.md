@@ -377,6 +377,7 @@ pub struct PlayerState {
     pub wish_velocity: Vec3,   // m_outWishVel, for the physics shadow
     pub vphysics_position: Vec3, // m_vNewVPhysicsPosition — where the shadow is sent
     pub view_offset: Vec3,     // m_vecViewOffset; the eye is origin + this
+    pub teleported: bool,      // in only: went through a portal (gotcha 45)
 }
 ```
 
@@ -2506,11 +2507,21 @@ the arm's origin start at 91.
     either half and a push either does nothing or never lets go.
 
 45. **A teleport discards the swept-from point.** The touch pass sweeps from
-    where the player was at the *last tick*, and a `trigger_teleport` moves it
-    a thousand units mid-pass — so the next tick's sweep is reset to the new
-    origin. Valve gets the same by having `CBaseEntity::Teleport` call
-    `PhysicsTouchTriggers()` with **no** previous origin. Without it a teleport
-    fires every trigger between the two ends.
+    where the player was at the *last tick*, so that the frames between two
+    ticks cannot carry a player across a thin trigger unseen — and a sweep
+    across a teleport touches every trigger between the two ends. So every
+    teleport sets `EntityCore::teleported` (`touch::Teleport::apply`, which
+    `trigger_teleport` and `point_teleport` share; a portal crossing arrives as
+    `PlayerState::teleported` from the client), and the next check is a box
+    at the destination and clears it — `PhysicsTouchTriggers()` with no
+    previous origin, which is what Valve's player gets after every command
+    (`CMoveHelperServer::ProcessImpacts`). **This used to hold only for a
+    `trigger_teleport` fired inside the touch pass**, and a `point_teleport`
+    fired from the event queue swept: four maps — `sp_a2_triple_laser`,
+    `sp_a3_portal_intro`, `sp_a4_intro` and `sp_a4_stop_the_box` — dragged the
+    player's hull from the spawn box into the arrival elevator through
+    `transition_trigger` and asked for the next map on their first tick.
+    `no_shipped_map_leaves_itself_on_arrival` guards all 106.
 
 46. **The player entity's `angles` are its *view* angles**, where
     `CBasePlayer` keeps `m_angAbsRotation` (yaw only) and its eye angles
@@ -3599,6 +3610,8 @@ case values.
 | `tests::a_script_error_is_printed_and_the_level_carries_on` | The error handler's output |
 | `tests::a_removed_entitys_handle_goes_invalid_and_its_scope_leaves_the_root` | `RemoveInstance`, `IsValid` |
 | `tests::sp_a1_intro2s_elevators_run_on_the_maps_own_scripts` (depot) | Both elevators, on the shipped scripts: the player **walks** into the exit car through the movement code, rides it down, and `@changelevel` asks for `changelevel sp_a1_intro3` |
+| `tests::a_teleport_does_not_touch_the_triggers_it_jumps_over` | gotcha 45: `point_teleport` and a portal crossing are box tests at the destination; a walk still sweeps |
+| `tests::no_shipped_map_leaves_itself_on_arrival` (depot) | gotcha 45 on every map: ten seconds of arrival, with scripts and real triggers, asks for no `changelevel` or `map` |
 | `tests::point_changelevel_asks_the_engine_for_one_changelevel` | `OnChangeLevel`, and one `changelevel` per level (gotcha 105) |
 | `tests::every_shipped_maps_scripts_run` (depot) | 104 of 106 maps run five seconds of their scripts without an error |
 | `random::random_int_is_inclusive_at_both_ends` | gotcha 18 |

@@ -4170,6 +4170,7 @@ fn player_at(origin: Vec3) -> PlayerState {
         buttons: 0,
         wish_velocity: Vec3::ZERO,
         vphysics_position: origin,
+        teleported: false,
         view_offset: crate::client::player::VEC_VIEW,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),
@@ -4231,6 +4232,52 @@ fn walking_into_a_trigger_fires_its_outputs() {
     server.set_player_state(player_at(Vec3::ZERO));
     run_touching(&mut server, &mut query, 0.1);
     assert_eq!(counter_value(&server, "count"), 1.0);
+}
+
+/// **A teleport is not a path.** The player's trigger check sweeps from where
+/// it was last tick, so that frames between ticks cannot skip a thin trigger —
+/// but a sweep across a teleport touches everything between the two ends. The
+/// check after one is a box at the destination instead, whether the server
+/// moved the player (`point_teleport`) or a portal did (the client's
+/// `PlayerState::teleported`). Walking the same distance still sweeps.
+#[test]
+fn a_teleport_does_not_touch_the_triggers_it_jumps_over() {
+    let (mins, maxs) = trigger_box();
+    let mut query = BoxTriggers::new(&[(1, mins, maxs)]);
+    let far_side = Vec3::new(-1000.0, 0.0, 0.0);
+
+    // The server's teleport — `sp_a2_triple_laser`'s `@arrival_teleport`.
+    let mut map = trigger_map("trigger_multiple", "OnStartTouch", &[("wait", "1")]);
+    map.push(block(&[
+        ("classname", "point_teleport"),
+        ("targetname", "tp"),
+        ("target", "!player"),
+        ("origin", "-1000 0 0"),
+    ]));
+    map.push(block(&[
+        ("classname", "logic_auto"),
+        ("OnMapSpawn", &conn("tp", "Teleport", "", "0.1", "-1")),
+    ]));
+    let mut server = Server::new();
+    server.level_init("test", &map, &trigger_models());
+    server.spawn_player(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+    run_touching(&mut server, &mut query, 0.5);
+    assert_eq!(server.player_state().expect("a player").origin, far_side);
+    assert_eq!(counter_value(&server, "count"), 0.0, "point_teleport swept through the trigger");
+
+    // A portal's, from the client, against a plain walk of the same distance.
+    for (teleported, expected) in [(true, 0.0), (false, 1.0)] {
+        let map = trigger_map("trigger_multiple", "OnStartTouch", &[("wait", "1")]);
+        let mut server = Server::new();
+        server.level_init("test", &map, &trigger_models());
+        server.spawn_player(player_at(Vec3::new(1000.0, 0.0, 0.0)));
+        run_touching(&mut server, &mut query, 0.1);
+        let mut state = player_at(far_side);
+        state.teleported = teleported;
+        server.set_player_state(state);
+        run_touching(&mut server, &mut query, 0.1);
+        assert_eq!(counter_value(&server, "count"), expected, "teleported: {teleported}");
+    }
 }
 
 /// `SF_TRIGGER_ALLOW_CLIENTS` is what makes a trigger notice a player, and a
@@ -11745,4 +11792,87 @@ fn every_shipped_maps_scripts_run() {
         vec!["mp_coop_credits", "sp_a2_bts4"]
     );
     assert_eq!(warnings, 2, "scripts that failed to run to the end");
+}
+
+/// **No shipped map leaves itself on arrival.** Every map is loaded with its
+/// scripts and a player at its `info_player_start`, and run for ten seconds
+/// with the touch pass the engine runs — brush triggers through the engine's
+/// own `sync_placements` — and nothing may ask for `changelevel` or `map`.
+///
+/// It exists because `sp_a2_triple_laser` did: `OnPostTransition()` teleports
+/// the player 2,300 units from the spawn box into the arrival elevator, and
+/// the trigger pass swept the player's hull along the jump, through
+/// `transition_trigger`, whose `TransitionFromMap()` then sent the game on to
+/// `sp_a2_bts1` on the first tick. A teleport is a box test at the
+/// destination now ([`EntityCore::teleported`]).
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release no_shipped_map_leaves -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn no_shipped_map_leaves_itself_on_arrival() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, sync_placements};
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Rc::new(
+        crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game"),
+    );
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let mut left = Vec::new();
+    let mut teleported = 0;
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let entities = bsp.entities();
+        let collision = CollisionBsp::build(&bsp);
+        let mut models = find_brush_models(&entities, &collision);
+        let mut server = Server::new();
+        server.set_script_files(Rc::new(DepotScripts(vfs.clone())));
+        server.level_init(name, &entities, &bsp.models);
+        let spawn = entities
+            .iter()
+            .find(|e| e.classname() == Some("info_player_start"))
+            .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+            .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+            .unwrap_or(Vec3::ZERO);
+        server.spawn_player(player_at(spawn));
+        let interval = server.time().interval;
+        let mut moved = false;
+        for _ in 0..(64 * 10) {
+            sync_placements(&mut models, |index| crate::engine::brush_placement(&server, index));
+            let mut query = Placed {
+                collision: &collision,
+                models: &models,
+                chain: Vec::new(),
+            };
+            server.frame(interval, &mut query);
+            moved |= server.player_state().is_some_and(|p| (p.origin - spawn).length() > 256.0);
+            let asked: Vec<String> = server
+                .take_server_commands()
+                .into_iter()
+                .chain(server.take_console_commands())
+                .filter(|c| c.starts_with("changelevel ") || c.starts_with("map "))
+                .collect();
+            if !asked.is_empty() {
+                left.push(format!("{name}: {asked:?}"));
+                break;
+            }
+        }
+        teleported += moved as usize;
+    }
+    println!("{} maps, {teleported} of them moved the player more than 256 units in ten seconds", names.len());
+    assert!(left.is_empty(), "maps that asked to leave on arrival:\n{}", left.join("\n"));
 }

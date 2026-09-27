@@ -395,6 +395,7 @@ impl Teleport {
         if let Some(velocity) = self.velocity {
             entity.velocity = velocity;
         }
+        entity.teleported = true;
     }
 }
 

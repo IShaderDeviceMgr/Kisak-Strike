@@ -981,6 +981,7 @@ impl Client {
         // them, and `ApplyMouse` clamps on the next command.
         if let Some(teleport) = mv.teleported {
             self.player.angles = teleport.turn(self.player.angles);
+            self.player.teleported = true;
         }
         // **The angles deliberately do not come back.** `CheckParameters` pins
         // `mv->m_vecAngles` to the previous command's when `IsDead()`, and

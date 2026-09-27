@@ -133,6 +133,12 @@ pub struct Player {
     /// walking into the cube moved it **1.3 units** before this and **91**
     /// after.
     pub vphysics_position: Vec3,
+    /// Whether a move went through a portal since the server last took the
+    /// player's state — `PlayerState::teleported`, so that the server's
+    /// trigger check does not sweep from one portal to the other. Set by
+    /// `Client::run_move`, cleared by the engine when the server's state comes
+    /// back.
+    pub teleported: bool,
     /// `m_vecBaseVelocity` — the velocity of whatever is carrying the player.
     ///
     /// **The server owns it.** A `trigger_push` writes it every tick it is
@@ -206,6 +212,7 @@ impl Player {
             velocity: Vec3::ZERO,
             wish_velocity: Vec3::ZERO,
             vphysics_position: origin,
+            teleported: false,
             base_velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
             // `MOVETYPE_WALK`, which is what a player spawns as
