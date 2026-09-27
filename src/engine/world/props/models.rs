@@ -51,6 +51,11 @@ pub struct PropBatch {
     pub materials: Vec<Arc<Material>>,
     pub first_index: u32,
     pub index_count: u32,
+    /// Which body part, and which of its models, this batch is geometry of —
+    /// [`studio::Batch`](crate::studio::Batch)'s own two, kept so that a body
+    /// group can choose between them.
+    pub body_part: u16,
+    pub model: u16,
 }
 
 impl PropBatch {
@@ -136,6 +141,18 @@ pub struct PropModel {
     /// megabyte for a whole map's models and keeping it is what would let a
     /// prop's lighting be rebuilt without re-reading the `.mdl`.
     pub meshes: Vec<crate::studio::HardwareMesh>,
+    /// Each body part's `(base, nummodels)` — see
+    /// [`StudioModel::body_part_model`](crate::studio::StudioModel::body_part_model).
+    pub body_parts: Vec<(i32, usize)>,
+}
+
+impl PropModel {
+    /// Whether `batch` is drawn at `m_nBody = body`: its model is the one its
+    /// body part selects.
+    pub fn draws(&self, batch: &PropBatch, body: i32) -> bool {
+        crate::studio::StudioModel::body_part_model(&self.body_parts, batch.body_part as usize, body)
+            .is_none_or(|model| model == batch.model as usize)
+    }
 }
 
 /// What loading a map's prop models turned out to cost.
@@ -246,6 +263,7 @@ impl PropModel {
                 .any(|material| material.uses_bumpmapping),
             checksum: model.checksum,
             meshes: model.meshes.clone(),
+            body_parts: model.body_parts.clone(),
             vertices: VertexBuffer::new(device, &model.path, &model.vertices),
             indices: IndexBuffer::new_u32(device, &model.path, &indices),
             batches,
@@ -368,6 +386,8 @@ impl PropModels {
                             .collect(),
                         first_index: batch.first_index,
                         index_count: batch.index_count,
+                        body_part: batch.body_part,
+                        model: batch.model,
                     })
                     .collect();
 

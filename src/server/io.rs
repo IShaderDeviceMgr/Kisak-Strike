@@ -621,6 +621,10 @@ pub struct IoStats {
     pub bad_conversion: usize,
     /// Thinks run.
     pub thinks: usize,
+    /// What [`accepted`](IoStats::accepted) was made of, by `class.input` —
+    /// for a census that has to say *which* inputs a new class made land.
+    #[cfg(test)]
+    pub accepted_by: BTreeMap<String, usize>,
 }
 
 #[cfg(test)]

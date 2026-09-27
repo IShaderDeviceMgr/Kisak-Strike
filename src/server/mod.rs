@@ -78,6 +78,8 @@ pub mod movement;
 pub mod name;
 pub mod obb;
 pub mod physics;
+pub mod placement;
+pub mod portalgun;
 pub mod push;
 pub mod random;
 pub mod script;
@@ -306,6 +308,13 @@ pub struct Server {
     /// `Fade` user messages on their way to the client — see
     /// [`Server::take_screen_fades`].
     screen_fades: Vec<crate::client::fade::ScreenFade>,
+    /// The sequence last sent to the view model, and when — `SendWeaponAnim`.
+    /// See [`portalgun::ViewModelState`].
+    view_model_sequence: (&'static str, f32),
+    /// Every button down at any frame since the last tick, and the ones down
+    /// now — see [`Server::update_player_buttons`].
+    player_buttons_latched: u32,
+    player_buttons_held: u32,
 }
 
 /// The engine's half of a touch test — `engine->SolidMoved`
@@ -425,6 +434,116 @@ pub trait TouchQuery {
             end,
             start_solid: false,
         }
+    }
+
+    /// `enginetrace->TraceRay` for a **line**, against the world and every
+    /// solid brush entity, with `mask` as raw `CONTENTS_*` bits — the portal
+    /// gun's trace, and every one of the dozens
+    /// [`placement`] asks per shot.
+    ///
+    /// Richer than [`solid_trace`](TouchQuery::solid_trace) because placement
+    /// reads more of `trace_t` than anything before it: the surface's flags
+    /// and game material decide whether a portal may go there, the plane
+    /// decides which way it faces, `fractionleftsolid` finds the edge of the
+    /// wall a portal is fitted to, and the brush model hit is how
+    /// `FClassnameIs( tr.m_pEnt, "func_door" )` is asked from this side.
+    ///
+    /// **Studio models are not in it.** The engine's clip chain holds brush
+    /// models and nothing else, and a static prop's only collision is the
+    /// physics environment's, which is the server's — so
+    /// [`placement`] sweeps those itself and takes the
+    /// nearer answer.
+    ///
+    /// The default is a clean miss, which is what every synthetic test here
+    /// that has no world wants.
+    fn shot_trace(&mut self, start: Vec3, end: Vec3, mask: u32) -> ShotHit {
+        let _ = mask;
+        ShotHit::miss(start, end)
+    }
+
+    /// `enginetrace->ClipRayToEntity( ray, mask, pEntity, &tr )` for a brush
+    /// entity — the line against **one** brush model at `origin`/`angles`,
+    /// and nothing else.
+    ///
+    /// Solidity is not asked: a `func_noportal_volume` is `FSOLID_NOT_SOLID`
+    /// and still clips, which is the whole reason `TraceBumpingEntities`
+    /// calls this rather than tracing the world.
+    fn clip_to_model(
+        &mut self,
+        model: usize,
+        origin: Vec3,
+        angles: Vec3,
+        start: Vec3,
+        end: Vec3,
+        mask: u32,
+    ) -> ShotHit {
+        let _ = (model, origin, angles, mask);
+        ShotHit::miss(start, end)
+    }
+
+    /// The material behind a [`ShotHit::surface`] — `csurface_t::name`.
+    ///
+    /// Asked by `IsPassThroughMaterial`, which compares the name against a
+    /// list. Empty for an index the engine does not know.
+    fn surface_name(&self, surface: u16) -> String {
+        let _ = surface;
+        String::new()
+    }
+}
+
+/// One [`TouchQuery::shot_trace`] or [`TouchQuery::clip_to_model`] — `trace_t`
+/// as placement reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShotHit {
+    /// `startpos` — where the trace began, or where it left solid.
+    pub start: Vec3,
+    /// `endpos`.
+    pub end: Vec3,
+    pub fraction: f32,
+    /// `fractionleftsolid` — how far along a trace that began inside a solid
+    /// it stopped being inside. Placement walks a portal's edges with it.
+    pub fraction_left_solid: f32,
+    /// `plane.normal`, out of the surface hit.
+    pub normal: Vec3,
+    /// `plane.dist`.
+    pub plane_dist: f32,
+    pub start_solid: bool,
+    pub all_solid: bool,
+    /// The collision model's surface index — see
+    /// [`TouchQuery::surface_name`]. `None` for nothing hit.
+    pub surface: Option<u16>,
+    /// `surface.flags` — `SURF_*`.
+    pub surface_flags: i32,
+    /// `physprops->GetSurfaceData( surface.surfaceProps )->game.material`,
+    /// the `CHAR_TEX_*` letter.
+    pub game_material: u16,
+    /// `"*N"`'s `N` when a brush entity stopped the trace, `None` for the
+    /// world or nothing.
+    pub model: Option<usize>,
+}
+
+impl ShotHit {
+    /// `UTIL_ClearTrace`, plus the two positions a miss reports.
+    pub fn miss(start: Vec3, end: Vec3) -> ShotHit {
+        ShotHit {
+            start,
+            end,
+            fraction: 1.0,
+            fraction_left_solid: 0.0,
+            normal: Vec3::ZERO,
+            plane_dist: 0.0,
+            start_solid: false,
+            all_solid: false,
+            surface: None,
+            surface_flags: 0,
+            game_material: 0,
+            model: None,
+        }
+    }
+
+    /// `DidHit()` — `fraction < 1 || allsolid || startsolid`.
+    pub fn did_hit(&self) -> bool {
+        self.fraction < 1.0 || self.all_solid || self.start_solid
     }
 }
 
@@ -911,6 +1030,9 @@ impl Server {
             server_commands: Vec::new(),
             change_level_issued: false,
             screen_fades: Vec::new(),
+            view_model_sequence: (portalgun::IDLE_SEQUENCE, 0.0),
+            player_buttons_latched: 0,
+            player_buttons_held: 0,
         }
     }
 
@@ -1247,6 +1369,7 @@ impl Server {
         // A new level is a new `sv.GetSpawnCount()`.
         self.change_level_issued = false;
         self.screen_fades.clear();
+        self.view_model_sequence = (portalgun::IDLE_SEQUENCE, 0.0);
     }
 
     /// What `studio/` says about the models this level's entities place.
@@ -1370,6 +1493,8 @@ impl Server {
     fn run_tick(&mut self, query: &mut dyn TouchQuery) {
         // Anything removed outside the loop — by a console command, say.
         self.cleanup_delete_list();
+        // `SetupMove`'s `UpdateButtonState` — this tick's usercmd buttons.
+        self.update_player_buttons();
         // `CPlayerMove::CheckMovingGround`, which in the original is the first
         // thing the player's own simulation does.
         self.check_moving_ground();
@@ -1385,6 +1510,10 @@ impl Server {
         // before the thinks and well before the physics step that moves what
         // is being carried.
         self.player_use(query);
+        // `CBasePlayer::ItemPostFrame` — the gun. After the use key, because
+        // a cube picked up this tick makes the pickup controller the use
+        // entity and `ItemPostFrame` then fires nothing.
+        self.player_weapon_frame(query);
         self.player_touch_triggers(query);
         self.run_think_functions(query);
         // `CBaseEntity::ScriptThink` — a context think in the original, run
@@ -1703,9 +1832,15 @@ impl Server {
             // `GetRequiredTriggerFlags()` for a solid non-trigger is
             // `FSOLID_TRIGGER`, and `EnumElement` requires every bit of it —
             // the same line that drops the solid brush models above.
-            if core.solid != movement::Solid::Obb
-                || !core.is_solid_flag_set(movement::FSOLID_TRIGGER)
-            {
+            // `SOLID_BBOX` too, which is the same box unturned — a weapon on
+            // the floor, the one trigger in the port that is not a brush or an
+            // OBB.
+            let angles = match core.solid {
+                movement::Solid::Obb => core.angles,
+                movement::Solid::Bbox => Vec3::ZERO,
+                _ => continue,
+            };
+            if !core.is_solid_flag_set(movement::FSOLID_TRIGGER) {
                 continue;
             }
             if obb::swept_box_touches_obb(
@@ -1714,7 +1849,7 @@ impl Server {
                 mins,
                 maxs,
                 core.origin,
-                core.angles,
+                angles,
                 core.model_bounds.mins,
                 core.model_bounds.maxs,
             ) {
@@ -2021,7 +2156,17 @@ impl Server {
         }
 
         match accepted {
-            true => self.io.accepted += 1,
+            true => {
+                self.io.accepted += 1;
+                #[cfg(test)]
+                {
+                    *self
+                        .io
+                        .accepted_by
+                        .entry(format!("{}.{input_name}", class.name))
+                        .or_default() += 1;
+                }
+            }
             // Only reachable if a class declares an input its handler refuses,
             // which `classes`' invariant test makes impossible — so this arm
             // is the test's safety net rather than a live path.
@@ -2107,6 +2252,10 @@ impl Server {
         let reload = cx.take_reload_level();
         let change_level = cx.take_change_level();
         self.screen_fades.extend(cx.take_screen_fades());
+        let (server_commands, client_commands) = cx.take_commands();
+        self.server_commands.extend(server_commands);
+        self.console_commands.extend(client_commands);
+        let bumped_weapons = cx.take_bumped_weapons();
         // Once a level has any attachment parenting, every tick re-derives
         // what rides one — see `Server::refresh_attachment_children`.
         self.attachments_in_use |= cx.took_attachment();
@@ -2184,6 +2333,12 @@ impl Server {
         // it right up to the moment it returns.
         self.pending_physics.extend(queued_physics);
         self.flush_physics();
+
+        // `BumpWeapon`, which in the C++ the weapon's touch calls on the
+        // player directly — see [`Context::bump_weapon`].
+        for weapon in bumped_weapons {
+            self.bump_weapon(weapon);
+        }
 
         if reload {
             self.level_restart = self.map.clone();
@@ -3040,21 +3195,39 @@ impl Server {
             true => core.flags |= movement::FL_ONGROUND,
             false => core.flags &= !movement::FL_ONGROUND,
         }
-        // `CBasePlayer::UpdateButtonState` (`player.cpp:4030`), which the
-        // original runs once per usercmd — that is, once per tick — from
-        // `CPlayerMove::SetupMove`. It runs once per *rendered frame* here,
-        // which is the one place the two clocks show: a tick sees whatever the
-        // last frame before it sampled.
-        //
-        // > **A press and release inside one tick is lost**, and that is
-        // > Valve's too rather than this port's: a shipped server sees one
-        // > usercmd per tick and computes the same edge from it. What differs
-        // > is only *which* sample within the tick, and the answer here is
-        // > "the most recent one", where Valve's client would have merged the
-        // > frames into the command.
-        let player_class = entity.behaviour.downcast_mut::<classes::Player>();
-        if let Some(player_class) = player_class {
-            player_class.update_button_state(state.buttons);
+        // The buttons are **latched here and applied once per tick** — see
+        // [`Server::update_player_buttons`].
+        self.player_buttons_latched |= state.buttons;
+        self.player_buttons_held = state.buttons;
+    }
+
+    /// `CBasePlayer::UpdateButtonState` (`player.cpp:4030`), which the original
+    /// runs once per usercmd — once per tick — from `CPlayerMove::SetupMove`.
+    ///
+    /// **Once per tick, on everything held since the last one.** The client
+    /// here hands its buttons over once per *rendered frame*, which at 200 fps
+    /// is three frames a tick; running `UpdateButtonState` on each of them
+    /// computed the press edge on a frame no tick then saw, and lost it — a
+    /// `+use` or a click landed only when it happened to arrive on a frame
+    /// that ran a tick. And it made `m_afButtonLast` last *frame's* buttons,
+    /// which to the portal gun made every fresh click look held.
+    ///
+    /// The latch is what Valve's client does with the same frames:
+    /// `kbutton_t`'s state is "down now" *or* "went down since the last
+    /// `CreateMove` read it" — the impulse bit — so a key tapped between two
+    /// commands still reaches the next one. A tick therefore sees what is held
+    /// now and everything that was down at any frame since the last tick, and
+    /// the latch is then emptied. A frame that ran two ticks gives the second
+    /// what is held and nothing else.
+    fn update_player_buttons(&mut self) {
+        let buttons = std::mem::take(&mut self.player_buttons_latched) | self.player_buttons_held;
+        let Some(player) = self.player else { return };
+        if let Some(class) = self
+            .entities
+            .get_mut(player)
+            .and_then(|e| e.behaviour.downcast_mut::<classes::Player>())
+        {
+            class.update_button_state(buttons);
         }
     }
 
@@ -3291,8 +3464,9 @@ impl Server {
     /// returning it — which is what lets the gun re-place the portal you can
     /// see rather than a spare.
     ///
-    /// The one caller is the [`place_portal`](Server::place_portal) console
-    /// command; in the shipped game it is the portal gun.
+    /// Two callers: the gun's first shot of each colour
+    /// ([`fire_portal`](Server::fire_portal)), as in the shipped game, and the
+    /// [`place_portal`](Server::place_portal) console command.
     fn find_portal(&mut self, group: u8, is_portal2: bool, create: bool) -> Option<EntityId> {
         let mut inactive = None;
         for (id, entity) in self.entities.iter() {
@@ -3339,8 +3513,10 @@ impl Server {
     /// `VerifyPortalPlacementAndFizzleBlockingPortals`: whether the surface is
     /// portalable, whether the oval fits on it, whether a bumper or a
     /// no-portal volume forbids it, and whether it overlaps the other portal.
-    /// All of that is `portal_placement.cpp`, which needs the gun
-    /// (`portdocs/PORTAL.md` §8).
+    /// All of that is `portal_placement.cpp` — [`placement`] — and the gun
+    /// goes through it; this command deliberately does not, which is what
+    /// makes it the tool for putting a portal where the rules would refuse
+    /// one.
     ///
     /// `NewLocation` activates the portal, so placing both colours links them.
     /// Returns whether a portal was placed, which is `false` only with no map

@@ -41,6 +41,9 @@ pub(crate) struct Fixture {
     /// a brush side built by [`add_surfaced_box`](Fixture::add_surfaced_box)
     /// names.
     pub(crate) surface_flags: i32,
+    /// Further surfaces, each its own texinfo and texdata after the first —
+    /// `(name, SURF_*)`, named by [`add_named_box`](Fixture::add_named_box).
+    pub(crate) named_surfaces: Vec<(String, i32)>,
 }
 
 impl Fixture {
@@ -116,6 +119,33 @@ impl Fixture {
         let count = sides.num_sides as usize;
         for side in &mut self.brush_sides[first..first + count] {
             side.tex_info = 0;
+        }
+        brush
+    }
+
+    /// A box brush wearing its **own** material and flags, for a fixture that
+    /// needs more than one kind of surface — a portalable wall with a
+    /// `SURF_NOPORTAL` panel on it, or glass beside concrete.
+    ///
+    /// Each call adds a texinfo and a texdata after the fixture's shared
+    /// first one, so [`add_surfaced_box`](Fixture::add_surfaced_box) and this
+    /// can be mixed.
+    pub(crate) fn add_named_box(
+        &mut self,
+        mins: Vec3,
+        maxs: Vec3,
+        contents: Contents,
+        name: &str,
+        flags: i32,
+    ) -> u16 {
+        self.named_surfaces.push((name.to_owned(), flags));
+        let tex_info = self.named_surfaces.len() as i16;
+        let brush = self.add_box(mins, maxs, contents, true);
+        let sides = &self.brushes[brush as usize];
+        let first = sides.first_side as usize;
+        let count = sides.num_sides as usize;
+        for side in &mut self.brush_sides[first..first + count] {
+            side.tex_info = tex_info;
         }
         brush
     }
@@ -401,8 +431,8 @@ impl Fixture {
         }
         // One texinfo and texdata, so a displacement's surface resolves to a
         // real table entry rather than the null surface.
-        let (texinfo, texdata, texdata_string_table) =
-            match self.faces.is_empty() && self.surface_flags == 0 {
+        let (mut texinfo, mut texdata, mut texdata_string_table) =
+            match self.faces.is_empty() && self.surface_flags == 0 && self.named_surfaces.is_empty() {
                 true => (Vec::new(), Vec::new(), Vec::new()),
                 false => (
                     vec![TexInfo {
@@ -422,6 +452,23 @@ impl Fixture {
                     vec!["nature/test_displacement".to_owned()],
                 ),
             };
+        for (at, (name, flags)) in self.named_surfaces.iter().enumerate() {
+            texinfo.push(TexInfo {
+                texture_vecs: [[0.0; 4]; 2],
+                lightmap_vecs: [[0.0; 4]; 2],
+                flags: *flags,
+                tex_data: at as i32 + 1,
+            });
+            texdata.push(TexData {
+                reflectivity: [0.5; 3],
+                name_string_table_id: at as i32 + 1,
+                width: 64,
+                height: 64,
+                view_width: 64,
+                view_height: 64,
+            });
+            texdata_string_table.push(name.clone());
+        }
 
         Bsp {
             phys_collide: Vec::new(),

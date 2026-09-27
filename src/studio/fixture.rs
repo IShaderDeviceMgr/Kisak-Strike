@@ -195,6 +195,7 @@ impl Spec {
             out.resize(model_at + MODEL_STRIDE, 0);
 
             put_i32(&mut out, part_at + 4, 1); // nummodels
+            put_i32(&mut out, part_at + 8, 1); // base
             put_i32(&mut out, part_at + 12, model_at as i32 - part_at as i32);
 
             let mesh_base = out.len();

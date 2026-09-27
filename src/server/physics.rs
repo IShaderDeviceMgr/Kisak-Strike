@@ -521,6 +521,13 @@ impl Physics {
         self.env.sweep_box(half, start, end)
     }
 
+    /// The portal shot's half against the environment — the static props and
+    /// the still studio entities, and nothing that moves. See
+    /// [`Environment::sweep_box_static`].
+    pub fn sweep_studio(&self, start: Vec3, end: Vec3) -> Option<Sweep> {
+        self.env.sweep_box_static(Vec3::ZERO, start, end)
+    }
+
     /// The `+use` trace's half against the environment — every body an
     /// **entity** owns, static and kinematic included, and none of the
     /// world's.

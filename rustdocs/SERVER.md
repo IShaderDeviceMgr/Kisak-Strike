@@ -111,9 +111,10 @@ it and `Context` grew `punch_penetrating_players`, which queues the work the way
 `take_damage` queues damage; gotchas 83 and 84 are the two things about it that
 read as bugs.
 
-**What does not exist yet**: the weapon (Portal 2's is `weapon_portalgun` and
-it needs the portal system), the armour and drowning. **50 of the 200
-classnames the shipped maps place are implemented**, out of 55 registered — the
+**What does not exist yet**: the armour and drowning. The weapon — Portal 2's
+only one, `weapon_portalgun` — has landed with its placement rules; see "The
+portal gun" under "What has landed". **59 of the 200
+classnames the shipped maps place are implemented**, out of 64 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -2007,8 +2008,65 @@ pub vscripts: Option<String>,
 pub script_think_function: Option<String>,
 ```
 
-Fifty-seven classnames, **37,890 of the shipped game's 60,925 entity blocks**.
-**Fifty-two of them are among the 200 classnames the maps place**; the other
+```rust
+// portalgun.rs — the gun's server half
+pub struct Shot { pub result: PlacementResult, pub position: Vec3, pub angles: Vec3, pub portal: Option<EntityId> }
+pub struct ViewModelState { pub model: &'static str, pub sequence: &'static str,
+                            pub started_at: f32, pub body: i32, pub skin: i32 }
+pub const IDLE_SEQUENCE: &str;                 // "idle"; the fire is "fire1", the deploy "draw"
+impl Server {
+    pub fn player_portalgun(&self) -> Option<EntityId>;
+    pub fn portalgun(&self) -> Option<&WeaponPortalgun>;
+    pub fn give_named_item(&mut self, classname: &str) -> Result<Option<EntityId>, String>; // `give`
+    pub fn give_portalgun(&mut self) -> Result<(), String>;      // reconstructed
+    pub fn upgrade_portalgun(&mut self) -> Result<(), String>;   // reconstructed
+    pub fn upgrade_potatogun(&mut self) -> Result<(), String>;   // reconstructed
+    pub fn view_model(&self) -> Option<ViewModelState>;
+    pub fn fire_portal(&mut self, gun: EntityId, portal2: bool, query: &mut dyn TouchQuery) -> Option<Shot>;
+}
+pub fn trace_fire_portal(world: &mut ShotWorld<'_>, portal: EntityId, start: Vec3, direction: Vec3,
+                         half_width: f32, half_height: f32, placed_by: PlacedBy) -> Shot; // `TraceFirePortal`
+// placement.rs — `portal_placement.cpp`
+pub enum PlacementResult { Success, UsedHelper, Bumped, CantFit, Cleanser, OverlapLinked,
+                           OverlapPartnerPortal, InvalidVolume, InvalidSurface, PassthroughSurface }
+pub enum PlacedBy { Fixed, Pedestal, Player }
+impl PlacementResult { pub fn succeeded(self) -> bool }
+pub struct ShotWorld<'a>;                      // ::new(query, physics, entities, brush_models, player)
+impl ShotWorld<'_> { pub fn trace_line(&mut self, start: Vec3, end: Vec3, mask: u32) -> Trace }
+pub fn verify(world: &mut ShotWorld<'_>, ignore: EntityId, origin: &mut Vec3, angles: Vec3,
+              half_width: f32, half_height: f32, placed_by: PlacedBy) -> PlacementResult; // bumps `origin`
+pub fn verify_and_fizzle_blocking(/* … */);   // `VerifyPortalPlacementAndFizzleBlockingPortals`
+pub fn overlapping_other_portals(/* … */);
+pub fn is_intersecting_no_portal_volume(/* … */);
+pub const MASK_SHOT_PORTAL: u32;
+pub const MASK_SOLID_BRUSHONLY: u32;
+pub const PORTAL_BUMP_FORGIVENESS: f32;        // 2.0
+// mod.rs — on `TouchQuery`, all defaulting to a clean miss
+fn shot_trace(&mut self, start: Vec3, end: Vec3, mask: u32) -> ShotHit;
+fn clip_to_model(&mut self, model: usize, origin: Vec3, angles: Vec3, start: Vec3, end: Vec3, mask: u32) -> ShotHit;
+fn surface_name(&self, surface: u16) -> String;
+pub struct ShotHit { /* start, end, fraction, fraction_left_solid, normal, plane_dist, start_solid,
+                        all_solid, surface, surface_flags, game_material, model */ }
+// class.rs — on `Context`
+pub fn server_command(&mut self, command: &str);  // `point_servercommand`
+pub fn client_command(&mut self, command: &str);  // `point_clientcommand`
+pub fn bump_weapon(&mut self, weapon: EntityId);  // a player walked into a gun
+// obb.rs
+pub fn obb_intersects_obb(/* origin, angles, mins, maxs — twice */) -> bool; // 15 separating axes
+// physics.rs
+impl Physics { pub fn sweep_studio(&self, start: Vec3, end: Vec3) -> Option<Sweep> } // still studio bodies only
+// classes/weapon.rs, classes/volume.rs, classes/portal.rs
+pub struct WeaponPortalgun { pub can_fire_portal1: bool, pub can_fire_portal2: bool, pub owner: Option<EntityId>,
+                             pub last_fired_portal: u8, pub potato: bool, /* delays, portals */ }
+pub struct PortalVolume { pub kind: BumperKind, pub active: bool }  // the three volumes
+pub struct PlacementHelper { pub radius: f32, pub use_angles: bool, pub enabled: bool }
+impl PropPortal { pub fn place_from_gun(&mut self, entity: &mut EntityCore, origin: Vec3, angles: Vec3,
+                                        gun: EntityId, fired_by_player: bool, cx: &mut Context<'_>) } // `NewLocation`
+pub const IN_ATTACK: u32; pub const IN_ATTACK2: u32;  // classes/player.rs
+```
+
+Sixty-four classnames, **41,787 of the shipped game's 60,925 entity blocks**.
+**Fifty-nine of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2068,6 +2126,13 @@ because Valve registers them:
 | `path_track` | `CPathTrack` | 1,464 |
 | `prop_button` | `CPropButton` | 56, in 38 maps |
 | `prop_under_button` | `CPropUnderButton` | 27, in 12 maps |
+| `weapon_portalgun` | `CWeaponPortalgun` (server half not in the tree) | 3 — and given by command everywhere else |
+| `point_servercommand` | `CPointServerCommand` | 115 |
+| `point_clientcommand` | `CPointClientCommand` | 175 |
+| `func_portal_bumper` | `PortalVolume` (source not in the tree) | 2,383 |
+| `func_noportal_volume` | `PortalVolume` (source not in the tree) | 458 |
+| `trigger_portal_cleanser` | `PortalVolume` (source not in the tree) | 371 |
+| `info_placement_helper` | `PlacementHelper` (source not in the tree) | 392 |
 
 ---
 
@@ -3033,6 +3098,39 @@ the arm's origin start at 91.
     a recipient that is not a net client — so a test that fires `Fade` before
     `spawn_player` sees `OnBeginFade` fire and `take_screen_fades` come back
     empty. Fades are taken once, like server commands.
+108. **Buttons are latched per tick, not per frame.** `set_player_state` runs
+    every rendered frame and ORs the buttons into a latch;
+    `update_player_buttons`, the first thing a tick does, takes the latch and
+    ORs in what is held *now* — `kbutton_t`'s impulse bit. Before it, a click
+    that went down and up between two ticks never reached the game, and a
+    press that arrived on a tickless frame lost its edge. Setting the latch
+    to the held buttons instead of *taking* it swallows one-frame releases.
+    It applies to `+use` and `+jump` as much as to the trigger.
+109. **Every map command runs twice, and must be idempotent.** 60
+    single-player maps name two entities `@command` — a `point_servercommand`
+    and a `point_clientcommand` — so `EntFire("@command", "Command",
+    "give_portalgun")` reaches both. `give_portalgun` on a player who has a
+    gun, and `upgrade_portalgun` on one already upgraded, do nothing but re-arm
+    the fire delay. A `point_clientcommand` with no player sends nothing.
+110. **An upgrade holds the gun.** `SetCanFirePortal1`/`2` push both attack
+    times 0.25 s / 0.5 s out when the gun has an owner. A test that gives a
+    gun and fires on the next tick fires nothing; wait 20 ticks.
+111. **A shot ignores portals, and that is Valve's result.** Portal 2's
+    `TraceFirePortal` stops a segment at a `prop_portal` and then treats the
+    hit as the wall it is on. This port's traces never see portals, and reach
+    the same wall. Shooting *through* a portal is not something the shipped
+    gun does.
+112. **Studio models are the server's to trace, not the engine's.**
+    `TouchQuery::shot_trace` holds brush models only; `ShotWorld::trace_line`
+    adds `Physics::sweep_studio` and keeps the nearer hit, which it reports as
+    a surface named `studio` — invalid for a portal, like any model surface in
+    the shipped game (`IsPortalOnValidSurface` refuses a non-brush entity).
+    A studio entity that is animating is not in the sweep.
+113. **Glass needs its game material, not a flag.** 4,302 of the shipped
+    game's glass brush sides carry no `SURF_NOPORTAL`; placement refuses them
+    because their `$surfaceprop`'s `gamematerial` is `Y`. A `ShotHit` whose
+    `game_material` is 0 is not glass, so a harness that leaves it unresolved
+    accepts portals on windows.
 
 ---
 
@@ -3140,7 +3238,8 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `prop_floor_cube_button` (9), `prop_floor_ball_button` (7), `prop_under_floor_button` (13) | Ordinary follow-on work, no longer blocked: a cube now presses a `prop_floor_button` through `CPortalButtonTrigger`'s cube arm. The first two accept **only** cubes and balls and are **co-op only**. `prop_under_floor_button` is `prop_floor_button` with a bigger box and different sequence names. (`prop_button` was on this row too; it has landed — "Pedestal buttons".) The counts are over `portal2/maps` only; an earlier version of this row counted the DLC maps too. See [the census](#what-the-maps-place-that-is-not-here--the-unported-classnames). |
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
-| **The player's weapon** — `weapon_portalgun` (3 placed), `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon` | Portal 2's only weapon is the portal gun and it needs the portal system (`portdocs/SERVER.md` §1.3). |
+| **The rest of the weapon system** — `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon`'s inventory, slots, switching and dropping | Portal 2's only weapon is the portal gun, which has landed as one class and one `Player::weapon` slot ("The portal gun"). Nothing in single player takes it away. |
+| **The fizzler's own behaviour** — `CTriggerPortalCleanser`'s touch | A shot stops at an enabled fizzler and its field draws only while it is on, but walking through one fizzles nothing and a cube carried into one is not dissolved: the source is not in the tree. `WeightedCube::SilentDissolve` is the landing site. |
 | **The movement, still** — `CGameMovement` on the server, `CPlayerMove::RunCommand` | Stage 5 moved the *authority* (the move type, the health, the life state) and deliberately left the *integration* in `client/` on the rendered frame. §5 of the porting doc is the argument: `CPrediction` re-runs the same movement code on the client, so a one-process port with no `net/` already has the client half and would gain nothing but a 64 Hz camera by moving it. Revisit when `net/` exists. |
 | `CBasePlayer::SetFogController` and `SetHUDVisibility` | 97 connections in the game fire `SetFogController` at `!player`, and there is no fog or HUD. `SetHealth`, the player's third input, **is** implemented. |
 | Named think *contexts* (`m_aThinkFunctions`) | Still no class here needs two independent timers, and stage 3 is the evidence rather than the counter-example: a mover uses the think schedule **and** the arrival alarm, which are two different mechanisms with two different fields, not two contexts. The one class that genuinely wanted a context is `CBaseDoor`'s `"MovingSound"`, and there is no sound system. |
@@ -3156,10 +3255,13 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 ## What the maps place that is not here — the unported classnames
 
-**148 of the 200 classnames the shipped maps place have no class here: 23,035 of
+**141 of the 200 classnames the shipped maps place have no class here: 19,138 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
 `func_tracktrain`, `path_track`, `prop_button`, `prop_under_button`,
-`logic_script`, `point_changelevel` and `env_fade` have landed since.) Every one is listed below, grouped by what it would
+`logic_script`, `point_changelevel`, `env_fade` and the portal gun's seven —
+`weapon_portalgun`, `point_servercommand`, `point_clientcommand`,
+`func_portal_bumper`, `func_noportal_volume`, `trigger_portal_cleanser` and
+`info_placement_helper` — have landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3262,11 +3364,9 @@ This is a ranking of what unblocks the most, not a plan.
 5. **`prop_physics`/`prop_physics_override`, `func_physbox` and
    `func_clip_vphysics`.** The simulation and `CPhysicsProp`'s base are both
    here already.
-6. **The portal gun and its placement rules:**
-   - `weapon_portalgun`;
-   - `func_portal_bumper`, `func_noportal_volume` and
-     `info_placement_helper`;
-   - `func_portal_detector`.
+6. ~~**The portal gun and its placement rules**~~ — **landed**; see "The
+   portal gun". `func_portal_detector` (31) is still here, and is now
+   buildable: a portal placed by rule is what it fires on.
 7. **Everything gated on a subsystem:**
    - choreography, which with VScript is the whole story layer — VScript has
      landed, and `CreateSceneEntity` is the one native the shipped scripts
@@ -3279,19 +3379,16 @@ This is a ranking of what unblocks the most, not a plan.
 
 ### Every unported classname, by family
 
-#### The portal gun's world — 7 classnames, 3,644 entities
+#### The portal gun's world — 2 classnames, 37 entities
 
-What a portal gun places portals *against* and what a portal does to things. Mostly without source here (`portdocs/SERVER.md` §1.3).
+What a portal does to things. `weapon_portalgun`, `func_portal_bumper`,
+`func_noportal_volume`, `info_placement_helper` and `trigger_portal_cleanser`
+have landed — "The portal gun" — though the cleanser's *touch* has not.
 
 | classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
 |---|---|---:|---:|---:|---:|---:|---|
-| `func_portal_bumper` | **none** | 2,383 | 1,239 / 1,144 | 59 | 2 | 1 / 2 | Nudges a portal off an edge during placement. Inert until the portal gun places portals by rule — the `portal` command skips every rule. |
-| `func_noportal_volume` | **none** | 458 | 448 / 10 | 36 |  | 29 / 0 | Refuses portal placement inside it. Same gate as the bumper. |
-| `info_placement_helper` | **none** | 392 | 163 / 229 | 43 |  | 8 / 0 | Snaps a portal onto a fixed spot. Same gate; `baseprojectedentity_shared.cpp` names it. |
-| `trigger_portal_cleanser` | **none** | 371 | 116 / 255 | 55 | 1 | 205 / 216 | The emancipation grill. Fizzles portals and dissolves props; its `OnDissolve` needs `WeightedCube`'s `SilentDissolve`. Its brush is left drawn in place, so a `Disable`d grill still shows. |
-| `func_portal_detector` | **none** | 31 | 31 / 0 | 17 |  | 16 / 68 | Fires when a portal lands inside it. Needs portal placement. |
+| `func_portal_detector` | **none** | 31 | 31 / 0 | 17 |  | 16 / 68 | Fires when a portal lands inside it. Portals are now placed by rule, so it can be built. |
 | `linked_portal_door` | `CLinkedPortalDoor` (`server/portal2/prop_linked_portal_door.cpp:126`) | 6 | 6 / 0 | 2 |  | 8 / 0 | A scripted pair of portals with no gun (`prop_linked_portal_door.cpp` survives). Two maps. |
-| `weapon_portalgun` | **none** | 3 | 1 / 2 | 1 |  | 4 / 34 | The gun. Also what `OnPlayerPickup` (34) fires from, on the maps where it is picked up. |
 
 #### Test elements — 25 classnames, 934 entities
 
@@ -3336,7 +3433,7 @@ Choreography and the scripted characters. **These are what start `sp_a1_intro1`'
 | `scripted_sequence` | `CAI_ScriptedSequence` (`server/scripted.cpp:121`) | 32 | 32 / 0 | 16 |  | 27 / 2 | Plays an NPC animation. Needs the AI. |
 | `ai_script_conditions` | `CAI_ScriptConditions` (`server/ai_scriptconditions.cpp:41`) | 18 | 18 / 0 | 9 | 3 | 20 / 48 | Fires when an NPC's conditions hold. 45 `OnConditionsSatisfied`; on `sp_a1_intro1`. |
 
-#### Logic and spawning — 13 classnames, 971 entities
+#### Logic and spawning — 11 classnames, 681 entities
 
 Ordinary map logic, the kind stage 2 ported. `point_template` is the one with teeth.
 
@@ -3344,8 +3441,6 @@ Ordinary map logic, the kind stage 2 ported. `point_template` is the one with te
 |---|---|---:|---:|---:|---:|---:|---|
 | `point_template` | `CPointTemplate` (`server/point_template.cpp:160`) | 302 | 149 / 153 | 44 | 2 | 228 / 142 | Spawns copies of other entities on `ForceSpawn` (207 connections) — the cube and ball droppers' way of making a new cube. Needs entities created after load and a fixup of their names. |
 | `env_global` | `CEnvGlobal` (`server/logicentities.cpp:1323`) | 178 | 8 / 170 | 8 |  | 514 / 0 | Sets a global state that `logic_auto`'s `globalstate` reads. 8 on SP maps; `Auto::global_state` already parses the reader side. |
-| `point_clientcommand` | `CPointClientCommand` (`server/client.cpp:649`) | 175 | 130 / 45 | 63 | 1 | 136 / 0 | Runs a console command on the client. 118 of its 136 connections set `r_flashlightbrightness`. |
-| `point_servercommand` | `CPointServerCommand` (`server/client.cpp:702`) | 115 | 67 / 48 | 62 |  | 10 / 1 | Runs a server console command. |
 | `env_entity_maker` | `CEnvEntityMaker` (`server/env_entity_maker.cpp:106`) | 94 | 62 / 32 | 33 | 1 | 160 / 16 | Spawns a `point_template`'s contents at its own position. |
 | `logic_achievement` | `CLogicAchievement` (`server/logic_achievement.cpp:41`) | 52 | 49 / 3 | 31 | 2 | 50 / 0 | Unlocks an achievement. Steam. |
 | `logic_compare` | `CLogicCompare` (`server/logicentities.cpp:2440`) | 20 | 0 / 20 | 0 |  | 17 / 59 | Compares a value. Co-op only. |
@@ -3574,6 +3669,11 @@ case values.
 
 | Test | Guards |
 |---|---|
+| `placement::tests::*` (14) | `portal_placement.cpp` case by case on a fixture: a clean shot, the edge bump, the floor snap, no-portal and glass and sky surfaces, a shot at nothing, a no-portal strip, a wall too narrow, another portal, a no-portal volume from outside and inside, a fizzler, a placement helper, the OBB test |
+| `portalgun::tests::*` (8) | the three commands and their order, `give weapon_portalgun` and the incinerator, the floor pickup, both command entities, the fire buttons and delays, the held-button repeat, a fizzler switched on and off (gotchas 109, 110) |
+| `tests::a_button_pressed_between_ticks_reaches_the_next_one` | gotcha 108 |
+| `tests::sp_a1_intro4_gives_the_gun_on_its_own_scripts_and_the_gun_places_portals` (depot) | the whole path from `sp_transition_list.nut` to a blue portal on a real wall: `give_portalgun` twice, then 72 shots — 52 bumped, 3 can't fit, 17 invalid surfaces |
+| `tests::every_shipped_map_can_be_shot_at` (depot) | 72 shots from every map's spawn, 7,632 in all: exact counts for each result, and every placed portal finite |
 | `io::an_outputs_connections_fire_in_reverse_lump_order` | gotcha 3 |
 | `io::an_event_posted_at_the_current_time_runs_in_the_same_pass` | gotcha 4 |
 | `io::an_empty_input_is_use_and_a_zero_fire_count_is_always` | gotchas 8 and 9 |
@@ -3833,7 +3933,7 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 37,890 matched, 65
+server time**, and asserts exact totals: 60,925 blocks, 41,787 matched, 65
 created, 31,018 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
 148 unimplemented classnames, the full 49-name unhandled-key table, 7,005
 events dispatched, 6,277 inputs accepted, 17,357 thinks, 1,027 events that found
@@ -4469,8 +4569,7 @@ kill you — `sp_a1_intro5` is the nearest that can, and is already the map to
 load for the floor button. What `sp_a1_intro1` does have is the
 `logic_playerproxy`.
 
-Not implemented, and each is a class or a subsystem: the weapon
-(`weapon_portalgun`, 3 placed, and it needs the portal system), the armour
+Not implemented, and each is a class or a subsystem: the armour
 (Portal has none), drowning, the HEV suit, and everything else that can hurt
 you — turrets, crushers, `prop_physics`. `trigger_hurt` is the whole damage
 surface the shipped maps reach.
@@ -5494,3 +5593,115 @@ kept: exactly five arguments read the alpha from past the end, as 0.
 **Not reproduced:** `ShouldThrottleUserMessage( "Fade" )`, a per-player rate limit
 nothing in single player approaches, and `g_pIntroData`'s override of the fade,
 which is the co-op intro camera.
+
+### The portal gun — `weapon_portalgun`, placement, and the commands that give it
+
+`classes/weapon.rs` (`WeaponPortalgun`), `portalgun.rs` (the server half: getting
+one, firing it, the view model), `placement.rs` (`portal_placement.cpp`, 1,663
+lines, all of it) and `classes/volume.rs` (the three brush volumes and
+`info_placement_helper`), plus `point_servercommand` and `point_clientcommand` in
+`classes/point.rs`. `portdocs/PORTALGUN.md` is the design record; this is what a
+caller needs.
+
+**Most of what the gun is has no source in this tree.** `weapon_portalgun.cpp`
+(the server half, where `give_portalgun` and `upgrade_portalgun` are defined),
+`func_noportal_volume.cpp`, `func_portal_bumper.cpp`,
+`trigger_portal_cleanser.cpp`, `info_placement_helper.cpp`,
+`UTIL_FindPlacementHelper` and `c_weapon_portalgun.cpp` are all named by the
+`.vpc`s and none shipped. What did ship is `weapon_portalgun_shared.cpp` (the
+state, the firing, `TraceFirePortal`, the helper snap), `portal_placement.cpp`
+(every rule), `CPortal_Player::BumpWeapon`, and every *reader* of the missing
+classes — so each missing class is exactly as much as its readers ask of it.
+
+**How the player gets it.** Three `weapon_portalgun`s are placed in the whole
+game; everywhere else the gun is given by a console command a map sends:
+
+| map | sent | to | reconstructed as |
+|---|---|---|---|
+| `sp_a1_intro3`, `sp_a2_intro` | `give weapon_portalgun` | `cmd_give_weapon` (a `point_servercommand`) | `GiveNamedItem` → `BumpWeapon`: a blue gun — both chips on `sp_a2_intro`, `BumpWeapon`'s named hack |
+| `sp_a1_intro4` on (`FIRST_MAP_WITH_GUN`) | `give_portalgun` | `@command` | a blue gun if the player has none |
+| `sp_a2_laser_intro` on | `+ upgrade_portalgun` | `@command` | orange as well |
+| `sp_a3_speed_ramp` on | `upgrade_potatogun` instead | `@command` | orange, and the potato |
+
+All of that is `transitions/sp_transition_list.nut`'s `OnPostTransition`, run by
+the map's own `logic_script`, through `EntFire`, the command entities, the
+server's command queue (`Server::take_server_commands`) and the engine's console,
+which calls back into `Server::give_portalgun` and its siblings. The depot test
+drives `sp_a1_intro4` down exactly that path and sees `give_portalgun` arrive
+twice (gotcha 109).
+
+**A shot.** `Server::run_tick` calls `player_weapon_frame` after `player_use`:
+nothing fires while carrying, a click fires at most every 0.2 s
+(`portalgun_fire_delay`), a held button every 0.5 s, and the primary branch
+returns whichever way it goes, so holding both fires only blue. `fire_portal`
+builds a `ShotWorld` — the portals, bumpers, no-portal volumes, cleansers,
+helpers and brush entities out of the entity list, the engine's `TouchQuery`
+for the world, and `Physics` for studio bodies — and runs `TraceFirePortal`:
+a `MASK_SHOT_PORTAL` line from the eye, stopped early by an enabled fizzler
+(`PortalTraceClippedByBlockers`), passed through sky and
+`lights/light_orange001`, snapped to a placement helper within its radius, and
+then `VerifyPortalPlacementAndFizzleBlockingPortals`. On success the portal —
+found by linkage group and colour, or made — is moved with
+`PropPortal::place_from_gun`, which is `NewLocation`: relink, reopen, punch the
+player out. `OnFiredPortal1` fires from the primary attack; nothing fires
+`OnFiredPortal2`, which is Valve's.
+
+**What placement decides, in order** (`VerifyPortalPlacement`): the portal is
+fitted onto the surface by `FitPortalOnSurface` — four corner traces, five cases
+by how many corners hit and where their lines meet, up to six recursions,
+`FindBumpVectorInCorner` and `FitPortalAroundOtherPortals` — then checked
+against no-portal volumes (a 15-axis OBB test, `obb::obb_intersects_obb`),
+against the other portals, against the surface (`IsPortalOnValidSurface`:
+`SURF_NOPORTAL`, sky, glass, a moving brush entity, a studio model), snapped
+to a floor it nearly touches, and refused if it hopped vertically too far.
+The results the shipped maps give, from each map's spawn, 72 shots each:
+
+```text
+  6,959  InvalidSurface        most spawns are inside an elevator's glass and metal
+    319  PassthroughSurface    out into the void or the sky
+    257  Bumped                placed — every success on shipped content is a bump
+     54  CantFit
+     22  Cleanser              a fizzler in the way
+     16  InvalidVolume
+      5  UsedHelper
+```
+
+**24 of the 106 maps take a portal from their spawn**; from `sp_a1_intro4`'s
+floor button 52 of 72 shots place one.
+
+**The view model is the server's choice and the engine's picture.**
+`Server::view_model` hands back the model, the last sequence sent (`draw` on
+pickup, `fire1` per shot) and when, `skin` = the last portal fired (0, 1, 2)
+and `body` = 1 with the potato. The engine plays the sequence once and falls
+back to `idle`; `rustdocs/ENGINE.md` has the pass.
+
+Findings worth knowing:
+
+- **`SURF_NOPORTAL` is not the constant the shipped game reads.**
+  `PortalSurfaceType` reads `CEG_SURF_NO_PORTAL_FLAG`, filled in by an
+  anti-tamper macro at DLL init; its fallback, `0xffff`, would refuse every
+  lightmapped wall. `bspflags.h`'s `0x20` is the only flag with that meaning.
+- **Glass is refused by game material** (gotcha 113), which meant carrying
+  `gamematerial` from `$surfaceprop` through `vphysics::Surface` into the trace
+  (`CollisionBsp::resolve_game_materials`).
+- **`TracePortalCorner`'s binary search feeds degrees to `cosf`.** Kept: a
+  corrected search would bump portals where the shipped game does not.
+  `FindBumpVectorInCorner` reads uninitialised points when its two lines do not
+  meet; that case is no bump here.
+- **Every command runs twice** (gotcha 109), and the reconstruction had to be
+  idempotent to survive the shipped maps at all.
+- **The fizzler draws itself.** All 1,174 `effects/fizzler*` faces belong to
+  `trigger_portal_cleanser` models, and all 284 of those write `Visible 1`: a
+  visible cleanser clears `EF_NODRAW` while enabled and sets it when disabled,
+  so switching one off now makes the field vanish, as it does in the game.
+  `FSOLID_TRIGGER` follows the enabled state too — that took the live-trigger
+  census to 2,568.
+- **Buttons were being lost between ticks** (gotcha 108). The gun is the
+  first thing here that a single short click has to reach, and at any frame
+  rate above 64 Hz a click could start and end on frames that ran no tick.
+
+**Not here:** the cleanser's touch (portals are not fizzled by walking through
+a field, cubes are not dissolved), `func_portal_detector`, the gun's effects and
+sounds, `FVisible`'s pickup trace, a dropped gun's physics, paint, and co-op's
+partner-portal and pedestal cases (`OverlapPartnerPortal` and
+`PlacedBy::Pedestal` exist and are unreachable).

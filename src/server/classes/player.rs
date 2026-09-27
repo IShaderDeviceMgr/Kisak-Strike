@@ -32,12 +32,17 @@
 //! state, `client/` reads them, and `FullWalkMove` still runs on the rendered
 //! frame.
 //!
+//! # The weapon
+//!
+//! A single slot rather than `m_hMyWeapons`: Portal 2 has one weapon, the
+//! portal gun, and [`Player::weapon`] holds it once the player has picked one
+//! up or been given one — see [`crate::server::portalgun`].
+//!
 //! # What is still not here
 //!
-//! The weapon (Portal 2's is `weapon_portalgun`, 3 placed, and it needs the
-//! portal system), the armour (`m_ArmorValue`; Portal has no armour and no
-//! pickup that gives any), drowning, the suit, the HUD, teams, observer mode,
-//! and `CBasePlayer::PreThink`/`PostThink` beyond the two lines
+//! The armour (`m_ArmorValue`; Portal has no armour and no pickup that gives
+//! any), drowning, the suit, the HUD, teams, observer mode, and
+//! `CBasePlayer::PreThink`/`PostThink` beyond the two lines
 //! `logic_playerproxy` needs. Each is a measurement in `rustdocs/SERVER.md`
 //! rather than a stub here.
 
@@ -74,6 +79,11 @@ pub const IN_DUCK: u32 = 1 << 2;
 /// re-grab every tick, and `CPortal_Player::PlayerUse` debounces it for the
 /// same reason.
 pub const IN_USE: u32 = 1 << 5;
+
+/// `IN_ATTACK` — the left mouse button, which fires the blue portal.
+pub const IN_ATTACK: u32 = 1 << 0;
+/// `IN_ATTACK2` — the right mouse button, which fires the orange one.
+pub const IN_ATTACK2: u32 = 1 << 11;
 
 /// `VEC_DUCK_HULL_MAX.z` (`portal_mp_gamerules.cpp:177`) — 36, against 72
 /// standing.
@@ -137,6 +147,10 @@ pub struct Player {
     /// `UpdateButtonState`, read by `logic_playerproxy`.
     last_buttons: u32,
     pressed_buttons: u32,
+    /// `GetActiveWeapon()` — and, since Portal 2 has one weapon, the whole of
+    /// `m_hMyWeapons`. The portal gun once one has been picked up or given;
+    /// see [`crate::server::portalgun`].
+    pub weapon: Option<crate::server::entity::EntityId>,
     /// `m_flDeathTime` — when `Event_Killed` ran. The fade and the respawn are
     /// both measured from it.
     death_time: f32,
@@ -172,6 +186,12 @@ impl Player {
     /// `m_afButtonPressed` — the bits that went down since the last call.
     pub fn pressed_buttons(&self) -> u32 {
         self.pressed_buttons
+    }
+
+    /// `m_afButtonLast` — what was held before the last call. The portal
+    /// gun's held-button delay reads it.
+    pub fn last_buttons(&self) -> u32 {
+        self.last_buttons
     }
 
     /// `CBasePlayer::UpdateButtonState` (`player.cpp:4030`).

@@ -235,6 +235,11 @@ pub(super) fn build(
         indices,
         batches,
         skin_families: mdl.skin_families.len(),
+        body_parts: mdl
+            .body_parts
+            .iter()
+            .map(|part| (part.base, part.models.len()))
+            .collect(),
         meshes,
         bones: mdl.bones.clone(),
         sequences: mdl.sequences.clone(),

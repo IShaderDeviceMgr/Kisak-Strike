@@ -63,6 +63,7 @@ pub struct StudioModel {
     pub indices: Vec<u32>,
     pub batches: Vec<Batch>,
     pub skin_families: usize,    // numskinfamilies — how many material sets, >= 1
+    pub body_parts: Vec<(i32, usize)>, // each part's (base, nummodels) — m_nBody's digits
     pub bones: Vec<anim::Bone>,
     pub sequences: Vec<anim::Sequence>,
     /// **Shared, not owned** — the draw path poses a model to look at it and
@@ -83,6 +84,10 @@ impl StudioModel {
     /// The largest bone index any vertex is weighted to, plus one — how many
     /// palette entries a draw of this model reads. At most `bones.len()`.
     pub fn skinned_bones(&self) -> usize;
+    /// Which model of body part `part` draws at `m_nBody = body` —
+    /// `R_StudioSetupModel`'s `( body / base ) % nummodels`. `None` for a part
+    /// the model has not got; a negative body or a zero base reads as model 0.
+    pub fn body_part_model(body_parts: &[(i32, usize)], part: usize, body: i32) -> Option<usize>;
 }
 
 impl StudioModel {
@@ -794,12 +799,15 @@ Ordered by how likely each is to bite. **13-16 are the animation's.**
   Valve gets the sharing free from `CMDLCache`; the equivalent here is a cache
   above `StudioModel::load`, and the condition for writing one is a level load
   that is actually too slow.
-- **Body groups** (`m_nBody`) — the other half of the selector family skin
-  families belong to, and the one still missing. It chooses which *model*
-  inside a body part draws, which is geometry rather than materials;
-  `build.rs` already keeps body parts in separate batches precisely so that it
-  can be added without a rewrite. 959 of 968 models have exactly one body part,
-  so it is near-vestigial on props and matters for characters.
+- **Body groups for map entities** (`m_nBody`) — the selector is here
+  (`StudioModel::body_parts`, `body_part_model`, `mdl::BodyPart::base`) and the
+  engine applies it per instance (`EntityModels::set_body`), but **only the
+  portal gun's view model sets one**: every map entity is still drawn with
+  every model of every part. `v_portalgun.mdl` is why it could not wait — its
+  second part, `potatos_vmodel`, is an empty model 0 and PotatOS as model 1,
+  so drawing everything put the potato on the gun on every map. 959 of 968
+  models have exactly one body part, so for props it is near-vestigial; the
+  `body` key and `SetBodyGroup` are what would carry it for entities.
 - **Culling** — `PropModel::bounds` is already in hand for it.
 
 ---

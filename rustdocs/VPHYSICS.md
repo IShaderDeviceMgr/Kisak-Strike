@@ -41,7 +41,7 @@ for (body, origin, angles) in env.active() { /* VPhysicsUpdate */ }
 | Module | Is | Answers |
 |---|---|---|
 | [`collide`](../src/vphysics/collide.rs) | Valve's format: `.phy` and `LUMP_PHYSCOLLIDE` | "what shape is this model?" |
-| [`surfaceprops`](../src/vphysics/surfaceprops.rs) | `scripts/surfaceproperties*.txt` | "how slippery is it?" |
+| [`surfaceprops`](../src/vphysics/surfaceprops.rs) | `scripts/surfaceproperties*.txt` | "how slippery is it?" — and, as `Surface::game_material`, the `CHAR_TEX_*` letter (`gamematerial`, upper-cased, inherited through `base`) the portal gun refuses glass by |
 | [`env`](../src/vphysics/env.rs) | Rapier | "where does it end up?" |
 | [`shadow`](../src/vphysics/shadow.rs) | `physics_shadow.cpp`'s `CPlayerController` | "what does the player shove?" |
 | [`grab`](../src/vphysics/grab.rs) | `portal_grabcontroller_shared.cpp`'s `CGrabController` | "what is the player carrying?" |
@@ -122,6 +122,7 @@ not centred on its entity's origin (the player's is not) carries its own shift.
 ```rust,ignore
 Environment::sweep_box(half, start, end) -> Option<Sweep>   // ClipRayToVPhysics
 Environment::sweep_box_among(half, start, end, accept)      // …over any body `accept` admits
+Environment::sweep_box_static(half, start, end)             // traced && !dynamic only — the portal gun's
 Environment::set_traced(BodyId, bool)                       // a static studio body sweep_box sees
 Environment::is_dynamic(BodyId) -> bool                     // created Motion::Dynamic?
 Environment::contacts(BodyId) -> Vec<Contact>               // IPhysicsFrictionSnapshot
@@ -138,6 +139,15 @@ not the player's own shadow. The filter reads the environment's record of how
 each body was *created*, because `EnableMotion( false )` makes a prop a fixed
 body and filtering on the Rapier body type would let the player walk through
 every cube a map spawns frozen.
+
+**`sweep_box_static` is the other half, for the portal gun.** It admits only the
+bodies marked `set_traced` that were *not* created dynamic — the static props and
+the still studio entities, which is everything a portal may be shot at that
+`trace/` does not hold. `server::Physics::sweep_studio` calls it with a zero
+half-extent, and placement reports what it hits as a studio surface, which
+refuses a portal. A cube is not in it: a portal shot at a cube goes through to
+the wall behind, as it does in the shipped game, where `UTIL_Portal_Trace_Filter`
+ignores `prop_weighted_cube`, `prop_physics` and the rest by classname.
 
 **`set_traced` is the static props and the still studio entities**, whose
 `.phy` this environment holds the only copy of — `trace/` has no studio

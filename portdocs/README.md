@@ -162,6 +162,16 @@ e.g. `engine/` → `ENGINE.md`, `materialsystem/` → `MATERIALSYSTEM.md`.
   gated on a **blended pass** this port has never had — which is stage 1, is not portal
   work, and unblocks the five translucent brush entities too. Five stages.
 
+- [`PORTALGUN.md`](PORTALGUN.md) — **`weapon_portalgun` and `portal_placement.cpp`.**
+  Written *with* the port, like `CLIENT_TONEMAP.md`, and it reverses `PORTAL.md` §8's
+  deletion of the gun. Placement is ported whole, bugs included; the gun's server half,
+  its three console commands and the four placement volumes have no source in the tree
+  and are rebuilt from what reads them — the transition script that sends the commands,
+  `BumpWeapon`'s comment, and every line of placement that asks a volume anything.
+  Findings: every map command runs twice (two `@command`s), glass is refused by game
+  material and not by flag (4,302 unflagged sides), `SURF_NOPORTAL` hides behind an
+  anti-tamper constant, and a click could fall between two ticks.
+
 `LAUNCHER.md` predates PORTING.md's architecture change and carries a note at the top
 saying what that changed; its factual content (module behavior analysis) is unaffected.
 `FILESYSTEM.md`, `MATERIALSYSTEM.md` and `ENGINE.md` are written against the current

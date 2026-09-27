@@ -370,6 +370,25 @@ pub struct WorldStats {
     pub pak_files: usize,
 }
 
+/// Where the view model is and what it is doing, in `world/`'s vocabulary —
+/// the engine fills it in from the game's `ViewModelState` and the view.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewModelPose<'a> {
+    /// `EyePosition()`.
+    pub eye: Vec3,
+    /// `EyeAngles()` — pitch, yaw, roll.
+    pub angles: Vec3,
+    /// The sequence last sent, and the scene time it was sent at.
+    pub sequence: &'a str,
+    pub started_at: f32,
+    /// What plays once a sequence that does not loop has finished.
+    pub idle: &'a str,
+    /// `m_nSkin`.
+    pub skin: i32,
+    /// `m_nBody`.
+    pub body: i32,
+}
+
 /// A loaded map.
 pub struct World {
     pub name: String,
@@ -487,6 +506,14 @@ pub struct World {
     /// cannot run inside [`load`](World::load): which entities draw a model is
     /// the game's to say and the game has not spawned them yet.
     pub entity_models: EntityModels,
+    /// The gun in the player's hands — `v_portalgun.mdl`, one instance, drawn
+    /// by [`draw_view_model`](World::draw_view_model) in its own pass.
+    ///
+    /// An [`EntityModels`] of one rather than a new kind of model, because a
+    /// view model *is* an animated studio model; what is different about it
+    /// is where it is (the eye), how it is lit (wherever the eye is, every
+    /// frame) and how it is projected, and all three are the caller's.
+    pub view_model: EntityModels,
     /// The ovals the map's active portals wear — `portdocs/PORTAL.md` stage 2.
     ///
     /// Not built from the `.bsp` at all: a portal's whole geometry is four
@@ -575,7 +602,14 @@ impl World {
         // and the collision tree resolves a `"*N"` into a placement. The props
         // below want the same tree for their leaf lookup.
         let entities = bsp.entities();
-        let collision = CollisionBsp::build(&bsp);
+        let mut collision = CollisionBsp::build(&bsp);
+        // Read once and used twice: here for the collision model's game
+        // materials, which the portal gun's glass test reads, and below for
+        // the physics environment.
+        let surface_props = physics::surface_properties(vfs);
+        collision.resolve_game_materials(|material| {
+            physics::game_material(vfs, &surface_props, material)
+        });
         let brush_models = find_brush_models(&entities, &collision);
 
         // One group map per placement, and empty for the ones that draw
@@ -716,7 +750,7 @@ impl World {
         // it cannot do yet are the entities' models (`add_models`, once
         // `level_init` has named them) and the brush entities' placements
         // (`Server::set_physics`, for the same reason).
-        let physics = physics::build(name, &bsp, &props, vfs, physics::surface_properties(vfs));
+        let physics = physics::build(name, &bsp, &props, vfs, surface_props);
 
         // Read before the struct literal so that the sky's six materials can
         // be loaded from it in the same expression that records it.
@@ -754,6 +788,7 @@ impl World {
             prop_models,
             physics: Some(physics),
             entity_models: EntityModels::default(),
+            view_model: EntityModels::default(),
             portals: Portals::load(materials, vfs),
             portal_holes: PortalHoles::default(),
             lighting,
@@ -1158,6 +1193,85 @@ impl World {
             &self.lighting,
             &self.collision,
         );
+    }
+
+    /// Reads and uploads the view model, `model`, as one instance with id 0 at
+    /// body 0.
+    ///
+    /// **Body 0 is chosen, not left to draw everything**:
+    /// `v_portalgun.mdl`'s second body part is the potato, whose model 0 is
+    /// empty and model 1 is PotatOS — so a model drawn without a body would
+    /// carry the potato on every map of the game.
+    pub fn load_view_model(
+        &mut self,
+        vfs: &Vfs,
+        materials: &mut MaterialCache,
+        device: &wgpu::Device,
+        model: &str,
+    ) {
+        let entity = ModelEntity {
+            id: 0,
+            model: model.to_owned(),
+            origin: Vec3::ZERO,
+            angles: Vec3::ZERO,
+            skin: 0,
+            visible: false,
+            sequence: String::new(),
+            cycle: 0.0,
+            anim_time: 0.0,
+            playback_rate: 1.0,
+            modulation: [1.0; 4],
+        };
+        self.view_model = EntityModels::load(
+            vfs,
+            materials,
+            device,
+            &[entity],
+            &self.lighting,
+            &self.collision,
+        );
+        self.view_model.set_body(0, Some(0));
+    }
+
+    /// Draws the view model, posed and placed, into `pass` — which the caller
+    /// has opened with the view model's own projection and a cleared depth
+    /// buffer (`CViewRender::DrawViewModels`, `viewrender.cpp:1526`).
+    ///
+    /// `CBaseViewModel::CalcViewModelView`: the model's origin is the eye and
+    /// its angles are the view's. Portal's gun adds no bob
+    /// (`CBasePortalCombatWeapon::AddViewmodelBob` is empty); the sway
+    /// `CalcViewModelLag` adds is not ported.
+    ///
+    /// **A sequence that does not loop plays once and gives way to `idle`**,
+    /// which is `WeaponIdle`'s `SendWeaponAnim( ACT_VM_IDLE )` once
+    /// `HasWeaponIdleTimeElapsed` — decided here rather than by the server,
+    /// because how long `fire1` lasts is the model's to say. Lit where the eye
+    /// is, re-sampled every frame, because the gun goes wherever the player
+    /// does.
+    pub fn draw_view_model(&mut self, pass: &mut Pass<'_>, curtime: f32, pose: &ViewModelPose<'_>) {
+        let (sequence, anim_time) = match self.view_model.sequence_timing(0, pose.sequence) {
+            Some((duration, false)) if curtime - pose.started_at >= duration => {
+                (pose.idle, pose.started_at + duration)
+            }
+            _ => (pose.sequence, pose.started_at),
+        };
+        self.view_model.sync(&[ModelEntity {
+            id: 0,
+            model: String::new(),
+            origin: pose.eye,
+            angles: pose.angles,
+            skin: pose.skin,
+            visible: true,
+            sequence: sequence.to_owned(),
+            cycle: 0.0,
+            anim_time,
+            playback_rate: 1.0,
+            modulation: [1.0; 4],
+        }]);
+        self.view_model.set_body(0, Some(pose.body));
+        let lighting = self.lighting.lighting_at(&mut self.collision.tracer(), pose.eye);
+        self.view_model.relight(0, lighting);
+        self.view_model.draw_all(pass, curtime);
     }
 
     /// Takes every entity model's placement and pose from the game server,

@@ -6,11 +6,11 @@
 //!
 //! # What is here, and what it covers
 //!
-//! **Fifty-seven classnames, 37,890 of the shipped game's 60,925 entity blocks.**
-//! Five of the 57 are placed by no map: `player` (the engine makes it when a
+//! **Sixty-four classnames, 41,787 of the shipped game's 60,925 entity blocks.**
+//! Five of the 64 are placed by no map: `player` (the engine makes it when a
 //! client connects), `trigger_portal_button` (a `prop_floor_button` makes it
 //! in its own `Spawn`), and `dynamic_prop`, `prop_dynamic_glow` and
-//! `light_glspot`, each registered because Valve registers it — so **52 of
+//! `light_glspot`, each registered because Valve registers it — so **59 of
 //! the 200 classnames the maps place** are implemented. The exact totals are
 //! asserted by `every_shipped_map_spawns_its_entities`, which is where to
 //! look when this paragraph and the table disagree.
@@ -79,6 +79,8 @@ pub mod prop;
 pub mod sky;
 pub mod train;
 pub mod trigger;
+pub mod volume;
+pub mod weapon;
 pub mod world;
 
 use crate::server::class::{ClassDef, InputDef, InputDefs, PointEntity};
@@ -95,14 +97,17 @@ pub use logic::{
 };
 pub use pedestal::PedestalButton;
 pub use player::{
-    LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_DUCK, IN_JUMP, IN_USE,
+    LogicPlayerProxy, Player, RevertSaved, DUCK_HULL_HEIGHT, IN_ATTACK, IN_ATTACK2, IN_DUCK,
+    IN_JUMP, IN_USE,
 };
-pub use point::{PointChangelevel, PointTeleport};
+pub use point::{PointChangelevel, PointClientCommand, PointServerCommand, PointTeleport};
 pub use portal::PropPortal;
 pub use sky::SkyCamera;
 pub use train::{PathTrack, TrackTrain};
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
+pub use volume::{PlacementHelper, PortalVolume};
+pub use weapon::WeaponPortalgun;
 pub use world::World;
 
 /// Every class this port knows. `CEntityFactoryDictionary::m_Factories`.
@@ -470,6 +475,64 @@ pub(super) static CLASSES: &[ClassDef] = &[
         inputs: point::POINT_CHANGELEVEL_INPUTS,
         outputs: &["OnChangeLevel"],
         create: PointChangelevel::create,
+    },
+    // The portal gun's classes — `portdocs/PORTALGUN.md`. The gun is given
+    // by command far more often than it is placed (three in the game), and
+    // the commands arrive through the two `point_*command` classes, which is
+    // why those came with it; the four volumes are what its shots are fitted
+    // around.
+    ClassDef {
+        name: "weapon_portalgun",
+        keys: weapon::WEAPON_KEYS,
+        inputs: &[],
+        outputs: weapon::WEAPON_OUTPUTS,
+        create: WeaponPortalgun::create,
+    },
+    // `CPointServerCommand` and `CPointClientCommand` (`server/client.cpp`).
+    ClassDef {
+        name: "point_servercommand",
+        keys: &[],
+        inputs: point::COMMAND_INPUTS,
+        outputs: &[],
+        create: PointServerCommand::create,
+    },
+    ClassDef {
+        name: "point_clientcommand",
+        keys: &[],
+        inputs: point::COMMAND_INPUTS,
+        outputs: &[],
+        create: PointClientCommand::create,
+    },
+    // `func_portal_bumper`, `func_noportal_volume`, `trigger_portal_cleanser`
+    // and `info_placement_helper` — none of whose sources ships; see
+    // [`volume`].
+    ClassDef {
+        name: "func_portal_bumper",
+        keys: &[],
+        inputs: volume::VOLUME_INPUTS,
+        outputs: &[],
+        create: PortalVolume::create_bumper,
+    },
+    ClassDef {
+        name: "func_noportal_volume",
+        keys: &[],
+        inputs: volume::VOLUME_INPUTS,
+        outputs: &[],
+        create: PortalVolume::create_no_portal_volume,
+    },
+    ClassDef {
+        name: "trigger_portal_cleanser",
+        keys: volume::CLEANSER_KEYS,
+        inputs: volume::CLEANSER_INPUTS,
+        outputs: volume::CLEANSER_OUTPUTS,
+        create: PortalVolume::create_cleanser,
+    },
+    ClassDef {
+        name: "info_placement_helper",
+        keys: volume::HELPER_KEYS,
+        inputs: volume::HELPER_INPUTS,
+        outputs: &[],
+        create: PlacementHelper::create,
     },
     // `LINK_ENTITY_TO_CLASS( player, CPortal_Player )`. **No shipped map
     // places one** — the player is created when a client connects, which here

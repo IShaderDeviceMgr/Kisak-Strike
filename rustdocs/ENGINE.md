@@ -758,6 +758,16 @@ impl EntityModels {
     pub fn attachments(&self) -> Arc<AttachmentModels>;
     pub fn draw(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn draw_refracting(&self, pass: &mut Pass<'_>, curtime: f32);
+    /// `m_nBody` for one instance — `( body / base ) % nummodels` per body
+    /// part — or `None` to draw every model of every part, which is what
+    /// every map entity still gets: **only the view model sets one.**
+    pub fn set_body(&mut self, id: u64, body: Option<i32>);
+    /// Re-sample one instance's lighting; for the view model, which moves every frame.
+    pub fn relight(&mut self, id: u64, lighting: ModelLighting);
+    /// How long an instance's model plays `label`, and whether it loops.
+    pub fn sequence_timing(&self, id: u64, label: &str) -> Option<(f32, bool)>;
+    /// Every visible instance, opaque then translucent, unculled — the view model's pass.
+    pub fn draw_all(&self, pass: &mut Pass<'_>, curtime: f32);
     pub fn refracts(&self) -> bool;
     pub fn summary(&self) -> String;
 }
@@ -2189,6 +2199,11 @@ impl CollisionBsp {
     pub fn point_contents(&self, point: Vec3) -> Contents;
     pub fn leaf(&self, point: Vec3) -> usize;
     pub fn surface_name(&self, surface: Option<u16>) -> &str;
+    /// Fill every surface's `CHAR_TEX_*` letter from its material's
+    /// `$surfaceprop` — `world::physics::game_material(vfs, props, material)`
+    /// is the resolver `World::load` passes. Until called, every surface's is 0.
+    pub fn resolve_game_materials(&mut self, game_material: impl FnMut(&str) -> u16);
+    pub fn surface_game_material(&self, surface: Option<u16>) -> u16;
     pub fn is_empty(&self) -> bool;
     pub fn summary(&self) -> String;
     /// How many displacements built collision geometry — stage 3.
@@ -2213,6 +2228,10 @@ impl Tracer<'_> {
     /// The world's subtree alone. What `trace` is when the chain is empty.
     pub fn trace_world(&mut self, ray: &Ray, mask: Contents) -> Trace;
     pub fn trace_model(&mut self, ray: &Ray, model: &BrushModel, mask: Contents) -> Trace;
+    /// `trace`, plus the index into the clip chain of the entity that stopped
+    /// it (`None` for the world). No hole may be set. The portal gun's trace,
+    /// which has to know *which* brush entity it hit.
+    pub fn trace_indexed(&mut self, ray: &Ray, mask: Contents) -> (Trace, Option<usize>);
     /// Stage 4: put brush entities in the clip chain. See below.
     pub fn with_entities(self, entities: &[BrushModel]) -> Tracer<'_>;
     /// Put the **physics props** in the clip chain — the thing that makes a
@@ -4674,7 +4693,20 @@ launcher holds the `Vfs` in an `Arc` for exactly this.
 
 It owns `map`/`changelevel`/`quit`/`restart`, the four `bind` commands, `key_listboundkeys`/
 `key_findbinding`, `toggleconsole`/`showconsole`/`hideconsole`, `noclip`, `impulse`,
-`trace`, `tonemap`, `portal`, and the 22 `+`/`-` button pairs from `client::BUTTONS`.
+`trace`, `tonemap`, `portal`, the portal gun's four — `give <classname>`,
+`give_portalgun`, `upgrade_portalgun`, `upgrade_potatogun` (`Server::give_named_item`
+and siblings; the last three are reconstructed, `rustdocs/SERVER.md` "The portal gun") —
+and the 22 `+`/`-` button pairs from `client::BUTTONS`. `r_drawviewmodel` and
+`crosshair` are this module's cvars too.
+
+**The gun's trace is the engine's.** `WorldTouchQuery` implements
+`TouchQuery::shot_trace`, `clip_to_model` and `surface_name` over three free functions
+in `engine/mod.rs` — `pub(crate) shot_trace(collision, models, chain, start, end,
+mask)`, `pub(crate) clip_to_model(..)` and `shot_hit`, which turns a `trace::Trace`
+into a `server::ShotHit`. `shot_trace` is the world plus the solid brush entities'
+clip chain through `Tracer::trace_indexed`, so the hit names the brush model it
+stopped on; the surface's `SURF_*` flags and game material come off the collision
+model. Studio models are not in it — the server sweeps those itself.
 
 <a id="the-portal-command"></a>
 
@@ -4721,8 +4753,26 @@ context.set_exposure(..)  BEFORE the scene, never after           UpdateMaterial
 world.draw(post.scene)    the opaque scene, offscreen             DrawWorld + DrawOpaqueRenderables
 update_refract_texture    the copy, then draw_refracting          UpdateRefractTexture
 world.draw_translucent    everything blended (portals included)     DrawTranslucentRenderables
+world.draw_view_model     the gun in hand, over a cleared depth     DrawViewModels
 post.resolve(frame, ..)   measure it, then put it on the screen   DoEnginePostProcessing
 ```
+
+**The view model** is the last scene pass, and the only one opened with
+`Load::ClearDepth` after the sky's: `DrawViewModels` (`viewrender.cpp:1526`) in
+Portal's own branch, *"the depth range hack doesn't work well enough for the portal
+mod … step up to a full depth clear"* — which is also the branch a `wgpu` pass can
+express, and means the gun is never inside a wall. It has its own projection:
+`cl_viewmodelfov` 50 (`VIEWMODEL_FOV`, Portal's, not the base game's 54) scaled by the
+width ratio as the main view's is, and a near plane of 1 (`VIEWMODEL_ZNEAR`,
+`view.cpp:685`). It draws only when `r_drawviewmodel` (cheat, 1) is set and
+`Server::view_model()` answers — that is, when the player owns a gun. `World` holds the
+model as its own one-instance `EntityModels`, loaded per level by
+`World::load_view_model(vfs, materials, device, model)` at body 0, and
+`World::draw_view_model(pass, curtime, &ViewModelPose)` poses it at the eye with the
+view's angles, plays a non-looping sequence once and then `idle` (the model says how
+long `fire1` is, so the engine decides, not the server), sets skin and body, and
+re-lights it from the light cache at the eye every frame. No sway (`CalcViewModelLag`)
+and no bob — Portal's gun has none.
 
 The middle three are separate render passes over one target, each `Load::Keep`, and each
 of the last two is skipped when it would be empty — `needs_frame_buffer_copy()` and
@@ -4776,8 +4826,16 @@ The cursor is given back *for* the console by `wants_mouse_capture`, which is
 `mouse_look` is what makes closing the console restore whatever the game had.
 
 `Engine::run_ui` is called by `window/` between `render` and the present, with the `egui`
-pass already open. It is one line — the dialog and the console it drives are two disjoint
-fields, which is the same split `host.frame(&mut self.scene)` makes.
+pass already open. It draws the dialog — the dialog and the console it drives are two
+disjoint fields, which is the same split `host.frame(&mut self.scene)` makes — and,
+under `crosshair` (archived, 1), the portal gun's reticle.
+
+**The reticle is a stand-in, not a port.** Portal 2's is `CHUDQuickInfo`
+(`hud_quickinfo.cpp`), which is not in this tree and needs a HUD this port has not got.
+`draw_crosshair` draws what it *says*: a ring on `egui`'s background layer, the left half
+blue (0, 60, 255) and the right orange (233, 78, 2) — `UTIL_Portal_Color`'s — dim when
+the gun has no chip for that colour, outlined when it can fire it, and bold while that
+portal is up. Only with a gun in hand.
 
 `-vmt` is owned here too: when set, `render` draws the material preview *instead of* the
 world, because it is an inspector for one material and anything else in the shot defeats
@@ -4788,7 +4846,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-384 tests under `engine::`, 21 of them depot-gated; 1,280 in the crate. (Treat both as a scale rather than a
+384 tests under `engine::`, plus 22 depot-gated; 1,304 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that
@@ -5449,3 +5507,14 @@ then see and walk through both. It is the portal gun minus the gun and minus eve
 placement rule, so nothing refuses a surface and nothing stops the two ending up in the
 same place. `r_portal_stencil_depth` sets how many levels of portal-in-portal are drawn:
 2 by default, 0 to switch the view through off entirely and leave a flat oval, 10 at most.
+
+**And there is a portal gun.** From `sp_a1_intro4` on, the map's own transition script
+gives it — `give_portalgun`, then `upgrade_portalgun` from `sp_a2_laser_intro` and
+`upgrade_potatogun` from `sp_a3_speed_ramp` — and `give_portalgun` in the console gives
+one anywhere. Left click places blue and right click orange, through every one of
+`portal_placement.cpp`'s rules: a portal is bumped onto the wall it nearly fits, refused
+on glass, sky and no-portal surfaces, stopped by an enabled fizzler, and snapped to a
+placement helper. The gun draws in the player's hands, `v_portalgun.mdl` in the colour of
+the last portal fired and with the potato when it has one, and a two-colour ring stands
+in for the reticle. `r_drawviewmodel 0` and `crosshair 0` hide them. `portal 1`/`2` are
+still there, and still skip every rule.

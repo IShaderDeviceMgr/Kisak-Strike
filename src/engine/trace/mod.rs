@@ -829,9 +829,29 @@ impl<'a> Tracer<'a> {
     /// stage 5's; for a brush model the whole of it is `ClipRayToBSP`, which
     /// is [`trace_model`](Tracer::trace_model).
     fn trace_chain(&mut self, ray: &Ray, mask: Contents) -> Trace {
+        self.trace_chain_indexed(ray, mask).0
+    }
+
+    /// [`trace`](Tracer::trace), and **which entry of the clip chain won** —
+    /// `trace_t::m_pEnt` for a brush entity, as an index into the slice
+    /// [`with_entities`](Tracer::with_entities) was given. `None` is the
+    /// world, or a prop, or nothing at all.
+    ///
+    /// The portal gun is the caller that needs it: placement refuses a
+    /// `func_door` and anything moving, and both are questions about the
+    /// *entity* a trace stopped on. The merge is [`trace`](Tracer::trace)'s own,
+    /// so the two can never give different answers about where the ray
+    /// stopped. Not for a tracer with a hole attached.
+    pub fn trace_indexed(&mut self, ray: &Ray, mask: Contents) -> (Trace, Option<usize>) {
+        debug_assert!(self.hole.is_none(), "a hole has no entity to name");
+        self.trace_chain_indexed(ray, mask)
+    }
+
+    fn trace_chain_indexed(&mut self, ray: &Ray, mask: Contents) -> (Trace, Option<usize>) {
+        let mut hit = None;
         let mut trace = self.trace_world(ray, mask);
         if trace.start_solid {
-            return trace;
+            return (trace, hit);
         }
 
         let world_fraction = trace.fraction;
@@ -855,7 +875,9 @@ impl<'a> Tracer<'a> {
         for i in 0..self.entities.len() {
             let model = self.entities[i];
             let clip = self.trace_model(&entity_ray, &model, mask);
-            clip_trace_to_trace(&clip, &mut trace);
+            if clip_trace_to_trace(&clip, &mut trace) {
+                hit = Some(i);
+            }
             if trace.all_solid {
                 break;
             }
@@ -867,10 +889,12 @@ impl<'a> Tracer<'a> {
         if let Some(props) = self.props.filter(|_| !trace.all_solid) {
             if mask.intersects(Contents::SOLID) {
                 let start = entity_ray.start;
-                let hit = props.sweep(entity_ray.extents, start, start + entity_ray.delta);
-                if let Some(hit) = hit {
-                    let clip = prop_trace(&entity_ray, &hit);
-                    clip_trace_to_trace(&clip, &mut trace);
+                let hit_prop = props.sweep(entity_ray.extents, start, start + entity_ray.delta);
+                if let Some(prop) = hit_prop {
+                    let clip = prop_trace(&entity_ray, &prop);
+                    if clip_trace_to_trace(&clip, &mut trace) {
+                        hit = None;
+                    }
                 }
             }
         }
@@ -883,7 +907,7 @@ impl<'a> Tracer<'a> {
             trace.start = ray.origin();
             trace.fraction_left_solid = 0.0;
         }
-        trace
+        (trace, hit)
     }
 
     /// `CM_BoxTrace` with Valve's `computeEndpt` false: fractions and flags,

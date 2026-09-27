@@ -222,3 +222,88 @@ impl Behaviour for PointChangelevel {
         true
     }
 }
+
+/// `point_servercommand` — `CPointServerCommand` (`server/client.cpp:653`):
+/// run a string as the **server's** console command.
+///
+/// ```text
+///   115 placed, on 67 single-player and 48 co-op maps
+/// ```
+///
+/// `engine->ServerCommand( "%s\n" )`, which is `Cbuf_AddText( CBUF_SERVER )`.
+/// The `CSTRIKE15` whitelist branch above it is a dedicated-server rule for
+/// CS:GO and does not apply to a listen server with a player.
+///
+/// **It is how the portal gun reaches the player**: `sp_a1_intro3` and
+/// `sp_a2_intro` fire `give weapon_portalgun` at their `cmd_give_weapon`, and
+/// the transition script fires `give_portalgun` and `upgrade_portalgun` at
+/// `@command` on every map after that — and 60 of the single-player maps have
+/// *two* entities named `@command`, one of each command class, so every one of
+/// those commands runs twice. Both commands are written to take that.
+pub struct PointServerCommand;
+
+/// `point_clientcommand` — `CPointClientCommand` (`server/client.cpp:614`):
+/// run a string as the **player's** console command.
+///
+/// ```text
+///   175 placed; 118 of its 136 connections set r_flashlightbrightness
+/// ```
+///
+/// `engine->ClientCommand( pClient, "%s\n" )` to `UTIL_GetLocalPlayer()` — the
+/// activator if it is a player, else the local one, else nobody. In a port
+/// with one process the "client's console" is the same console, reached as
+/// `SendToConsole` reaches it.
+pub struct PointClientCommand;
+
+pub static COMMAND_INPUTS: InputDefs = &[InputDef::new("Command", FieldType::String)];
+
+impl PointServerCommand {
+    pub fn create() -> Box<dyn Behaviour> {
+        Box::new(PointServerCommand)
+    }
+}
+
+impl PointClientCommand {
+    pub fn create() -> Box<dyn Behaviour> {
+        Box::new(PointClientCommand)
+    }
+}
+
+impl Behaviour for PointServerCommand {
+    fn accept_input(
+        &mut self,
+        _entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        if !input.name.eq_ignore_ascii_case("Command") {
+            return false;
+        }
+        // `if ( !inputdata.value.String()[0] ) return;`
+        let command = input.value.to_string();
+        if !command.is_empty() {
+            cx.server_command(&command);
+        }
+        true
+    }
+}
+
+impl Behaviour for PointClientCommand {
+    fn accept_input(
+        &mut self,
+        _entity: &mut EntityCore,
+        input: &Input<'_>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        if !input.name.eq_ignore_ascii_case("Command") {
+            return false;
+        }
+        let command = input.value.to_string();
+        // `if ( !pClient || !pClient->GetUnknown() ) return;` — no player, no
+        // client to send it to.
+        if !command.is_empty() && cx.player().is_some() {
+            cx.client_command(&command);
+        }
+        true
+    }
+}

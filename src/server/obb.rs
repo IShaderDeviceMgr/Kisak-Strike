@@ -376,6 +376,62 @@ fn ray_intersects_sphere(
     (start + t * delta - centre).length_squared() <= radius * radius
 }
 
+/// `IsOBBIntersectingOBB( … , flTolerance = 0 )` (`collisionutils.cpp:616`)
+/// — do two oriented boxes overlap?
+///
+/// `ComputeSeparatingPlane` (`:2452`) with its answer inverted: the fifteen
+/// separating axes of two boxes — each box's three faces, and the nine
+/// pairwise edge crossings — and the boxes overlap when none of them
+/// separates. **Separation is strict**, `originProjection >
+/// boxProjectionSum`, so two boxes that only touch overlap. An edge crossing
+/// whose two edges are within `1e-3` of parallel is skipped, as Valve skips
+/// it, because its cross product is too short to be an axis.
+///
+/// The portal gun's question: `IsPortalOverlappingOtherPortals` asks it of
+/// the portal being placed against every other portal on the same face.
+#[allow(clippy::too_many_arguments)]
+pub fn obb_intersects_obb(
+    origin1: Vec3,
+    angles1: Vec3,
+    mins1: Vec3,
+    maxs1: Vec3,
+    origin2: Vec3,
+    angles2: Vec3,
+    mins2: Vec3,
+    maxs2: Vec3,
+) -> bool {
+    let r1 = angle_matrix(angles1);
+    let r2 = angle_matrix(angles2);
+    let c1 = origin1 + r1 * ((mins1 + maxs1) * 0.5);
+    let c2 = origin2 + r2 * ((mins2 + maxs2) * 0.5);
+    let e1 = (maxs1 - mins1) * 0.5;
+    let e2 = (maxs2 - mins2) * 0.5;
+    let a = [r1.x_axis, r1.y_axis, r1.z_axis];
+    let b = [r2.x_axis, r2.y_axis, r2.z_axis];
+    let t = c2 - c1;
+
+    let separates = |axis: Vec3| {
+        let r_a = e1.x * a[0].dot(axis).abs() + e1.y * a[1].dot(axis).abs() + e1.z * a[2].dot(axis).abs();
+        let r_b = e2.x * b[0].dot(axis).abs() + e2.y * b[1].dot(axis).abs() + e2.z * b[2].dot(axis).abs();
+        t.dot(axis).abs() > r_a + r_b
+    };
+
+    if a.iter().chain(b.iter()).any(|&axis| separates(axis)) {
+        return false;
+    }
+    for &ai in &a {
+        for &bj in &b {
+            if ai.dot(bj).abs() >= 1.0 - 1e-3 {
+                continue;
+            }
+            if separates(ai.cross(bj)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

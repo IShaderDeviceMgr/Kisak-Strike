@@ -256,6 +256,10 @@ pub struct StudioModel {
     /// it is kept because a model with no batches still has an answer and
     /// because the census wants it without walking the batches.
     pub skin_families: usize,
+    /// Every body part's `(base, nummodels)`, in file order — what picks the
+    /// one model of each part `m_nBody` draws. See
+    /// [`body_part_model`](StudioModel::body_part_model).
+    pub body_parts: Vec<(i32, usize)>,
     /// The studio meshes of LOD 0, in file order — what a [`Vhv`]'s meshes are
     /// matched against.
     pub meshes: Vec<HardwareMesh>,
@@ -323,6 +327,21 @@ pub struct HardwareMesh {
 }
 
 impl StudioModel {
+    /// Which model of body part `part` draws at `m_nBody = body` —
+    /// `R_StudioSetupModel`'s `( body / base ) % nummodels`.
+    ///
+    /// `None` for a part the model has not got. A negative body or a zero
+    /// base — neither of which a shipped model has — reads as model 0 rather
+    /// than indexing outside the part.
+    pub fn body_part_model(body_parts: &[(i32, usize)], part: usize, body: i32) -> Option<usize> {
+        let &(base, count) = body_parts.get(part)?;
+        if count == 0 {
+            return None;
+        }
+        let index = body.max(0) / base.max(1);
+        Some(index as usize % count)
+    }
+
     /// Reads `<name>.mdl` and its two companions.
     ///
     /// `name` may carry the `.mdl` extension or not; both

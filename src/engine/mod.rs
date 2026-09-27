@@ -95,6 +95,12 @@ pub struct Engine<'a> {
     /// `r_3dsky` — draw the map's second room, at 1/16 scale, behind
     /// everything. `viewrender.cpp:114`.
     r_3dsky: Cvar,
+    /// `r_drawviewmodel` — draw the gun in the player's hands.
+    /// `viewrender.cpp:116`, a cheat there.
+    r_drawviewmodel: Cvar,
+    /// `crosshair` — `hud_crosshair.cpp:31`, archived. Gates the stand-in
+    /// reticle [`draw_crosshair`] paints.
+    crosshair: Cvar,
     /// `r_skybox` — draw the six sky quads. `viewrender.cpp:115`.
     ///
     /// **`r_drawskybox` is not ported.** `gl_warp.cpp:27` declares a second
@@ -276,6 +282,13 @@ impl<'a> Engine<'a> {
             CvarFlags::NONE,
             "Enable the rendering of 3d sky boxes.",
         );
+        let r_drawviewmodel = console.cvar(
+            "r_drawviewmodel",
+            "1",
+            CvarFlags::CHEAT,
+            "Draw the view model.",
+        );
+        let crosshair = console.cvar("crosshair", "1", CvarFlags::ARCHIVE, "Draw the crosshair.");
         let r_skybox = console.cvar(
             "r_skybox",
             "1",
@@ -336,6 +349,18 @@ impl<'a> Engine<'a> {
                 "fadein {time r g b}: Fades the screen in from black or from the specified color over the given number of seconds.",
             ),
             CommandSpec::new("impulse", "Issue an impulse command."),
+            // `game/server/client.cpp:950`, and the portal gun's three from
+            // `weapon_portalgun.cpp`, which this tree does not ship — see
+            // `src/server/portalgun.rs` for what they are reconstructed from.
+            // All `FCVAR_CHEAT` there (`give` is allowed in single player),
+            // and the maps fire them through `point_servercommand`.
+            CommandSpec::new("give", "Give item to player.\n\tArguments: <item_name>"),
+            CommandSpec::new("give_portalgun", "Give the player a portalgun."),
+            CommandSpec::new("upgrade_portalgun", "Equip the player with a dual portalgun."),
+            CommandSpec::new(
+                "upgrade_potatogun",
+                "Equip the player with a dual portalgun, with the potato.",
+            ),
             // **This port's, not Valve's.** The C++ has no `trace` command:
             // its equivalents are `debugrayenable` and the trace counter,
             // which exist to work around a DLL boundary this build does not
@@ -434,6 +459,8 @@ impl<'a> Engine<'a> {
             r_lockpvs,
             r_portal_stencil_depth,
             r_3dsky,
+            r_drawviewmodel,
+            crosshair,
             r_skybox,
             locked_eye: None,
             scene: Scene {
@@ -634,8 +661,13 @@ impl<'a> Engine<'a> {
         let Engine {
             console,
             console_ui,
+            scene,
+            crosshair,
             ..
         } = self;
+        if crosshair.bool() {
+            draw_crosshair(ctx, &scene.server);
+        }
         console_ui.draw(ctx, console);
     }
 
@@ -995,6 +1027,7 @@ impl<'a> Engine<'a> {
         let curtime = self.scene.curtime;
         let draw_3d_sky = self.r_3dsky.bool();
         let draw_sky_box = self.r_skybox.bool();
+        let draw_view_model = self.r_drawviewmodel.bool();
         // Read here because `frame` is borrowed by the pass that wants it and
         // `self` by the scene that owns the world.
         let portal_depth = self
@@ -1222,6 +1255,54 @@ impl<'a> Engine<'a> {
             // The top-level scene is recursion level 0, so every level
             // `r_portal_stencil_depth` allows is still ahead of it.
             world.draw_translucent(&mut pass, curtime, &translucent, &visible, portal_depth);
+        }
+
+        // `DrawViewModels` (`viewrender.cpp:1526`): the gun in the player's
+        // hands, last, in its own projection — `cl_viewmodelfov` scaled by the
+        // width ratio like the main view's, and a near plane of 1
+        // (`view.cpp:685`). **Over a cleared depth buffer**, which is
+        // Portal's own branch of that function (*"the depth range hack
+        // doesn't work well enough for the portal mod ... step up to a full
+        // depth clear"*) and the one that needs nothing a `wgpu` pass cannot
+        // give: the gun can never be inside a wall, because nothing is in
+        // front of it.
+        if draw_view_model {
+            if let Some(state) = server.view_model() {
+                let fov = crate::client::view::scale_fov_by_width_ratio(
+                    VIEWMODEL_FOV,
+                    view.aspect / crate::client::view::FOV_ASPECT,
+                );
+                let (forward, _, up) = view.angles.vectors();
+                let view_model_camera = Camera::perspective(
+                    view.origin,
+                    glam::camera::rh::view::look_at_mat4(view.origin, view.origin + forward, up),
+                    fov,
+                    view.aspect,
+                    VIEWMODEL_ZNEAR,
+                    view.z_far,
+                );
+                let scene = post.scene(frame.size());
+                let mut pass = context.target_pass(
+                    frame,
+                    materials.pipelines(),
+                    scene,
+                    &view_model_camera,
+                    Load::ClearDepth,
+                );
+                world.draw_view_model(
+                    &mut pass,
+                    curtime,
+                    &world::ViewModelPose {
+                        eye: view.origin,
+                        angles: glam::Vec3::new(view.angles.pitch, view.angles.yaw, view.angles.roll),
+                        sequence: state.sequence,
+                        started_at: state.started_at,
+                        idle: crate::server::portalgun::IDLE_SEQUENCE,
+                        skin: state.skin,
+                        body: state.body,
+                    },
+                );
+            }
         }
 
         // `GetFadeParams` then `SetViewFadeParams` (`viewrender.cpp:3292`):
@@ -1666,6 +1747,111 @@ impl server::TouchQuery for WorldTouchQuery<'_> {
             pushers,
         )
     }
+
+    fn shot_trace(&mut self, start: glam::Vec3, end: glam::Vec3, mask: u32) -> server::ShotHit {
+        shot_trace(
+            &self.world.collision,
+            &self.world.brush_models,
+            &mut self.chain,
+            start,
+            end,
+            mask,
+        )
+    }
+
+    fn clip_to_model(
+        &mut self,
+        model: usize,
+        origin: glam::Vec3,
+        angles: glam::Vec3,
+        start: glam::Vec3,
+        end: glam::Vec3,
+        mask: u32,
+    ) -> server::ShotHit {
+        clip_to_model(&self.world.collision, model, origin, angles, start, end, mask)
+    }
+
+    fn surface_name(&self, surface: u16) -> String {
+        self.world.collision.surface_name(Some(surface)).to_owned()
+    }
+}
+
+/// [`TouchQuery::shot_trace`](crate::server::TouchQuery::shot_trace)'s body —
+/// the portal gun's line against the world and the solid brush entities.
+///
+/// Free and taking its parts for [`push_trace`]'s reason: the depot tests
+/// have no GPU and no `World`, and the placement they exercise has to go
+/// through this and not a copy of it.
+///
+/// **The brush entities are the ones the game says are solid** — `owned`
+/// and `solid`, the same chain [`solid_trace`] builds — so a
+/// `func_portal_bumper` or a fizzler, both `FSOLID_NOT_SOLID`, is not a wall
+/// here, exactly as the shot filter's `StandardFilterRules` would pass
+/// through it. Which model won is read back out of the chain by position.
+pub(crate) fn shot_trace(
+    collision: &crate::engine::trace::CollisionBsp,
+    models: &[world::PlacedBrushModel],
+    chain: &mut Vec<crate::engine::trace::BrushModel>,
+    start: glam::Vec3,
+    end: glam::Vec3,
+    mask: u32,
+) -> server::ShotHit {
+    use crate::engine::trace::{Contents, Ray};
+
+    let solid = |model: &&world::PlacedBrushModel| model.owned && model.solid;
+    chain.clear();
+    chain.extend(models.iter().filter(solid).map(|model| model.model));
+    let (trace, hit) = collision
+        .tracer()
+        .with_entities(chain)
+        .trace_indexed(&Ray::line(start, end), Contents(mask));
+    let model = hit.and_then(|at| models.iter().filter(solid).nth(at).map(|m| m.index));
+    shot_hit(collision, &trace, model)
+}
+
+/// [`TouchQuery::clip_to_model`](crate::server::TouchQuery::clip_to_model)'s
+/// body — `ClipRayToEntity` for one brush model, whatever its solidity.
+pub(crate) fn clip_to_model(
+    collision: &crate::engine::trace::CollisionBsp,
+    model: usize,
+    origin: glam::Vec3,
+    angles: glam::Vec3,
+    start: glam::Vec3,
+    end: glam::Vec3,
+    mask: u32,
+) -> server::ShotHit {
+    use crate::engine::trace::{Contents, Ray};
+
+    let Some(placed) = collision.brush_model(model, origin, angles) else {
+        return server::ShotHit::miss(start, end);
+    };
+    let trace = collision
+        .tracer()
+        .trace_model(&Ray::line(start, end), &placed, Contents(mask));
+    let hit = trace.fraction < 1.0 || trace.start_solid;
+    shot_hit(collision, &trace, hit.then_some(model))
+}
+
+/// A `trace/` answer in the server's vocabulary.
+fn shot_hit(
+    collision: &crate::engine::trace::CollisionBsp,
+    trace: &crate::engine::trace::Trace,
+    model: Option<usize>,
+) -> server::ShotHit {
+    server::ShotHit {
+        start: trace.start,
+        end: trace.end,
+        fraction: trace.fraction,
+        fraction_left_solid: trace.fraction_left_solid,
+        normal: trace.normal,
+        plane_dist: trace.plane_dist,
+        start_solid: trace.start_solid,
+        all_solid: trace.all_solid,
+        surface: trace.surface,
+        surface_flags: trace.surface_flags,
+        game_material: collision.surface_game_material(trace.surface),
+        model,
+    }
 }
 
 /// [`TouchQuery::push_trace`](crate::server::TouchQuery::push_trace)'s body —
@@ -1903,6 +2089,15 @@ impl Level for Scene<'_> {
         // the one place the two halves of a level are both in hand.
         let placements = model_entities(&self.server);
         world.load_entity_models(vfs, &mut self.materials, &self.device, &placements);
+        // The gun in the player's hands. Read for every map, whether or not
+        // the player has one yet: the transition script gives it a moment
+        // after the level starts, and the model is one file.
+        world.load_view_model(
+            vfs,
+            &mut self.materials,
+            &self.device,
+            crate::server::classes::weapon::VIEW_MODEL,
+        );
         if !placements.is_empty() {
             eprintln!("source-engine: world: {}", world.entity_models.summary());
         }
@@ -2156,6 +2351,63 @@ fn tonemap_command(client: &Client, cx: &mut ExecContext<'_>) {
         ));
     }
 }
+
+/// The portal gun's reticle — **a stand-in, not a port**.
+///
+/// Portal 2's is `CHUDQuickInfo` (`portal/hud_quickinfo.cpp`, named by
+/// `client_portal_base.vpc` and not in this tree), a HUD element this port
+/// has no HUD to put in. What is drawn here is what that reticle *says*:
+/// a ring at the centre of the screen whose left half is the blue portal and
+/// whose right half is the orange — dim when the gun cannot fire that colour,
+/// outlined when it can, and filled while that portal is up. The colours are
+/// `UTIL_Portal_Color`'s (`portal_util_shared.cpp:274`).
+///
+/// Only with a gun in hand, on `egui`'s background layer so the console draws
+/// over it.
+fn draw_crosshair(ctx: &egui::Context, server: &Server) {
+    let Some(gun) = server.portalgun() else {
+        return;
+    };
+    if server.view_model().is_none() {
+        return;
+    }
+    let portals = server.portals();
+    let up = |portal2: bool| portals.iter().any(|p| p.is_portal2 == portal2);
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let centre = ctx.content_rect().center();
+    const RADIUS: f32 = 9.0;
+    for (portal2, can_fire, colour) in [
+        (false, gun.can_fire_portal1, egui::Color32::from_rgb(0, 60, 255)),
+        (true, gun.can_fire_portal2, egui::Color32::from_rgb(233, 78, 2)),
+    ] {
+        // The left half runs from the top round to the bottom through the
+        // left; the right half the other way.
+        let points: Vec<egui::Pos2> = (0..=16)
+            .map(|i| {
+                let t = std::f32::consts::PI * (0.5 + i as f32 / 16.0);
+                let t = if portal2 { t + std::f32::consts::PI } else { t };
+                centre + egui::vec2(t.cos(), -t.sin()) * RADIUS
+            })
+            .collect();
+        let (alpha, width) = match (can_fire, up(portal2)) {
+            (false, _) => (60, 1.5),
+            (true, false) => (200, 1.5),
+            (true, true) => (255, 3.0),
+        };
+        let colour = egui::Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), alpha);
+        painter.add(egui::Shape::line(points, egui::Stroke::new(width, colour)));
+    }
+    painter.circle_filled(centre, 1.5, egui::Color32::from_white_alpha(200));
+}
+
+/// `cl_viewmodelfov` (`clientmode_portal.cpp:37`) — Portal 2's view model
+/// FOV, which `ClientModePortalNormal::GetViewModelFOV` returns in place of
+/// the base game's `viewmodel_fov` 54. A 4:3 horizontal FOV, like the main
+/// view's `default_fov`.
+const VIEWMODEL_FOV: f32 = 50.0;
+
+/// `view.zNearViewmodel = 1` (`view.cpp:685`).
+const VIEWMODEL_ZNEAR: f32 = 1.0;
 
 /// `MAX_TRACE_LENGTH` (`public/worldsize.h:32`) — `sqrt(3) * COORD_EXTENT`,
 /// the diagonal of the largest legal map, and so the longest a trace can
@@ -2749,6 +3001,25 @@ impl CommandTarget for EngineCommands<'_> {
                     false => FFADE_IN | FFADE_PURGE,
                 };
                 self.server.screen_fade(ScreenFade::new(color, time, 0.0, flags));
+            }
+            "give" => match cmd.arg(1) {
+                Some(item) => {
+                    if let Err(message) = self.server.give_named_item(item.trim()) {
+                        cx.print(&format!("give: {message}"));
+                    }
+                }
+                None => cx.print("Usage: give <item_name>"),
+            },
+            "give_portalgun" | "upgrade_portalgun" | "upgrade_potatogun" => {
+                let name = cmd.name().to_ascii_lowercase();
+                let result = match name.as_str() {
+                    "give_portalgun" => self.server.give_portalgun(),
+                    "upgrade_portalgun" => self.server.upgrade_portalgun(),
+                    _ => self.server.upgrade_potatogun(),
+                };
+                if let Err(message) = result {
+                    cx.print(&format!("{name}: {message}"));
+                }
             }
             "noclip" => match self.server.toggle_noclip() {
                 Some(true) => cx.print("noclip ON"),

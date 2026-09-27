@@ -118,6 +118,27 @@ impl PhysicsStats {
     }
 }
 
+/// The `CHAR_TEX_*` game material of a world material — its `$surfaceprop`,
+/// looked up in the surface property database.
+///
+/// `CollisionBSPData_LoadTexinfo`'s resolution (`engine/cmodel_bsp.cpp:355`):
+/// a material with no `$surfaceprop`, one naming a surface the database has
+/// not got, and one that does not load at all (the error material has none)
+/// all come out as `"default"`, which is `GetSurfaceData`'s answer for an
+/// invalid index. Material names are the texdata's, which are upper case in
+/// most shipped maps, so they are lowercased first — `FindMaterial`'s own
+/// normalisation.
+pub fn game_material(vfs: &Vfs, props: &SurfaceProps, material: &str) -> u16 {
+    let name = material.replace('\\', "/").to_ascii_lowercase();
+    let vmt = crate::materials::vmt::Vmt::load(vfs, &name).ok();
+    let surface = vmt
+        .as_ref()
+        .and_then(|vmt| vmt.var("$surfaceprop"))
+        .and_then(|var| var.as_str())
+        .unwrap_or("default");
+    props.resolve(surface).game_material
+}
+
 /// Reads the surface property database the way `physics_shared.cpp` does:
 /// through the manifest, in the order it lists.
 ///

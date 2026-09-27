@@ -2954,10 +2954,12 @@ fn a_brush_entity_is_found_by_its_model_index() {
         ]),
         // A classname the port has no implementation for: no placement, so
         // whoever asks leaves it where the lump put it — and, since stage 4,
-        // leaves it out of the player's clip chain too. `func_portal_bumper`
-        // is the ninth commonest classname in the game and is exactly the
-        // reason that rule exists: 2,383 of them, none solid to a player.
-        block(&[("classname", "func_portal_bumper"), ("model", "*2")]),
+        // leaves it out of the player's clip chain too. That rule was written
+        // for `func_portal_bumper` — 2,383 of them, none solid to a player —
+        // which the portal gun has since given a class; `func_clip_vphysics`
+        // is the case now, and the one the rule matters most for: it is solid
+        // to physics props and *not* to the player.
+        block(&[("classname", "func_clip_vphysics"), ("model", "*2")]),
     ];
     let mut server = Server::new();
     server.level_init("test", &map, &door_models());
@@ -2965,7 +2967,7 @@ fn a_brush_entity_is_found_by_its_model_index() {
     assert_eq!(server.brush_entity_count(), 1);
     assert!(
         server.brush_entity(2).is_none(),
-        "func_portal_bumper has no class"
+        "func_clip_vphysics has no class"
     );
     assert!(server.brush_entity(0).is_none(), "model 0 is the world");
     close(
@@ -3170,7 +3172,9 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     // CPU/GPU-level keys the port now consumes — and unlike those four it is
     // read by nothing in the whole tree, on either side of the DLL boundary.
     ("disablex360", 123),
-    ("filtername", 1),
+    // One on a `trigger_multiple`, and three on fizzlers: the cleanser's
+    // trigger half (touch, filters) is not here — `classes::volume`.
+    ("filtername", 4),
     ("inputfilter", 2497),
     ("mapversion", 106),
     // The DirectX-level fade pair. In no Portal 2 `.fgd` and read nowhere in
@@ -3193,11 +3197,19 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     ("onproxyrelay", 135),
     ("onstarttouchblueplayer", 1),
     ("onstarttouchorangeplayer", 1),
-    ("ontrigger", 15),
+    // +2 for two `func_portal_bumper`s that carry an `OnTrigger`, which the
+    // class does not declare.
+    ("ontrigger", 17),
     ("onunpressed", 2),
     ("paintinmap", 25),
     ("scalevalue", 599),
-    ("skin", 1),
+    // +2 for the two co-op guns on `mp_coop_start`, which are drawn by nobody:
+    // a carried gun's world model is `EF_NODRAW` here.
+    ("skin", 3),
+    // `mp_coop_start`'s orange gun, and the two co-op guns' teams — co-op
+    // state the single-player gun has no use for.
+    ("startdisabled", 1),
+    ("startingteamnum", 2),
     ("sunspreadangle", 27),
     ("vrad_brush_cast_shadows", 2456),
     // `vscripts` (114) and `thinkfunction` (2) left this list with VScript:
@@ -3497,6 +3509,9 @@ fn every_shipped_map_spawns_its_entities() {
         for (key, count) in &server.io.unhandled {
             *io.unhandled.entry(key.clone()).or_default() += count;
         }
+        for (key, count) in &server.io.accepted_by {
+            *io.accepted_by.entry(key.clone()).or_default() += count;
+        }
     }
 
     println!("\n{} maps: {}", names.len(), total.summary());
@@ -3542,6 +3557,22 @@ fn every_shipped_map_spawns_its_entities() {
         "    {carried} of the movers' children were carried rather than driven, \
          the furthest by {carried_furthest:.1} units"
     );
+    println!("  inputs accepted, for the classes the portal gun brought:");
+    for (input, count) in io.accepted_by.iter().filter(|(k, _)| {
+        [
+            "point_servercommand.",
+            "point_clientcommand.",
+            "trigger_portal_cleanser.",
+            "func_noportal_volume.",
+            "func_portal_bumper.",
+            "info_placement_helper.",
+            "weapon_portalgun.",
+        ]
+        .iter()
+        .any(|prefix| k.starts_with(prefix))
+    }) {
+        println!("    {count:>7}  {input}");
+    }
     println!("  inputs nothing handled:");
     let mut unhandled_inputs: Vec<_> = io.unhandled.iter().collect();
     unhandled_inputs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -3606,8 +3637,13 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **+327 for `env_fade`**, on 105 maps. All spawn. **No shipped map
     // connects `OnBeginFade`**, so `outputs` does not move.
-    assert_eq!(total.matched, 37_890);
-    assert_eq!(total.spawned, 31_018);
+    //
+    // **+3,897 for the portal gun's seven**: 2,383 `func_portal_bumper`, 458
+    // `func_noportal_volume`, 392 `info_placement_helper`, 371
+    // `trigger_portal_cleanser`, 175 `point_clientcommand`, 115
+    // `point_servercommand` and 3 `weapon_portalgun`. All spawn.
+    assert_eq!(total.matched, 41_787);
+    assert_eq!(total.spawned, 34_915);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3630,7 +3666,12 @@ fn every_shipped_map_spawns_its_entities() {
     // **No shipped map connects `OnStart` or `OnNextPoint`.**
     // **+263 for the pedestal buttons**: `OnPressed` (154 + 66),
     // `OnButtonReset` (35 + 6), and one each of the co-op team outputs.
-    assert_eq!(total.outputs, 55_987);
+    // **+251 for the portal gun's classes**: on the fizzlers, 180 `OnUser1`
+    // and `OnUser2`, 22 `OnDissolve`, 8 `OnStartTouch` and 6 `OnTrigger`; 34
+    // `OnPlayerPickup` on the two co-op guns; and one `OnUser1` on a
+    // `point_servercommand`. Two bumpers carry an `OnTrigger` their class does
+    // not have — it is on the unconsumed list below.
+    assert_eq!(total.outputs, 56_238);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
     // **-2 and -409 again** for the two areaportal classnames, both of which
@@ -3643,8 +3684,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-1 and -384** for `logic_script`.
     // **-1 and -62** for `point_changelevel`.
     // **-1 and -327** for `env_fade`.
-    assert_eq!(total.unknown.len(), 148);
-    assert_eq!(total.unknown.values().sum::<usize>(), 23_035);
+    // **-7 and -3,897** for the portal gun's seven.
+    assert_eq!(total.unknown.len(), 141);
+    assert_eq!(total.unknown.values().sum::<usize>(), 19_138);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3739,6 +3781,15 @@ fn every_shipped_map_spawns_its_entities() {
     // One per map on 62 maps, all `@changelevel`; no map connects an output
     // to one, and only `TransitionFromMap()` fires at one.
     assert_eq!(per_class.get("point_changelevel"), Some(&62));
+    // The portal gun's seven. Nothing deletes a gun inside two seconds — no
+    // player walks into one here.
+    assert_eq!(per_class.get("weapon_portalgun"), Some(&3));
+    assert_eq!(per_class.get("point_servercommand"), Some(&115));
+    assert_eq!(per_class.get("point_clientcommand"), Some(&175));
+    assert_eq!(per_class.get("func_portal_bumper"), Some(&2_383));
+    assert_eq!(per_class.get("func_noportal_volume"), Some(&458));
+    assert_eq!(per_class.get("trigger_portal_cleanser"), Some(&371));
+    assert_eq!(per_class.get("info_placement_helper"), Some(&392));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -3861,7 +3912,11 @@ fn every_shipped_map_spawns_its_entities() {
     // script id, which is Valve's, and that moves which way a map's
     // `logic_case` pickers go. Take the draw out and all three return to
     // exactly the old numbers plus the 498.
-    assert_eq!(io.dispatched, 7_005);
+    //
+    // **+4 with `trigger_portal_cleanser`**: on `sp_a2_column_blocker` and
+    // `sp_a2_pit_flings` the exit elevator's fizzler is sent `FireUser1` at
+    // spawn, and its `OnUser1` disables the two emitter props beside it.
+    assert_eq!(io.dispatched, 7_009);
     // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
     // `SetActivatedState` a map used to aim at a classname nothing answered
     // for now lands. Only two of the game's 31 are fired inside two seconds.
@@ -3902,7 +3957,14 @@ fn every_shipped_map_spawns_its_entities() {
     //
     // **+5 with `env_fade`**: the fades a map fires in its first two seconds
     // — arrival fade-ins, mostly.
-    assert_eq!(io.accepted, 6_277);
+    //
+    // **+141 with the portal gun's classes**, printed above by input:
+    // 113 `point_clientcommand.Command` (the `r_flashlightbrightness`
+    // settings, mostly), one `point_servercommand.Command`, 14
+    // `SetParentAttachmentMaintainOffset` and 7 `Disable` at fizzlers, 2
+    // `FireUser1` at fizzlers — and the 4 prop `Disable`s the fizzlers'
+    // `OnUser1` then sends, which are the `dispatched` +4.
+    assert_eq!(io.accepted, 6_418);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3943,7 +4005,13 @@ fn every_shipped_map_spawns_its_entities() {
     // `logic_script`, and 3 from the random stream.
     //
     // **-5 with `env_fade`**: the five accepted above.
-    assert_eq!(io.no_target, 1_027);
+    //
+    // **-117 with the portal gun's classes**, which is 20 fewer than the 137
+    // inputs they accept, and the difference is measured: all 14
+    // `SetParentAttachmentMaintainOffset`s and six of the `Disable`s name a
+    // fizzler that shares its name with a `trigger_hurt` — a laser-death
+    // fizzler is the two — so those events always had a target.
+    assert_eq!(io.no_target, 910);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -4024,9 +4092,15 @@ fn every_shipped_map_spawns_its_entities() {
     // units** — `sp_a3_00`'s shaft depth signs, drawn far from the shaft they
     // run down. 70 brush entities are still travelling at two seconds, 36
     // more than before.
-    assert_eq!(brush_entities, 6_535);
-    assert_eq!(moved, 326, "brush entities that left their spawn placement");
-    assert_eq!(carried, 133, "…of which this many were carried by a parent");
+    //
+    // **The portal gun's three brush classes are 3,212 more** — 2,383
+    // bumpers, 458 no-portal volumes and 371 fizzlers — and move nothing of
+    // their own. **One is carried**: a `func_noportal_volume` on
+    // `sp_a2_laser_over_goo` is parented to the train `ele1_train`, which
+    // `Find` snaps four units onto its first node.
+    assert_eq!(brush_entities, 9_747);
+    assert_eq!(moved, 327, "brush entities that left their spawn placement");
+    assert_eq!(carried, 134, "…of which this many were carried by a parent");
     assert!(
         carried_furthest > 7_837.0 && carried_furthest < 7_838.0,
         "the longest carried ride moved: {carried_furthest}"
@@ -4051,7 +4125,12 @@ fn every_shipped_map_spawns_its_entities() {
     // rather than one made at spawn. They are live whether or not the portal
     // is `Activated` — `CPortal_Base2D::Spawn` sets `FSOLID_TRIGGER`
     // unconditionally — which is what stage 4's teleport will hang off.
-    assert_eq!(triggers, 2_341);
+    //
+    // **The portal gun takes it to 2,657**: the 313 fizzlers that start
+    // enabled (a disabled one is not a trigger, `InitTrigger`'s rule), and
+    // the 3 placed `weapon_portalgun`s — a gun on a floor is a `SOLID_BBOX`
+    // trigger the player picks up by walking into.
+    assert_eq!(triggers, 2_657);
 
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
@@ -5052,6 +5131,26 @@ impl TouchQuery for Placed<'_> {
             out,
         );
     }
+
+    fn shot_trace(&mut self, start: Vec3, end: Vec3, mask: u32) -> crate::server::ShotHit {
+        crate::engine::shot_trace(self.collision, self.models, &mut self.chain, start, end, mask)
+    }
+
+    fn clip_to_model(
+        &mut self,
+        model: usize,
+        origin: Vec3,
+        angles: Vec3,
+        start: Vec3,
+        end: Vec3,
+        mask: u32,
+    ) -> crate::server::ShotHit {
+        crate::engine::clip_to_model(self.collision, model, origin, angles, start, end, mask)
+    }
+
+    fn surface_name(&self, surface: u16) -> String {
+        self.collision.surface_name(Some(surface)).to_owned()
+    }
 }
 
 /// **Every trigger in the shipped game, touched by a real player hull swept
@@ -5104,7 +5203,7 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // reason a brush trigger's probe can dispatch something a brush trigger
     // did not cause.
     let mut also_on_a_button = 0usize;
-    let mut by_class: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+    let mut by_class: BTreeMap<&'static str, (usize, usize, usize)> = BTreeMap::new();
 
     for name in &names {
         let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
@@ -5237,6 +5336,9 @@ fn every_shipped_maps_triggers_notice_the_player() {
             }
             if server.io.dispatched > before + posted_at_spawn {
                 fired += 1;
+                if let Some(entry) = by_class.get_mut(classname) {
+                    entry.2 += 1;
+                }
             }
         }
     }
@@ -5249,8 +5351,8 @@ fn every_shipped_maps_triggers_notice_the_player() {
          {withdrawn} were switched off or deleted by the map before the second tick;\n  \
          {also_on_a_button} of the probe points are also on a prop_floor_button"
     );
-    for (classname, (visited, noticed)) in &by_class {
-        println!("    {noticed:>5} of {visited:>5}  {classname}");
+    for (classname, (visited, noticed, fired)) in &by_class {
+        println!("    {noticed:>5} of {visited:>5} noticed, {fired:>5} fired  {classname}");
     }
 
     assert_eq!(names.len(), 106);
@@ -5271,8 +5373,12 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // of 192 and 3 `trigger_teleport` of 110. **107 of the game's 110
     // teleports start switched off**, which is what makes an elevator an
     // elevator rather than a trap.
-    assert_eq!(visited, 2_255);
-    assert_eq!(noticed, 2_246);
+    //
+    // **`trigger_portal_cleanser` took it to 2,568**: the 313 fizzlers that
+    // start enabled. The other 58 are `StartDisabled`, and a disabled trigger
+    // is not a trigger — `InitTrigger` leaves `FSOLID_TRIGGER` off it.
+    assert_eq!(visited, 2_568);
+    assert_eq!(noticed, 2_517);
     // 1,889 of them get as far as dispatching something, which is the whole
     // chain — geometry, `FSOLID_TRIGGER`, the touch link, `PassesTriggerFilters`
     // and an output with a connection on it. The 357 that do not are triggers
@@ -5295,10 +5401,19 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // **`func_tracktrain` and `path_track` took it to 2,117** — 228 triggers
     // whose connections go to a train (`StartForward`, `MoveToPathNode`) or
     // to a node, and used to reach nothing.
-    assert_eq!(fired, 2_117);
+    //
+    // **And the fizzlers took it to 2,247, without firing anything
+    // themselves.** A fizzler has no touch behaviour here (see
+    // `classes::volume`), so all 130 are probe points inside a fizzler that
+    // are also inside another trigger — the fizzler across a chamber's
+    // doorway and the doorway's own `trigger_once`. The per-class column
+    // printed above shows the other five classes fire exactly the 2,117 they
+    // did before.
+    assert_eq!(fired, 2_247);
     assert_eq!(also_on_a_button, 21, "probes that also stand on a pad");
-    // Three triggers in the game have no point a 32x32x72 hull fits inside.
-    assert_eq!(unreachable, 3);
+    // Three triggers in the game have no point a 32x32x72 hull fits inside —
+    // and 42 fizzlers, which are sheets rather than volumes.
+    assert_eq!(unreachable, 45);
     // …and six are switched off, deleted, or take the player with them within
     // two ticks of the map starting.
     assert_eq!(withdrawn, 6);
@@ -7117,9 +7232,13 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     assert_eq!(unreadable, 15);
     assert_eq!(models_missing, 41);
 
-    // 1,000 props carry `StartDisabled 1`; the other 127 were switched off by
-    // their map's own first two seconds.
-    assert_eq!(invisible, 1_127);
+    // 1,000 props carry `StartDisabled 1`; the other 131 were switched off by
+    // their map's own first two seconds. It was 127 until
+    // `trigger_portal_cleanser` had a class: on `sp_a2_column_blocker` and
+    // `sp_a2_pit_flings` a `logic_auto` sends `FireUser1` to the exit
+    // elevator's fizzler at spawn, and its `OnUser1` disables the fizzler
+    // *and* the two emitter props beside it.
+    assert_eq!(invisible, 1_131);
 
     // The `solid` key, which only the prop family writes. 2,830 are
     // `SOLID_NONE` promoted to `SOLID_OBB` (or left alone, for an `_override`)
@@ -9944,6 +10063,10 @@ fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
     // Exact, the way the other depot tests are exact: the seed is fixed and
     // the maps do not change, so a number that moves is a behaviour that
     // moved.
+    //
+    // 1,040 riding a bone until `trigger_portal_cleanser` had a class: the
+    // shipped maps carry **14** `SetParentAttachmentMaintainOffset`
+    // connections to fizzlers, which had nothing to land on before.
     assert_eq!(
         (
             declared,
@@ -9953,7 +10076,7 @@ fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
             parent_has_no_model,
             no_such_point
         ),
-        (1362, 1040, 6, 6, 0, 174),
+        (1362, 1054, 6, 6, 0, 174),
         "the attachment census over the shipped maps has changed"
     );
 }
@@ -12001,3 +12124,342 @@ fn no_shipped_map_leaves_itself_on_arrival() {
 }
 
 
+
+/// **Buttons are the tick's, not the frame's.** The client hands its buttons
+/// over every rendered frame and the server ticks at 64 Hz, so at any frame
+/// rate above that most frames run no tick at all. A press that arrives on one
+/// of those frames must still be a press edge on the next tick, and a tap that
+/// goes down and up again between two ticks must still reach the game —
+/// `kbutton_t`'s impulse bit, which `Server::update_player_buttons` latches.
+#[test]
+fn a_button_pressed_between_ticks_reaches_the_next_one() {
+    let mut map = vec![
+        block(&[("classname", "worldspawn")]),
+        block(&[("classname", "logic_playerproxy"), ("targetname", "playerproxy")]),
+        block(&[("classname", "math_counter"), ("targetname", "jumps")]),
+    ];
+    map[1]
+        .pairs
+        .push((String::from("OnJump"), conn("jumps", "Add", "1", "0", "-1")));
+    let mut server = Server::new();
+    server.level_init("test", &map, &[]);
+    let mut state = player_at(Vec3::ZERO);
+    server.spawn_player(state);
+    let mut query = crate::server::NoTouchQuery;
+    let interval = server.time().interval;
+    server.frame(interval, &mut query);
+
+    // Down on a frame that runs no tick, still down on the one that does:
+    // one press.
+    state.buttons = crate::server::classes::IN_JUMP;
+    server.set_player_state(state);
+    assert_eq!(server.frame(0.0, &mut query), 0, "a frame that runs no tick");
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    assert_eq!(counter_value(&server, "jumps"), 1.0, "the edge survived a tickless frame");
+
+    // Up, then a tap that is down for one tickless frame and up again before
+    // the tick: still a jump.
+    state.buttons = 0;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    state.buttons = crate::server::classes::IN_JUMP;
+    server.set_player_state(state);
+    assert_eq!(server.frame(0.0, &mut query), 0, "a frame that runs no tick");
+    state.buttons = 0;
+    server.set_player_state(state);
+    server.frame(interval, &mut query);
+    assert_eq!(counter_value(&server, "jumps"), 2.0, "the tap between ticks landed");
+}
+
+/// The engine's half of running a portal-gun command the server asked for —
+/// what `Engine::frame` does with `take_server_commands` and
+/// `take_console_commands`, for the four commands the maps send about the
+/// gun. Returns every command seen, run or not.
+fn run_gun_commands(server: &mut Server) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut commands = server.take_server_commands();
+    commands.extend(server.take_console_commands());
+    for text in commands {
+        for command in text.split(';') {
+            let command = command.trim();
+            let mut words = command.split_whitespace();
+            let result = match (words.next(), words.next()) {
+                (Some("give_portalgun"), _) => server.give_portalgun(),
+                (Some("upgrade_portalgun"), _) => server.upgrade_portalgun(),
+                (Some("upgrade_potatogun"), _) => server.upgrade_potatogun(),
+                (Some("give"), Some(item)) => server.give_named_item(item).map(|_| ()),
+                _ => Ok(()),
+            };
+            let _ = result;
+            seen.push(command.to_owned());
+        }
+    }
+    seen
+}
+
+/// **The first map the player has the gun on, run on its own scripts.**
+///
+/// `sp_a1_intro4` is `FIRST_MAP_WITH_GUN` in `sp_transition_list.nut`, so its
+/// `OnPostTransition()` fires `give_portalgun` at `@command` — both of them,
+/// a `point_servercommand` and a `point_clientcommand` — and nothing else
+/// gives the player a gun on this map. So this is the whole path: script,
+/// `EntFire`, both command entities, the console, `GiveNamedItem`,
+/// `BumpWeapon`. Then the gun is fired round the room from where the arrival
+/// elevator leaves the player, against the map's own brushes, and at least
+/// one shot has to put a blue portal on a wall.
+///
+/// ```text
+/// KISAK_GAME_DIR=/path/to/portal2 cargo test --release sp_a1_intro4_gives_the_gun -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn sp_a1_intro4_gives_the_gun_on_its_own_scripts_and_the_gun_places_portals() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, physics as world_physics, sync_placements};
+
+    const MAP: &str = "sp_a1_intro4";
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = Rc::new(
+        crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game"),
+    );
+    let bsp = Bsp::load(&vfs, MAP).expect("the map parses");
+    let mut collision = CollisionBsp::build(&bsp);
+    let surface_props = world_physics::surface_properties(&vfs);
+    collision.resolve_game_materials(|m| world_physics::game_material(&vfs, &surface_props, m));
+    let entities = bsp.entities();
+    let placed = find_brush_models(&entities, &collision);
+
+    let mut server = Server::new();
+    server.set_script_files(Rc::new(DepotScripts(vfs.clone())));
+    server.level_init(MAP, &entities, &bsp.models);
+    {
+        let props = crate::engine::world::props::Props::load(MAP, &bsp).expect("the prop lump");
+        let mut built = world_physics::build(MAP, &bsp, &props, &vfs, surface_props.clone());
+        let names: Vec<String> = server.model_entities().into_iter().map(|e| e.model).collect();
+        built.add_models(&names, &vfs);
+        server.set_physics(built.environment, built.models, built.brush_models);
+    }
+    let spawn = entities
+        .iter()
+        .find(|e| e.classname() == Some("info_player_start"))
+        .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+        .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+        .expect("an info_player_start");
+    server.spawn_player(player_at(spawn));
+
+    let mut models = placed.clone();
+    let mut seen = Vec::new();
+    for _ in 0..(64 * 3) {
+        sync_placements(&mut models, |index| crate::engine::brush_placement(&server, index));
+        let mut query = Placed {
+            collision: &collision,
+            models: &models,
+            chain: Vec::new(),
+        };
+        let interval = server.time().interval;
+        server.frame(interval, &mut query);
+        seen.extend(run_gun_commands(&mut server));
+    }
+    let gun_commands: Vec<&String> = seen
+        .iter()
+        .filter(|c| c.contains("portalgun") || c.starts_with("give"))
+        .collect();
+    println!("gun commands the map sent: {gun_commands:?}");
+    assert_eq!(
+        gun_commands,
+        ["give_portalgun", "give_portalgun"],
+        "the transition script's `give_portalgun`, once through each `@command`"
+    );
+    let gun = server.portalgun().expect("the player has a gun");
+    assert!(gun.can_fire_portal1 && !gun.can_fire_portal2, "blue only on this map");
+    let gun_id = server.player_portalgun().expect("owned");
+
+    // Round the room: 24 yaws at three pitches. **Not from where the arrival
+    // elevator leaves the player** — that is inside the elevator's tube, and
+    // all 72 shots from there come back `InvalidSurface`. From the chamber
+    // instead, standing on its floor button: 52 place, 3 cannot fit and 17
+    // land on something a portal may not go on.
+    let at = entities
+        .iter()
+        .find(|e| e.classname() == Some("prop_floor_button"))
+        .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+        .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+        .expect("a floor button")
+        + Vec3::new(0.0, 0.0, 8.0);
+    let mut results: BTreeMap<String, usize> = BTreeMap::new();
+    let mut placed_on_a_wall = 0;
+    sync_placements(&mut models, |index| crate::engine::brush_placement(&server, index));
+    for pitch in [-20.0f32, 0.0, 25.0] {
+        for step in 0..24 {
+            let mut state = player_at(at);
+            state.angles = Vec3::new(pitch, step as f32 * 15.0, 0.0);
+            server.set_player_state(state);
+            let mut query = Placed {
+                collision: &collision,
+                models: &models,
+                chain: Vec::new(),
+            };
+            let shot = server
+                .fire_portal(gun_id, false, &mut query)
+                .expect("a gun and a player");
+            *results.entry(format!("{:?}", shot.result)).or_default() += 1;
+            if shot.result.succeeded() {
+                // A placed portal is on something: a line from one unit in
+                // front of it to one behind stops in between.
+                let (forward, _, _) = crate::math::angle_vectors(shot.angles);
+                let hit = crate::engine::shot_trace(
+                    &collision,
+                    &models,
+                    &mut Vec::new(),
+                    shot.position + forward,
+                    shot.position - forward,
+                    crate::server::placement::MASK_SHOT_PORTAL,
+                );
+                assert!(hit.did_hit(), "a portal placed on nothing: {shot:?}");
+                placed_on_a_wall += 1;
+            }
+        }
+    }
+    println!("72 shots from {at}: {results:?}");
+    assert!(placed_on_a_wall > 0, "no shot placed a portal: {results:?}");
+    assert_eq!(
+        results.into_iter().collect::<Vec<_>>(),
+        [
+            ("Bumped".to_owned(), 52),
+            ("CantFit".to_owned(), 3),
+            ("InvalidSurface".to_owned(), 17)
+        ],
+        "the shots round sp_a1_intro4's chamber"
+    );
+    let portals = server.portals();
+    assert!(
+        portals.iter().any(|p| !p.is_portal2),
+        "the blue portal is up: {portals:?}"
+    );
+}
+
+/// **The gun fired round every shipped map**, from its `info_player_start`:
+/// 24 yaws at three pitches, against the map's own brushes, static props and
+/// materials, through the whole of `portal_placement.cpp`.
+///
+/// It is a census rather than a check of any one answer — most spawns are
+/// inside an arrival elevator, whose glass and metal refuse a portal — and
+/// what it guards is that the fit terminates and answers on real geometry
+/// everywhere, that some of what it answers is a portal, and that every
+/// portal it places is on something.
+#[test]
+#[ignore = "needs a Portal 2 install; set KISAK_GAME_DIR"]
+fn every_shipped_map_can_be_shot_at() {
+    use crate::engine::trace::CollisionBsp;
+    use crate::engine::world::{bsp::Bsp, find_brush_models, physics as world_physics, sync_placements};
+
+    let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+        panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let base = dir.parent().unwrap_or(&dir).to_path_buf();
+    let vfs = crate::filesystem::Vfs::mount_game(&dir, &base, &Default::default())
+        .expect("mount the game");
+    let surface_props = world_physics::surface_properties(&vfs);
+    let mut names: Vec<String> = vfs
+        .list("maps")
+        .expect("maps/")
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".bsp"))
+        .map(|e| e.name.trim_end_matches(".bsp").to_owned())
+        .collect();
+    names.sort();
+
+    let mut results: BTreeMap<String, usize> = BTreeMap::new();
+    let mut maps_with_a_portal = 0;
+    let started = std::time::Instant::now();
+    for name in &names {
+        let bsp = Bsp::load(&vfs, name).expect("a shipped map parses");
+        let mut collision = CollisionBsp::build(&bsp);
+        collision.resolve_game_materials(|m| world_physics::game_material(&vfs, &surface_props, m));
+        let entities = bsp.entities();
+        let mut models = find_brush_models(&entities, &collision);
+        let mut server = Server::new();
+        server.level_init(name, &entities, &bsp.models);
+        {
+            let props = crate::engine::world::props::Props::load(name, &bsp).expect("the prop lump");
+            let mut built = world_physics::build(name, &bsp, &props, &vfs, surface_props.clone());
+            let names: Vec<String> = server.model_entities().into_iter().map(|e| e.model).collect();
+            built.add_models(&names, &vfs);
+            server.set_physics(built.environment, built.models, built.brush_models);
+        }
+        let Some(spawn) = entities
+            .iter()
+            .find(|e| e.classname() == Some("info_player_start"))
+            .and_then(|e| e.pairs.iter().find(|(k, _)| k == "origin"))
+            .map(|(_, v)| crate::server::keyvalue::string_to_vector(v))
+        else {
+            continue;
+        };
+        server.spawn_player(player_at(spawn));
+        server.give_portalgun().expect("a player");
+        let gun = server.player_portalgun().expect("given");
+        sync_placements(&mut models, |index| crate::engine::brush_placement(&server, index));
+
+        let mut placed_here = false;
+        for pitch in [-20.0f32, 0.0, 25.0] {
+            for step in 0..24 {
+                let mut state = player_at(spawn);
+                state.angles = Vec3::new(pitch, step as f32 * 15.0, 0.0);
+                server.set_player_state(state);
+                let mut query = Placed {
+                    collision: &collision,
+                    models: &models,
+                    chain: Vec::new(),
+                };
+                let shot = server.fire_portal(gun, false, &mut query).expect("a gun");
+                *results.entry(format!("{:?}", shot.result)).or_default() += 1;
+                if shot.result.succeeded() {
+                    placed_here = true;
+                    assert!(
+                        shot.position.is_finite() && shot.angles.is_finite(),
+                        "{name}: {shot:?}"
+                    );
+                }
+            }
+        }
+        if placed_here {
+            maps_with_a_portal += 1;
+        }
+    }
+    let shots: usize = results.values().sum();
+    println!(
+        "\n{} maps, {shots} shots in {:.1}s; {maps_with_a_portal} maps took a portal from their spawn",
+        names.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for (result, count) in &results {
+        println!("  {count:>6}  {result}");
+    }
+    assert_eq!(names.len(), 106);
+    // Exact, so that a change to placement has to be read. **Most spawns are
+    // inside an arrival elevator or a sealed container**, so most shots end on
+    // the elevator's own surfaces and are refused — which is why 24 maps
+    // rather than 106 take a portal from where the player starts. Every kind
+    // of answer the fit can give turns up on shipped content: fizzlers in the
+    // way, no-portal volumes, placement helpers, and shots out into the void.
+    assert_eq!(maps_with_a_portal, 24);
+    let expected: BTreeMap<String, usize> = [
+        ("Bumped", 257),
+        ("CantFit", 54),
+        ("Cleanser", 22),
+        ("InvalidSurface", 6_959),
+        ("InvalidVolume", 16),
+        ("PassthroughSurface", 319),
+        ("UsedHelper", 5),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    assert_eq!(results, expected, "the shot census has changed");
+}

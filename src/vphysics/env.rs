@@ -1017,6 +1017,21 @@ impl Environment {
         self.sweep_box_where(half, start, end, |id, _| accept(id))
     }
 
+    /// [`sweep_box`](Environment::sweep_box) against the **studio models that
+    /// do not move** — the bodies [`set_traced`](Environment::set_traced)
+    /// marked and that were not created dynamic.
+    ///
+    /// The portal shot's question. `UTIL_Portal_Trace_Filter`
+    /// (`portal_util_shared.cpp:278`) ignores every physics prop by classname
+    /// — `prop_physics`, `prop_weighted_cube`, `prop_monster_box` and the rest
+    /// — and the player, so what is left of the studio world for a portal to
+    /// land on (and be refused by, as `**studio**`) is the static props and
+    /// the still `prop_dynamic`s. Every dynamic body in this port belongs to a
+    /// class on that list.
+    pub fn sweep_box_static(&self, half: Vec3, start: Vec3, end: Vec3) -> Option<Sweep> {
+        self.sweep_box_where(half, start, end, |_, body| body.traced && !body.dynamic)
+    }
+
     fn sweep_box_where(
         &self,
         half: Vec3,

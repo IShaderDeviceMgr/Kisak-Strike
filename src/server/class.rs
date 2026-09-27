@@ -493,6 +493,13 @@ pub struct Context<'a> {
     change_level: Option<String>,
     /// What [`screen_fade`](Context::screen_fade) sent.
     screen_fades: Vec<ScreenFade>,
+    /// What [`server_command`](Context::server_command) and
+    /// [`client_command`](Context::client_command) asked for, in that order
+    /// of queue.
+    server_commands: Vec<String>,
+    client_commands: Vec<String>,
+    /// What [`bump_weapon`](Context::bump_weapon) asked for.
+    bumped_weapons: Vec<EntityId>,
     /// Whether this handler parented anything to an attachment point — the
     /// one bit `Server::refresh_attachment_children` needs to know.
     attachments_used: bool,
@@ -531,6 +538,9 @@ impl<'a> Context<'a> {
             reload_level: false,
             change_level: None,
             screen_fades: Vec::new(),
+            server_commands: Vec::new(),
+            client_commands: Vec::new(),
+            bumped_weapons: Vec::new(),
             attachments_used: false,
             sequences,
             attachments,
@@ -1069,6 +1079,49 @@ impl<'a> Context<'a> {
     /// What [`screen_fade`](Context::screen_fade) sent.
     pub(super) fn take_screen_fades(&mut self) -> Vec<ScreenFade> {
         std::mem::take(&mut self.screen_fades)
+    }
+
+    /// `engine->ServerCommand( "…\n" )` — `point_servercommand`'s whole job.
+    ///
+    /// Harvested by `Server::dispatch` and answered by
+    /// `Server::take_server_commands`, as [`change_level`](Context::change_level)
+    /// is.
+    pub fn server_command(&mut self, command: &str) {
+        self.server_commands.push(command.to_owned());
+    }
+
+    /// `engine->ClientCommand( player, "…\n" )` — `point_clientcommand`'s,
+    /// which in a listen server with one player is text for this console.
+    /// Answered by `Server::take_console_commands`, where `SendToConsole`'s
+    /// go.
+    pub fn client_command(&mut self, command: &str) {
+        self.client_commands.push(command.to_owned());
+    }
+
+    /// What the two command calls queued.
+    pub(super) fn take_commands(&mut self) -> (Vec<String>, Vec<String>) {
+        (
+            std::mem::take(&mut self.server_commands),
+            std::mem::take(&mut self.client_commands),
+        )
+    }
+
+    /// `pPlayer->BumpWeapon( this )` — the player walked into a weapon on the
+    /// floor.
+    ///
+    /// **The player's function, not the weapon's**: `CPortal_Player::BumpWeapon`
+    /// decides whether it is taken, merges a second portal gun's chips into
+    /// the first, and equips — which reaches into the player, the weapon and
+    /// the map name at once. So `DefaultTouch` asks and `Server::dispatch`
+    /// does it on the way out, as [`take_damage`](Context::take_damage) is
+    /// done.
+    pub fn bump_weapon(&mut self, weapon: EntityId) {
+        self.bumped_weapons.push(weapon);
+    }
+
+    /// What [`bump_weapon`](Context::bump_weapon) queued.
+    pub(super) fn take_bumped_weapons(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.bumped_weapons)
     }
 
     /// Whether this handler parented anything to an attachment point.

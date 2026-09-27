@@ -65,7 +65,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,280 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,304 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -95,9 +95,13 @@ it has momentum (`sv_noclipaccelerate` is 5; set it to 0 for an instant stop, an
 fly up by looking up, because Portal 2 binds no key to `+moveup`). `trace`
 reports what is under and in front of the player, `tonemap` what the exposure is
 doing, and `report_entities`/`ent_dump`/`ent_fire`/`dumpeventqueue` inspect the
-entity list. `portal 1` and `portal 2` place a blue and an orange oval on
-whatever you are looking at and `portal off` fizzles them — the portal gun minus
-the gun and minus every placement rule, so nothing refuses a surface.
+entity list. **The portal gun is real**: the maps give it
+themselves from `sp_a1_intro4` on, and `give_portalgun` / `upgrade_portalgun` /
+`upgrade_potatogun` give it anywhere. Left click fires blue, right click orange,
+through every placement rule; `r_drawviewmodel 0` hides the gun in hand and
+`crosshair 0` the reticle. `portal 1` and `portal 2` still place a blue and an
+orange oval on whatever you are looking at and `portal off` fizzles them — with
+every placement rule skipped, so nothing refuses a surface.
 `r_portal_stencil_depth` is how many levels of portal-in-portal are drawn: 2 by
 default, 0 for a flat oval with no view through, 10 at most.
 
@@ -157,10 +161,10 @@ before calling into a module.** This table is the index.
 | `src/launcher/` | **ported** — command line, single-instance lock, startup, mounts the filesystem, hands off to `engine::window::run` | `portdocs/LAUNCHER.md` |
 | `src/filesystem/` | **ported** — `Vfs` over an ordered mount list, `gameinfo.txt`, KeyValues, VPK (v1/v2/headerless), the `.bsp` pak lump at the head. Async and `sv_pure` deferred; deflate unimplemented because all 64,428 shipped pak entries are stored | `rustdocs/FILESYSTEM.md`, `portdocs/FILESYSTEM.md` |
 | `src/materials/` | **stages 1-6 of 8**, plus 10 shaders — `UnlitGeneric`, `LightmappedGeneric`, `WorldVertexTransition`, `VertexLitGeneric`, `Phong`, `Refract`, `PortalRefract` and its `$Stage 1`, `BufferClearObeyStencil`, **`SolidEnergy`** (the fizzlers) — the **stencil**, and the **screen fade** in the presenting pass. Paint maps and GPU morph not started | `rustdocs/MATERIALS.md`, `portdocs/MATERIALSYSTEM.md` |
-| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**, the **sky**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp and the pusher's three clip chains), `input/` (4 of 5), `console/` (complete). No fog, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
+| `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**, the **sky**, the **view model**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp, the pusher's three clip chains and the **portal gun's shot trace**, with game materials), `input/` (4 of 5), `console/` (complete). No fog, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy, **screen fades**. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
-| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning** and **skin families**. No LOD selection, no body groups, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** and **`env_fade`** — **57 classnames, 37,890 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md` |
+| `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning**, **skin families** and the **body-group selector** (used by the view model only). No LOD selection, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** and **`env_fade`** and the **portal gun** (`weapon_portalgun`, all of `portal_placement.cpp`, the three placement volumes, `info_placement_helper`, the two command entities and the three commands that give it) — **64 classnames, 41,787 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md`, `portdocs/PORTALGUN.md` |
 | `src/vscript/` | **Squirrel 2.2.3, written** — the language rule for rule on a tree walker (32-bit numbers, byte strings, Lua 4.0's hash table replicated because its layout is `foreach`'s order), the standard libraries Valve registers, `Vector`, `init.nut`. **All 92 shipped scripts compile; 104 of the 106 maps run five seconds of theirs without an error.** No generators or threads, which no shipped script uses; natives whose systems are absent (`CreateSceneEntity` first) are not registered | `rustdocs/VSCRIPT.md`, `portdocs/VSCRIPT.md` |
 | `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it** — and **static props and still studio props are solid to the player**. No constraints, collision events, ragdolls or vehicles, and a held object cannot cross a portal | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
@@ -189,7 +193,7 @@ not from this map's own spawn, which is inside a sealed container: walk out of
 the room and the second camera starts drawing the skybox at 1/16 scale behind
 the holes the map's sky brushes cut.
 
-**It is not a runnable game**: no sound, no netcode, no weapon and no fog —
+**It is not a runnable game**: no sound, no netcode, no scenes and no fog —
 but a door closing on you now shoves you out of the way, or is stopped by you,
 and a cube on the floor is something you bump into, shove, pick up and carry
 onto the button it belongs on rather than something you walk through.
@@ -613,9 +617,31 @@ for as long as a cube could not reach a button.
 **345 units** from the pad, and the player picks it up, walks it over and the
 pad goes down. Shoving moved it 18.8 units.
 
+**The portal gun has landed** — `portdocs/PORTALGUN.md`, `rustdocs/SERVER.md` "The
+portal gun" — and it reverses `portdocs/PORTAL.md` §8's deletion of the gun.
+`portal_placement.cpp` (1,663 lines) is ported whole, bugs included, so a shot is
+bumped onto the wall it nearly fits, slid off other portals and no-portal volumes,
+refused on glass and `SURF_NOPORTAL`, stopped by a fizzler and snapped to a placement
+helper. **Most of the rest has no source in this tree** — the gun's server half, the
+three commands that give it, the four placement volumes, the helper search and the
+client's view-model skin — and is rebuilt from what reads it: `sp_transition_list.nut`
+sends `give_portalgun` from `sp_a1_intro4`, `upgrade_portalgun` from `sp_a2_laser_intro`
+and `upgrade_potatogun` from `sp_a3_speed_ramp`, and the maps run those scripts
+themselves. Four findings: **every map command runs twice**, because 60 maps name both a
+`point_servercommand` and a `point_clientcommand` `@command`, so the commands must be
+idempotent; **glass is refused by its game material, not a flag** — 4,302 shipped glass
+sides carry no `SURF_NOPORTAL`, so the trace grew `$surfaceprop`'s `gamematerial`;
+**`SURF_NOPORTAL` is hidden behind an anti-tamper constant** whose fallback would refuse
+every wall, so `bspflags.h`'s `0x20` is used; and **a click could fall between two
+ticks** — buttons are now latched per tick, which fixed `+use` and `+jump` too. Fired
+72 times from each of the 106 spawns, 24 maps take a portal, and every success on
+shipped content is a bump. The gun draws in hand (`v_portalgun.mdl`, over a cleared
+depth buffer, skin = the last portal fired, body 1 = the potato) and a two-colour ring
+stands in for `CHUDQuickInfo`.
+
 - **The unported entity classes.** `rustdocs/SERVER.md`, "What the maps place that is
-  not here", lists all 149 classnames the shipped maps place that have no class here.
-  That is 23,362 of the 60,925 blocks. Each classname has its C++ source (or "none"),
+  not here", lists all 141 classnames the shipped maps place that have no class here.
+  That is 19,138 of the 60,925 blocks. Each classname has its C++ source (or "none"),
   its single-player and co-op counts, its I/O and a suggested order. The headline: an
   unknown classname is not spawned, which silently breaks implemented entities that
   name it. `func_tracktrain` was the `parentname` of 1,290 of them and **has landed**
@@ -633,8 +659,16 @@ pad goes down. Shoving moved it 18.8 units.
   quad. VScript's largest absence is now the scene system: `CreateSceneEntity` is 4,647
   of the shipped scripts' calls, and the only one that still stops a file loading.
 - **Fizzler behaviour.** `SolidEnergy` draws the field (1,174 brush faces on 59 maps),
-  but `trigger_portal_cleanser` (371, source not in this tree) is not a class yet, so nothing is fizzled, and the
-  `FizzlerVortex` proxy that swirls the field round a cube is not in this tree at all.
+  and `trigger_portal_cleanser` (371, source not in this tree) is now a class — but only
+  as the portal gun sees it: a shot stops at an enabled one, and its field shows only
+  while it is enabled. **Walking through one fizzles nothing** and a carried cube is not
+  dissolved; `CTriggerPortalCleanser`'s touch has to be reconstructed, and
+  `WeightedCube::SilentDissolve` is where it lands. The `FizzlerVortex` proxy that swirls
+  the field round a cube is not in this tree at all.
+- **The portal gun's loose ends** (`portdocs/PORTALGUN.md` §8): the view-model sway
+  (`CalcViewModelLag`), the gun's effects and sounds, `func_portal_detector` (31, now
+  buildable), and a test that fires a portal onto a slope so the transition ramp is
+  finally exercised by shipped geometry.
 - **External `.ani` animation blocks** (`animblock != 0`), which skinning just promoted
   to the largest gap in the model path. Until skinning landed, every `$includemodel` host
   but the two panel arms — eggbot, ballbot, both Chells, the s8 player, the Wheatley boss
@@ -644,11 +678,12 @@ pad goes down. Shoving moved it 18.8 units.
   sequences declare, the worst by 23,029 units, and since `studiomdl` computes that box
   from the animated geometry the pose is what is wrong.
   `every_shipped_studio_model_parses` prints the list.
-- **Body groups** (`m_nBody`) in `src/studio/` — the half of the selector family skin
-  families left behind. It chooses which *model* inside a body part draws, which is
-  geometry rather than materials, and `build.rs` already keeps body parts in separate
-  batches so that it can be added without a rewrite. 959 of 968 models have exactly one
-  body part, so it is near-vestigial on props and matters for characters.
+- **Body groups for map entities** (`m_nBody`). The selector landed with the portal
+  gun — `StudioModel::body_part_model`, `EntityModels::set_body` — because
+  `v_portalgun.mdl`'s potato is a body part, but only the view model sets one; every map
+  entity still draws every model of every part. 959 of 968 models have exactly one body
+  part, so it is near-vestigial on props and matters for characters. The `body` key and
+  `SetBodyGroup` are what would carry it.
 - **A physics prop that can cross a portal**, which is what the grab controller
   stopped short of (`portdocs/VPHYSICS_GRAB.md` §9) and is **not** a grab-controller gap:
   nothing but the *player* teleports here at all, because `handle_portalling` lives in

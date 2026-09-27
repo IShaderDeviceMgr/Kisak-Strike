@@ -174,6 +174,11 @@ pub struct Model {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyPart {
     pub name: String,
+    /// `mstudiobodyparts_t::base` — this part's place value in `m_nBody`:
+    /// the model drawn is `( body / base ) % nummodels`
+    /// (`studio.h`'s `R_StudioSetupModel`). The product of the model counts
+    /// of every part before it, so 1 for the first.
+    pub base: i32,
     pub models: Vec<Model>,
 }
 
@@ -485,13 +490,18 @@ impl Mdl {
         let name_at = r.relative_offset(at, at, "mstudiobodyparts_t::sznameindex")?;
         let name = normalize(&r.c_string(name_at)?);
         let count = r.count(at + 4, "models")?;
+        let place = r.i32(at + 8)?;
         let base = r.relative_offset(at + 12, at, "mstudiobodyparts_t::modelindex")?;
 
         let mut models = Vec::with_capacity(count);
         for i in 0..count {
             models.push(Self::model(r, base + i * MODEL_STRIDE, skin_refs)?);
         }
-        Ok(BodyPart { name, models })
+        Ok(BodyPart {
+            name,
+            base: place,
+            models,
+        })
     }
 
     fn model(r: &Reader, at: usize, skin_refs: usize) -> Result<Model, StudioError> {

@@ -60,6 +60,16 @@ impl EntityId {
         generation: u32::MAX,
     };
 
+    /// A handle naming slot `slot`, for a test that needs distinct ids and no
+    /// list to get them from.
+    #[cfg(test)]
+    pub fn test(slot: u32) -> EntityId {
+        EntityId {
+            slot,
+            generation: 0,
+        }
+    }
+
     /// The slot, for reporting. **Not an identity** — two entities that lived
     /// in the same slot at different times share it. `ent_dump <index>` takes
     /// one because Valve's takes an edict index and mappers think in those.

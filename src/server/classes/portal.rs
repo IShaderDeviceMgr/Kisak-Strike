@@ -62,10 +62,12 @@
 //! - **The placement snap.** `CProp_Portal::ActivatePortal` (`:700`) traces one
 //!   unit in front of the portal to eight units behind it, takes the surface
 //!   normal as the new angles, and re-places itself there through
-//!   `VerifyPortalPlacementAndFizzleBlockingPortals`. That is the placement
-//!   system, which needs the gun (`portdocs/PORTAL.md` §8), and this port
-//!   activates a portal where the map put it. The assumption is checked rather
-//!   than assumed: `server::tests::every_shipped_portal_is_on_a_wall` sweeps
+//!   `VerifyPortalPlacementAndFizzleBlockingPortals`. The placement system
+//!   exists now — [`placement`](crate::server::placement), which the gun
+//!   fires through — but a *map's* portal is still activated where the map
+//!   put it rather than snapped, because turning the snap on moves portals
+//!   every existing test measures. The assumption is checked rather than
+//!   assumed: `server::tests::every_shipped_portal_is_on_a_wall` sweeps
 //!   the player hull backwards through all 21 and asserts each is within a
 //!   unit of solid geometry.
 //! - **`Fizzle`'s effect.** `InputFizzle` is `DoFizzleEffect` (particles and a
@@ -304,6 +306,14 @@ pub struct PropPortal {
     /// shipped game's "the other end of the pair flickers when this one is
     /// re-placed". One timestamp cannot say both.
     pub static_at: f32,
+    /// `m_hFiredByPlayer` — who shot this portal where it is, set by the gun
+    /// before every shot and never by the map.
+    ///
+    /// Placement reads it: a portal fitted against one fired by the *same*
+    /// player is a hard bump (its own partner), and against anyone else's —
+    /// in single player, a map's own portal, whose shooter is nobody — a soft
+    /// one. See [`placement`](crate::server::placement).
+    pub fired_by: Option<EntityId>,
 }
 
 /// The inputs (`prop_portal.cpp:66`).
@@ -357,6 +367,7 @@ impl PropPortal {
             matrix: Mat4::IDENTITY,
             opened_at: 0.0,
             static_at: 0.0,
+            fired_by: None,
         })
     }
 
@@ -696,6 +707,42 @@ impl PropPortal {
                 cx.punch_penetrating_players(partner);
             }
         }
+    }
+
+    /// `DelayedPlacementThink`'s success half (`prop_portal_shared.cpp:88`) —
+    /// a shot from `gun` has been verified, so the portal fires
+    /// `OnPlacedSuccessfully` and moves.
+    ///
+    /// The output fires **only when the gun has a player**, with the gun as
+    /// activator — `m_OnPlacedSuccessfully.FireOutput( pPortalGun, this )`
+    /// inside `if( pFiringPlayer )`. The failure half — the fizzle effect at
+    /// the spot the shot hit — has no subsystem, and a failed shot leaves the
+    /// portal where it was, which is the half that matters.
+    ///
+    /// Not here: `TestRestingSurfaceThink`, which fizzles a portal whose wall
+    /// moves out from behind it a tenth of a second later. Placement has
+    /// already refused a moving surface.
+    pub fn place_from_gun(
+        &mut self,
+        entity: &mut EntityCore,
+        origin: Vec3,
+        angles: Vec3,
+        gun: EntityId,
+        fired_by_player: bool,
+        cx: &mut Context<'_>,
+    ) {
+        if fired_by_player {
+            let me = entity.id();
+            entity.fire_output(
+                "OnPlacedSuccessfully",
+                crate::server::io::Variant::Void,
+                Some(gun),
+                Some(me),
+                0.0,
+                cx,
+            );
+        }
+        self.new_location(entity, origin, angles, cx);
     }
 
     /// `CPortal_Base2D::Resize` (`portal_base2d.cpp:1700`).

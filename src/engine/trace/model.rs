@@ -399,6 +399,30 @@ impl CollisionBsp {
             .unwrap_or(NULL_SURFACE_NAME)
     }
 
+    /// The `CHAR_TEX_*` game material behind a
+    /// [`Trace::surface`](super::Trace::surface) — 0 for the null surface and
+    /// for a table [`resolve_game_materials`](CollisionBsp::resolve_game_materials)
+    /// has not been run over.
+    pub fn surface_game_material(&self, surface: Option<u16>) -> u16 {
+        surface
+            .and_then(|i| self.surfaces.get(i as usize))
+            .map_or(0, |s| s.game_material)
+    }
+
+    /// Fills every surface's [`game_material`](super::result::Surface::game_material)
+    /// from its name — `physprops->GetSurfaceIndex( material->GetString(
+    /// "$surfaceprop" ) )` per texdata, which `CollisionBSPData_LoadTexinfo`
+    /// does at load (`engine/cmodel_bsp.cpp:355`).
+    ///
+    /// **A closure rather than a material system and a surface database**,
+    /// because this module names neither: the caller reads the `.vmt` and the
+    /// surface properties and hands back a letter.
+    pub fn resolve_game_materials(&mut self, mut game_material: impl FnMut(&str) -> u16) {
+        for surface in &mut self.surfaces {
+            surface.game_material = game_material(&surface.name);
+        }
+    }
+
     /// A surface-table index and its flags, resolving Valve's
     /// `SURFACE_INDEX_INVALID` to the null surface
     /// (`CCollisionBSPData::GetSurfaceAtIndex`, `engine/cmodel.cpp:55`).
@@ -475,6 +499,7 @@ fn surface_table(bsp: &Bsp) -> Vec<Surface> {
                 .cloned()
                 .unwrap_or_default(),
             flags: 0,
+            game_material: 0,
         })
         .collect();
 

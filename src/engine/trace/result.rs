@@ -171,12 +171,12 @@ impl Trace {
 /// One entry of the collision model's surface table — `csurface_t`
 /// (`public/cmodel.h:47`), one per texdata rather than one per brush side.
 ///
-/// `surfaceProps` is deliberately absent: it is an index into the physics
-/// surface-property database, which is filled in from the material's
-/// `$surfaceprop` at load (`engine/cmodel_bsp.cpp:355`) and there is no
-/// material system call and no `physprops` here yet. It arrives with
-/// `vphysics/`; carrying a field that is always zero would read as "this
-/// surface has the default properties", which is a different claim.
+/// `surfaceProps` is not carried as an index: what it indexes is the physics
+/// surface-property database, and the one field of that record anything here
+/// reads is the game material — so that is what is stored, resolved from the
+/// material's `$surfaceprop` once at load
+/// ([`CollisionBsp::resolve_game_materials`](super::CollisionBsp::resolve_game_materials)),
+/// the way `CollisionBSPData_LoadTexinfo` resolves it (`engine/cmodel_bsp.cpp:355`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Surface {
     /// The material name, without `materials/` or `.vmt` — the same string
@@ -186,4 +186,9 @@ pub struct Surface {
     /// The OR of `SURF_*` over every texinfo naming this texdata. See
     /// [`Trace::surface_flags`].
     pub flags: i32,
+    /// `surfacedata_t::game.material` of the material's `$surfaceprop` — the
+    /// `CHAR_TEX_*` letter. **0 until resolved**, which is every collision
+    /// model built without a filesystem (the unit tests); the game's own
+    /// `"default"` is `'C'`.
+    pub game_material: u16,
 }

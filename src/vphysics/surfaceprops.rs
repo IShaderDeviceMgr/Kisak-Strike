@@ -69,6 +69,16 @@ pub struct Surface {
     pub thickness: f32,
     /// Read, never used.
     pub dampening: f32,
+    /// `surfacegameprops_t::material` — the `CHAR_TEX_*` letter, `'C'` for
+    /// concrete, `'Y'` for glass.
+    ///
+    /// A game field rather than a physics one, and the one the portal gun
+    /// reads: `PortalSurfaceType` (`portal_placement.cpp:136`) refuses any
+    /// surface whose material is `CHAR_TEX_GLASS`, which is what keeps a
+    /// portal off 4,302 ceiling light panels, signs and fizzler emitters that
+    /// carry no `SURF_NOPORTAL`. It rides along with `base` like everything
+    /// else, because `CopyPhysicsProperties` copies the whole record.
+    pub game_material: u16,
 }
 
 impl Default for Surface {
@@ -83,6 +93,7 @@ impl Default for Surface {
             density: 0.0,
             thickness: 0.0,
             dampening: 0.0,
+            game_material: 0,
         }
     }
 }
@@ -128,6 +139,7 @@ static FALLBACK: Surface = Surface {
     density: 2000.0,
     thickness: 0.0,
     dampening: 0.0,
+    game_material: 0,
 };
 
 impl SurfaceProps {
@@ -204,6 +216,21 @@ impl SurfaceProps {
                     "density" => surface.density = number().unwrap_or(surface.density),
                     "thickness" => surface.thickness = number().unwrap_or(surface.thickness),
                     "dampening" => surface.dampening = number().unwrap_or(surface.dampening),
+                    // `if ( strlen(value) == 1 && !V_isdigit( value[0]) )` a
+                    // letter, upper-cased; otherwise a number
+                    // (`physics_material.cpp:574`).
+                    "gamematerial" => {
+                        let bytes = value.as_bytes();
+                        surface.game_material = match bytes {
+                            [letter] if !letter.is_ascii_digit() => {
+                                u16::from(letter.to_ascii_uppercase())
+                            }
+                            // Every shipped value is a letter; the number
+                            // form is `atoi`, which a plain parse matches for
+                            // anything well formed.
+                            _ => value.trim().parse::<i32>().unwrap_or(0) as u16,
+                        };
+                    }
                     // Everything else is a game, audio or sound-script field.
                     // Valve asserts on an unrecognised key; this does not,
                     // because half the keys in the shipped files are ones this
@@ -303,6 +330,7 @@ mod tests {
             "density"    "2700"
             "elasticity" "0.2"
             "friction"   "0.5"
+            "gamematerial" "y"
         }
     "#;
 
@@ -361,6 +389,26 @@ mod tests {
         let glass = amended.find("glass").unwrap();
         assert_eq!(glass.friction, 0.25, "overwritten");
         assert_eq!(glass.elasticity, 0.2, "and the rest survives");
+    }
+
+    /// `gamematerial` is upper-cased, rides `base` with the physics, and
+    /// starts from `default`'s — the three ways a surface gets its
+    /// `CHAR_TEX_*`, and the portal gun's glass test reads the answer.
+    #[test]
+    fn the_game_material_is_a_letter_that_base_carries() {
+        let p = props();
+        assert_eq!(p.find("glass").unwrap().game_material, u16::from(b'Y'));
+        assert_eq!(
+            p.find("energyball").unwrap().game_material,
+            u16::from(b'Y'),
+            "through `base`"
+        );
+        assert_eq!(p.find("default_silent").unwrap().game_material, u16::from(b'X'));
+        assert_eq!(
+            p.find("solidmetal").unwrap().game_material,
+            u16::from(b'C'),
+            "a new name starts from `default`"
+        );
     }
 
     #[test]

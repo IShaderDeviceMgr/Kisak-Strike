@@ -66,7 +66,9 @@ punch; and `PunchAllPenetratingPlayers` is a deferred queue on `Context` that
 `Server::flush_portal_punches` drains against a `TouchQuery`. §10's stage-5 entry
 records what each of the four found, including the one that matters most — **none of
 the nine shipped portal pairs is steep enough to reach the transition ramp**, so it is
-unit-tested but unreachable from shipped content until the portal gun exists.
+unit-tested but unreachable from shipped content until the portal gun exists. (The gun
+now exists — `portdocs/PORTALGUN.md` — but no test yet fires a portal onto a slope and
+walks into it, so the ramp is still unexercised by shipped geometry.)
 
 ---
 
@@ -85,7 +87,7 @@ unit-tested but unreachable from shipped content until the portal gun exists.
 | `game/shared/portal/portal_util_shared.cpp` | 3,472 | **Port ~200.** `UTIL_Portal_PointTransform`/`VectorTransform`/`AngleTransform`/`RayTransform` (`:1476-1525`), `UTIL_Portal_TraceRay( pPortal, … )` (`:638-1020`, of which the holy-wall half matters), `UTIL_IntersectRayWithPortal`, `UTIL_Portal_Triangles`. The `FindClosestPassableSpace` family, the complex multi-segment trace and `CTransformedCollideable` all wait for something that needs them. |
 | `game/shared/portal/staticcollisionpolyhedroncache.cpp` | 586 | **Delete** — §4.3. It converts BSP brushes and static props into `CPolyhedron`s; this port traces planes. |
 | `mathlib/polyhedron.cpp` | 3,895 | **Delete** — §4.3. This is the single largest saving in the module. |
-| `game/shared/portal/portal_placement.cpp` | 1,663 | **Delete** — needs a gun (§8). |
+| `game/shared/portal/portal_placement.cpp` | 1,663 | ~~Delete~~ — **ported**, `src/server/placement.rs` (`portdocs/PORTALGUN.md`). |
 | `game/server/portal/physicsshadowclone.cpp` | 1,220 | **Delete** — §8. |
 | `game/server/portal/physicsclonearea.cpp` | 280 | **Delete** — §8. |
 | `game/server/portal/pvs_extender.cpp` | 158 | **Delete.** The port has no visibility system to extend; `world/` draws every face every frame. |
@@ -139,7 +141,7 @@ game. Every number below decided something in §3–§8.
 | Output connections on a `prop_portal` | **1** — `sp_a1_intro1`'s `OnPlayerTeleportFromMe` |
 | Portal angles | 19 of 21 are axis-aligned yaws; the exceptions are one `90 180 0` and the two `NewLocation` targets (`0 30 0`, `-90 0 0`) |
 
-The placement-side classes, all of which are moot without a gun (§8):
+The placement-side classes, all of which were moot without a gun (§8) — the first four have since landed with it, the cleanser only as a shot blocker (`portdocs/PORTALGUN.md`):
 
 | Classname | Entities | Maps |
 |---|---|---|
@@ -783,6 +785,13 @@ Each of these is a decision, not an omission, and each names what would reverse 
   mechanism. Until then a console command placing and linking a pair covers everything,
   and `NewLocation`'s "skipping placement rules" path (`prop_portal.cpp:799`) is
   precisely that command already written.
+  **Reversed** — `portdocs/PORTALGUN.md`. `portal_placement.cpp` is ported whole
+  (`src/server/placement.rs`), `weapon_portalgun` is a class, and
+  `func_portal_bumper`, `func_noportal_volume`, `info_placement_helper` and
+  `trigger_portal_cleanser` are classes as far as placement reads them.
+  `UTIL_TestForOrientationVolumes` stays deleted (it is `#if !defined( PORTAL2 )`),
+  and so do `func_portal_detector` and `env_portal_laser`, which react to a portal
+  rather than constrain one.
 - **Everything teleporting except the player.** This port has no `prop_physics`, no
   weighted cubes, no energy balls and no turrets, so the player is the only teleportable
   entity in it. That deletes `physicsshadowclone.cpp` (1,220),

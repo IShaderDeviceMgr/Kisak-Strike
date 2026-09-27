@@ -201,6 +201,13 @@ struct Instance {
     /// [`ModelEntity::modulation`], carried through to the draw.
     modulation: [f32; 4],
     lighting: ModelLighting,
+    /// `m_nBody`, **when something has chosen one** — see
+    /// [`set_body`](EntityModels::set_body). `None` draws every model of
+    /// every body part, which is what every entity model got before body
+    /// groups were read and what they all still get: selecting for the whole
+    /// game is the body-groups step, and it changes pictures that have not
+    /// been measured.
+    body: Option<i32>,
 }
 
 /// What loading a map's entity models cost.
@@ -495,6 +502,8 @@ impl EntityModels {
                             .collect(),
                         first_index: batch.first_index,
                         index_count: batch.index_count,
+                        body_part: batch.body_part,
+                        model: batch.model,
                     })
                     .collect();
 
@@ -534,6 +543,7 @@ impl EntityModels {
                 playback_rate: entity.playback_rate,
                 modulation: entity.modulation,
                 lighting: lighting.lighting_at(&mut tracer, entity.origin),
+                body: None,
             });
         }
 
@@ -619,6 +629,74 @@ impl EntityModels {
             instance.anim_time = entity.anim_time;
             instance.playback_rate = entity.playback_rate;
             instance.modulation = entity.modulation;
+        }
+    }
+
+    /// Chooses `m_nBody` for one instance — `R_StudioSetupModel`'s
+    /// `( body / base ) % nummodels` per body part — or `None` to go back to
+    /// drawing every model of every part.
+    pub fn set_body(&mut self, id: u64, body: Option<i32>) {
+        if let Some(&at) = self.by_id.get(&id) {
+            self.instances[at].body = body;
+        }
+    }
+
+    /// Re-samples one instance's lighting — for an instance that moves every
+    /// frame, which [`load`](EntityModels::load)'s once-only sample does not
+    /// follow. The caller does the sampling; see
+    /// [`World::draw_view_model`](super::World::draw_view_model).
+    pub fn relight(&mut self, id: u64, lighting: ModelLighting) {
+        if let Some(&at) = self.by_id.get(&id) {
+            self.instances[at].lighting = lighting;
+        }
+    }
+
+    /// How long one instance's model plays `label` for, and whether it loops.
+    /// `None` for an instance or a sequence that is not there.
+    pub fn sequence_timing(&self, id: u64, label: &str) -> Option<(f32, bool)> {
+        let instance = &self.instances[*self.by_id.get(&id)?];
+        let model = &self.models[instance.model];
+        let sequence = model.sequence(label)?;
+        let duration = model.animation(sequence)?.duration();
+        let loops = model.sequences[sequence].flags & crate::studio::anim::STUDIO_LOOPING != 0;
+        Some((duration, loops))
+    }
+
+    /// Every visible instance, **opaque batches and then translucent ones**,
+    /// with no culling — for a model that is always in front of the camera and
+    /// is drawn in its own pass: the view model. The translucent half is in
+    /// batch order rather than sorted, which for one model whose one
+    /// translucent part is its glass is the same thing.
+    pub fn draw_all(&self, pass: &mut Pass<'_>, curtime: f32) {
+        for translucent_pass in [false, true] {
+            for instance in &self.instances {
+                if !instance.visible {
+                    continue;
+                }
+                let model = &self.models[instance.model];
+                let Some(unlit) = self
+                    .unlit
+                    .as_ref()
+                    .map(|buffer| buffer.range(0, model.vertex_count as u32))
+                else {
+                    continue;
+                };
+                pass.set_model_lighting(&instance.lighting);
+                pass.bind_static_light(&unlit);
+                pass.set_bones(&model.pose(instance.sequence, self.cycle(instance, curtime)));
+                for batch in &model.batches {
+                    if instance.body.is_some_and(|body| !model.draws(batch, body)) {
+                        continue;
+                    }
+                    let translucent = GeometryPass::of_instance(
+                        batch.material(instance.skin),
+                        instance.modulation[3] != 1.0,
+                    ) == GeometryPass::Translucent;
+                    if translucent == translucent_pass {
+                        self.record_batch(pass, model, instance, batch);
+                    }
+                }
+            }
         }
     }
 
@@ -741,7 +819,9 @@ impl EntityModels {
                     batch.material(instance.skin),
                     instance.modulation[3] != 1.0,
                 );
-                if pass == GeometryPass::Translucent {
+                if pass == GeometryPass::Translucent
+                    && !instance.body.is_some_and(|body| !model.draws(batch, body))
+                {
                     out(center, index, batch_index);
                 }
             }
@@ -827,6 +907,9 @@ impl EntityModels {
                 let translucent = instance.modulation[3] != 1.0;
                 if GeometryPass::of_instance(batch.material(instance.skin), translucent) != wanted
                 {
+                    continue;
+                }
+                if instance.body.is_some_and(|body| !model.draws(batch, body)) {
                     continue;
                 }
                 self.record_batch(pass, model, instance, batch);
@@ -1861,5 +1944,173 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 3, "sp_a1_intro1 places three furniture props");
+    }
+
+    /// **The gun in the player's hands**, drawn by
+    /// [`World::draw_view_model`](super::super::World::draw_view_model) over
+    /// black: in the lower right of the screen, in the skin the last portal
+    /// asked for, and with the potato **only** when `m_nBody` says so.
+    ///
+    /// The potato is the reason this is a test: `v_portalgun.mdl`'s second
+    /// body part is PotatOS, and before body groups were selected for this
+    /// model every model of every part drew — so every gun in the game would
+    /// have carried the potato.
+    ///
+    /// ```text
+    /// KISAK_GAME_DIR=/path/to/portal2 cargo test --release the_view_model_draws -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Portal 2 install and a GPU; set KISAK_GAME_DIR"]
+    fn the_view_model_draws_the_gun_in_hand_with_the_potato_only_when_asked() {
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 288;
+        let Ok(dir) = std::env::var("KISAK_GAME_DIR") else {
+            panic!("set KISAK_GAME_DIR to a directory holding gameinfo.txt");
+        };
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let base = dir.parent().unwrap_or(&dir).to_path_buf();
+        let vfs = Vfs::mount_game(&dir, &base, &Default::default()).expect("mount the game");
+        let mut materials = MaterialCache::new(&device, &queue);
+        let mut world = super::super::World::load(&vfs, &mut materials, &device, "sp_a1_intro4")
+            .expect("the map loads");
+        world.load_view_model(&vfs, &mut materials, &device, crate::server::classes::weapon::VIEW_MODEL);
+        assert_eq!(world.view_model.stats.models_missing, 0, "v_portalgun.mdl loads");
+
+        // Above the chamber's floor button, looking along +x.
+        let button = world
+            .entities
+            .iter()
+            .find(|e| e.classname() == Some("prop_floor_button"))
+            .and_then(|e| e.get("origin"))
+            .map(crate::server::keyvalue::string_to_vector)
+            .expect("a floor button");
+        let eye = button + Vec3::new(0.0, 0.0, 72.0);
+        let angles = Vec3::new(10.0, 0.0, 0.0);
+        let (forward, _, up) = crate::math::angle_vectors(angles);
+        let aspect = WIDTH as f32 / HEIGHT as f32;
+        let fov = crate::client::view::scale_fov_by_width_ratio(
+            50.0,
+            aspect / crate::client::view::FOV_ASPECT,
+        );
+        let camera = Camera::perspective(
+            eye,
+            glam::camera::rh::view::look_at_mat4(eye, eye + forward, up),
+            fov,
+            aspect,
+            1.0,
+            28_400.0,
+        );
+        let mut context = RenderContext::new(&device, &queue, materials.pipelines());
+        context.set_exposure(1.0);
+        let target = RenderTarget::new(
+            &device,
+            "view model",
+            WIDTH,
+            HEIGHT,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            true,
+        );
+
+        let mut shot = |world: &mut super::super::World, skin: i32, body: i32| -> Vec<u8> {
+            context.begin_frame();
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: u64::from(WIDTH * HEIGHT * 4),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = context.offscreen_pass(
+                    &mut encoder,
+                    materials.pipelines(),
+                    &target,
+                    &camera,
+                    Load::Clear(wgpu::Color::BLACK),
+                );
+                world.draw_view_model(
+                    &mut pass,
+                    10.0,
+                    &super::super::ViewModelPose {
+                        eye,
+                        angles,
+                        sequence: "fire1",
+                        started_at: 0.0,
+                        idle: "idle",
+                        skin,
+                        body,
+                    },
+                );
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target.color_texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(WIDTH * 4),
+                        rows_per_image: Some(HEIGHT),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |r| {
+                r.expect("readback mapped");
+            });
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the queue drained");
+            let pixels = readback.slice(..).get_mapped_range().unwrap().to_vec();
+            readback.unmap();
+            pixels
+        };
+        // Drawn pixels, and how many of them are in the lower-right quarter.
+        let coverage = |pixels: &[u8]| {
+            let mut drawn = 0usize;
+            let mut lower_right = 0usize;
+            for (i, p) in pixels.chunks_exact(4).enumerate() {
+                if p[0..3] == [0, 0, 0] {
+                    continue;
+                }
+                drawn += 1;
+                let (x, y) = (i as u32 % WIDTH, i as u32 / WIDTH);
+                if x >= WIDTH / 2 && y >= HEIGHT / 2 {
+                    lower_right += 1;
+                }
+            }
+            (drawn, lower_right)
+        };
+
+        let plain = shot(&mut world, 0, 0);
+        let blue = shot(&mut world, 1, 0);
+        let potato = shot(&mut world, 1, 1);
+        let (drawn, lower_right) = coverage(&plain);
+        let (with_potato, _) = coverage(&potato);
+        println!(
+            "gun: {drawn} pixels, {lower_right} in the lower right; with the potato {with_potato}"
+        );
+        assert!(drawn > 5_000, "the gun is drawn: {drawn}");
+        assert!(
+            lower_right * 2 > drawn,
+            "and mostly in the lower right, where a right-handed gun is held"
+        );
+        assert_ne!(plain, blue, "skin 1 is the blue family");
+        assert!(
+            with_potato > drawn + 500,
+            "body 1 adds PotatOS, and body 0 did not draw her: {drawn} → {with_potato}"
+        );
     }
 }
