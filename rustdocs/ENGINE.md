@@ -4429,7 +4429,7 @@ Not bugs; each names what it waits on.
 | Shaders this port has not ported | 3 of `sp_a1_intro1`'s 76 materials name one — `SolidEnergy` (the fizzler field), `Black`, and a `.vmt` the game does not ship. They are the magenta checkerboard; the rest resolve, the `maps/<map>/…` cubemap patches included, since the `.bsp`'s pak lump is mounted. |
 | Dynamic lights, and lightstyles past style 0 | The atlas bakes style 0 once at load. `R_BuildLightMap` rebuilt a page every frame from `LightStyleValue( style )` and the visible `dlight_t`s. `WorldStats::faces_with_lightstyles` counts the surfaces this understates — zero on `sp_a1_intro1`. |
 | A portal's *warp* | The view through a portal is drawn (`world::portalview`), but its surface does not refract what is behind it and it has no opening animation. Both are `PortalRefract`'s `$Stage 0`, which samples a copy of the scene taken part way through the frame — impossible inside a `wgpu` render pass. `portdocs/PORTAL_RENDER.md` §7. |
-| An entity half-way through a portal | `c_portalghostrenderable.cpp` (980 lines): the part of a model that sticks out of the *other* portal is a second, clipped draw. Nothing but the player passes through a portal in this port, and the player is not drawn. |
+| An entity half-way through a portal | `c_portalghostrenderable.cpp` (980 lines): the part of a model that sticks out of the *other* portal is a second, clipped draw. **A cube now goes through a portal** (`server::transit`), so this is visible: while it is half-way, the half behind the entrance is drawn inside the wall and nothing sticks out of the exit until its centre crosses. |
 | Displacement `$seamless_scale` | Terrain **draws** now (`world/disp/`), but seamless mapping is a triplanar projection blended by the world normal, and a `WorldVertex` has none. 553 of the game's 1,181 displacement faces set it, all in the `sp_a3_*` underground maps and **none in `sp_a1_intro1`**; they draw with the texinfo's ordinary planar mapping — the right texture at the wrong scale. It is the feature that will force `LightmappedGeneric`'s second vertex layout. |
 | The *leaf order* of translucent geometry | The translucent pass exists and sorts by box centre; what is missing is `DrawTranslucentRenderables`' leaf walk, which interleaves each leaf's translucent world surfaces with the entities in it. With no PVS there are no leaves. A world batch is a whole map's worth of one material, so two overlapping translucent world materials can sort wrongly. |
 | The two glow render modes | `kRenderGlow` and `kRenderWorldGlow` additionally switch the depth test off (`IgnoresZBuffer()`), which needs a per-draw state override. **No brush entity and no `prop_dynamic` in the shipped game sets one** — they are `env_sprite`'s and `point_spotlight`'s, and neither class is ported. |
@@ -4846,7 +4846,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-384 tests under `engine::`, plus 22 depot-gated; 1,304 in the crate. (Treat both as a scale rather than a
+384 tests under `engine::`, plus 22 depot-gated; 1,314 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

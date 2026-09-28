@@ -997,6 +997,13 @@ Same ordering: most likely to bite first.
   without the mouse. A caller that drops `mv.teleported` gets a player who comes out of the
   exit portal facing the way they went in, which looks like the matrix is wrong.
 
+- **`Player::portal_entered` goes with `Player::teleported`.** `Client::run_move` sets
+  both from `mv.teleported` — the second is `Teleport::entered`, the portal's key — and
+  the engine clears both when the server's state comes back. The server needs the
+  *which*, not only the *whether*: a cube the player is carrying is held across the
+  pair from the other side the moment they go through (`rustdocs/SERVER.md`, "Props
+  through portals").
+
 - **`select_portal` takes the nearest centre**, so on a map with two portals close together
   the one you walked at is not necessarily the one you go through. Measured on shipped
   content: it happens. That is Valve's rule, not a bug.

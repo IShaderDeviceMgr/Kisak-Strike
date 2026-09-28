@@ -4259,6 +4259,7 @@ fn player_at(origin: Vec3) -> PlayerState {
         wish_velocity: Vec3::ZERO,
         vphysics_position: origin,
         teleported: false,
+        portal_entered: None,
         view_offset: crate::client::player::VEC_VIEW,
         mins: Vec3::new(-16.0, -16.0, 0.0),
         maxs: Vec3::new(16.0, 16.0, 72.0),

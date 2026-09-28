@@ -139,6 +139,9 @@ pub struct Player {
     /// `Client::run_move`, cleared by the engine when the server's state comes
     /// back.
     pub teleported: bool,
+    /// Which portal [`teleported`](Player::teleported) went *into*, as the
+    /// portal's key — `server::PlayerState::portal_entered`.
+    pub portal_entered: Option<u64>,
     /// `m_vecBaseVelocity` — the velocity of whatever is carrying the player.
     ///
     /// **The server owns it.** A `trigger_push` writes it every tick it is
@@ -213,6 +216,7 @@ impl Player {
             wish_velocity: Vec3::ZERO,
             vphysics_position: origin,
             teleported: false,
+            portal_entered: None,
             base_velocity: Vec3::ZERO,
             angles: ViewAngles::new(pitch, yaw),
             // `MOVETYPE_WALK`, which is what a player spawns as

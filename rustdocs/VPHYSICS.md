@@ -256,6 +256,46 @@ hold something. Five things to know before calling it:
   second call in the same tick returns zero — which is also why Valve's second
   drop threshold is unreachable (`portdocs/VPHYSICS_GRAB.md` §6.1).
 
+## 4e. Going into a portal
+
+```rust,ignore
+PortalHole { center, forward, right, up, half_width, half_height, depth }
+PortalHole::contains(point) -> bool
+Environment::step_through(&[(BodyId, PortalHole)])       // step() is step_through(&[])
+Environment::set_pose(BodyId, origin, rotation: Quat)    // a teleport with the orientation
+Environment::overlaps_oriented_box(BodyId, center, rotation, half) -> bool
+Environment::is_free(BodyId) -> bool                     // created dynamic and not frozen
+```
+
+Valve gives every entity a portal owns a physics environment of its own, with the
+wall behind the portal carved away and a clone of what is behind the partner
+(`CPortalSimulator`, `physicsshadowclone.cpp`). Rapier has one world and it stays
+whole. What a prop in the hole needs is for **the wall not to push back**, and
+that is a contact filter: `step_through` installs a `PhysicsHooks` whose
+`modify_solver_contacts` removes, for each owned body, every solver contact with
+a *fixed or kinematic* body whose point lies inside that body's `PortalHole` —
+the portal's rectangle, `depth` behind the plane and one unit in front (the
+wall's face sits at the plane, and a contact is made a prediction distance
+before it). Two props in one hole still collide. Every collider of a
+`Motion::Dynamic` body carries `ActiveHooks::MODIFY_SOLVER_CONTACTS` from `add`,
+which is what makes the hook run for it at all; with nothing owned it returns at
+once.
+
+Which body is in which hole is the *game's* decision — `server::transit` and
+`server::physics::Physics::step` — because ownership is a rule about entity
+centres and portal planes, not about bodies.
+
+**The friction snapshot has to agree with the solver.** `contacts()` reads
+Rapier's narrow phase, which still lists a manifold whose solver contacts the
+hook removed; the hook marks such a manifold (`user_data == CARVED`) and
+`contacts()` skips it when nothing of it reached the solver. Without that the
+grab controller's `PhysComputeSlideDirection` slides a carried cube along the
+face of the very hole it is being pushed into, and it stops at the plane —
+which is exactly what the first version of this did.
+
+**Not the clone.** A prop half-way through does not collide with what is behind
+the *other* portal until its centre crosses and it is teleported there.
+
 ## 5. Invariants and gotchas, most likely to bite first
 
 1. **`IVP_Compact_Surface::rotation_inertia` is not a moment of inertia, and
@@ -399,11 +439,11 @@ would be noticed first.
   it — 21 in the game, a class this port does not have — so a cube goes the
   physics way. There is also no view model to draw into.
   `portdocs/VPHYSICS_GRAB.md` §0.1.
-- **Carrying a held object through a portal** — and the blocker is *not* the
-  grab controller. Nothing but the player teleports here at all, so the ~300
-  lines of portal branches in `UpdateObject`, `ComputeError`, `AttachEntity`
-  and `CheckPortalOscillation` have nothing to stand on.
-  `portdocs/VPHYSICS_GRAB.md` §9.
+- **The rest of carrying through a portal.** A held cube now goes through
+  and is held across the pair (§4e, `rustdocs/SERVER.md` "Props through
+  portals"); what is still absent is `CheckPortalOscillation`, `ComputeError`'s
+  portal multiplier, picking something up *through* a portal, and the
+  collision clone of the far side (§4e).
 - **`FindSafePlacementLocation`** (270 lines) — the three-pass search for
   somewhere to put a held object down. Called only from `DetachEntityVM`, so it
   leaves with the VM path; the physics drop refuses instead, through
@@ -492,6 +532,10 @@ would be noticed first.
 | A shadow left behind is teleported, not driven | `a_shadow_left_too_far_behind_is_teleported` |
 | …and a *disabled* one is stopped and recovered too | `a_standing_players_shadow_is_stopped_rather_than_left_coasting` |
 | **The real player shoving the real cube** | `the_player_shadow_shoves_the_cube_on_sp_a1_intro1` *(depot)* |
+| A prop in a portal's hole falls through the wall under it, and out of the partner | `server::transit::tests::a_cube_dropped_into_a_floor_portal_comes_out_of_the_wall_portal` |
+| …but not through the back of that wall | `server::transit::tests::a_cube_on_the_far_side_of_a_portals_wall_is_not_taken_by_it` |
+| A carved wall is not a contact the grab slides along | `server::transit::tests::a_carried_cube_pushed_into_a_wall_portal_is_held_across_it` |
+| **The real cube through real floor portals** | `server::transit::tests::the_cube_on_sp_a1_intro1_falls_between_two_floor_portals` *(depot)* |
 
 ## 9. Extending it
 

@@ -997,6 +997,7 @@ impl Client {
         if let Some(teleport) = mv.teleported {
             self.player.angles = teleport.turn(self.player.angles);
             self.player.teleported = true;
+            self.player.portal_entered = Some(teleport.entered);
         }
         // **The angles deliberately do not come back.** `CheckParameters` pins
         // `mv->m_vecAngles` to the previous command's when `IsDead()`, and

@@ -40,6 +40,8 @@
 //! body here, which is the half of the shadow controller a door actually uses.
 
 
+use std::collections::HashMap;
+
 use glam::{Mat3, Quat, Vec3};
 use rapier3d::dynamics::{MassProperties, RigidBodyBuilder, RigidBodyHandle, RigidBodyType};
 use rapier3d::geometry::{
@@ -47,7 +49,7 @@ use rapier3d::geometry::{
 };
 use rapier3d::math::Pose;
 use rapier3d::parry::query::{ShapeCastOptions, ShapeCastStatus};
-use rapier3d::pipeline::{PhysicsWorld, QueryFilter};
+use rapier3d::pipeline::{ActiveHooks, ContactModificationContext, PhysicsHooks, PhysicsWorld, QueryFilter};
 use rapier3d::prelude::CoefficientCombineRule;
 
 use super::collide::{Solid, SolidParams, UNITS_PER_METER};
@@ -517,6 +519,13 @@ impl Environment {
         for shape in &hulls.shapes {
             let mut collider = collider(shape.clone(), &surface);
             collider.set_collision_groups(groups);
+            // A prop may be taken into a portal's hole — see [`PortalHole`] —
+            // so every contact it makes passes through the hook that removes
+            // the wall behind the hole. Nothing else can go through a portal
+            // this way: the player is moved by its own trace, not the solver.
+            if motion == Motion::Dynamic {
+                collider.set_active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            }
             self.world.insert_collider(collider, Some(handle));
         }
         // **Fold the mass properties in now rather than at the first step.**
@@ -894,6 +903,17 @@ impl Environment {
         self.slot(id).is_some_and(|body| body.dynamic)
     }
 
+    /// Whether this body is dynamic *now* — created [`Motion::Dynamic`] and
+    /// not frozen by [`enable_motion`](Environment::enable_motion). A frozen
+    /// prop does not go through a portal: nothing moves it into one.
+    pub fn is_free(&self, id: BodyId) -> bool {
+        self.is_dynamic(id)
+            && self
+                .handle(id)
+                .and_then(|handle| self.world.bodies.get(handle))
+                .is_some_and(|body| body.body_type() == RigidBodyType::Dynamic)
+    }
+
     /// Whether the solver is still integrating this body — `IsAsleep`,
     /// negated. Like [`pose`](Environment::pose), for asking about one body.
     #[allow(dead_code)]
@@ -1183,6 +1203,16 @@ impl Environment {
                     if manifold.points.is_empty() {
                         continue;
                     }
+                    // **A wall a portal carved away is not a contact.** In the
+                    // shipped game the object is in the portal's own physics
+                    // environment, where that wall does not exist, so its
+                    // friction snapshot never lists it. Without this the grab
+                    // controller's `PhysComputeSlideDirection` slides a
+                    // carried cube along the face of the hole it is being
+                    // pushed into, and it stops at the plane.
+                    if manifold.data.user_data == CARVED && manifold.data.solver_contacts.is_empty() {
+                        continue;
+                    }
                     // `CFrictionSnapshot::GetSurfaceNormal`'s
                     // `out *= sign[m_synapseIndex]`: the normal is reported
                     // **pointing from the asking object towards the other
@@ -1209,8 +1239,72 @@ impl Environment {
 
     /// `physenv->Simulate( TICK_INTERVAL )`. One fixed step; see the module
     /// docs on why there is no accumulator here.
+    ///
+    /// The game always steps through [`step_through`](Environment::step_through),
+    /// because it always has a list of portals, even an empty one; this is
+    /// the same step for a caller with none — every test in this module.
+    #[allow(dead_code)]
     pub fn step(&mut self) {
-        self.world.step();
+        self.step_through(&[]);
+    }
+
+    /// [`step`](Environment::step), with some bodies inside a portal's hole —
+    /// each `(body, hole)` is a body a portal **owns**
+    /// (`CPortalSimulator::TakeOwnershipOfEntity`), and for this step it does
+    /// not collide with the fixed or kinematic geometry the hole is cut
+    /// through. See [`PortalHole`].
+    pub fn step_through(&mut self, holes: &[(BodyId, PortalHole)]) {
+        let owned: HashMap<RigidBodyHandle, PortalHole> = holes
+            .iter()
+            .filter_map(|&(id, hole)| Some((self.handle(id)?, hole)))
+            .collect();
+        self.world.step_with_events(&HoleHooks { owned: &owned }, &());
+    }
+
+    /// Put a body somewhere, facing some way, without sweeping it there —
+    /// [`teleport`](Environment::teleport) with the orientation as well, which
+    /// is what a portal needs: `CBaseEntity::Teleport` with both an origin
+    /// and angles, on a `MOVETYPE_VPHYSICS` entity.
+    pub fn set_pose(&mut self, id: BodyId, origin: Vec3, rotation: Quat) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(handle) {
+            body.set_position(Pose::from_parts(origin, rotation), true);
+        }
+    }
+
+    /// Does `body`'s own collision overlap a box of half-extents `half`,
+    /// centred on `center` and turned by `rotation`?
+    ///
+    /// [`overlaps_box`](Environment::overlaps_box) for a box that is not
+    /// axis-aligned — a portal's trigger box and its hole, which face
+    /// wherever the portal faces. `CPortalSimulator::EntityIsInPortalHole`
+    /// asks it with `TraceCollide` against the hole shape, and this is the
+    /// same test with the shape as a cuboid.
+    pub fn overlaps_oriented_box(&self, body: BodyId, center: Vec3, rotation: Quat, half: Vec3) -> bool {
+        let Some(handle) = self.handle(body) else {
+            return false;
+        };
+        let Some(rigid) = self.world.bodies.get(handle) else {
+            return false;
+        };
+        if half.min_element() < 0.0 {
+            return false;
+        }
+        let shape = SharedShape::cuboid(half.x, half.y, half.z);
+        let pose = Pose::from_parts(center, rotation);
+        rigid.colliders().iter().any(|&collider| {
+            self.world.colliders.get(collider).is_some_and(|other| {
+                rapier3d::parry::query::intersection_test(
+                    &pose,
+                    shape.as_ref(),
+                    other.position(),
+                    other.shape(),
+                )
+                .unwrap_or(false)
+            })
+        })
     }
 
     /// `physenv->GetActiveObjects` — every body the solver moved, with where
@@ -1255,6 +1349,97 @@ impl Environment {
                     slot: (self.bodies.len() - 1) as u32,
                     generation: self.generation,
                 }
+            }
+        }
+    }
+}
+
+/// The hole a portal cuts in the geometry behind it, as the solver sees it.
+///
+/// Valve's `CPortalSimulator` gives every entity a portal *owns* a physics
+/// environment of its own: the world with the wall behind the portal carved
+/// away, plus a clone of whatever is behind the partner. Rapier has one world
+/// and it stays whole; what a body in the hole needs is for the wall it is
+/// passing into **not to push back**, and that is a contact filter. So a
+/// contact between an owned body and any fixed or kinematic body is dropped
+/// when either of its points lies in this box: the portal's rectangle,
+/// reaching [`depth`](PortalHole::depth) behind the plane and a hair in front
+/// of it — the hair is the contact skin, where the wall's face sits.
+///
+/// What is *not* reproduced is the clone: a body half-way through does not
+/// collide with what is behind the other portal until it has been teleported
+/// there. `portdocs/PORTAL.md` §8 is the deletion that covers it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalHole {
+    /// The portal's origin, in its plane.
+    pub center: Vec3,
+    /// Out of the wall.
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub half_width: f32,
+    pub half_height: f32,
+    /// How far behind the plane the carve reaches.
+    pub depth: f32,
+}
+
+impl PortalHole {
+    /// How far in front of the plane a contact still counts as being on the
+    /// wall's face — more than the solver's prediction distance, which is
+    /// how far apart two surfaces can be and still make a contact.
+    const FACE: f32 = 1.0;
+
+    /// Is `point` inside the hole?
+    pub fn contains(&self, point: Vec3) -> bool {
+        let local = point - self.center;
+        let along = local.dot(self.forward);
+        along <= Self::FACE
+            && along >= -self.depth
+            && local.dot(self.right).abs() <= self.half_width
+            && local.dot(self.up).abs() <= self.half_height
+    }
+}
+
+/// A contact manifold's `user_data` when [`HoleHooks`] took contacts out of
+/// it — so that [`Environment::contacts`] does not report a wall the solver
+/// has just been told is not there.
+const CARVED: u32 = 1;
+
+/// The contact filter [`PortalHole`] describes, for one step.
+struct HoleHooks<'a> {
+    owned: &'a HashMap<RigidBodyHandle, PortalHole>,
+}
+
+impl PhysicsHooks for HoleHooks<'_> {
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        // Reset every step, so that a manifold marked while its body was in a
+        // hole does not stay marked once the portal lets go of it.
+        *context.user_data = 0;
+        if self.owned.is_empty() {
+            return;
+        }
+        let pairs = [
+            (context.rigid_body1, context.rigid_body2),
+            (context.rigid_body2, context.rigid_body1),
+        ];
+        for (owned, other) in pairs {
+            let Some(hole) = owned.and_then(|handle| self.owned.get(&handle)) else {
+                continue;
+            };
+            // Another prop is not the wall: two cubes in one hole still
+            // collide with each other.
+            let other_moves = other
+                .and_then(|handle| context.bodies.get(handle))
+                .is_some_and(|body| body.is_dynamic());
+            if other_moves {
+                continue;
+            }
+            let before = context.solver_contacts.len();
+            context
+                .solver_contacts
+                .retain(|contact| !hole.contains(contact.anchor1) && !hole.contains(contact.anchor2));
+            if context.solver_contacts.len() < before {
+                *context.user_data = CARVED;
             }
         }
     }

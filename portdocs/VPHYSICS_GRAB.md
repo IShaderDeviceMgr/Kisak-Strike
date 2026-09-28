@@ -349,13 +349,17 @@ were in code that predates it:
 
 ## §9 What it will still not do
 
-- **Carry a cube through a portal.** Not a grab-controller gap: no physics prop
-  teleports here at all (`handle_portalling` is `client/movement.rs` and takes
-  a `MoveData`). The portal branches of `UpdateObject`, `ComputeError`,
-  `AttachEntity` and `CheckPortalOscillation` are ~300 lines that all assume
-  the object can already be on the far side. **Fix prop teleport first**; the
-  grab's portal half is then a follow-on, and §2.2's target transform is the
-  whole of it.
+- ~~**Carry a cube through a portal.**~~ **Landed** — `src/server/transit.rs`
+  and `rustdocs/SERVER.md`, "Props through portals". As predicted, prop teleport
+  came first and the grab's half was the target transform: the reach trace
+  goes through a portal (`UTIL_Portal_TraceRay`), the target is taken through
+  the held portal's matrix, and `m_bHeldObjectOnOppositeSideOfPortal` is
+  toggled whenever the object or the player goes through. One thing it needed
+  that nobody predicted is in `vphysics::env::Environment::contacts`: the
+  friction snapshot must not list a wall a portal has carved away, or
+  `PhysComputeSlideDirection` stops the cube at the plane. Still absent:
+  `CheckPortalOscillation`, `ComputeError`'s portal multiplier, and picking an
+  object up *through* a portal.
 - **Draw the held object in the view model** (§0.1) — 21 personality cores, a
   class this port does not have, and no view model to draw into.
 - **Pick up a turret, a monster box or a `prop_physics`** — the classes do not

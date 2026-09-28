@@ -86,6 +86,7 @@ pub mod script;
 pub mod sequences;
 pub mod think;
 pub mod touch;
+pub mod transit;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -733,6 +734,11 @@ pub struct PlayerState {
     /// entrance to the exit. See [`EntityCore::teleported`]. Always `false`
     /// coming out.
     pub teleported: bool,
+    /// **The client's**, in only: which portal the player went *into*, as
+    /// [`PortalState::id`], when [`teleported`](PlayerState::teleported) is
+    /// set by a portal. What a carried object needs to know — see
+    /// [`transit::player_teleported`]. Always `None` coming out.
+    pub portal_entered: Option<u64>,
 }
 
 /// One entity's studio model, as the renderer needs to see it.
@@ -2420,7 +2426,9 @@ impl Server {
         };
         physics.follow_movers(&self.entities);
         physics.sync_traced(&self.entities);
-        let moved = physics.step();
+        let portals = transit::linked_portals(&self.entities);
+        let physics::Stepped { moved, teleported } = physics.step(&portals);
+        self.after_prop_teleports(&teleported, &portals);
         if moved.is_empty() {
             return;
         }
@@ -2436,7 +2444,14 @@ impl Server {
             if entity.core.parent().is_some() {
                 continue;
             }
-            previous.push((id, entity.core.origin));
+            // A prop a portal just moved sweeps its triggers from where it came
+            // *out*, not from the entrance — the sweep in between would cross
+            // whatever lies between the two portals.
+            let start = match teleported.iter().any(|t| t.entity == id) {
+                true => origin,
+                false => entity.core.origin,
+            };
+            previous.push((id, start));
             entity.core.set_abs_placement(origin, angles);
             hierarchy::propagate_id(
                 id,
@@ -2453,6 +2468,32 @@ impl Server {
         // which is how a cube presses a floor button.
         for (id, start) in previous {
             self.touch_triggers(id, start, query);
+        }
+    }
+
+    /// The rest of `TeleportTouchingEntity` once a prop has been moved: the
+    /// two portals' outputs, and — if the player is carrying it — which side
+    /// of the pair it is now on.
+    ///
+    /// `OnEntityTeleportedFromPortal` and `OnEntityTeleportedToPortal`
+    /// (`portal_base2d.cpp:2034`) fire with the **portal** as both activator
+    /// and caller, `FireOutput( this, this )`, not the prop.
+    fn after_prop_teleports(&mut self, teleported: &[physics::Teleported], portals: &[transit::LinkedPortal]) {
+        for done in teleported {
+            if let Some(mut carry) = self.carry.filter(|carry| carry.entity == done.entity) {
+                if let Some(entrance) = portals.iter().find(|p| p.id == done.entrance) {
+                    carry.through = transit::held_object_teleported(carry.through, entrance);
+                    self.carry = Some(carry);
+                }
+            }
+            for (portal, output) in [
+                (done.entrance, "OnEntityTeleportFromMe"),
+                (done.exit, "OnEntityTeleportToMe"),
+            ] {
+                self.dispatch(portal, |core, _, cx| {
+                    core.fire_output(output, io::Variant::Void, Some(core.id()), Some(core.id()), 0.0, cx);
+                });
+            }
         }
     }
 
@@ -2637,6 +2678,7 @@ impl Server {
                 false => 0.0,
             },
             floor_bump: 0.0,
+            through: None,
         });
     }
 
@@ -2724,7 +2766,30 @@ impl Server {
             tick: crate::vphysics::env::TIMESTEP,
         };
         let speed = entity.core.velocity.length();
-        let (target, rotation) = grab::hold_placement(&hold, &mut carry.floor_bump, query);
+        let portals = transit::linked_portals(&self.entities);
+        // *"If the portal isn't linked we need to drop the object"* — the
+        // portal it was held through closed, moved or lost its partner.
+        let through = match carry.through {
+            Some(id) => match portals.iter().find(|p| p.id == id) {
+                Some(portal) => Some(*portal),
+                None => {
+                    self.drop_carried(true);
+                    return;
+                }
+            },
+            None => None,
+        };
+        let (target, rotation) =
+            grab::hold_placement(&hold, &mut carry.floor_bump, query, &portals, through.as_ref());
+        // Worked out in the player's space; the object is on the far side of
+        // `through`, so the target is taken through it.
+        let (target, rotation) = match through {
+            Some(portal) => (
+                portal.matrix.transform_point3(target),
+                (portal.turn() * rotation).normalize(),
+            ),
+            None => (target, rotation),
+        };
         self.carry = Some(carry);
         if let Some(physics) = &mut self.physics {
             physics.drive_grab(target, rotation, speed, crate::vphysics::env::TIMESTEP);
@@ -3195,6 +3260,15 @@ impl Server {
             true => core.flags |= movement::FL_ONGROUND,
             false => core.flags &= !movement::FL_ONGROUND,
         }
+        // The player went through a portal carrying something: which side of
+        // the pair the object is on, relative to them, has just flipped.
+        if let (Some(key), Some(mut carry)) = (state.portal_entered, self.carry) {
+            let portals = transit::linked_portals(&self.entities);
+            if let Some(portal) = transit::portal_by_key(&portals, key) {
+                carry.through = transit::player_teleported(carry.through, portal);
+                self.carry = Some(carry);
+            }
+        }
         // The buttons are **latched here and applied once per tick** — see
         // [`Server::update_player_buttons`].
         self.player_buttons_latched |= state.buttons;
@@ -3263,6 +3337,7 @@ impl Server {
             view_offset: self.player_view_offset,
             vphysics_position: self.player_shadow_target.unwrap_or(core.origin),
             teleported: false,
+            portal_entered: None,
         })
     }
 

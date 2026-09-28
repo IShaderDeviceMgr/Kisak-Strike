@@ -28,6 +28,7 @@
 
 use glam::{Mat3, Quat, Vec3};
 
+use super::transit::{self, LinkedPortal};
 use super::TouchQuery;
 use crate::math::{angle_matrix, angle_vectors, matrix_angles};
 
@@ -112,6 +113,13 @@ pub struct Carry {
     /// `flLastDelta`, per-controller here where the shipped tree has one
     /// `static` for the whole process — `portdocs/VPHYSICS_GRAB.md` §6.2.
     pub floor_bump: f32,
+    /// The portal on the **player's** side of the pair the object is being
+    /// held through, when it is on the other side of one —
+    /// `m_bHeldObjectOnOppositeSideOfPortal` and `m_hHeldObjectPortal` as one
+    /// field. The carry target is worked out in the player's space and taken
+    /// through this portal's matrix to where the object really is. See
+    /// [`transit`].
+    pub through: Option<super::EntityId>,
 }
 
 /// `CBasePlayer::CanPickupObject` (`baseplayer_shared.cpp:2829`) plus
@@ -159,10 +167,20 @@ pub struct Hold {
     pub tick: f32,
 }
 
-/// Where a held object's **origin** and orientation should be this tick —
-/// `CGrabController::UpdateObject` (`:1506`) with the portal branches removed.
+/// Where a held object's **origin** and orientation should be this tick, in
+/// the **player's** space — `CGrabController::UpdateObject` (`:1506`).
 ///
 /// `floor_bump` is `flLastDelta`, carried between calls.
+///
+/// # Portals
+///
+/// The reach trace is `UTIL_Portal_TraceRay`: it goes through a linked portal
+/// in `portals` and on into the room behind the partner, so a target can be
+/// *behind* a portal in the player's space — which is how a held cube is
+/// pushed into one. `through` is the portal the object is being held across
+/// ([`Carry::through`]); the floor-bump ray is taken through it before it is
+/// traced, `player_held_object_transform_bump_ray`. Taking the result to
+/// where the object actually is is the caller's.
 ///
 /// > **`flLastDelta` is a function-level `static` in the shipped tree**
 /// > (`:1806`), so every grab controller in the process shares one and it
@@ -173,6 +191,8 @@ pub fn hold_placement(
     hold: &Hold,
     floor_bump: &mut f32,
     query: &mut dyn TouchQuery,
+    portals: &[LinkedPortal],
+    through: Option<&LinkedPortal>,
 ) -> (Vec3, Quat) {
     // `AngleDistance( playerAngles.x, 0 )` then the ±75° clamp. Without it,
     // looking straight down puts the object through the floor.
@@ -208,13 +228,13 @@ pub fn hold_placement(
 
     // `MASK_SOLID_BRUSHONLY` from the eye to where the object wants to be.
     let ray_end = start + forward * distance + up * up_offset;
-    let hit = query.solid_trace(start, ray_end, Vec3::ZERO, Vec3::ZERO);
+    let fraction = transit::trace_line_through(query, portals, start, ray_end);
     // > **`distance * tr.fraction` is not the distance along the ray.** The
     // > ray is `forward * distance + up * flUpOffset`, which is longer than
     // > `distance` whenever the up offset is non-zero, so the fraction is
     // > being scaled by the wrong length. Reproduced: it is what every shipped
     // > carry is tuned against, and the error is at most ten units of reach.
-    let trace_distance = (distance * hit.fraction).max(radius);
+    let trace_distance = (distance * fraction).max(radius);
     let direction = (ray_end - start).normalize_or_zero();
     // The up offset lands **twice** — once inside `direction`, which was
     // normalised from a delta that already contained it, and once again here.
@@ -224,12 +244,15 @@ pub fn hold_placement(
     // Lift it off the floor: a line dropped from the carry point, and the
     // object is raised by however much of `radius` the floor took.
     let half_radius = radius * 0.5;
-    let bump = query.solid_trace(
+    let (mut bump_start, mut bump_end) = (
         end + Vec3::Z * (half_radius + 1.0),
         end - Vec3::Z * (half_radius + 1.0),
-        Vec3::ZERO,
-        Vec3::ZERO,
     );
+    if let Some(portal) = through {
+        bump_start = portal.matrix.transform_point3(bump_start);
+        bump_end = portal.matrix.transform_point3(bump_end);
+    }
+    let bump = query.solid_trace(bump_start, bump_end, Vec3::ZERO, Vec3::ZERO);
     // `if ( !tr.startsolid )` — a trace that began inside geometry keeps the
     // *previous* frame's answer, which is what `flLastDelta` is for: it stops
     // the object popping while it passes through a wall it is momentarily
@@ -435,7 +458,7 @@ mod tests {
     fn a_held_cube_hangs_in_front_of_the_player() {
         let hold = hold(Vec3::ZERO);
         let mut bump = 0.0;
-        let (origin, _) = hold_placement(&hold, &mut bump, &mut NoTouchQuery);
+        let (origin, _) = hold_placement(&hold, &mut bump, &mut NoTouchQuery, &[], None);
         // Facing +X with no yaw, so it should be out along +X and near the
         // eye's height.
         assert!(origin.x > 30.0, "should be well in front, got {origin}");
@@ -466,9 +489,9 @@ mod tests {
         down_hold.up_offset = 0.0;
 
         let mut bump = 0.0;
-        let level = hold_placement(&level_hold, &mut bump, &mut NoTouchQuery).0;
+        let level = hold_placement(&level_hold, &mut bump, &mut NoTouchQuery, &[], None).0;
         let mut bump = 0.0;
-        let down = hold_placement(&down_hold, &mut bump, &mut NoTouchQuery).0;
+        let down = hold_placement(&down_hold, &mut bump, &mut NoTouchQuery, &[], None).0;
 
         assert!(
             (flat(level) - flat(down)).abs() < 0.5,
@@ -490,9 +513,9 @@ mod tests {
         without.up_offset = 0.0;
 
         let mut bump = 0.0;
-        let low = hold_placement(&with, &mut bump, &mut NoTouchQuery).0;
+        let low = hold_placement(&with, &mut bump, &mut NoTouchQuery, &[], None).0;
         let mut bump = 0.0;
-        let centred = hold_placement(&without, &mut bump, &mut NoTouchQuery).0;
+        let centred = hold_placement(&without, &mut bump, &mut NoTouchQuery, &[], None).0;
         assert!(
             low.z < centred.z - 10.0,
             "the cube offset should drop it: {} vs {}",
@@ -507,7 +530,7 @@ mod tests {
     fn a_steep_look_is_bounded_by_the_column_and_stays_out_of_the_player() {
         let mut bump = 0.0;
         let hold = hold(Vec3::new(75.0, 0.0, 0.0));
-        let (origin, _) = hold_placement(&hold, &mut bump, &mut NoTouchQuery);
+        let (origin, _) = hold_placement(&hold, &mut bump, &mut NoTouchQuery, &[], None);
         let radius = 22.63 + 22.0 * 3f32.sqrt();
         // Measured from the player's vertical axis, which is what
         // `UpdateObject`'s last clamp uses.
@@ -522,9 +545,9 @@ mod tests {
     #[test]
     fn the_object_follows_the_players_yaw() {
         let mut bump = 0.0;
-        let east = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut NoTouchQuery).0;
+        let east = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut NoTouchQuery, &[], None).0;
         let mut bump = 0.0;
-        let north = hold_placement(&hold(Vec3::new(0.0, 90.0, 0.0)), &mut bump, &mut NoTouchQuery).0;
+        let north = hold_placement(&hold(Vec3::new(0.0, 90.0, 0.0)), &mut bump, &mut NoTouchQuery, &[], None).0;
         assert!(east.x > 30.0 && east.y.abs() < 1.0, "{east}");
         assert!(north.y > 30.0 && north.x.abs() < 1.0, "{north}");
     }
@@ -549,9 +572,9 @@ mod tests {
             }
         }
         let mut bump = 0.0;
-        let open = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut NoTouchQuery).0;
+        let open = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut NoTouchQuery, &[], None).0;
         let mut bump = 0.0;
-        let walled = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut Wall).0;
+        let walled = hold_placement(&hold(Vec3::ZERO), &mut bump, &mut Wall, &[], None).0;
         assert!(
             walled.x < open.x,
             "a wall should pull the carry in: {walled} vs {open}"

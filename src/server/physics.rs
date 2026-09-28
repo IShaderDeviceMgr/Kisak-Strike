@@ -41,7 +41,8 @@ use glam::{Quat, Vec3};
 
 use super::entity::{EntityId, EntityList};
 use super::movement::{MoveType, Solid};
-use crate::vphysics::env::{BodyId, Environment, Motion, Sweep};
+use super::transit::{self, LinkedPortal};
+use crate::vphysics::env::{BodyId, Environment, Motion, PortalHole, Sweep};
 /// `CategorizePosition`'s ground probe, in units — the same number
 /// [`push`](super::push) uses, and for the same missing ground entity.
 const GROUND_PROBE: f32 = 2.0;
@@ -128,7 +129,34 @@ pub struct Physics {
     /// [`Carry`](super::grab::Carry) on the `Server`, because none of it is
     /// about a body.
     grab: Option<(EntityId, GrabController)>,
+    /// Which portal owns each prop that is in one —
+    /// `CPortalSimulator::GetSimulatorThatOwnsEntity`. See
+    /// [`transit`].
+    portal_owners: HashMap<BodyId, EntityId>,
     stats: PhysicsStats,
+}
+
+/// What one [`Physics::step`] did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Stepped {
+    /// Every body the solver moved, as `(entity, origin, angles)` — the
+    /// caller applies it, because writing an entity's placement has to go
+    /// through [`hierarchy`](super::hierarchy) and this module does not own
+    /// the list.
+    pub moved: Vec<(EntityId, Vec3, Vec3)>,
+    /// Every prop a portal sent to its partner this step.
+    pub teleported: Vec<Teleported>,
+}
+
+/// One prop through one portal — what `TeleportTouchingEntity` tells
+/// everyone else about: `OnEntityTeleportFromMe` on the entrance,
+/// `OnEntityTeleportToMe` on the exit, and the holding player's
+/// `ToggleHeldObjectOnOppositeSideOfPortal`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Teleported {
+    pub entity: EntityId,
+    pub entrance: EntityId,
+    pub exit: EntityId,
 }
 
 /// What the level's physics did, for `report_entities` and for the depot test.
@@ -173,6 +201,7 @@ impl Physics {
             studio_statics: Vec::new(),
             player: None,
             grab: None,
+            portal_owners: HashMap::new(),
             stats: PhysicsStats {
                 static_bodies,
                 ..Default::default()
@@ -688,14 +717,21 @@ impl Physics {
         }
     }
 
-    /// `physenv->Simulate()` followed by the `GetActiveObjects` loop.
+    /// `physenv->Simulate()`, then the portals' touch pass, then the
+    /// `GetActiveObjects` loop.
     ///
-    /// Returns what moved, as `(entity, origin, angles)` — the caller applies
-    /// it, because writing an entity's placement has to go through
-    /// [`hierarchy`](super::hierarchy) and this module does not own the list.
-    pub fn step(&mut self) -> Vec<(EntityId, Vec3, Vec3)> {
-        self.env.step();
-        self.env
+    /// `portals` is every portal that is on and linked. The ones that owned a
+    /// prop at the end of the last step cut their hole in its collision for
+    /// this one ([`PortalHole`]); then every prop is offered to every portal
+    /// — `CPortal_Base2D::Touch`, which takes ownership and teleports — and
+    /// only then is the writeback gathered, so that a prop teleported this
+    /// step is written back at the exit.
+    pub fn step(&mut self, portals: &[LinkedPortal]) -> Stepped {
+        let holes = self.owned_holes(portals);
+        self.env.step_through(&holes);
+        let teleported = self.touch_portals(portals);
+        let moved = self
+            .env
             .active()
             .filter_map(|(body, origin, angles)| {
                 let &id = self.owners.get(&body)?;
@@ -710,9 +746,163 @@ impl Physics {
                 let angles = if angles.is_finite() { angles } else { Vec3::ZERO };
                 Some((id, origin, angles))
             })
+            .collect();
+        Stepped { moved, teleported }
+    }
+
+    /// Which portal owns `body`, if any — for a test, and for `ent_dump`.
+    #[allow(dead_code)]
+    pub fn portal_owner(&self, entities: &EntityList, id: EntityId) -> Option<EntityId> {
+        let body = entities.get(id)?.core.physics?;
+        self.portal_owners.get(&body).copied()
+    }
+
+    /// The hole each owned prop is in, dropping any ownership whose body or
+    /// portal has gone — `ReleaseOwnershipOfEntity` for a portal that closed,
+    /// moved off its partner or was removed.
+    fn owned_holes(&mut self, portals: &[LinkedPortal]) -> Vec<(BodyId, PortalHole)> {
+        let env = &self.env;
+        self.portal_owners.retain(|&body, portal| {
+            env.is_free(body) && portals.iter().any(|p| p.id == *portal)
+        });
+        self.portal_owners
+            .iter()
+            .filter_map(|(&body, &owner)| {
+                let portal = portals.iter().find(|p| p.id == owner)?;
+                Some((body, portal.hole()))
+            })
             .collect()
     }
 
+    /// `CPortal_Base2D::StartTouch`, `Touch` and `EndTouch`
+    /// (`portal_base2d.cpp:707-990`) for every prop against every linked
+    /// portal, once a step.
+    ///
+    /// **Every free prop, not only the ones that moved**: a portal opened
+    /// under a sleeping cube has to take it, and waking it is part of taking
+    /// it. There are at most a handful of props and four portals in a
+    /// single-player map, and each test is a box against a hull.
+    fn touch_portals(&mut self, portals: &[LinkedPortal]) -> Vec<Teleported> {
+        let mut teleported = Vec::new();
+        if portals.is_empty() {
+            self.portal_owners.clear();
+            return teleported;
+        }
+        let props: Vec<(BodyId, EntityId)> = self
+            .owners
+            .iter()
+            .filter(|(&body, _)| self.env.is_free(body))
+            .map(|(&body, &entity)| (body, entity))
+            .collect();
+        for (body, entity) in props {
+            let Some(center) = self.world_center(body) else {
+                continue;
+            };
+            for portal in portals {
+                let (middle, rotation, half) = portal.trigger_box();
+                let touching = self.env.overlaps_oriented_box(body, middle, rotation, half);
+                let owner = self.portal_owners.get(&body).copied();
+                if touching {
+                    // `TakeOwnershipOfEntity` — only from in front, and only
+                    // if no other portal has it (`SharedEnvironmentCheck`).
+                    if owner.is_none() && portal.plane_distance(center) >= 0.0 {
+                        self.portal_owners.insert(body, portal.id);
+                        self.env.wake(body);
+                    }
+                    if self.portal_owners.get(&body) == Some(&portal.id)
+                        && self.should_teleport(body, center, portal)
+                    {
+                        if let Some(done) = self.teleport(body, entity, portal, portals) {
+                            teleported.push(done);
+                        }
+                        break;
+                    }
+                } else if owner == Some(portal.id) {
+                    // `EndTouch`: *"an object passed through the plane and
+                    // all the way out of the touch box"* goes through;
+                    // anything else is let go.
+                    if self.should_teleport(body, center, portal) {
+                        if let Some(done) = self.teleport(body, entity, portal, portals) {
+                            teleported.push(done);
+                        }
+                        break;
+                    }
+                    self.portal_owners.remove(&body);
+                }
+            }
+        }
+        teleported
+    }
+
+    /// `ShouldTeleportTouchingEntity` (`portal_base2d_shared.cpp:251`): not
+    /// moving out of the portal, centre behind the plane, and some of it in
+    /// the hole — `EntityIsInPortalHole`, which is what stops a prop that
+    /// slid *round* the edge of the portal's wall from being teleported.
+    fn should_teleport(&self, body: BodyId, center: Vec3, portal: &LinkedPortal) -> bool {
+        if self.env.velocity(body).dot(portal.forward) > 0.0 {
+            return false;
+        }
+        if portal.plane_distance(center) >= 0.0 {
+            return false;
+        }
+        let (middle, rotation, half) = portal.hole_box();
+        self.env.overlaps_oriented_box(body, middle, rotation, half)
+    }
+
+    /// `TeleportTouchingEntity` (`portal_base2d_shared.cpp:349`), the
+    /// physics-object branch: the origin and orientation through
+    /// `m_matrixThisToLinked`, the velocity rotated and then clamped into
+    /// [`transit::exit_speed_range`], and the partner takes ownership.
+    ///
+    /// > **The angular velocity is rotated too.** Valve does not touch it,
+    /// > and does not need to: IVP keeps `rot_speed` in the body's own frame,
+    /// > so a body beamed to a new orientation keeps spinning about the same
+    /// > body axes. Rapier's angular velocity is in world axes, and the same
+    /// > physical result is the old one turned by the portal.
+    fn teleport(
+        &mut self,
+        body: BodyId,
+        entity: EntityId,
+        entrance: &LinkedPortal,
+        portals: &[LinkedPortal],
+    ) -> Option<Teleported> {
+        let exit = portals.iter().find(|p| p.id == entrance.linked)?;
+        let (origin, _) = self.env.pose(body)?;
+        let rotation = self.env.rotation(body)?;
+        let turn = entrance.turn();
+        let (minimum, maximum) = transit::exit_speed_range(entrance, exit);
+        let velocity = transit::clamp_exit_velocity(
+            turn * self.env.velocity(body),
+            exit.forward,
+            minimum,
+            maximum,
+        );
+        let angular = turn * self.env.angular_velocity(body);
+        self.env.set_pose(
+            body,
+            entrance.matrix.transform_point3(origin),
+            (turn * rotation).normalize(),
+        );
+        self.env.set_velocity(body, velocity);
+        self.env.set_angular_velocity(body, angular);
+        // `m_PortalSimulator.ReleaseOwnershipOfEntity( pOther, true )` then
+        // `m_hLinkedPortal->m_PortalSimulator.TakeOwnershipOfEntity( pOther )`.
+        self.portal_owners.insert(body, exit.id);
+        Some(Teleported {
+            entity,
+            entrance: entrance.id,
+            exit: exit.id,
+        })
+    }
+
+    /// `WorldSpaceCenter()` for a prop — the middle of its collision bounds,
+    /// taken out of its own frame.
+    fn world_center(&self, body: BodyId) -> Option<Vec3> {
+        let (origin, _) = self.env.pose(body)?;
+        let rotation = self.env.rotation(body)?;
+        let (mins, maxs) = self.env.local_bounds(body)?;
+        Some(origin + rotation * ((mins + maxs) * 0.5))
+    }
 }
 
 /// Static or kinematic, for an entity that places a **studio** model.
@@ -1369,6 +1559,7 @@ mod depot {
             // Rewritten every tick inside the loop below; see there.
             vphysics_position: feet,
             teleported: false,
+            portal_entered: None,
             view_offset: crate::client::player::VEC_VIEW,
         };
         server.spawn_player(state);
@@ -1560,6 +1751,7 @@ mod depot {
                         false => mv.origin,
                     },
                     teleported: false,
+                    portal_entered: None,
                     view_offset: crate::client::player::VEC_VIEW,
                 };
                 match server.player() {
@@ -1793,6 +1985,7 @@ mod depot {
                     false => mv.origin,
                 },
                 teleported: false,
+                portal_entered: None,
                 view_offset: crate::client::player::VEC_VIEW,
             };
             state.vphysics_position = state.origin;
@@ -2098,6 +2291,7 @@ mod depot {
                 wish_velocity: Vec3::ZERO,
                 vphysics_position: mv.origin,
                 teleported: false,
+                portal_entered: None,
                 view_offset: crate::client::player::VEC_VIEW,
             };
             match server.player() {

@@ -802,6 +802,15 @@ Each of these is a decision, not an omission, and each names what would reverse 
   cube that *moves* — `prop_weighted_cube` has landed but has no vphysics, so the blocker
   is now `MOVETYPE_VPHYSICS` rather than the class. Same for
   `prop_floor_cube_button`.
+  **Half reversed** — `src/server/transit.rs`. `TeleportTouchingEntity`'s physics-object
+  branch, `ShouldTeleportTouchingEntity`, `EntityIsInPortalHole`, the portal's
+  `Touch`/`EndTouch` and `CPortalSimulator`'s *ownership* rule are ported; the cloning
+  tower is still deleted, and it did not have to come back: one Rapier contact filter
+  removes the wall inside the hole for the props a portal owns
+  (`rustdocs/VPHYSICS.md` §4e). What that costs is the clone of the far side — a prop
+  half-way through does not collide with what is behind the other portal until it is
+  teleported — and `c_portalghostrenderable.cpp`, so the half that should stick out of
+  the exit is not drawn.
 - **The recursive view** — `portalrender.cpp` (2,113) and the stencil/depth-doubler/ghost
   path (`c_portalghostrenderable.cpp`, 980). This is the module's whole visual identity
   and it is explicitly out of scope; it also wants a second camera and render target per

@@ -65,7 +65,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,304 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,314 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -166,7 +166,7 @@ before calling into a module.** This table is the index.
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning**, **skin families** and the **body-group selector** (used by the view model only). No LOD selection, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
 | `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** and **`env_fade`** and the **portal gun** (`weapon_portalgun`, all of `portal_placement.cpp`, the three placement volumes, `info_placement_helper`, the two command entities and the three commands that give it) — **64 classnames, 41,787 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md`, `portdocs/PORTALGUN.md` |
 | `src/vscript/` | **Squirrel 2.2.3, written** — the language rule for rule on a tree walker (32-bit numbers, byte strings, Lua 4.0's hash table replicated because its layout is `foreach`'s order), the standard libraries Valve registers, `Vector`, `init.nut`. **All 92 shipped scripts compile; 104 of the 106 maps run five seconds of theirs without an error.** No generators or threads, which no shipped script uses; natives whose systems are absent (`CreateSceneEntity` first) are not registered | `rustdocs/VSCRIPT.md`, `portdocs/VSCRIPT.md` |
-| `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it** — and **static props and still studio props are solid to the player**. No constraints, collision events, ragdolls or vehicles, and a held object cannot cross a portal | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
+| `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it** — and **static props and still studio props are solid to the player**. No constraints, collision events, ragdolls or vehicles. **A prop goes through a portal**, dropped or carried — a contact filter removes the wall inside a portal's hole (`rustdocs/VPHYSICS.md` §4e) | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
 
 **What that adds up to, on `sp_a1_intro1`:** the boot path is continuous from
@@ -639,6 +639,24 @@ shipped content is a bump. The gun draws in hand (`v_portalgun.mdl`, over a clea
 depth buffer, skin = the last portal fired, body 1 = the potato) and a two-colour ring
 stands in for `CHUDQuickInfo`.
 
+**Props go through portals** — `src/server/transit.rs`, `rustdocs/SERVER.md` "Props
+through portals", `rustdocs/VPHYSICS.md` §4e — so a cube dropped into a floor portal
+comes out of its partner, and a carried cube can be pushed into a portal and held across
+the pair. It needed **none of `CPortalSimulator`'s cloning tower**
+(`physicsshadowclone.cpp`, `physicsclonearea.cpp`, ~2,900 lines stay deleted): Valve
+gives each portal a physics environment with the wall carved away, and one Rapier
+contact-modification hook does the same job by dropping, for each prop a portal owns,
+every contact with fixed or kinematic geometry inside the portal's hole. The ownership
+rule is Valve's — taken only while the prop's centre is in front of the plane, which is
+what stops a cube on a floor over a ceiling portal falling through the slab — and so are
+the teleport test, the exit speeds (225 floor-to-floor, 50 into a floor, 1000 at most)
+and the held-object toggle. **The finding that cost a debugging round:** the grab
+controller reads the body's *friction snapshot* to slide along what it is touching, and
+Rapier's narrow phase still listed the carved-away wall, so a carried cube stopped dead
+at the plane of the hole it was being pushed into; a carved manifold is now marked and
+left out. On `sp_a1_intro1` the shipped cube, woken by a portal opened under it, crosses
+a floor-to-floor pair four times before it comes to rest on a portal's rim.
+
 - **The unported entity classes.** `rustdocs/SERVER.md`, "What the maps place that is
   not here", lists all 141 classnames the shipped maps place that have no class here.
   That is 19,138 of the 60,925 blocks. Each classname has its C++ source (or "none"),
@@ -684,13 +702,11 @@ stands in for `CHUDQuickInfo`.
   entity still draws every model of every part. 959 of 968 models have exactly one body
   part, so it is near-vestigial on props and matters for characters. The `body` key and
   `SetBodyGroup` are what would carry it.
-- **A physics prop that can cross a portal**, which is what the grab controller
-  stopped short of (`portdocs/VPHYSICS_GRAB.md` §9) and is **not** a grab-controller gap:
-  nothing but the *player* teleports here at all, because `handle_portalling` lives in
-  `client/movement.rs` and takes a `MoveData`. Until a cube can go through an oval on its
-  own, the ~300 lines of portal branches in `UpdateObject`, `ComputeError`,
-  `AttachEntity` and `CheckPortalOscillation` have nothing to stand on. Fix the teleport
-  first; the grab's half is then the target transform and little else.
+- **What a prop going through a portal still lacks** (`rustdocs/SERVER.md`, "Props
+  through portals"): the half of a cube that sticks out of the exit is not drawn
+  (`c_portalghostrenderable.cpp`), a cube half-way through does not collide with what is
+  behind the other portal, and an object cannot be picked up *through* a portal. The
+  first is the visible one.
 - **Fog** — which the sky just promoted to the largest thing missing from the picture.
   `fogparams_t`, `env_fog_controller`, `CSkyboxView::Enable3dSkyboxFog` and one uniform
   every shader's flag word is already carrying a `NO_FOG` bit for. **Five of the game's

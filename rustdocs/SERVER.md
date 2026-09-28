@@ -379,6 +379,7 @@ pub struct PlayerState {
     pub vphysics_position: Vec3, // m_vNewVPhysicsPosition — where the shadow is sent
     pub view_offset: Vec3,     // m_vecViewOffset; the eye is origin + this
     pub teleported: bool,      // in only: went through a portal (gotcha 45)
+    pub portal_entered: Option<u64>, // in only: which portal, as PortalState::id (gotcha 115)
 }
 ```
 
@@ -1763,6 +1764,7 @@ pub struct Carry {
     pub radius: f32,
     pub up_offset: f32,
     pub floor_bump: f32,
+    pub through: Option<EntityId>, // held across this portal — "Props through portals"
 }
 
 /// `CBasePlayer::CanPickupObject` with Portal 2's 85 kg / 128 unit limits.
@@ -1770,7 +1772,9 @@ pub fn can_pickup(mass: f32, size: Vec3, standing_on_it: bool) -> bool;
 
 /// `CGrabController::UpdateObject`'s geometry — where a held object's
 /// **origin** and orientation should be this tick.
-pub fn hold_placement(&Hold, floor_bump: &mut f32, &mut dyn TouchQuery) -> (Vec3, Quat);
+/// In the player's space; the reach trace goes through a linked portal.
+pub fn hold_placement(&Hold, floor_bump: &mut f32, &mut dyn TouchQuery,
+                      portals: &[LinkedPortal], through: Option<&LinkedPortal>) -> (Vec3, Quat);
 
 /// The eleven rays `CPortal_Player::FindUseEntity` casts, in order.
 pub fn use_rays(eye: Vec3, view: Vec3) -> Vec<(Vec3, Vec3, f32)>;
@@ -2055,6 +2059,21 @@ pub fn bump_weapon(&mut self, weapon: EntityId);  // a player walked into a gun
 pub fn obb_intersects_obb(/* origin, angles, mins, maxs — twice */) -> bool; // 15 separating axes
 // physics.rs
 impl Physics { pub fn sweep_studio(&self, start: Vec3, end: Vec3) -> Option<Sweep> } // still studio bodies only
+impl Physics { pub fn step(&mut self, portals: &[LinkedPortal]) -> Stepped }          // step, portal touch, writeback
+pub struct Stepped { pub moved: Vec<(EntityId, Vec3, Vec3)>, pub teleported: Vec<Teleported> }
+pub struct Teleported { pub entity: EntityId, pub entrance: EntityId, pub exit: EntityId }
+// transit.rs — props through portals
+pub struct LinkedPortal { pub id, pub linked: EntityId, pub origin, pub forward, pub right, pub up: Vec3,
+                          pub rotation: Quat, pub half_width, pub half_height: f32, pub matrix: Mat4 }
+impl LinkedPortal { plane_distance, is_floor, hole, trigger_box, hole_box, turn, entered_by }
+pub fn linked_portals(&EntityList) -> Vec<LinkedPortal>;          // on, and partner on
+pub fn exit_speed_range(entrance: &LinkedPortal, exit: &LinkedPortal) -> (f32, f32);
+pub fn clamp_exit_velocity(velocity: Vec3, exit_forward: Vec3, minimum: f32, maximum: f32) -> Vec3;
+pub fn held_object_teleported(through: Option<EntityId>, portal: &LinkedPortal) -> Option<EntityId>;
+pub fn player_teleported(through: Option<EntityId>, portal: &LinkedPortal) -> Option<EntityId>;
+pub fn trace_line_through(&mut dyn TouchQuery, &[LinkedPortal], start: Vec3, end: Vec3) -> f32;
+pub const HOLE_DEPTH: f32;        // 64
+pub const EXIT_SPEED_MAX: f32;    // 1000
 // classes/weapon.rs, classes/volume.rs, classes/portal.rs
 pub struct WeaponPortalgun { pub can_fire_portal1: bool, pub can_fire_portal2: bool, pub owner: Option<EntityId>,
                              pub last_fired_portal: u8, pub potato: bool, /* delays, portals */ }
@@ -3131,6 +3150,24 @@ the arm's origin start at 91.
     because their `$surfaceprop`'s `gamematerial` is `Y`. A `ShotHit` whose
     `game_material` is 0 is not glass, so a harness that leaves it unresolved
     accepts portals on windows.
+114. **A portal only takes a prop whose centre is in front of it.** Ownership
+    — the thing that removes the wall inside the hole — is taken when the
+    prop's collision overlaps the portal's one-sided trigger box *and* its
+    centre is on the room side of the plane. Drop that second condition and a
+    cube resting on a floor over a ceiling portal (whose hole reaches up
+    through the slab) falls through it. One portal owns a prop at a time.
+115. **A player teleport must say which portal.** `PlayerState::teleported`
+    is enough for the trigger sweep, but a carried object's side of the pair
+    flips when the player goes through, and flipping it needs the portal —
+    `portal_entered`, the entered portal's `PortalState::id`, which
+    `set_player_state` resolves through `transit::portal_by_key`. A test that
+    builds a `PlayerState` by hand passes `None`.
+116. **The carry target is in the player's space.** `hold_placement` answers
+    as though the portal pair were not there — its reach trace goes *through*
+    a portal and carries straight on — and `drive_carry` takes the answer
+    through `Carry::through`'s matrix to where the object is. A portal that
+    closes or loses its partner while something is held across it drops the
+    object, forced: *"If the portal isn't linked we need to drop the object"*.
 
 ---
 
@@ -3670,6 +3707,8 @@ case values.
 | Test | Guards |
 |---|---|
 | `placement::tests::*` (14) | `portal_placement.cpp` case by case on a fixture: a clean shot, the edge bump, the floor snap, no-portal and glass and sky surfaces, a shot at nothing, a no-portal strip, a wall too narrow, another portal, a no-portal volume from outside and inside, a fizzler, a placement helper, the OBB test |
+| `transit::tests::*` (10) | the exit-speed range and clamp, the held-side toggle, a line entering a portal, the hold trace through a portal, a cube dropped into a floor portal out of a wall portal with both outputs once, an unlinked portal holding a cube, the far side of a portal's wall (gotcha 114), a carried cube pushed into a portal and back out (gotcha 116) |
+| `transit::tests::the_cube_on_sp_a1_intro1_falls_between_two_floor_portals` (depot) | the shipped cube, woken by a portal opened under it, through a floor-to-floor pair on the map's own displacement floor |
 | `portalgun::tests::*` (8) | the three commands and their order, `give weapon_portalgun` and the incinerator, the floor pickup, both command entities, the fire buttons and delays, the held-button repeat, a fizzler switched on and off (gotchas 109, 110) |
 | `tests::a_button_pressed_between_ticks_reaches_the_next_one` | gotcha 108 |
 | `tests::sp_a1_intro4_gives_the_gun_on_its_own_scripts_and_the_gun_places_portals` (depot) | the whole path from `sp_transition_list.nut` to a blue portal on a real wall: `give_portalgun` twice, then 72 shots — 52 bumped, 3 can't fit, 17 invalid surfaces |
@@ -5705,3 +5744,77 @@ a field, cubes are not dissolved), `func_portal_detector`, the gun's effects and
 sounds, `FVisible`'s pickup trace, a dropped gun's physics, paint, and co-op's
 partner-portal and pedestal cases (`OverlapPartnerPortal` and
 `PlacedBy::Pedestal` exist and are unreachable).
+
+### Props through portals — `transit.rs`
+
+`transit.rs` plus `Physics::step`, and the contact filter under both in
+`vphysics::env` (`rustdocs/VPHYSICS.md` §4e). **A cube goes through a portal**:
+dropped into one, pushed into one, or carried into one, it comes out of the
+partner with its origin, orientation, velocity and spin taken through
+`m_matrixThisToLinked`, and the two portals fire `OnEntityTeleportFromMe` and
+`OnEntityTeleportToMe`. It is `CPortal_Base2D::Touch`, `EndTouch`,
+`ShouldTeleportTouchingEntity` and the physics-object branch of
+`TeleportTouchingEntity`, with `CPortalSimulator`'s ownership rule and not its
+cloning tower.
+
+**The tick.** `Server::step_physics` builds `transit::linked_portals` — every
+portal that is on and whose partner is on — and hands it to `Physics::step`,
+which:
+
+1. **steps with holes cut**: each prop a portal owned at the end of the last
+   step does not collide with fixed or kinematic geometry inside that
+   portal's rectangle, `HOLE_DEPTH` (64 units) deep;
+2. **runs the portals' touch pass** over *every* free prop, moved or not — a
+   portal opened under a sleeping cube has to take it, and wakes it:
+   - touching the trigger box with its centre in front and no other owner →
+     the portal takes it (gotcha 114);
+   - owned, centre behind the plane, not moving out, some of it in the hole
+     box → teleported, and the partner takes it;
+   - owned but no longer touching → teleported if it qualifies, otherwise let
+     go (`EndTouch`);
+3. **gathers the writeback after the teleports**, so a teleported prop's
+   entity lands at the exit — and its trigger sweep starts there rather than
+   sweeping the gap between the two portals.
+
+`Server::after_prop_teleports` fires the two outputs, activator and caller the
+portal itself (`FireOutput( this, this )`), and toggles the carry.
+
+**The exit velocity** is `GetExitSpeedRange` for a non-player: at most 1000;
+out of a floor portal at least 225 from a floor and 50 from anywhere else;
+nothing otherwise. Below the minimum it is *scaled* up in the direction it was
+going (a still prop gets `exit_forward × minimum`) — unlike the player's, which
+adds along the exit. **The spin is rotated too**, which Valve does not write
+because IVP keeps angular velocity in the body's frame and Rapier keeps it in
+the world's.
+
+**Carrying across a portal.** `Carry::through` is
+`m_bHeldObjectOnOppositeSideOfPortal` and `m_hHeldObjectPortal` in one field:
+the portal on the *player's* side through which the object is being held.
+`hold_placement` works in the player's space with a reach trace that goes
+through a portal (`trace_line_through`, `UTIL_Portal_TraceRay`), so a target a
+little past a portal's plane pulls the cube into it; once through, the target is
+taken through `through`'s matrix. The field toggles exactly as Valve's bool
+does — on the object going through (`held_object_teleported`: set to the
+entrance) and on the player going through (`player_teleported`: set to the exit
+they came out of) — so turning round with a cube held across a portal pulls it
+back out. `portal_entered` on `PlayerState` is how the player half learns which
+portal (gotcha 115).
+
+Measured: a cube dropped 200 units onto a floor portal comes out of a wall
+portal within a second and lands on the floor between the two; carried into a
+wall portal it hovers over the partner, held, and comes back when the player
+turns round; on `sp_a1_intro1` the shipped cube, woken by a portal opened under
+it, crosses a floor-to-floor pair four times before it comes to rest across a
+portal's rim.
+
+**Not here:**
+- the clone of the far side — a prop half-way through does not collide with
+  what is behind the other portal until its centre crosses;
+- `c_portalghostrenderable.cpp`, so the half behind the entrance draws inside
+  the wall and nothing sticks out of the exit until the teleport;
+- `CheckPortalOscillation`, `ComputeError`'s portal multiplier, and picking an
+  object up *through* a portal;
+- mobile portals, `sv_portal_high_speed_physics_early_untouch`, and every
+  teleportable class but the cube (`prop_physics`, turrets, energy balls — none
+  is a class here yet).
+

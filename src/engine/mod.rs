@@ -1605,6 +1605,7 @@ fn player_state(client: &Client) -> server::PlayerState {
         wish_velocity: player.wish_velocity,
         vphysics_position: player.vphysics_position,
         teleported: player.teleported,
+        portal_entered: player.portal_entered,
     }
 }
 
@@ -1618,6 +1619,7 @@ fn apply_player_state(client: &mut Client, state: server::PlayerState) {
     let player = client.player_mut();
     // The server has latched any portal crossing onto the entity by now.
     player.teleported = false;
+    player.portal_entered = None;
     player.origin = state.origin;
     player.velocity = state.velocity;
     player.base_velocity = state.base_velocity;
