@@ -455,7 +455,12 @@ fn the_cube_on_sp_a1_intro1_falls_between_two_floor_portals() {
     server.level_init("sp_a1_intro1", &bsp.entities(), &bsp.models);
     let names: Vec<String> = server.model_entities().into_iter().map(|e| e.model).collect();
     built.add_models(&names, &vfs);
+    built.add_models(&server.precache_models(), &vfs);
     server.set_physics(built.environment, built.models, built.brush_models);
+    // The cube is a dropper's — see `physics::depot::drop_the_cube`.
+    let relay = named(&server, "drop_box_rl");
+    server.accept_input(relay, "Trigger", crate::server::io::Variant::Void, None, None, 0);
+    run(&mut server, 1);
     let cube = named(&server, "box");
 
     // Let it drop out of its dropper and go to sleep.

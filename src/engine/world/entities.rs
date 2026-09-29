@@ -417,6 +417,10 @@ pub struct EntityModels {
     /// [`Instance::id`] to its index, so that a sync is a lookup rather than a
     /// scan over a map's several hundred instances.
     by_id: HashMap<u64, usize>,
+    /// Each loaded model by lowercased name — what lets
+    /// [`sync`](EntityModels::sync) place an entity made after the level
+    /// loaded, whose model was loaded ahead of it.
+    by_name: HashMap<String, usize>,
     /// The black colour stream every instance binds in slot 1.
     ///
     /// An entity model has no `.vhv` — `vrad` bakes per-vertex lighting for
@@ -452,6 +456,7 @@ impl EntityModels {
         materials: &mut MaterialCache,
         device: &wgpu::Device,
         entities: &[ModelEntity],
+        precache: &[String],
         lighting: &LightCache,
         collision: &CollisionBsp,
     ) -> EntityModels {
@@ -470,7 +475,27 @@ impl EntityModels {
         let mut from_include: Vec<bool> = Vec::new();
         let mut attachments = AttachmentModels::default();
 
-        for entity in entities {
+        // Models to have ready without placing them — `PerformPrecache`, for
+        // what a `point_template` makes later. Loaded through the same path
+        // as a placed model, and placed by nothing.
+        let precached: Vec<ModelEntity> = precache
+            .iter()
+            .map(|model| ModelEntity {
+                id: u64::MAX,
+                model: model.clone(),
+                origin: Vec3::ZERO,
+                angles: Vec3::ZERO,
+                skin: 0,
+                visible: false,
+                sequence: String::new(),
+                cycle: 0.0,
+                anim_time: 0.0,
+                playback_rate: 0.0,
+                modulation: [1.0; 4],
+            })
+            .collect();
+        let listed = entities.iter().map(|e| (e, true));
+        for (entity, placed) in listed.chain(precached.iter().map(|e| (e, false))) {
             let key = entity.model.to_ascii_lowercase();
             let slot = *by_name.entry(key).or_insert_with(|| {
                 let model = match StudioModel::load(vfs, &entity.model) {
@@ -522,6 +547,9 @@ impl EntityModels {
             });
 
             let Some(slot) = slot else { continue };
+            if !placed {
+                continue;
+            }
             let model = &models[slot];
             stats.instances += 1;
             if model.bones.len() > 1 {
@@ -567,6 +595,10 @@ impl EntityModels {
 
         EntityModels {
             by_id,
+            by_name: by_name
+                .into_iter()
+                .filter_map(|(name, slot)| Some((name, slot?)))
+                .collect(),
             unlit: (widest > 0).then(|| {
                 VertexBuffer::new(
                     device,
@@ -609,11 +641,38 @@ impl EntityModels {
     /// **The placement is taken too**, so that an entity model on a moving
     /// platform follows it — its *lighting* does not, which is the limitation
     /// [`load`](EntityModels::load) records.
-    pub fn sync(&mut self, entities: &[ModelEntity]) {
+    ///
+    /// **An id it has not seen is placed**, if its model was loaded — either
+    /// because another entity places it or because it was precached. That is
+    /// an entity made after the level loaded; the new ones come back as
+    /// `(id, origin)`, lit fullbright until the caller relights them.
+    pub fn sync(&mut self, entities: &[ModelEntity]) -> Vec<(u64, Vec3)> {
         for instance in &mut self.instances {
             instance.visible = false;
         }
+        let mut new = Vec::new();
         for entity in entities {
+            if !self.by_id.contains_key(&entity.id) {
+                let Some(&slot) = self.by_name.get(&entity.model.to_ascii_lowercase()) else {
+                    continue;
+                };
+                self.by_id.insert(entity.id, self.instances.len());
+                self.instances.push(Instance {
+                    id: entity.id,
+                    model: slot,
+                    transform: Mat4::IDENTITY,
+                    visible: false,
+                    sequence: 0,
+                    skin: 0,
+                    cycle: 0.0,
+                    anim_time: 0.0,
+                    playback_rate: 0.0,
+                    modulation: [1.0; 4],
+                    lighting: ModelLighting::fullbright(),
+                    body: None,
+                });
+                new.push((entity.id, entity.origin));
+            }
             let Some(&at) = self.by_id.get(&entity.id) else {
                 continue;
             };
@@ -630,6 +689,7 @@ impl EntityModels {
             instance.playback_rate = entity.playback_rate;
             instance.modulation = entity.modulation;
         }
+        new
     }
 
     /// Chooses `m_nBody` for one instance — `R_StudioSetupModel`'s
@@ -1349,7 +1409,7 @@ mod tests {
             println!("  {} at {:?} angles {:?}", p.model, p.origin, p.angles);
         }
 
-        world.load_entity_models(&vfs, &mut materials, &device, &placements);
+        world.load_entity_models(&vfs, &mut materials, &device, &placements, &server.precache_models());
         println!("{}", world.entity_models.summary());
         assert_eq!(world.entity_models.stats.models_missing, 0);
         assert!(world.entity_models.stats.animated > 0, "nothing to animate");
@@ -1548,7 +1608,7 @@ mod tests {
         // One of them, drawn on its own so that nothing else can be what
         // changed.
         let door = placements[0].clone();
-        world.load_entity_models(&vfs, &mut materials, &device, std::slice::from_ref(&door));
+        world.load_entity_models(&vfs, &mut materials, &device, std::slice::from_ref(&door), &[]);
         assert_eq!(world.entity_models.stats.models_missing, 0);
         assert_eq!(
             world.entity_models.stats.models_skinned, 0,
@@ -1886,7 +1946,7 @@ mod tests {
                 modulation: e.modulation,
             })
             .collect();
-        world.load_entity_models(&vfs, &mut materials, &device, &placements);
+        world.load_entity_models(&vfs, &mut materials, &device, &placements, &server.precache_models());
 
         // What the whole map says, before the three under test: how many of
         // its models are posed differently by sequence 0 than by their bind

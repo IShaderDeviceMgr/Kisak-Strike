@@ -35,19 +35,38 @@
 //! vanish. Before this class existed the field drew because *nobody* owned
 //! the model, which also meant a switched-off fizzler kept drawing.
 //!
-//! # What is not here
+//! # The cleanser's touch
 //!
-//! The cleanser's own behaviour — fizzling the player's portals when they walk
-//! through it, dissolving a cube, `FizzleTouchingPortals` (8 connections),
-//! `OnDissolve` (22) and the rest of its outputs — is `CTriggerPortalCleanser`,
-//! whose source is not in this tree. What is here is the fizzler as the
-//! *portal gun* sees it: a shot stops at an enabled one.
+//! `CTriggerPortalCleanser` is a `CBaseTrigger` — its spawnflags are the
+//! trigger filter bits (4105, clients and physics objects, on 117 of the 371;
+//! 4104, physics objects only, on 47; 4097, clients only, on 36) and three
+//! name a `filtername` — so it holds a [`BaseTrigger`] and passes its filters
+//! before anything else. Its source is not in this tree; what it does is
+//! reconstructed from the FGD (`bin/portal.fgd:111`, *"disolves any entities
+//! that touch it and fizzles active portals when the player touches it"*), the
+//! two places the tree calls into it (`CPropWeightedCube::InputDissolve` →
+//! `FizzleBaseAnimating`) and the maps' own wiring:
+//!
+//! - **the player** touching an enabled cleanser loses the portals their gun
+//!   has placed, and the cleanser fires `OnFizzle` if any went;
+//! - **a cube** touching one is dissolved — its own `OnFizzled`, then the
+//!   cleanser's `OnDissolve` (22 connections) and, for a cube named `Box`,
+//!   `OnDissolveBox` (none);
+//! - **`FizzleTouchingPortals`** (8 connections) fizzles every portal inside
+//!   the volume.
+//!
+//! All three reach past the cleanser — the gun, the carry, the cube's class —
+//! so each is asked for through [`Context::cleanse`] and done by the server.
+//! What is still absent is the *look*: the cube's fizzle is instant, with no
+//! float, no fade and no particles.
 
-use crate::server::class::{Behaviour, Context, InputDef, InputDefs, SpawnResult};
-use crate::server::entity::EntityCore;
+use crate::server::class::{Behaviour, Cleanse, Context, InputDef, InputDefs, SpawnResult};
+use crate::server::classes::trigger::BaseTrigger;
+use crate::server::entity::{EntityCore, EntityId};
 use crate::server::io::{FieldType, Input};
 use crate::server::keyvalue::{atof, atoi};
-use crate::server::movement::{Solid, EF_NODRAW, FSOLID_NOT_SOLID, FSOLID_TRIGGER};
+use crate::server::movement::{Solid, EF_NODRAW, FSOLID_NOT_SOLID};
+use crate::server::classes::prop::WeightedCube;
 use crate::server::placement::BumperKind;
 
 /// `SF_START_INACTIVE` on a no-portal volume or a bumper.
@@ -62,6 +81,9 @@ pub struct PortalVolume {
     /// The cleanser's `Visible` key — whether its brushes are the field you
     /// see. Meaningless for the other two, which never draw.
     visible: bool,
+    /// The cleanser's `CBaseTrigger` — its filters, its touch list, its
+    /// `Enable`/`Disable`. Unused by the other two.
+    trigger: BaseTrigger,
 }
 
 /// `Activate`/`Deactivate`/`Toggle` — the no-portal volume's and the bumper's.
@@ -71,16 +93,20 @@ pub static VOLUME_INPUTS: InputDefs = &[
     InputDef::new("Toggle", FieldType::Void),
 ];
 
-/// `Enable`/`Disable`/`Toggle` — `CBaseTrigger`'s, which the cleanser has.
+/// The cleanser's inputs: its own and `CBaseTrigger`'s.
 pub static CLEANSER_INPUTS: InputDefs = &[
+    InputDef::new("FizzleTouchingPortals", FieldType::Void),
     InputDef::new("Enable", FieldType::Void),
     InputDef::new("Disable", FieldType::Void),
     InputDef::new("Toggle", FieldType::Void),
+    InputDef::new("TouchTest", FieldType::Void),
+    InputDef::new("StartTouch", FieldType::Void),
+    InputDef::new("EndTouch", FieldType::Void),
 ];
 
 /// The cleanser's keys, as the maps write them. `UseScanline` (312) is a
 /// look and is read by nothing here.
-pub static CLEANSER_KEYS: &[&str] = &["StartDisabled", "Visible", "UseScanline"];
+pub static CLEANSER_KEYS: &[&str] = &["StartDisabled", "Visible", "UseScanline", "filtername"];
 
 /// The cleanser's outputs, declared so that the shipped connections parse as
 /// outputs. None can fire; see the module docs.
@@ -103,6 +129,7 @@ impl PortalVolume {
             kind: BumperKind::NoPortalVolume,
             active: true,
             visible: false,
+            trigger: BaseTrigger::default(),
         })
     }
 
@@ -111,6 +138,7 @@ impl PortalVolume {
             kind: BumperKind::Bumper,
             active: true,
             visible: false,
+            trigger: BaseTrigger::default(),
         })
     }
 
@@ -119,26 +147,43 @@ impl PortalVolume {
             kind: BumperKind::Cleanser,
             active: true,
             visible: false,
+            trigger: BaseTrigger::default(),
         })
     }
 
-    /// Switches it. For a cleanser that is also `CBaseTrigger::Enable`/`Disable`
-    /// — a disabled trigger is not a trigger at all, `FSOLID_TRIGGER` comes
-    /// off — and, for a visible one, showing or hiding the field.
-    fn set_active(&mut self, entity: &mut EntityCore, active: bool) {
+    /// Switches a no-portal volume or a bumper — `IsActive()`.
+    fn set_active(&mut self, active: bool) {
         self.active = active;
-        if self.kind != BumperKind::Cleanser {
-            return;
-        }
-        match active {
-            true => entity.solid_flags |= FSOLID_TRIGGER,
-            false => entity.solid_flags &= !FSOLID_TRIGGER,
-        }
+    }
+
+    /// A cleanser's state after anything changed its trigger: placement's
+    /// `IsEnabled()` is `!m_bDisabled`, and a visible cleanser shows its
+    /// field exactly while it is enabled.
+    fn sync_cleanser(&mut self, entity: &mut EntityCore) {
+        self.active = !self.trigger.is_disabled();
         if self.visible {
-            match active {
+            match self.active {
                 true => entity.effects &= !EF_NODRAW,
                 false => entity.effects |= EF_NODRAW,
             }
+        }
+    }
+
+    /// The cleanser's own `Touch`: filters, then who it is.
+    fn cleanse(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        if self.trigger.is_disabled() || !self.trigger.passes_trigger_filters(entity, other, cx) {
+            return;
+        }
+        let cleanser = entity.id();
+        if cx.player() == Some(other) {
+            cx.cleanse(Cleanse::Player { cleanser, player: other });
+            return;
+        }
+        let dissolvable = cx
+            .entity(other)
+            .is_some_and(|e| !e.core.removed && e.behaviour.downcast_ref::<WeightedCube>().is_some());
+        if dissolvable {
+            cx.cleanse(Cleanse::Prop { cleanser, prop: other });
         }
     }
 }
@@ -148,8 +193,8 @@ impl Behaviour for PortalVolume {
         if self.kind != BumperKind::Cleanser {
             return false;
         }
-        if key.eq_ignore_ascii_case("StartDisabled") {
-            self.active = atoi(value) == 0;
+        if self.trigger.key_value(key, value) {
+            self.active = !self.trigger.is_disabled();
             return true;
         }
         if key.eq_ignore_ascii_case("Visible") {
@@ -168,17 +213,9 @@ impl Behaviour for PortalVolume {
     fn spawn(&mut self, entity: &mut EntityCore, _cx: &mut Context<'_>) -> SpawnResult {
         match self.kind {
             BumperKind::Cleanser => {
-                // `InitTrigger` (`triggers.cpp:327`): `SOLID_VPHYSICS` under a
-                // parent, `SOLID_BSP` otherwise, never solid, and a trigger
-                // only while enabled.
-                entity.solid = match entity.parent() {
-                    Some(_) => Solid::VPhysics,
-                    None => Solid::Bsp,
-                };
-                entity.solid_flags |= FSOLID_NOT_SOLID;
-                entity.effects |= EF_NODRAW;
-                let active = self.active;
-                self.set_active(entity, active);
+                self.trigger.spawn(entity);
+                self.trigger.init_trigger(entity);
+                self.sync_cleanser(entity);
             }
             BumperKind::NoPortalVolume | BumperKind::Bumper => {
                 self.active = !entity.has_spawn_flags(SF_START_INACTIVE);
@@ -190,34 +227,67 @@ impl Behaviour for PortalVolume {
         SpawnResult::Ok
     }
 
+    fn activate(&mut self, _entity: &mut EntityCore, cx: &mut Context<'_>) {
+        if self.kind == BumperKind::Cleanser {
+            self.trigger.activate(cx);
+        }
+    }
+
+    fn start_touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        if self.kind == BumperKind::Cleanser {
+            self.trigger.start_touch(entity, other, cx);
+        }
+    }
+
+    fn touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        if self.kind == BumperKind::Cleanser {
+            self.cleanse(entity, other, cx);
+        }
+    }
+
+    fn end_touch(&mut self, entity: &mut EntityCore, other: EntityId, cx: &mut Context<'_>) {
+        if self.kind == BumperKind::Cleanser {
+            self.trigger.end_touch(entity, other, cx);
+        }
+    }
+
     fn accept_input(
         &mut self,
         entity: &mut EntityCore,
         input: &Input<'_>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> bool {
-        let (on, off) = match self.kind {
-            BumperKind::Cleanser => ("Enable", "Disable"),
-            _ => ("Activate", "Deactivate"),
-        };
-        if input.name.eq_ignore_ascii_case(on) {
-            self.set_active(entity, true);
+        if self.kind == BumperKind::Cleanser {
+            if input.name.eq_ignore_ascii_case("FizzleTouchingPortals") {
+                cx.cleanse(Cleanse::TouchingPortals { cleanser: entity.id() });
+                return true;
+            }
+            let handled = self.trigger.accept_input(entity, input, cx);
+            self.sync_cleanser(entity);
+            return handled;
+        }
+        if input.name.eq_ignore_ascii_case("Activate") {
+            self.set_active(true);
             return true;
         }
-        if input.name.eq_ignore_ascii_case(off) {
-            self.set_active(entity, false);
+        if input.name.eq_ignore_ascii_case("Deactivate") {
+            self.set_active(false);
             return true;
         }
         if input.name.eq_ignore_ascii_case("Toggle") {
             let active = !self.active;
-            self.set_active(entity, active);
+            self.set_active(active);
             return true;
         }
         false
     }
 
     fn describe(&self) -> Vec<(&'static str, String)> {
-        vec![("active", self.active.to_string())]
+        let mut out = vec![("active", self.active.to_string())];
+        if self.kind == BumperKind::Cleanser {
+            out.extend(self.trigger.describe());
+        }
+        out
     }
 }
 

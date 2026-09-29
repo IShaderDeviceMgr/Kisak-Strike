@@ -1184,12 +1184,14 @@ impl World {
         materials: &mut MaterialCache,
         device: &wgpu::Device,
         entities: &[ModelEntity],
+        precache: &[String],
     ) {
         self.entity_models = EntityModels::load(
             vfs,
             materials,
             device,
             entities,
+            precache,
             &self.lighting,
             &self.collision,
         );
@@ -1227,6 +1229,7 @@ impl World {
             materials,
             device,
             &[entity],
+            &[],
             &self.lighting,
             &self.collision,
         );
@@ -1255,7 +1258,7 @@ impl World {
             }
             _ => (pose.sequence, pose.started_at),
         };
-        self.view_model.sync(&[ModelEntity {
+        let _ = self.view_model.sync(&[ModelEntity {
             id: 0,
             model: String::new(),
             origin: pose.eye,
@@ -1278,7 +1281,17 @@ impl World {
     /// once a frame — the animated counterpart of
     /// [`sync_brush_models`](World::sync_brush_models).
     pub fn sync_entity_models(&mut self, entities: &[ModelEntity]) {
-        self.entity_models.sync(entities);
+        // An entity made since the level loaded — a template's — is lit where
+        // it first appears, as a loaded one is lit where it was placed.
+        let new = self.entity_models.sync(entities);
+        if new.is_empty() {
+            return;
+        }
+        let mut tracer = self.collision.tracer();
+        for (id, origin) in new {
+            let lighting = self.lighting.lighting_at(&mut tracer, origin);
+            self.entity_models.relight(id, lighting);
+        }
     }
 
     /// Takes every brush entity's placement from whoever owns it — the game

@@ -148,7 +148,7 @@ const FL_NPC: u32 = 1 << 14;
 
 /// `CBaseTrigger` (`triggers.cpp:109`) — held, not inherited, by all five
 /// classes.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BaseTrigger {
     /// `m_bDisabled` — the `StartDisabled` key, and then whatever
     /// `Enable`/`Disable` last said.
@@ -279,6 +279,11 @@ impl BaseTrigger {
         if entity.has_spawn_flags(SF_TRIG_TOUCH_DEBRIS) {
             entity.add_solid_flags(FSOLID_TRIGGER_TOUCH_DEBRIS);
         }
+    }
+
+    /// `m_bDisabled` — see the field.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     /// `CBaseTrigger::Activate` (`triggers.cpp:232`) — resolve `filtername`.

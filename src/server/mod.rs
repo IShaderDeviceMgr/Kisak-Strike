@@ -87,6 +87,8 @@ pub mod sequences;
 pub mod think;
 pub mod touch;
 pub mod transit;
+mod cleanse;
+mod templates;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -240,6 +242,21 @@ pub struct Server {
     /// Whether [`Server::level_init`] is between its spawn pass and its
     /// activate pass, which is what makes the field above meaningful.
     level_loading: bool,
+    /// The map's brush models' bounds, by `"*N"` index — `UTIL_SetModel` for
+    /// an entity made after load, which is a template's.
+    brush_model_bounds: Vec<ModelBounds>,
+    /// Brush models whose entity became a template at load and is not in the
+    /// map until something spawns it — see
+    /// [`is_templated_brush_model`](Server::is_templated_brush_model).
+    templated_brush_models: Vec<usize>,
+    /// `g_iCurrentTemplateInstance` — the number each template instance's
+    /// names are made unique with.
+    template_instance: u32,
+    /// [`Context::spawn_template`] and [`Context::cleanse`] requests not yet
+    /// served, and the guard that makes the outermost dispatch serve them.
+    pending_template_spawns: Vec<class::TemplateSpawn>,
+    pending_cleanses: Vec<class::Cleanse>,
+    serving_requests: bool,
     /// Damage [`Context::take_damage`] queued and that has not been applied
     /// yet — `TakeDamage`, deferred by one dispatch. See
     /// [`Server::flush_damage`].
@@ -901,6 +918,10 @@ pub struct LevelStats {
     /// that makes `spawned + removed_on_spawn` differ from `matched`, and a
     /// silent difference there would look like an entity going missing.
     pub created: usize,
+    /// Entities a `point_template` turned into a template at load and took out
+    /// of the map — `MapEntity_ParseAllEntites_SpawnTemplates`. They exist
+    /// again only when something fires `ForceSpawn`.
+    pub templated: usize,
     /// Output connections parsed.
     pub outputs: usize,
     /// Entities that named a parent, and how many of those resolved.
@@ -1020,6 +1041,12 @@ impl Server {
             pending_spawn: Vec::new(),
             spawning: false,
             created_while_loading: Vec::new(),
+            brush_model_bounds: Vec::new(),
+            templated_brush_models: Vec::new(),
+            template_instance: 0,
+            pending_template_spawns: Vec::new(),
+            pending_cleanses: Vec::new(),
+            serving_requests: false,
             level_loading: false,
             pending_damage: Vec::new(),
             damaging: false,
@@ -1074,8 +1101,17 @@ impl Server {
         };
         // `HierarchicalSpawn_t` — everything queued for the sorted pass.
         let mut spawn_list: Vec<EntityId> = Vec::with_capacity(blocks.len());
+        // Which block each entity came from, for the templates.
+        let mut block_of: Vec<(EntityId, usize)> = Vec::with_capacity(blocks.len());
+        self.brush_model_bounds = models
+            .iter()
+            .map(|model| ModelBounds {
+                mins: glam::Vec3::from(model.mins),
+                maxs: glam::Vec3::from(model.maxs),
+            })
+            .collect();
 
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
             let Some(classname) = block.classname() else {
                 // No `classname` key at all. `MapEntity_ParseEntity` treats
                 // this as a parse failure and skips the block.
@@ -1127,6 +1163,7 @@ impl Server {
                 entity.core.parent_name = None;
             }
             let id = self.entities.insert(entity);
+            block_of.push((id, block_index));
             // Model 0 is the world, which `worldspawn` names and which is not
             // a *placement* — `world/` draws it in world space and `trace`
             // already covers it. The same exclusion `find_brush_models` makes.
@@ -1142,6 +1179,12 @@ impl Server {
                 false => spawn_list.push(id),
             }
         }
+
+        // `MapEntity_ParseAllEntites_SpawnTemplates` — before anything
+        // spawns, every `point_template` takes the entities it names out of
+        // the map and keeps their blocks.
+        stats.templated = self.build_templates(blocks, &block_of);
+        spawn_list.retain(|&id| self.entities.get(id).is_some());
 
         let ordered = self.spawn_order(&spawn_list);
 
@@ -1360,6 +1403,11 @@ impl Server {
         self.pending_spawn.clear();
         self.created_while_loading.clear();
         self.level_loading = false;
+        self.brush_model_bounds.clear();
+        self.templated_brush_models.clear();
+        self.template_instance = 0;
+        self.pending_template_spawns.clear();
+        self.pending_cleanses.clear();
         self.sequences = SequenceTable::new();
         self.attachments = Box::new(attachment::NoAttachments);
         self.attachments_in_use = false;
@@ -2262,6 +2310,8 @@ impl Server {
         self.server_commands.extend(server_commands);
         self.console_commands.extend(client_commands);
         let bumped_weapons = cx.take_bumped_weapons();
+        self.pending_template_spawns.extend(cx.take_template_spawns());
+        self.pending_cleanses.extend(cx.take_cleanses());
         // Once a level has any attachment parenting, every tick re-derives
         // what rides one — see `Server::refresh_attachment_children`.
         self.attachments_in_use |= cx.took_attachment();
@@ -2345,6 +2395,12 @@ impl Server {
         for weapon in bumped_weapons {
             self.bump_weapon(weapon);
         }
+
+        // `CreateInstance` and the cleanser's `Touch`, which in the C++ run
+        // inside the handler that asked — see [`Context::spawn_template`] and
+        // [`Context::cleanse`]. Both dispatch in their turn, so only the
+        // outermost dispatch serves them, as a loop.
+        self.serve_requests();
 
         if reload {
             self.level_restart = self.map.clone();

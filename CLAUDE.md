@@ -65,7 +65,7 @@ invest in it and don't wire it back in. (`.github/workflows/kstrike-compile.yml`
 describes the old CMake build; it is `master`-gated and stale with respect to this
 branch, where the top-level `CMakeLists.txt` has moved into `legacy/`.)
 
-`cargo test` is 1,314 tests. What the binary has grown into, stage by stage, and
+`cargo test` is 1,328 tests. What the binary has grown into, stage by stage, and
 the standing census of what `sp_a1_intro1` draws — the numbers to re-measure
 after a change to the draw path — are in `rustdocs/ENGINE.md`, **"What the
 binary does, and what `sp_a1_intro1` draws"**.
@@ -164,7 +164,7 @@ before calling into a module.** This table is the index.
 | `src/engine/` | **6 of 14 modules** — `window/`, `host/`, `world/` (geometry, lightmaps, terrain, light cache, brush entities, entity models, portals, **visibility**, the **recursive portal view**, the **sky**, the **view model**), `trace/` (**all 5**, plus the portal carve, the far-side trace, the transition ramp, the pusher's three clip chains and the **portal gun's shot trace**, with game materials), `input/` (4 of 5), `console/` (complete). No fog, dynamic lights or simulation | `rustdocs/ENGINE.md`, `portdocs/ENGINE.md` |
 | `src/client/` | **stages 1-4 of 5**, plus the teleport and the portal funnel — input→command→movement→view, `CPortalGameMovement`'s walk and `AirMove`, `HandlePortalling`, the view, auto-exposure policy, **screen fades**. Stage 5 needs `net/` | `rustdocs/CLIENT.md`, `portdocs/CLIENT.md` |
 | `src/studio/` | **stages 1-5 of 6**, plus animation, `$includemodel`, **attachment points**, **skinning**, **skin families** and the **body-group selector** (used by the view model only). No LOD selection, no `.phy`, and **135 models pose outside the box their own sequences declare** — the external `.ani` blocks | `rustdocs/STUDIO.md`, `portdocs/STUDIO.md` |
-| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** and **`env_fade`** and the **portal gun** (`weapon_portalgun`, all of `portal_placement.cpp`, the three placement volumes, `info_placement_helper`, the two command entities and the three commands that give it) — **64 classnames, 41,787 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md`, `portdocs/PORTALGUN.md` |
+| `src/server/` | **all five stages**, plus `prop_floor_button`, `prop_dynamic`, `prop_testchamber_door`, `logic_branch_listener`, `prop_portal`, `prop_weighted_cube`, the two areaportals, the **local/abs transform pair**, the **pusher**, **attachment parenting**, the **vphysics seam**, `sky_camera`, the **trains** (`func_tracktrain`, `path_track`), the **pedestal buttons** (`prop_button`, `prop_under_button`) and **VScript's server half** (`logic_script`, `vscripts`, `thinkfunction`, `RunScriptCode`, `EntFire`, `Entities`, `self`) and **`point_changelevel`** and **`env_fade`** and the **portal gun** (`weapon_portalgun`, all of `portal_placement.cpp`, the three placement volumes, `info_placement_helper`, the two command entities and the three commands that give it) and the **fizzlers and droppers** (`trigger_portal_cleanser`'s touch, `point_template`, `env_entity_maker`) — **66 classnames, 42,183 of the game's 60,925 entity blocks** | `rustdocs/SERVER.md`, `portdocs/SERVER.md`, `portdocs/PORTALGUN.md` |
 | `src/vscript/` | **Squirrel 2.2.3, written** — the language rule for rule on a tree walker (32-bit numbers, byte strings, Lua 4.0's hash table replicated because its layout is `foreach`'s order), the standard libraries Valve registers, `Vector`, `init.nut`. **All 92 shipped scripts compile; 104 of the 106 maps run five seconds of theirs without an error.** No generators or threads, which no shipped script uses; natives whose systems are absent (`CreateSceneEntity` first) are not registered | `rustdocs/VSCRIPT.md`, `portdocs/VSCRIPT.md` |
 | `src/vphysics/` | **ported onto rapier** — `.phy`/`LUMP_PHYSCOLLIDE`, surface properties, an environment in Source units that the world, its terrain, its static props, its brush entities and its physics props all live in, and **the player controller** and **the grab controller**, so the player pushes a cube, is stopped by one, and **picks one up and carries it** — and **static props and still studio props are solid to the player**. No constraints, collision events, ragdolls or vehicles. **A prop goes through a portal**, dropped or carried — a contact filter removes the wall inside a portal's hole (`rustdocs/VPHYSICS.md` §4e) | `rustdocs/VPHYSICS.md`, `portdocs/VPHYSICS.md`, `portdocs/VPHYSICS_SHADOW.md`, `portdocs/VPHYSICS_GRAB.md` |
 | everything else | **unported**, and lives in `legacy/` | — |
@@ -180,7 +180,7 @@ door opens as you approach and shuts behind you, a `trigger_hurt` can kill you,
 bolted to a moving arm rides the point on it the map named**. **Every model is
 skinned**, so the seven pieces of falling debris on the default map bend with
 their skeletons instead of standing in their bind pose, and **the weighted cube
-falls**: it drops 255 units out of its dropper onto the chamber floor, settles
+falls**: when the player walks in, its dropper makes it and it drops 223 units onto the chamber floor, settles
 in two seconds and goes to sleep lying on the slope it landed on, in the right
 model **and in the rusted skin its map asked for** — **and you can walk into
 it and shove it, and you cannot walk through it — and you can pick it up,
@@ -614,8 +614,10 @@ for as long as a cube could not reach a button.
 
 **What is now demonstrable on the default map**, which was the whole point:
 `sp_a1_intro1` has one cube and one floor button, the cube comes to rest
-**345 units** from the pad, and the player picks it up, walks it over and the
-pad goes down. Shoving moved it 18.8 units.
+**342 units** from the pad, and the player picks it up, walks it over and the
+pad goes down. Shoving moved it 20.2 units. (It was 345 and 18.8 before the cube
+came out of its dropper rather than out of the entity lump — 32 units lower,
+where the dropper's `env_entity_maker` stands.)
 
 **The portal gun has landed** — `portdocs/PORTALGUN.md`, `rustdocs/SERVER.md` "The
 portal gun" — and it reverses `portdocs/PORTAL.md` §8's deletion of the gun.
@@ -639,6 +641,24 @@ shipped content is a bump. The gun draws in hand (`v_portalgun.mdl`, over a clea
 depth buffer, skin = the last portal fired, body 1 = the potato) and a two-colour ring
 stands in for `CHUDQuickInfo`.
 
+**Fizzlers fizzle and droppers drop** — `src/server/cleanse.rs`, `src/server/templates.rs`,
+`src/server/classes/template.rs`, `rustdocs/SERVER.md` "Fizzlers and droppers". Walking
+through an enabled grill closes the player's portals; a cube that touches one is
+dissolved, firing its `OnFizzled` and the grill's `OnDissolve`; and the cube's dropper,
+wired to that `OnFizzled`, makes a new one. The cleanser's source is not in this tree
+and is rebuilt as a `CBaseTrigger` — its spawnflags are the trigger filter bits, so 4097
+grills let cubes through and 4104 ones let the player keep their portals.
+`point_template` and `env_entity_maker` are in the tree and are ported, including the
+`&0001` name fixup, and the finding that changed the most is that **no shipped template
+keeps its entities**: 371 entities — 74 cubes, 55 trains, 159 props, `sp_a3_01`'s portal
+gun — leave the map at load and exist only once something fires `ForceSpawn`, and
+**`sp_a1_intro1`'s cube is one of them**, dropped when the player walks in. That moved
+seven whole-game censuses, each re-measured and explained in `server/tests.rs`, and it
+needed two engine changes: a template's models are loaded at level start
+(`Server::precache_models`, `Behaviour::precache_model` for a cube, whose model comes from
+its type) and the renderer places an entity made after the level loaded; and a brush
+model a template holds is hidden until it is made.
+
 **Props go through portals** — `src/server/transit.rs`, `rustdocs/SERVER.md` "Props
 through portals", `rustdocs/VPHYSICS.md` §4e — so a cube dropped into a floor portal
 comes out of its partner, and a carried cube can be pushed into a portal and held across
@@ -658,8 +678,8 @@ left out. On `sp_a1_intro1` the shipped cube, woken by a portal opened under it,
 a floor-to-floor pair four times before it comes to rest on a portal's rim.
 
 - **The unported entity classes.** `rustdocs/SERVER.md`, "What the maps place that is
-  not here", lists all 141 classnames the shipped maps place that have no class here.
-  That is 19,138 of the 60,925 blocks. Each classname has its C++ source (or "none"),
+  not here", lists all 139 classnames the shipped maps place that have no class here.
+  That is 18,742 of the 60,925 blocks. Each classname has its C++ source (or "none"),
   its single-player and co-op counts, its I/O and a suggested order. The headline: an
   unknown classname is not spawned, which silently breaks implemented entities that
   name it. `func_tracktrain` was the `parentname` of 1,290 of them and **has landed**
@@ -676,13 +696,9 @@ a floor-to-floor pair four times before it comes to rest on a portal's rim.
   way Valve applies it — in the last full-screen pass, in gamma space — rather than as a
   quad. VScript's largest absence is now the scene system: `CreateSceneEntity` is 4,647
   of the shipped scripts' calls, and the only one that still stops a file loading.
-- **Fizzler behaviour.** `SolidEnergy` draws the field (1,174 brush faces on 59 maps),
-  and `trigger_portal_cleanser` (371, source not in this tree) is now a class — but only
-  as the portal gun sees it: a shot stops at an enabled one, and its field shows only
-  while it is enabled. **Walking through one fizzles nothing** and a carried cube is not
-  dissolved; `CTriggerPortalCleanser`'s touch has to be reconstructed, and
-  `WeightedCube::SilentDissolve` is where it lands. The `FizzlerVortex` proxy that swirls
-  the field round a cube is not in this tree at all.
+- **The fizzler's look.** It behaves now (below) but the dissolve is instant: the cube
+  does not float and fade, and the `FizzlerVortex` proxy that swirls the field round a
+  cube is not in this tree at all.
 - **The portal gun's loose ends** (`portdocs/PORTALGUN.md` §8): the view-model sway
   (`CalcViewModelLag`), the gun's effects and sounds, `func_portal_detector` (31, now
   buildable), and a test that fires a portal onto a slope so the transition ramp is

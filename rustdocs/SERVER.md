@@ -113,8 +113,8 @@ read as bugs.
 
 **What does not exist yet**: the armour and drowning. The weapon — Portal 2's
 only one, `weapon_portalgun` — has landed with its placement rules; see "The
-portal gun" under "What has landed". **59 of the 200
-classnames the shipped maps place are implemented**, out of 64 registered — the
+portal gun" under "What has landed". **61 of the 200
+classnames the shipped maps place are implemented**, out of 66 registered — the
 other five (`player`, `trigger_portal_button`, `light_glspot`, `dynamic_prop`,
 `prop_dynamic_glow`) are placed by no map
 ([What is deliberately absent](#what-is-deliberately-absent)).
@@ -2052,6 +2052,29 @@ fn surface_name(&self, surface: u16) -> String;
 pub struct ShotHit { /* start, end, fraction, fraction_left_solid, normal, plane_dist, start_solid,
                         all_solid, surface, surface_flags, game_material, model */ }
 // class.rs — on `Context`
+pub fn spawn_template(&mut self, template: EntityId, origin: Vec3, angles: Vec3, maker: Option<EntityId>);
+pub fn cleanse(&mut self, cleanse: Cleanse);       // Player / Prop / TouchingPortals
+pub struct TemplateSpawn { pub template: EntityId, pub origin: Vec3, pub angles: Vec3, pub maker: Option<EntityId> }
+pub enum Cleanse { Player { cleanser, player }, Prop { cleanser, prop }, TouchingPortals { cleanser } }
+// class.rs — on `Behaviour`
+fn precache_model(&self, entity: &EntityCore) -> Option<String>;  // the model before `Spawn` picks it
+// templates.rs, on `Server`
+pub fn precache_models(&self) -> Vec<String>;                 // `PerformPrecache` — load these too
+pub fn is_templated_brush_model(&self, index: usize) -> bool; // hidden until a template makes it
+// classes/template.rs
+pub struct PointTemplate { pub names: Vec<String>, pub entries: Vec<TemplateEntry> }
+pub struct TemplateEntry { pub block: bsp::Entity, pub entity_to_template: Mat4, pub needs_fixup: bool }
+pub struct EnvEntityMaker { pub template: String, pub post_spawn_direction: Vec3, pub post_spawn_variance: f32,
+                            pub post_spawn_speed: f32, pub post_spawn_use_angles: bool }
+pub const SF_DONT_REMOVE_TEMPLATE_ENTITIES: u32;  // 1 — no shipped template sets it
+pub const SF_PRESERVE_NAMES: u32;                 // 2
+pub const FIXUP: &str;                            // "&0000"
+// LevelStats
+pub templated: usize,                             // entities a template took out of the map at load
+// physics.rs
+impl Physics { pub fn add_velocity(&mut self, entities: &EntityList, id: EntityId, velocity: Vec3) }
+// classes/trigger.rs
+impl BaseTrigger { pub fn is_disabled(&self) -> bool }
 pub fn server_command(&mut self, command: &str);  // `point_servercommand`
 pub fn client_command(&mut self, command: &str);  // `point_clientcommand`
 pub fn bump_weapon(&mut self, weapon: EntityId);  // a player walked into a gun
@@ -2084,8 +2107,8 @@ impl PropPortal { pub fn place_from_gun(&mut self, entity: &mut EntityCore, orig
 pub const IN_ATTACK: u32; pub const IN_ATTACK2: u32;  // classes/player.rs
 ```
 
-Sixty-four classnames, **41,787 of the shipped game's 60,925 entity blocks**.
-**Fifty-nine of them are among the 200 classnames the maps place**; the other
+Sixty-six classnames, **42,183 of the shipped game's 60,925 entity blocks**.
+**Sixty-one of them are among the 200 classnames the maps place**; the other
 five are `player` (the engine makes it when a client connects),
 `trigger_portal_button` (a `prop_floor_button` makes it in its own `Spawn`), and
 `light_glspot`, `dynamic_prop` and `prop_dynamic_glow`, which are registered
@@ -2150,8 +2173,10 @@ because Valve registers them:
 | `point_clientcommand` | `CPointClientCommand` | 175 |
 | `func_portal_bumper` | `PortalVolume` (source not in the tree) | 2,383 |
 | `func_noportal_volume` | `PortalVolume` (source not in the tree) | 458 |
-| `trigger_portal_cleanser` | `PortalVolume` (source not in the tree) | 371 |
+| `trigger_portal_cleanser` | `PortalVolume`, holding a `BaseTrigger` (source not in the tree) | 371 |
 | `info_placement_helper` | `PlacementHelper` (source not in the tree) | 392 |
+| `point_template` | `CPointTemplate` | 302 — **none keeps its entities**: 371 leave the map at load |
+| `env_entity_maker` | `CEnvEntityMaker` | 94 |
 
 ---
 
@@ -3168,6 +3193,29 @@ the arm's origin start at 91.
     through `Carry::through`'s matrix to where the object is. A portal that
     closes or loses its partner while something is held across it drops the
     object, forced: *"If the portal isn't linked we need to drop the object"*.
+117. **A template's entities are not in the map until something makes them.**
+    None of the 302 shipped `point_template`s sets spawnflag 1, so all 371
+    entities they name — 74 cubes, 55 trains, 159 props, `sp_a3_01`'s portal
+    gun — leave the map in `level_init` and exist only after a `ForceSpawn`.
+    **`sp_a1_intro1`'s cube is one**: a test that wants it fires `drop_box_rl`
+    first (`physics::depot::drop_the_cube`), as the map's own fallback trigger
+    does when the player walks in.
+118. **A template's models must be loaded before it makes anything.**
+    `Server::precache_models` is what the engine adds to the entity models
+    and to physics at load; without it a dropped cube has no body and draws
+    nothing. A class that picks its model in `Spawn` answers
+    `Behaviour::precache_model` — the cube does, from its type, because its
+    block has no `model` key.
+119. **A templated brush model is hidden, not left where the lump put it.**
+    The engine leaves a model no entity ever claimed at its lump placement;
+    `Server::is_templated_brush_model` is what makes `brush_placement` say
+    "invisible and not solid" for one a template holds, until an instance
+    places it.
+120. **The cleanser passes its trigger filters first.** Spawnflag 4097
+    (clients only, 36 cleansers) lets cubes through; 4104 (physics only, 47)
+    lets the player keep their portals. A disabled cleanser does nothing —
+    and still stops nothing a shot would, because placement reads
+    `PortalVolume::active`, which follows the trigger's `m_bDisabled`.
 
 ---
 
@@ -3276,7 +3324,9 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 | `CPortalButtonTrigger`'s cube half — `SetActivated`, `GetCubeType`, `OnlyAcceptBall`/`AcceptsBall`, `prop_monster_box`'s `BecomeBox`/`BecomeMonster`, `sv_slippery_cube_button` | `GetCubeType` is answerable now — `WeightedCube::cube_type` — but the rest needs a cube that *moves*, which is `MOVETYPE_VPHYSICS` (`ENGINE_TRACE.md` stage 5). `ShouldPlayerTouch` is asked of the owner rather than answered in the trigger, so the shape is there for it. |
 | A floor button's co-op outputs — `OnPressedOrange`, `OnPressedBlue` | `GameRules()->IsMultiplayer()` and `GetTeamNumber()`. Declared so the connection parses as an output; one shipped map writes each. |
 | **The rest of the weapon system** — `trigger_weapon_strip` (2), `player_weaponstrip` (2), `CBaseCombatWeapon`'s inventory, slots, switching and dropping | Portal 2's only weapon is the portal gun, which has landed as one class and one `Player::weapon` slot ("The portal gun"). Nothing in single player takes it away. |
-| **The fizzler's own behaviour** — `CTriggerPortalCleanser`'s touch | A shot stops at an enabled fizzler and its field draws only while it is on, but walking through one fizzles nothing and a cube carried into one is not dissolved: the source is not in the tree. `WeightedCube::SilentDissolve` is the landing site. |
+| **The fizzler's look** — the dissolve effect, `FizzlerVortex`, the particles | A cube touching a fizzler is dissolved at once, where the shipped game floats it and fades it out over a second or so; nothing is drawn. The behaviour is here ("Fizzlers and droppers"); the effect has no subsystem. |
+| **Template VScript hooks** — `PreSpawnInstance`, `PostSpawn` | Only the 45 co-op movie templates carry a script, over `logic_playmovie`, which is not a class here. |
+| **`env_entity_maker`'s spawnflags** — autospawn, wait for destruction, check for space, player looking | All 94 shipped makers write 0. |
 | **The movement, still** — `CGameMovement` on the server, `CPlayerMove::RunCommand` | Stage 5 moved the *authority* (the move type, the health, the life state) and deliberately left the *integration* in `client/` on the rendered frame. §5 of the porting doc is the argument: `CPrediction` re-runs the same movement code on the client, so a one-process port with no `net/` already has the client half and would gain nothing but a 64 Hz camera by moving it. Revisit when `net/` exists. |
 | `CBasePlayer::SetFogController` and `SetHUDVisibility` | 97 connections in the game fire `SetFogController` at `!player`, and there is no fog or HUD. `SetHealth`, the player's third input, **is** implemented. |
 | Named think *contexts* (`m_aThinkFunctions`) | Still no class here needs two independent timers, and stage 3 is the evidence rather than the counter-example: a mover uses the think schedule **and** the arrival alarm, which are two different mechanisms with two different fields, not two contexts. The one class that genuinely wanted a context is `CBaseDoor`'s `"MovingSound"`, and there is no sound system. |
@@ -3292,13 +3342,14 @@ Each of these is a place the port does *not* do what the C++ does, on purpose.
 
 ## What the maps place that is not here — the unported classnames
 
-**141 of the 200 classnames the shipped maps place have no class here: 19,138 of
+**139 of the 200 classnames the shipped maps place have no class here: 18,742 of
 the 60,925 entity blocks.** (It was 155 and 25,588 when the census was taken;
 `func_tracktrain`, `path_track`, `prop_button`, `prop_under_button`,
 `logic_script`, `point_changelevel`, `env_fade` and the portal gun's seven —
 `weapon_portalgun`, `point_servercommand`, `point_clientcommand`,
 `func_portal_bumper`, `func_noportal_volume`, `trigger_portal_cleanser` and
-`info_placement_helper` — have landed since.) Every one is listed below, grouped by what it would
+`info_placement_helper` — and the droppers' two, `point_template` and
+`env_entity_maker`, have landed since.) Every one is listed below, grouped by what it would
 take, and measured the same way as the rest of this file: the entity lump
 (lump 0) of `portal2/maps/*.bsp` — the 106 maps, 64 single-player and 42
 co-op, not the DLC directories. "I/O in" is the number of shipped connections
@@ -3387,17 +3438,16 @@ This is a ranking of what unblocks the most, not a plan.
    un-breaks 41 teleports, `sp_a1_intro1`'s elevator exit among them.
 2. ~~**`func_tracktrain` with `path_track`**~~ — **landed**. `path_corner`
    (26) is not a train's node and stays below, with the NPCs that walk it.
-3. **`point_template` and `env_entity_maker`.** These are how a dropper makes
-   a new cube. They need entities created after load, with their names fixed
-   up, which `trigger_portal_button` already exercises in a small way.
+3. ~~**`point_template` and `env_entity_maker`**~~ — **landed**; see
+   "Fizzlers and droppers".
 4. **The test elements with source or a small surface:**
    - ~~`prop_button` and `prop_under_button`~~ — **landed**; see "Pedestal
      buttons". `prop_under_floor_button` is still here, and is
      `prop_floor_button` with a bigger box and other sequence names;
    - `prop_indicator_panel`;
    - `trigger_catapult`, which is `trigger_push` plus a ballistic solve;
-   - `trigger_portal_cleanser`, whose `OnDissolve` lands on
-     `WeightedCube`'s existing `SilentDissolve`.
+   - ~~`trigger_portal_cleanser`'s touch~~ — **landed**; see "Fizzlers and
+     droppers".
 5. **`prop_physics`/`prop_physics_override`, `func_physbox` and
    `func_clip_vphysics`.** The simulation and `CPhysicsProp`'s base are both
    here already.
@@ -3470,15 +3520,14 @@ Choreography and the scripted characters. **These are what start `sp_a1_intro1`'
 | `scripted_sequence` | `CAI_ScriptedSequence` (`server/scripted.cpp:121`) | 32 | 32 / 0 | 16 |  | 27 / 2 | Plays an NPC animation. Needs the AI. |
 | `ai_script_conditions` | `CAI_ScriptConditions` (`server/ai_scriptconditions.cpp:41`) | 18 | 18 / 0 | 9 | 3 | 20 / 48 | Fires when an NPC's conditions hold. 45 `OnConditionsSatisfied`; on `sp_a1_intro1`. |
 
-#### Logic and spawning — 11 classnames, 681 entities
+#### Logic and spawning — 9 classnames, 285 entities
 
-Ordinary map logic, the kind stage 2 ported. `point_template` is the one with teeth.
+Ordinary map logic, the kind stage 2 ported. `point_template` and
+`env_entity_maker` have landed.
 
 | classname | C++ | placed | SP / co-op | SP maps | `intro1` | I/O in / out | notes |
 |---|---|---:|---:|---:|---:|---:|---|
-| `point_template` | `CPointTemplate` (`server/point_template.cpp:160`) | 302 | 149 / 153 | 44 | 2 | 228 / 142 | Spawns copies of other entities on `ForceSpawn` (207 connections) — the cube and ball droppers' way of making a new cube. Needs entities created after load and a fixup of their names. |
 | `env_global` | `CEnvGlobal` (`server/logicentities.cpp:1323`) | 178 | 8 / 170 | 8 |  | 514 / 0 | Sets a global state that `logic_auto`'s `globalstate` reads. 8 on SP maps; `Auto::global_state` already parses the reader side. |
-| `env_entity_maker` | `CEnvEntityMaker` (`server/env_entity_maker.cpp:106`) | 94 | 62 / 32 | 33 | 1 | 160 / 16 | Spawns a `point_template`'s contents at its own position. |
 | `logic_achievement` | `CLogicAchievement` (`server/logic_achievement.cpp:41`) | 52 | 49 / 3 | 31 | 2 | 50 / 0 | Unlocks an achievement. Steam. |
 | `logic_compare` | `CLogicCompare` (`server/logicentities.cpp:2440`) | 20 | 0 / 20 | 0 |  | 17 / 59 | Compares a value. Co-op only. |
 | `info_game_event_proxy` | `CInfoGameEventProxy` (`server/world.cpp:163`) | 17 | 5 / 12 | 4 | 2 | 12 / 0 | Raises a game event — for the instructor hints and achievements. |
@@ -3707,6 +3756,9 @@ case values.
 | Test | Guards |
 |---|---|
 | `placement::tests::*` (14) | `portal_placement.cpp` case by case on a fixture: a clean shot, the edge bump, the floor snap, no-portal and glass and sky surfaces, a shot at nothing, a no-portal strip, a wall too narrow, another portal, a no-portal volume from outside and inside, a fizzler, a placement helper, the OBB test |
+| `cleanse::tests::*` (6) | a player losing both portals and `OnFizzle` once, 4104 and disabled cleansers leaving them, a cube dissolved with `OnFizzled` then `OnDissolve`, 4097 letting a cube through, `FizzleTouchingPortals` taking only the portal inside, **the dropper loop** — a dissolved cube replaced by its maker, three rounds, always exactly one (gotcha 120) |
+| `templates::tests::*` (6) | `ReconnectIOForGroup`'s renaming, preserved names, the instance stamp, a templated entity gone at load and back at its own placement on `ForceSpawn` with `OnEntitySpawned`, per-instance names talking to their own instance, a templated brush model hidden until made (gotchas 117, 119) |
+| `classes::template::tests::*` (2) | the maker's post-spawn velocity |
 | `transit::tests::*` (10) | the exit-speed range and clamp, the held-side toggle, a line entering a portal, the hold trace through a portal, a cube dropped into a floor portal out of a wall portal with both outputs once, an unlinked portal holding a cube, the far side of a portal's wall (gotcha 114), a carried cube pushed into a portal and back out (gotcha 116) |
 | `transit::tests::the_cube_on_sp_a1_intro1_falls_between_two_floor_portals` (depot) | the shipped cube, woken by a portal opened under it, through a floor-to-floor pair on the map's own displacement floor |
 | `portalgun::tests::*` (8) | the three commands and their order, `give weapon_portalgun` and the incinerator, the floor pickup, both command entities, the fire buttons and delays, the held-button repeat, a fizzler switched on and off (gotchas 109, 110) |
@@ -3972,7 +4024,7 @@ KISAK_GAME_DIR=/path/to/portal2 cargo test --release shipped_attachment -- --ign
 ```
 
 The first loads all 106 maps, spawns a player in each, runs **two seconds of
-server time**, and asserts exact totals: 60,925 blocks, 41,787 matched, 65
+server time**, and asserts exact totals: 60,925 blocks, 42,183 matched, 371 templated, 65
 created, 31,018 spawned, 6,937 lights deleted, 213 kept, 55,987 connections,
 148 unimplemented classnames, the full 49-name unhandled-key table, 7,005
 events dispatched, 6,277 inputs accepted, 17,357 thinks, 1,027 events that found
@@ -5739,8 +5791,7 @@ Findings worth knowing:
   first thing here that a single short click has to reach, and at any frame
   rate above 64 Hz a click could start and end on frames that ran no tick.
 
-**Not here:** the cleanser's touch (portals are not fizzled by walking through
-a field, cubes are not dissolved), `func_portal_detector`, the gun's effects and
+**Not here:** `func_portal_detector`, the gun's effects and
 sounds, `FVisible`'s pickup trace, a dropped gun's physics, paint, and co-op's
 partner-portal and pedestal cases (`OverlapPartnerPortal` and
 `PlacedBy::Pedestal` exist and are unreachable).
@@ -5818,3 +5869,67 @@ portal's rim.
   teleportable class but the cube (`prop_physics`, turrets, energy balls — none
   is a class here yet).
 
+
+### Fizzlers and droppers — `cleanse.rs`, `templates.rs`, `classes/template.rs`
+
+**A fizzler now fizzles, and a dropper drops.** Walk through an enabled
+emancipation grill and your portals close; carry or drop a cube into one and it
+is dissolved — its own `OnFizzled`, then the grill's `OnDissolve` — and the
+cube's dropper, which is wired to that `OnFizzled`, makes a new one. The loop
+is unit-tested end to end (`a_dissolved_cube_is_replaced_by_its_dropper`).
+
+**The cleanser** (`classes/volume.rs`, `cleanse.rs`). `CTriggerPortalCleanser`
+has no source in this tree, so it is rebuilt from the FGD, the two calls the
+cube makes into it (`FizzleBaseAnimating`) and the maps' wiring. It is a
+`CBaseTrigger`: `PortalVolume` holds a `BaseTrigger` for the cleanser kind, so
+`StartDisabled`, `filtername`, `Enable`/`Disable`/`Toggle`, the touch outputs
+and the spawnflag filters are the trigger's own, and placement's
+`IsEnabled()` follows `m_bDisabled`. Its `Touch`, once filters pass:
+
+| toucher | request | the server then |
+|---|---|---|
+| the player | `Cleanse::Player` | fizzles every active portal in the gun's linkage group (`Fizzle` input), clears the gun's colour, fires `OnFizzle` (activator: the player) — once, because a second tick finds nothing open |
+| a `prop_weighted_cube` | `Cleanse::Prop` | drops it if carried, sends it `Dissolve` (`OnFizzled`, removed), fires `OnDissolve` and, for a cube named `Box`, `OnDissolveBox` (activator: the cube) |
+| `FizzleTouchingPortals` | `Cleanse::TouchingPortals` | fizzles every active portal whose quad overlaps the cleanser's box |
+
+The requests are queued on `Context` and served by `Server::serve_requests` at
+the outermost dispatch, because each reaches past the cleanser.
+
+**The templates** (`classes/template.rs`, `templates.rs`). `point_template.cpp`,
+`TemplateEntities.cpp` and `env_entity_maker.cpp` are all in the tree and are
+ported:
+
+- **At load**, `Server::build_templates` — inside `level_init`, after every
+  block is an entity and before any spawns — records each named entity's block
+  and its placement in the template's frame, and takes it out of the map (no
+  shipped template keeps its entities: **371 leave**, `LevelStats::templated`).
+  Unless the template preserves names (spawnflag 2, 232 of the 302), a value
+  naming another member of the group gets `&0000`, and so does that member's
+  `targetname` (`reconnect_io`).
+- **`ForceSpawn`** asks `Context::spawn_template`; `spawn_template_instance`
+  stamps `&0001`, `&0002`, … over the fixups, makes each entity from its block
+  (`create_from_block` — class, keys, brush bounds, and the brush model's
+  placement), places it at template × entity-to-template, then spawns the lot
+  parents-first and activates it — `SpawnHierarchicalList(…, true)` — and
+  gives them bodies. Then `OnEntitySpawned` from the maker, or from the template
+  if there is none, and the maker's post-spawn velocity.
+- **The engine** loads `Server::precache_models()` with the level's entity
+  models and collision models, adds an instance for any new entity id whose
+  model it has (`EntityModels::sync`), and hides a brush model a template holds
+  (`Server::is_templated_brush_model`).
+
+Measured: **`sp_a1_intro1`'s cube is a dropper's** — `box_template_rm1` holds
+it, `entity_box_maker_rm1` makes it 32 units below where the lump drew it, and
+`drop_box_rl` fires the maker from a `trigger_look` (not a class here) or, when
+the player walks in, from `drop_box_fallback_trigger`. Dropped, it falls 223
+units rather than 255 and comes to rest 342.3 units from the floor button.
+`sp_a3_01`'s portal gun is a template too, made when the knockout animation
+ends. Of the 371, only the classes this port has are made; a template's
+`logic_playmovie` or `npc_portal_turret_floor` is skipped where Valve would
+have made it.
+
+**Not here:** the dissolve's look (the cube vanishes at once), the template
+VScript hooks (45 co-op movie templates), `env_entity_maker`'s spawnflags (all
+94 write 0), and dissolving anything but a cube — the other classes a shipped
+cleanser can meet (`prop_physics`, turrets, `prop_monster_box`) are not classes
+here.

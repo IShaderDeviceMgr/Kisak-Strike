@@ -1406,7 +1406,18 @@ fn sync_brush_models(world: &mut World, server: &Server) {
 pub(crate) fn brush_placement(server: &Server, index: usize) -> Option<world::Placement> {
     use crate::server::movement::EF_NODRAW;
 
-    let entity = server.brush_entity(index)?;
+    let Some(entity) = server.brush_entity(index) else {
+        // A brush entity a `point_template` took out of the map at load: it
+        // is not there until something spawns it, so it is neither drawn nor
+        // solid — where a model no entity ever claimed stays where the lump
+        // put it.
+        return server.is_templated_brush_model(index).then_some(world::Placement {
+            origin: glam::Vec3::ZERO,
+            angles: glam::Vec3::ZERO,
+            visible: false,
+            solid: false,
+        });
+    };
     Some(world::Placement {
         origin: entity.origin,
         angles: entity.angles,
@@ -2090,7 +2101,10 @@ impl Level for Scene<'_> {
         // entity list is built from the lump that load just read — and it is
         // the one place the two halves of a level are both in hand.
         let placements = model_entities(&self.server);
-        world.load_entity_models(vfs, &mut self.materials, &self.device, &placements);
+        // …and the models a `point_template` can make later — a dropper's
+        // cube is not in the map until the dropper drops it. `PerformPrecache`.
+        let precache = self.server.precache_models();
+        world.load_entity_models(vfs, &mut self.materials, &self.device, &placements, &precache);
         // The gun in the player's hands. Read for every map, whether or not
         // the player has one yet: the transition script gives it a moment
         // after the level starts, and the model is one file.
@@ -2153,6 +2167,7 @@ impl Level for Scene<'_> {
             let names: Vec<String> = placements
                 .iter()
                 .map(|placement| placement.model.clone())
+                .chain(precache.iter().cloned())
                 .collect();
             physics.add_models(&names, vfs);
             eprintln!("source-engine: world: {}", physics.stats.summary());

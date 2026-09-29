@@ -269,10 +269,14 @@ pub(crate) fn solid_trace(
 /// The models the game's entities place. Cannot run inside `load` — the entity
 /// list is built from the lump `load` just read, so `Level::load` is where the
 /// two halves meet.
+/// `precache` is `Server::precache_models()` — models a `point_template` can
+/// make later, loaded now and placed by nothing (`PerformPrecache`).
 pub fn load_entity_models(
     &mut self, vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
-    entities: &[entities::ModelEntity],
+    entities: &[entities::ModelEntity], precache: &[String],
 );
+/// …and an entity made since the level loaded is placed and lit where it
+/// first appears, if its model was loaded.
 pub fn sync_entity_models(&mut self, entities: &[entities::ModelEntity]);
 /// The active portals, once a rendered frame. The third and simplest of the
 /// three server seams — a portal owns no uploaded geometry, so the list is
@@ -586,6 +590,14 @@ player clip and could only be entered with `noclip`. Guarded by
 same `sync_placements` and `engine::brush_placement` the frame does, so they cannot
 disagree with it.
 
+**A model a `point_template` holds is hidden the same way.** Its entity left the
+map inside `level_init`, before the first sync, so by the rule above it would be
+"never answered for" and left drawn and solid where the lump put it — 82 brush
+entities in the game, 55 of them trains. `brush_placement` asks
+`Server::is_templated_brush_model` and answers invisible and non-solid until an
+instance of the template places the model (`rustdocs/SERVER.md`, "Fizzlers and
+droppers").
+
 `brush_models_touching` is the other direction — the engine's half of the
 server's touch test (`engine->SolidMoved`, `engine/world.cpp`'s `CTouchLinks`).
 Two things it is *not*: not a bounding-box overlap (Valve's enumerator ends in
@@ -746,9 +758,12 @@ impl AttachmentModels {
 impl EntityModels {
     pub fn load(
         vfs: &Vfs, materials: &mut MaterialCache, device: &wgpu::Device,
-        entities: &[ModelEntity], lighting: &LightCache, collision: &CollisionBsp,
+        entities: &[ModelEntity], precache: &[String],
+        lighting: &LightCache, collision: &CollisionBsp,
     ) -> EntityModels;
-    pub fn sync(&mut self, entities: &[ModelEntity]);
+    /// Returns `(id, origin)` for every id it had not seen and has now placed
+    /// — lit fullbright until the caller relights it.
+    pub fn sync(&mut self, entities: &[ModelEntity]) -> Vec<(u64, Vec3)>;
     /// What each loaded model says about each of its sequences — the answer
     /// back, for `crate::server::sequences::SequenceTable`.
     pub fn sequences(&self) -> impl Iterator<Item = SequenceRow<'_>> + '_;
@@ -4846,7 +4861,7 @@ system's GPU regression suite.
 
 ## Test coverage
 
-384 tests under `engine::`, plus 22 depot-gated; 1,314 in the crate. (Treat both as a scale rather than a
+384 tests under `engine::`, plus 22 depot-gated; 1,328 in the crate. (Treat both as a scale rather than a
 promise; `cargo test engine::` prints the current one.) **104 are `console/`'s** and have
 [their own table](#test-coverage-console); the input tests, now 58, have
 [theirs](#test-coverage-input). The tests that arrived with bindings, and those that

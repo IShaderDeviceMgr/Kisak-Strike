@@ -210,10 +210,10 @@ bumped, 3 can't fit, 17 invalid surfaces.
 
 ## §8 Not done, and what reverses each
 
-- **The cleanser's touch** — fizzling the player's portals as they walk through,
-  dissolving a carried cube, `FizzleTouchingPortals`, `OnDissolve`. The source is
-  missing; `WeightedCube::SilentDissolve` is the landing site. Reversed by wanting
-  chambers that depend on a fizzler to be solvable honestly.
+- ~~**The cleanser's touch**~~ — **landed**; `rustdocs/SERVER.md`, "Fizzlers and
+  droppers". Walking through a grill closes the player's portals, a cube touching
+  one is dissolved, and `FizzleTouchingPortals` works. Only the dissolve's look is
+  still absent.
 - **`func_portal_detector`** (31) — now buildable, since portals are placed by rule.
 - **The gun's effects and sounds** — prongs, beam, glow, muzzle flash; there is no
   particle or sound system.

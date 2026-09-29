@@ -500,6 +500,10 @@ pub struct Context<'a> {
     client_commands: Vec<String>,
     /// What [`bump_weapon`](Context::bump_weapon) asked for.
     bumped_weapons: Vec<EntityId>,
+    /// What [`spawn_template`](Context::spawn_template) asked for.
+    template_spawns: Vec<TemplateSpawn>,
+    /// What [`cleanse`](Context::cleanse) asked for.
+    cleanses: Vec<Cleanse>,
     /// Whether this handler parented anything to an attachment point — the
     /// one bit `Server::refresh_attachment_children` needs to know.
     attachments_used: bool,
@@ -511,6 +515,29 @@ pub struct Context<'a> {
     /// unlike their sequences has to be asked rather than tabulated. See
     /// [`attachment`](super::attachment).
     attachments: &'a dyn Attachments,
+}
+
+/// One [`Context::spawn_template`] request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TemplateSpawn {
+    pub template: EntityId,
+    pub origin: glam::Vec3,
+    pub angles: glam::Vec3,
+    pub maker: Option<EntityId>,
+}
+
+/// One [`Context::cleanse`] request — a `trigger_portal_cleanser` acting on
+/// something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleanse {
+    /// The player walked in: fizzle the portals their gun owns and, if any
+    /// went, fire the cleanser's `OnFizzle`.
+    Player { cleanser: EntityId, player: EntityId },
+    /// A prop walked in: `FizzleBaseAnimating` — dissolve it and fire
+    /// `OnDissolve` (and `OnDissolveBox` for one named `Box`).
+    Prop { cleanser: EntityId, prop: EntityId },
+    /// `FizzleTouchingPortals` — every portal inside the volume.
+    TouchingPortals { cleanser: EntityId },
 }
 
 impl<'a> Context<'a> {
@@ -541,6 +568,8 @@ impl<'a> Context<'a> {
             server_commands: Vec::new(),
             client_commands: Vec::new(),
             bumped_weapons: Vec::new(),
+            template_spawns: Vec::new(),
+            cleanses: Vec::new(),
             attachments_used: false,
             sequences,
             attachments,
@@ -1124,6 +1153,46 @@ impl<'a> Context<'a> {
         std::mem::take(&mut self.bumped_weapons)
     }
 
+    /// `CPointTemplate::CreateInstance` — make one instance of `template`'s
+    /// entities with the template standing at `origin`/`angles`, then fire
+    /// `OnEntitySpawned` from `maker` if there is one and from the template if
+    /// not.
+    ///
+    /// **Queued**, for the reason [`create_entity`](Context::create_entity)
+    /// is: making an instance is creating, spawning and activating entities,
+    /// which cannot happen while this handler has its own entity lifted out of
+    /// the list. `Server::dispatch` makes it on the way out, in the same tick.
+    pub fn spawn_template(
+        &mut self,
+        template: EntityId,
+        origin: glam::Vec3,
+        angles: glam::Vec3,
+        maker: Option<EntityId>,
+    ) {
+        self.template_spawns.push(TemplateSpawn {
+            template,
+            origin,
+            angles,
+            maker,
+        });
+    }
+
+    pub(super) fn take_template_spawns(&mut self) -> Vec<TemplateSpawn> {
+        std::mem::take(&mut self.template_spawns)
+    }
+
+    /// What `CTriggerPortalCleanser` does to what touches it — asked for
+    /// rather than done, because every case reaches past the cleanser: the
+    /// player's gun and portals, the carry, the prop's own class. See
+    /// [`Cleanse`].
+    pub fn cleanse(&mut self, cleanse: Cleanse) {
+        self.cleanses.push(cleanse);
+    }
+
+    pub(super) fn take_cleanses(&mut self) -> Vec<Cleanse> {
+        std::mem::take(&mut self.cleanses)
+    }
+
     /// Whether this handler parented anything to an attachment point.
     pub(super) fn took_attachment(&self) -> bool {
         self.attachments_used
@@ -1532,6 +1601,17 @@ pub trait Behaviour: Any {
     /// names no studio type.
     fn model_state(&self) -> Option<ModelState<'_>> {
         None
+    }
+
+    /// The studio model this entity will place once it spawns, asked of an
+    /// entity that has had its keys and **not** its `Spawn` — `Precache`.
+    ///
+    /// What a `point_template` asks of the entities it holds, so that the
+    /// engine can load their models before any of them exist. The default is
+    /// the `model` key; a class that picks its model in `Spawn` — a cube,
+    /// from its type — answers for itself.
+    fn precache_model(&self, entity: &EntityCore) -> Option<String> {
+        entity.model.clone()
     }
 
     /// `CBaseEntity::IsPlayer()`.

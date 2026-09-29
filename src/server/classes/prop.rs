@@ -2299,6 +2299,20 @@ impl WeightedCube {
         self.new_skins = true;
     }
 
+    /// The model [`set_cube_type`](WeightedCube::set_cube_type) will choose,
+    /// before `Spawn` has run `ConvertOldSkins` — `Precache`'s answer.
+    fn model_before_spawn(&self) -> &'static str {
+        let mut cube_type = self.cube_type;
+        if !self.new_skins {
+            let skin = if self.skin > 1 { self.skin - 1 } else { self.skin };
+            cube_type = CubeType::from_int(skin);
+        }
+        if cube_type == CubeType::Schrodinger {
+            cube_type = CubeType::Reflective;
+        }
+        cube_type.model()
+    }
+
     /// `SetCubeType` (`:341`) — pick the model, then the skin.
     ///
     /// The `CreateRotationController` and `AddSpawnFlags(
@@ -2453,6 +2467,10 @@ impl WeightedCube {
 }
 
 impl Behaviour for WeightedCube {
+    fn precache_model(&self, _entity: &EntityCore) -> Option<String> {
+        Some(self.model_before_spawn().to_owned())
+    }
+
     fn key_value(&mut self, _entity: &mut EntityCore, key: &str, value: &str) -> bool {
         // Every one of these is a `DEFINE_KEYFIELD` on this class or on
         // `CPhysicsProp`; the comparison is case-insensitive because a `.bsp`

@@ -97,7 +97,7 @@ mod tests {
                 modulation: e.modulation,
             })
             .collect();
-        world.load_entity_models(&vfs, &mut materials, &device, &placements);
+        world.load_entity_models(&vfs, &mut materials, &device, &placements, &server.precache_models());
         println!("{}", world.entity_models.summary());
 
         // **A linked pair in front of the camera**, so that the recursive view

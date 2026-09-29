@@ -750,6 +750,16 @@ impl Physics {
         Stepped { moved, teleported }
     }
 
+    /// `IPhysicsObject::AddVelocity` on an entity's body — what
+    /// `env_entity_maker` gives what it made.
+    pub fn add_velocity(&mut self, entities: &EntityList, id: EntityId, velocity: Vec3) {
+        let Some(body) = entities.get(id).and_then(|e| e.core.physics) else {
+            return;
+        };
+        let current = self.env.velocity(body);
+        self.env.set_velocity(body, current + velocity);
+    }
+
     /// Which portal owns `body`, if any — for a test, and for `ent_dump`.
     #[allow(dead_code)]
     pub fn portal_owner(&self, entities: &EntityList, id: EntityId) -> Option<EntityId> {
@@ -1403,6 +1413,24 @@ mod tests {
 #[cfg(test)]
 mod depot {
     use super::*;
+
+    /// `sp_a1_intro1`'s cube is a dropper's: the template `box_template_rm1`
+    /// takes it out of the map at load and `entity_box_maker_rm1` makes it
+    /// when `drop_box_rl` fires — from a `trigger_look` this port has not got,
+    /// or from `drop_box_fallback_trigger` when the player walks in. This is
+    /// that relay, fired by hand, and one tick for the maker's `ForceSpawn`
+    /// to arrive.
+    fn drop_the_cube(server: &mut Server) {
+        let relay = name::find_by_name(&server.entities, "drop_box_rl")
+            .next()
+            .expect("sp_a1_intro1's drop relay");
+        assert!(
+            name::find_by_name(&server.entities, "box").next().is_none(),
+            "the cube is a template's, and not in the map until it is dropped"
+        );
+        server.accept_input(relay, "Trigger", crate::server::io::Variant::Void, None, None, 0);
+        server.frame(1.0 / 64.0, &mut NoTouchQuery);
+    }
     use crate::engine::world::bsp::Bsp;
     use crate::engine::world::physics as world_physics;
     use crate::engine::world::props::Props;
@@ -1442,11 +1470,13 @@ mod depot {
             .map(|e| e.model)
             .collect();
         built.add_models(&names, &vfs);
+        built.add_models(&server.precache_models(), &vfs);
         server.set_physics(built.environment, built.models, built.brush_models);
+        drop_the_cube(&mut server);
 
         let stats = server.physics_stats().expect("an environment").clone();
         eprintln!("{stats:?}");
-        assert_eq!(stats.dynamic_bodies, 1, "the map places one cube");
+        assert_eq!(stats.dynamic_bodies, 1, "the map drops one cube");
         assert!(
             stats.brush_bodies > 0,
             "the map's brush entities should have bodies: {stats:?}"
@@ -1525,7 +1555,9 @@ mod depot {
             .map(|e| e.model)
             .collect();
         built.add_models(&names, &vfs);
+        built.add_models(&server.precache_models(), &vfs);
         server.set_physics(built.environment, built.models, built.brush_models);
+        drop_the_cube(&mut server);
 
         let cube = name::find_by_name(&server.entities, "box")
             .next()
@@ -1652,7 +1684,9 @@ mod depot {
             .map(|e| e.model)
             .collect();
         built.add_models(&names, &vfs);
+        built.add_models(&server.precache_models(), &vfs);
         server.set_physics(built.environment, built.models, built.brush_models);
+        drop_the_cube(&mut server);
 
         let cube = name::find_by_name(&server.entities, "box")
             .next()
@@ -1905,7 +1939,9 @@ mod depot {
             .map(|e| e.model)
             .collect();
         built.add_models(&names, &vfs);
+        built.add_models(&server.precache_models(), &vfs);
         server.set_physics(built.environment, built.models, built.brush_models);
+        drop_the_cube(&mut server);
 
         let cube = name::find_by_name(&server.entities, "box")
             .next()

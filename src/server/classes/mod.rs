@@ -77,6 +77,7 @@ pub mod point;
 pub mod portal;
 pub mod prop;
 pub mod sky;
+pub mod template;
 pub mod train;
 pub mod trigger;
 pub mod volume;
@@ -103,6 +104,7 @@ pub use player::{
 pub use point::{PointChangelevel, PointClientCommand, PointServerCommand, PointTeleport};
 pub use portal::PropPortal;
 pub use sky::SkyCamera;
+pub use template::{EnvEntityMaker, PointTemplate};
 pub use train::{PathTrack, TrackTrain};
 pub use prop::{ButtonTrigger, DynamicProp, FloorButton, TestChamberDoor, WeightedCube};
 pub use trigger::{TriggerHurt, TriggerMultiple, TriggerPush, TriggerTeleport};
@@ -481,6 +483,24 @@ pub(super) static CLASSES: &[ClassDef] = &[
     // the commands arrive through the two `point_*command` classes, which is
     // why those came with it; the four volumes are what its shots are fitted
     // around.
+    // `CPointTemplate` (`point_template.cpp`) and `CEnvEntityMaker`
+    // (`env_entity_maker.cpp`) — how a map makes an entity after it has
+    // loaded, which is how every cube dropper in the game works. See
+    // `classes::template` and `server::templates`.
+    ClassDef {
+        name: "point_template",
+        keys: template::TEMPLATE_KEYS,
+        inputs: template::TEMPLATE_INPUTS,
+        outputs: template::TEMPLATE_OUTPUTS,
+        create: PointTemplate::create,
+    },
+    ClassDef {
+        name: "env_entity_maker",
+        keys: template::MAKER_KEYS,
+        inputs: template::MAKER_INPUTS,
+        outputs: template::MAKER_OUTPUTS,
+        create: EnvEntityMaker::create,
+    },
     ClassDef {
         name: "weapon_portalgun",
         keys: weapon::WEAPON_KEYS,

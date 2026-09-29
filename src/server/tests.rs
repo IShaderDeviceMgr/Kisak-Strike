@@ -3172,9 +3172,9 @@ const EXPECTED_UNHANDLED: &[(&str, usize)] = &[
     // CPU/GPU-level keys the port now consumes — and unlike those four it is
     // read by nothing in the whole tree, on either side of the DLL boundary.
     ("disablex360", 123),
-    // One on a `trigger_multiple`, and three on fizzlers: the cleanser's
-    // trigger half (touch, filters) is not here — `classes::volume`.
-    ("filtername", 4),
+    // One on a `trigger_multiple`. The three on fizzlers are read now that
+    // the cleanser is a `CBaseTrigger` — `classes::volume`.
+    ("filtername", 1),
     ("inputfilter", 2497),
     ("mapversion", 106),
     // The DirectX-level fade pair. In no Portal 2 `.fgd` and read nowhere in
@@ -3307,9 +3307,10 @@ fn every_shipped_map_spawns_its_entities() {
             "{name}: blocks unaccounted for"
         );
         // …and every entity alive is one of those, or one another entity's
-        // `Spawn` made — a `prop_floor_button`'s trigger.
+        // `Spawn` made — a `prop_floor_button`'s trigger — less the ones a
+        // `point_template` took out of the map to make later.
         assert_eq!(
-            stats.spawned + stats.removed_on_spawn,
+            stats.spawned + stats.removed_on_spawn + stats.templated,
             stats.matched + stats.created,
             "{name}: entities unaccounted for"
         );
@@ -3382,6 +3383,7 @@ fn every_shipped_map_spawns_its_entities() {
         total.spawned += stats.spawned;
         total.removed_on_spawn += stats.removed_on_spawn;
         total.created += stats.created;
+        total.templated += stats.templated;
         total.outputs += stats.outputs;
         total.parented += stats.parented;
         total.parents_missing += stats.parents_missing;
@@ -3588,10 +3590,19 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(names.len(), 106, "Portal 2 ships 106 maps");
     assert_eq!(total.blocks, 60_925);
     assert_eq!(
-        total.spawned + total.removed_on_spawn,
+        total.spawned + total.removed_on_spawn + total.templated,
         total.matched + total.created
     );
     assert_eq!(total.removed_on_spawn, 6_937, "unnamed lights");
+    // **371 entities are a template's, and leave the map at load** — none of
+    // the 302 `point_template`s sets spawnflag 1. 103 `prop_dynamic`, 74
+    // `prop_weighted_cube` (every dropper's cube, `sp_a1_intro1`'s among
+    // them), 56 `prop_dynamic_override`, 55 `func_tracktrain`, 23
+    // `logic_case`, 15 `logic_relay`, 12 each of `filter_activator_class` and
+    // `trigger_once`, 6 `func_door`, and 15 more across ten classes —
+    // including `sp_a3_01`'s one `weapon_portalgun`, made when the knockout
+    // animation ends. A Python pass over the lumps gets the same 371.
+    assert_eq!(total.templated, 371);
 
     // The parse side. Stage 1 matched 17,069 blocks and spawned 10,132,
     // stage 2 took it to 19,229 and 12,292, stage 3's six brush classes were
@@ -3642,8 +3653,12 @@ fn every_shipped_map_spawns_its_entities() {
     // `func_noportal_volume`, 392 `info_placement_helper`, 371
     // `trigger_portal_cleanser`, 175 `point_clientcommand`, 115
     // `point_servercommand` and 3 `weapon_portalgun`. All spawn.
-    assert_eq!(total.matched, 41_787);
-    assert_eq!(total.spawned, 34_915);
+    //
+    // **+396 for the droppers' two**: 302 `point_template` and 94
+    // `env_entity_maker`. All spawn — and `spawned` is 371 short of that,
+    // because the templates take what they name out of the map (above).
+    assert_eq!(total.matched, 42_183);
+    assert_eq!(total.spawned, 34_940);
     // +593 over stage 5, and 326 of them are `OnUser1`: a `prop_dynamic`'s
     // connections used to be keys on a block with no class. The other 267 are
     // `OnAnimationDone` (181), `OnBreak` (16), `OnAnimationBegun` (15) and
@@ -3671,7 +3686,8 @@ fn every_shipped_map_spawns_its_entities() {
     // `OnPlayerPickup` on the two co-op guns; and one `OnUser1` on a
     // `point_servercommand`. Two bumpers carry an `OnTrigger` their class does
     // not have — it is on the unconsumed list below.
-    assert_eq!(total.outputs, 56_238);
+    // **+158 `OnEntitySpawned`**: 142 on templates and 16 on makers.
+    assert_eq!(total.outputs, 56_396);
     // **-1 classname and -21 occurrences**, both `prop_portal`: it was the
     // only one of the five names the class table gained that any map places.
     // **-2 and -409 again** for the two areaportal classnames, both of which
@@ -3685,8 +3701,9 @@ fn every_shipped_map_spawns_its_entities() {
     // **-1 and -62** for `point_changelevel`.
     // **-1 and -327** for `env_fade`.
     // **-7 and -3,897** for the portal gun's seven.
-    assert_eq!(total.unknown.len(), 141);
-    assert_eq!(total.unknown.values().sum::<usize>(), 19_138);
+    // **-2 and -396** for `point_template` and `env_entity_maker`.
+    assert_eq!(total.unknown.len(), 139);
+    assert_eq!(total.unknown.values().sum::<usize>(), 18_742);
     // **The first entities in this port that are not in a `.bsp`.** One
     // `trigger_portal_button` per `prop_floor_button`, made by its `Spawn`
     // through `Context::create_entity` — so `spawned` is 130 larger than the
@@ -3708,33 +3725,36 @@ fn every_shipped_map_spawns_its_entities() {
 
     // The census `portdocs/SERVER.md` §1.2 is built on, re-derived from the
     // live list rather than from the lump. These are the classes nothing
-    // deletes at run time, so the counts are the ones the maps place.
+    // deletes at run time, so the counts are the ones the maps place — **less
+    // what a `point_template` took out of the map at load** (371 in all; see
+    // `total.templated`). That is why there are 24 cubes alive at load of the
+    // game's 98: the other 74 are in droppers.
     assert_eq!(per_class.get("func_instance_io_proxy"), Some(&1_184));
-    assert_eq!(per_class.get("info_target"), Some(&431));
+    assert_eq!(per_class.get("info_target"), Some(&430));
     assert_eq!(per_class.get("info_player_start"), Some(&116));
     assert_eq!(per_class.get("worldspawn"), Some(&106));
     assert_eq!(per_class.get("env_tonemap_controller"), Some(&110));
     assert_eq!(per_class.get("logic_branch"), Some(&601));
     assert_eq!(per_class.get("logic_branch_listener"), Some(&158));
-    assert_eq!(per_class.get("logic_case"), Some(&84));
-    assert_eq!(per_class.get("logic_timer"), Some(&151));
+    assert_eq!(per_class.get("logic_case"), Some(&61));
+    assert_eq!(per_class.get("logic_timer"), Some(&149));
     assert_eq!(per_class.get("math_counter"), Some(&102));
     // Stage 3's. `func_brush` is the third commonest classname in the game,
     // behind `logic_relay` and `prop_dynamic`.
-    assert_eq!(per_class.get("func_brush"), Some(&2_502));
+    assert_eq!(per_class.get("func_brush"), Some(&2_500));
     assert_eq!(per_class.get("func_door_rotating"), Some(&346));
-    assert_eq!(per_class.get("func_door"), Some(&275));
-    assert_eq!(per_class.get("func_movelinear"), Some(&196));
+    assert_eq!(per_class.get("func_door"), Some(&269));
+    assert_eq!(per_class.get("func_movelinear"), Some(&195));
     assert_eq!(per_class.get("func_button"), Some(&64));
-    assert_eq!(per_class.get("func_rotating"), Some(&27));
+    assert_eq!(per_class.get("func_rotating"), Some(&25));
     // Stage 4's. `trigger_once` is the fifth commonest classname in the game.
-    assert_eq!(per_class.get("trigger_once"), Some(&1_476));
-    assert_eq!(per_class.get("trigger_multiple"), Some(&899));
-    assert_eq!(per_class.get("trigger_hurt"), Some(&215));
+    assert_eq!(per_class.get("trigger_once"), Some(&1_464));
+    assert_eq!(per_class.get("trigger_multiple"), Some(&898));
+    assert_eq!(per_class.get("trigger_hurt"), Some(&213));
     assert_eq!(per_class.get("trigger_push"), Some(&192));
     assert_eq!(per_class.get("trigger_teleport"), Some(&110));
     assert_eq!(per_class.get("point_teleport"), Some(&128));
-    assert_eq!(per_class.get("filter_activator_class"), Some(&212));
+    assert_eq!(per_class.get("filter_activator_class"), Some(&200));
     assert_eq!(per_class.get("filter_activator_name"), Some(&74));
     assert_eq!(per_class.get("filter_multi"), Some(&9));
     assert_eq!(per_class.get("filter_player_held"), Some(&4));
@@ -3753,8 +3773,8 @@ fn every_shipped_map_spawns_its_entities() {
     // after `logic_relay` — by ten entities. The two classnames a map can
     // place are one C++ class and two different behaviours; see
     // `DynamicProp::is_plain_dynamic`.
-    assert_eq!(per_class.get("prop_dynamic"), Some(&8_072));
-    assert_eq!(per_class.get("prop_dynamic_override"), Some(&390));
+    assert_eq!(per_class.get("prop_dynamic"), Some(&7_969));
+    assert_eq!(per_class.get("prop_dynamic_override"), Some(&334));
     assert_eq!(
         per_class.get("dynamic_prop"),
         None,
@@ -3766,9 +3786,9 @@ fn every_shipped_map_spawns_its_entities() {
     // drawn, in the skin its map asked for, and every one of them falls —
     // `the_cube_on_sp_a1_intro1_falls_and_comes_to_rest` is the one that is
     // watched all the way down.
-    assert_eq!(per_class.get("prop_weighted_cube"), Some(&98));
+    assert_eq!(per_class.get("prop_weighted_cube"), Some(&24));
     // The trains, on 64 maps. Nothing deletes either at run time.
-    assert_eq!(per_class.get("func_tracktrain"), Some(&233));
+    assert_eq!(per_class.get("func_tracktrain"), Some(&178));
     assert_eq!(per_class.get("path_track"), Some(&1_464));
     // The pedestal buttons, on 38 and 12 maps. Nothing deletes either.
     assert_eq!(per_class.get("prop_button"), Some(&56));
@@ -3783,13 +3803,15 @@ fn every_shipped_map_spawns_its_entities() {
     assert_eq!(per_class.get("point_changelevel"), Some(&62));
     // The portal gun's seven. Nothing deletes a gun inside two seconds — no
     // player walks into one here.
-    assert_eq!(per_class.get("weapon_portalgun"), Some(&3));
+    assert_eq!(per_class.get("weapon_portalgun"), Some(&2));
     assert_eq!(per_class.get("point_servercommand"), Some(&115));
     assert_eq!(per_class.get("point_clientcommand"), Some(&175));
-    assert_eq!(per_class.get("func_portal_bumper"), Some(&2_383));
+    assert_eq!(per_class.get("func_portal_bumper"), Some(&2_382));
     assert_eq!(per_class.get("func_noportal_volume"), Some(&458));
     assert_eq!(per_class.get("trigger_portal_cleanser"), Some(&371));
-    assert_eq!(per_class.get("info_placement_helper"), Some(&392));
+    assert_eq!(per_class.get("info_placement_helper"), Some(&390));
+    assert_eq!(per_class.get("point_template"), Some(&302));
+    assert_eq!(per_class.get("env_entity_maker"), Some(&94));
     println!(
         "  entity skins: {entity_skins} placements name a non-zero family, \
          {entity_skins_remapped} of them draw a different material, \
@@ -3804,12 +3826,14 @@ fn every_shipped_map_spawns_its_entities() {
     // number that does. +11 with the pedestal buttons: the eleven
     // `prop_button`s that write `skin 1`, all of which remap — `switch001`
     // has a second family, and `sp_a1_intro2`'s three buttons are drawn in it.
-    assert_eq!(entity_skins, 674, "model entities on a non-zero skin family");
+    // **-27 with the templates**: that many props with a skin are a
+    // template's, and are not in the map at load.
+    assert_eq!(entity_skins, 647, "model entities on a non-zero skin family");
     assert_eq!(
-        entity_skins_remapped, 670,
+        entity_skins_remapped, 643,
         "…of which draw a different material for it"
     );
-    // **Every one of the 674 names a model that loads**, so the four that do
+    // **Every one of the 647 names a model that loads**, so the four that do
     // not remap are four maps asking for a family their model has not got and
     // getting family 0 from `studio::family` — not four models this port
     // failed to read. The distinction is invisible in the count and is the
@@ -3838,28 +3862,27 @@ fn every_shipped_map_spawns_its_entities() {
     for ((model, skin), count) in &cube_skins {
         println!("    {count:>4}  {model} skin {skin}");
     }
-    // **The whole of what the shipped maps can produce**, and the measurement
-    // behind two claims. First, that `ConvertOldSkins` is doing its job: the
-    // four distinct models are the four cube types the maps actually place,
-    // and 77 of the 98 got there from a `skin` key rather than a `CubeType`.
-    // Second, what skin families bought here — **15 of the 98 end on a
-    // non-zero skin** (5 companion, 8 rusted standard, 2 rusted reflective),
-    // and every one of them now draws in it. One of the 15 is on
-    // `sp_a1_intro1`, which is why the default map's cube went from clean to
-    // rusted the day `Batch::materials` landed.
+    // **What the cubes alive at load wear** — 24 of the game's 98. The other
+    // 74 are droppers' cubes, templates until something drops them, and this
+    // census never makes them. Before the templates landed all 98 were here:
+    // **15 of the 98 end on a non-zero skin** (5 companion, 8 rusted
+    // standard, 2 rusted reflective), 77 of them reach their model from a
+    // `skin` key rather than a `CubeType`, and one of the 15 is
+    // `sp_a1_intro1`'s — which is why the default map's cube went from clean
+    // to rusted the day `Batch::materials` landed. It is a dropper's cube, so
+    // it is not among the 24; the `mp_ball`s are all in droppers too.
     assert_eq!(
         cube_skins
             .iter()
             .map(|((m, s), n)| (m.as_str(), *s, *n))
             .collect::<Vec<_>>(),
         vec![
-            ("models/props/metal_box.mdl", 0, 31),
-            ("models/props/metal_box.mdl", 1, 5),
-            ("models/props/metal_box.mdl", 3, 8),
-            ("models/props/reflection_cube.mdl", 0, 24),
-            ("models/props/reflection_cube.mdl", 1, 2),
-            ("models/props_gameplay/mp_ball.mdl", 0, 14),
-            ("models/props_underground/underground_weighted_cube.mdl", 0, 14),
+            ("models/props/metal_box.mdl", 0, 7),
+            ("models/props/metal_box.mdl", 1, 1),
+            ("models/props/metal_box.mdl", 3, 2),
+            ("models/props/reflection_cube.mdl", 0, 8),
+            ("models/props/reflection_cube.mdl", 1, 1),
+            ("models/props_underground/underground_weighted_cube.mdl", 0, 5),
         ],
         "what the shipped cubes wear has changed"
     );
@@ -3869,7 +3892,7 @@ fn every_shipped_map_spawns_its_entities() {
             .filter(|((_, skin), _)| *skin != 0)
             .map(|(_, n)| n)
             .sum::<usize>(),
-        15,
+        4,
         "cubes drawn in a family other than 0"
     );
     // `portdocs/PORTAL.md` stage 2. 21 across 10 maps, two of them on
@@ -3916,7 +3939,13 @@ fn every_shipped_map_spawns_its_entities() {
     // **+4 with `trigger_portal_cleanser`**: on `sp_a2_column_blocker` and
     // `sp_a2_pit_flings` the exit elevator's fizzler is sent `FireUser1` at
     // spawn, and its `OnUser1` disables the two emitter props beside it.
-    assert_eq!(io.dispatched, 7_009);
+    // **The templates took a large bite out of every I/O number** — the 371
+    // entities a `point_template` holds are not in the map for these two
+    // seconds unless the map makes them, and with them go their thinks (55
+    // trains and 159 props among them), the inputs aimed at them
+    // and the outputs they would have fired. Measured, not attributed class
+    // by class: dispatched -392, accepted -304, thinks -5,323, no target -68.
+    assert_eq!(io.dispatched, 6_617);
     // **+2 with `prop_portal`, and `no_target` falls by the same 2**: the
     // `SetActivatedState` a map used to aim at a classname nothing answered
     // for now lands. Only two of the game's 31 are fired inside two seconds.
@@ -3964,7 +3993,7 @@ fn every_shipped_map_spawns_its_entities() {
     // `SetParentAttachmentMaintainOffset` and 7 `Disable` at fizzlers, 2
     // `FireUser1` at fizzlers — and the 4 prop `Disable`s the fizzlers'
     // `OnUser1` then sends, which are the `dispatched` +4.
-    assert_eq!(io.accepted, 6_418);
+    assert_eq!(io.accepted, 6_114);
     // **+2,898, and every one of them is a chamber door.** `AnimateThink`
     // re-arms unconditionally, which is Valve's, so all 138 doors wake ten
     // times a second for the whole level — 2 seconds at a `SetNextThink`
@@ -3983,7 +4012,7 @@ fn every_shipped_map_spawns_its_entities() {
     // `dispatched` and `accepted` do not move.
     //
     // **-4 with VScript**, from the random stream — see `dispatched`.
-    assert_eq!(io.thinks, 17_357);
+    assert_eq!(io.thinks, 12_034);
     // **-86 with the two areaportal classnames, and `accepted` does not
     // move** — every one of the 86 is refused rather than accepted. They are
     // `func_areaportalwindow`'s two fade inputs, fired at the *classname*
@@ -4011,7 +4040,7 @@ fn every_shipped_map_spawns_its_entities() {
     // `SetParentAttachmentMaintainOffset`s and six of the `Disable`s name a
     // fizzler that shares its name with a `trigger_hurt` — a laser-death
     // fizzler is the two — so those events always had a target.
-    assert_eq!(io.no_target, 910);
+    assert_eq!(io.no_target, 842);
 
     // Nothing may fail to convert: every shipped connection's parameter is
     // compatible with the input it is aimed at.
@@ -4098,14 +4127,18 @@ fn every_shipped_map_spawns_its_entities() {
     // their own. **One is carried**: a `func_noportal_volume` on
     // `sp_a2_laser_over_goo` is parented to the train `ele1_train`, which
     // `Find` snaps four units onto its first node.
-    assert_eq!(brush_entities, 9_747);
-    assert_eq!(moved, 327, "brush entities that left their spawn placement");
-    assert_eq!(carried, 134, "…of which this many were carried by a parent");
+    // **-82 with the templates**: 55 trains, 6 doors, 2 brushes, 2 rotators,
+    // a mover, 12 `trigger_once`, 2 `trigger_hurt` and a `trigger_multiple`
+    // and a bumper wait in templates — and with them 28 of the brush entities
+    // that moved in the first two seconds.
+    assert_eq!(brush_entities, 9_665);
+    assert_eq!(moved, 299, "brush entities that left their spawn placement");
+    assert_eq!(carried, 132, "…of which this many were carried by a parent");
     assert!(
         carried_furthest > 7_837.0 && carried_furthest < 7_838.0,
         "the longest carried ride moved: {carried_furthest}"
     );
-    assert_eq!(still_moving, 70, "…and were still travelling at 2s");
+    assert_eq!(still_moving, 44, "…and were still travelling at 2s");
 
     // Stage 4's own parse-side number, and it is no longer only about brush
     // entities: how many entities are *live* triggers two ticks into the map —
@@ -4130,7 +4163,9 @@ fn every_shipped_map_spawns_its_entities() {
     // enabled (a disabled one is not a trigger, `InitTrigger`'s rule), and
     // the 3 placed `weapon_portalgun`s — a gun on a floor is a `SOLID_BBOX`
     // trigger the player picks up by walking into.
-    assert_eq!(triggers, 2_657);
+    // -15 with the templates: 12 `trigger_once`, 2 `trigger_hurt` and a
+    // `trigger_multiple`.
+    assert_eq!(triggers, 2_642);
 
     // `ThinkList` is a flat `Vec` with a linear scan, which is only the right
     // shape while this number is small. It is the measurement `think.rs` cites.
@@ -5378,8 +5413,11 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // **`trigger_portal_cleanser` took it to 2,568**: the 313 fizzlers that
     // start enabled. The other 58 are `StartDisabled`, and a disabled trigger
     // is not a trigger — `InitTrigger` leaves `FSOLID_TRIGGER` off it.
-    assert_eq!(visited, 2_568);
-    assert_eq!(noticed, 2_517);
+    // **-14 with the templates**: 12 `trigger_once`s and a `trigger_multiple`
+    // and a `trigger_hurt` wait in templates — the other templated
+    // `trigger_hurt` starts disabled and was never visited.
+    assert_eq!(visited, 2_554);
+    assert_eq!(noticed, 2_503);
     // 1,889 of them get as far as dispatching something, which is the whole
     // chain — geometry, `FSOLID_TRIGGER`, the touch link, `PassesTriggerFilters`
     // and an output with a connection on it. The 357 that do not are triggers
@@ -5410,7 +5448,11 @@ fn every_shipped_maps_triggers_notice_the_player() {
     // doorway and the doorway's own `trigger_once`. The per-class column
     // printed above shows the other five classes fire exactly the 2,117 they
     // did before.
-    assert_eq!(fired, 2_247);
+    // -30 with the templates: the fourteen triggers above, and sixteen more
+    // that no longer dispatch anything in their two seconds — measured, not
+    // attributed one by one; a trigger whose only live target is in a
+    // template is the likely shape.
+    assert_eq!(fired, 2_217);
     assert_eq!(also_on_a_button, 21, "probes that also stand on a pad");
     // Three triggers in the game have no point a 32x32x72 hull fits inside —
     // and 42 fizzlers, which are sheets rather than volumes.
@@ -6452,7 +6494,10 @@ fn every_shipped_trigger_hurt_kills_the_player_standing_in_it() {
     println!("  {restarts} of the deaths asked the engine for the level back");
 
     assert_eq!(names.len(), 106);
-    assert_eq!(visited, 215, "the game places 215 trigger_hurts");
+    // **Two of the game's 215 are a template's** and not in the map at load:
+    // one that would have killed a player standing in it and one that starts
+    // disabled.
+    assert_eq!(visited, 213, "the game places 215 trigger_hurts, 2 in templates");
     // **Nothing is unexplained.** Every trigger a standing player fits inside,
     // that is switched on, and that admits clients, must kill them — the
     // weakest damage value in the game is 10 a second and nothing heals.
@@ -6475,8 +6520,8 @@ fn every_shipped_trigger_hurt_kills_the_player_standing_in_it() {
     //   to an `npc_bullseye` filter.
     // - **1 has nowhere to stand** — no point inside its brushes that a
     //   32×32×72 hull fits in.
-    assert_eq!(killed, 138);
-    assert_eq!(disabled, 72, "StartDisabled 1");
+    assert_eq!(killed, 137);
+    assert_eq!(disabled, 71, "StartDisabled 1");
     assert_eq!(refused, 4, "no SF_TRIGGER_ALLOW_CLIENTS, or a filter");
     assert_eq!(unreachable, 1);
     // **Every death reaches `RespawnPlayer`**, three seconds later — which is
@@ -7072,17 +7117,17 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
         // hand the answers back. `Engine::load_level` does exactly this,
         // between `World::load_entity_models` and the first tick.
         let mut table = sequences::SequenceTable::new();
-        let mut here = 0usize;
-        for (_, entity) in server.entities.iter() {
-            if !entity.classname().starts_with("prop_dynamic")
-                && entity.classname() != "dynamic_prop"
-            {
-                continue;
-            }
-            here += 1;
-            let Some(model) = entity.core.model.clone() else {
-                continue;
-            };
+        let placed: Vec<Option<String>> = server
+            .entities
+            .iter()
+            .filter(|(_, e)| e.classname().starts_with("prop_dynamic") || e.classname() == "dynamic_prop")
+            .map(|(_, e)| e.core.model.clone())
+            .collect();
+        let here = placed.len();
+        // …and what a `point_template` can make, which `Engine::load_level`
+        // loads as well — `PerformPrecache`.
+        let precached = server.precache_models();
+        for model in placed.into_iter().flatten().chain(precached) {
             let entry = loaded.entry(model.to_ascii_lowercase()).or_insert_with(|| {
                 let studio = StudioModel::load(&vfs, &model).ok()?;
                 rigidity.insert(
@@ -7202,9 +7247,15 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     );
 
     // The census, which is the number every doc in the port quotes.
-    assert_eq!(spawned, 8_462, "prop_dynamic + prop_dynamic_override");
+    //
+    // **-159 with the templates**: 103 `prop_dynamic` and 56
+    // `prop_dynamic_override` are a template's, and not in the map at load.
+    // The models they wear are loaded anyway, as the engine loads them —
+    // `PerformPrecache` — which is two more distinct models than the props
+    // alive at load name.
+    assert_eq!(spawned, 8_303, "prop_dynamic + prop_dynamic_override");
     assert_eq!(maps_with_a_prop, 105, "every map but one places a prop");
-    assert_eq!(loaded.len(), 606, "distinct models");
+    assert_eq!(loaded.len(), 608, "distinct models");
 
     // **Ten props do not survive the first two seconds of their map.** `Kill`
     // (556 shipped connections) and `FadeAndKill` (51) — which is exactly why
@@ -7215,7 +7266,11 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // end of their path tells them to, and the 58 props riding them go with
     // them — `removing_a_parent_removes_everything_under_it`. Before the
     // trains existed nothing fired the `FireUser2`, so the props lived.
-    assert_eq!(props, 8_395, "67 were removed while the map ran");
+    //
+    // **With the templates, 116 more are alive at two seconds than were
+    // there at load**: the maps' own `ForceSpawn`s make that many template
+    // props inside the first two seconds (8,303 + 116 - 67 = 8,352).
+    assert_eq!(props, 8_352, "67 were removed while the map ran");
 
     // **15 of the 606 models will not read, and 41 entities wear one.**
     //
@@ -7239,7 +7294,9 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // `sp_a2_pit_flings` a `logic_auto` sends `FireUser1` to the exit
     // elevator's fizzler at spawn, and its `OnUser1` disables the fizzler
     // *and* the two emitter props beside it.
-    assert_eq!(invisible, 1_131);
+    // 1,136 with the templates: five of the props made from a template in the
+    // first two seconds are invisible when the count is taken.
+    assert_eq!(invisible, 1_136);
 
     // The `solid` key, which only the prop family writes. 2,830 are
     // `SOLID_NONE` promoted to `SOLID_OBB` (or left alone, for an `_override`)
@@ -7255,7 +7312,9 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // random stream — `GenerateUniqueKey` draws a `RandomInt` for every
     // script id, as Valve's does, and that changes which way a random picker
     // goes. With the draw taken out the old `[2_773, 5_622]` comes back.
-    assert_eq!(solid_key, [2_772, 5_623]);
+    // [2,742, 5,610] with the templates, which change which props are alive
+    // at two seconds.
+    assert_eq!(solid_key, [2_742, 5_610]);
 
     // **What `$includemodel` was worth, measured on the running maps.**
     // Before `studio::include` landed these read 2,563 / 1,666 / **897**: of
@@ -7276,9 +7335,13 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     // every one of them is a `mp_coop_credits` prop that a self-killing train
     // took with it**: with that map left out, this port before and after the
     // trains agree on all three to the entity.
-    assert_eq!(animating, 2_718);
-    assert_eq!(resolved, 2_542);
-    assert_eq!(unresolved, 176);
+    //
+    // **The templates moved them again, to 2,711, 2,538 and 173**, for the
+    // same reason `props` above moved: a different set of props is alive at
+    // two seconds.
+    assert_eq!(animating, 2_711);
+    assert_eq!(resolved, 2_538);
+    assert_eq!(unresolved, 173);
 
     // **What skinning bought**, and before it landed the measured cost of not
     // having it. `prop_dynamic` is what made it concrete: **74 of the 591
@@ -7295,9 +7358,10 @@ fn every_shipped_prop_dynamic_plays_the_animation_its_map_asks_for() {
     );
     // 15 and 9 of these were `mp_coop_credits` props riding trains that
     // `Kill` themselves; see `animating` above.
-    assert_eq!(skinned, 275, "entities that needed skinning to pose at all");
+    // 279 and 3,296 with the templates, which change which props are alive.
+    assert_eq!(skinned, 279, "entities that needed skinning to pose at all");
     assert_eq!(
-        animatable, 3_314,
+        animatable, 3_296,
         "entities whose model the renderer can pose"
     );
 }
@@ -9777,11 +9841,18 @@ fn every_shipped_mover_pushes_the_player_standing_in_front_of_it() {
     // the doorway pass two probes is not where the door closes.
     assert_eq!(
         (pushed, blocked, missed, no_room, passable),
-        (54, 13, 53, 144, 163),
+        (53, 13, 52, 143, 159),
         "the pusher's census over the shipped maps has changed"
     );
+    // **Seven fewer with the templates** — six `func_door`s and a
+    // `func_movelinear` are a template's, and not there to probe — and the
+    // furthest shove went from 234.4 to **338.4 units**: `sp_a2_bts3`'s
+    // `laser_cutter_1-laser_cutter_arm_1_mover`. That map's eleven panel
+    // templates each hold a brush and a train, which used to stand in the
+    // room at load and now wait for the map to make them, so the player the
+    // arm shoves has further to go before something stops them.
     assert!(
-        (234.0..235.0).contains(&furthest),
+        (338.0..339.0).contains(&furthest),
         "the furthest shove was {furthest:.1} units"
     );
 }
@@ -10068,6 +10139,10 @@ fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
     // 1,040 riding a bone until `trigger_portal_cleanser` had a class: the
     // shipped maps carry **14** `SetParentAttachmentMaintainOffset`
     // connections to fizzlers, which had nothing to land on before.
+    //
+    // **1,044 and 172 with the templates**: ten of the connections that put
+    // an entity on a bone, and two of the ones naming a point the model has
+    // not got, are aimed at entities a template holds until later.
     assert_eq!(
         (
             declared,
@@ -10077,7 +10152,7 @@ fn every_shipped_attachment_connection_puts_its_entity_on_a_bone() {
             parent_has_no_model,
             no_such_point
         ),
-        (1362, 1054, 6, 6, 0, 174),
+        (1362, 1044, 6, 6, 0, 172),
         "the attachment census over the shipped maps has changed"
     );
 }
@@ -10928,7 +11003,11 @@ fn every_shipped_train_finds_its_track() {
     // nodes that do not exist, and the crane never moved in the shipped game
     // either. The other two are `sp_a1_wakeup`'s incinerator pincer and
     // `sp_a2_bts6`'s player pod.
-    assert_eq!((trains, on_track, parented, lost), (233, 229, 1, 3));
+    //
+    // **55 of the 233 are a template's** and not in the map at load —
+    // `sp_a2_bts3`'s panels among them — so 178 are checked, and all 55 were
+    // on their track: 229 became 174 and the three lost ones are still lost.
+    assert_eq!((trains, on_track, parented, lost), (178, 174, 1, 3));
 }
 
 /// `sp_a1_intro1`'s departure elevator runs down its shaft and loops: the
